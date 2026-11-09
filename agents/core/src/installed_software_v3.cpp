@@ -8,6 +8,7 @@
 #include <cctype>
 #include <iterator>
 #include <tuple>
+#include <vector>
 
 namespace yuzu::agent {
 
@@ -208,47 +209,149 @@ std::string canonical_release(std::string_view release) {
 
 namespace {
 
-// Roots that name an account, compared on the normalised form (lower case, '/' for '\\', any
-// drive letter dropped) at a segment boundary.
-constexpr std::string_view kPerUserRoots[] = {"/users", "/documents and settings", "/home",
-                                               "/root"};
+// THE machine-root allowlist for slot 13 (ADR-0016 section 8; the user manual's "Install type,
+// scope and location" and the installed_apps README restate it). A location is kept only when
+// its canonical form sits under one of these roots; everything else, and every spelling the
+// canonicaliser does not recognise, is blanked. `drive` rows are Windows roots under ANY drive
+// letter (`C:\Program Files`, `D:\Program Files`); the others are POSIX roots. Compared in lower
+// case on segment boundaries. `WindowsApps` sits under `Program Files`, `/usr/local` under `/usr`.
+struct MachineRoot {
+    bool drive;
+    std::string_view path; // lower case, '/'-separated, no trailing separator
+};
+constexpr MachineRoot kMachineRoots[] = {
+    // Windows
+    {true, "program files"},
+    {true, "program files (x86)"},
+    {true, "programdata"},
+    {true, "windows"},
+    // macOS
+    {false, "applications"},
+    {false, "library"},
+    {false, "system/applications"},
+    {false, "developer"},
+    // macOS and Linux
+    {false, "opt"},
+    {false, "usr"},
+    // Linux
+    {false, "snap"},
+    {false, "var/lib/flatpak"},
+    {false, "nix"},
+    {false, "app"},
+};
 
 // The macOS firmlink: the Data volume's logical path is the same path without this prefix.
-constexpr std::string_view kDataVolume = "/system/volumes/data";
+constexpr std::string_view kDataVolumeSegments[] = {"system", "volumes", "data"};
+
+bool is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
 
 } // namespace
 
-bool is_per_user_path(std::string_view p) {
-    if (p.size() >= 2 && is_sep(p[0]) && is_sep(p[1])) {
-        // `\\?\` and `\\.\` are the Win32 extended-length and device prefixes: the path after
-        // one is the same path as without it, so classify what follows. Anything else that
-        // opens with two separators is a UNC path (`\\host\share\...`, `\\?\UNC\...`): the
-        // writer cannot tell a home share from an application share, so every UNC path is
-        // blanked (fail closed).
-        if (p.size() < 4 || !(p[2] == '?' || p[2] == '.') || !is_sep(p[3]))
-            return true;
+std::string machine_install_location(std::string_view p) {
+    // 1. Quotes and padding: installers write `"C:\Program Files\X"` and ` C:\...`.
+    while (!p.empty() && (is_ws(p.front()) || p.front() == '"'))
+        p.remove_prefix(1);
+    while (!p.empty() && (is_ws(p.back()) || p.back() == '"'))
+        p.remove_suffix(1);
+    if (p.empty())
+        return {};
+    for (const char c : p) {
+        if (static_cast<unsigned char>(c) < 0x20)
+            return {}; // a control byte is not a path
+    }
+    // 2. The Win32 extended-length and device prefixes (`\\?\`, `\\.\`, `//?/`): the path after
+    //    one is the same path as without it. What they can introduce besides a drive (`UNC\`,
+    //    `Volume{...}`, `GLOBALROOT`) is left to fail the shape test below.
+    if (p.size() >= 4 && is_sep(p[0]) && is_sep(p[1]) && (p[2] == '?' || p[2] == '.') &&
+        is_sep(p[3]))
         p.remove_prefix(4);
-        if (starts_with_ci(p, "unc") && p.size() > 3 && is_sep(p[3]))
-            return true;
+    if (p.empty())
+        return {}; // a bare prefix
+    // 3. Shape. A drive letter followed by a separator is a Windows absolute path; a single
+    //    leading separator a POSIX one. Anything else (UNC `\\host\share`, drive-relative
+    //    `C:Users`, `\??\`, `%ProgramFiles%\X`, a bare name) is not recognised and is blanked:
+    //    the writer cannot tell a home share from an application share, nor resolve an
+    //    environment variable or an NT object name, so it fails closed.
+    char drive = 0;
+    if (p.size() >= 3 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) &&
+        p[1] == ':' && is_sep(p[2])) {
+        drive = static_cast<char>(p[0] >= 'a' ? p[0] - 'a' + 'A' : p[0]);
+        p.remove_prefix(3);
+    } else if (is_sep(p[0]) && !(p.size() >= 2 && is_sep(p[1]))) {
+        p.remove_prefix(1);
+    } else {
+        return {};
     }
-    // The same normalisation as mount_entry_is_personal (sync_source_device_ci.cpp), so the two
-    // writers classify one spelling alike. They differ on purpose: /volumes is not a root here (an
-    // install location on another volume names an application, not a person), a UNC path is
-    // blanked above (fail closed) where the mount rule passes it through, and a non-path is kept
-    // where the mount rule treats it as personal.
-    std::string n(p);
-    for (char& c : n)
-        c = c == '\\' ? '/' : ascii_lower(c);
-    std::string_view v = n;
-    if (v.size() >= 2 && v[0] >= 'a' && v[0] <= 'z' && v[1] == ':')
-        v.remove_prefix(2);
-    if (v.starts_with(kDataVolume) && v.size() > kDataVolume.size() && v[kDataVolume.size()] == '/')
-        v.remove_prefix(kDataVolume.size());
-    for (const auto root : kPerUserRoots) {
-        if (v.starts_with(root) && (v.size() == root.size() || v[root.size()] == '/'))
-            return true;
+    // 4. Segments: both separators split, runs collapse, `.` is dropped, `..` pops (one that
+    //    would climb past the root is an escape and is blanked), and on the Windows shape each
+    //    segment loses the trailing dots and spaces Win32 itself ignores. Case is kept.
+    std::vector<std::string_view> segs;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= p.size(); ++i) {
+        if (i < p.size() && !is_sep(p[i]))
+            continue;
+        std::string_view seg = p.substr(start, i - start);
+        start = i + 1;
+        if (seg.empty() || seg == ".")
+            continue;
+        if (seg == "..") {
+            if (segs.empty())
+                return {};
+            segs.pop_back();
+            continue;
+        }
+        if (drive) {
+            // After the dot segments are recognised, so `..` is never stripped to nothing.
+            while (!seg.empty() && (seg.back() == '.' || seg.back() == ' '))
+                seg.remove_suffix(1);
+            if (seg.empty())
+                return {}; // `...` or a run of spaces: not a name Win32 resolves one way
+        }
+        segs.push_back(seg);
     }
-    return false;
+    // 5. The macOS firmlink: `/System/Volumes/Data/<x>` is `/<x>`.
+    if (!drive && segs.size() >= 3 && starts_with_ci(segs[0], kDataVolumeSegments[0]) &&
+        segs[0].size() == kDataVolumeSegments[0].size() &&
+        starts_with_ci(segs[1], kDataVolumeSegments[1]) &&
+        segs[1].size() == kDataVolumeSegments[1].size() &&
+        starts_with_ci(segs[2], kDataVolumeSegments[2]) &&
+        segs[2].size() == kDataVolumeSegments[2].size())
+        segs.erase(segs.begin(), segs.begin() + 3);
+    if (segs.empty())
+        return {};
+    // 6. The allowlist, on the lower-cased '/'-joined segments, at a segment boundary.
+    std::string key;
+    for (const auto seg : segs) {
+        if (!key.empty())
+            key += '/';
+        for (const char c : seg)
+            key += ascii_lower(c);
+    }
+    bool allowed = false;
+    for (const auto& root : kMachineRoots) {
+        if (root.drive == (drive != 0) && key.starts_with(root.path) &&
+            (key.size() == root.path.size() || key[root.path.size()] == '/')) {
+            allowed = true;
+            break;
+        }
+    }
+    if (!allowed)
+        return {};
+    // 7. One spelling of a kept location: the shape's own separator, the drive letter upper
+    //    case, no trailing separator, the segments' own case.
+    std::string out;
+    out.reserve(p.size() + 3);
+    if (drive) {
+        out += drive;
+        out += ':';
+    }
+    for (const auto seg : segs) {
+        out += drive ? '\\' : '/';
+        out += seg;
+    }
+    return out;
 }
 
 SwEntry v3_normal_form(const SwEntry& in) {
@@ -265,9 +368,7 @@ SwEntry v3_normal_form(const SwEntry& in) {
     e.signature_status = clamp(in.signature_status);
     e.distro_id = clamp(in.distro_id);
     e.distro_version = clamp(in.distro_version);
-    e.install_location = clamp(in.install_location);
-    if (is_per_user_path(e.install_location))
-        e.install_location.clear();
+    e.install_location = machine_install_location(clamp(in.install_location));
     e.package_id = clamp(in.package_id);
     e.source = clamp(in.source);
     return e;

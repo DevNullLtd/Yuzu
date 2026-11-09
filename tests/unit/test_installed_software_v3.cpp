@@ -268,13 +268,15 @@ TEST_CASE("a field carrying 0x1E, 0x1F and NUL writes a record with no raw separ
     CHECK(v3_section_hash({gone}) == kEmptyHash);
 }
 
-TEST_CASE("is_per_user_path and the writer's install_location rule", "[v3][writer][privacy]") {
+TEST_CASE("machine_install_location and the writer's install_location rule", "[v3][writer][privacy]") {
     for (const char* p : {"C:\\Users\\x", "c:\\users\\x\\AppData", "D:/Users/x", "/Users/x/Applications",
-                          "/home/x/.local", "/root", "/root/bin"})
-        CHECK(is_per_user_path(p));
-    for (const char* p : {"C:\\Program Files\\x", "C:\\Usersx", "/Applications/x.app", "/opt/x",
-                          "/usr/local", "/homework", "", "C:\\"})
-        CHECK_FALSE(is_per_user_path(p));
+                          "/home/x/.local", "/root", "/root/bin", "C:\\Usersx", "/homework", "",
+                          "C:\\", "D:\\Apps\\Tool", "C:\\Tools\\Foo"})
+        CHECK(machine_install_location(p).empty());
+    CHECK(machine_install_location("C:\\Program Files\\x") == "C:\\Program Files\\x");
+    CHECK(machine_install_location("/Applications/x.app") == "/Applications/x.app");
+    CHECK(machine_install_location("/opt/x") == "/opt/x");
+    CHECK(machine_install_location("/usr/local") == "/usr/local");
 
     SwEntry e = alpha();
     e.install_location = "C:\\Users\\alex\\AppData\\Local\\Tool";
@@ -287,23 +289,39 @@ TEST_CASE("is_per_user_path and the writer's install_location rule", "[v3][write
     CHECK(split(v3_record(e), '\x1f')[12] == "/Applications/Tool.app");
 }
 
-TEST_CASE("per-user install_location spellings are blanked on the wire", "[v3][writer][privacy]") {
-    // The Win32 extended-length and device prefixes, every UNC spelling, and the macOS Data-volume
-    // firmlink name the same per-user (or unclassifiable) paths as the plain forms.
+TEST_CASE("install_location is an allowlist: every spelling outside a machine root is blanked on the wire",
+          "[v3][writer][privacy]") {
+    // Every spelling the governance probe found leaking under the old blacklist, plus the shapes
+    // the canonicaliser cannot resolve. None of these may reach the wire.
     const std::vector<std::string> blanked = {
+        // Quotes, padding, doubled separators, dot segments, trailing dots (installer-authored text).
+        "\"C:\\Users\\alice\\AppData\\Local\\Foo\"", " C:\\Users\\alice", "C:\\\\Users\\\\alice\\\\Foo",
+        "C:\\.\\Users\\alice", "C:\\Users.\\alice", "C:\\Program Files\\..\\Users\\alice",
+        "C:\\Program Files\\..\\..\\Users", "/Applications/../Users/alice/App",
+        // 8.3 names, NT object spellings, drive-relative, unexpanded variables: not resolvable.
+        "C:\\DOCUME~1\\alice", "C:\\PROGRA~1\\Tool", "\\??\\C:\\Users\\alice",
+        "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\Users\\alice",
+        "\\\\?\\Volume{5a2b}\\Users\\alice", "\\\\?\\Volume{5a2b}\\Program Files\\Tool",
+        "C:Users\\alice", "%USERPROFILE%\\Tool", "%LOCALAPPDATA%\\Programs\\Foo",
+        "%ProgramFiles%\\Vendor", "~/Applications/Tool.app", "Tool",
+        // Volumes and relocated profile roots: not under a machine root.
+        "/Volumes/Backup/Users/alice/Applications/Foo.app", "/Volumes/Alice's Passport/Foo.app",
+        "/Volumes/Data/Apps/Tool", "E:\\Profiles\\alice", "/private/var/root", "/var/home/alice",
+        "/mnt/c/Users/alice", "D:\\Apps\\Foo",
+        // The Win32 prefixes, every UNC spelling, the macOS firmlink, case and separator variants.
         "\\\\?\\C:\\Users\\Alice\\App",   "\\\\?\\c:\\users\\Alice\\App", "\\\\.\\D:\\Users\\Alice",
         "//?/C:/Users/Alice/App",         "\\\\host\\share\\apps\\Tool",  "\\\\host\\home$\\alice",
         "//host/share/Tool",              "\\\\?\\UNC\\host\\share\\Tool", "\\\\?\\unc\\host\\share",
-        "\\\\.\\UNC\\host\\share\\Tool",
+        "\\\\.\\UNC\\host\\share\\Tool",  "\\\\?\\", "\\\\?\\Cx",
         "/System/Volumes/Data/Users/alice/App", "/System/Volumes/Data/home/alice",
-        "/System/Volumes/Data/root/bin",
-        // Case, separator, a missing drive letter and the legacy profile root name the same trees
-        // (mount_entry_is_personal, sync_source_device_ci.cpp, reads them all as personal).
+        "/System/Volumes/Data/root/bin", "/System/Volumes/Data",
         "/users/alice/App", "/System/Volumes/Data/users/x", "C:\\Documents and Settings\\alice\\x",
-        "c:/documents and settings/x", "\\Users\\alice\\x", "/Documents and Settings/x"};
+        "c:/documents and settings/x", "\\Users\\alice\\x", "/Documents and Settings/x", "\\x",
+        // A control byte is not a path.
+        std::string("C:\\Program Files\\Tool\x01"), "/Applications/\tTool.app"};
     for (const auto& path : blanked) {
         CAPTURE(path);
-        CHECK(is_per_user_path(path));
+        CHECK(machine_install_location(path).empty());
         SwEntry e = alpha();
         e.install_location = path;
         // v3_record: slot 12 (install_location) is empty, and the row hashes as the blanked row.
@@ -318,18 +336,52 @@ TEST_CASE("per-user install_location spellings are blanked on the wire", "[v3][w
         CHECK(plan.adds[0].install_location.empty());
         CHECK(plan.section_hash == plan_section(kApps, {blank}, std::nullopt, false).section_hash);
     }
-    // Machine-scope spellings of the same shapes are kept.
-    const std::vector<std::string> kept = {
-        "\\\\?\\C:\\Program Files\\Tool", "\\\\.\\C:\\Windows", "/System/Volumes/Data/Applications/Tool.app",
-        "/System/Applications/Tool.app", "/System/Volumes/Data", "/System/Volumes/Data/opt/x",
-        "\\\\?\\", "\\x", "\\\\?\\Cx", "/homework", "C:\\Usersx", "/Documents and Settingsx"};
-    for (const auto& path : kept) {
+    // Under a machine root the location is kept, in ONE spelling: the shape's separator, an
+    // upper-case drive letter, no quotes, padding, prefix, doubled separator, dot segment or
+    // trailing separator, the segments' own case.
+    const std::vector<std::pair<std::string, std::string>> kept = {
+        {"C:\\Program Files\\Tool", "C:\\Program Files\\Tool"},
+        {"\"C:\\Program Files\\Tool\"", "C:\\Program Files\\Tool"},
+        {" c:/program files (x86)/Tool/ ", "C:\\program files (x86)\\Tool"},
+        {"\\\\?\\C:\\Program Files (x86)\\Tool", "C:\\Program Files (x86)\\Tool"},
+        {"\\\\.\\C:\\Windows", "C:\\Windows"},
+        {"C:\\\\Program Files\\\\.\\Tool\\..\\Tool2.", "C:\\Program Files\\Tool2"},
+        {"D:\\ProgramData\\Vendor\\App", "D:\\ProgramData\\Vendor\\App"},
+        {"C:\\Program Files\\WindowsApps\\Vendor.App_1.0_x64__8wekyb3d8bbwe",
+         "C:\\Program Files\\WindowsApps\\Vendor.App_1.0_x64__8wekyb3d8bbwe"},
+        {"C:\\Windows\\System32\\drivers", "C:\\Windows\\System32\\drivers"},
+        {"/Applications/Tool.app", "/Applications/Tool.app"},
+        {"/Applications/Tool.app/", "/Applications/Tool.app"},
+        {"/System/Volumes/Data/Applications/Tool.app", "/Applications/Tool.app"},
+        {"/System/Applications/Tool.app", "/System/Applications/Tool.app"},
+        {"/Library/Application Support/Vendor", "/Library/Application Support/Vendor"},
+        {"/System/Volumes/Data/opt/x", "/opt/x"},
+        {"/usr/local/bin", "/usr/local/bin"},
+        {"/Developer/Tool", "/Developer/Tool"},
+        {"/snap/foo/12", "/snap/foo/12"},
+        {"/var/lib/flatpak/app/org.example.Foo", "/var/lib/flatpak/app/org.example.Foo"},
+        {"/nix/store/abc-foo", "/nix/store/abc-foo"},
+        {"/app/bin", "/app/bin"},
+        {"/opt//x/./y/../z", "/opt/x/z"},
+        {"C:\\Program Files", "C:\\Program Files"}};
+    for (const auto& [path, canonical] : kept) {
         CAPTURE(path);
-        CHECK_FALSE(is_per_user_path(path));
+        CHECK(machine_install_location(path) == canonical);
         SwEntry e = alpha();
         e.install_location = path;
-        CHECK(split(v3_record(e), '\x1f')[12] == path);
+        CHECK(split(v3_record(e), '\x1f')[12] == canonical);
+        const SectionPlan plan = plan_section(kApps, {e}, std::nullopt, false);
+        REQUIRE(plan.status == V3Status::full);
+        REQUIRE(plan.adds.size() == 1);
+        CHECK(plan.adds[0].install_location == canonical);
     }
+    // The macOS name of the root is kept as spelled; one app under two spellings of its root is
+    // one row only when the spellings canonicalise alike (case is kept, separators are not).
+    SwEntry a = alpha();
+    a.install_location = "C:/Program Files/Tool";
+    SwEntry b = alpha();
+    b.install_location = "\"C:\\Program Files\\Tool\\\"";
+    CHECK(v3_row_hash(a) == v3_row_hash(b));
 }
 
 TEST_CASE("canonical epoch and release spelling are stable across two collections",

@@ -515,10 +515,13 @@ int emit_inventory(Ctx& ctx, bool degraded, const std::vector<Rec>& records, Fmt
 // no defined order (std::sort is unstable), exactly as at base -- that survivor
 // choice is NOT made deterministic here, because doing so could move a hashed
 // row on a host with duplicates.
-// The one `list`-only layer sits between the sort and unique(): the survivor's
+// The one location layer sits between the sort and unique(): the survivor's
 // install_location becomes the lexicographically smallest populated location in
 // its run, so the value is the same whatever order the sort left the run in and
-// a '-' never shadows a path another hive holds. No other field moves.
+// a '-' never shadows a path another hive holds. No other field moves. Since the
+// `inv|` row carries install_location as its 14th token, this deterministic
+// survivor is what the daily sync hashes (the agent core then keeps it only under
+// a machine root).
 // Templated because the plugin's AppInfo aliases AppRowFields; any record with
 // name/version/install_location std::string members qualifies. Pure, so the
 // whole pipeline is tested on every host with the plugin's own instantiation.

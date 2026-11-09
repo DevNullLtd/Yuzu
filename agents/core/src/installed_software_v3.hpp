@@ -2,8 +2,8 @@
 
 /// @file installed_software_v3.hpp
 /// The pure writer for the `installed_software` blob contract v3 (ADR-0016 Updates 2026-11-04
-/// and 2026-11-09): sectioned, one section per plugin facet, rows plus a row-hash delta when the
-/// facet is FULL, status only when it is degraded. No plugin, no KV, no clock and no I/O, so the
+/// and 2026-11-09): sectioned, one section per source (a plugin action), rows plus a row-hash
+/// delta when the source is FULL, status only when it is degraded. No plugin, no KV, no clock and no I/O, so the
 /// whole writer is unit-tested against the server's golden vectors
 /// (tests/unit/server/test_software_inventory_store.cpp) without a build of the collector.
 ///
@@ -93,19 +93,27 @@ enum class V3Status { full, delta, constrained, timeout, oversize, not_collected
 /// a real release and is kept.
 [[nodiscard]] YUZU_EXPORT std::string canonical_release(std::string_view release);
 
-/// True for a path under an account's home: `/Users`, `/Documents and Settings`, `/home` or `/root`
-/// on a segment boundary, compared case-insensitively (Windows and the default macOS volume are),
-/// with `\` read as `/`, after an optional drive letter (`C:\Users\x`, `\Users\x`) and, on macOS,
-/// under `/System/Volumes/Data`; also when spelled with a `\\?\` or `\\.\` prefix. EVERY UNC
-/// path (`\\host\share\...`, `\\?\UNC\...`) is true too: a home share cannot be told from an
-/// application share, so the writer fails closed. The writer blanks such an install_location
-/// (ADR-0016 section 8: machine-scope data only; the server stores slot 13 as sent and keeps a copy
-/// in the change ledger for 400 days).
-[[nodiscard]] YUZU_EXPORT bool is_per_user_path(std::string_view path);
+/// The install_location the writer sends for a raw collector value, or empty. Slot 13 is an
+/// ALLOWLIST (ADR-0016 section 8: machine-scope data only; the server stores it as sent and
+/// keeps a copy in the change ledger for 400 days): the value is canonicalised first (quotes
+/// and padding trimmed, the Win32 `\\?\` and `\\.\` prefixes dropped, separator runs collapsed,
+/// `.` and `..` resolved, trailing dots and spaces stripped per Windows segment, the macOS
+/// `/System/Volumes/Data` firmlink folded) and KEPT, in one spelling (`C:\Program Files\X`,
+/// `/Applications/X.app`), only when it sits under a root of `kMachineRoots` in
+/// installed_software_v3.cpp: Windows `Program Files`, `Program Files (x86)`, `ProgramData`
+/// and `Windows` under any drive letter; macOS `/Applications`, `/Library`,
+/// `/System/Applications`, `/Developer`; `/opt` and `/usr`; Linux `/snap`, `/var/lib/flatpak`,
+/// `/nix`, `/app`. Everything else is blanked: a home under any root (`C:\Users`, `/home`,
+/// `E:\Profiles\alice`, `/Volumes/<label>/Users`), a UNC path (a home share cannot be told
+/// from an application share), a drive-relative path, an unexpanded `%ProgramFiles%`, an NT
+/// object name (`\??\`, `Volume{...}`, `GLOBALROOT`), an 8.3 name, a `..` that escapes the
+/// root, anything with a control byte. Fails closed: an unrecognised shape is blank. The
+/// row's name, version, publisher and hash are reported whatever this returns.
+[[nodiscard]] YUZU_EXPORT std::string machine_install_location(std::string_view raw);
 
 /// The stored form of one row, exactly what the server holds after its own field step: every
-/// field through clamp_field, the canonical epoch and release, and a per-user install_location
-/// blanked. Idempotent. Every hash below is taken over this form.
+/// field through clamp_field, the canonical epoch and release, and install_location through
+/// machine_install_location. Idempotent. Every hash below is taken over this form.
 [[nodiscard]] YUZU_EXPORT SwEntry v3_normal_form(const SwEntry& e);
 
 /// Normal form of every row, nameless rows dropped (the server drops them too), then sorted and

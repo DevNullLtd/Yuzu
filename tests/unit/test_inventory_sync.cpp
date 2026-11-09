@@ -37,8 +37,10 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <new>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string_view>
 #include <string>
 #include <tuple>
@@ -1524,10 +1526,20 @@ struct Collector {
         std::chrono::steady_clock::time_point{} + std::chrono::hours{1};
     SyncSource src;
 
-    explicit Collector(SyncPluginMap plugins, yuzu::agent::CollectorTuning tuning = {}) {
+    explicit Collector(SyncPluginMap plugins, yuzu::agent::CollectorTuning tuning = {})
+        : plugins_(std::move(plugins)) {
+        reconnect(std::move(tuning));
+    }
+    Collector(const Collector&) = delete;
+    Collector& operator=(const Collector&) = delete;
+
+    // The next connection's source: the same plugins, KV and agent-owned workers, new tuning.
+    // This is what a reconnect builds (the in-memory per-facet state is dropped, the KV and the
+    // single-flight flags survive), so a test can change the time limit between passes.
+    void reconnect(yuzu::agent::CollectorTuning tuning = {}) {
         tuning.clock = [this] { return now; };
         src = make_installed_software_source(
-            std::move(plugins),
+            plugins_,
             [this](const std::string& k) {
                 const auto it = kv.find(k);
                 return it == kv.end() ? std::string{} : it->second;
@@ -1535,8 +1547,6 @@ struct Collector {
             [this](const std::string& k, const std::string& v) { kv[k] = v; }, workers,
             std::move(tuning));
     }
-    Collector(const Collector&) = delete;
-    Collector& operator=(const Collector&) = delete;
 
     std::optional<std::pair<std::string, std::string>> collect() { return src.collect(); }
     // The scheduler's clean (no tokens) or nacked acknowledgement of the last collect().
@@ -1547,7 +1557,20 @@ struct Collector {
         return src.collect();
     }
     void pass_cooldown() { now += yuzu::agent::kPassCooldown + std::chrono::minutes{1}; }
+
+private:
+    SyncPluginMap plugins_;
 };
+
+// The single-flight tests park a worker on a promise and abandon it at a REAL-clock limit: that
+// leg is the contract and stays short. A pass that must COMPLETE (every fake answers at once) is
+// run after a reconnect under this limit instead, so a scheduling stall on a loaded runner cannot
+// turn an instant answer into a false `timeout`.
+yuzu::agent::CollectorTuning must_complete_tuning() {
+    yuzu::agent::CollectorTuning t;
+    t.time_limit = std::chrono::seconds{2};
+    return t;
+}
 
 // A first collection from a fresh source: every facet is a first contact.
 std::optional<std::pair<std::string, std::string>> collect_with(SyncPluginMap plugins) {
@@ -5465,6 +5488,7 @@ TEST_CASE("collector: a blocked plugin times out alone, stays single-flight, and
     CHECK(c.workers->outstanding() == 0);
     CHECK(g_blocking_entered.load() == 1);
 
+    c.reconnect(must_complete_tuning());
     const auto third = c.collect();
     REQUIRE(third.has_value());
     CHECK(find_sec(sections_of(third->first), kFacetApps)->status == "full");
@@ -5521,6 +5545,7 @@ TEST_CASE("collector: single-flight is per plugin, so a hung action keeps its si
     CHECK(c.workers->outstanding() == 0);
     CHECK(g_blocking_entered.load() == 1); // only `managers` was ever entered
 
+    c.reconnect(must_complete_tuning());
     const auto third = c.collect();
     REQUIRE(third.has_value());
     const auto s3 = sections_of(third->first);
@@ -5544,9 +5569,11 @@ TEST_CASE("collector: a hung plugin leaves the other plugins' sections reporting
     g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\n";
     g_fake[3].out["list_inventory"] = "status|list_inventory|supported|-\n";
     CollectorTuning tuning;
-    // Real-clock wait is the contract under test (a hung worker is abandoned at its limit);
-    // bounded at 50 ms.
-    tuning.time_limit = std::chrono::milliseconds{50};
+    // Real-clock wait is the contract under test (a hung worker is abandoned at its limit). This
+    // pass mixes the blocking leg with two that must complete (apps and msi answer at once), so
+    // the one limit is 250 ms: short enough for the hang, wide enough that a scheduling stall on
+    // a loaded runner does not turn an instant answer into a false `timeout`.
+    tuning.time_limit = std::chrono::milliseconds{250};
     // pkg_inventory sits BETWEEN the two responders in the action table: a flag shared by every
     // plugin would hold msi_packages out, one keyed by plugin does not.
     Collector c({{"installed_apps", &kFakeIa},
@@ -5596,6 +5623,7 @@ TEST_CASE("collector: a hung plugin leaves the other plugins' sections reporting
     release_worker();
     CHECK(yuzu::agent::drain_collector_workers(*c.workers, std::chrono::seconds{10}, {}));
     CHECK(c.workers->outstanding() == 0);
+    c.reconnect(must_complete_tuning());
     const auto second = c.collect();
     REQUIRE(second.has_value());
     const auto s2 = sections_of(second->first);
@@ -5631,12 +5659,110 @@ TEST_CASE("collector: a rejected bounded call is timeout:rejected and its flag i
     CHECK(a->status == "timeout");
     CHECK(a->token == "rejected");
     CHECK(invoked.load() == 1);
-    CHECK(c.workers->outstanding() == 0); // the CALLER cleared the flag: no worker ever ran
+    CHECK(c.workers->outstanding() == 0); // the ticket died with the never-run closure
     // ...so the next pass is not `busy`: it tries again.
     const auto again = c.collect();
     REQUIRE(again.has_value());
     CHECK(invoked.load() == 2);
     CHECK(find_sec(sections_of(again->first), kFacetApps)->token == "rejected");
+}
+
+TEST_CASE("collector: a throw between admission and the bounded call leaves no flag behind",
+          "[sync][collector][v3][workers]") {
+    // The gap cpp-safety named: the plugin's flag is taken, then the std::function, the string
+    // copies or the thread set-up fail under memory pressure before any worker exists. Nothing
+    // ran, so nothing could release the flag by hand; the ticket in the closure must.
+    int attempts = 0;
+    CollectorTuning tuning;
+    tuning.runner = [&attempts](std::chrono::milliseconds,
+                                std::function<yuzu::agent::LocalDispatcher::Result()> fn)
+        -> yuzu::agent::CollectorCallResult {
+        if (++attempts == 1)
+            throw std::bad_alloc{}; // `fn` (and the ticket it carries) unwinds with the throw
+        return {fn(), yuzu::shared::BoundedCallStatus::Completed};
+    };
+    Collector c({{"installed_apps", &kFakeIa}}, tuning);
+    reset_fakes();
+    g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\n";
+    // In production the sync tick's firewall swallows this; here it surfaces.
+    REQUIRE_THROWS_AS(c.collect(), std::bad_alloc);
+    CHECK(c.workers->outstanding() == 0); // no flag survives the failed admission
+    // The next pass enters the plugin: not `busy`, and the ticket of a completed worker is gone too.
+    const auto again = c.collect();
+    REQUIRE(again.has_value());
+    CHECK(attempts == 2);
+    CHECK(find_sec(sections_of(again->first), kFacetApps)->status == "full");
+    CHECK(c.workers->outstanding() == 0);
+}
+
+#if !defined(_MSC_VER)
+// MSVC's default /EHsc model treats a call through a C-linkage function type as nothrow, so a
+// C++ exception leaving a plugin's `execute` is not a contract the collector's catch can hold on
+// Windows (nor is it on any OS for a real plugin across the ABI); the catch is a backstop. The
+// backstop is pinned where the toolchain lets a fake throw through the pointer.
+namespace {
+int throwing_execute(YuzuCommandContext* /*ctx*/, const char* /*action*/,
+                     const YuzuParam* /*params*/, std::size_t /*param_count*/) {
+    ++g_blocking_entered;
+    throw std::runtime_error("plugin fault");
+}
+const YuzuPluginDescriptor kThrowingIa = {YUZU_PLUGIN_ABI_VERSION, "installed_apps", "1.0.0",
+                                          "test fake", kBlockingActions, nullptr, nullptr,
+                                          throwing_execute, nullptr};
+} // namespace
+
+TEST_CASE("collector: a plugin whose execute throws is constrained rc=-1 and leaves no flag",
+          "[sync][collector][v3][workers]") {
+    g_blocking_entered = 0;
+    Collector c({{"installed_apps", &kThrowingIa}}, must_complete_tuning());
+    const auto got = c.collect();
+    REQUIRE(got.has_value());
+    const V3Sec* a = find_sec(sections_of(got->first), kFacetApps);
+    REQUIRE(a != nullptr);
+    CHECK(a->status == "constrained");
+    CHECK(a->token == "rc=-1");
+    CHECK(g_blocking_entered.load() == 1);
+    CHECK(c.workers->outstanding() == 0); // the ticket's local in the worker ended the flag on the throw
+    // ...so the plugin is entered again on the next pass outside the cooldown (a constrained
+    // answer is cached like any other; only a timeout is not).
+    c.pass_cooldown();
+    const auto again = c.collect();
+    REQUIRE(again.has_value());
+    CHECK(g_blocking_entered.load() == 2);
+    CHECK(c.workers->outstanding() == 0);
+}
+#endif
+
+TEST_CASE("collector: a FULL answer whose typed status is not OK is constrained, never rows",
+          "[sync][collector][v3][completeness]") {
+    // No in-tree plugin pairs a non-OK status with FULL; the gate is on both so a future one
+    // cannot ship rows the plugin itself says it could not read cleanly.
+    reset_fakes();
+    g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\n";
+    SECTION("with a provenance token: the token") {
+        g_fake[0].result_status["list_inventory"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                                     YUZU_RESULT_COMPLETENESS_FULL,
+                                                     "installed_apps:hive_read_failed"};
+        const auto s = section_of({{"installed_apps", &kFakeIa}}, kFacetApps);
+        REQUIRE(s.has_value());
+        CHECK(s->status == "constrained");
+        CHECK(s->token == "installed_apps:hive_read_failed");
+        CHECK(s->adds.empty());
+    }
+    SECTION("without one: `status`") {
+        g_fake[0].result_status["list_inventory"] = {YUZU_RESULT_STATUS_UNAVAILABLE,
+                                                     YUZU_RESULT_COMPLETENESS_FULL, ""};
+        const auto s = section_of({{"installed_apps", &kFakeIa}}, kFacetApps);
+        REQUIRE(s.has_value());
+        CHECK(s->status == "constrained");
+        CHECK(s->token == "status");
+    }
+    SECTION("OK and FULL: the rows") {
+        const auto s = section_of({{"installed_apps", &kFakeIa}}, kFacetApps);
+        REQUIRE(s.has_value());
+        CHECK(s->status == "full");
+        CHECK(s->adds.size() == 1);
+    }
 }
 
 TEST_CASE("the teardown barrier waits the grace for outstanding workers, then escalates",
@@ -5651,21 +5777,36 @@ TEST_CASE("the teardown barrier waits the grace for outstanding workers, then es
     SECTION("one outstanding past the grace: the escalation hook runs with the count") {
         // Real-clock wait is the contract under test (the barrier gives up after its grace);
         // bounded at 60 ms.
-        REQUIRE(w.try_begin("installed_apps.list_inventory"));
+        REQUIRE(w.try_begin("installed_apps"));
         std::size_t seen = 0;
         CHECK_FALSE(yuzu::agent::drain_collector_workers(w, std::chrono::milliseconds{60},
                                                          [&](std::size_t n) { seen = n; }));
         CHECK(seen == 1);
-        w.end("installed_apps.list_inventory");
+        w.end("installed_apps");
         CHECK(yuzu::agent::drain_collector_workers(w, std::chrono::milliseconds{60}, {}));
     }
-    SECTION("single flight: a facet cannot be begun twice until it ends") {
-        CHECK(w.try_begin("a"));
-        CHECK_FALSE(w.try_begin("a"));
-        CHECK(w.try_begin("b"));
+    SECTION("single flight: a plugin cannot be begun twice until it ends") {
+        CHECK(w.try_begin("pkg_inventory"));
+        CHECK_FALSE(w.try_begin("pkg_inventory"));
+        CHECK(w.try_begin("runtimes"));
         CHECK(w.outstanding() == 2);
-        w.end("a");
-        CHECK(w.try_begin("a"));
+        w.end("pkg_inventory");
+        CHECK(w.try_begin("pkg_inventory"));
+    }
+    SECTION("a ticket holds the flag while any copy lives and ends it with the last one") {
+        auto shared = std::make_shared<CollectorWorkers>();
+        auto t = CollectorWorkers::admit(shared, "installed_apps");
+        REQUIRE(static_cast<bool>(t));
+        CHECK_FALSE(static_cast<bool>(CollectorWorkers::admit(shared, "installed_apps")));
+        CHECK(shared->outstanding() == 1);
+        {
+            auto copy = t; // a std::function copy of the closure would do this
+            t = CollectorWorkers::Ticket{};
+            CHECK(shared->outstanding() == 1);
+        }
+        CHECK(shared->outstanding() == 0);
+        CHECK(static_cast<bool>(CollectorWorkers::admit(shared, "installed_apps")));
+        CHECK(shared->outstanding() == 0); // the temporary's ticket ended at the semicolon
     }
 }
 

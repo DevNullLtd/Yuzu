@@ -83,7 +83,7 @@ cadences.
   application subkey) now emits a single `error|installed_apps: acquisition
   degraded (...)` row and a nonzero result instead of an empty or partial
   `app|` list; on macOS a `list` may begin with a `warning|bundle_id_*` row --
-  key on the first token `app`. See "Degraded collections are skipped, not
+  key on the first token `app`. See "degraded collections are reported, not
   published" below.
   Automation that only parses `app|` rows and ignores `error|` is
   unaffected; automation that assumed `list` always succeeds needs an
@@ -141,8 +141,8 @@ cadences.
   Chocolatey and winget are mapped from `managers`: the Linux manager rows (dpkg,
   apt, rpm, dnf, pacman, apk, snap, flatpak) are read but not collected as
   software, and a
-  constrained `managers` answer keeps the sync cycle as long as it names at
-  least one present manager.
+  constrained `managers` answer is a status-only section that contributes no rows
+  (the server keeps the source's stored rows, shown as unconfirmed).
 
   Linux snaps and flatpaks are collected through `pkg_inventory`
   `store_packages` (`source` `pkg_inventory.store_packages`), active
@@ -353,9 +353,12 @@ cadences.
   `error|installed_apps: acquisition degraded (...)` row with rc 1 instead of a
   partial list; `list_per_user` keeps the rows it read and appends
   `warning|hive_read_failed`. A missing HKCU Uninstall key is normal, and a failed read of the
-  agent identity's own HKCU never degrades the machine inventory (it holds per-user entries the
-  inventory does not report); a missing WoW6432Node Uninstall key is normal only on a 32-bit OS and
-  degrades the collection on a 64-bit one. A value-level failure (a non-REG_SZ or over-64 KiB
+  agent identity's own HKCU never degrades the machine inventory: `list_inventory` does read that
+  hive, so entries from it may be missing from a section sent as complete until the next clean
+  read restores them; a missing WoW6432Node Uninstall key is normal only on a 32-bit OS and
+  degrades the collection on a 64-bit one, so a 64-bit host that has no WOW6432Node Uninstall
+  key at all (a stripped or WoW64-less image) reports `installed_apps` constrained on every
+  cycle. A value-level failure (a non-REG_SZ or over-64 KiB
   DisplayName) is not distinguished from an absent value (plugin README caveat
   1).
 - **rpm fields:** `publisher` is the rpm **VENDOR** tag, else the **PACKAGER**
@@ -375,11 +378,15 @@ cadences.
   `uninstall_string` reserved (see "Install type, scope and location, and the
   sectioned report" below). This build's agent sends `install_location` (the Windows
   `InstallLocation`, the macOS `.app` path) and never `uninstall_string`; since a path under a
-  user's profile names an account, the agent blanks any location under `/Users`,
-  `/Documents and Settings`, `/home` or `/root` (whatever the letter case, with `\` or `/`, with or
-  without a drive letter, including the `\\?\` and macOS `/System/Volumes/Data` spellings of
-  them) before it hashes or sends it, and every UNC path too (a home share cannot be told from an
-  application share), so the stored value and the change
+  user's profile names an account, the location is an allowlist: the agent canonicalises the
+  value (quotes, padding, doubled separators, `.` and `..` segments, the `\\?\` prefix and the
+  macOS `/System/Volumes/Data` spelling) and keeps it, in one spelling, only when it sits under a
+  known machine root (Windows `Program Files`, `Program Files (x86)`, `ProgramData` and `Windows`
+  on any drive; macOS `/Applications`, `/Library`, `/System/Applications`, `/Developer`; `/opt` and
+  `/usr`; Linux `/snap`, `/var/lib/flatpak`, `/nix`, `/app`). A location outside those roots, and
+  any spelling the agent cannot resolve (a UNC path, an unexpanded `%ProgramFiles%`, an 8.3 name,
+  a drive-relative or NT-namespace path), is blanked before it is hashed or sent; the row's name,
+  version, publisher and hash are still reported. So the stored value and the change
   history name machine-scope roots only (ADR-0016 §8, #5186). (The only `HKCU`
   read is the agent's own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
@@ -419,8 +426,9 @@ database.
   one. It is stored only from the v3 blob (the v2 blob's slot is ignored), so a device that has not
   yet sent a v3 report has none. The agent fills it for Windows applications (the registry's
   `InstallLocation`) and macOS applications (the `.app` path); Linux packages, MSI products, store
-  packages and the other sources have no single install folder, so it is empty for them. A folder
-  under an account's home is never sent (the agent blanks it).
+  packages and the other sources have no single install folder, so it is empty for them. Only a
+  folder under a known machine root is sent (the allowlist above); a location outside those roots
+  is blanked, and the row is still reported with its name, version and publisher.
 - **`purl`** is the row's Package URL (for example
   `pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12`), composed by the server from the
   row's name, version, release, epoch, architecture and distribution. Linux package rows
@@ -554,6 +562,13 @@ whole source name.
   rows alone cannot fit in one report is `oversize` and sends no rows. Sync now and a server request
   for the whole source resend every section in full; there is no weekly full resend of this report,
   because a section that has drifted is refused by the server and asked for again on its own.
+  A worker abandoned at its limit is left to finish inside its plugin: at shutdown the agent waits up
+  to 3 seconds for such workers, then exits with code 3 rather than unload a plugin under one (the
+  log carries a critical `collector worker(s) still inside a plugin` line); a stop that lands while a
+  source is still waiting out its limit ends in the 20-second shutdown watchdog (exit code 4). On
+  Windows that exit happens before the service reports stopped, so the Service Control Manager's
+  recovery action restarts the agent after 60 seconds even when an operator asked for the stop
+  (bounded to three restarts a day; a later stop with no worker inside a plugin stops cleanly).
 - **Hash-skip.** If a device's installed software hasn't changed since its last
   successful sync, the agent sends only a small **content hash** (the `v3:` report hash, over the
   sections it holds) instead of any section. The server replies asking for the full list only when it can't match
@@ -1147,7 +1162,11 @@ could not be read for a reason other than the product not having it (or, as
 way. A token is cut at 64 bytes and characters outside `A-Z a-z 0-9 _ . : = , -` become `_`, so a long
 list of constraint tokens is shortened. The server keeps the latest status and token of each source
 per device; no server page or API returns them yet, so read the cause from the agent's own log. Fix
-the failing action, or remove its plugin, and the next daily sync recovers.
+the failing action, or remove its plugin, and the next daily sync recovers; `timeout` and `busy`
+are the exception: a worker that never returns holds its plugin's flag across passes and
+reconnects, so recovery is the worker returning or an agent restart, and that restart is the
+3-second drain and exit code 3 described under "Sections and deltas" (expect the critical
+`collector worker(s) still inside a plugin` journal line).
 
 **A device's Python (or IBM MQ, .NET or Java) rows are marked unconfirmed, but the rest of its
 software is still reported; the log shows `sync: runtimes.python constrained (<tokens>) — reported

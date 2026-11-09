@@ -75,8 +75,8 @@ struct SwEntry {
     std::string signature_status; // "signed"|"unsigned" (rpm stored tags, driver signature state)
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
-    // Wire slot 13. Machine-scope roots only: the v3 writer blanks a path under an account's
-    // home (installed_software_v3.hpp is_per_user_path). Slot 14 (uninstall_string) is
+    // Wire slot 13. Machine-scope roots only: the v3 writer keeps a location only under a known
+    // machine root (installed_software_v3.hpp machine_install_location). Slot 14 (uninstall_string) is
     // reserved and always sent empty (#5186). Inserted here, between distro_version and
     // package_id, so the member order stays the wire order.
     std::string install_location;
@@ -241,10 +241,32 @@ YUZU_EXPORT void vendor_or_origin(SwEntry& e);
 /// its caller stops waiting); outstanding() is the number of plugins with a worker in flight.
 class YUZU_EXPORT CollectorWorkers {
 public:
-    /// True and the plugin marked busy iff no worker of it is in flight.
+    /// One plugin's admission, RAII. The flag is held from `admit` until the LAST copy of the
+    /// ticket is destroyed, so no path between admission and the worker can leave it set: the
+    /// collector moves the one copy into the worker lambda and, at the worker's entry, into a
+    /// local of the call, so the flag ends when the worker returns or throws; a lambda never
+    /// invoked (the bounded call was Rejected, or building it threw) ends it when the closure
+    /// is destroyed. Copyable only because std::function demands it; nothing copies it.
+    class Ticket {
+    public:
+        Ticket() = default;
+        /// Engaged iff the plugin was admitted.
+        [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(hold_); }
+
+    private:
+        friend class CollectorWorkers;
+        explicit Ticket(std::shared_ptr<void> hold) noexcept : hold_(std::move(hold)) {}
+        std::shared_ptr<void> hold_;
+    };
+    /// Admit a worker of `plugin`: an engaged ticket iff no worker of it is in flight. `self`
+    /// must own this object; the ticket keeps it alive until the flag ends. Nothing is
+    /// allocated between the flag being set and the ticket owning it.
+    [[nodiscard]] static Ticket admit(std::shared_ptr<CollectorWorkers> self,
+                                      std::string_view plugin);
+    /// True and the plugin marked busy iff no worker of it is in flight (the primitive under
+    /// `admit`; the barrier tests drive it directly).
     [[nodiscard]] bool try_begin(std::string_view plugin);
-    /// Release a plugin (the worker returning, or the caller when the bounded call was rejected
-    /// and no worker ever ran).
+    /// Release a plugin (what a ticket's last copy does).
     void end(std::string_view plugin) noexcept;
     /// Plugins with a worker in flight now (callable from any thread).
     [[nodiscard]] std::size_t outstanding() const;

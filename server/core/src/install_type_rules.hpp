@@ -26,8 +26,9 @@
 namespace yuzu::server {
 
 /// The closed `install_type` vocabulary (matches the `installed_software_install_type_chk`
-/// CHECK constraint, which additionally admits '' for "not yet derived"). `driver` is reserved
-/// for the drivers facet and `component` for embedded components; no source maps to either yet.
+/// CHECK constraint, which additionally admits '' for "not yet derived"). `driver` is the
+/// install_type of `hardware.drivers_inventory`; `component` is reserved for embedded
+/// components, and no source maps to it yet.
 inline constexpr std::array<std::string_view, 9> kInstallTypes{{
     "msi",
     "installer",

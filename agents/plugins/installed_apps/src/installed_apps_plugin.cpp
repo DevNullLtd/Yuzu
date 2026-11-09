@@ -299,9 +299,11 @@ std::span<const reg_walk::UninstallRoot> windows_roots() {
 
 void log_failed_root(std::size_t i) {
     static constexpr const char* kRootNames[] = {"HKLM-64", "HKLM-32", "HKCU"};
-    spdlog::warn("installed_apps: Uninstall root {} could not be fully read -- the "
-                 "collection is degraded",
-                 kRootNames[i]);
+    // Row 3 (the agent identity's own HKCU) never degrades the walk (windows_roots()): its
+    // entries may be missing from a section sent as complete, which is what the line says.
+    spdlog::warn("installed_apps: Uninstall root {} could not be fully read -- {}", kRootNames[i],
+                 windows_roots()[i].degrades_walk ? "the collection is degraded"
+                                                  : "its entries may be missing");
 }
 
 AppCollection get_installed_apps_windows() {
@@ -310,11 +312,12 @@ AppCollection get_installed_apps_windows() {
         log_failed_root(i);
     auto apps = std::move(walk.apps);
 
-    // Sort, `list`-only location layer, unique(): one pure pass shared with the
-    // tests (installed_apps_parsers.hpp). The comparator and survivor are the
-    // pre-ADR-0028 code byte-for-byte, so the ADR-0016 `inv|` rows and `query`
+    // Sort, location layer, unique(): one pure pass shared with the tests
+    // (installed_apps_parsers.hpp). The comparator and survivor are the pre-ADR-0028
+    // code byte-for-byte, so the hashed fields of the ADR-0016 `inv|` rows and `query`
     // cannot move; only the survivor's install_location changes (it becomes the
-    // lexicographically smallest populated one in its run).
+    // lexicographically smallest populated one in its run), and that value now feeds
+    // the `inv|` row's 14th token (wire slot 13) as well as `list`.
     parsers::dedupe_uninstall_records(apps);
 
     return AppCollection{std::move(apps), walk.degraded};

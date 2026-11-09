@@ -685,6 +685,30 @@ void CollectorWorkers::end(std::string_view plugin) noexcept {
         busy_.erase(it);
 }
 
+CollectorWorkers::Ticket CollectorWorkers::admit(std::shared_ptr<CollectorWorkers> self,
+                                                 std::string_view plugin) {
+    if (!self)
+        return {};
+    struct Held {
+        std::shared_ptr<CollectorWorkers> w;
+        std::string plugin;
+        bool held{false};
+        ~Held() {
+            if (held)
+                w->end(plugin);
+        }
+    };
+    // Allocate BEFORE the flag is taken: a bad_alloc here leaves nothing to clean up, and once
+    // try_begin succeeds the flag is already owned by `held`.
+    auto held = std::make_shared<Held>();
+    held->w = std::move(self);
+    held->plugin = std::string(plugin);
+    held->held = held->w->try_begin(held->plugin);
+    if (!held->held)
+        return {};
+    return Ticket{std::shared_ptr<void>(std::move(held))};
+}
+
 std::size_t CollectorWorkers::outstanding() const {
     std::lock_guard<std::mutex> lk(mu_);
     return busy_.size();
@@ -804,29 +828,26 @@ struct CollectorState {
         // outlived its time limit is still inside it, and a plugin is one shared object with
         // shared state. A second dispatch, of the same action or a sibling, would pile another
         // thread into the same wedged plugin. Every facet of a busy plugin reports `busy`.
-        const std::string plugin(row.plugin);
-        if (!workers->try_begin(plugin)) {
+        CollectorWorkers::Ticket ticket = CollectorWorkers::admit(workers, row.plugin);
+        if (!ticket) {
             spdlog::warn("sync: plugin {} still has a worker running from an earlier pass — {} is "
                          "reported timeout:busy",
-                         plugin, source);
+                         row.plugin, source);
             c.status = V3Status::timeout;
             c.token = "busy";
             return c;
         }
         const auto t0 = std::chrono::steady_clock::now();
-        // The dispatcher is built INSIDE the worker and the plugin's single-flight flag is
-        // released by a guard inside it too: whichever of Completed and TimedOut the caller sees,
-        // the flag is cleared when the worker physically returns (or throws), never before. A
-        // Rejected call never invoked the lambda, so no guard exists and the caller clears the
-        // flag below.
+        // The dispatcher is built INSIDE the worker, and the plugin's single-flight ticket rides
+        // in the closure: at the worker's entry it is moved into a local of the call, so whichever
+        // of Completed and TimedOut the caller sees, the flag ends when the worker physically
+        // returns (or throws), never before. A closure never invoked (Rejected, or a throw while
+        // building it or the strings below) ends the flag when it is destroyed: there is no path
+        // on which the caller has to clear it by hand.
         using Result = LocalDispatcher::Result;
-        std::function<Result()> fn = [workers = workers, desc = it->second,
-                                      action = std::string(row.action), plugin]() -> Result {
-            struct Release {
-                CollectorWorkers& w;
-                const std::string& k;
-                ~Release() { w.end(k); }
-            } release{*workers, plugin};
+        std::function<Result()> fn = [ticket = std::move(ticket), desc = it->second,
+                                      action = std::string(row.action)]() mutable -> Result {
+            const CollectorWorkers::Ticket in_flight = std::move(ticket);
             try {
                 LocalDispatcher d;
                 return d.run(desc, action, {}, kInventoryCaptureCap);
@@ -845,7 +866,6 @@ struct CollectorState {
                             std::chrono::steady_clock::now() - t0)
                             .count();
         if (call.status == yuzu::shared::BoundedCallStatus::Rejected) {
-            workers->end(plugin);
             spdlog::warn("sync: {} could not start a worker (outstanding-call ceiling or thread "
                          "creation) — reported timeout:rejected",
                          source);
@@ -905,15 +925,19 @@ struct CollectorState {
         case AdaptedRows::Status::ok:
             break;
         }
-        if (r.result_completeness != YUZU_RESULT_COMPLETENESS_FULL) {
-            // Only a plugin that declares FULL is believed to have read everything. PARTIAL
+        if (r.result_completeness != YUZU_RESULT_COMPLETENESS_FULL ||
+            r.result_status != YUZU_RESULT_STATUS_OK) {
+            // Only a plugin that declares OK and FULL is believed to have read everything. PARTIAL
             // overrides rows the plugin did hand over (a partial roster); an answer that declares
             // nothing (UNKNOWN) is not FULL either and is the one counted and persisted at once
-            // (rare).
-            const bool partial = r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL;
+            // (rare). A non-OK status paired with FULL (no in-tree plugin does it) is read as
+            // the status says: constrained, under its provenance token.
+            const bool partial = r.result_completeness != YUZU_RESULT_COMPLETENESS_UNKNOWN;
             if (partial) {
-                spdlog::warn("sync: {} typed result completeness PARTIAL — reported constrained",
-                             source);
+                spdlog::warn("sync: {} typed result {} — reported constrained", source,
+                             r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL
+                                 ? "completeness PARTIAL"
+                                 : "status not OK");
             } else {
                 kv_set(unknown_total_key, std::to_string(++unknown_total));
                 spdlog::warn("sync: {} declared no result completeness — reported constrained "
@@ -921,9 +945,10 @@ struct CollectorState {
                              source);
             }
             c.status = V3Status::constrained;
-            c.token = !partial                     ? "unknown"
-                      : r.result_provenance.empty() ? "partial"
-                                                    : r.result_provenance;
+            c.token = !partial                      ? "unknown"
+                      : !r.result_provenance.empty() ? r.result_provenance
+                      : r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL ? "partial"
+                                                                                   : "status";
             return c;
         }
         for (auto& e : rows.entries)
@@ -993,7 +1018,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
             // `installed_software:<facet>`.
             if (t == kName)
                 whole = true;
-            else
+            else if (t.size() > kName.size() + 1) // `installed_software:<facet>`; the hook is public
                 nacked.insert(t.substr(kName.size() + 1));
         }
         for (auto& f : st->facets) {

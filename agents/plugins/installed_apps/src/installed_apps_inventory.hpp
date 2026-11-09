@@ -60,8 +60,8 @@ struct InvRecord {
     std::string distro_version;   // /etc/os-release VERSION_ID (Linux rows only)
     std::string install_location; // Windows InstallLocation, macOS the .app path, Linux empty (no
                                   // single prefix). Wire token 14 (blob v3 slot 13). The agent
-                                  // core blanks a path under an account's home before it hashes
-                                  // or sends it (installed_software_v3.hpp is_per_user_path).
+                                  // core keeps it only under a known machine root, blanking any
+                                  // other value (installed_software_v3.hpp machine_install_location).
 };
 
 // Epoch/version/release triple shared by the deb and pacman splitters.

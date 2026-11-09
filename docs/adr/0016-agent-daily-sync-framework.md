@@ -977,8 +977,9 @@ packages) is `package_manager`, so the same package reads the same with or witho
 ecosystem: `msi` → `msi`, `optional_feature` → `optional_feature`, `python` → `runtime`,
 `ibm_mq` → `middleware`, `snap` and
 `flatpak` → `store`, `brew`, `rpm`, `deb`, `apk`, `pacman` → `package_manager`, `windows`, `macos`,
-`macos_pkgutil` → `installer`, anything else `''`. `component` and `driver` are reserved for the
-component and drivers facets; no source maps to them yet. The table has a compile-time
+`macos_pkgutil` → `installer`, anything else `''`. `driver` is the install type of
+`hardware.drivers_inventory` (the 2026-11-09 Update); `component` is reserved for the component
+facet, and no source maps to it yet. The table has a compile-time
 totality check over `kSoftwareSources`, so a new collector cannot ship without an install type.
 The `pkg_inventory.managers` presence row is stored in `installed_software` today, so it is typed
 `package_manager` like the packages it manages; it is not exempted by name. `install_scope` is
@@ -1474,14 +1475,15 @@ is unchanged; any other answer is a status-only section (`constrained`, `timeout
 differ from the ones the server last acknowledged for that source, and not again while they stay the same
 (memory only: a restart costs one resend, which the server's upsert makes harmless), so a host with
 sources its OS cannot collect still sends the report hash alone on a quiet day. The sources run one at a
-time, in the collector's table order, and at most one detached worker is ever inside a plugin: the
-single-flight slot is per plugin, so the three `pkg_inventory` sources (and the three `runtimes` ones) share
-one (see Bounded workers).
+time, in the collector's table order, and the daily sync never starts a second detached worker inside a
+plugin (an operator dispatch of the same plugin is not held by this flag): the single-flight slot is per
+plugin, so the three `pkg_inventory` sources (and the three `runtimes` ones) share one (see Bounded
+workers).
 
 **Rows.** A `+` record is the 16 wire slots of the stored form: every field through `clamp_field` (scrub to
 UTF-8, clamp to 1,024 bytes on a codepoint boundary, then strip 0x1F, 0x1E and NUL, the one preparation
 step), a canonical epoch (`0` and rpm's `(none)` are written empty) and release (`(none)` is empty), a
-per-user `install_location` blanked, the facet as `source`, and a publisher that is never empty (the
+`install_location` kept only under a machine root, the facet as `source`, and a publisher that is never empty (the
 declared vendor, else `via:<ecosystem>`, applied by the planner to every row it plans). Rows are
 sorted and de-duplicated in the server's comparator order (the 15 stored fields in wire order, location
 before `package_id` and `source`). The section hash, the row hash (the server's `instance_key`), the
@@ -1528,8 +1530,9 @@ status or token change reaches the server although the held-facet hash did not m
 is false and the report is the hash alone.
 
 **No weekly full resend (`SyncSource::no_full_floor`).** The source is exempt from the scheduler's 7-day
-full floor (roadmap R3: no weekly forced full for v3); a force, a whole-source nack and a
-never-acknowledged hash still send the blob, full for every facet the agent holds no acknowledged set for. Divergence heals without a floor: the server recomputes each
+full floor (roadmap R3: no weekly forced full for v3); a force and a whole-source nack still send the
+blob, full for EVERY facet, and a never-acknowledged hash sends it full for every facet the agent holds
+no acknowledged set for. Divergence heals without a floor: the server recomputes each
 section's hash after every apply and refuses a delta over a base that no longer matches, answering
 `installed_software:<facet>`, which the agent resends in full, and a facet with no acknowledged hash is
 always sent in full. The report hash covers only the facets the agent holds, so a facet the server lost is
@@ -1566,8 +1569,17 @@ waits `kOrphanDrainGrace` (3 s) for the count to reach zero and otherwise logs a
 worker still executing it. A plugin that never returns therefore makes the restart a hard exit. The
 sync thread is joined on every reconnect and on shutdown, so it can wait out a source's time limit; the
 shutdown watchdog (20 s) is shorter than 120 s, so a stop that lands inside such a wait ends in that
-watchdog (exit code 4), exactly as an unbounded in-process collection did before this change, and a
-reconnect waits up to the limit.
+watchdog (exit code 4), exactly as an unbounded in-process collection did before this change. A
+reconnect joins the sync thread, and the pass runs its sources in sequence with no stop check between
+them, so a reconnect waits for the SUM of the limits of the plugins that newly stall in that pass (up to
+about 600 s when every one does: three at 120 s and four at 60 s; a plugin already `busy` costs nothing),
+with the agent disconnected meanwhile. On Windows the hard exit precedes the service's stopped report, so
+the Service Control Manager's recovery action restarts the agent after 60 s even on an operator stop
+(three restarts a day at most; systemd and launchd honour an operator stop). The single-flight flag is
+RAII: `CollectorWorkers::admit` returns a ticket that rides in the worker closure and is moved into a
+local at the worker's entry, so the flag ends when the worker returns or throws, and a closure never
+invoked (a Rejected bounded call, or an allocation failing before it) ends it when the closure is
+destroyed; no path clears it by hand.
 
 **Retired policies.** `ConstrainedPolicy`, `accept_partial` and the `withheld` status are removed.
 Every degraded answer is a status-only section: a non-zero return, a truncated capture, a
@@ -1590,19 +1602,29 @@ written as U+FFFD), which the collector reads as wire slot 13. On Windows a fail
 identity's own `HKCU` Uninstall key never degrades the machine-scope collection, and the `WOW6432Node` view is absent
 only on a 32-bit OS.
 
-**No per-user paths (ADR-0016 section 8).** The writer blanks an `install_location` under
-`/Users`, `/Documents and Settings`, `/home` or `/root` on a segment boundary, read without regard to case,
-with `\` as `/` and after an optional drive letter (`C:\Users\...`, `\Users\...`), so the server's stored location
-and the change ledger's `identity_key` copy of it name machine-scope roots only; the blanking is part of the
-stored form, so it also keeps one app installed under two accounts one row. This is the normalisation the
-mount-point redaction above uses (`mount_entry_is_personal`), with three deliberate differences: `/Volumes` is not
-a root here, a non-path is kept, and a UNC path is blanked. The same paths spelled with the
-Win32 `\\?\` or `\\.\` prefix, or on macOS under `/System/Volumes/Data`, are blanked too, and so is
-EVERY UNC path (`\\host\share\...`, `\\?\UNC\...`): the writer cannot tell a home share from an application
-share, so it fails closed and an application installed to a network share carries no location. A
-`\\?\Volume{...}` or other NT-namespace spelling that names neither a drive letter nor UNC is not recognised
-(a disclosed residual). `tests/unit/test_installed_software_v3.cpp` covers the predicate and the blanked record through both
-`v3_record` and `plan_section`.
+**No per-user paths (ADR-0016 section 8): slot 13 is an allowlist.** The writer
+(`machine_install_location`, `installed_software_v3.cpp`) canonicalises the collector's value first (quotes and
+padding trimmed; the Win32 `\\?\` and `\\.\` prefixes dropped; `\` and `/` both separators, runs collapsed;
+`.` dropped and `..` resolved, an escape past the root refused; trailing dots and spaces stripped per
+Windows segment; the macOS `/System/Volumes/Data` firmlink folded; compared without regard to case) and
+then KEEPS it, in one spelling, only when it sits under a root of the one table `kMachineRoots`: Windows
+`Program Files`, `Program Files (x86)`, `ProgramData` and `Windows` under any drive letter; macOS
+`/Applications`, `/Library`, `/System/Applications`, `/Developer`; `/opt` and `/usr` (macOS and Linux);
+Linux `/snap`, `/var/lib/flatpak`, `/nix`, `/app`. Everything else is blanked, fail closed: a home under
+any root or volume (`C:\Users`, `/home`, `E:\Profiles\alice`, `/Volumes/<label>/Users`, `/var/home`), a
+UNC path (a home share cannot be told from an application share), a drive-relative `C:Users`, an
+unexpanded `%ProgramFiles%`, an 8.3 name (`PROGRA~1`), an NT object spelling (`\??\`, `\\?\Volume{...}`,
+`GLOBALROOT`), a bare name, a control byte. A location outside the roots (`D:\Apps\Foo`, `/Volumes/Data/Apps`)
+is therefore not reported; the row's name, version, publisher and hash are, and two same-version installs
+of one product in non-allowlisted folders collapse to one row. The decision (2026-11-09) replaced a blacklist
+of home roots, which a probe showed leaking through quoting, padding, doubled separators, dot segments, 8.3
+names, NT prefixes, relocated profile roots and `/Volumes`; a blacklist on installer-authored text is
+fail-open, an allowlist is not. The blanking is part of the stored form, so it also keeps one app installed
+under two accounts one row, and a kept location is written in one spelling, so quoting or separator variants
+of one folder are one row too. The mount-point redaction above (`mount_entry_is_personal`) stays a personal-roots
+rule (it redacts, it does not select); a shared canonical form for both is a follow-up. Customer-configurable
+extra roots are a follow-up. `tests/unit/test_installed_software_v3.cpp` pins every probed spelling and the
+kept machine paths through both `v3_record` and `plan_section`.
 
 **Drivers are a daily-sync section.** This reverses the 2026-11-03 statement that
 `hardware.drivers_inventory` is not a daily-sync source. It is the eleventh and last row of the collector's
