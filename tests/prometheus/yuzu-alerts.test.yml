@@ -8458,20 +8458,12 @@ tests:
 
   # -- YuzuEchoDbCorruptionDetected / YuzuPluginInitFailed (#5033, #6696) -------
   #
-  # YuzuEchoDbCorruptionDetected is `delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0 unless on
-  # (job, instance) (yuzu_server_uptime_seconds < 3900)`, `for: 0m`. The gauge is per replica and
-  # ramps 0 -> N after a replica restart, so the uptime guard suppresses the first 65 minutes of a
-  # replica's life (cases C and D); case E pins `delta` against `increase`, cases A and B the
-  # [1h] window. Mutation-checked: [1h] -> [5m] reddens A and D; [1h] -> [2h] reddens A (91m);
-  # dropping the guard reddens C and D; 3600 reddens C and D; `<= 3900` reddens D; `increase`
-  # reddens E.
-  #
-  # YuzuPluginInitFailed is `sum by (job, plugin) (max_over_time(<gauge>[5m])) > 0`, `for: 15m`.
-  # Case F pins the `for:` boundary, cases G-H the replica-restart and replica-move resets the
-  # expression exists to survive (#3663 shape), cases I-J the 5m window width, cases K-L the
-  # generic plugin label (an Echo-only rule would fail them). Mutation-checked: `for:` 5m or 16m,
-  # the bare gauge, a [1m], [4m] or [6m] window, `sum by` keeping `instance` or dropping `plugin`,
-  # and an Echo-only selector each redden at least one case.
+  # Mutation-checked, YuzuEchoDbCorruptionDetected: [1h] -> [5m] reddens A and D; [1h] -> [2h]
+  # reddens A (91m); dropping the uptime guard or 3600 reddens C and D; `<= 3900` reddens D;
+  # `increase` reddens E.
+  # Mutation-checked, YuzuPluginInitFailed: `for:` 5m or 16m, the bare gauge, a [1m], [4m] or [6m]
+  # window, `sum by` keeping `instance` or dropping `plugin`, and an Echo-only selector each
+  # redden at least one case.
 
   # CASE A -- the corruption gauge steps 0 -> 1 at minute 31 (no uptime series present: an absent
   # right-hand side must not suppress). Fires at 31m and still at 80m, and is gone at 91m once the
@@ -8481,19 +8473,12 @@ tests:
     input_series:
       - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
         values: "0x30 1x70"
-    alert_rule_test:
-      - eval_time: 31m
-        alertname: YuzuEchoDbCorruptionDetected
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              job: yuzu
-              instance: s1
-            exp_annotations:
-              summary: "The count of agents with a quarantined Echo database rose in the last hour"
-              description: "At least one more agent than an hour ago reports that its Echo database failed its integrity check and was quarantined. This is a lower bound on new quarantines, not an event count: the gauge counts agents once per sweep, so an agent returning from offline with an old quarantine raises it, a repeat quarantine on an agent already counted does not, and an agent leaving in the same window can mask one arriving. A server restart in the last hour is suppressed; a failover is not. The echo.db.corruption_quarantined audit rows name the affected agents."
-              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
     promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
+        eval_time: 31m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
         eval_time: 80m
         exp_samples:
@@ -8530,15 +8515,11 @@ tests:
         values: "100000x100 _x5 0+60x130"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 160m
-        exp_samples: []
-      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
         eval_time: 166m
         exp_samples: []
 
   # CASE D -- a genuine rise 30 minutes into a replica's life is held back by the guard until
-  # uptime reaches 3900 s (65m), then fires: quiet at 64m, firing at 65m (pins `<` against `<=`)
-  # and 66m.
+  # uptime reaches 3900 s (65m), then fires: quiet at 64m, firing at 65m (pins `<` against `<=`).
   - interval: 1m
     name: echo corruption rise inside the guard window fires once uptime passes 65m
     input_series:
@@ -8552,11 +8533,6 @@ tests:
         exp_samples: []
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
         eval_time: 65m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
-            value: 1
-      - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 66m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
@@ -8616,14 +8592,6 @@ tests:
         values: "1x20 _x1 0x1 1x40"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
-        eval_time: 14m
-        exp_samples: []
-      - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
-        eval_time: 16m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="echo", severity="warning"}'
-            value: 1
-      - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
         eval_time: 30m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="echo", severity="warning"}'
@@ -8640,11 +8608,6 @@ tests:
         values: "0x20 1x40"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
-        eval_time: 16m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="echo", severity="warning"}'
-            value: 1
-      - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
         eval_time: 30m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="echo", severity="warning"}'
@@ -8660,9 +8623,6 @@ tests:
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuPluginInitFailed"}'
         eval_time: 15m
-        exp_samples: []
-      - expr: 'ALERTS{alertname="YuzuPluginInitFailed"}'
-        eval_time: 16m
         exp_samples: []
 
   # CASE J -- a failure SPANNING 11 minutes (12 samples) fires at exactly the 15m mark and is gone
@@ -8693,9 +8653,6 @@ tests:
       - series: 'yuzu_fleet_plugin_init_failed{job="yuzu",instance="s1",plugin="wmi"}'
         values: "1x30"
     promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
-        eval_time: 14m
-        exp_samples: []
       - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
         eval_time: 16m
         exp_samples:

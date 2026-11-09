@@ -7877,13 +7877,8 @@ groups:
       # real rise stays visible to `delta[1h]` for an hour, so the guard only loses a rise
       # inside the first ~5 minutes of a boot. If agents take longer than 5 minutes to
       # reconnect, the tail of the ramp can still leak. An absent uptime series suppresses
-      # nothing. Unlike the retired young-server grace on the audit-retention rule, a restart
-      # cadence cannot hide a dead component here: the rule is about agent state, not a reaper.
-      #
-      # Residuals the guard does not cover, both already lower-bound limits: a replica failover
-      # raises the gaining replica's series, and an agent returning from offline with an old
-      # quarantine raises it. The 1h any-rise threshold is the #5065 starting default, not sized
-      # from fleet data.
+      # nothing. The 1h any-rise threshold is the #5065 starting default, not sized from fleet
+      # data.
       - alert: YuzuEchoDbCorruptionDetected
         expr: |
           delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
@@ -7908,15 +7903,9 @@ groups:
       # returns no series and the rule stays quiet (max_over_time over an absent series is
       # absent too).
       #
-      # THE EXPRESSION. `sum by (job, plugin) (max_over_time(...[5m]))`, not the bare gauge, for
-      # the reason spelled out on YuzuDedupStoreDegraded: the gauge is per core replica and
-      # recomputed from a 90 s staleness window, and `for:` restarts whenever the series
-      # breaks, so a replica restart, an agent moving replicas (a new `instance`) or a slow
-      # heartbeat would each reset the 15 m clock (docs/observability-conventions.md, #3663).
-      # max_over_time[5m] bridges gaps shorter than the window and sum drops `instance` from
-      # the alert identity. Same effects as that rule: a failure spanning more than 10 minutes
-      # fires, 10 or fewer never does, and a failover counts one agent on two replicas for a
-      # few minutes, hence "about N". Do not widen the window: it adds to the effective `for:`.
+      #
+      # Same expression and effects as YuzuDedupStoreDegraded (#3663,
+      # docs/observability-conventions.md); do not widen the window.
       - alert: YuzuPluginInitFailed
         expr: |
           sum by (job, plugin) (max_over_time(yuzu_fleet_plugin_init_failed[5m])) > 0
