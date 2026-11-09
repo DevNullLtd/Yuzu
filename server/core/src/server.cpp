@@ -22552,12 +22552,33 @@ private:
         // store the three routes answer 503. MUST run BEFORE register_routes().
         if (dex_score_policy_provider_) {
             auto policy_writes = dex_score_policy_store_writer(*runtime_config_store_);
-            rest_api_v1_->set_dex_score_policy_writer(
-                {.read_stored = dex_score_policy_store_reader(*runtime_config_store_),
-                 .compare_and_set = std::move(policy_writes.compare_and_set),
-                 .compare_and_remove = std::move(policy_writes.compare_and_remove),
-                 .provider = dex_score_policy_provider_,
-                 .audit = {}});
+            DexScorePolicyWriteDeps policy_deps{
+                .read_stored = dex_score_policy_store_reader(*runtime_config_store_),
+                .compare_and_set = std::move(policy_writes.compare_and_set),
+                .compare_and_remove = std::move(policy_writes.compare_and_remove),
+                .provider = dex_score_policy_provider_,
+                .audit = {}};
+            // AP-3.12: the Scoring tab shares these deps; its setters read per request, so only
+            // the REST setter below must precede register_routes.
+            settings_routes_->set_dex_score_policy_writer(policy_deps);
+            rest_api_v1_->set_dex_score_policy_writer(std::move(policy_deps));
+            // The suggestions and the pre-save tier-change preview score the Apps model through
+            // the production scorer with a substituted policy. Deliberately absent where the
+            // signals store is (a runtime-config store without one is a shipped configuration):
+            // the tab then edits without suggestions and the preview answers "unavailable".
+            if (dex_api)
+                settings_routes_->set_dex_apps_fn(
+                    [dex_api, store = guaranteed_state_store_.get(),
+                     dex_fleet_fn](const std::optional<DexPolicyInForce>& p) {
+                        if (!p)
+                            return dex_api->apps("7d", kDexAppsScopeAll);
+                        return make_local_dex_api(
+                                   store, dex_fleet_fn,
+                                   [v = *p]() -> std::expected<DexPolicyInForce, std::string> {
+                                       return v;
+                                   })
+                            ->apps("7d", kDexAppsScopeAll);
+                    });
         }
         // REST and MCP name this type separately; they must stay the SAME type, or the
         // copies handed to each could silently drift behind a std::function conversion.
