@@ -3997,7 +3997,61 @@ TEST_CASE("EchoDatabase: a symlink at echo.db or a sidecar is refused (#1527)",
     }
 }
 
+// #1527. A quarantine frees the echo.db names for a moment. A link planted there before the reopen
+// is refused exactly like one found at the first check, and its target is never opened through:
+// the seam stands in for a swap the first check cannot see.
+TEST_CASE("EchoDatabase: a link planted after a quarantine is refused before the reopen (#1527)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    for (const char* suffix : {"", "-wal"}) {
+        INFO("suffix='" << suffix << "'");
+        yuzu::test::TempDir dir{"yuzu_test_echo_relink_"};
+        REQUIRE(fs::create_directories(dir.path));
+        const auto db = dir.path / "echo.db";
+        spit_file(db, "this is not a SQLite database");
+        const fs::path target = dir.path / "elsewhere.bin";
+        spit_file(target, "target bytes");
+        const fs::path link{db.string() + suffix};
+        std::error_code planted;
+        OpenSeams seams;
+        seams.after_quarantine = [&] { fs::create_symlink(target, link, planted); };
+
+        auto refused = EchoDatabase::open(db, seams);
+        if (planted)
+            SKIP("cannot create a symlink here: " << planted.message());
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find("symbolic link or reparse point") != std::string::npos);
+        CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").size() == 1); // the quarantine stood
+        CHECK(fs::is_symlink(link));                                        // not replaced
+        CHECK(slurp_file(target) == "target bytes");                        // never opened through
+    }
+}
+
 #ifndef _WIN32
+// #1527. What binds the name check to the open on POSIX: the vendored SQLite, given the flags
+// open() uses, refuses a symbolic link at the database name itself rather than following it (the
+// directory part is resolved by open() first, so a link in an ancestor such as macOS's /var is no
+// refusal). A build of SQLite without lstat/readlink support would pass the link through.
+TEST_CASE("sqlite: SQLITE_OPEN_NOFOLLOW refuses a symlink at the database name (#1527)",
+          "[echo][store][lifecycle][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_nofollow_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const fs::path resolved = fs::canonical(dir.path);
+    const fs::path target = resolved / "elsewhere.db";
+    const fs::path link = resolved / "echo.db";
+    std::error_code ec;
+    fs::create_symlink(target, link, ec);
+    if (ec)
+        SKIP("cannot create a symlink here: " << ec.message());
+
+    SqliteOwner o;
+    const int rc = sqlite3_open_v2(link.string().c_str(), &o.db,
+                                   SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                                       SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
+                                   nullptr);
+    CHECK(rc == SQLITE_CANTOPEN);
+    CHECK_FALSE(fs::exists(target)); // nothing was created through the link
+}
+
 // #6366. A non-empty -wal beside a corrupt echo.db is evidence. A second connection keeps the WAL
 // open (and un-checkpointed) across the corrupt reopen, as a concurrent reader would; the quarantine
 // must carry the WAL byte for byte and leave nothing byte-ful beside the fresh database.

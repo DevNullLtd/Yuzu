@@ -533,6 +533,9 @@ struct OpenSeams {
     /// Called inside the v10 transaction right after the retired tables are dropped; an error it
     /// returns rolls the whole migration back (the crash/rollback test's fault point).
     std::function<std::expected<void, std::string>()> v10_after_drop;
+    /// Called after a corrupt database was quarantined and before the names are checked for a
+    /// link again and reopened (the link-swap test's fault point, #1527).
+    std::function<void()> after_quarantine;
 };
 
 /// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the

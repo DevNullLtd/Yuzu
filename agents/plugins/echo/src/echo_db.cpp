@@ -64,6 +64,19 @@ namespace {
 // the call and restores it from here.
 constexpr int kBusyTimeoutMs = 5000;
 
+// #1527 — every connection to echo.db is opened with SQLITE_OPEN_NOFOLLOW (SQLite 3.31+). On
+// POSIX SQLite resolves the path itself before the open; with this flag a symbolic link anywhere
+// in it is SQLITE_CANTOPEN_SYMLINK instead of being followed (so open() hands SQLite a name whose
+// directory part is already resolved), and the open(2) of the database, -wal, -shm and -journal
+// files is O_NOFOLLOW regardless, so a link swapped in between refuse_linked_db_files and the open
+// is refused by SQLite rather than followed. The Windows VFS ignores the flag (CreateFileW follows
+// a reparse point): see the DACL block below for the window that leaves and what bounds it.
+#ifdef SQLITE_OPEN_NOFOLLOW
+constexpr int kOpenNoFollow = SQLITE_OPEN_NOFOLLOW;
+#else
+constexpr int kOpenNoFollow = 0;
+#endif
+
 using yuzu::shared::sqlite_quarantine::now_epoch_seconds;
 
 struct StmtDeleter {
@@ -239,6 +252,20 @@ struct IntegrityResult {
     int rc; ///< the sqlite rc behind a non-ok verdict (SQLITE_ROW for a non-"ok" integrity row)
 };
 
+const char* integrity_label(IntegrityCheck verdict) noexcept {
+    switch (verdict) {
+    case IntegrityCheck::ok:
+        return "ok";
+    case IntegrityCheck::busy:
+        return "busy";
+    case IntegrityCheck::corrupt:
+        return "corrupt";
+    case IntegrityCheck::unreadable:
+        return "unreadable";
+    }
+    return "unknown";
+}
+
 IntegrityResult check_integrity(sqlite3* db) noexcept {
     sqlite3_stmt* raw = nullptr;
     const int prc = sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &raw, nullptr);
@@ -268,6 +295,8 @@ int parse_schema_version(const std::string& text) {
 // local user who can plant one in the state directory would steer the agent's database writes (and
 // the quarantine's moves) at a file of their choosing. Fail closed: nothing is opened, moved or
 // secured. A path that is absent is fine (the open creates it). Returns the refusal text.
+// This is a check by name: it runs immediately before EACH sqlite3_open_v2 in open() (the first
+// open and the reopen after a quarantine), and kOpenNoFollow binds it to the open itself on POSIX.
 std::optional<std::string> refuse_linked_db_files(const std::filesystem::path& db) {
     namespace fs = std::filesystem;
     for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
@@ -433,7 +462,16 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 // through a READ_CONTROL-only handle and gets the same two tests; if it passes it keeps its
 // ACL, logged. SQLite's own GENERIC_READ includes READ_CONTROL, so a file we cannot look at
 // that way SQLite cannot open either. FILE_FLAG_OPEN_REPARSE_POINT examines a planted symlink
-// as the link, never its target. Lock-out: a later run under a different non-admin account
+// as the link, never its target. RESIDUAL (#1527): both this pass and refuse_linked_db_files
+// judge the directory ENTRY, and SQLite's Windows VFS ignores SQLITE_OPEN_NOFOLLOW (CreateFileW
+// follows a reparse point), so a link swapped into the entry between the last check and SQLite's
+// own CreateFileW is followed. SQLite opens by path, so binding the check to the handle is a VFS
+// redesign, not taken here. What bounds it: the swap needs write access to the state directory,
+// which the packaged install grants to SYSTEM, Administrators and the agent account only
+// (scripts/install-agent-user.ps1), and a file symlink needs SeCreateSymbolicLinkPrivilege or
+// Developer Mode; an account with that access can already write echo.db itself. The POSIX
+// opens are closed by SQLite's own O_NOFOLLOW (kOpenNoFollow). Lock-out: a later run under a
+// different non-admin account
 // cannot open echo.db. An account switch is not undone by `icacls /reset` (it rewrites the DACL,
 // never the owner): the open fails until the new account holds an ACE for the files (the open
 // asks FILE_READ_ATTRIBUTES, which owning a file does not grant) and, when the former owner is
@@ -837,15 +875,35 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         return std::unexpected(*refusal);
 #endif
 
+    // The name SQLite is given. kOpenNoFollow refuses a symbolic link in ANY component of it
+    // (SQLite resolves the whole path before the open), and a data directory legitimately sits
+    // behind one on macOS (/var -> /private/var). So the DIRECTORY is resolved once here and only
+    // a link at the final name (echo.db itself) trips the flag; a directory component swapped
+    // after this point is outside the model (the attacker would own the data directory's parent).
+    // The Windows VFS ignores the flag, so the path is passed as given there.
+#ifdef _WIN32
+    const std::string open_name = path.string();
+#else
+    std::error_code cec;
+    const auto resolved_dir =
+        std::filesystem::canonical(std::filesystem::absolute(path).parent_path(), cec);
+    if (cec) {
+        return std::unexpected(std::format("cannot resolve the directory of {}: {}",
+                                           path.string(), cec.message()));
+    }
+    const std::string open_name = (resolved_dir / path.filename()).string();
+#endif
+
     // Open the main connection, give it its busy timeout at once (so the integrity check below
     // waits for a holder instead of reading "locked" as corrupt, #7286) and hand it to the guard.
     // SQLite returns a handle even when the open fails; the guard closes it either way.
     DbGuard guard;
     const auto open_main = [&]() -> std::expected<void, std::string> {
         sqlite3* opened = nullptr;
-        const int orc = sqlite3_open_v2(
-            path.string().c_str(), &opened,
-            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
+        const int orc = sqlite3_open_v2(open_name.c_str(), &opened,
+                                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                                            SQLITE_OPEN_FULLMUTEX | kOpenNoFollow,
+                                        nullptr);
         guard.reset(opened);
         if (orc != SQLITE_OK)
             return std::unexpected(opened ? sqlite3_errmsg(opened) : "unknown error");
@@ -904,6 +962,12 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         spdlog::error("ECHO: echo.db failed PRAGMA integrity_check (echo.db.corruption_detected) — "
                       "quarantined to {} and re-initialising a fresh database",
                       quarantined->string());
+        if (seams.after_quarantine)
+            seams.after_quarantine(); // the link-swap test's fault point
+        // The quarantine left the names free for a moment: a link planted at one of them now
+        // would be followed by the reopen, so the #1527 refusal runs again right before it.
+        if (auto refusal = refuse_linked_db_files(path))
+            return std::unexpected(*refusal);
 #ifdef _WIN32
         // The quarantine rename left no echo.db: pre-create it (and any sidecar) protected again.
         if (auto refusal = secure_echo_db_files(path, dacl))
@@ -917,10 +981,12 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         // also catches the case where a -wal/-shm sidecar belonging to the
         // quarantined file could neither be moved nor removed and was adopted by
         // the new file. If even the fresh DB is not clean (or is busy), fail closed.
-        if (check_integrity(guard.get()).verdict != IntegrityCheck::ok) {
+        if (const auto rechecked = check_integrity(guard.get());
+            rechecked.verdict != IntegrityCheck::ok) {
             return std::unexpected(std::format(
-                "echo.db re-initialised after quarantine still fails integrity_check: {}",
-                path.string()));
+                "echo.db re-initialised after quarantine still fails integrity_check ({}, sqlite "
+                "rc {}): {}",
+                integrity_label(rechecked.verdict), rechecked.rc, path.string()));
         }
         break;
     }
@@ -1451,8 +1517,9 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // closed.
     {
         sqlite3* ro = nullptr;
-        int rrc = sqlite3_open_v2(path.string().c_str(), &ro,
-                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
+        int rrc = sqlite3_open_v2(open_name.c_str(), &ro,
+                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | kOpenNoFollow,
+                                  nullptr);
         if (rrc == SQLITE_OK) {
             sqlite3_busy_timeout(ro, kBusyTimeoutMs);
             sqlite3_db_config(ro, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, nullptr);

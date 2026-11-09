@@ -47,6 +47,11 @@
 // cannot be resolved nothing is moved, the warning above is the only effect and echo.db wins, so
 // an unreadable owner can never be turned into a move.
 //
+// Recorded limit: the owner probe and the move are two operations on a NAME, so a file swapped
+// into that name between them is moved on the earlier verdict. The swap needs rename rights over
+// files whose protected DACL withholds them from the planting account, so it reduces to an
+// account moving a file it could already move; it is accepted, not closed.
+//
 // The second shape a planted file takes is a SIDECAR with no echo.db: a planted echo.db-wal
 // beside the real tar.db-wal, which the collision refusal below would otherwise stop for good.
 // So when echo.db is absent, every echo.db sidecar whose tar.db twin also exists is probed the
