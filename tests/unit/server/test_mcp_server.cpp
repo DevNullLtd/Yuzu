@@ -47620,6 +47620,39 @@ TEST_CASE("MCP execute_instruction_definition: Execution:Execute withdrawn insid
     CHECK(idef_audited(ts, "failure"));
 }
 
+TEST_CASE("MCP execute_instruction_definition: the caller dispatched is the one re-derived after "
+          "the writes, with approval_provenance forced to None (#7110)",
+          "[mcp][integration][execute][idef][security][7110]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    // Not idef_start: it would overwrite the deriving caller_fn below.
+    ts.instr_exec_ports_for_test = rig.ports();
+    // The first derivation (the request's caller) sees agent-A and carries a Ticket stamp; the
+    // second (inside `readmit`) sees agent-B. Only a handler that derives the caller again after
+    // the writes dispatches agent-B with provenance None.
+    int derivations = 0;
+    ts.caller_fn_for_test = [&](const yuzu::server::auth::Session& s) {
+        ++derivations;
+        auto c = yuzu::test::instr_exec::make_caller(
+            s.username, true,
+            std::unordered_set<std::string>{derivations == 1 ? "agent-A" : "agent-B"});
+        c.approval_provenance = yuzu::server::ApprovalProvenance::Ticket;
+        return c;
+    };
+    ts.start("operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("error"));
+    CHECK(derivations == 2);
+    REQUIRE(rig.calls.size() == 1);
+    CHECK(rig.calls[0].exec_visible ==
+          yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-B"}});
+    CHECK(rig.calls[0].provenance == yuzu::server::ApprovalProvenance::None);
+    CHECK(rig.cancelled.empty());
+}
+
 TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-std) is -32603 "
           "with NO retry hint and a failure audit row",
           "[mcp][integration][execute][idef][audit][security]") {

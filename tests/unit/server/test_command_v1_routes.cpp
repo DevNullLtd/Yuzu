@@ -1463,8 +1463,8 @@ TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the execution-ro
         std::function<void(Rig&)> mutate; // runs INSIDE the execution-row write
         const char* detail;
         bool counted; // a chokepoint refusal also counts yuzu_server_dispatch_denied_total
-        /// Exact perm_fn calls per "Securable:Operation": the pre-row gate, then the recheck (a
-        /// refusal at the session gate returns before the route gate, so it counts the pre-row one).
+        /// Exact perm_fn calls per "Securable:Operation": the admission gate, then the recheck (a
+        /// refusal at the session gate returns before the route gate, so it counts the admission one).
         std::vector<std::pair<const char*, int>> perm_counts;
         std::function<void(Rig&)> arrange{}; // runs before the post
         json body = kRead;
@@ -1503,7 +1503,7 @@ TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the execution-ro
          // securable are one pair, each decided before and after the writes.
          "gate=dispatch dispatch_reason=approval_required", true, {{"Execution:Execute", 4}},
          [](Rig& r) {
-             r.session.role = auth::Role::admin; // admin at both pre-row resolutions
+             r.session.role = auth::Role::admin; // admin at both pre-write resolutions
              r.visible_agents = Ids{kA};
          },
          json{{"plugin", "script_exec"},

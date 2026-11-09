@@ -165,7 +165,7 @@ struct Rig {
     std::int64_t seq{0};
 
     std::optional<DispatchDenial> force_denial;
-    /// #7110 post-row recheck. By default `readmit` answers the caller the last `request()` was
+    /// #7110 post-write recheck. By default `readmit` answers the caller the last `request()` was
     /// built with (the surface re-derives the SAME principal); a test narrows that with
     /// `readmit_caller`, withdraws the permission with `readmit_withdrawn`, or leaves the port
     /// unset with `readmit_unwired`. `on_create` runs inside the execution-row write (the core's

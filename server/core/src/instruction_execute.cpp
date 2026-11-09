@@ -130,7 +130,7 @@ std::string resolve_cid(const Request& rq) {
                                      : rq.correlation_id;
 }
 
-/// The ONE dispatch-denied refusal, for both authorize runs (the pre-row dry run and the post-row
+/// The ONE dispatch-denied refusal, for both authorize runs (the pre-row dry run and the post-write
 /// re-run): counts the denial and carries the denial, plugin and action the renderers dereference
 /// unconditionally for kDispatchDenied. The audit row stays at each site (its result word
 /// differs: `denied` before the `requested` row, `failure` after it) and reads `reason` from here.

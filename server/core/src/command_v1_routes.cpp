@@ -60,7 +60,7 @@ void count_target_rejected(yuzu::MetricsRegistry* metrics, std::string_view reas
 }
 
 /// A chokepoint refusal, counted by its closed reason token. Shared by the admission dry run and
-/// the post-row repeat of it, so both report one series.
+/// the post-write repeat of it, so both report one series.
 void count_dispatch_denied(yuzu::MetricsRegistry* metrics, std::string_view reason) {
     if (metrics == nullptr)
         return;

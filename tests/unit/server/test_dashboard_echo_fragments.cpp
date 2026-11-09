@@ -1288,6 +1288,15 @@ TEST_CASE("fragment re-enable/purge: a denial on the outcome is reported as disp
          {detail::DispatchDenialReason::Forbidden, "Infrastructure",
           yuzu::server::authz::Operation::Delete},
          403, "forbidden"},
+        // The other permission-class tokens: describe_dispatch_denial maps both to kPermissionDenied.
+        {"AnonymousOperator answers 403",
+         {detail::DispatchDenialReason::AnonymousOperator, "Infrastructure",
+          yuzu::server::authz::Operation::Write},
+         403, "anonymous_operator"},
+        {"KillSwitched answers 403",
+         {detail::DispatchDenialReason::KillSwitched, "Infrastructure",
+          yuzu::server::authz::Operation::Write},
+         403, "kill_switched"},
         // 500, unlike the 400 describe_dispatch_denial gives a caller-named pair: both pairs here
         // are server literals, so an Unclassified one is a server catalogue fault.
         {"Unclassified answers 500 (server-literal pair)",

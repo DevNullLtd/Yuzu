@@ -1732,7 +1732,7 @@ TEST_CASE("execute: [pg] a dispatch that throws on the 2nd of 3 sends leaves a r
     };
     Ports ports = make_ports(b);
     ports.lookup_definition = rig_ports.lookup_definition; // InstructionStore is not under test
-    ports.readmit = rig_ports.readmit;                     // the surface's post-row recheck (#7110)
+    ports.readmit = rig_ports.readmit;                     // the surface's post-write recheck (#7110)
 
     auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB, kC})}},
                              make_caller("u", true)),
@@ -1783,7 +1783,7 @@ TEST_CASE("execute: [pg] a dispatch that throws on the 1st send leaves the row r
     };
     Ports ports = make_ports(b);
     ports.lookup_definition = rig_ports.lookup_definition;
-    ports.readmit = rig_ports.readmit; // the surface's post-row recheck (#7110)
+    ports.readmit = rig_ports.readmit; // the surface's post-write recheck (#7110)
 
     auto out = run(r.request("d", json{{"agent_ids", json::array({kA, kB})}},
                              make_caller("u", true)),

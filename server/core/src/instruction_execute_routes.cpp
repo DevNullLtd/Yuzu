@@ -249,7 +249,8 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         // an approval-gated definition must not fill the cap every other principal shares.
         rq.submitter_pending_cap = kSubmitterPendingCap;
 
-        // #7110: the post-row recheck re-decides this route's own gate and re-derives the caller.
+        // #7110: the post-write recheck (after the `requested` row and the execution row) re-decides
+        // this route's own gate and re-derives the caller.
         // `perm_fn` writes its own 403 into `res` on refusal; the refusal render below overwrites
         // it with the same status. A copy: `deps.ports` is const and shared across requests.
         Ports ports = deps.ports;

@@ -3676,6 +3676,14 @@ TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.last_live_plugin.empty()); // never dispatched
+    // The metric label is the closed set: an unresolved kind is counted as `unknown`, never as
+    // the caller's own text (one series per distinct string a caller sends).
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "unknown"}, {"outcome", "400"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "bogus"}, {"outcome", "400"}})
+              .value() == 0.0);
 }
 
 TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch",
