@@ -27,6 +27,7 @@
 #include <expected>
 #include <algorithm>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -2620,6 +2621,23 @@ TEST_CASE("route: GET /api/v1/hardware/ci never returns a device outside the cal
         CHECK(q.agent_ids->size() == 3);
     }
 
+    SECTION("the body and the audit detail of a confined caller carry no omitted count") {
+        h.audit_full.clear();
+        h.audit_details.clear();
+        auto res = h.sink.Get("/api/v1/hardware/ci");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        // the exact key set of the data object: devices, next_cursor, scope_basis
+        std::set<std::string> keys;
+        for (const auto& [k, v] : body["data"].items())
+            keys.insert(k);
+        CHECK(keys == std::set<std::string>{"devices", "next_cursor", "scope_basis"});
+        CHECK(body["data"]["scope_basis"] == "authority_scoped");
+        CHECK_FALSE(contains(res->body, "devices_omitted"));
+        REQUIRE(h.audit_details.size() == 1);
+        CHECK(h.audit_details[0] == "hardware CI records (REST): rows=2 scope=confined");
+    }
     SECTION("a named device outside the scope is an empty page, not a 404 and not its row") {
         h.audit_full.clear();
         auto res = h.sink.Get("/api/v1/hardware/ci?agent_id=out-c");
@@ -2638,6 +2656,45 @@ TEST_CASE("route: GET /api/v1/hardware/ci never returns a device outside the cal
         CHECK(nlohmann::json::parse(res->body)["data"]["devices"].empty());
         CHECK(contains(h.audit_details.back(), "scope=confined"));
     }
+}
+
+TEST_CASE("route: GET /api/v1/hardware/ci gives an unconfined caller the omitted count and no scope_basis",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h; // scope unset: TOP
+    seed_ci(h, {"a", "b"});
+    auto res = h.sink.Get("/api/v1/hardware/ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    std::set<std::string> keys;
+    for (const auto& [k, v] : body["data"].items())
+        keys.insert(k);
+    CHECK(keys == std::set<std::string>{"devices", "next_cursor", "devices_omitted"});
+    CHECK(body["data"]["devices_omitted"] == 0);
+    REQUIRE(h.audit_details.size() == 1);
+    CHECK(h.audit_details[0] == "hardware CI records (REST): rows=2 omitted=0 scope=fleet");
+}
+
+// The count is only non-zero on the wide-scope path (a scope above the push-down ceiling), so that
+// is where a leak would show: it must not reach a confined caller's body or audit row.
+TEST_CASE("route: GET /api/v1/hardware/ci hides the dropped-device count from a wide confined scope",
+          "[hardware][route][rest][ci_page]") {
+    HwHarness h;
+    seed_ci(h, {"in-a", "out-b", "out-c", "in-d"});
+    std::unordered_set<std::string> ids{"in-a", "in-d"};
+    for (int i = 0; ids.size() <= 10000; ++i)
+        ids.insert("pad-" + std::to_string(i));
+    h.scope = ids;
+    auto res = h.sink.Get("/api/v1/hardware/ci");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(ci_page_ids(body) == std::vector<std::string>{"in-a", "in-d"});
+    CHECK_FALSE(body["data"].contains("devices_omitted"));
+    CHECK(body["data"]["scope_basis"] == "authority_scoped");
+    REQUIRE(h.audit_details.size() == 1);
+    CHECK_FALSE(contains(h.audit_details[0], "omitted"));
+    CHECK_FALSE(contains(res->body, "out-"));
 }
 
 TEST_CASE("route: GET /api/v1/hardware/ci refuses a tampered or mismatched cursor with 400 and reads nothing",

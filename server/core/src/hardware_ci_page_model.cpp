@@ -282,6 +282,13 @@ nlohmann::json page_json(const Page& page) {
     };
 }
 
+void apply_scope_disclosure(nlohmann::json& body, bool confined) {
+    if (!confined)
+        return;
+    body.erase("devices_omitted");
+    body["scope_basis"] = "authority_scoped";
+}
+
 // ── Audit text ───────────────────────────────────────────────────────────────
 
 std::string audit_target_type(const Request& rq) {
@@ -293,9 +300,9 @@ std::string audit_target_id(const Request& rq) {
 }
 
 std::string audit_detail(const Page& page, const Request& rq, std::string_view surface,
-                         bool confined, bool include_omitted) {
+                         bool confined) {
     std::string out = std::format("hardware CI records ({}): rows={}", surface, page.rows.size());
-    if (include_omitted)
+    if (!confined)
         out += " omitted=" + std::to_string(page.devices_omitted);
     if (!rq.cursor.empty())
         out += " page=continuation";

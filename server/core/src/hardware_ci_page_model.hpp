@@ -126,6 +126,13 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope)
 /// `{"devices": [...], "next_cursor": "<cursor or empty>", "devices_omitted": N}`.
 [[nodiscard]] nlohmann::json page_json(const Page& page);
 
+/// The disclosure rule for a CONFINED caller (the gate's VisibleSet was a present set), applied to
+/// a `page_json` body by REST and MCP alike: `devices_omitted` is removed and `scope_basis`
+/// ("authority_scoped", a status set whether or not any device was hidden) is added, because how
+/// many devices lie outside a caller's scope is an existence oracle. An unconfined caller's body
+/// is left as it is.
+void apply_scope_disclosure(nlohmann::json& body, bool confined);
+
 // ── Audit text ───────────────────────────────────────────────────────────────
 
 /// The audit row's target: the requested device when an `agent_id` filter is set, else the fleet.
@@ -133,10 +140,10 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope)
 [[nodiscard]] std::string audit_target_id(const Request& rq);
 
 /// `hardware CI records (<surface>): rows=<n>[ omitted=<n>][ page=continuation] scope=<fleet|confined>`
-/// (the requested device, when there is one, is the row's target, not repeated here). `surface` is "REST" or "MCP". `include_omitted` is false where the
-/// caller is confined and must not learn how many devices lie outside its scope (an existence
-/// oracle); `confined` is whether the gate's VisibleSet was a present set.
+/// (the requested device, when there is one, is the row's target, not repeated here). `surface` is
+/// "REST" or "MCP". `confined` is whether the gate's VisibleSet was a present set; for a confined
+/// caller the `omitted` count is left out, as `apply_scope_disclosure` leaves it out of the body.
 [[nodiscard]] std::string audit_detail(const Page& page, const Request& rq, std::string_view surface,
-                                       bool confined, bool include_omitted);
+                                       bool confined);
 
 } // namespace yuzu::server::hardware_ci_page

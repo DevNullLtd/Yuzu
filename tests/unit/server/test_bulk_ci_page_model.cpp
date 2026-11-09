@@ -464,13 +464,39 @@ TEST_CASE("hardware ci page: page JSON shape and audit text", "[hardware_ci_page
     hcp::Request rq;
     CHECK(hcp::audit_target_type(rq) == "Inventory");
     CHECK(hcp::audit_target_id(rq) == "fleet");
-    CHECK(hcp::audit_detail(page, rq, "REST", false, true) ==
+    CHECK(hcp::audit_detail(page, rq, "REST", false) ==
           "hardware CI records (REST): rows=1 omitted=3 scope=fleet");
-    CHECK(hcp::audit_detail(page, rq, "MCP", true, false) ==
+    CHECK(hcp::audit_detail(page, rq, "MCP", true) ==
           "hardware CI records (MCP): rows=1 scope=confined");
     rq.agent_id = "dev-9";
     rq.cursor = "c";
     CHECK(hcp::audit_target_type(rq) == "Agent");
     CHECK(hcp::audit_target_id(rq) == "dev-9");
-    CHECK(hcp::audit_detail(page, rq, "REST", false, true).find("page=continuation") != std::string::npos);
+    CHECK(hcp::audit_detail(page, rq, "REST", false).find("page=continuation") != std::string::npos);
+}
+
+TEST_CASE("hardware ci page: a confined caller's body carries scope_basis and never the omitted count",
+          "[hardware_ci_page][json][security]") {
+    hcp::Page page;
+    page.rows.push_back(make_record("a"));
+    page.devices_omitted = 7;
+
+    json confined = hcp::page_json(page);
+    hcp::apply_scope_disclosure(confined, /*confined=*/true);
+    CHECK(confined.size() == 3);
+    CHECK_FALSE(confined.contains("devices_omitted"));
+    CHECK(confined["scope_basis"] == "authority_scoped");
+    CHECK(confined["devices"].size() == 1);
+    CHECK(confined["next_cursor"] == "");
+
+    json global = hcp::page_json(page);
+    hcp::apply_scope_disclosure(global, /*confined=*/false);
+    CHECK(global == hcp::page_json(page)); // untouched
+    CHECK(global["devices_omitted"] == 7);
+    CHECK_FALSE(global.contains("scope_basis"));
+
+    // and neither does the confined audit detail
+    const hcp::Request rq;
+    CHECK(hcp::audit_detail(page, rq, "REST", true).find("omitted") == std::string::npos);
+    CHECK(hcp::audit_detail(page, rq, "REST", false).find("omitted=7") != std::string::npos);
 }

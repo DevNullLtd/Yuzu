@@ -224,10 +224,11 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     // Both rows are attempted (no short-circuit) so a drop of one never hides the other. A
     // confined caller is never told how many devices lie outside its scope (an existence oracle,
     // ADR-0032 Decision 11 / ADR-0033 section 10 / ADR-0017 INV-3): neither the response nor the
-    // audit detail carries the count, and confinement is reported as a STATUS instead.
+    // audit detail carries the count, and confinement is reported as a STATUS instead (the same
+    // rule REST applies, hardware_ci_page::apply_scope_disclosure).
     const bool authority_scoped = gate.scope.has_value();
-    const std::string detail_text = hardware_ci_page::audit_detail(page, *rq, "MCP", authority_scoped,
-                                                                   /*include_omitted=*/!authority_scoped);
+    const std::string detail_text =
+        hardware_ci_page::audit_detail(page, *rq, "MCP", authority_scoped);
     const bool domain_ok = yuzu::server::detail::try_persist_audit(
         deps->audit_fn, ctx.req, "inventory.devices.ci", "success",
         hardware_ci_page::audit_target_type(*rq), hardware_ci_page::audit_target_id(*rq), detail_text);
@@ -238,10 +239,7 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     }
 
     nlohmann::json body = hardware_ci_page::page_json(page);
-    if (authority_scoped) {
-        body.erase("devices_omitted");
-        body["scope_basis"] = "authority_scoped";
-    }
+    hardware_ci_page::apply_scope_disclosure(body, authority_scoped);
     answer(ctx, success_response(ctx.id, ctx.tool_result(dump_replace(body), kRecordsOutputSchema)));
 }
 

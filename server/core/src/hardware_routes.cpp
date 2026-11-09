@@ -765,11 +765,14 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         const hardware_ci_page::Page& page = *read;
 
+        // A confined caller is never told how many devices lie outside its scope (an existence
+        // oracle): neither the audit detail nor the body carries the count, and confinement is
+        // reported as a status instead (hardware_ci_page::apply_scope_disclosure, shared with MCP).
+        const bool confined = gate.scope.has_value();
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices.ci", "success",
             hardware_ci_page::audit_target_type(rq), hardware_ci_page::audit_target_id(rq),
-            hardware_ci_page::audit_detail(page, rq, "REST", gate.scope.has_value(),
-                                           /*include_omitted=*/true));
+            hardware_ci_page::audit_detail(page, rq, "REST", confined));
         if (!persisted) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
@@ -778,8 +781,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
+        nlohmann::json data = hardware_ci_page::page_json(page);
+        hardware_ci_page::apply_scope_disclosure(data, confined);
         nlohmann::json out = {
-            {"data", hardware_ci_page::page_json(page)},
+            {"data", std::move(data)},
             {"meta", {{"api_version", "v1"}}},
         };
         // The scalar fields are agent-supplied bytes: a byte that is not valid UTF-8 must not
