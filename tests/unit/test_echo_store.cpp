@@ -3326,8 +3326,22 @@ int deny_nth_value_read(void*, int action, const char* table, const char* column
     return SQLITE_OK;
 }
 
+// Denies `PRAGMA integrity_check` (prepare fails with SQLITE_AUTH) on the FIRST connection a later
+// EchoDatabase::open() creates: the portable stand-in for an I/O, permission or space failure at
+// the integrity stage, which open() must treat as "unreadable" (refuse, move nothing; #7286).
+std::atomic<bool> g_deny_integrity_check{false};
+
+int deny_integrity_check(void*, int action, const char* a1, const char*, const char*,
+                         const char*) {
+    if (action == SQLITE_PRAGMA && a1 != nullptr && std::strcmp(a1, "integrity_check") == 0)
+        return SQLITE_DENY;
+    return SQLITE_OK;
+}
+
 int instrument_first_connection(sqlite3* db, char**, const sqlite3_api_routines*) {
-    if (g_instrument_next.exchange(false))
+    if (g_deny_integrity_check.exchange(false))
+        sqlite3_set_authorizer(db, deny_integrity_check, nullptr);
+    else if (g_instrument_next.exchange(false))
         sqlite3_set_authorizer(db, deny_nth_value_read, nullptr);
     return SQLITE_OK;
 }
@@ -3341,6 +3355,7 @@ struct AutoExtensionGuard {
         sqlite3_cancel_auto_extension(reinterpret_cast<void (*)()>(instrument_first_connection));
         g_instrument_next = false;
         g_deny_value_read = -1;
+        g_deny_integrity_check = false;
     }
     AutoExtensionGuard(const AutoExtensionGuard&) = delete;
     AutoExtensionGuard& operator=(const AutoExtensionGuard&) = delete;
@@ -3844,7 +3859,12 @@ TEST_CASE("EchoDatabase: a busy echo.db is refused and never quarantined (#7286)
         CHECK(((rc & 0xff) == SQLITE_BUSY || (rc & 0xff) == SQLITE_LOCKED));
     }
 
+    const auto started = std::chrono::steady_clock::now();
     auto refused = EchoDatabase::open(db);
+    // The refusal came AFTER the busy timeout ran out, not from an immediate BUSY: open() set the
+    // timeout on the connection before the integrity check (kBusyTimeoutMs = 5000 in echo_db.cpp).
+    // A lower bound on a wait that already happens; load can only lengthen it, never shorten it.
+    CHECK(std::chrono::steady_clock::now() - started >= std::chrono::seconds{4});
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("busy") != std::string::npos);
     CHECK(refused.error().find("not quarantined") != std::string::npos);
@@ -3885,6 +3905,35 @@ TEST_CASE("classify_integrity_rc: only CORRUPT and NOTADB quarantine, BUSY refus
         INFO("rc = " << rc << " (" << sqlite3_errstr(rc) << ")");
         CHECK(classify_integrity_rc(rc) == IntegrityCheck::unreadable);
     }
+}
+
+// #7286. open() acting on the `unreadable` verdict: the integrity check fails for a reason that is
+// neither corruption nor contention (here SQLITE_AUTH from an authorizer on open()'s first
+// connection; in the field an I/O, permission or space error), so open() refuses, moves nothing,
+// and the very same file opens on the next start. Mapping `unreadable` onto the corrupt path
+// would quarantine this healthy file and boot a fresh database with every paused source re-enabled.
+TEST_CASE("EchoDatabase: an unreadable integrity check refuses and quarantines nothing (#7286)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_unreadable_"};
+    const auto db = make_healthy_echo_db(dir.path);
+
+    {
+        const AutoExtensionGuard hook;
+        g_deny_integrity_check = true;
+        auto refused = EchoDatabase::open(db);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find("could not be checked") != std::string::npos);
+        CHECK(refused.error().find("not quarantined") != std::string::npos);
+    }
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty()); // nothing moved aside
+    CHECK(fs::exists(db));
+
+    // The next start: the same file, healthy, with its paused source intact.
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    CHECK_FALSE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->get_config("process_enabled", "true") == "false");
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
 }
 
 TEST_CASE("EchoDatabase: a genuinely corrupt echo.db is still quarantined, and its handle is closed (#7286, #6698)",
@@ -4180,6 +4229,51 @@ TEST_CASE("adopt_legacy_echo_db: two foreign files are both moved aside, one at 
     REQUIRE(db.has_value());
     CHECK(db->get_config("wal_marker", "") == "x");
 }
+
+#ifndef _WIN32
+// The heal's order and its fail-closed arm: files move one at a time, sidecars first and the main
+// file last, and the first move that fails stops everything with that file named, so an
+// interruption leaves "echo.db still planted" (re-detected next start), never a stranded sidecar.
+// A read-only directory makes the hard-link claim fail at the first attempt, so the file the error
+// names IS the first one tried: the sidecar. POSIX only (Windows ignores a directory's write bit).
+TEST_CASE("adopt_legacy_echo_db: a failed move stops the heal, sidecar first, nothing moved (#6695)",
+          "[echo][store][adopt]") {
+    if (::geteuid() == 0)
+        SKIP("root bypasses directory permissions; cannot make the claim fail");
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(echo_db, "planted main");
+    spit_file(d.path() / "echo.db-wal", "planted sidecar");
+    // Declared after `d`, so it runs first and the scratch dir can be removed.
+    struct WritableAgain {
+        fs::path dir;
+        ~WritableAgain() {
+            std::error_code ec;
+            fs::permissions(dir, fs::perms::owner_write, fs::perm_options::add, ec);
+        }
+    } writable_again{d.path()};
+    std::error_code perm_ec;
+    fs::permissions(d.path(),
+                    fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                    fs::perm_options::remove, perm_ec);
+    REQUIRE_FALSE(perm_ec);
+
+    const auto result = yuzu::agent::adopt_legacy_echo_db(
+        echo_db, probe_by_name({
+                     {"echo.db", EchoFileOwner::foreign},
+                     {"echo.db-wal", EchoFileOwner::foreign},
+                 }));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("echo.db-wal") != std::string::npos); // the sidecar went first
+    CHECK(result.error().find("resolve it by hand") != std::string::npos);
+    CHECK(slurp_file(echo_db) == "planted main");
+    CHECK(slurp_file(d.path() / "echo.db-wal") == "planted sidecar");
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK(names_with_prefix(d.path(), "echo.db.planted-").empty());
+    CHECK(names_with_prefix(d.path(), "echo.db-wal.planted-").empty());
+}
+#endif // !_WIN32
 
 // An owner-verified echo.db wins even when a sidecar beside it is foreign: adoption moves nothing
 // (open() replaces a foreign sidecar on Windows; that is its job, not adoption's).

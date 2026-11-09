@@ -51,8 +51,9 @@
 // beside the real tar.db-wal, which the collision refusal below would otherwise stop for good.
 // So when echo.db is absent, every echo.db sidecar whose tar.db twin also exists is probed the
 // same way; a foreign-owned one is moved aside alone (`echo.db-wal.planted-<epoch>[-n]`), an
-// owner-verified or unresolved one is left where it is and the refusal below stands. A lone
-// echo.db sidecar with no tar.db twin is the resume state and is never probed or moved. Adoption
+// owner-verified one is left where it is and the refusal below stands, and an unresolved one
+// cancels every move, as above. A lone echo.db sidecar with no tar.db twin is the resume state
+// and is never probed or moved. Adoption
 // proceeds only once everything in its way was moved aside: echo.db itself when present, the
 // colliding sidecars otherwise. The POSIX arm is unchanged: the state directory is root-owned
 // there, so a local user cannot plant a file in it.
