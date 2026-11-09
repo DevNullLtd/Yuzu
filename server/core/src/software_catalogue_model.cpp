@@ -39,62 +39,14 @@ using model_detail::valid_text;
 
 // ── Parameter helpers ────────────────────────────────────────────────────────
 
-// The raw route's legacy rule: a repeated key keeps the FIRST value. lower_bound is the first equal
-// element (multimap::find may return any of them).
-const std::string* first_param(const Params& p, const std::string& key) {
-    const auto it = p.lower_bound(key);
-    return it != p.end() && it->first == key ? &it->second : nullptr;
-}
-
-using Fields = std::initializer_list<const std::string*>;
-
-// The shared hygiene block of the three parsers: strict UTF-8 / no NUL over every text field, the
-// short-field bound, then the name-length bound. nullopt = clean; else the 400 message.
-std::optional<std::string> text_error(Fields text, Fields short_fields, Fields long_fields = {}) {
-    for (const std::string* f : text)
-        if (!valid_text(*f))
-            return "invalid parameter encoding";
-    for (const std::string* f : short_fields)
-        if (f->size() > kSourceMaxBytes)
-            return "parameter too long";
-    for (const std::string* f : long_fields)
-        if (f->size() > kNameMaxBytes)
-            return "parameter too long";
-    return std::nullopt;
-}
-
-// Shared by the two parsers: reads `limit` (empty == absent) into [1, max].
-std::expected<std::int64_t, std::string> read_limit(const std::string& v, std::int64_t def,
-                                                    std::int64_t max) {
-    if (v.empty())
-        return def;
-    const auto n = parse_i64(v);
-    if (!n)
-        return std::unexpected("invalid limit (expected integer)");
-    return std::clamp<std::int64_t>(*n, 1, max);
-}
+using model_detail::first_param;
+using model_detail::split;
 
 // ── base64url (RFC 4648 §5, no padding) ──────────────────────────────────────
 
 // The strict codec is shared with every other cursor in the server (list_keyset.hpp).
 using ::yuzu::server::keyset::b64url_decode;
 using ::yuzu::server::keyset::b64url_encode;
-
-// ── Fingerprints and tokens ──────────────────────────────────────────────────
-
-std::vector<std::string_view> split(std::string_view s, char d) {
-    std::vector<std::string_view> out;
-    std::size_t start = 0;
-    for (;;) {
-        const auto pos = s.find(d, start);
-        if (pos == std::string_view::npos) {
-            out.push_back(s.substr(start));
-            return out;
-        }
-        out.push_back(s.substr(start, pos - start));
-        start = pos + 1;
-    }
-}
 
 // ── JSON/CSV helpers ─────────────────────────────────────────────────────────
 
@@ -140,6 +92,31 @@ void tail(std::string& out, std::string_view key, const std::string& v) {
 }
 
 } // namespace
+
+// ── Parameter hygiene (shared with the SAM-17 list model) ────────────────────
+
+std::optional<std::string> text_error(Fields text, Fields short_fields, Fields long_fields) {
+    for (const std::string* f : text)
+        if (!valid_text(*f))
+            return "invalid parameter encoding";
+    for (const std::string* f : short_fields)
+        if (f->size() > kSourceMaxBytes)
+            return "parameter too long";
+    for (const std::string* f : long_fields)
+        if (f->size() > kNameMaxBytes)
+            return "parameter too long";
+    return std::nullopt;
+}
+
+std::expected<std::int64_t, std::string> read_limit(const std::string& v, std::int64_t def,
+                                                    std::int64_t max) {
+    if (v.empty())
+        return def;
+    const auto n = parse_i64(v);
+    if (!n)
+        return std::unexpected("invalid limit (expected integer)");
+    return std::clamp<std::int64_t>(*n, 1, max);
+}
 
 // ── Parsers ──────────────────────────────────────────────────────────────────
 

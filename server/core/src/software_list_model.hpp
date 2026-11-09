@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -148,8 +149,7 @@ struct ComponentsOps {
 };
 
 using ComponentsPage = software_catalogue::ScopedPage<SoftwareComponentRow>;
-using ComponentsReader =
-    std::function<std::optional<std::vector<SoftwareComponentRow>>(const SoftwareComponentQuery&)>;
+using ComponentsReader = software_catalogue::ScopedReader<ComponentsOps>;
 
 /// One installs page for the list route (read_scoped_page<DevicesOps> with list_fingerprint).
 [[nodiscard]] std::expected<software_catalogue::DevicesPage, std::optional<software_catalogue::CursorError>>
@@ -180,9 +180,9 @@ struct FactsReads {
 template <class Row>
 [[nodiscard]] std::vector<std::string> page_agent_ids(const std::vector<Row>& rows) {
     std::vector<std::string> out;
-    std::unordered_map<std::string, bool> seen;
+    std::unordered_set<std::string> seen;
     for (const auto& r : rows)
-        if (seen.emplace(r.agent_id, true).second)
+        if (seen.insert(r.agent_id).second)
             out.push_back(r.agent_id);
     return out;
 }
@@ -211,8 +211,7 @@ struct TotalsReads {
     std::function<std::optional<SoftwareTotals>(std::string_view, const std::vector<std::string>&)>
         version_set_totals;
     std::function<std::optional<SoftwareTotals>(std::string_view, std::string_view,
-                                                const std::optional<std::vector<std::string>>&,
-                                                bool*)>
+                                                const std::optional<std::vector<std::string>>&)>
         component_totals;
 };
 
@@ -231,9 +230,6 @@ struct TotalsOutcome {
 /// Component totals for a SERVED decision: kind + no version filter reads the (kind, name)
 /// rollup row; every other shape is a live aggregate.
 [[nodiscard]] TotalsOutcome read_component_totals(const TotalsReads& io, const SoftwareComponentQuery& q);
-
-/// `{installs|instances, devices, [devices_unconfirmed,] as_of}`.
-[[nodiscard]] nlohmann::json totals_json(const TotalsOutcome& t, bool components);
 
 // ── JSON / CSV ───────────────────────────────────────────────────────────────
 

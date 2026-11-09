@@ -300,8 +300,6 @@ struct SoftwareTotals {
 /// Freshness stamp of the components rollup (refreshed_at == 0: never computed, "building").
 struct ComponentRollupMeta {
     std::int64_t refreshed_at{0};
-    std::int64_t total_components{0}; ///< distinct (kind, name)
-    std::int64_t total_devices{0};
 };
 
 /// The row-status rule, ONE SQL fragment shared by every read and the rollup. Needs the facet
@@ -733,10 +731,10 @@ public:
     /// (kind, name) rollup row (a missing row is a genuine zero; pair with
     /// component_rollup_meta() for "building"); every other shape (a version set, or no kind:
     /// distinct devices are not additive across kinds) is ONE live aggregate over
-    /// software_components (5 s bound, name-index driven). `from_rollup` reports which path ran.
+    /// software_components (5 s bound, name-index driven).
     [[nodiscard]] std::optional<SoftwareTotals>
     component_totals(std::string_view kind, std::string_view name,
-                     const std::optional<std::vector<std::string>>& versions, bool* from_rollup);
+                     const std::optional<std::vector<std::string>>& versions);
 
     /// Name-pattern rollup over `installed_software` (see `NamePatternQuery`): per-(label,
     /// version, ecosystem) distinct-device counts, per-label and grand-total distinct-device

@@ -65,6 +65,28 @@ template <class Src>
     return &lo->second;
 }
 
+/// The raw routes' legacy rule: a repeated key keeps the FIRST value (nullptr when absent).
+/// lower_bound is the first equal element (multimap::find may return any of them).
+[[nodiscard]] inline const std::string* first_param(const Params& p, const std::string& key) {
+    const auto it = p.lower_bound(key);
+    return it != p.end() && it->first == key ? &it->second : nullptr;
+}
+
+/// `s` split on every `d` (an empty input is one empty field). The views point into `s`.
+[[nodiscard]] inline std::vector<std::string_view> split(std::string_view s, char d) {
+    std::vector<std::string_view> out;
+    std::size_t start = 0;
+    for (;;) {
+        const auto pos = s.find(d, start);
+        if (pos == std::string_view::npos) {
+            out.push_back(s.substr(start));
+            return out;
+        }
+        out.push_back(s.substr(start, pos - start));
+        start = pos + 1;
+    }
+}
+
 /// Full-consume signed decimal; nullopt on any defect (empty, sign-only, trailing bytes, range).
 [[nodiscard]] inline std::optional<std::int64_t> parse_i64(std::string_view s) {
     std::int64_t v = 0;

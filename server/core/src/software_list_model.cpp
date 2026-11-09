@@ -21,39 +21,20 @@ namespace swc = software_catalogue;
 
 namespace {
 
+using model_detail::first_param;
 using model_detail::fnv1a_hex16;
 using model_detail::is_lower_hex16;
 using model_detail::length_prefixed;
-using model_detail::parse_i64;
 using model_detail::parse_nonneg;
 using model_detail::read_length_prefixed;
+using model_detail::split;
 using model_detail::valid_text;
 using ::yuzu::server::keyset::b64url_decode;
 using ::yuzu::server::keyset::b64url_encode;
 
-// The raw routes' legacy rule: a repeated key keeps the FIRST value.
-const std::string* first_param(const Params& p, const std::string& key) {
-    const auto it = p.lower_bound(key);
-    return it != p.end() && it->first == key ? &it->second : nullptr;
-}
-
 std::string get(const Params& p, const char* k) {
     const auto* v = first_param(p, k);
     return v ? *v : std::string{};
-}
-
-std::vector<std::string_view> split(std::string_view s, char d) {
-    std::vector<std::string_view> out;
-    std::size_t start = 0;
-    for (;;) {
-        const auto pos = s.find(d, start);
-        if (pos == std::string_view::npos) {
-            out.push_back(s.substr(start));
-            return out;
-        }
-        out.push_back(s.substr(start, pos - start));
-        start = pos + 1;
-    }
 }
 
 void tail(std::string& out, std::string_view key, const std::string& v) {
@@ -168,16 +149,9 @@ std::expected<ComponentsRequest, std::string> parse_components_params(const Para
     const std::string limit = get(p, "limit");
     const std::string no_version;
     const std::string& version = r.version ? *r.version : no_version;
-    using Fields = std::initializer_list<const std::string*>;
-    for (const std::string* f : Fields{&q.kind, &q.name, &q.agent_id, &search, &version, &r.cursor})
-        if (!valid_text(*f))
-            return std::unexpected("invalid parameter encoding");
-    for (const std::string* f : Fields{&q.kind, &q.agent_id})
-        if (f->size() > swc::kSourceMaxBytes)
-            return std::unexpected("parameter too long");
-    for (const std::string* f : Fields{&q.name, &version})
-        if (f->size() > swc::kNameMaxBytes)
-            return std::unexpected("parameter too long");
+    if (auto bad = swc::text_error({&q.kind, &q.name, &q.agent_id, &search, &version, &r.cursor},
+                                   {&q.kind, &q.agent_id}, {&q.name, &version}))
+        return std::unexpected(*bad);
     q.q = sc::clamp_utf8(search, sc::kSearchMaxBytes);
     if (!r.format.empty() && r.format != "json" && r.format != "csv")
         return std::unexpected("invalid format (expected json or csv)");
@@ -190,16 +164,11 @@ std::expected<ComponentsRequest, std::string> parse_components_params(const Para
     if (r.version)
         q.versions = std::vector<std::string>{*r.version};
     const bool export_mode = !r.format.empty();
-    const std::int64_t def = export_mode ? swc::kExportCap : swc::kCatalogueDefaultLimit;
-    const std::int64_t max = export_mode ? swc::kExportCap : swc::kCataloguePageMax;
-    std::int64_t lim = def;
-    if (!limit.empty()) {
-        const auto n = parse_i64(limit);
-        if (!n)
-            return std::unexpected("invalid limit (expected integer)");
-        lim = std::clamp<std::int64_t>(*n, 1, max);
-    }
-    q.limit = static_cast<int>(lim);
+    const auto lim = swc::read_limit(limit, export_mode ? swc::kExportCap : swc::kCatalogueDefaultLimit,
+                                     export_mode ? swc::kExportCap : swc::kCataloguePageMax);
+    if (!lim)
+        return std::unexpected(lim.error());
+    q.limit = static_cast<int>(*lim);
     return r;
 }
 
@@ -406,7 +375,7 @@ TotalsOutcome read_component_totals(const TotalsReads& io, const SoftwareCompone
             out.status = TotalsStatus::kBuilding;
             return out;
         }
-        const auto t = io.component_totals(q.kind, q.name, std::nullopt, nullptr);
+        const auto t = io.component_totals(q.kind, q.name, std::nullopt);
         if (!t)
             return out;
         out.status = TotalsStatus::kServed;
@@ -414,7 +383,7 @@ TotalsOutcome read_component_totals(const TotalsReads& io, const SoftwareCompone
         out.as_of = meta->refreshed_at;
         return out;
     }
-    const auto t = io.component_totals(q.kind, q.name, q.versions, nullptr);
+    const auto t = io.component_totals(q.kind, q.name, q.versions);
     if (!t)
         return out;
     out.status = TotalsStatus::kServed;
@@ -422,18 +391,13 @@ TotalsOutcome read_component_totals(const TotalsReads& io, const SoftwareCompone
     return out;
 }
 
-nlohmann::json totals_json(const TotalsOutcome& t, bool components) {
-    nlohmann::json j = nlohmann::json::object();
+void set_totals(nlohmann::json& body, const TotalsOutcome& t, bool components) {
+    nlohmann::json& j = body["totals"] = nlohmann::json::object();
     j[components ? "instances" : "installs"] = t.totals.installs;
     j["devices"] = t.totals.devices;
     if (components)
         j["devices_unconfirmed"] = t.totals.devices_unconfirmed;
     j["as_of"] = t.as_of ? nlohmann::json(*t.as_of) : nlohmann::json(nullptr);
-    return j;
-}
-
-void set_totals(nlohmann::json& body, const TotalsOutcome& t, bool components) {
-    body["totals"] = totals_json(t, components);
 }
 
 void set_totals_omitted(nlohmann::json& body, std::string_view reason) {

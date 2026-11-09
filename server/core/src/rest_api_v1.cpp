@@ -11396,17 +11396,120 @@ void RestApiV1::register_routes(
         };
         io.component_totals = [software_inventory_store](
                                   std::string_view kind, std::string_view name,
-                                  const std::optional<std::vector<std::string>>& vs,
-                                  bool* from_rollup) {
-            return software_inventory_store->component_totals(kind, name, vs, from_rollup);
+                                  const std::optional<std::vector<std::string>>& vs) {
+            return software_inventory_store->component_totals(kind, name, vs);
         };
         return io;
+    };
+    // The per-route constants of the shared tail below.
+    struct LookupShape {
+        const char* noun;         // audit detail prefix of an export: "installs" | "components"
+        const char* csv_filename; // Content-Disposition of the CSV export
+        std::size_t csv_columns;  // width of the CSV truncation trailer
+        bool components;          // totals key: instances (true) | installs (false)
+    };
+    // The tail both lookup routes share once their page is read: the cursor-400 / degraded-503
+    // split, the per-page device facts, the totals decision + read (JSON only; a degraded read is
+    // a 503, never a null), the set-and-proceed audit (`success` on EVERY call, continuation
+    // pages tagged page=continuation — the cursor is opaque but unauthenticated, so per-call
+    // audit keeps a forged cursor from walking the fleet unrecorded; a post-filter drop is
+    // audited distinctly as `denied`), then the CSV file (continuation in X-Next-Cursor, in-band
+    // trailer on a capped page) or the JSON body with totals / totals_omitted / audit_persisted.
+    // `read` is the model's page result, `query` the parsed store query, `read_totals`,
+    // `to_csv` and `to_json` the route's model functions.
+    auto serve_lookup_page = [audit_fn, sw_503, lookup_facts_reads, lookup_totals_reads](
+                                 const httplib::Request& req, httplib::Response& res,
+                                 const std::string& cid, const char* verb,
+                                 const std::string& audit_key, const std::string& format,
+                                 bool continuation, const auto& read, bool admit_all,
+                                 const auto& query, auto&& read_totals, auto&& to_csv,
+                                 auto&& to_json, const LookupShape& shape) {
+        namespace swc = software_catalogue;
+        namespace swl = software_list;
+        const bool csv = format == "csv";
+        const bool export_mode = !format.empty();
+        if (!read) {
+            if (read.error()) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res, std::string(swc::cursor_error_message(*read.error()))),
+                    "application/json");
+                return;
+            }
+            // Store degraded (pool/query failure) — surface it, NEVER an empty list. A silent
+            // empty reads as "installed nowhere" for a fleet vuln query (ADR-0016 §7
+            // authoritative reads; agentic-first A4 failure-vs-empty). Audit the degraded access
+            // (CC7.2) through the #1647 throw-safe kernel.
+            sw_503(req, res, cid, verb, audit_key, "store degraded",
+                   "software inventory store degraded — query failed");
+            return;
+        }
+        const auto& page = *read;
+        const auto facts =
+            swl::load_device_facts(lookup_facts_reads(), swl::page_agent_ids(page.rows));
+        if (!facts) {
+            sw_503(req, res, cid, verb, audit_key, "device facts degraded",
+                   "software inventory store degraded — last-poll read failed");
+            return;
+        }
+
+        // Totals (JSON only). The admission rule is the model's; the decision is the gate's:
+        // scope == nullopt is the unfiltered (AdmitAll) case, anything engaged gets rows and NO
+        // totals (a fleet rollup cannot be confined, ADR-0017).
+        const auto decision = swl::totals_decision(admit_all, query);
+        swl::TotalsOutcome totals;
+        if (!csv && decision.serve) {
+            totals = read_totals(lookup_totals_reads(), query);
+            if (totals.status == swl::TotalsStatus::kDegraded) {
+                sw_503(req, res, cid, verb, audit_key, "totals degraded",
+                       "software inventory store degraded — totals read failed");
+                return;
+            }
+        }
+
+        bool denied_ok = true;
+        if (const auto denied = swc::denied_detail(page); !denied.empty())
+            denied_ok = detail::try_persist_audit(audit_fn, req, verb, "denied", "Inventory",
+                                                  audit_key, denied + "; cid=" + cid);
+        const std::string detail_text =
+            (export_mode ? std::string(shape.noun) + " format=" + format +
+                               " rows=" + std::to_string(page.rows.size()) +
+                               " truncated=" + (page.hit_cap ? "true" : "false")
+                         : "rows=" + std::to_string(page.rows.size())) +
+            (continuation ? " page=continuation" : "") + " cid=" + cid;
+        const bool audit_ok = detail::try_persist_audit(audit_fn, req, verb, "success",
+                                                        "Inventory", audit_key, detail_text) &&
+                              denied_ok;
+
+        if (csv) {
+            res.set_header("Content-Disposition",
+                           std::string("attachment; filename=\"") + shape.csv_filename + "\"");
+            if (page.hit_cap)
+                res.set_header("X-Result-Truncated-By-Cap", "true");
+            if (!page.next_cursor.empty())
+                res.set_header("X-Next-Cursor", page.next_cursor);
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            auto body = to_csv(page.rows, *facts);
+            if (page.hit_cap)
+                body += export_csv_truncation_row(ExportCut{.row_cap = true}, shape.csv_columns);
+            res.set_content(std::move(body), "text/csv; charset=utf-8");
+            return;
+        }
+        auto body = to_json(page.rows, *facts, page.next_cursor, page.devices_omitted, page.hit_cap);
+        if (decision.serve && totals.status == swl::TotalsStatus::kServed)
+            swl::set_totals(body, totals, shape.components);
+        else
+            swl::set_totals_omitted(body, decision.serve ? "building" : decision.omitted);
+        if (!audit_ok)
+            body["audit_persisted"] = false;
+        res.set_content(ok_json(swc::dump_safe(body)), "application/json");
     };
 
     sink.Get(
         "/api/v1/inventory/software/components",
-        [audit_fn, software_inventory_store, sw_503, sw_building, lookup_admit, lookup_facts_reads,
-         lookup_totals_reads](const httplib::Request& req, httplib::Response& res) {
+        [software_inventory_store, sw_503, sw_building, lookup_admit,
+         serve_lookup_page](const httplib::Request& req, httplib::Response& res) {
             namespace swc = software_catalogue;
             namespace swl = software_list;
             const auto cid = detail::make_correlation_id();
@@ -11423,7 +11526,6 @@ void RestApiV1::register_routes(
                 return;
             }
             auto rq = std::move(*parsed);
-            const bool csv = rq.format == "csv";
             const bool export_mode = !rq.format.empty();
             const bool continuation = !rq.cursor.empty();
             const char* const verb =
@@ -11464,81 +11566,11 @@ void RestApiV1::register_routes(
                     return software_inventory_store->query_components(q);
                 },
                 rq, gate.scope);
-            if (!read) {
-                if (read.error()) {
-                    res.status = 400;
-                    res.set_content(
-                        detail::a4_error(res,
-                                         std::string(swc::cursor_error_message(*read.error()))),
-                        "application/json");
-                    return;
-                }
-                sw_503(req, res, cid, verb, audit_key, "store degraded",
-                       "software inventory store degraded — query failed");
-                return;
-            }
-            const auto& page = *read;
-            const auto facts =
-                swl::load_device_facts(lookup_facts_reads(), swl::page_agent_ids(page.rows));
-            if (!facts) {
-                sw_503(req, res, cid, verb, audit_key, "device facts degraded",
-                       "software inventory store degraded — last-poll read failed");
-                return;
-            }
-
-            // Totals (JSON only): the admission rule is the model's, the decision is the gate's.
-            const auto decision = swl::totals_decision(!gate.scope.has_value(), rq.query);
-            swl::TotalsOutcome totals;
-            if (!csv && decision.serve) {
-                totals = swl::read_component_totals(lookup_totals_reads(), rq.query);
-                if (totals.status == swl::TotalsStatus::kDegraded) {
-                    sw_503(req, res, cid, verb, audit_key, "totals degraded",
-                           "software inventory store degraded — totals read failed");
-                    return;
-                }
-            }
-
-            // Audit posture: SET-AND-PROCEED (machine-scope inventory, not behavioural PII), on
-            // every call; continuation pages tagged page=continuation.
-            bool denied_ok = true;
-            if (const auto denied = swc::denied_detail(page); !denied.empty())
-                denied_ok = detail::try_persist_audit(audit_fn, req, verb, "denied", "Inventory",
-                                                      audit_key, denied + "; cid=" + cid);
-            const std::string detail_text =
-                (export_mode ? "components format=" + rq.format +
-                                   " rows=" + std::to_string(page.rows.size()) +
-                                   " truncated=" + (page.hit_cap ? "true" : "false")
-                             : "rows=" + std::to_string(page.rows.size())) +
-                (continuation ? " page=continuation" : "") + " cid=" + cid;
-            const bool audit_ok = detail::try_persist_audit(audit_fn, req, verb, "success",
-                                                            "Inventory", audit_key, detail_text) &&
-                                  denied_ok;
-
-            if (csv) {
-                res.set_header("Content-Disposition",
-                               "attachment; filename=\"software-components.csv\"");
-                if (page.hit_cap)
-                    res.set_header("X-Result-Truncated-By-Cap", "true");
-                if (!page.next_cursor.empty())
-                    res.set_header("X-Next-Cursor", page.next_cursor);
-                if (!audit_ok)
-                    res.set_header("Sec-Audit-Failed", "true");
-                auto body = swl::components_csv(page.rows, *facts);
-                if (page.hit_cap)
-                    body += export_csv_truncation_row(ExportCut{.row_cap = true},
-                                                      swl::kComponentsCsvColumns);
-                res.set_content(std::move(body), "text/csv; charset=utf-8");
-                return;
-            }
-            auto body = swl::components_response_json(page.rows, *facts, page.next_cursor,
-                                                      page.devices_omitted, page.hit_cap);
-            if (decision.serve && totals.status == swl::TotalsStatus::kServed)
-                swl::set_totals(body, totals, true);
-            else
-                swl::set_totals_omitted(body, decision.serve ? "building" : decision.omitted);
-            if (!audit_ok)
-                body["audit_persisted"] = false;
-            res.set_content(ok_json(swc::dump_safe(body)), "application/json");
+            serve_lookup_page(req, res, cid, verb, audit_key, rq.format, continuation, read,
+                              !gate.scope.has_value(), rq.query, &swl::read_component_totals,
+                              &swl::components_csv, &swl::components_response_json,
+                              LookupShape{"components", "software-components.csv",
+                                          swl::kComponentsCsvColumns, true});
         });
 
     sink.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
@@ -11690,12 +11722,15 @@ void RestApiV1::register_routes(
     // sink → false, not a 500 with no trail) — full parity with the MCP sibling's
     // mcp_audit (which wraps the same kernel), not just the bool-surfacing half.
     sink.Get("/api/v1/inventory/software",
-             [fleet_read_fn, audit_fn, software_inventory_store, sw_503, sw_building,
-              lookup_facts_reads,
-              lookup_totals_reads](const httplib::Request& req, httplib::Response& res) {
+             [fleet_read_fn, software_inventory_store, sw_503, sw_building,
+              serve_lookup_page](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
 
+                 // The gate block is spelled out HERE rather than through lookup_admit: this
+                 // route has an MCP twin (query_installed_software) and
+                 // scripts/ci/check-api-parity.py reads the gate call lexically from the
+                 // handler body (a handler with no recognised gate call fails closed).
                  if (!fleet_read_fn) {
                      spdlog::error("inventory.software.query: fleet_read_fn unwired — "
                                    "misconfigured call site; failing closed; cid={}",
@@ -11733,7 +11768,6 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto rq = std::move(*parsed);
-                 const bool csv = rq.base.format == "csv";
                  const bool export_mode = !rq.base.format.empty();
                  const bool continuation = !rq.base.cursor.empty();
                  const char* const verb =
@@ -11779,98 +11813,12 @@ void RestApiV1::register_routes(
                  const auto read =
                      swl::read_list_page(swc::devices_reader(*software_inventory_store), rq,
                                          gate.scope);
-                 if (!read) {
-                     if (read.error()) {
-                         res.status = 400;
-                         res.set_content(
-                             detail::a4_error(res,
-                                              std::string(swc::cursor_error_message(*read.error()))),
-                             "application/json");
-                         return;
-                     }
-                     // Store degraded (pool/query failure) — surface it, NEVER an empty list.
-                     // A silent empty reads as "installed nowhere" for a fleet vuln query
-                     // (ADR-0016 §7 authoritative reads; agentic-first A4 failure-vs-empty).
-                     // Audit the degraded access (CC7.2) through the #1647 throw-safe kernel.
-                     sw_503(req, res, cid, verb, audit_key, "store degraded",
-                            "software inventory store degraded — query failed");
-                     return;
-                 }
-                 const auto& page = *read;
-                 const auto facts =
-                     swl::load_device_facts(lookup_facts_reads(), swl::page_agent_ids(page.rows));
-                 if (!facts) {
-                     sw_503(req, res, cid, verb, audit_key, "device facts degraded",
-                            "software inventory store degraded — last-poll read failed");
-                     return;
-                 }
-
-                 // Totals (JSON only). The admission rule is the model's; the decision is the
-                 // gate's: scope == nullopt is the unfiltered (AdmitAll) case, anything engaged
-                 // gets rows and NO totals (a fleet rollup cannot be confined, ADR-0017).
-                 const auto decision =
-                     swl::totals_decision(!gate.scope.has_value(), rq.base.query);
-                 swl::TotalsOutcome totals;
-                 if (!csv && decision.serve) {
-                     totals = swl::read_application_totals(lookup_totals_reads(), rq.base.query);
-                     if (totals.status == swl::TotalsStatus::kDegraded) {
-                         sw_503(req, res, cid, verb, audit_key, "totals degraded",
-                                "software inventory store degraded — totals read failed");
-                         return;
-                     }
-                 }
-
-                 // Audit posture: SET-AND-PROCEED (see route header) — capture the persist
-                 // bool, surface audit_persisted:false, never withhold. Routed through the
-                 // #1647 throw-safe kernel `try_persist_audit` so a throwing audit sink returns
-                 // false instead of escaping as a 500 with no trail. `success` is written on
-                 // EVERY call (continuation pages tagged page=continuation): the cursor is
-                 // opaque but unauthenticated, so per-call audit keeps a forged cursor from
-                 // walking the fleet unrecorded. A post-filter drop is audited distinctly.
-                 bool denied_ok = true;
-                 if (const auto denied = swc::denied_detail(page); !denied.empty())
-                     denied_ok = detail::try_persist_audit(audit_fn, req, verb, "denied",
-                                                           "Inventory", audit_key,
-                                                           denied + "; cid=" + cid);
-                 const std::string detail_text =
-                     (export_mode ? "installs format=" + rq.base.format +
-                                        " rows=" + std::to_string(page.rows.size()) +
-                                        " truncated=" + (page.hit_cap ? "true" : "false")
-                                  : "rows=" + std::to_string(page.rows.size())) +
-                     (continuation ? " page=continuation" : "") + " cid=" + cid;
-                 const bool audit_ok =
-                     detail::try_persist_audit(audit_fn, req, verb, "success", "Inventory",
-                                               audit_key, detail_text) &&
-                     denied_ok;
-
-                 if (csv) {
-                     res.set_header("Content-Disposition",
-                                    "attachment; filename=\"software-installs.csv\"");
-                     if (page.hit_cap)
-                         res.set_header("X-Result-Truncated-By-Cap", "true");
-                     // The continuation rides in a header (the body is rectangular rows): feed it
-                     // back as `cursor` to read on. A page that may have more rows also ends with
-                     // the in-band trailer record, as the responses export does.
-                     if (!page.next_cursor.empty())
-                         res.set_header("X-Next-Cursor", page.next_cursor);
-                     if (!audit_ok)
-                         res.set_header("Sec-Audit-Failed", "true");
-                     auto body = swl::list_csv(page.rows, *facts);
-                     if (page.hit_cap)
-                         body += export_csv_truncation_row(ExportCut{.row_cap = true},
-                                                           swl::kListCsvColumns);
-                     res.set_content(std::move(body), "text/csv; charset=utf-8");
-                     return;
-                 }
-                 auto body = swl::list_response_json(page.rows, *facts, page.next_cursor,
-                                                     page.devices_omitted, page.hit_cap);
-                 if (decision.serve && totals.status == swl::TotalsStatus::kServed)
-                     swl::set_totals(body, totals, false);
-                 else
-                     swl::set_totals_omitted(body, decision.serve ? "building" : decision.omitted);
-                 if (!audit_ok)
-                     body["audit_persisted"] = false;
-                 res.set_content(ok_json(swc::dump_safe(body)), "application/json");
+                 serve_lookup_page(req, res, cid, verb, audit_key, rq.base.format, continuation,
+                                   read, !gate.scope.has_value(), rq.base.query,
+                                   &swl::read_application_totals, &swl::list_csv,
+                                   &swl::list_response_json,
+                                   LookupShape{"installs", "software-installs.csv",
+                                               swl::kListCsvColumns, false});
              });
 
     // ── Devices (#4033, #2146 API-parity Batch A) ─────────────────────────

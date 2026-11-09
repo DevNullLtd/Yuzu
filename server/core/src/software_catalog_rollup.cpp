@@ -71,72 +71,52 @@ void SoftwareCatalogRollup::run() {
         // refresh_catalog_rollup touches PG; an exception escaping a std::thread entry
         // calls std::terminate — catch, log, keep ticking.
         try {
-            const auto t0 = std::chrono::steady_clock::now();
+            // One refresh: time it, count the outcome, stamp the gauges, log. A refresh aborted
+            // by shutdown is a cancel, not a failure: counting it as outcome="error" would let a
+            // restart mid-refresh trip the rollup-failing alert. The store cannot tell stop from
+            // budget, so the worker decides: stop_ set => cancelled; a budget-exhausted or failed
+            // refresh stays outcome="error" + warn. `metric_stem` is the metric family
+            // (`yuzu_inventory_<x>_rollup`), `label` the log prefix.
+            auto run_refresh = [this](const std::string& metric_stem, const char* label,
+                                      auto&& refresh) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const bool ok = refresh([this] { return stop_.load(std::memory_order_acquire); });
+                const double secs =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                const bool cancelled = !ok && stop_.load(std::memory_order_acquire);
+                if (metrics_) {
+                    if (!cancelled)
+                        metrics_
+                            ->counter(metric_stem + "_total",
+                                      {{"outcome", ok ? "success" : "error"}})
+                            .increment();
+                    metrics_->gauge(metric_stem + "_duration_seconds").set(secs);
+                    if (ok) {
+                        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
+                        metrics_->gauge(metric_stem + "_last_success_timestamp")
+                            .set(static_cast<double>(now));
+                    }
+                }
+                if (cancelled)
+                    spdlog::info("{}: refresh cancelled by shutdown — keeping last-good", label);
+                else if (!ok)
+                    spdlog::warn("{}: refresh failed — keeping last-good rollup", label);
+            };
             YUZU_ASSERT_BACKGROUND_JOB(
                 "software_catalog_rollup.refresh_catalog_rollup"); // WS-10 ReplicaSafe
-            const bool ok = store_.refresh_catalog_rollup(
-                [this] { return stop_.load(std::memory_order_acquire); });
-            const double secs =
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            // A refresh aborted by shutdown is a cancel, not a failure: counting it as
-            // outcome="error" would let a restart mid-refresh trip the rollup-failing alert.
-            // The store cannot tell stop from budget, so the worker decides: stop_ set =>
-            // cancelled; a budget-exhausted or failed refresh stays outcome="error" + warn.
-            const bool cancelled = !ok && stop_.load(std::memory_order_acquire);
-            if (metrics_) {
-                if (!cancelled)
-                    metrics_
-                        ->counter("yuzu_inventory_catalog_rollup_total",
-                                  {{"outcome", ok ? "success" : "error"}})
-                        .increment();
-                metrics_->gauge("yuzu_inventory_catalog_rollup_duration_seconds").set(secs);
-                if (ok) {
-                    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                                         std::chrono::system_clock::now().time_since_epoch())
-                                         .count();
-                    metrics_->gauge("yuzu_inventory_catalog_rollup_last_success_timestamp")
-                        .set(static_cast<double>(now));
-                }
-            }
-            if (cancelled)
-                spdlog::info(
-                    "Software catalogue rollup: refresh cancelled by shutdown — keeping last-good");
-            else if (!ok)
-                spdlog::warn(
-                    "Software catalogue rollup: refresh failed — keeping last-good rollup");
+            run_refresh("yuzu_inventory_catalog_rollup", "Software catalogue rollup",
+                        [this](auto&& cancelled) { return store_.refresh_catalog_rollup(cancelled); });
 
             // The components rollup (same thread, same cancel flag, its own advisory lock and
             // keep-last-good), run whether or not the catalogue refresh succeeded: neither
             // result gates the other. Skipped once a stop was requested.
-            if (!stop_.load(std::memory_order_acquire)) {
-                const auto c0 = std::chrono::steady_clock::now();
-                const bool cok = store_.refresh_component_rollup(
-                    [this] { return stop_.load(std::memory_order_acquire); });
-                const double csecs =
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - c0).count();
-                const bool ccancelled = !cok && stop_.load(std::memory_order_acquire);
-                if (metrics_) {
-                    if (!ccancelled)
-                        metrics_
-                            ->counter("yuzu_inventory_component_rollup_total",
-                                      {{"outcome", cok ? "success" : "error"}})
-                            .increment();
-                    metrics_->gauge("yuzu_inventory_component_rollup_duration_seconds").set(csecs);
-                    if (cok) {
-                        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                                             std::chrono::system_clock::now().time_since_epoch())
-                                             .count();
-                        metrics_->gauge("yuzu_inventory_component_rollup_last_success_timestamp")
-                            .set(static_cast<double>(now));
-                    }
-                }
-                if (ccancelled)
-                    spdlog::info("Software components rollup: refresh cancelled by shutdown — "
-                                 "keeping last-good");
-                else if (!cok)
-                    spdlog::warn(
-                        "Software components rollup: refresh failed — keeping last-good rollup");
-            }
+            if (!stop_.load(std::memory_order_acquire))
+                run_refresh("yuzu_inventory_component_rollup", "Software components rollup",
+                            [this](auto&& cancelled) {
+                                return store_.refresh_component_rollup(cancelled);
+                            });
         } catch (const std::exception& e) {
             spdlog::error("Software catalogue rollup: tick threw ({}) — thread continuing",
                           e.what());

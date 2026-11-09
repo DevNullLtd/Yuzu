@@ -282,7 +282,7 @@ struct FakeTotals {
         io.component_meta = [this]() -> std::optional<ComponentRollupMeta> {
             if (!ok)
                 return std::nullopt;
-            return ComponentRollupMeta{refreshed_at, 0, 0};
+            return ComponentRollupMeta{refreshed_at};
         };
         io.title_totals = [this](std::string_view) -> std::optional<SoftwareTotals> {
             ++title_reads;
@@ -299,8 +299,8 @@ struct FakeTotals {
             return SoftwareTotals{7, 2, 0};
         };
         io.component_totals = [this](std::string_view, std::string_view,
-                                     const std::optional<std::vector<std::string>>& v,
-                                     bool*) -> std::optional<SoftwareTotals> {
+                                     const std::optional<std::vector<std::string>>& v)
+            -> std::optional<SoftwareTotals> {
             ++comp_reads;
             last_had_versions = v.has_value();
             if (!ok)

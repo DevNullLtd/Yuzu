@@ -761,21 +761,14 @@ curl -H "Authorization: Bearer $TOKEN" \
   `last_confirmed_at`, `install_type`, `install_scope`, `install_location` and
   `instance_key`. The MCP tool's rows keep the 14 package fields until its twin catches up.
 - **Lookup totals.** For an exact `name`, an unfiltered (global) caller also gets `totals`
-  `{installs, devices, as_of}`: `installs` counts install rows (a device with two
-  architectures counts twice), `devices` distinct devices. A management-group-confined
-  caller gets its rows and `totals: null` with `totals_omitted: "scope"`: **null means not
-  shown, never zero**. An `unconfirmed` row may be stale or missing and is never proof of
-  absence. `version_min` / `version_max` need an exact `name`; a title with 2000 or more
-  distinct versions must be queried with `version=`.
-- **Components.** `GET /api/v1/inventory/software/components` answers the same question for
-  components found inside applications (libraries and similar artefacts), with the same
-  gate, scope confinement, status and `totals` rule (`instances`, `devices`,
-  `devices_unconfirmed` in `totals`), and the audit verbs
-  `inventory.components.view` / `inventory.components.export`. Components are collected only
-  once the component producer ships, so an empty answer is expected before then. See
-  [rest-api.md](rest-api.md#get-apiv1inventorysoftwarecomponents). The components totals come
-  from an hourly rollup refreshed by the same background thread as the catalogue rollup
-  (`yuzu_inventory_component_rollup_total{outcome}`,
+  (install rows and distinct devices); a management-group-confined caller gets its rows and
+  `totals: null` with `totals_omitted: "scope"`: **null means not shown, never zero**. The
+  totals rule, the `totals_omitted` reasons and the version-range limit are in
+  [rest-api.md](rest-api.md#get-apiv1inventorysoftware).
+- **Components.** [`GET /api/v1/inventory/software/components`](rest-api.md#get-apiv1inventorysoftwarecomponents)
+  answers the same question for components found inside applications, under the same gate,
+  scope confinement, status and `totals` rule; its totals come from an hourly rollup on the
+  catalogue rollup's thread (`yuzu_inventory_component_rollup_total{outcome}`,
   `yuzu_inventory_component_rollup_duration_seconds`,
   `yuzu_inventory_component_rollup_last_success_timestamp`).
 - **Carries the same scope push-down as the MCP tool** — the SAME

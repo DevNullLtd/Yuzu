@@ -510,10 +510,8 @@ const std::vector<pg::PgMigration>& migrations() {
          "  PRIMARY KEY (kind, name, version, grain));"
          "CREATE INDEX IF NOT EXISTS component_rollup_name_idx ON component_rollup (name);"
          "CREATE TABLE IF NOT EXISTS component_rollup_meta ("
-         "  id               INT    PRIMARY KEY,"
-         "  refreshed_at     BIGINT NOT NULL DEFAULT 0,"
-         "  total_components BIGINT NOT NULL DEFAULT 0,"
-         "  total_devices    BIGINT NOT NULL DEFAULT 0);"
+         "  id           INT    PRIMARY KEY,"
+         "  refreshed_at BIGINT NOT NULL DEFAULT 0);"
          "INSERT INTO component_rollup_meta (id, refreshed_at) VALUES (1, 0) "
          "ON CONFLICT (id) DO NOTHING;"
          "CREATE INDEX IF NOT EXISTS software_components_name_idx "
@@ -1402,7 +1400,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
          "unsigned_count, ecosystems, kinds, sources, newest_version, row_count"},
         {"component_rollup",
          "kind, name, version, grain, instances, devices, devices_unconfirmed"},
-        {"component_rollup_meta", "id, refreshed_at, total_components, total_devices"},
+        {"component_rollup_meta", "id, refreshed_at"},
         {"version_rollup", "name, version, device_count"},
         {"title_triples", "name, publisher, ecosystem, device_count"},
         {"catalog_rollup_meta",
@@ -3435,14 +3433,15 @@ SoftwareInventoryStore::query_components(const SoftwareComponentQuery& q) {
         sql += " AND c.kind = $" + std::to_string(++p);
         params.push_back(q.kind);
     }
-    bool scan_shaped = add_name_predicate(sql, params, p, "c.name", q.name, q.match);
+    // Every component read runs under the 5 s bound (the table has no per-title fan-out limit),
+    // so the scan-shaped flag the predicate reports is not needed here.
+    (void)add_name_predicate(sql, params, p, "c.name", q.name, q.match);
     if (!q.q.empty()) {
         // One clamped, LIKE-escaped bind reused over name | path | anchor_app (literal substring).
         const std::string ph = "$" + std::to_string(++p);
         const std::string pat = " ILIKE '%' || " + ph + " || '%' ESCAPE '\\'";
         sql += " AND (c.name" + pat + " OR c.path" + pat + " OR c.anchor_app" + pat + ")";
         params.push_back(search_term(q.q));
-        scan_shaped = true;
     }
     if (q.versions)
         add_version_set(sql, params, p, "c.version", *q.versions);
@@ -3497,8 +3496,6 @@ SoftwareInventoryStore::query_components(const SoftwareComponentQuery& q) {
     };
 
     static SiteSamplers samplers;
-    // Every component read runs under the 5 s bound: the table has no per-title fan-out limit.
-    (void)scan_shaped;
     return bounded_query(pool_, metrics_, "query_components", samplers, sql, params, parse);
 }
 
@@ -3595,9 +3592,7 @@ SoftwareInventoryStore::installed_software_version_set_totals(
 
 std::optional<SoftwareTotals> SoftwareInventoryStore::component_totals(
     std::string_view kind, std::string_view name,
-    const std::optional<std::vector<std::string>>& versions, bool* from_rollup) {
-    if (from_rollup)
-        *from_rollup = false;
+    const std::optional<std::vector<std::string>>& versions) {
     if (!open_) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
@@ -3619,8 +3614,6 @@ std::optional<SoftwareTotals> SoftwareInventoryStore::component_totals(
     };
     static SiteSamplers samplers;
     if (!kind.empty() && !versions) {
-        if (from_rollup)
-            *from_rollup = true;
         return bounded_query(pool_, metrics_, "component_totals", samplers,
                              "SELECT instances, devices, devices_unconfirmed FROM "
                              "software_inventory_store.component_rollup "
@@ -3730,11 +3723,7 @@ bool SoftwareInventoryStore::refresh_component_rollup(const std::function<bool()
         pg::PgResult m = pg::exec_params(
             c,
             "UPDATE software_inventory_store.component_rollup_meta SET "
-            "refreshed_at = EXTRACT(EPOCH FROM now())::bigint, "
-            "total_components = (SELECT count(*) FROM software_inventory_store.component_rollup "
-            "WHERE grain = 1), "
-            "total_devices = (SELECT count(DISTINCT agent_id) FROM "
-            "software_inventory_store.software_components) "
+            "refreshed_at = EXTRACT(EPOCH FROM now())::bigint "
             "WHERE id = 1 RETURNING id",
             std::vector<std::string>{});
         if (m.status() != PGRES_TUPLES_OK)
@@ -3757,35 +3746,16 @@ std::optional<ComponentRollupMeta> SoftwareInventoryStore::component_rollup_meta
                          d.occurrence);
         return std::nullopt;
     }
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: component_rollup_meta degraded — no connection "
-                         "({}) (occurrence {})",
-                         pool_.last_error(), d.occurrence);
-        return std::nullopt;
-    }
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "SELECT refreshed_at, total_components, total_devices "
-        "FROM software_inventory_store.component_rollup_meta WHERE id = 1",
-        std::vector<std::string>{});
-    if (res.status() != PGRES_TUPLES_OK) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: component_rollup_meta degraded — query failed: "
-                         "{} (occurrence {})",
-                         PQerrorMessage(lease.get()), d.occurrence);
-        return std::nullopt;
-    }
-    ComponentRollupMeta m; // migration seeds id=1 with refreshed_at=0; default if absent.
-    if (PQntuples(res.get()) == 1) {
-        m.refreshed_at = result_i64(res, 0, 0);
-        m.total_components = result_i64(res, 0, 1);
-        m.total_devices = result_i64(res, 0, 2);
-    }
-    return m;
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "component_rollup_meta", samplers,
+                         "SELECT refreshed_at FROM software_inventory_store.component_rollup_meta "
+                         "WHERE id = 1",
+                         std::vector<std::string>{}, [](const pg::PgResult& res) {
+                             ComponentRollupMeta m; // migration seeds id=1 with refreshed_at=0
+                             if (PQntuples(res.get()) == 1)
+                                 m.refreshed_at = result_i64(res, 0, 0);
+                             return m;
+                         });
 }
 
 bool SoftwareInventoryStore::delete_agent(std::string_view agent_id) {

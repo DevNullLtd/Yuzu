@@ -6897,7 +6897,6 @@ TEST_CASE("v12: the lookup objects exist and the meta singleton is seeded buildi
     const auto meta = store.component_rollup_meta();
     REQUIRE(meta.has_value());
     CHECK(meta->refreshed_at == 0); // never computed: "building"
-    CHECK(meta->total_components == 0);
 }
 
 TEST_CASE("refresh_component_rollup: grain 0 and 1 counts are exact, devices_unconfirmed counts non-current facets",
@@ -6921,8 +6920,6 @@ TEST_CASE("refresh_component_rollup: grain 0 and 1 counts are exact, devices_unc
     const auto meta = store.component_rollup_meta();
     REQUIRE(meta.has_value());
     CHECK(meta->refreshed_at > 0);
-    CHECK(meta->total_components == 1); // (jar, libfoo)
-    CHECK(meta->total_devices == 3);
 
     const auto grain1 = sql_rows(pool,
                                  "SELECT instances, devices, devices_unconfirmed FROM "
@@ -6938,32 +6935,33 @@ TEST_CASE("refresh_component_rollup: grain 0 and 1 counts are exact, devices_unc
     CHECK(grain0[1] == std::vector<std::string>{"2.0", "1", "1", "0"});
 
     // component_totals without versions IS the grain-1 row; a version set is a live aggregate.
-    bool from_rollup = false;
-    const auto t = store.component_totals("jar", "libfoo", std::nullopt, &from_rollup);
+    // The two paths are told apart by a row that lands AFTER the refresh: the rollup answer
+    // stays put, the live one moves.
+    REQUIRE(sql_ok(pool,
+                   "INSERT INTO software_inventory_store.software_components (agent_id, kind, "
+                   "path_hash, path, name, version, row_hash, first_seen) VALUES ('dev-d', 'jar', "
+                   "'ph', '/d', 'libfoo', '1.0', 'rh', 1)"));
+    const auto t = store.component_totals("jar", "libfoo", std::nullopt);
     REQUIRE(t.has_value());
-    CHECK(from_rollup);
-    CHECK(t->installs == 5);
+    CHECK(t->installs == 5); // the rollup row, not the live table (which now holds 6)
     CHECK(t->devices == 3);
     CHECK(t->devices_unconfirmed == 2);
-    // dev-a holds BOTH versions: it counts once in the distinct-device figure.
-    const auto live = store.component_totals(
-        "jar", "libfoo", std::vector<std::string>{"1.0", "2.0"}, &from_rollup);
+    // dev-a holds BOTH versions: it counts once in the distinct-device figure; dev-d is live.
+    const auto live =
+        store.component_totals("jar", "libfoo", std::vector<std::string>{"1.0", "2.0"});
     REQUIRE(live.has_value());
-    CHECK_FALSE(from_rollup);
-    CHECK(live->installs == 5);
-    CHECK(live->devices == 3);
-    const auto only_two = store.component_totals("jar", "libfoo", std::vector<std::string>{"2.0"},
-                                                 &from_rollup);
+    CHECK(live->installs == 6);
+    CHECK(live->devices == 4);
+    const auto only_two = store.component_totals("jar", "libfoo", std::vector<std::string>{"2.0"});
     REQUIRE(only_two.has_value());
     CHECK(only_two->installs == 1);
     CHECK(only_two->devices == 1);
     // No kind: live across kinds (distinct devices are not additive), still exact.
-    const auto any_kind = store.component_totals("", "libfoo", std::nullopt, &from_rollup);
+    const auto any_kind = store.component_totals("", "libfoo", std::nullopt);
     REQUIRE(any_kind.has_value());
-    CHECK_FALSE(from_rollup);
-    CHECK(any_kind->devices == 3);
+    CHECK(any_kind->devices == 4);
     // An unknown component is a genuine zero, not a degrade.
-    const auto none = store.component_totals("jar", "nothing", std::nullopt, &from_rollup);
+    const auto none = store.component_totals("jar", "nothing", std::nullopt);
     REQUIRE(none.has_value());
     CHECK(none->installs == 0);
 }
@@ -6982,12 +6980,12 @@ TEST_CASE("refresh_component_rollup: a cancelled refresh keeps the last-good rol
     const auto after = store.component_rollup_meta();
     REQUIRE(after.has_value());
     CHECK(after->refreshed_at == good->refreshed_at);
-    CHECK(after->total_components == 1);
     CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup WHERE "
                          "grain = 1")[0][0] == "1");
     // An idempotent re-run picks the new data up.
     REQUIRE(store.refresh_component_rollup());
-    CHECK(store.component_rollup_meta()->total_components == 2);
+    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup WHERE "
+                         "grain = 1")[0][0] == "2");
 }
 
 TEST_CASE("query_components: keyset order, scope push-down, prefix and contains escape LIKE metacharacters",

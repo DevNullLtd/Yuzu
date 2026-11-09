@@ -61,6 +61,19 @@ inline constexpr std::string_view kTitlesCsvHeader =
 // ── Parameters ───────────────────────────────────────────────────────────────
 
 using Params = std::multimap<std::string, std::string>;
+using Fields = std::initializer_list<const std::string*>;
+
+/// The shared hygiene block of the parsers (catalogue, versions, devices and the SAM-17 list
+/// model): strict UTF-8 / no NUL over every text field, then the short-field bound
+/// (kSourceMaxBytes), then the name-length bound (kNameMaxBytes). nullopt = clean; else the 400
+/// message.
+[[nodiscard]] std::optional<std::string> text_error(Fields text, Fields short_fields,
+                                                    Fields long_fields = {});
+
+/// Reads `limit` (empty == absent -> `def`) into [1, max]; the 400 message on a non-integer.
+[[nodiscard]] std::expected<std::int64_t, std::string> read_limit(const std::string& v,
+                                                                  std::int64_t def,
+                                                                  std::int64_t max);
 
 struct CatalogueRequest {
     SoftwareCatalogQuery query;
