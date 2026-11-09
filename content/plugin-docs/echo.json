@@ -2842,6 +2842,7 @@
       "changelog.d/2026-11-02-echo-fold-substrate.added.md",
       "changelog.d/2026-11-02-echo-fold-substrate.changed.md",
       "changelog.d/2026-11-02-echo-offline-hive-baselines.added.md",
+      "changelog.d/6386-echo-tests-windows-honesty.fixed.md",
       "changelog.d/7037-echo-rollup-only-v10.changed.md",
       "changelog.d/7318-echo-rollup-only-server.changed.md"
     ],
@@ -2954,6 +2955,7 @@
       "tests/unit/test_echo_proc_es.cpp",
       "tests/unit/test_echo_proc_etw.cpp",
       "tests/unit/test_echo_proc_perf.cpp",
+      "tests/unit/test_echo_registry_bam_live.cpp",
       "tests/unit/test_echo_registry_source.cpp",
       "tests/unit/test_echo_removable.cpp",
       "tests/unit/test_echo_retention_tiers_table.cpp",
