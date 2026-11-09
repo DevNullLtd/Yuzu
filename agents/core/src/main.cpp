@@ -518,6 +518,13 @@ int main(int argc, char* argv[]) {
         ->default_val(21600)
         ->envname("YUZU_UPDATE_CHECK_INTERVAL");
 
+    app.add_option("--runtime-endpoint", cfg.runtime_endpoint,
+                   "Absolute path of ONE operator-provided read-only unix socket in front of a "
+                   "container runtime (virtualization.runtime_posture, Linux). Default empty: the "
+                   "plugin never opens a socket. Never the runtime's own default socket; the "
+                   "plugin refuses those and reports why.")
+        ->envname("YUZU_AGENT_RUNTIME_ENDPOINT");
+
     app.add_flag("--dex-disable", cfg.dex_disable,
                  "Disable the Guardian DEX crash recorder (collect no process-crash "
                  "telemetry). Deploy-time opt-out; not a server-side runtime toggle.")

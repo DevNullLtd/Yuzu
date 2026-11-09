@@ -146,14 +146,26 @@ int supported_leg(yuzu::CommandContext& ctx) {
     return 0;
 }
 
-template <yuzu::virtualization::LegFn Leg, yuzu::virtualization::LegFn WslLeg = Leg>
+template <yuzu::virtualization::LegFn Leg, yuzu::virtualization::LegFn WslLeg = Leg,
+          yuzu::virtualization::LegFn RuntimeLeg = Leg>
 int seam_execute(YuzuCommandContext* raw, const char* action, const YuzuParam* /*params*/,
                  std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
-    return yuzu::virtualization::execute_action(ctx, action,
-                                                yuzu::virtualization::Legs{Leg, WslLeg},
-                                                "linux:leg:exception");
+    return yuzu::virtualization::execute_action(
+        ctx, action, yuzu::virtualization::Legs{Leg, WslLeg, RuntimeLeg}, "linux:leg:exception");
 }
+
+/// A leg that reports a status row named for the action it serves, so a routing test can tell
+/// which leg ran.
+template <const char* Name>
+int named_leg(yuzu::CommandContext& ctx) {
+    yuzu::virtualization::report(
+        ctx, Name, yuzu::virtualization::Posture{yuzu::virtualization::StatusState::supported, "", {}});
+    return 0;
+}
+constexpr char kHostName[] = "host";
+constexpr char kWslName[] = "wsl";
+constexpr char kRuntimeName[] = "runtime_posture";
 
 std::size_t field_count(const std::string& row) {
     std::size_t n = 1;
@@ -371,7 +383,7 @@ TEST_CASE("virtualization plugin: wsl answers per OS (one unsupported row off Wi
 #endif
 }
 
-TEST_CASE("virtualization descriptor advertises wsl and version 1.1.0",
+TEST_CASE("virtualization descriptor advertises host, wsl and runtime_posture at version 1.2.0",
           "[virtualization][dispatcher][wsl]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -379,16 +391,16 @@ TEST_CASE("virtualization descriptor advertises wsl and version 1.1.0",
         return;
     }
     const YuzuPluginDescriptor& d = *plugin->descriptor;
-    CHECK(std::string{d.version} == "1.1.0");
+    CHECK(std::string{d.version} == "1.2.0");
 
     REQUIRE(d.actions != nullptr);
     std::vector<std::string> actions;
     for (const char* const* a = d.actions; *a != nullptr; ++a)
         actions.emplace_back(*a);
-    CHECK(actions == std::vector<std::string>{"host", "wsl"});
+    CHECK(actions == std::vector<std::string>{"host", "wsl", "runtime_posture"});
 
     REQUIRE(d.action_descriptors != nullptr);
-    REQUIRE(d.action_descriptor_count == 2);
+    REQUIRE(d.action_descriptor_count == 3);
     const YuzuActionDescriptor* wsl = nullptr;
     for (std::size_t i = 0; i < d.action_descriptor_count; ++i)
         if (std::string{d.action_descriptors[i].action} == "wsl")
@@ -401,6 +413,19 @@ TEST_CASE("virtualization descriptor advertises wsl and version 1.1.0",
     CHECK(wsl->macos_leg.rung == 0);
     CHECK(wsl->windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
     CHECK(wsl->windows_leg.rung == 1);
+
+    // runtime_posture is Linux-only: supported at rung 1 there, unsupported at rung 0 elsewhere.
+    const YuzuActionDescriptor* rt = nullptr;
+    for (std::size_t i = 0; i < d.action_descriptor_count; ++i)
+        if (std::string{d.action_descriptors[i].action} == "runtime_posture")
+            rt = &d.action_descriptors[i];
+    REQUIRE(rt != nullptr);
+    CHECK(rt->linux_leg.support == YUZU_SUPPORT_SUPPORTED);
+    CHECK(rt->linux_leg.rung == 1);
+    CHECK(rt->macos_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+    CHECK(rt->macos_leg.rung == 0);
+    CHECK(rt->windows_leg.support == YUZU_SUPPORT_UNSUPPORTED);
+    CHECK(rt->windows_leg.rung == 0);
 }
 
 TEST_CASE("virtualization execute seam: a throwing wsl leg is contained under its own action name",
@@ -417,6 +442,104 @@ TEST_CASE("virtualization execute seam: a throwing wsl leg is contained under it
     CHECK(w.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
 
     // The host leg of the same table is untouched and keeps its own status name.
+    const auto h = dispatcher.run(&d, "host");
+    const auto hrows = captured_rows(h.captured);
+    REQUIRE(hrows.size() == 1);
+    CHECK(hrows[0] == "status|host|supported|-");
+}
+
+// ---------------------------------------------------------------------------------------------
+// runtime_posture
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("virtualization plugin: runtime_posture without an endpoint reports detection only, "
+          "unsupported off Linux",
+          "[virtualization][dispatcher][runtime]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    // The real init() with a config that lacks agent.runtime_endpoint: the plugin never opens a socket.
+    yuzu::agent::StandalonePluginContext ctx("virtualization", {});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor, "runtime_posture");
+    CHECK(result.rc == 0); // a degraded read is never a failed command
+    CHECK_FALSE(result.truncated);
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+#if defined(__linux__)
+    INFO("status row: " << rows[0]);
+    REQUIRE(starts_with(rows[0], "status|runtime_posture|"));
+    const bool supported = starts_with(rows[0], "status|runtime_posture|supported|");
+    const bool constrained = starts_with(rows[0], "status|runtime_posture|constrained|");
+    CHECK((supported || constrained)); // never unsupported on a Linux host
+    REQUIRE(rows.size() >= 5);
+    CHECK(rows[1] == "endpoint|unset|-|-");
+    CHECK(starts_with(rows[2], "runtime|docker|"));
+    CHECK(starts_with(rows[3], "runtime|podman|"));
+    CHECK(starts_with(rows[4], "runtime|containerd|"));
+    for (const auto& r : rows) {
+        CHECK_FALSE(starts_with(r, "container|")); // no endpoint, so no container is ever listed
+        CHECK(field_count(r) <= 8);
+    }
+    for (std::size_t i = 2; i <= 4; ++i) {
+        CHECK(field_count(rows[i]) == 7);
+        CHECK(one_of(field(rows[i], 2), {"not_detected", "detected"})); // never `served`
+    }
+#else
+    REQUIRE(rows.size() == 1);
+#if defined(__APPLE__)
+    CHECK(rows[0] == "status|runtime_posture|unsupported|macos:virtualization:runtime_posture:unsupported");
+#else
+    CHECK(rows[0] == "status|runtime_posture|unsupported|windows:virtualization:runtime_posture:unsupported");
+#endif
+    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN);
+#endif
+    plugin->descriptor->shutdown(ctx.get());
+}
+
+TEST_CASE("virtualization execute seam: every action routes to its own leg and an unknown one is "
+          "still refused",
+          "[virtualization][dispatcher][seam][runtime]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor d{};
+    d.execute = &seam_execute<&named_leg<kHostName>, &named_leg<kWslName>, &named_leg<kRuntimeName>>;
+
+    for (const char* action : {"host", "wsl", "runtime_posture"}) {
+        const auto r = dispatcher.run(&d, action);
+        INFO(action);
+        CHECK(r.rc == 0);
+        const auto rows = captured_rows(r.captured);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == std::string{"status|"} + action + "|supported|-");
+        CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
+    }
+    const auto unknown = dispatcher.run(&d, "runtime_posture2");
+    CHECK(unknown.rc == 1);
+    const auto urows = captured_rows(unknown.captured);
+    REQUIRE(urows.size() == 1);
+    CHECK(urows[0] == "unknown action: runtime_posture2");
+}
+
+TEST_CASE("virtualization execute seam: a throwing runtime_posture leg is contained under its own name",
+          "[virtualization][dispatcher][seam][runtime]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor d{};
+    d.execute = &seam_execute<&supported_leg, &supported_leg, &throwing_leg>;
+
+    const auto r = dispatcher.run(&d, "runtime_posture");
+    CHECK(r.rc == 0); // contained, never unwound across the ABI
+    const auto rows = captured_rows(r.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "status|runtime_posture|unsupported|linux:leg:exception"); // no body text
+    CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(r.result_provenance == "linux:leg:exception");
+
+    // the other legs of the same table keep their own status names
     const auto h = dispatcher.run(&d, "host");
     const auto hrows = captured_rows(h.captured);
     REQUIRE(hrows.size() == 1);

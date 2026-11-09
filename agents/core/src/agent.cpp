@@ -835,6 +835,7 @@ public:
             std::to_string(cfg_.heartbeat_interval.count());
         plugin_ctx_.config["agent.plugin_dir"] = cfg_.plugin_dir.string();
         plugin_ctx_.config["agent.data_dir"] = cfg_.data_dir.string();
+        plugin_ctx_.config["agent.runtime_endpoint"] = cfg_.runtime_endpoint;
         plugin_ctx_.config["agent.log_level"] = cfg_.log_level;
         plugin_ctx_.config["agent.debug_mode"] = cfg_.debug_mode ? "true" : "false";
         plugin_ctx_.config["agent.verbose_logging"] = cfg_.verbose_logging ? "true" : "false";

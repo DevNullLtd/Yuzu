@@ -23,6 +23,9 @@ DEFINITION = REPO_ROOT / "content" / "definitions" / "virtualization.yaml"
 EXPECTED_COLUMNS = ["row_kind", "field_1", "field_2", "field_3", "field_4", "field_5", "field_6"]
 ROW_KINDS = ["status", "host", "container"]
 WSL_ROW_KINDS = ["status", "summary", "profile", "distribution"]
+# runtime_posture: the container row is the widest (eight fields after the discriminator).
+RUNTIME_COLUMNS = ["row_kind"] + [f"field_{i}" for i in range(1, 9)]
+RUNTIME_ROW_KINDS = ["status", "endpoint", "runtime", "config", "container"]
 
 
 def _documents() -> list:
@@ -36,9 +39,9 @@ def _definitions() -> dict:
 class VirtualizationDefinitionColumns(unittest.TestCase):
     def test_one_definition_per_action(self):
         # Counted before keying by action, which would collapse a duplicate document.
-        self.assertEqual(len(_documents()), 2)
+        self.assertEqual(len(_documents()), 3)
         defs = _definitions()
-        self.assertEqual(sorted(defs), ["host", "wsl"])
+        self.assertEqual(sorted(defs), ["host", "runtime_posture", "wsl"])
         d = defs["host"]
         self.assertEqual(d["spec"]["execution"]["plugin"], "virtualization")
         self.assertEqual(d["metadata"]["id"], "crossplatform.virtualization.host")
@@ -57,6 +60,18 @@ class VirtualizationDefinitionColumns(unittest.TestCase):
         cols = d["spec"]["result"]["columns"]
         self.assertEqual([c["name"] for c in cols], EXPECTED_COLUMNS)
         self.assertEqual(cols[0]["values"], WSL_ROW_KINDS)
+
+    def test_runtime_posture_definition_is_linux_only_and_pinned(self):
+        d = _definitions()["runtime_posture"]
+        self.assertEqual(d["metadata"]["id"], "linux.virtualization.runtime_posture")
+        self.assertEqual(d["spec"]["execution"]["plugin"], "virtualization")
+        self.assertEqual(d["spec"]["platforms"], ["linux"])
+        self.assertEqual(d["spec"]["approval"]["mode"], "auto")
+        self.assertEqual(d["spec"]["gather"]["ttlSeconds"], 3600)
+        self.assertEqual(d["spec"]["compatibility"]["requiredPlugins"], ["virtualization"])
+        cols = d["spec"]["result"]["columns"]
+        self.assertEqual([c["name"] for c in cols], RUNTIME_COLUMNS)
+        self.assertEqual(cols[0]["values"], RUNTIME_ROW_KINDS)
 
     def test_row_kind_leads_and_the_columns_match_the_wire_rows(self):
         names = [c["name"] for c in _definitions()["host"]["spec"]["result"]["columns"]]

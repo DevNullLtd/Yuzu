@@ -193,6 +193,12 @@ int run_windows_wsl(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+int run_windows_runtime_posture(yuzu::CommandContext& ctx) {
+    report_unavailable(ctx, "runtime_posture",
+                       "windows:virtualization:runtime_posture:unsupported");
+    return 0;
+}
+
 } // namespace yuzu::virtualization
 
 #endif // defined(_WIN32)

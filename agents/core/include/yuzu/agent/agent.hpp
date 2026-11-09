@@ -73,6 +73,13 @@ struct Config {
     std::chrono::seconds update_check_interval{6 * 3600}; // --update-check-interval
 
 
+    // Container-runtime posture (virtualization.runtime_posture, Linux only): the ONE
+    // operator-provided read-only unix-socket endpoint the plugin may connect to.
+    // --runtime-endpoint / YUZU_AGENT_RUNTIME_ENDPOINT. EMPTY (default) = the plugin never opens a
+    // socket. Not validated here (CLI11 silently drops a rejected env value): the plugin's
+    // parse_endpoint decides and reports a typed endpoint_refused row.
+    std::string runtime_endpoint;
+
     // Guardian DEX (Digital Experience) — fleet-wide crash recorder (slice 1)
     bool dex_disable{false}; // --dex-disable / YUZU_AGENT_DEX_DISABLE: deploy-time opt-out;
                              // when set, the crash recorder never arms and no crash
