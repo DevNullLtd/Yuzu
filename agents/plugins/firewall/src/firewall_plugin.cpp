@@ -7,9 +7,9 @@
  *   "quarantine", "release", "quarantine_status", "quarantine_allow" —
  *       device containment (PRQ.1): a Windows Firewall rule group + per-profile
  *       default-block, an own nftables table (iptables fallback) on Linux, a pf
- *       anchor on macOS (design note first; the leg follows its review). All
- *       decisions live in firewall_quarantine_parsers.hpp; the shell at the end
- *       of this file only wires the OS mechanisms to it.
+ *       sub-anchor with an enable token on macOS (docs/quarantine-macos-pf-
+ *       anchor-design.md). All decisions live in firewall_quarantine_parsers.hpp;
+ *       the shell at the end of this file only wires the OS mechanisms to it.
  *
  * Output is pipe-delimited via write_output().
  *
@@ -82,6 +82,19 @@
 
 #if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
 #include <systemd/sd-bus.h>
+#endif
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
+#endif
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/time.h>
 #endif
 
 #if defined(__linux__)
@@ -1615,8 +1628,8 @@ private:
 /// merged: the core reads "No such file or directory" from it to treat an
 /// already-absent table as a clean release, and quotes a first line of it in
 /// failure notes. The one spawn site of the containment legs: sink-manifest
-/// IDs firewall/do_quarantine_linux#1..#8 (docs/agent-spawn-sink-manifest.md),
-/// macOS #1..#8 reserved for the leg that follows the design review.
+/// IDs firewall/do_quarantine_linux#1..#8 and firewall/do_quarantine_macos#1..#10
+/// (docs/agent-spawn-sink-manifest.md).
 [[maybe_unused]] fq::Runner sudo_runner() {
     return [](const fq::Argv& argv, std::chrono::milliseconds budget) {
         auto res = run_bounded_subprocess(
@@ -1632,12 +1645,37 @@ private:
     };
 }
 
-/// Writes a ruleset into a secure temporary file that is removed when the
-/// returned handle drops (after the privileged load has finished with it).
-[[maybe_unused]] fq::Stage temp_file_stage() {
-    return [](std::string_view stem, std::string_view suffix,
-              std::string_view contents) -> std::optional<fq::StagedFile> {
-        auto tmp = yuzu::TempFile::create(stem, suffix);
+/// The agent-private directory a ruleset is staged in: `<agent.data_dir>/
+/// firewall-staging`, mode 0700 and owned by the agent. The privileged `nft -f` /
+/// `pfctl -f` reads the file after it is written, so a world-writable temp dir
+/// would let another local user swap the content in between. An existing
+/// directory is trusted only when it is a real directory (not a link) owned by
+/// us with no group/other access. Empty when `agent.data_dir` is unset or the
+/// directory cannot be made safe: the apply is then refused, never staged in /tmp.
+[[maybe_unused]] std::string private_staging_dir(YuzuPluginContext* raw) {
+    const auto data_dir = config_value(raw, "agent.data_dir");
+    if (data_dir.empty())
+        return {};
+    const std::string dir = data_dir + "/firewall-staging";
+    if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST)
+        return {};
+    struct stat st{};
+    if (::lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ::geteuid() ||
+        (st.st_mode & 077) != 0)
+        return {};
+    return dir;
+}
+
+/// Writes a ruleset into a secure temporary file (mkstemps: O_CREAT|O_EXCL, 0600)
+/// in the private staging directory; it is removed when the returned handle drops,
+/// after the privileged load has finished with it.
+[[maybe_unused]] fq::Stage temp_file_stage(YuzuPluginContext* raw) {
+    return [raw](std::string_view stem, std::string_view suffix,
+                 std::string_view contents) -> std::optional<fq::StagedFile> {
+        const auto dir = private_staging_dir(raw);
+        if (dir.empty())
+            return std::nullopt;
+        auto tmp = yuzu::TempFile::create(stem, suffix, dir);
         if (!tmp)
             return std::nullopt;
         {
@@ -1720,7 +1758,7 @@ private:
 /// The Linux leg for `hint` (the backend recorded in the state, so release and
 /// update use what applied), or the best available one for a fresh quarantine:
 /// nft when `/usr/sbin/nft` exists, else iptables. nullptr: no tool at all.
-[[nodiscard]] std::unique_ptr<fq::Leg> make_leg(YuzuPluginContext*, fq::BackendKind hint,
+[[nodiscard]] std::unique_ptr<fq::Leg> make_leg(YuzuPluginContext* raw, fq::BackendKind hint,
                                                 bool for_apply) {
     const bool has_nft = ::access("/usr/sbin/nft", X_OK) == 0;
     const bool has_ipt = ::access("/usr/sbin/iptables", X_OK) == 0;
@@ -1729,7 +1767,7 @@ private:
         use = has_nft ? fq::BackendKind::nft
                       : (has_ipt ? fq::BackendKind::iptables : fq::BackendKind::none);
     if (use == fq::BackendKind::nft)
-        return std::make_unique<fq::NftLeg>(sudo_runner(), temp_file_stage(),
+        return std::make_unique<fq::NftLeg>(sudo_runner(), temp_file_stage(raw),
                                             read_quarantine_table_netlink);
     if (use == fq::BackendKind::iptables) {
         // Apply covers v6 only where a stack exists; release and status cover
@@ -2269,22 +2307,32 @@ private:
 
 #endif // _WIN32
 
-/// False on macOS until the pf-anchor leg lands (after the design note's review).
+// ── macOS leg (rung 2, sudo pfctl over the pf sub-anchor) ───────────────────
 #if defined(__APPLE__)
-constexpr bool kContainmentBuilt = false;
-#else
-constexpr bool kContainmentBuilt = true;
-#endif
 
-#if defined(__APPLE__)
-// macOS: the pf-anchor leg is NOT built yet. docs/quarantine-macos-pf-anchor-design.md
-// is reviewed first; until then the four actions answer one typed
-// unsupported/planned row (the descriptor says PLANNED) and touch nothing.
-[[nodiscard]] std::unique_ptr<fq::Leg> make_leg(YuzuPluginContext*, fq::BackendKind, bool) {
-    return nullptr;
+/// The current boot's identity, `kern.boottime` as "<sec>.<usec>", read in-process
+/// (no spawn, so no sudoers line or PATH to trust). pf's enable references reset
+/// at reboot, so a token is only meaningful for the boot that issued it.
+[[nodiscard]] std::optional<std::string> kern_boot_time() {
+    struct timeval tv{};
+    size_t len = sizeof(tv);
+    if (::sysctlbyname("kern.boottime", &tv, &len, nullptr, 0) != 0 || len != sizeof(tv) ||
+        tv.tv_sec <= 0)
+        return std::nullopt;
+    return std::format("{}.{}", static_cast<long long>(tv.tv_sec), static_cast<long long>(tv.tv_usec));
 }
-[[nodiscard]] std::vector<std::string> host_resolvers() { return {}; }
-#endif
+
+/// macOS has one backend (pf), so the hint and for_apply carry nothing: release
+/// and status use the same leg that applied.
+[[nodiscard]] std::unique_ptr<fq::Leg> make_leg(YuzuPluginContext* raw, fq::BackendKind, bool) {
+    return std::make_unique<fq::PfLeg>(sudo_runner(), temp_file_stage(raw), kern_boot_time);
+}
+
+/// /etc/resolv.conf on macOS is configd's own list of the primary resolvers
+/// (scoped per-interface resolvers in `scutil --dns` are not read).
+[[nodiscard]] std::vector<std::string> host_resolvers() { return posix_resolvers(); }
+
+#endif // __APPLE__
 
 // ── Action handlers (all OSes) ──────────────────────────────────────────────
 
@@ -2376,6 +2424,13 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
     Rig rig(raw, /*for_apply=*/true);
     if (!rig.leg)
         return emit_refusal(ctx, "unsupported_platform");
+#ifndef _WIN32
+    // The nft and pf legs hand a staged file to a privileged tool: no private
+    // directory to stage it in, no apply (and nothing has been touched yet).
+    if ((rig.leg->kind() == fq::BackendKind::nft || rig.leg->kind() == fq::BackendKind::pf) &&
+        private_staging_dir(raw).empty())
+        return emit_refusal(ctx, "staging_unavailable");
+#endif
 
     // Read ONCE at agent start (never resolved here: the host being contained
     // must not choose which address survives its own containment, #3429).
@@ -2478,7 +2533,6 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
 /// the OS no longer enforces (a reboot), re-register the TTL trigger. Bounded by
 /// the operation deadline; never throws; never rolls back or releases.
 [[nodiscard]] std::string recover_containment_at_start(YuzuPluginContext* raw) {
-#if defined(_WIN32) || defined(__linux__)
     try {
         KvStateStore probe_store(raw);
         const auto l = probe_store.load();
@@ -2495,10 +2549,6 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
     } catch (...) {
         return "exception";
     }
-#else
-    (void)raw;
-    return {};
-#endif
 }
 
 
@@ -2512,7 +2562,7 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
 // backend is reachable. `state` and `rules` never mutate firewall state. The
 // four containment actions below do: Windows over COM (rung 1), Linux over
 // `sudo nft -f` / iptables argv (rung 2, with the status read rung 1 -> 2),
-// macOS PLANNED until the pf-anchor design note has been reviewed.
+// macOS over `sudo pfctl` (rung 2): an own sub-anchor plus a pf enable reference.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "state",
@@ -2546,8 +2596,12 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "iptables/ip6tables generation chain via run_bounded_subprocess when nft is absent",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 2, "pf sub-anchor com.apple/yuzu_quarantine via sudo pfctl",
-         "pending the reviewed design note"},
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "sudo pfctl: own sub-anchor com.apple/000.yuzu_quarantine loaded with -a -f (the main ruleset "
+         "is never loaded), a pf enable reference (-E), one global pf state flush (-F states)",
+         "needs Apple's anchor com.apple/* in the main ruleset and no sibling anchor sorting before "
+         "000.yuzu_quarantine, else the result is partial or degraded; the state flush cuts every pf "
+         "connection once and release does not restore them"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "INetFwPolicy2 COM rule group + per-profile default-block; other enabled rules "
@@ -2559,8 +2613,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2, "sudo nft delete table / iptables chain removal", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 2, "pf anchor flush + pfctl -X enable-token release",
-         "pending the reviewed design note"},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "sudo pfctl: empty own anchor (-F rules, -F nat), release the enable token (-X)",
+         "connections cut by the apply-time state flush are not restored; a token pf no longer "
+         "knows is noted, not an error"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "INetFwPolicy2 COM rule-group removal, prior-policy restore, disabled rules re-enabled",
@@ -2575,8 +2631,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "netlink needs CAP_NET_ADMIN, which the unprivileged agent lacks: the sudo read is "
          "the usual path"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 2, "pfctl anchor rules, enable state and references",
-         "pending the reviewed design note"},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "sudo pfctl reads: info, main-ruleset anchor reference, own anchor rules, sibling anchors "
+         "under com.apple, enable references",
+         "read-only; a disabled pf, a dangling anchor or an earlier sibling reads degraded"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "INetFwPolicy2 COM rule group presence + per-profile default actions", nullptr},
@@ -2587,8 +2645,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 2,
          "atomic nft reload / iptables build-then-swap of a new generation", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 2, "pf anchor reload (atomic per anchor) + state flush",
-         "pending the reviewed design note"},
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "sudo pfctl: atomic reload of the own sub-anchor (-a -f), then a global pf state flush",
+         "each update flushes every pf state once, so connections not covered by an allowance are "
+         "cut and not restored"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "INetFwPolicy2 COM: new generation's rules added first, stale ones removed last", nullptr},
@@ -2677,12 +2737,6 @@ private:
     int execute_containment(yuzu::CommandContext& ctx, std::string_view action,
                             yuzu::Params params) {
         try {
-            if (!kContainmentBuilt) {
-                // macOS, pending the reviewed design note: one typed unsupported
-                // row, nothing touched.
-                ctx.write_output("note|macos=pending_design_review");
-                return emit_refusal(ctx, "unsupported_platform");
-            }
             if (action == "quarantine")
                 return do_quarantine(ctx, params, ctx_);
             if (action == "release")

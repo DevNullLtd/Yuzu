@@ -9,6 +9,8 @@
  *   YUZU_FQ_SERVER_ADDRESS=<ip:port reachable control endpoint> \
  *   YUZU_FQ_PROBE_TARGET=<ip:port reachable BEFORE the quarantine> \
  *   [YUZU_FQ_STREAM_TARGET=<ip:port of an HTTP server, for the pre-established-stream case>] \
+ *     (the control-stream case opens a stream to YUZU_FQ_SERVER_ADDRESS the same way and
+ *     SKIPs when that endpoint is not an HTTP server) \
  *   [YUZU_FQ_OPERATOR_EXCEPTION=<addr[:port][/proto][/dir], e.g. 10.0.0.5:22/tcp/in>] \
  *   yuzu_agent_tests '[firewall_quarantine_live]'
  *
@@ -23,8 +25,11 @@
  * FAILURE, never a skip: a live run that silently tested nothing is the failure
  * mode this guard exists for.
  *
- * macOS: the pf-anchor leg follows the design note's review. Until then the
- * only live assertion is the typed unsupported row; the cases below SKIP.
+ * macOS: the pf sub-anchor leg runs for real here and ONLY here: this TU is
+ * hidden and gated on YUZU_FIREWALL_QUARANTINE_LIVE=1, and the live capture is
+ * taken on a disposable macOS VM (never on a shared build host), because the
+ * apply flushes every pf state on the machine and the cases below switch pf off
+ * and on behind the plugin's back to prove the repair and the token handling.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -68,6 +73,9 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
 #endif
 
 namespace fq = yuzu::firewall::quarantine;
@@ -170,7 +178,14 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall()
     return capture({"/usr/sbin/nft", "list", "ruleset"}) + capture({"/usr/sbin/iptables-save"}) +
            capture({"/usr/sbin/ip6tables-save"});
 #else
-    return {};
+    // pf: the main ruleset, the Status line and the enable-reference count. `-s info`
+    // also carries counters and uptime, which are never byte-identical, so only the
+    // Status line is compared; the reference rows are counted, not compared as text.
+    std::string out = capture({"/sbin/pfctl", "-s", "rules"});
+    out += fq::pf_enabled(capture({"/sbin/pfctl", "-s", "info"})) ? "\nStatus: Enabled" : "\nStatus: Disabled";
+    out += "\nreferences=" +
+           std::to_string(fq::parse_pf_references(capture({"/sbin/pfctl", "-s", "References"})).size());
+    return out;
 #endif
 }
 
@@ -293,12 +308,16 @@ private:
 /// The plugin, loaded and init()-ed over a real KV store, the way the agent does.
 struct LiveRig {
     yuzu::test::TempDbFile db{"yuzu_test_fq_"};
+    yuzu::test::TempDir data_dir{"yuzu_test_fq_data_"}; // agent.data_dir: the private staging dir lives here
     std::optional<yuzu::agent::KvStore> kv;
     std::optional<yuzu::agent::PluginHandle> plugin;
     std::unique_ptr<yuzu::agent::StandalonePluginContext> ctx;
     yuzu::agent::LocalDispatcher dispatcher;
 
     LiveRig(const std::string& server_address, const std::string& resolved_ip) {
+        std::error_code mk_ec;
+        fs::create_directories(data_dir.path, mk_ec);
+        REQUIRE_FALSE(mk_ec);
         auto opened = yuzu::agent::KvStore::open(db.path);
         REQUIRE(opened.has_value());
         kv.emplace(std::move(*opened));
@@ -310,7 +329,8 @@ struct LiveRig {
             "firewall",
             std::unordered_map<std::string, std::string>{
                 {"agent.server_address", server_address},
-                {"agent.server_address_resolved", resolved_ip}},
+                {"agent.server_address_resolved", resolved_ip},
+                {"agent.data_dir", data_dir.path.string()}},
             &*kv);
         REQUIRE(plugin->descriptor()->init(ctx->get()) == 0);
     }
@@ -370,37 +390,10 @@ struct LiveEnv {
         FAIL("YUZU_FQ_SERVER_ADDRESS and YUZU_FQ_PROBE_TARGET are required under "                 \
              "YUZU_FIREWALL_QUARANTINE_LIVE=1")
 
-#if defined(__APPLE__)
-#define LIVE_NOT_ON_MACOS() SKIP("macOS pf-anchor leg follows the design note's review")
-#else
-#define LIVE_NOT_ON_MACOS() (void)0
-#endif
-
 } // namespace
-
-TEST_CASE("live: macOS answers one typed unsupported row until the pf-anchor leg lands",
-          "[.][firewall_quarantine_live]") {
-#if defined(__APPLE__)
-    if (!live_enabled())
-        SKIP("set YUZU_FIREWALL_QUARANTINE_LIVE=1");
-    auto loaded = load_firewall();
-    REQUIRE(loaded.has_value());
-    yuzu::agent::LocalDispatcher d;
-    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
-        const auto r = d.run(loaded->descriptor(), action);
-        INFO(action);
-        CHECK(r.rc == 1);
-        CHECK(has_row(r.captured, "status|refused|unsupported_platform"));
-        CHECK(r.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
-    }
-#else
-    SKIP("macOS only");
-#endif
-}
 
 TEST_CASE("live: apply, verify the block, release restores the host byte-identical",
           "[.][firewall_quarantine_live]") {
-    LIVE_NOT_ON_MACOS();
     LIVE_OR_SKIP(env);
     const auto before = firewall_snapshot();
     LiveRig rig(env.server, env.server_ip());
@@ -427,7 +420,6 @@ TEST_CASE("live: apply, verify the block, release restores the host byte-identic
 
 TEST_CASE("live: a pre-established prohibited stream stops carrying data on apply",
           "[.][firewall_quarantine_live]") {
-    LIVE_NOT_ON_MACOS();
     LIVE_OR_SKIP(env);
     const auto target = env.stream_target.empty() ? env.probe_target : env.stream_target;
     LiveRig rig(env.server, env.server_ip());
@@ -482,9 +474,28 @@ TEST_CASE("live: an unrelated enabled allow rule is disabled for the duration an
 }
 #endif
 
+TEST_CASE("live: a control-channel stream open before the apply keeps carrying data across the flush",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    LiveRig rig(env.server, env.server_ip());
+    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+
+    KeptStream stream;
+    if (!stream.open(env.server))
+        SKIP("the control endpoint did not accept a connection");
+    if (!stream.answers(3000))
+        SKIP("the control endpoint is not an HTTP server that answers a keep-alive request");
+
+    const auto q = rig.run("quarantine", env.quarantine_params());
+    REQUIRE(has_row(q.captured, "status|active"));
+    // The stream predates the apply and, on macOS, the `pfctl -F states` that follows the load.
+    // The control rules are stateless in both directions, so the flush cannot touch it: no
+    // reconnect, the reply still arrives. (A rebuilt state would lose the TCP window scale.)
+    CHECK(stream.answers(3000));
+}
+
 TEST_CASE("live: a control channel that cannot be reached rolls the apply back",
           "[.][firewall_quarantine_live]") {
-    LIVE_NOT_ON_MACOS();
     LIVE_OR_SKIP(env);
     const auto before = firewall_snapshot();
     // Both inputs name a TEST-NET address nothing answers on: the verify's control check must fail.
@@ -498,7 +509,6 @@ TEST_CASE("live: a control channel that cannot be reached rolls the apply back",
 }
 
 TEST_CASE("live: quarantine_status shapes", "[.][firewall_quarantine_live]") {
-    LIVE_NOT_ON_MACOS();
     LIVE_OR_SKIP(env);
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
@@ -527,6 +537,8 @@ TEST_CASE("live: quarantine_status shapes", "[.][firewall_quarantine_live]") {
 #elif defined(_WIN32)
     (void)capture({"C:\\Windows\\System32\\netsh.exe", "advfirewall", "set", "allprofiles",
                    "firewallpolicy", "blockinbound,allowoutbound"});
+#elif defined(__APPLE__)
+    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "rules"});
 #endif
     const auto degraded = rig.run("quarantine_status");
     CHECK(has_prefix(degraded.captured, "status|degraded|"));
@@ -534,7 +546,6 @@ TEST_CASE("live: quarantine_status shapes", "[.][firewall_quarantine_live]") {
 
 TEST_CASE("live: init completes an interrupted release and re-applies a lost containment",
           "[.][firewall_quarantine_live]") {
-    LIVE_NOT_ON_MACOS();
     LIVE_OR_SKIP(env);
     const auto before = firewall_snapshot();
     LiveRig rig(env.server, env.server_ip());
@@ -561,6 +572,12 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
 #elif defined(_WIN32)
     (void)capture({"C:\\Windows\\System32\\netsh.exe", "advfirewall", "set", "allprofiles",
                    "firewallpolicy", "blockinbound,allowoutbound"});
+#elif defined(__APPLE__)
+    // the anchor is gone and pf is off while our (same-boot) token is still on record:
+    // the repair path -- release the dead token, take a fresh one, reload
+    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "rules"});
+    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "nat"});
+    (void)capture({"/sbin/pfctl", "-d"});
 #endif
     rig.restart();
     CHECK(has_row(rig.run("quarantine_status").captured, "status|active"));
@@ -569,7 +586,6 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
 
 TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
           "[.][firewall_quarantine_live]") {
-    LIVE_NOT_ON_MACOS();
     LIVE_OR_SKIP(env);
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
@@ -596,17 +612,19 @@ TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
     CHECK_FALSE(rig.record().has_value());
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 namespace {
 
-/// Real nft, real temp files, but every `nft -f` after the first fails: a
-/// runner forced to fail in the middle of an update.
-struct FlakyNftRunner {
+/// Real nft / pfctl, real temp files, but every ruleset load after the first fails:
+/// a runner forced to fail in the middle of an update. A load is `nft -f <file>` or
+/// `pfctl -a <anchor> -f <file>`.
+struct FlakyLoadRunner {
     int loads = 0;
     int fail_from_load = 2;
     fq::Runner fn() {
         return [this](const fq::Argv& argv, std::chrono::milliseconds budget) {
-            if (argv.size() > 1 && argv[1] == "-f" && ++loads >= fail_from_load) {
+            const bool is_load = argv.size() > 1 && (argv[1] == "-f" || (argv.size() == 5 && argv[3] == "-f"));
+            if (is_load && ++loads >= fail_from_load) {
                 fq::ToolResult t;
                 t.ran = true;
                 t.exit_code = 1;
@@ -662,13 +680,15 @@ fq::Stage real_stage() {
 }
 
 } // namespace
+#endif
 
+#if defined(__linux__)
 TEST_CASE("live (linux nft): a failed update keeps the previous generation in force",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
     if (::access("/usr/sbin/nft", X_OK) != 0)
         SKIP("nft is not installed on this host");
-    FlakyNftRunner runner;
+    FlakyLoadRunner runner;
     fq::NftLeg leg(runner.fn(), real_stage());
     MemStore store;
     fq::Env fenv{leg, store,
@@ -697,6 +717,126 @@ TEST_CASE("live (linux nft): a failed update keeps the previous generation in fo
     const auto upd = fq::update(fenv, true, {*fq::parse_exception("198.18.0.9:22/tcp/in")}, dl2);
     CHECK(upd.status == "update_failed");
     CHECK(capture({"/usr/sbin/nft", "list", "table", "inet", "yuzu_quarantine"}) == table_before);
+    CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout); // still blocked
+    REQUIRE(store.s.has_value());
+    CHECK(store.s->phase == fq::Phase::active);
+
+    fq::Deadline dl3;
+    CHECK(fq::release(fenv, fq::ReleaseRequest{}, dl3).status == "inactive");
+}
+#endif
+
+#if defined(__APPLE__)
+namespace {
+
+/// The same value the plugin reads in-process, for a PfLeg built directly by a test.
+std::optional<std::string> live_boot_time() {
+    struct timeval tv{};
+    size_t len = sizeof(tv);
+    if (::sysctlbyname("kern.boottime", &tv, &len, nullptr, 0) != 0 || len != sizeof(tv))
+        return std::nullopt;
+    return std::to_string(static_cast<long long>(tv.tv_sec)) + "." +
+           std::to_string(static_cast<long long>(tv.tv_usec));
+}
+
+[[nodiscard]] std::string pf_anchor_capture(const char* what) {
+    return capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", what});
+}
+
+} // namespace
+
+TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release restores pf byte-identical",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    const auto before = firewall_snapshot();
+    LiveRig rig(env.server, env.server_ip());
+    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+
+    const auto q = rig.run("quarantine", env.quarantine_params());
+    INFO(q.captured);
+    // `active` means pfctl accepted the whole anchor, `no nat all` and `no rdr all` included
+    REQUIRE(has_row(q.captured, "status|active"));
+
+    // Captured for the PR narrative: design-note open questions 3 (References layout),
+    // 6 (Anchors layout) and 7 (a flush of an anchor that does not exist).
+    const auto anchors = capture({"/sbin/pfctl", "-a", "com.apple", "-s", "Anchors"});
+    INFO("-a com.apple -s Anchors:\n" << anchors);
+    INFO("-s References:\n" << capture({"/sbin/pfctl", "-s", "References"}));
+    INFO("anchor -s rules:\n" << pf_anchor_capture("rules"));
+    INFO("anchor -s nat:\n" << pf_anchor_capture("nat"));
+    CHECK(anchors.find(std::string{fq::kPfAnchorLeaf}) != std::string::npos);
+    CHECK(fq::pf_siblings_before(anchors).empty()); // nothing is evaluated before us
+    CHECK(fq::pf_anchor_referenced(capture({"/sbin/pfctl", "-s", "rules"})));
+    CHECK(fq::pf_anchor_enforcing(pf_anchor_capture("rules")));
+    CHECK(has_row(rig.run("quarantine_status").captured, "status|active"));
+
+    const auto rel = rig.run("release");
+    INFO(rel.captured);
+    CHECK(has_row(rel.captured, "status|inactive"));
+    // main ruleset, Status line and reference count equal their pre-quarantine values
+    CHECK(firewall_snapshot() == before);
+    // our anchor is empty, not merely unreferenced
+    CHECK_FALSE(fq::pf_anchor_enforcing(pf_anchor_capture("rules")));
+}
+
+TEST_CASE("live (macOS pf): pf switched off behind the plugin's back is reported, then repaired",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    LiveRig rig(env.server, env.server_ip());
+    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+
+    REQUIRE(has_row(rig.run("quarantine", env.quarantine_params()).captured, "status|active"));
+    const auto old_token = rig.record() ? rig.record()->os.pf_token : std::string{};
+    REQUIRE_FALSE(old_token.empty());
+
+    (void)capture({"/sbin/pfctl", "-d"}); // another actor
+    const auto st = rig.run("quarantine_status");
+    INFO(st.captured);
+    CHECK(has_row(st.captured, "status|degraded|pf_disabled"));
+    CHECK(probe(env.probe_target) != fq::ProbeOutcome::timeout); // honestly uncontained
+
+    const auto fixed = rig.run("quarantine", env.quarantine_params());
+    INFO(fixed.captured);
+    CHECK(has_row(fixed.captured, "status|active"));
+    CHECK(has_row(fixed.captured, "note|repaired=1"));
+    CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
+    REQUIRE(rig.record().has_value());
+    CHECK(rig.record()->os.pf_token != old_token); // a fresh reference, recorded
+
+    CHECK(has_row(rig.run("release").captured, "status|inactive"));
+}
+
+TEST_CASE("live (macOS pf): a failed update keeps the previous generation in force",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    FlakyLoadRunner runner;
+    fq::PfLeg leg(runner.fn(), real_stage(), live_boot_time);
+    MemStore store;
+    fq::Env fenv{leg, store,
+                 [](const std::string& ip, int port, std::chrono::milliseconds t) {
+                     return probe(ip + ":" + std::to_string(port), static_cast<int>(t.count()));
+                 },
+                 [] { return static_cast<std::int64_t>(std::time(nullptr)); }};
+    const auto exceptions =
+        env.operator_exception.empty() ? std::vector<fq::Endpoint>{} : *fq::parse_exceptions_csv(env.operator_exception);
+    auto allow = fq::build_allow_set(env.server_ip(), env.server, {}, exceptions);
+    REQUIRE(allow.has_value());
+
+    Watchdog dog(120s, [&] {
+        fq::Deadline dl;
+        (void)fq::release(fenv, fq::ReleaseRequest{}, dl);
+    });
+    fq::Deadline dl;
+    fq::ApplyRequest req;
+    req.allow = *allow;
+    req.probe_target = env.probe_target;
+    REQUIRE(fq::apply_and_verify(fenv, req, dl).status == "active");
+    const auto rules_before = pf_anchor_capture("rules");
+
+    fq::Deadline dl2;
+    const auto upd = fq::update(fenv, true, {*fq::parse_exception("198.18.0.9:22/tcp/in")}, dl2);
+    CHECK(upd.status == "update_failed");
+    CHECK(pf_anchor_capture("rules") == rules_before); // the anchor load is atomic: nothing changed
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout); // still blocked
     REQUIRE(store.s.has_value());
     CHECK(store.s->phase == fq::Phase::active);

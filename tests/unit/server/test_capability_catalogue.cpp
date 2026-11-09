@@ -263,10 +263,11 @@ constexpr std::array<std::pair<std::string_view, std::string_view>, 2> kReversib
      "Destructive (not Mutating) because it must inherit the destructive-targeting gate — "
      "explicit device IDs, no unapproved broadcast — not because the effect is unrecoverable."},
     {"firewall.quarantine",
-     "true undo on all three legs: release restores the captured Windows profile policy and "
-     "re-enables every rule quarantine disabled, deletes the nft table / iptables chain, and "
-     "unloads the pf anchor and releases its enable token. Destructive only for the "
-     "destructive-targeting gate."},
+     "undo of the rules and the enable state on all three legs: release restores the captured "
+     "Windows profile policy and re-enables every rule quarantine disabled, deletes the nft "
+     "table / iptables chain, and empties the pf anchor and releases its enable token. The "
+     "macOS state flush at apply time is one-way (connections are not restored). Destructive "
+     "only for the destructive-targeting gate."},
 }};
 // `printing.clear_queue` is deliberately NOT allowlisted here: it is
 // Destructive+Irreversible. Cancelling a job has no compensating Yuzu

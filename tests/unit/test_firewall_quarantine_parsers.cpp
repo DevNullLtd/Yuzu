@@ -1028,48 +1028,92 @@ TEST_CASE("iptables worst case stays inside the operation budget as counted call
 
 // ── macOS pure pieces ───────────────────────────────────────────────────────
 
-TEST_CASE("pf anchor ruleset: lo0 first, quick everywhere, block last", "[agent][firewall_quarantine]") {
+TEST_CASE("pf anchor ruleset: no nat/rdr, lo0, stateless control channel, block last",
+          "[agent][firewall_quarantine]") {
     const auto set = make_set({"203.0.113.53"}, {ex("10.0.0.5:22/tcp/in")});
     const auto text = pf_anchor_ruleset(set);
     std::vector<std::string> lines;
     for (const auto l : detail::split(text, '\n'))
         if (!l.empty())
             lines.emplace_back(l);
-    REQUIRE(lines.size() > 4);
-    CHECK(lines.front() == "pass quick on lo0 all no state");
+    REQUIRE(lines.size() > 6);
+    // translation rules come first (a pf file must order them before filter rules)
+    CHECK(lines[0] == "no nat all");
+    CHECK(lines[1] == "no rdr all");
+    CHECK(lines[2] == "pass quick on lo0 all no state");
     CHECK(lines.back() == "block drop quick all");
     for (const auto& l : lines) {
         INFO(l);
-        CHECK(l.find("quick") != l.npos);
+        CHECK((l.find("quick") != l.npos || detail::starts_with(l, "no ")));
         CHECK(is_safe_ruleset_line(l));
     }
     CHECK(text.find("set skip") == text.npos);
-    // the control channel re-creates state mid-stream
-    CHECK(text.find("pass out quick inet proto tcp from any to 198.51.100.7 port 50051 flags any keep state") !=
-          text.npos);
-    // the inbound half too: after the state flush the server's packet may be the first to arrive
-    CHECK(text.find("pass in quick inet proto tcp from 198.51.100.7 port 50051 to any flags any keep state") !=
-          text.npos);
-    CHECK(text.find("proto udp from any port 68 to any port 67 keep state") != text.npos);
-    CHECK(text.find("to 203.0.113.53 port 53 keep state") != text.npos);
-    CHECK(text.find("icmp6-type { 133, 134, 135, 136, 137 }") != text.npos);
 
-    CHECK(join(pfctl_load_argv("/tmp/x.pf")) == "/sbin/pfctl -a com.apple/yuzu_quarantine -f /tmp/x.pf");
+    // the control channel is STATELESS in both directions: a state rebuilt from a
+    // mid-stream packet loses the TCP window scale and would stall the live stream
+    CHECK(text.find("pass out quick inet proto tcp from any to 198.51.100.7 port 50051 no state\n") !=
+          text.npos);
+    CHECK(text.find("pass in quick inet proto tcp from 198.51.100.7 port 50051 to any no state\n") !=
+          text.npos);
+    CHECK(text.find("flags") == text.npos); // no `flags any` anywhere
+    for (const auto& l : lines)
+        if (l.find("198.51.100.7") != l.npos) {
+            INFO(l);
+            CHECK(l.find("keep state") == l.npos);
+        }
+
+    // DHCP leaves only toward the broadcast address; the reply direction is inbound only
+    CHECK(text.find("pass out quick inet proto udp from any port 68 to 255.255.255.255 port 67 "
+                    "keep state") != text.npos);
+    CHECK(text.find("to any port 67") == text.npos);
+    CHECK(text.find("pass in quick inet proto udp from any port 67 to any port 68 keep state") !=
+          text.npos);
+    // DNS and exceptions keep state; ports are service ports per direction
+    CHECK(text.find("to 203.0.113.53 port 53 keep state") != text.npos);
+    CHECK(text.find("pass in quick inet proto tcp from 10.0.0.5 to any port 22 keep state") != text.npos);
+    // neighbour discovery 133-136; redirect (137) is not allowed
+    CHECK(text.find("icmp6-type { 133, 134, 135, 136 } no state") != text.npos);
+    CHECK(text.find("137") == text.npos);
+
+    // an IPv6 control endpoint gets the same stateless pair
+    auto v6 = build_allow_set("2001:db8::7", "[2001:db8::7]:50051", {}, {});
+    REQUIRE(v6);
+    const auto v6text = pf_anchor_ruleset(*v6);
+    CHECK(v6text.find("pass out quick inet6 proto tcp from any to 2001:db8::7 port 50051 no state") !=
+          v6text.npos);
+    CHECK(v6text.find("pass in quick inet6 proto tcp from 2001:db8::7 port 50051 to any no state") !=
+          v6text.npos);
+}
+
+TEST_CASE("pfctl argv: the anchor sorts first, flush is scoped to our anchor, nothing global",
+          "[agent][firewall_quarantine]") {
+    // pf evaluates com.apple/* sub-anchors in name order; 200.AirDrop and
+    // 250.ApplicationFirewall ship with the OS, and `0` sorts before `2`
+    CHECK(kPfAnchor == "com.apple/000.yuzu_quarantine");
+    CHECK(kPfAnchorLeaf < std::string_view{"200.AirDrop"});
+    CHECK(kPfAnchorLeaf < std::string_view{"250.ApplicationFirewall"});
+    CHECK(is_safe_token(kPfAnchor));
+
+    CHECK(join(pfctl_load_argv("/tmp/x.pf")) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -f /tmp/x.pf");
     CHECK(join(pfctl_flush_states_argv()) == "/sbin/pfctl -F states");
     CHECK(join(pfctl_references_argv()) == "/sbin/pfctl -s References");
     CHECK(join(pfctl_release_argv("123456")) == "/sbin/pfctl -X 123456");
     CHECK(join(pfctl_enable_argv()) == "/sbin/pfctl -E");
-    CHECK(join(pfctl_flush_anchor_argv()) == "/sbin/pfctl -a com.apple/yuzu_quarantine -F all");
+    // `-a X -F all` would also flush the GLOBAL state table and counters; rules + nat only
+    CHECK(join(pfctl_flush_anchor_rules_argv()) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -F rules");
+    CHECK(join(pfctl_flush_anchor_nat_argv()) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -F nat");
     CHECK(join(pfctl_info_argv()) == "/sbin/pfctl -s info");
     CHECK(join(pfctl_rules_argv()) == "/sbin/pfctl -s rules");
-    CHECK(join(pfctl_anchor_rules_argv()) == "/sbin/pfctl -a com.apple/yuzu_quarantine -s rules");
+    CHECK(join(pfctl_anchor_rules_argv()) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -s rules");
+    CHECK(join(pfctl_siblings_argv()) == "/sbin/pfctl -a com.apple -s Anchors");
     for (const auto& a : {pfctl_load_argv("/tmp/x.pf"), pfctl_flush_states_argv(), pfctl_references_argv(),
-                          pfctl_release_argv("123456"), pfctl_enable_argv(), pfctl_flush_anchor_argv(),
-                          pfctl_info_argv(), pfctl_rules_argv(), pfctl_anchor_rules_argv()})
+                          pfctl_release_argv("123456"), pfctl_enable_argv(),
+                          pfctl_flush_anchor_rules_argv(), pfctl_flush_anchor_nat_argv(), pfctl_info_argv(),
+                          pfctl_rules_argv(), pfctl_anchor_rules_argv(), pfctl_siblings_argv()})
         CHECK(all_tokens_safe(a));
 }
 
-TEST_CASE("pf parsers: token, references, anchor reference, enabled, boot time",
+TEST_CASE("pf parsers: token, references, anchor reference, siblings, enabled, enable plan",
           "[agent][firewall_quarantine]") {
     CHECK(parse_pfctl_token("pfctl: Use of -f option, could result in flushing of rules\nToken : 3665316113424588829\n")
               .value() == "3665316113424588829");
@@ -1078,28 +1122,62 @@ TEST_CASE("pf parsers: token, references, anchor reference, enabled, boot time",
     CHECK_FALSE(parse_pfctl_token("Token : 12abc"));
     CHECK_FALSE(parse_pfctl_token("Token : "));
 
-    const auto refs = parse_pf_references("TOKEN\t\tDESCRIPTION\n3665316113424588829  com.apple.alf\n"
-                                          "  1122334455667788  yuzu\nnoise\n");
+    // pfctl(8): "pid/name of enabler, token, timestamp" -- the column order is unverified,
+    // so a line counts once when any field is a token-sized decimal
+    const auto refs = parse_pf_references("PID NAME TOKEN TIMESTAMP\n"
+                                          "321 com.apple.alf 3665316113424588829 1700000000\n"
+                                          "  1122334455667788  yuzu\n"
+                                          "noise 12345\n");
     REQUIRE(refs.size() == 2);
     CHECK(refs[0] == "3665316113424588829");
+    CHECK(refs[1] == "1122334455667788");
     CHECK(parse_pf_references("").empty());
 
+    // the reference must be the WHOLE unqualified line; a prefix match is not enough
     CHECK(pf_anchor_referenced("scrub-anchor \"com.apple/*\" all fragment\nanchor \"com.apple/*\" all\n"));
+    CHECK(pf_anchor_referenced("  anchor \"com.apple/000.yuzu_quarantine\" all  \n"));
     CHECK_FALSE(pf_anchor_referenced("scrub-anchor \"com.apple/*\" all fragment\nblock all\n"));
+    CHECK_FALSE(pf_anchor_referenced("anchor \"com.apple/*\" on en0 all\n")); // one interface only
+    CHECK_FALSE(pf_anchor_referenced("anchor \"com.apple/*\" all label x\n"));
+    CHECK_FALSE(pf_anchor_referenced("anchor \"com.apple/yuzu_quarantine\" all\n")); // the old name
+    CHECK_FALSE(pf_anchor_referenced("nat-anchor \"com.apple/*\" all\n"));
     CHECK_FALSE(pf_anchor_referenced(""));
+
+    CHECK(pf_anchor_enforcing("pass quick on lo0 all no state\nblock drop quick all\n"));
+    CHECK_FALSE(pf_anchor_enforcing(""));
+    CHECK_FALSE(pf_anchor_enforcing("pass quick on lo0 all no state\n"));
+
+    // siblings that pf evaluates before ours: direct children sorting below 000.yuzu_quarantine
+    CHECK(pf_siblings_before("   com.apple/200.AirDrop\n   com.apple/250.ApplicationFirewall\n"
+                             "   com.apple/000.yuzu_quarantine\n")
+              .empty());
+    const auto early = pf_siblings_before("com.apple/000.aaa\n000.aab\ncom.apple/200.AirDrop\n"
+                                          "com.apple/000.yuzu_quarantine\n");
+    REQUIRE(early.size() == 2);
+    CHECK(early[0] == "000.aaa");
+    // a banner, a deeper path or an unsafe token never flags a healthy host
+    CHECK(pf_siblings_before("No ALTQ support in kernel\ncom.apple/000.a/deeper\n  \n000.a;b\n").empty());
+    CHECK(pf_siblings_before("").empty());
+
     CHECK(pf_enabled("Status: Enabled for 0 days 00:00:04           Debug: Urgent\n"));
     CHECK_FALSE(pf_enabled("Status: Disabled\n"));
 
-    CHECK(parse_kern_boottime("{ sec = 1699999999, usec = 123456 } Tue Nov 14 22:13:19 2023\n").value() ==
-          "1699999999.123456");
-    CHECK_FALSE(parse_kern_boottime("garbage"));
-
     OsPayload os;
-    CHECK(pf_should_enable(os, "1699999999.123456")); // nothing stored: fresh -E
+    constexpr auto boot = "1699999999.123456";
+    CHECK(pf_enable_plan(os, boot, false) == PfEnablePlan::enable); // nothing stored: fresh -E
+    CHECK(pf_enable_plan(os, boot, true) == PfEnablePlan::enable);  // pf on for someone else: still ours to take
     os.pf_token = "123456";
-    os.boot_time = "1699999999.123456";
-    CHECK_FALSE(pf_should_enable(os, "1699999999.123456")); // same boot: reuse, no second -E
-    CHECK(pf_should_enable(os, "1700000500.000001"));       // new boot: the refcount reset
+    os.boot_time = boot;
+    CHECK(pf_enable_plan(os, boot, true) == PfEnablePlan::reuse);   // same boot, pf on: no second -E
+    CHECK(pf_enable_plan(os, boot, false) == PfEnablePlan::repair); // pf -d behind our back: dead token
+    CHECK(pf_enable_plan(os, "1700000500.000001", true) == PfEnablePlan::enable);  // new boot: refcount reset
+    CHECK(pf_enable_plan(os, "1700000500.000001", false) == PfEnablePlan::enable); // and no -X of a stale token
+
+    CHECK(detail::pf_error_line("pfctl: Use of -f option, could result in flushing of rules\n"
+                                "present in the main ruleset added by the system at startup.\n"
+                                "See /etc/pf.conf for further details.\n\n"
+                                "/tmp/x.pf:3: syntax error\n") == "/tmp/x.pf:3: syntax error");
+    CHECK(detail::pf_error_line("").empty());
 }
 
 // ── resolvers ───────────────────────────────────────────────────────────────
@@ -1187,12 +1265,14 @@ TEST_CASE("quarantine: apply, verify, record -- and release restores the host",
     CHECK(contains(rows, "note|backend=nft"));
     CHECK(result_kind(o).provenance == "firewall:active");
 
-    // already active: no second mutation
+    // already active: the live table is read, but nothing is mutated
     const auto calls = rig.world.crash.calls;
     const auto again = apply_and_verify(rig.env, rig.request(), dl);
     CHECK(again.status == "active");
     CHECK(contains(again.notes, "already_active=1"));
-    CHECK(rig.world.crash.calls == calls);
+    CHECK(std::none_of(rig.world.log.begin() + calls, rig.world.log.end(), [](const Argv& a) {
+        return a.size() > 1 && (a[1] == "-f" || a[1] == "delete");
+    }));
 
     const auto rel = release(rig.env, ReleaseRequest{}, dl);
     CHECK(rel.status == "inactive");
@@ -1974,6 +2054,704 @@ TEST_CASE("crash at every runner call during an iptables update", "[agent][firew
             }
         }
     }
+}
+
+// ── drivers over the pf leg ─────────────────────────────────────────────────
+
+namespace {
+
+constexpr const char* kPfBoot1 = "1699999999.123456";
+constexpr const char* kPfBoot2 = "1700000500.000001";
+constexpr const char* kPfAnchorName = "com.apple/000.yuzu_quarantine";
+
+/// A macOS pf world: the enable reference table, the one anchor we own, the main
+/// ruleset's wildcard reference, sibling anchors and the global state table.
+struct PfWorld {
+    FakeClock* clock = nullptr;
+    std::chrono::milliseconds per_call{0};
+    std::function<std::string()> record; // the durable record as text, peeked at each effect
+    std::function<void()> on_enable;     // runs when `-E` lands (a test hook)
+
+    bool pf_on = false;
+    std::vector<std::string> tokens;     // enable references, oldest first
+    std::string next_token = "3665316113424588000";
+    bool anchor_exists = false;
+    std::string anchor_text;
+    bool referenced = true;              // the main ruleset carries anchor "com.apple/*"
+    std::vector<std::string> siblings{"com.apple/200.AirDrop", "com.apple/250.ApplicationFirewall"};
+    std::string boot = kPfBoot1;
+    std::map<std::string, std::string> files;
+    int next_file = 0;
+
+    int flush_states = 0;
+    int enables = 0;
+    int fail_flush_states = 0;           // fail the next N `-F states`
+    bool fail_load = false;
+    bool fail_enable = false;
+    bool fail_info = false;
+    bool flush_fails_when_absent = false;
+    bool fail_flush_anchor = false;      // the anchor flush is refused outright
+    bool disable_clears_refs = false;    // what `pfctl -d` does to the references (unverified on xnu)
+    std::string record_at_enable, record_at_load, record_at_flush;
+    Crash crash;
+    std::vector<Argv> log;
+
+    void external_disable() { // someone ran `pfctl -d`
+        pf_on = false;
+        if (disable_clears_refs)
+            tokens.clear();
+    }
+    void reboot() { // pf starts disabled with no references and no dynamic anchors
+        pf_on = false;
+        tokens.clear();
+        anchor_exists = false;
+        anchor_text.clear();
+        boot = kPfBoot2;
+    }
+    [[nodiscard]] bool enforcing() const { return pf_on && anchor_exists; }
+
+    ToolResult effect(const Argv& a) {
+        const auto cmd = join(a);
+        const std::string anchor_flag = std::string("-a ") + kPfAnchorName;
+        if (cmd == "/sbin/pfctl -s info") {
+            if (fail_info)
+                return done(1, "pfctl: /dev/pf: Permission denied");
+            return done(0, pf_on ? "Status: Enabled for 0 days 00:00:04           Debug: Urgent\n"
+                                 : "Status: Disabled\n");
+        }
+        if (cmd == "/sbin/pfctl -s rules")
+            return done(0, referenced ? "scrub-anchor \"com.apple/*\" all fragment reassemble\n"
+                                        "anchor \"com.apple/*\" all\n"
+                                      : "block drop all\n");
+        if (cmd == "/sbin/pfctl " + anchor_flag + " -s rules") {
+            if (!anchor_exists)
+                return done(1, "pfctl: DIOCGETRULES: Invalid argument");
+            std::string out;
+            for (const auto l : detail::split(anchor_text, '\n'))
+                if (!l.empty() && !detail::starts_with(l, "no "))
+                    out += std::string{l} + "\n";
+            return done(0, out);
+        }
+        if (cmd == "/sbin/pfctl -a com.apple -s Anchors") {
+            std::string out;
+            for (const auto& s : siblings)
+                out += "   " + s + "\n";
+            if (anchor_exists)
+                out += std::string("   ") + kPfAnchorName + "\n";
+            return done(0, out);
+        }
+        if (cmd == "/sbin/pfctl -s References") {
+            std::string out = "PID   NAME             TOKEN                TIMESTAMP\n";
+            for (const auto& t : tokens)
+                out += "321   holder           " + t + "  1700000000\n";
+            return done(0, out);
+        }
+        if (cmd == "/sbin/pfctl -E") {
+            if (fail_enable)
+                return done(1, "pfctl: pf not enabled");
+            ++enables;
+            record_at_enable = record ? record() : std::string{};
+            next_token = std::to_string(std::stoull(next_token) + 1);
+            tokens.push_back(next_token);
+            pf_on = true;
+            if (on_enable)
+                on_enable();
+            return done(0, "pfctl: Use of -f option, could result in flushing of rules\n"
+                           "No ALTQ support in kernel\nToken : " + next_token + "\n");
+        }
+        if (a.size() == 3 && a[1] == "-X") {
+            const auto it = std::find(tokens.begin(), tokens.end(), a[2]);
+            if (it == tokens.end())
+                return done(1, "pfctl: Unable to release the reference: Invalid argument");
+            tokens.erase(it);
+            if (tokens.empty())
+                pf_on = false;
+            return done(0);
+        }
+        if (cmd == "/sbin/pfctl -F states") {
+            record_at_flush = record ? record() : std::string{};
+            ++flush_states;
+            if (fail_flush_states > 0) {
+                --fail_flush_states;
+                return done(1, "pfctl: DIOCCLRSTATES: Operation not permitted");
+            }
+            return done(0, "0 states cleared\n");
+        }
+        if (cmd == "/sbin/pfctl " + anchor_flag + " -F rules" ||
+            cmd == "/sbin/pfctl " + anchor_flag + " -F nat") {
+            if (fail_flush_anchor)
+                return done(1, "sudo: a password is required");
+            if (flush_fails_when_absent && !anchor_exists)
+                return done(1, "pfctl: DIOCXBEGIN: Invalid argument");
+            anchor_text.clear();
+            anchor_exists = false;
+            return done(0);
+        }
+        if (a.size() == 5 && a[1] == "-a" && a[2] == kPfAnchorName && a[3] == "-f") {
+            record_at_load = record ? record() : std::string{};
+            if (fail_load)
+                return done(1, "pfctl: Use of -f option, could result in flushing of rules\n"
+                               "present in the main ruleset added by the system at startup.\n"
+                               "See /etc/pf.conf for further details.\n\n" + a[4] + ":3: syntax error");
+            anchor_text = files[a[4]];
+            anchor_exists = true;
+            return done(0, "pfctl: Use of -f option, could result in flushing of rules\n"
+                           "present in the main ruleset added by the system at startup.\n"
+                           "See /etc/pf.conf for further details.\n");
+        }
+        return done(1, "unexpected argv: " + cmd);
+    }
+
+    Runner runner() {
+        return [this](const Argv& a, std::chrono::milliseconds) {
+            ++crash.calls;
+            log.push_back(a);
+            if (clock)
+                clock->advance(per_call);
+            if (crash.calls == crash.crash_at && !crash.after_effect)
+                throw CrashSim{};
+            auto r = effect(a);
+            if (crash.calls == crash.crash_at && crash.after_effect)
+                throw CrashSim{};
+            return r;
+        };
+    }
+    Stage stage() {
+        return [this](std::string_view, std::string_view suffix,
+                      std::string_view contents) -> std::optional<StagedFile> {
+            const auto path = std::format("/tmp/yuzu-fwq-pf-{}{}", ++next_file, suffix);
+            files[path] = std::string{contents};
+            return StagedFile{path, nullptr};
+        };
+    }
+    [[nodiscard]] bool ran(std::string_view needle) const {
+        return std::any_of(log.begin(), log.end(),
+                           [&](const Argv& a) { return join(a).find(needle) != std::string::npos; });
+    }
+    [[nodiscard]] int count(std::string_view needle, std::size_t from = 0) const {
+        int n = 0;
+        for (std::size_t i = from; i < log.size(); ++i)
+            n += join(log[i]).find(needle) != std::string::npos ? 1 : 0;
+        return n;
+    }
+};
+
+struct PfRig {
+    FakeClock clock;
+    PfWorld world;
+    FakeStore store;
+    Probe probe;
+    bool boot_readable = true;
+    PfLeg leg;
+    std::int64_t now = 1'700'000'000;
+    Env env;
+
+    PfRig()
+        : leg(world.runner(), world.stage(),
+              [this]() -> std::optional<std::string> {
+                  if (!boot_readable)
+                      return std::nullopt;
+                  return world.boot;
+              }),
+          env{leg, store, probe.fn(), [this] { return now; }} {
+        world.clock = &clock;
+        world.record = [this] { return store.raw; };
+        probe.blocked = [this] { return world.enforcing(); };
+    }
+    Deadline dl() { return Deadline(kOperationBudget, clock.fn()); }
+    ApplyRequest request(std::string target = kProbeTarget, std::int64_t ttl = 0) {
+        ApplyRequest r;
+        r.allow = make_set();
+        r.probe_target = std::move(target);
+        r.ttl_seconds = ttl;
+        return r;
+    }
+    [[nodiscard]] std::string token() const { return store.state() ? store.state()->os.pf_token : ""; }
+};
+
+} // namespace
+
+TEST_CASE("pf: apply order -- reference, siblings, load, then the state flush; token recorded first",
+          "[agent][firewall_quarantine]") {
+    PfRig rig;
+    auto dl = rig.dl();
+    const auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
+    CHECK(o.status == "active");
+    CHECK(*o.verify == "verify|control=ok|probe=blocked");
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::active);
+    CHECK(rig.store.state()->backend == BackendKind::pf);
+    CHECK(rig.world.enforcing());
+    REQUIRE(rig.world.tokens.size() == 1);
+    CHECK(rig.store.state()->os.pf_token == rig.world.tokens[0]);
+    CHECK(rig.store.state()->os.boot_time == kPfBoot1);
+
+    // the exact order of the privileged calls
+    std::vector<std::string> cmds;
+    for (const auto& a : rig.world.log)
+        cmds.push_back(join(a));
+    const std::vector<std::string> want{
+        "/sbin/pfctl -s info",
+        "/sbin/pfctl -E",
+        "/sbin/pfctl -s rules",
+        "/sbin/pfctl -a com.apple -s Anchors",
+        std::string("/sbin/pfctl -a ") + kPfAnchorName + " -f /tmp/yuzu-fwq-pf-1.pf",
+        "/sbin/pfctl -F states",
+    };
+    REQUIRE(cmds.size() >= want.size());
+    CHECK(std::vector<std::string>(cmds.begin(), cmds.begin() + static_cast<long>(want.size())) == want);
+
+    // no OS mutation without a recovery record, and the token is durable BEFORE the
+    // anchor is loaded or the states are flushed
+    CHECK(rig.world.record_at_enable.find("phase=applying") != std::string::npos);
+    CHECK(rig.world.record_at_enable.find("pf_token=") == std::string::npos); // no token exists yet
+    CHECK(rig.world.record_at_load.find("pf_token=" + rig.world.tokens[0]) != std::string::npos);
+    CHECK(rig.world.record_at_load.find("phase=applying") != std::string::npos);
+    CHECK(rig.world.record_at_flush.find("pf_token=" + rig.world.tokens[0]) != std::string::npos);
+
+    // the staged ruleset is the one the pure core builds, and it is clean
+    CHECK(rig.world.anchor_text == pf_anchor_ruleset(make_set()));
+    for (const auto& a : rig.world.log)
+        CHECK(all_tokens_safe(a));
+    // never a main-ruleset load, never `-d`
+    CHECK_FALSE(rig.world.ran("pfctl -f"));
+    CHECK_FALSE(rig.world.ran(" -d"));
+    CHECK_FALSE(rig.world.ran("/etc/pf.conf"));
+
+    // an update is one anchor reload plus one state flush and takes no second reference
+    const auto before_calls = rig.world.log.size();
+    const auto upd = update(rig.env, true, {ex("10.0.0.9:22/tcp/in")}, dl);
+    CHECK(upd.status == "active");
+    CHECK(rig.world.flush_states == 2);
+    CHECK(rig.world.count(" -f ", before_calls) == 1);
+    CHECK(rig.world.count("pfctl -E", before_calls) == 0);
+    CHECK(rig.world.tokens.size() == 1);
+}
+
+TEST_CASE("pf: a failed state flush is a failed apply, never active", "[agent][firewall_quarantine]") {
+    SECTION("one failure is retried") {
+        PfRig rig;
+        rig.world.fail_flush_states = 1;
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "active");
+        CHECK(rig.world.flush_states == 2);
+    }
+    SECTION("two failures roll an initial apply back to absence") {
+        PfRig rig;
+        rig.world.fail_flush_states = 2;
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK(o.reason == "apply_failed:state_flush_failed");
+        CHECK(rig.world.flush_states == 2);
+        // the anchor is emptied, the reference given back, pf is off again, no record
+        CHECK_FALSE(rig.world.anchor_exists);
+        CHECK(rig.world.tokens.empty());
+        CHECK_FALSE(rig.world.pf_on);
+        CHECK(rig.store.raw.empty());
+    }
+    SECTION("a failed update keeps the record and the reference it took") {
+        PfRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.world.external_disable(); // the next apply must take a fresh reference
+        rig.world.fail_flush_states = 2;
+        const auto o = update(rig.env, true, {ex("10.0.0.9:22/tcp/in")}, dl);
+        CHECK(o.status == "update_failed");
+        CHECK(o.reason == "state_flush_failed");
+        // the record carries the reference the failed attempt took, so it can be released
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::active);
+        REQUIRE(rig.world.tokens.size() == 1);
+        CHECK(rig.store.state()->os.pf_token == rig.world.tokens[0]);
+        CHECK(rig.world.pf_on); // containment stays on after the anchor loaded
+        CHECK(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+        CHECK(rig.world.tokens.empty());
+    }
+}
+
+TEST_CASE("pf: a load failure gives back the reference taken in this call", "[agent][firewall_quarantine]") {
+    PfRig rig;
+    rig.world.fail_load = true;
+    auto dl = rig.dl();
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "rolled_back");
+    CHECK(o.reason == "apply_failed:pf_load_failed");
+    REQUIRE(contains(o.notes, "detail=/tmp/yuzu-fwq-pf-1.pf:3: syntax error")); // not the -f boilerplate
+    CHECK(rig.world.flush_states == 0); // no state is disturbed for a ruleset that never loaded
+    CHECK(rig.world.tokens.empty());
+    CHECK_FALSE(rig.world.pf_on);
+    CHECK(rig.store.raw.empty());
+}
+
+TEST_CASE("pf: a dangling anchor is refused before anything is loaded or flushed",
+          "[agent][firewall_quarantine]") {
+    PfRig rig;
+    rig.world.referenced = false;
+    auto dl = rig.dl();
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "rolled_back");
+    CHECK(o.reason == "apply_failed:anchor_not_referenced");
+    CHECK_FALSE(rig.world.ran(" -f "));
+    CHECK(rig.world.flush_states == 0);
+    CHECK(rig.world.tokens.empty());
+    CHECK_FALSE(rig.world.pf_on);
+    CHECK(rig.store.raw.empty());
+}
+
+TEST_CASE("pf: an unreadable boot time refuses to guess a token's age", "[agent][firewall_quarantine]") {
+    PfRig rig;
+    rig.boot_readable = false;
+    auto dl = rig.dl();
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "rolled_back");
+    CHECK(o.reason == "apply_failed:boot_time_unreadable");
+    CHECK_FALSE(rig.world.ran(" -E"));    // no reference taken, nothing loaded or flushed
+    CHECK_FALSE(rig.world.ran(" -f "));
+    CHECK(rig.world.flush_states == 0);
+    CHECK(rig.store.raw.empty());
+}
+
+TEST_CASE("pf: a sibling anchor that sorts first makes the result partial, then degraded",
+          "[agent][firewall_quarantine]") {
+    PfRig rig;
+    rig.world.siblings.push_back("com.apple/000.aaa");
+    auto dl = rig.dl();
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "partial");
+    CHECK(contains(o.notes, "anchor_not_first=1"));
+    CHECK(rig.world.anchor_exists); // contained as far as this anchor can, and said so
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "degraded");
+    CHECK(st.reason == "anchor_not_first");
+
+    // re-applying cannot fix a sibling, so a retry neither flushes the states again nor says "active"
+    const auto flushes = rig.world.flush_states;
+    const auto again = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(again.status == "degraded");
+    CHECK(again.reason == "anchor_not_first");
+    CHECK(rig.world.flush_states == flushes);
+
+    // the sibling goes away: healthy
+    rig.world.siblings.pop_back();
+    CHECK(report_status(rig.env, dl).status == "active");
+}
+
+TEST_CASE("pf: pf disabled by someone else with our token stored is repaired with a fresh -E",
+          "[agent][firewall_quarantine]") {
+    for (const bool clears : {false, true}) {
+        INFO("pfctl -d clears references: " << clears);
+        PfRig rig;
+        rig.world.disable_clears_refs = clears;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto old_token = rig.token();
+
+        rig.world.external_disable();
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "degraded");
+        CHECK(st.reason == "pf_disabled");
+        CHECK(contains(st.notes, "pf_token_dead=1"));
+        CHECK(rig.store.state()->phase == Phase::active); // status never mutates
+
+        // the shared driver repairs an `active` record whose OS no longer enforces it
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "active");
+        CHECK(contains(o.notes, "repaired=1"));
+        CHECK(rig.world.pf_on);
+        CHECK(rig.world.enforcing());
+        // the dead token was released best-effort (it may be gone), a fresh one taken and recorded
+        CHECK(rig.world.ran("-X " + old_token));
+        REQUIRE(rig.world.tokens.size() == 1);
+        CHECK(rig.world.tokens[0] != old_token);
+        CHECK(rig.token() == rig.world.tokens[0]);
+        CHECK(report_status(rig.env, dl).status == "active");
+    }
+}
+
+TEST_CASE("pf: boot-time recovery repairs a disabled pf and re-applies after a reboot",
+          "[agent][firewall_quarantine]") {
+    PfRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    const auto first = rig.token();
+
+    // same boot, still enforcing: verified only -- no -E, no load, no flush
+    const auto calls = rig.world.log.size();
+    CHECK(recover_at_init(rig.env, dl).status == "active");
+    CHECK(rig.world.count("pfctl -E", calls) == 0);
+    CHECK(rig.world.count(" -f ", calls) == 0);
+    CHECK(rig.world.flush_states == 1);
+
+    // same boot, pf switched off: repaired
+    rig.world.external_disable();
+    const auto o = recover_at_init(rig.env, dl);
+    CHECK(o.status == "active");
+    CHECK(contains(o.notes, "reapplied=1"));
+    CHECK(rig.world.enforcing());
+    CHECK(rig.token() != first);
+
+    // a reboot: no references, no anchor, a new boot time. A fresh -E, and the stale
+    // token is NOT released (the kernel's count reset; the token means nothing now)
+    const auto stale = rig.token();
+    rig.world.reboot();
+    CHECK(report_status(rig.env, dl).status == "degraded");
+    const auto before = rig.world.log.size();
+    CHECK(recover_at_init(rig.env, dl).status == "active");
+    CHECK(rig.world.enforcing());
+    CHECK(rig.world.count("-X " + stale, before) == 0);
+    CHECK(rig.store.state()->os.boot_time == kPfBoot2);
+    CHECK(rig.token() != stale);
+    CHECK(rig.world.tokens.size() == 1);
+}
+
+TEST_CASE("pf: a crash between -E and the token write leaks one reference, visible, never silent",
+          "[agent][firewall_quarantine]") {
+    PfRig rig;
+    // crash right after -E lands (call 2: info, -E)
+    rig.world.crash.crash_at = 2;
+    rig.world.crash.after_effect = true;
+    auto dl = rig.dl();
+    CHECK_THROWS_AS(apply_and_verify(rig.env, rig.request(), dl), CrashSim);
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::applying); // the recovery record exists
+    CHECK(rig.store.state()->os.pf_token.empty());       // the token never reached it
+    CHECK(rig.world.tokens.size() == 1);                 // and the host holds the reference
+
+    // the next start converges; the orphan reference is the documented residual
+    rig.world.crash.crash_at = -1;
+    CHECK(recover_at_init(rig.env, dl).status == "active");
+    CHECK(rig.world.tokens.size() == 2);
+    const auto st = report_status(rig.env, dl);
+    CHECK(contains(st.notes, "pf_references=2")); // visible to the operator
+
+    // release gives back ours; the orphan remains until reboot (and is named, not hidden)
+    const auto rel = release(rig.env, ReleaseRequest{}, dl);
+    CHECK(rel.status == "inactive");
+    CHECK(contains(rel.notes, "pf_references=1"));
+}
+
+TEST_CASE("pf: a token that cannot be recorded is released at once", "[agent][firewall_quarantine]") {
+    PfRig rig;
+    rig.world.on_enable = [&] { rig.store.fail_save = true; }; // the record write after -E fails
+    auto dl = rig.dl();
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "rolled_back");
+    CHECK(o.reason == "apply_failed:state_not_persisted");
+    CHECK(rig.world.tokens.empty());
+    CHECK_FALSE(rig.world.pf_on);
+    CHECK_FALSE(rig.world.anchor_exists);
+}
+
+TEST_CASE("pf: release is a true undo of the rules and the enable state, and touches nothing global",
+          "[agent][firewall_quarantine]") {
+    SECTION("pf was off before") {
+        PfRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto flushes = rig.world.flush_states;
+        const auto calls = rig.world.log.size();
+        const auto rel = release(rig.env, ReleaseRequest{}, dl);
+        CHECK(rel.status == "inactive");
+        // pre-quarantine comparison: the main ruleset, the Status line, the reference count
+        CHECK_FALSE(rig.world.anchor_exists);
+        CHECK_FALSE(rig.world.pf_on);
+        CHECK(rig.world.tokens.empty());
+        CHECK(rig.store.raw.empty());
+        CHECK(contains(rel.notes, "pf_references=0"));
+        // release is exactly: our anchor's rules, our anchor's nat, our token -- no global flush
+        CHECK(rig.world.flush_states == flushes);
+        CHECK(rig.world.count("-F rules", calls) == 1);
+        CHECK(rig.world.count("-F nat", calls) == 1);
+        CHECK(rig.world.count("-F all", calls) == 0);
+        CHECK(rig.world.count("-F states", calls) == 0);
+        CHECK(rig.world.count(" -f ", calls) == 0);
+        CHECK(rig.world.count(" -d", calls) == 0);
+        CHECK(rig.world.count("-X ", calls) == 1);
+        // idempotent
+        CHECK(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+    }
+    SECTION("another holder's reference is untouched and pf stays on") {
+        PfRig rig;
+        rig.world.pf_on = true;
+        rig.world.tokens.push_back("1111111111111111111"); // e.g. the Application Firewall
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        CHECK(rig.world.tokens.size() == 2);
+        CHECK(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+        CHECK(rig.world.pf_on);
+        REQUIRE(rig.world.tokens.size() == 1);
+        CHECK(rig.world.tokens[0] == "1111111111111111111");
+    }
+}
+
+TEST_CASE("pf: release tolerates a token pf no longer knows, and an anchor that is already gone",
+          "[agent][firewall_quarantine]") {
+    SECTION("vanished token") {
+        PfRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.world.tokens.clear(); // `pfctl -d` cleared the references, say
+        const auto rel = release(rig.env, ReleaseRequest{}, dl);
+        CHECK(rel.status == "inactive");
+        CHECK(contains(rel.notes, "pf_token_release_failed=1"));
+        CHECK_FALSE(rig.world.anchor_exists);
+        CHECK(rig.store.raw.empty());
+    }
+    SECTION("a flush that errors on an anchor that does not exist is a clean release") {
+        PfRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.world.reboot();
+        rig.world.flush_fails_when_absent = true;
+        const auto rel = release(rig.env, ReleaseRequest{}, dl);
+        CHECK(rel.status == "inactive");
+        CHECK(rig.store.raw.empty());
+    }
+    SECTION("a flush that fails on an anchor that IS enforcing is a failed release") {
+        PfRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.world.fail_flush_anchor = true; // refused, and the anchor still holds the block
+        const auto rel = release(rig.env, ReleaseRequest{}, dl);
+        CHECK(rel.status == "partial");
+        CHECK(rel.reason.rfind("release_failed:", 0) == 0);
+        CHECK(rig.store.state()->phase == Phase::releasing); // finished at the next start
+    }
+    SECTION("no token on record: pf is left as found, and said so") {
+        PfRig rig;
+        rig.world.pf_on = true; // someone else's reference
+        rig.world.tokens.push_back("1111111111111111111");
+        auto dl = rig.dl();
+        const auto rel = release(rig.env, ReleaseRequest{}, dl);
+        CHECK(rel.status == "inactive");
+        CHECK(contains(rel.notes, "pf_left_enabled_no_token=1"));
+        CHECK_FALSE(rig.world.ran("-X"));
+        CHECK(rig.world.pf_on);
+    }
+}
+
+TEST_CASE("pf: status shapes", "[agent][firewall_quarantine]") {
+    PfRig rig;
+    auto dl = rig.dl();
+    CHECK(report_status(rig.env, dl).status == "inactive");
+
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    auto st = report_status(rig.env, dl);
+    CHECK(st.status == "active");
+    CHECK(contains(st.notes, "pf_references=1"));
+    CHECK(std::none_of(rig.world.log.begin(), rig.world.log.end(), [](const Argv& a) {
+        return a.size() > 1 && (a[1] == "-d" || a[1] == "-f");
+    }));
+
+    rig.world.referenced = false; // a customer ruleset with no Apple wildcard
+    st = report_status(rig.env, dl);
+    CHECK(st.status == "degraded");
+    CHECK(st.reason == "anchor_not_referenced");
+    // re-applying cannot fix a missing reference: reported, not re-flushed on every retry
+    const auto flushes = rig.world.flush_states;
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "degraded");
+    CHECK(o.reason == "anchor_not_referenced");
+    CHECK(rig.world.flush_states == flushes);
+    rig.world.referenced = true;
+
+    rig.world.anchor_text.clear(); // someone flushed our anchor
+    rig.world.anchor_exists = false;
+    st = report_status(rig.env, dl);
+    CHECK(st.status == "degraded");
+    CHECK(st.reason == "policy_not_blocking");
+    CHECK(contains(st.notes, "pf_anchor_read_failed=1"));
+
+    rig.world.fail_info = true; // pfctl itself is unreadable
+    st = report_status(rig.env, dl);
+    CHECK(st.status == "degraded");
+    CHECK(st.reason == "os_unreadable");
+}
+
+TEST_CASE("pf: a crash at every runner call during apply or release converges at the next start",
+          "[agent][firewall_quarantine]") {
+    int clean_apply = 0, clean_release = 0;
+    {
+        PfRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        clean_apply = rig.world.crash.calls;
+        const auto base = rig.world.crash.calls;
+        REQUIRE(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+        clean_release = rig.world.crash.calls - base;
+    }
+    for (int n = 1; n <= clean_apply; ++n) {
+        for (const bool after : {false, true}) {
+            INFO("apply: crash at call " << n << (after ? " (after its effect)" : " (before its effect)"));
+            PfRig rig;
+            rig.world.crash.crash_at = n;
+            rig.world.crash.after_effect = after;
+            auto dl = rig.dl();
+            bool crashed = false;
+            try {
+                (void)apply_and_verify(rig.env, rig.request(), dl);
+            } catch (const CrashSim&) {
+                crashed = true;
+            }
+            CHECK(crashed);
+            const auto rec = rig.store.state();
+            if (rig.world.anchor_exists)
+                CHECK(rec.has_value()); // never unrecorded rules
+            if (rec && rec->phase == Phase::active)
+                CHECK(rig.world.enforcing());
+            rig.world.crash.crash_at = -1;
+            (void)recover_at_init(rig.env, dl);
+            const auto after_rec = rig.store.state();
+            if (after_rec) {
+                CHECK(after_rec->phase == Phase::active);
+                CHECK(rig.world.enforcing());
+            } else {
+                CHECK_FALSE(rig.world.anchor_exists);
+            }
+        }
+    }
+    for (int n = 1; n <= clean_release; ++n) {
+        for (const bool after : {false, true}) {
+            INFO("release: crash at call " << n << (after ? " after" : " before"));
+            PfRig rig;
+            auto dl = rig.dl();
+            REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+            rig.world.crash.crash_at = rig.world.crash.calls + n;
+            rig.world.crash.after_effect = after;
+            try {
+                (void)release(rig.env, ReleaseRequest{}, dl);
+            } catch (const CrashSim&) {
+            }
+            rig.world.crash.crash_at = -1;
+            (void)recover_at_init(rig.env, dl);
+            CHECK_FALSE(rig.world.anchor_exists);
+            CHECK(rig.world.tokens.empty());
+            CHECK(rig.store.raw.empty());
+        }
+    }
+}
+
+TEST_CASE("nft: an active record the table no longer backs is re-applied from the stored set",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 0), dl).status == "active");
+    const auto stored = rig.store.state()->allow;
+    rig.world.table = false; // another actor deleted our table
+    rig.world.text.clear();
+
+    // a different request must not rewrite the stored allow set
+    auto req = rig.request();
+    req.allow = make_set({"203.0.113.99"}, {ex("10.9.9.9:22/tcp/in")});
+    const auto o = apply_and_verify(rig.env, req, dl);
+    CHECK(o.status == "active");
+    CHECK(contains(o.notes, "repaired=1"));
+    CHECK(contains(o.notes, "allow_set_unchanged_use_quarantine_allow=1"));
+    CHECK(rig.world.table);
+    CHECK(rig.store.state()->allow == stored);
+    CHECK(rig.store.state()->generation == 2);
 }
 
 // ── output rows ─────────────────────────────────────────────────────────────

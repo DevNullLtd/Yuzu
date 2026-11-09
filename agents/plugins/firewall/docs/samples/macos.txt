@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-09 · euid 501 · leg-hash e6a3841cfbc0
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-09 · euid 501 · leg-hash d8f66c5959ab
 == action=state
 backend|appfirewall
 state|disabled
@@ -19,30 +19,13 @@ ruleset|unknown
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=quarantine
-note|macos=pending_design_review
-status|refused|unsupported_platform
-refused|unsupported_platform
-[result_status] UNAVAILABLE / PARTIAL / firewall:refused
-[rc] 1
+[not captured] Destructive/Reversible: not executed on a live host (it contains the host: pf's whole state table is flushed once and every connection the allow set does not cover is cut; run on a disposable macOS VM, see the PR)
 
 == action=release
-note|macos=pending_design_review
-status|refused|unsupported_platform
-refused|unsupported_platform
-[result_status] UNAVAILABLE / PARTIAL / firewall:refused
-[rc] 1
+[not captured] Mutating/Reversible: not executed on a live host (lifts a containment; needs one in force)
 
 == action=quarantine_status
-note|macos=pending_design_review
-status|refused|unsupported_platform
-refused|unsupported_platform
-[result_status] UNAVAILABLE / PARTIAL / firewall:refused
-[rc] 1
+[not captured] agent-context: the containment record lives in the plugin KV store, which plugin-capture does not provide
 
 == action=quarantine_allow
-note|macos=pending_design_review
-status|refused|unsupported_platform
-refused|unsupported_platform
-[result_status] UNAVAILABLE / PARTIAL / firewall:refused
-[rc] 1
-
+[not captured] Mutating/Reversible: not executed on a live host (changes the allow set of a containment in force)

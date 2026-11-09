@@ -458,11 +458,16 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl
 # These lines NARROW the argv shape; they do not confine pfctl: sudo globs match concatenated
 # args, and the anchor file named by -f is agent-generated. The confinement is the firewall
 # plugin's token validation (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp).
+# The bare grant is removed with the quarantine plugin (PRQ.2); until then these lines are
+# cosmetic next to it. The anchor name sorts first among Apple's com.apple/* sub-anchors, and
+# the release flush is -F rules / -F nat on that anchor only (never -F all: that is global).
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -X *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/yuzu_quarantine -f *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/yuzu_quarantine -F all
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/yuzu_quarantine -s rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -f *
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -F rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -F nat
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -s rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple -s Anchors
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -F states
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s info
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s rules

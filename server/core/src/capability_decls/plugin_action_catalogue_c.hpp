@@ -389,13 +389,18 @@ inline constexpr std::array<CommandCapability, 39> kPluginActionCatalogueC{{
         .action = "quarantine",
         // Contains the host: Windows Firewall rule group + per-profile
         // default-block (every other enabled rule disabled for the duration),
-        // an own nftables table (iptables fallback) on Linux, a pf anchor on
-        // macOS. Destructive for the dispatch gate (explicit targets, no
+        // an own nftables table (iptables fallback) on Linux, a pf sub-anchor
+        // on macOS. Destructive for the dispatch gate (explicit targets, no
         // broadcast), but Reversible, unlike the legacy `quarantine.quarantine`
-        // row: `firewall.release` is a true undo on every leg -- it restores
-        // the captured Windows policy and re-enables the rules it disabled,
-        // deletes the nft table / iptables chain, and unloads the pf anchor
-        // and releases its enable token. The row is new, so nothing moves.
+        // row: `firewall.release` undoes the RULES and the ENABLE STATE on
+        // every leg -- it restores the captured Windows policy and re-enables
+        // the rules it disabled, deletes the nft table / iptables chain, and
+        // empties the pf anchor and releases its enable token. It does NOT
+        // restore connections: the macOS apply flushes the whole pf state
+        // table once (and again on each allow-set update), which no release
+        // can undo -- that part is one-way. Containment is also not in force
+        // between boot and the agent's start, on any leg. The row is new, so
+        // nothing moves.
         .dispatch_class = DispatchClass::Destructive,
         .mutability = Mutability::Reversible,
         .securable = "Security",

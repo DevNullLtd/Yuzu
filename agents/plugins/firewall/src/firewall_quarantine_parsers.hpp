@@ -67,7 +67,12 @@ inline constexpr std::string_view kLegacyIptablesChain = "yuzu-quarantine";
 
 inline constexpr std::string_view kNftTable = "yuzu_quarantine";
 inline constexpr std::string_view kIptablesChainPrefix = "yuzu-fwq-";
-inline constexpr std::string_view kPfAnchor = "com.apple/yuzu_quarantine";
+/// pf evaluates the sub-anchors of Apple's `anchor "com.apple/*"` wildcard in
+/// name order and a `quick` pass in an earlier one (200.AirDrop,
+/// 250.ApplicationFirewall, ...) wins, so ours leads with `000.` to sort first.
+inline constexpr std::string_view kPfAnchorParent = "com.apple";
+inline constexpr std::string_view kPfAnchorLeaf = "000.yuzu_quarantine";
+inline constexpr std::string_view kPfAnchor = "com.apple/000.yuzu_quarantine";
 
 inline constexpr std::string_view kTtlTriggerId = "firewall.quarantine.ttl";
 inline constexpr int kTtlPollSeconds = 30; // the trigger engine's floor
@@ -1251,7 +1256,7 @@ struct WinRuleSpec {
                 WinRuleSpec s;
                 s.dir = d;
                 s.protocol = 58;
-                s.icmp_types = "133:*,134:*,135:*,136:*,137:*";
+                s.icmp_types = "133:*,134:*,135:*,136:*";
                 add(std::move(s));
             }
             break;
@@ -1698,7 +1703,9 @@ using Argv = std::vector<std::string>;
         if (r.kind == RuleKind::nd) {
             if (!v6)
                 continue;
-            for (int t = 133; t <= 137; ++t)
+            // 133-136: router/neighbour solicit and advert. 137 (redirect) is not needed
+            // for neighbour discovery and would let a router steer traffic.
+            for (int t = 133; t <= 136; ++t)
                 append({"-p", "icmpv6", "--icmpv6-type", std::to_string(t), "-j", "ACCEPT"});
             continue;
         }
@@ -1813,33 +1820,54 @@ struct IptablesListing {
     return plan;
 }
 
-// ── macOS: pf anchor (pure pieces; the leg itself follows the design review) ──
+// ── macOS: pf anchor (pure pieces; the leg itself is PfLeg, below) ───────────
 
 inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
 
-/// The sub-anchor ruleset. Every rule is `quick`. Loopback is `no state` first
-/// (a lo0 state that dies is the incident class the design note exists for);
-/// control-channel rules carry `flags any keep state` so an in-flight stream
-/// re-creates its state after the post-load state flush; the explicit
-/// `block drop quick all` is last so nothing later in the main ruleset can
-/// override a containment.
+/// The sub-anchor ruleset (design note section 2.2). Every rule is `quick`.
+///  - `no nat all` / `no rdr all` come first: Apple's main ruleset has
+///    `nat-anchor`/`rdr-anchor "com.apple/*"`, translation is first-match, and a
+///    `nat pass` / `rdr pass` in another anchor would otherwise skip the filter.
+///    Translation rules must precede filter rules in a pf file.
+///  - Loopback is `no state`, first among the filter rules: there is no lo0 state
+///    to die (the commit 672896112 incident class).
+///  - The control channel is STATELESS in both directions. A state rebuilt from a
+///    mid-stream packet (`flags any`) lacks the TCP window-scaling factor and
+///    would stall the live stream after the state flush; with `no state` the
+///    flush cannot touch it, and `flags S/SA` is not applied to a `no state` rule.
+///  - DHCP leaves only toward the broadcast address: macOS lets an unprivileged
+///    process bind below 1024, so `to any port 67` would be an exit to anything.
+///    The reply direction stays `from any port 67` (inbound only, no exit).
+///  - ICMPv6 neighbour discovery is 133-136; redirect (137) is not needed.
+///  - `block drop quick all` is last so nothing later can override containment.
 [[nodiscard]] inline std::string pf_anchor_ruleset(const AllowSet& set) {
     std::vector<std::string> lines;
+    lines.emplace_back("no nat all");
+    lines.emplace_back("no rdr all");
     lines.emplace_back("pass quick on lo0 all no state");
     for (const auto& r : flatten(set)) {
         switch (r.kind) {
         case RuleKind::loopback:
             break;
         case RuleKind::nd:
-            lines.emplace_back("pass quick inet6 proto icmp6 icmp6-type { 133, 134, 135, 136, "
-                               "137 } no state");
+            lines.emplace_back("pass quick inet6 proto icmp6 icmp6-type { 133, 134, 135, 136 } "
+                               "no state");
             break;
         case RuleKind::dhcp:
-            lines.emplace_back("pass out quick inet proto udp from any port 68 to any port 67 "
-                               "keep state");
+            lines.emplace_back("pass out quick inet proto udp from any port 68 to 255.255.255.255 "
+                               "port 67 keep state");
             lines.emplace_back("pass in quick inet proto udp from any port 67 to any port 68 "
                                "keep state");
             break;
+        case RuleKind::control: {
+            const auto fam = r.ip.v6 ? "inet6" : "inet";
+            const auto addr = rule_addr_text(r);
+            lines.push_back(std::format("pass out quick {} proto tcp from any to {} port {} no state",
+                                        fam, addr, r.svc_port));
+            lines.push_back(std::format("pass in quick {} proto tcp from {} port {} to any no state",
+                                        fam, addr, r.svc_port));
+            break;
+        }
         default: {
             std::string s = r.dir == Dir::out ? "pass out quick" : "pass in quick";
             s += r.ip.v6 ? " inet6" : " inet";
@@ -1854,18 +1882,8 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
                 if (r.svc_port > 0)
                     s += std::format(" port {}", r.svc_port);
             }
-            if (r.kind == RuleKind::control && r.l4 == Proto::tcp)
-                s += " flags any";
             s += " keep state";
             lines.push_back(std::move(s));
-            if (r.kind == RuleKind::control) {
-                // After the post-load state flush the first packet of the live stream can
-                // be the server's, so the inbound half must be able to create the state
-                // too, not only the agent's outbound one.
-                lines.push_back(std::format(
-                    "pass in quick {} proto tcp from {} port {} to any flags any keep state",
-                    r.ip.v6 ? "inet6" : "inet", rule_addr_text(r), r.svc_port));
-            }
             break;
         }
         }
@@ -1888,13 +1906,23 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
 [[nodiscard]] inline Argv pfctl_release_argv(std::string_view token) {
     return {std::string{kPfctlPath}, "-X", std::string{token}};
 }
-[[nodiscard]] inline Argv pfctl_flush_anchor_argv() {
-    return {std::string{kPfctlPath}, "-a", std::string{kPfAnchor}, "-F", "all"};
+/// Empty OUR anchor only. `-a <anchor> -F all` is not used: pfctl scopes only
+/// rules, nat and tables by anchor; `-F states`, `Sources`, `info` and `osfp` are
+/// global whatever `-a` says, so `-F all` would cut every host connection a second
+/// time at release and zero the global counters.
+[[nodiscard]] inline Argv pfctl_flush_anchor_rules_argv() {
+    return {std::string{kPfctlPath}, "-a", std::string{kPfAnchor}, "-F", "rules"};
+}
+[[nodiscard]] inline Argv pfctl_flush_anchor_nat_argv() {
+    return {std::string{kPfctlPath}, "-a", std::string{kPfAnchor}, "-F", "nat"};
 }
 [[nodiscard]] inline Argv pfctl_info_argv() { return {std::string{kPfctlPath}, "-s", "info"}; }
 [[nodiscard]] inline Argv pfctl_rules_argv() { return {std::string{kPfctlPath}, "-s", "rules"}; }
 [[nodiscard]] inline Argv pfctl_anchor_rules_argv() {
     return {std::string{kPfctlPath}, "-a", std::string{kPfAnchor}, "-s", "rules"};
+}
+[[nodiscard]] inline Argv pfctl_siblings_argv() {
+    return {std::string{kPfctlPath}, "-a", std::string{kPfAnchorParent}, "-s", "Anchors"};
 }
 [[nodiscard]] inline Argv pfctl_references_argv() {
     return {std::string{kPfctlPath}, "-s", "References"};
@@ -1916,32 +1944,74 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
     return std::nullopt;
 }
 
-/// Live enable references from `pfctl -s References`: one entry per line that
-/// leads with a long decimal token. The exact column layout is unverified on a
-/// live host (design note, open question 3), so the parser keys only on the
-/// token and tolerates any trailing description.
+/// Live enable references from `pfctl -s References` ("pid/name of enabler,
+/// token, timestamp", pfctl(8)). The column order is unverified on a live host
+/// (design note, open question 3), so a line counts once when ANY of its fields
+/// is a 15-24 digit decimal -- a token; a pid and an epoch timestamp are shorter.
 [[nodiscard]] inline std::vector<std::string> parse_pf_references(std::string_view text) {
     std::vector<std::string> out;
     for (const auto raw : detail::split(text, '\n')) {
-        const auto line = detail::trim(raw);
-        const auto sp = line.find_first_of(" \t");
-        const auto tok = line.substr(0, sp);
-        if (detail::is_digits(tok, 6, 24))
-            out.emplace_back(tok);
+        std::string_view rest = detail::trim(raw);
+        while (!rest.empty()) {
+            const auto sp = rest.find_first_of(" \t");
+            const auto field = rest.substr(0, sp);
+            if (detail::is_digits(field, 15, 24)) {
+                out.emplace_back(field);
+                break;
+            }
+            if (sp == std::string_view::npos)
+                break;
+            rest = detail::trim(rest.substr(sp));
+        }
     }
     return out;
 }
 
 /// Is Apple's wildcard anchor reference in the main ruleset (`pfctl -s rules`)?
 /// Without it a sub-anchor is never evaluated: the quarantine would be dangling.
+/// The WHOLE line must match: a qualified `anchor "com.apple/*" on en0 ...` only
+/// covers one interface, so a prefix match would call it live. A reference is
+/// necessary, not sufficient (a `pass quick` before it still wins).
 [[nodiscard]] inline bool pf_anchor_referenced(std::string_view rules_text) {
     for (const auto raw : detail::split(rules_text, '\n')) {
         const auto line = detail::trim(raw);
-        if (detail::starts_with(line, "anchor \"com.apple/*\"") ||
-            detail::starts_with(line, "anchor \"com.apple/yuzu_quarantine\""))
+        if (line == "anchor \"com.apple/*\" all" ||
+            line == "anchor \"com.apple/000.yuzu_quarantine\" all")
             return true;
     }
     return false;
+}
+
+/// Does our anchor hold the containment? (`pfctl -a <anchor> -s rules`): the
+/// closing `block drop quick all` is there. An empty anchor reads as absent.
+[[nodiscard]] inline bool pf_anchor_enforcing(std::string_view anchor_rules_text) {
+    for (const auto raw : detail::split(anchor_rules_text, '\n'))
+        if (detail::starts_with(detail::trim(raw), "block drop quick all"))
+            return true;
+    return false;
+}
+
+/// Siblings of our anchor under `com.apple` that pf evaluates BEFORE it, from
+/// `pfctl -a com.apple -s Anchors`. A line counts only if it is one token that is
+/// a direct child (`com.apple/<leaf>` or a bare `<leaf>`); anything else (a
+/// banner, a deeper path) is ignored, so a misread cannot flag a healthy host.
+/// The printed form is unverified on a live host (design note, open question 6).
+[[nodiscard]] inline std::vector<std::string> pf_siblings_before(std::string_view anchors_text) {
+    std::vector<std::string> out;
+    constexpr std::string_view prefix = "com.apple/";
+    for (const auto raw : detail::split(anchors_text, '\n')) {
+        auto name = detail::trim(raw);
+        if (name.empty() || name.find_first_of(" \t") != std::string_view::npos)
+            continue;
+        if (detail::starts_with(name, prefix))
+            name.remove_prefix(prefix.size());
+        if (name.find('/') != std::string_view::npos || !is_safe_token(name))
+            continue;
+        if (name < kPfAnchorLeaf)
+            out.emplace_back(name);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 [[nodiscard]] inline bool pf_enabled(std::string_view info_text) {
@@ -1951,30 +2021,20 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
     return false;
 }
 
-/// `sysctl -n kern.boottime` -> "<sec>.<usec>"; the reference token is only
-/// meaningful for the boot that issued it (the kernel's refcount resets).
-[[nodiscard]] inline std::optional<std::string> parse_kern_boottime(std::string_view text) {
-    const auto sec = text.find("sec = ");
-    const auto usec = text.find("usec = ");
-    if (sec == std::string_view::npos || usec == std::string_view::npos)
-        return std::nullopt;
-    auto num = [&](std::size_t at, std::size_t skip) {
-        auto rest = text.substr(at + skip);
-        std::size_t n = 0;
-        while (n < rest.size() && rest[n] >= '0' && rest[n] <= '9')
-            ++n;
-        return rest.substr(0, n);
-    };
-    const auto s = num(sec, 6);
-    const auto u = num(usec, 7);
-    if (s.empty() || u.empty() || s.size() > 12 || u.size() > 7)
-        return std::nullopt;
-    return std::format("{}.{}", s, u);
-}
+/// What the leg does about pf's enable reference (design note 2.4).
+///  - enable: no token stored, or the token is from another boot (the kernel's
+///    reference count reset at reboot, the token means nothing): take a fresh `-E`.
+///  - reuse:  a token for THIS boot and pf is on: a second `-E` would take a
+///    second reference we would then have to track.
+///  - repair: a token for THIS boot but pf is OFF: someone ran `pfctl -d`, so the
+///    token is dead. Release it best-effort (it may be gone) and take a fresh `-E`.
+enum class PfEnablePlan : std::uint8_t { enable, reuse, repair };
 
-/// Take a fresh `pfctl -E` only when no token is stored for THIS boot.
-[[nodiscard]] inline bool pf_should_enable(const OsPayload& os, std::string_view current_boot) {
-    return os.pf_token.empty() || os.boot_time != current_boot;
+[[nodiscard]] inline PfEnablePlan pf_enable_plan(const OsPayload& os, std::string_view current_boot,
+                                                 bool pf_is_enabled) noexcept {
+    if (os.pf_token.empty() || os.boot_time != current_boot)
+        return PfEnablePlan::enable;
+    return pf_is_enabled ? PfEnablePlan::reuse : PfEnablePlan::repair;
 }
 
 // ── Resolvers ───────────────────────────────────────────────────────────────
@@ -2057,6 +2117,8 @@ using Stage = std::function<std::optional<StagedFile>(std::string_view stem,
 /// Status read of our nft table over netlink; nullopt when it was refused.
 using NftChainReader = std::function<std::optional<NftTableListing>()>;
 using PersistOs = std::function<bool(const OsPayload&)>;
+/// macOS: the current boot's identity (`kern.boottime`), or nullopt when unreadable.
+using BootTime = std::function<std::optional<std::string>()>;
 
 /// The operation-wide deadline. The clock is injectable so a test advances it
 /// from a fake runner instead of sleeping.
@@ -2111,12 +2173,16 @@ enum class OsState : std::uint8_t { enforcing, not_enforcing, unreadable };
 struct LegStatus {
     OsState state = OsState::unreadable;
     bool partial = false;
-    std::string reason; // policy_not_blocking | anchor_not_referenced | ...
+    std::string reason; // policy_not_blocking | pf_disabled | anchor_not_referenced | ...
+    /// False when re-applying cannot repair what is wrong (a dangling anchor, a
+    /// sibling that sorts first): `quarantine` then answers `already_active`
+    /// instead of flushing every pf state again on each retry.
+    bool reapply_helps = true;
     std::vector<std::string> notes;
 };
 
 /// What one OS mechanism can do. Windows implements it over COM in the plugin;
-/// the nft, iptables and (later) pf legs are implemented here over Runner.
+/// the nft, iptables and pf legs are implemented here over Runner.
 class Leg {
 public:
     virtual ~Leg() = default;
@@ -2152,6 +2218,20 @@ namespace detail {
 [[nodiscard]] inline std::string first_line(std::string_view out) {
     const auto nl = out.find('\n');
     return sanitize_text(detail::trim(out.substr(0, nl)), 80);
+}
+
+/// pfctl prints a warning about flushing system rules on every `-f` (success or
+/// not); the useful line of a failure is the first one that is not that boilerplate.
+[[nodiscard]] inline std::string pf_error_line(std::string_view out) {
+    for (const auto raw : split(out, '\n')) {
+        const auto line = trim(raw);
+        if (line.empty() || starts_with(line, "pfctl: Use of -f option") ||
+            starts_with(line, "present in the main ruleset") ||
+            starts_with(line, "See /etc/pf.conf"))
+            continue;
+        return sanitize_text(line, 80);
+    }
+    return {};
 }
 
 /// Every command goes through here: argv charset check, then the deadline.
@@ -2443,6 +2523,229 @@ private:
     bool has_v6_;
 };
 
+// ── macOS leg ───────────────────────────────────────────────────────────────
+
+/// The pf sub-anchor leg (docs/quarantine-macos-pf-anchor-design.md). The main
+/// ruleset is never loaded or rewritten: everything lives in the anchor
+/// `com.apple/000.yuzu_quarantine`, reached through Apple's own wildcard.
+///
+/// One apply, in this order (each step under the operation deadline):
+///   1. `-s info`: is pf on?
+///   2. enable reference (pf_enable_plan): reuse, fresh `-E`, or release a dead token
+///      then `-E`. The token is handed to `persist` IMMEDIATELY, before anything
+///      else depends on pf being on. The `applying` record already exists (the
+///      driver wrote it first), so a crash between `-E` and `persist` leaks one
+///      reference until reboot -- the one residual, visible as `pf_references`.
+///   3. `-s rules`: the main ruleset must reference the wildcard, else fail
+///      `anchor_not_referenced` (before anything is loaded or flushed).
+///   4. `-a com.apple -s Anchors`: a sibling that sorts before ours makes the
+///      result partial (`anchor_not_first`), never a clean success.
+///   5. `-a <anchor> -f <staged file>`: atomic per anchor.
+///   6. `-F states`: pf passes a state-matched packet without evaluating any rule,
+///      so pre-existing connections would survive the load. Retried once; a
+///      failure is a FAILED apply (`state_flush_failed`), never `active`. The
+///      control channel is stateless, so the flush cannot touch it.
+/// A failure before step 5 gives back a reference taken in this call. After the
+/// anchor is loaded the reference is kept: pf stays on, and the driver either
+/// removes the anchor (initial apply) or reports an update failure.
+class PfLeg final : public Leg {
+public:
+    PfLeg(Runner run, Stage stage, BootTime boot)
+        : run_(std::move(run)), stage_(std::move(stage)), boot_(std::move(boot)) {}
+
+    [[nodiscard]] BackendKind kind() const override { return BackendKind::pf; }
+
+    // The retained plugin's pf path loads a whole main ruleset and leaves no
+    // marker in `pfctl -s rules` that could be refused on (design note section 3).
+    [[nodiscard]] std::optional<std::string> preflight(Deadline&) override { return std::nullopt; }
+
+    [[nodiscard]] StepResult apply(const AllowSet& next, std::uint32_t, std::uint32_t, OsPayload& os,
+                                   Deadline& dl, const PersistOs& persist) override {
+        const auto text = pf_anchor_ruleset(next);
+        if (!is_safe_ruleset_text(text))
+            return StepResult::fail("unsafe_ruleset");
+        const auto boot = boot_ ? boot_() : std::nullopt;
+        if (!boot || !is_safe_token(*boot))
+            return StepResult::fail("boot_time_unreadable");
+        detail::Exec ex(run_, dl);
+
+        const OsPayload before = os;
+        bool took = false;
+        auto give_back = [&](StepResult r) {
+            if (took) {
+                auto cdl = dl.fresh(kVerifyBudget);
+                detail::Exec cx(run_, cdl);
+                (void)cx.call(pfctl_release_argv(os.pf_token));
+                os = before;
+                (void)persist(os);
+            }
+            return r;
+        };
+
+        const auto info = ex.call(pfctl_info_argv());
+        if (!info)
+            return StepResult::fail(ex.reason());
+        const auto plan = pf_enable_plan(os, *boot, info->ok() && pf_enabled(info->output));
+        if (plan == PfEnablePlan::repair) {
+            // pf was switched off behind our back: the token is dead. A vanished
+            // token is expected, so the release is best-effort.
+            if (!ex.call(pfctl_release_argv(os.pf_token)))
+                return StepResult::fail(ex.reason());
+            os.pf_token.clear();
+            os.boot_time.clear();
+        }
+        if (plan != PfEnablePlan::reuse) {
+            const auto en = ex.call(pfctl_enable_argv());
+            if (!en)
+                return StepResult::fail(ex.reason());
+            if (!en->ok())
+                return StepResult::fail("pf_enable_failed", detail::pf_error_line(en->output));
+            const auto token = parse_pfctl_token(en->output);
+            if (!token)
+                return StepResult::fail("pf_enable_no_token");
+            os.pf_token = *token;
+            os.boot_time = *boot;
+            took = true;
+            if (!persist(os))
+                return give_back(StepResult::fail("state_not_persisted"));
+        }
+
+        const auto rules = ex.call(pfctl_rules_argv());
+        if (!rules)
+            return give_back(StepResult::fail(ex.reason()));
+        if (!rules->ok())
+            return give_back(StepResult::fail("pf_rules_unreadable", detail::pf_error_line(rules->output)));
+        if (!pf_anchor_referenced(rules->output))
+            return give_back(StepResult::fail("anchor_not_referenced"));
+
+        StepResult ok = StepResult::success();
+        const auto sib = ex.call(pfctl_siblings_argv());
+        if (!sib)
+            return give_back(StepResult::fail(ex.reason()));
+        if (!sib->ok()) {
+            ok.notes.emplace_back("pf_siblings_unreadable=1");
+        } else if (!pf_siblings_before(sib->output).empty()) {
+            ok.partial = true;
+            ok.notes.emplace_back("anchor_not_first=1");
+        }
+
+        const auto staged = stage_("yuzu-fwq-", ".pf", text);
+        if (!staged)
+            return give_back(StepResult::fail("stage_failed"));
+        const auto ld = ex.call(pfctl_load_argv(staged->path));
+        if (!ld)
+            return give_back(StepResult::fail(ex.reason()));
+        if (!ld->ok())
+            return give_back(StepResult::fail("pf_load_failed", detail::pf_error_line(ld->output)));
+
+        bool flushed = false;
+        for (int attempt = 0; attempt < 2 && !flushed; ++attempt) {
+            const auto fl = ex.call(pfctl_flush_states_argv());
+            if (!fl)
+                break; // the deadline is spent: no retry
+            flushed = fl->ok();
+        }
+        if (!flushed)
+            return StepResult::fail("state_flush_failed");
+        return ok;
+    }
+
+    /// Empty OUR anchor (filter rules, then translation rules), then release our
+    /// enable token. Never `-F all`, never `-d`, never a main-ruleset load. A token
+    /// pf no longer knows (after `pfctl -d`, a reboot) fails to release: that is a
+    /// note, not a failed release -- the reference is not ours any more.
+    [[nodiscard]] StepResult remove(OsPayload& os, Deadline& dl) override {
+        detail::Exec ex(run_, dl);
+        for (const auto& argv : {pfctl_flush_anchor_rules_argv(), pfctl_flush_anchor_nat_argv()}) {
+            const auto r = ex.call(argv);
+            if (!r)
+                return StepResult::fail(ex.reason());
+            if (!r->ok() && !anchor_gone(ex))
+                return StepResult::fail("pf_anchor_flush_failed", detail::pf_error_line(r->output));
+        }
+        StepResult ok = StepResult::success();
+        const bool had_token = !os.pf_token.empty();
+        if (had_token) {
+            const auto r = ex.call(pfctl_release_argv(os.pf_token));
+            if (!r && ex.reason() == "deadline_exceeded")
+                return StepResult::fail(ex.reason());
+            if (!r || !r->ok())
+                ok.notes.emplace_back("pf_token_release_failed=1");
+            os.pf_token.clear();
+            os.boot_time.clear();
+        }
+        if (!had_token)
+            if (const auto info = ex.call(pfctl_info_argv()); info && info->ok() && pf_enabled(info->output))
+                ok.notes.emplace_back("pf_left_enabled_no_token=1");
+        if (const auto refs = ex.call(pfctl_references_argv()); refs && refs->ok())
+            ok.notes.push_back(std::format("pf_references={}", parse_pf_references(refs->output).size()));
+        return ok;
+    }
+
+    /// Enforcing needs ALL of: pf on, our anchor holding the closing block, the
+    /// wildcard reference in the main ruleset, no sibling anchor sorting before ours.
+    [[nodiscard]] LegStatus read_status(const OsPayload& os, Deadline& dl) override {
+        LegStatus st;
+        detail::Exec ex(run_, dl);
+        const auto info = ex.call(pfctl_info_argv());
+        if (!info || !info->ok())
+            return st;
+        const auto rules = ex.call(pfctl_rules_argv());
+        if (!rules || !rules->ok())
+            return st;
+        // pfctl and sudo work (the two reads above), so a failure to read just our
+        // anchor means the anchor does not exist -- after a reboot, say.
+        const auto anchor = ex.call(pfctl_anchor_rules_argv());
+        const bool anchor_read = anchor && anchor->ok();
+        if (anchor && !anchor->ok())
+            st.notes.emplace_back("pf_anchor_read_failed=1");
+        const bool loaded = anchor_read && pf_anchor_enforcing(anchor->output);
+        if (const auto refs = ex.call(pfctl_references_argv()); refs && refs->ok())
+            st.notes.push_back(std::format("pf_references={}", parse_pf_references(refs->output).size()));
+        bool sibling_first = false;
+        if (const auto sib = ex.call(pfctl_siblings_argv()); sib && sib->ok())
+            sibling_first = !pf_siblings_before(sib->output).empty();
+        else
+            st.notes.emplace_back("pf_siblings_unreadable=1");
+
+        st.state = OsState::not_enforcing;
+        if (!loaded) {
+            st.reason = "policy_not_blocking";
+        } else if (!pf_enabled(info->output)) {
+            st.reason = "pf_disabled";
+            if (!os.pf_token.empty())
+                st.notes.emplace_back("pf_token_dead=1");
+        } else if (!pf_anchor_referenced(rules->output)) {
+            st.reason = "anchor_not_referenced";
+            st.reapply_helps = false;
+        } else if (sibling_first) {
+            st.reason = "anchor_not_first";
+            st.reapply_helps = false;
+        } else {
+            st.state = OsState::enforcing;
+        }
+        return st;
+    }
+
+private:
+    /// A flush that failed is still a clean release when our anchor cannot be
+    /// addressed at all (pf is readable, the anchor read fails) or holds no
+    /// containment: there is nothing left to flush.
+    [[nodiscard]] bool anchor_gone(detail::Exec& ex) {
+        const auto info = ex.call(pfctl_info_argv());
+        if (!info || !info->ok())
+            return false;
+        const auto a = ex.call(pfctl_anchor_rules_argv());
+        if (!a)
+            return false;
+        return !a->ok() || !pf_anchor_enforcing(a->output);
+    }
+
+    Runner run_;
+    Stage stage_;
+    BootTime boot_;
+};
+
 // ── Drivers ─────────────────────────────────────────────────────────────────
 
 struct Env {
@@ -2585,10 +2888,27 @@ struct ApplyRequest {
         if (cur.phase == Phase::releasing)
             return refused("release_in_progress");
         if (cur.phase == Phase::active) {
+            // An `active` record is only true while the OS still enforces it: another
+            // actor may have undone it (pf switched off, a table deleted, profile
+            // defaults restored). Re-apply the STORED allow set -- a retry never
+            // rewrites a contained host's allow list -- instead of answering
+            // `already_active`. A read that fails changes nothing; a defect a
+            // re-apply cannot fix (a dangling anchor, an earlier sibling) is
+            // reported, not re-applied on every retry.
+            const auto ls = env.leg.read_status(cur.os, dl);
             Outcome o;
-            o.status = "active";
-            o.state = cur;
-            o.notes.emplace_back("already_active=1");
+            if (ls.state == OsState::not_enforcing && ls.reapply_helps) {
+                o = detail::converge(env, cur, cur.allow, dl);
+                o.notes.emplace_back("repaired=1");
+            } else if (ls.state == OsState::not_enforcing) {
+                o.status = "degraded";
+                o.reason = ls.reason;
+                o.state = cur;
+            } else {
+                o.status = "active";
+                o.state = cur;
+                o.notes.emplace_back("already_active=1");
+            }
             if (!(cur.allow == req.allow))
                 o.notes.emplace_back("allow_set_unchanged_use_quarantine_allow=1");
             return o;
@@ -2675,14 +2995,18 @@ namespace detail {
     const auto ap = env.leg.apply(cand.allow, cand.generation, cand.prev_generation, cand.os, dl,
                                   persist);
     if (!ap.ok) {
-        // The previous generation is still in force: put its record back.
-        if (!env.store.save(prev))
+        // The previous generation is still in force: put its record back. The leg's
+        // OS facts are carried over: a pf enable token taken before the failure is
+        // held by the host, and the record is the only way to release it.
+        auto back = prev;
+        back.os = cand.os;
+        if (!env.store.save(back))
             o.notes.emplace_back("state_restore_failed=1");
         if (!ap.detail.empty())
             o.notes.push_back("detail=" + ap.detail);
         o.status = "update_failed";
         o.reason = ap.reason;
-        o.state = prev;
+        o.state = back;
         return o;
     }
     add_notes(o, ap.notes);
@@ -2976,7 +3300,7 @@ struct ReleaseRequest {
         rows.emplace_back("allow|dhcp|udp/67-68");
         for (const auto& r : s.allow.resolvers)
             rows.push_back(std::format("allow|resolver|{}", format_ip(r)));
-        rows.emplace_back("allow|nd|icmpv6/133-137");
+        rows.emplace_back("allow|nd|icmpv6/133-136");
         for (const auto& e : s.allow.exceptions)
             rows.push_back(std::format("allow|exception|{}", canonical(e)));
     }
