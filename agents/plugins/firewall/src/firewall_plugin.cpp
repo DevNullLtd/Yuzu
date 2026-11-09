@@ -1742,18 +1742,19 @@ private:
     return l;
 }
 
-/// Does this host have an IPv6 stack that could carry traffic? Not just
-/// /proc/net/if_inet6 (absent when the module is merely not loaded, which is
-/// transient): an unloaded module counts as a stack, only a host that disabled
-/// IPv6 does not -- so v6 containment is never skipped on a guess.
-[[nodiscard]] bool ipv6_stack_present() {
+/// Does this host have an IPv6 stack that could carry traffic? Three answers:
+/// yes (/proc/net/if_inet6 exists, or disable_ipv6 reads 0), no (disable_ipv6
+/// reads 1: the host turned IPv6 off), and nullopt when neither can be read. The
+/// last is NOT "no": the module may simply not be loaded yet (a socket load
+/// pulls it in) and an unreadable answer must never be read as "IPv4 is the whole
+/// host" (iptables_v6_plan refuses on it when ip6tables is also missing).
+[[nodiscard]] std::optional<bool> ipv6_stack_present() {
     if (::access("/proc/net/if_inet6", F_OK) == 0)
         return true;
     std::ifstream f("/proc/sys/net/ipv6/conf/all/disable_ipv6");
-    if (!f)
-        return false;
     int disabled = 0;
-    f >> disabled;
+    if (!(f >> disabled))
+        return std::nullopt;
     return disabled == 0;
 }
 
@@ -1772,11 +1773,14 @@ private:
         return std::make_unique<fq::NftLeg>(sudo_runner(), temp_file_stage(raw),
                                             read_quarantine_table_netlink);
     if (use == fq::BackendKind::iptables) {
-        // Apply covers v6 only where a stack exists; release and status cover
-        // v6 wherever the tool exists, so a chain built earlier is never orphaned.
+        // Apply decides IPv6 from the tool AND the stack (iptables_v6_plan refuses a
+        // host that may route IPv6 with no ip6tables to cover it); release and
+        // status cover v6 wherever the tool exists, so a chain built earlier is
+        // never orphaned.
         const bool has_ip6 = ::access("/usr/sbin/ip6tables", X_OK) == 0;
-        return std::make_unique<fq::IptablesLeg>(sudo_runner(),
-                                                 has_ip6 && (!for_apply || ipv6_stack_present()));
+        const auto mode = for_apply ? fq::iptables_v6_plan(has_ip6, ipv6_stack_present())
+                                    : (has_ip6 ? fq::V6Mode::cover : fq::V6Mode::v4_only);
+        return std::make_unique<fq::IptablesLeg>(sudo_runner(), mode);
     }
     return nullptr;
 }
@@ -1790,6 +1794,7 @@ constexpr NET_FW_PROFILE_TYPE2 kQuarantineProfiles[] = {
     NET_FW_PROFILE2_DOMAIN, NET_FW_PROFILE2_PRIVATE, NET_FW_PROFILE2_PUBLIC};
 // The prior-policy image is indexed by the same profile position.
 static_assert(std::tuple_size_v<fq::WinPriorPolicy> == std::size(kQuarantineProfiles));
+static_assert(std::tuple_size_v<fq::WinSwitchReading> == std::size(kQuarantineProfiles));
 
 /// A BSTR out-param owner (the shared BStr type only builds by allocating).
 struct OwnedBstr {
@@ -1895,7 +1900,13 @@ public:
             }
             return true;
         });
-        return legacy ? std::optional<std::string>{"legacy_quarantine_active"} : std::nullopt;
+        if (legacy)
+            return std::string{"legacy_quarantine_active"};
+        // A profile whose firewall is switched off (or cannot be read) would make
+        // every rule below inert: refuse before anything is touched.
+        const auto why = fq::win_firewall_switch_token(
+            fq::win_firewall_switch_verdict(read_switch(*policy.get())));
+        return why.empty() ? std::nullopt : std::optional<std::string>{why};
     }
 
     [[nodiscard]] fq::StepResult apply(const fq::AllowSet& next, std::uint32_t gen, std::uint32_t,
@@ -1913,6 +1924,13 @@ public:
         if (FAILED(hr) || !rules)
             return fq::StepResult::fail(hr_token("rules_create", hr));
         yuzu::PluginContext pc{raw_};
+
+        // 0. The master switch, per profile. An init re-apply and an update do not
+        //    pass through preflight, and nothing has been written yet.
+        if (const auto why = fq::win_firewall_switch_token(
+                fq::win_firewall_switch_verdict(read_switch(*policy.get())));
+            !why.empty())
+            return fq::StepResult::fail(why);
 
         // 1. Read the ruleset once: legacy markers, our group, what to disable.
         std::vector<fq::WinRuleInfo> infos;
@@ -2048,11 +2066,24 @@ public:
         undo.committed = true; // this generation is in force; nothing below can fail the update
 
         // 7. Remove the stale generation's rules LAST. One that will not go is
-        //    only a looser allowance left behind: a note, not a failed update.
+        //    not a failed update (this generation is in force) but it IS a live
+        //    allowance the record no longer lists -- an Allow rule outranks the
+        //    default block -- so it is counted from a fresh read, persisted and
+        //    reported PARTIAL, like a rule the policy store refused to disable.
         fq::StepResult ok = fq::StepResult::success();
-        if (!plan.remove.empty())
-            if (const int left = remove_rules_by_name(*rules.get(), plan.remove); left > 0)
-                ok.notes.push_back(std::format("stale_rules_left={}", left));
+        std::size_t stale_left = 0;
+        if (!plan.remove.empty()) {
+            const int failed = remove_rules_by_name(*rules.get(), plan.remove);
+            std::vector<std::string> after;
+            stale_left = collect_our_rule_names(*rules.get(), after)
+                             ? fq::win_stale_residue(after, specs).size()
+                             : static_cast<std::size_t>(failed);
+        }
+        os.stale_rules_left = static_cast<std::uint32_t>(stale_left);
+        if (stale_left > 0) {
+            ok.partial = true;
+            ok.notes.push_back(std::format("stale_rules_left={}", stale_left));
+        }
 
         os.rules_not_disabled = refused;
         if (refused > 0) {
@@ -2083,12 +2114,7 @@ public:
         // this very command travels the control channel our rules keep open).
         // 1. Which of our rules exist (needed to decide the policy fallback below).
         const auto collect_ours = [&](std::vector<std::string>& out) {
-            return for_each_rule(*rules.get(), [&](INetFwRule& r) {
-                auto name = rule_name_of(r);
-                if (fq::is_our_win_rule(name, rule_group_of(r)))
-                    out.push_back(std::move(name));
-                return true;
-            });
+            return collect_our_rule_names(*rules.get(), out);
         };
         std::vector<std::string> ours_at_start;
         if (!collect_ours(ours_at_start))
@@ -2170,6 +2196,7 @@ public:
         if (image_exists)
             (void)pc.storage_delete(prior_key);
         os.rules_not_disabled = 0;
+        os.stale_rules_left = 0;
         return result;
     }
 
@@ -2189,6 +2216,7 @@ public:
                 return true;
             }))
             return st;
+        const auto sw = fq::win_firewall_switch_verdict(read_switch(*policy.get()));
         bool all_block = true;
         for (const auto profile : kQuarantineProfiles) {
             NET_FW_ACTION in = NET_FW_ACTION_ALLOW, out = NET_FW_ACTION_ALLOW;
@@ -2202,6 +2230,18 @@ public:
             st.notes.emplace_back("legacy_quarantine_rules_present=1");
         if (!group)
             st.notes.emplace_back("rules_missing=1");
+        // A switched-off profile makes the rules and the default block inert, so
+        // nothing is enforced; re-applying cannot help (it refuses the same way).
+        // An unreadable switch is unreadable, never a guess either way.
+        if (sw.kind != fq::WinSwitchVerdict::Kind::ok) {
+            st.notes.push_back(std::format("firewall_profile={}", fq::kWinProfileLabels[sw.profile]));
+            if (sw.kind == fq::WinSwitchVerdict::Kind::disabled) {
+                st.state = fq::OsState::not_enforcing;
+                st.reason = "firewall_disabled";
+                st.reapply_helps = false;
+            }
+            return st;
+        }
         st.state = (group && all_block) ? fq::OsState::enforcing : fq::OsState::not_enforcing;
         if (st.state == fq::OsState::not_enforcing)
             st.reason = "policy_not_blocking";
@@ -2209,6 +2249,31 @@ public:
     }
 
 private:
+    /// The master switch per profile, through classify_fw_hr: only S_OK is a
+    /// reading, so S_FALSE and every error stay nullopt (never a guess).
+    [[nodiscard]] static fq::WinSwitchReading read_switch(INetFwPolicy2& policy) {
+        fq::WinSwitchReading r{};
+        for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
+            VARIANT_BOOL on = VARIANT_FALSE;
+            if (classify_fw_hr(policy.get_FirewallEnabled(kQuarantineProfiles[i], &on)) ==
+                FwHrResult::Ok)
+                r[i] = on != VARIANT_FALSE;
+        }
+        return r;
+    }
+
+    /// The names of the rules that are ours (group or prefix); false when the
+    /// enumeration itself failed part-way.
+    [[nodiscard]] static bool collect_our_rule_names(INetFwRules& rules,
+                                                     std::vector<std::string>& out) {
+        return for_each_rule(rules, [&](INetFwRule& r) {
+            auto name = rule_name_of(r);
+            if (fq::is_our_win_rule(name, rule_group_of(r)))
+                out.push_back(std::move(name));
+            return true;
+        });
+    }
+
     /// Removes each named rule from the store; returns how many removals failed.
     [[nodiscard]] static int remove_rules_by_name(INetFwRules& rules,
                                                   const std::vector<std::string>& names) {

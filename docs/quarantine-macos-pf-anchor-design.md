@@ -157,7 +157,10 @@ pfctl -F states
   repair, a boot-time re-apply) the anchor load has already committed the new
   generation (the load is atomic, the flush is not) and recovery never rolls back,
   so the generation IS in force: the leg reports it, the record is written for it
-  and the result is `partial` with `note|state_flush_failed=1` (a boot-time
+  and the result is `partial` with `note|state_flush_failed=1`. The failure is
+  **recorded on the state record** (`flush_failed=1`), so every later
+  `quarantine_status` reads `partial|state_flush_failed` rather than `active`,
+  across a restart too; a flush that succeeds on a later update clears it (a boot-time
   re-apply surfaces it as `note|init_recovery=partial,reapplied=1,state_flush_failed=1`).
   The alternative, loading the previous generation back, would need that
   generation's allow set inside the leg, and would itself end in the same
@@ -171,13 +174,21 @@ pfctl -F states
     `pfctl -d`) no earlier generation flushed anything for this boot, so the
     residual is every state created since the anchor was last in force: when
     another holder had pf enabled since boot, that includes connections opened
-    between boot and agent start. Status stays `partial` because the anchor is
-    committed and the init path never rolls back.
+    between boot and agent start. Status stays `partial` (from the recorded flag,
+    not from anything pf can be asked) because the anchor is committed and the
+    init path never rolls back.
   - The next `quarantine_allow` flushes again (so does a later repair of an anchor
     that stopped being enforced). A later agent start does **not**: it leaves an
     anchor that is enforcing alone, so the remedy for a `partial` carrying
     `state_flush_failed=1` is a `quarantine_allow` that changes the set (one that
-    changes nothing is a no-op and does not flush).
+    changes nothing is a no-op and does not flush); the flag is cleared only by a
+    flush that succeeds.
+  - Converging an interrupted INITIAL apply (a retried `quarantine`, or boot-time
+    recovery of an `applying` record with no earlier generation) is treated as an
+    update, not as an initial apply: it passes the generation it replaces, never 0,
+    so a double flush failure leaves the record following the anchor (the set that
+    is loaded) and reports `partial`, instead of rolling the record back to a set
+    the anchor no longer holds.
 - Prohibited streams die (their next packet matches no state and then
   `block drop quick all`). Loopback survives (stateless). The agent's control
   channel survives: it is stateless, so the flush has nothing of it to remove and

@@ -71,6 +71,8 @@ struct FakeClock {
 struct FakeStore final : StateStore {
     std::string raw;          // empty: absent
     bool fail_save = false;
+    bool fail_erase = false;  // the record cannot be deleted (a locked or read-only store)
+    int fail_save_after = -1; // >= 0: every save after this many successes fails
     int saves = 0;
     StateLoad load() override {
         StateLoad l;
@@ -86,13 +88,15 @@ struct FakeStore final : StateStore {
         return l;
     }
     bool save(const QuarantineState& s) override {
-        if (fail_save)
+        if (fail_save || (fail_save_after >= 0 && saves >= fail_save_after))
             return false;
         ++saves;
         raw = serialize_state(s);
         return true;
     }
     bool erase() override {
+        if (fail_erase)
+            return false;
         raw.clear();
         return true;
     }
@@ -127,8 +131,11 @@ struct NftWorld {
     bool legacy = false;
     Crash crash;
     std::vector<Argv> log;
+    std::function<void(const Argv&)> on_call; // runs before each call's effect (a test hook)
 
     ToolResult effect(const Argv& a) {
+        if (on_call)
+            on_call(a);
         if (a[0] == "/usr/sbin/iptables")
             return done(0, legacy ? "-P INPUT ACCEPT\n-N yuzu-quarantine\n" : "-P INPUT ACCEPT\n");
         if (a[1] == "-f") {
@@ -294,6 +301,34 @@ struct Probe {
             return blocked() ? blocked_result : ProbeOutcome::connected;
         };
     }
+};
+
+/// A leg whose answers a test scripts: the Windows leg's decisions (a switched-off
+/// profile, a stale-generation residue) are COM calls the pure core never sees,
+/// so what the DRIVER does with each answer is pinned through this fake.
+struct ScriptedLeg final : Leg {
+    BackendKind k = BackendKind::windows;
+    std::optional<std::string> refuse;     // preflight
+    std::function<StepResult(OsPayload&)> on_apply = [](OsPayload&) { return StepResult::success(); };
+    LegStatus status = [] {
+        LegStatus l;
+        l.state = OsState::enforcing;
+        return l;
+    }();
+    int applies = 0;
+    int removes = 0;
+    BackendKind kind() const override { return k; }
+    std::optional<std::string> preflight(Deadline&) override { return refuse; }
+    StepResult apply(const AllowSet&, std::uint32_t, std::uint32_t, OsPayload& os, Deadline&,
+                     const PersistOs&) override {
+        ++applies;
+        return on_apply(os);
+    }
+    StepResult remove(OsPayload&, Deadline&) override {
+        ++removes;
+        return StepResult::success();
+    }
+    LegStatus read_status(const OsPayload&, Deadline&) override { return status; }
 };
 
 constexpr const char* kProbeTarget = "192.0.2.80:443";
@@ -675,6 +710,8 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     s.os.ipt_gen = 5;
     s.os.ipt_v6 = true;
     s.os.rules_not_disabled = 3;
+    s.os.stale_rules_left = 2;
+    s.os.state_flush_failed = true;
     s.last_verify = "verified control_ok probe_blocked";
     const auto text = serialize_state(s);
     const auto back = parse_state(text);
@@ -710,6 +747,20 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     CHECK_FALSE(parse_state(replace(text, "probe=192.0.2.80:443", "probe=example.com:443")));
     CHECK_FALSE(parse_state(text + "mystery=1\n"));
     CHECK_FALSE(parse_state(text + "gen=8\n")); // duplicate scalar
+    CHECK_FALSE(parse_state(text + "stale_left=1\n"));
+    CHECK_FALSE(parse_state(text + "flush_failed=1\n"));
+    CHECK_FALSE(parse_state(replace(text, "flush_failed=1", "flush_failed=0")));
+    CHECK_FALSE(parse_state(replace(text, "stale_left=2", "stale_left=many")));
+    // a clean record carries none of the residue keys
+    QuarantineState clean = s;
+    clean.os.rules_not_disabled = 0;
+    clean.os.stale_rules_left = 0;
+    clean.os.state_flush_failed = false;
+    const auto clean_text = serialize_state(clean);
+    CHECK(clean_text.find("stale_left") == std::string::npos);
+    CHECK(clean_text.find("flush_failed") == std::string::npos);
+    CHECK_FALSE(has_residue(parse_state(clean_text)->os));
+    CHECK(residue_reason(back->os) == "rules_not_disabled");
     CHECK_FALSE(parse_state(replace(text, "exc=10.0.0.5:22/tcp/in", "exc=10.0.0.5;rm")));
     // no control endpoint: not a record we could ever have written
     std::string no_ctl;
@@ -938,6 +989,69 @@ TEST_CASE("windows: release restores the captured policy; the default applies on
     CHECK(win_release_policy(odd, 0) == WinProfilePolicy{WinAction::block, WinAction::block});
     // an index outside the three profiles reads as no image
     CHECK(win_release_policy(image, 3) == WinProfilePolicy{WinAction::block, WinAction::allow});
+}
+
+TEST_CASE("windows: a profile with the firewall switched off, or unreadable, refuses containment",
+          "[agent][firewall_quarantine]") {
+    using K = WinSwitchVerdict::Kind;
+    const WinSwitchReading on{true, true, true};
+    CHECK(win_firewall_switch_verdict(on).kind == K::ok);
+    CHECK(win_firewall_switch_token(win_firewall_switch_verdict(on)).empty());
+
+    for (std::size_t i = 0; i < on.size(); ++i) {
+        INFO("profile " << kWinProfileLabels[i]);
+        auto off = on;
+        off[i] = false;
+        const auto d = win_firewall_switch_verdict(off);
+        CHECK(d.kind == K::disabled);
+        CHECK(d.profile == i);
+        const auto dt = win_firewall_switch_token(d);
+        CHECK(dt == "firewall_disabled:" + std::string{kWinProfileLabels[i]});
+        CHECK(is_safe_token(dt));
+
+        auto unreadable = on;
+        unreadable[i] = std::nullopt; // S_FALSE or an error: never a guess
+        const auto u = win_firewall_switch_verdict(unreadable);
+        CHECK(u.kind == K::unreadable);
+        CHECK(u.profile == i);
+        const auto ut = win_firewall_switch_token(u);
+        CHECK(ut == "firewall_state_unreadable:" + std::string{kWinProfileLabels[i]});
+        CHECK(is_safe_token(ut));
+    }
+
+    // every shape: the first disabled profile wins, and a definite "off" outranks
+    // an unreadable profile that sorts before it
+    CHECK(win_firewall_switch_verdict({false, false, false}).profile == 0);
+    const auto mixed = win_firewall_switch_verdict({std::nullopt, true, false});
+    CHECK(mixed.kind == K::disabled);
+    CHECK(mixed.profile == 2);
+    const auto two_unreadable = win_firewall_switch_verdict({true, std::nullopt, std::nullopt});
+    CHECK(two_unreadable.kind == K::unreadable);
+    CHECK(two_unreadable.profile == 1);
+}
+
+TEST_CASE("windows: a stale generation's rules that survive removal are residue",
+          "[agent][firewall_quarantine]") {
+    const auto set = make_set({}, {ex("10.0.0.5:22/tcp/in")});
+    const auto g1 = win_rule_specs(set, 1);
+    const auto g2 = win_rule_specs(set, 2);
+    auto names = [](const std::vector<WinRuleSpec>& v) {
+        std::vector<std::string> out;
+        for (const auto& s : v)
+            out.push_back(s.name);
+        return out;
+    };
+    // a clean removal leaves exactly the current generation: no residue
+    CHECK(win_stale_residue(names(g2), g2).empty());
+    // an old rule that would not delete is residue; the current generation never is
+    auto left = names(g2);
+    left.push_back(names(g1)[1]);
+    CHECK(win_stale_residue(left, g2) == std::vector<std::string>{names(g1)[1]});
+    // a second generation's leftover is counted beside the first's (recomputed per apply)
+    left.push_back(names(g1)[2]);
+    CHECK(win_stale_residue(left, g2).size() == 2);
+    // nothing of the current generation, even when it is all that is left
+    CHECK(win_stale_residue(names(g1), g1).empty());
 }
 
 // ── nftables ────────────────────────────────────────────────────────────────
@@ -1480,6 +1594,90 @@ TEST_CASE("quarantine: an initial apply rolls back to absence", "[agent][firewal
     }
 }
 
+TEST_CASE("rollback: the release intent is saved before the rules come out",
+          "[agent][firewall_quarantine]") {
+    SECTION("`releasing` is on the record by the time the removal runs") {
+        NftRig rig;
+        rig.probe.control_up = false;
+        std::optional<Phase> at_delete;
+        rig.world.on_call = [&](const Argv& a) {
+            if (a.size() > 1 && a[1] == "delete" && rig.store.state())
+                at_delete = rig.store.state()->phase;
+        };
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        REQUIRE(at_delete);
+        CHECK(*at_delete == Phase::releasing);
+        CHECK_FALSE(o.state);
+        CHECK(rig.store.raw.empty());
+        CHECK_FALSE(rig.world.table);
+    }
+    SECTION("an intent write that fails does not stop the removal") {
+        NftRig rig;
+        rig.probe.control_up = false;
+        rig.store.fail_save_after = 1; // the `applying` record landed; nothing after it does
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK_FALSE(rig.world.table); // undoing the failed containment is never skipped
+        CHECK(rig.store.raw.empty());
+        CHECK_FALSE(contains(o.notes, "state_not_persisted=1")); // no record left to be stale
+    }
+    SECTION("both writes failing leaves the stale record and says so") {
+        NftRig rig;
+        rig.probe.control_up = false;
+        rig.store.fail_save_after = 1;
+        rig.store.fail_erase = true;
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK_FALSE(rig.world.table);
+        CHECK(contains(o.notes, "state_not_persisted=1"));
+        CHECK(contains(o.notes, "state_not_erased=1"));
+    }
+    SECTION("a failed erase keeps `releasing`; the next start finishes the release and never re-applies") {
+        NftRig rig;
+        rig.probe.control_up = false;
+        rig.store.fail_erase = true;
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK(contains(o.notes, "state_not_erased=1"));
+        CHECK_FALSE(rig.world.table);
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::releasing);
+        REQUIRE(o.state);
+        CHECK(o.state->phase == Phase::releasing);
+        CHECK(report_status(rig.env, dl).reason == "release_incomplete");
+
+        rig.store.fail_erase = false;
+        const auto mark = rig.world.log.size();
+        const auto r = recover_at_init(rig.env, dl);
+        CHECK(r.status == "inactive");
+        CHECK(rig.store.raw.empty());
+        CHECK_FALSE(rig.world.table);
+        CHECK(std::none_of(rig.world.log.begin() + mark, rig.world.log.end(),
+                           [](const Argv& a) { return a.size() > 1 && a[1] == "-f"; }));
+    }
+    SECTION("a removal that fails keeps `releasing` too") {
+        NftRig rig;
+        rig.probe.control_up = false;
+        rig.world.fail_delete = true;
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK(contains(o.notes, "rollback_incomplete=1"));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::releasing);
+
+        rig.world.fail_delete = false;
+        CHECK(recover_at_init(rig.env, dl).status == "inactive");
+        CHECK_FALSE(rig.world.table);
+        CHECK(rig.store.raw.empty());
+    }
+}
+
 TEST_CASE("quarantine_allow: update keeps the previous generation on failure",
           "[agent][firewall_quarantine]") {
     NftRig rig;
@@ -1774,6 +1972,138 @@ TEST_CASE("recover_at_init with no record does nothing", "[agent][firewall_quara
     CHECK(rig.world.crash.calls == 0);
 }
 
+// ── what the driver does with a leg's Windows-shaped answers ────────────────
+
+namespace {
+
+/// A scripted leg, the store and a probe that is blocked once the leg applied.
+struct ScriptRig {
+    ScriptedLeg leg;
+    FakeStore store;
+    Probe probe;
+    std::int64_t now = 1'700'000'000;
+    Env env;
+    ScriptRig() : env{leg, store, probe.fn(), [this] { return now; }} {
+        probe.blocked = [this] { return leg.applies > 0; };
+    }
+    ApplyRequest request(std::string target = kProbeTarget) {
+        ApplyRequest r;
+        r.allow = make_set();
+        r.probe_target = std::move(target);
+        return r;
+    }
+};
+
+} // namespace
+
+TEST_CASE("a switched-off Windows profile refuses before anything is touched, and is never re-applied over",
+          "[agent][firewall_quarantine]") {
+    SECTION("preflight refusal") {
+        ScriptRig rig;
+        rig.leg.refuse = "firewall_disabled:Public";
+        Deadline dl;
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "refused");
+        CHECK(o.reason == "firewall_disabled:Public");
+        CHECK(rig.leg.applies == 0);
+        CHECK(rig.store.raw.empty());
+        CHECK(render_rows(o)[1] == "refused|firewall_disabled:Public");
+    }
+    SECTION("an apply that finds the switch off (init re-apply, update) fails with the same token") {
+        ScriptRig rig;
+        Deadline dl;
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto before = rig.store.state();
+        rig.leg.on_apply = [](OsPayload&) { return StepResult::fail("firewall_disabled:Domain"); };
+        const auto u = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+        CHECK(u.status == "update_failed");
+        CHECK(u.reason == "firewall_disabled:Domain");
+        CHECK(rig.store.state()->allow == before->allow); // the previous generation stays
+        // and an init re-apply reports it instead of claiming containment
+        rig.leg.status.state = OsState::not_enforcing;
+        const auto r = recover_at_init(rig.env, dl);
+        CHECK(r.status == "degraded");
+        CHECK(r.reason == "reapply_failed:firewall_disabled:Domain");
+    }
+    SECTION("status reads degraded|firewall_disabled; a retried quarantine reports it and does not re-apply") {
+        ScriptRig rig;
+        Deadline dl;
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.leg.status.state = OsState::not_enforcing;
+        rig.leg.status.reason = "firewall_disabled";
+        rig.leg.status.reapply_helps = false;
+        rig.leg.status.notes.emplace_back("firewall_profile=Private");
+
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "degraded");
+        CHECK(st.reason == "firewall_disabled");
+        CHECK(contains(st.notes, "firewall_profile=Private"));
+
+        const auto applies = rig.leg.applies;
+        const auto again = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(again.status == "degraded");
+        CHECK(again.reason == "firewall_disabled");
+        CHECK(rig.leg.applies == applies);
+    }
+    SECTION("a profile that cannot be read is os_unreadable, never a guess") {
+        ScriptRig rig;
+        Deadline dl;
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.leg.status.state = OsState::unreadable;
+        rig.leg.status.notes.emplace_back("firewall_profile=Domain");
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "degraded");
+        CHECK(st.reason == "os_unreadable");
+    }
+}
+
+TEST_CASE("windows stale-generation residue is partial, persisted, and recomputed by every generation",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    Deadline dl;
+    // the first generation: the removal pass left two of a previous generation's rules
+    rig.leg.on_apply = [](OsPayload& os) {
+        os.stale_rules_left = 2;
+        auto r = StepResult::success();
+        r.partial = true;
+        r.notes.emplace_back("stale_rules_left=2");
+        return r;
+    };
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "partial");
+    CHECK(contains(o.notes, "stale_rules_left=2"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::active);
+    CHECK(rig.store.state()->os.stale_rules_left == 2);
+
+    // later statuses read it from the record, not from the apply that saw it
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "stale_rules_left");
+    CHECK(contains(st.notes, "stale_rules_left=2"));
+    CHECK(result_kind(st).partial);
+
+    // an update that removes them clears it
+    rig.leg.on_apply = [](OsPayload& os) {
+        os.stale_rules_left = 0;
+        return StepResult::success();
+    };
+    const auto u = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+    CHECK(u.status == "active");
+    CHECK(rig.store.state()->os.stale_rules_left == 0);
+    CHECK(report_status(rig.env, dl).status == "active");
+
+    // and a boot-time re-apply that leaves some behind says so too
+    rig.leg.status.state = OsState::not_enforcing;
+    rig.leg.on_apply = [](OsPayload& os) {
+        os.stale_rules_left = 1;
+        return StepResult::success();
+    };
+    const auto r = recover_at_init(rig.env, dl);
+    CHECK(r.status == "partial");
+    CHECK(rig.store.state()->os.stale_rules_left == 1);
+}
+
 // ── TTL enforcement through the trigger registry ───────────────────────────
 
 namespace {
@@ -2051,6 +2381,53 @@ TEST_CASE("crash at every runner call during release", "[agent][firewall_quarant
     }
 }
 
+TEST_CASE("crash at every runner call during a rollback: the next start finishes the release, never re-applies",
+          "[agent][firewall_quarantine]") {
+    auto is_load = [](const Argv& a) { return a.size() > 1 && a[1] == "-f"; };
+    std::size_t apply_calls = 0, total = 0;
+    {
+        NftRig rig;
+        rig.probe.control_up = false;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "rolled_back");
+        total = rig.world.log.size();
+        for (std::size_t i = 0; i < rig.world.log.size(); ++i)
+            if (is_load(rig.world.log[i]))
+                apply_calls = i + 1;
+    }
+    REQUIRE(apply_calls > 0);
+    REQUIRE(total > apply_calls);
+
+    for (std::size_t n = apply_calls + 1; n <= total; ++n) {
+        for (const bool after : {false, true}) {
+            INFO("crash at rollback call " << n << (after ? " (after its effect)" : " (before its effect)"));
+            NftRig rig;
+            rig.probe.control_up = false;
+            rig.world.crash.crash_at = static_cast<int>(n);
+            rig.world.crash.after_effect = after;
+            auto dl = rig.dl();
+            bool crashed = false;
+            try {
+                (void)apply_and_verify(rig.env, rig.request(), dl);
+            } catch (const CrashSim&) {
+                crashed = true;
+            }
+            CHECK(crashed);
+            // the intent was durable before the first rule came out
+            const auto rec = rig.store.state();
+            REQUIRE(rec);
+            CHECK(rec->phase == Phase::releasing);
+
+            rig.world.crash.crash_at = -1;
+            const auto mark = rig.world.log.size();
+            (void)recover_at_init(rig.env, dl);
+            CHECK_FALSE(rig.world.table);
+            CHECK(rig.store.raw.empty());
+            CHECK(std::none_of(rig.world.log.begin() + mark, rig.world.log.end(), is_load));
+        }
+    }
+}
+
 // ── drivers over the iptables leg ───────────────────────────────────────────
 
 namespace {
@@ -2064,7 +2441,7 @@ struct IptRig {
     std::int64_t now = 1'700'000'000;
     Env env;
 
-    explicit IptRig(bool v6 = true)
+    explicit IptRig(V6Mode v6 = V6Mode::cover)
         : leg(world.runner(), v6), env{leg, store, probe.fn(), [this] { return now; }} {
         world.clock = &clock;
         probe.blocked = [this] { return !world.fam[std::string{kIptablesPath}].builtin["OUTPUT"].empty(); };
@@ -2109,7 +2486,7 @@ TEST_CASE("iptables: apply builds a generation, jumps in, release removes every 
 }
 
 TEST_CASE("iptables: a v4-only host never touches ip6tables", "[agent][firewall_quarantine]") {
-    IptRig rig(false);
+    IptRig rig(V6Mode::v4_only);
     auto dl = rig.dl();
     CHECK(apply_and_verify(rig.env, rig.request(), dl).status == "active");
     CHECK(std::none_of(rig.world.log.begin(), rig.world.log.end(),
@@ -2119,13 +2496,13 @@ TEST_CASE("iptables: a v4-only host never touches ip6tables", "[agent][firewall_
 TEST_CASE("iptables: a host with the ip6tables binary but no IPv6 stack still releases and reports",
           "[agent][firewall_quarantine]") {
     // Apply covered v4 only (no IPv6 stack then); the binary exists, `ip6tables -S` fails.
-    IptRig rig(/*v6=*/false);
+    IptRig rig(V6Mode::v4_only);
     auto dl = rig.dl();
     REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
     CHECK_FALSE(rig.store.state()->os.ipt_v6);
 
     // The status/release leg is built with v6 = "the binary exists", as the plugin does.
-    IptablesLeg later(rig.world.runner(), /*has_v6=*/true);
+    IptablesLeg later(rig.world.runner(), V6Mode::cover);
     Env later_env{later, rig.store, rig.probe.fn(), [] { return std::int64_t{1'700'000'100}; }};
     rig.world.fail_on = [](const std::string& cmd) { return cmd.starts_with("/usr/sbin/ip6tables"); };
     CHECK(report_status(later_env, dl).status == "active");
@@ -2266,6 +2643,72 @@ TEST_CASE("iptables: a legacy chain is refused; release removes strays", "[agent
     CHECK(o.status == "refused");
     CHECK(o.reason == "legacy_quarantine_active");
     CHECK(rig.chains(kIptablesPath).empty());
+}
+
+TEST_CASE("iptables v6 plan: the tool and the stack are separate facts", "[agent][firewall_quarantine]") {
+    constexpr std::optional<bool> unknown = std::nullopt;
+    // tool x stack
+    CHECK(iptables_v6_plan(true, true) == V6Mode::cover);
+    CHECK(iptables_v6_plan(true, false) == V6Mode::v4_only);
+    CHECK(iptables_v6_plan(true, unknown) == V6Mode::cover); // `ip6tables -S` decides
+    CHECK(iptables_v6_plan(false, true) == V6Mode::refuse_tool_missing);
+    CHECK(iptables_v6_plan(false, false) == V6Mode::v4_only); // IPv6 proven off: IPv4 is the host
+    CHECK(iptables_v6_plan(false, unknown) == V6Mode::refuse_stack_unknown); // unknown is not absent
+
+    CHECK(v6_refusal(V6Mode::cover).empty());
+    CHECK(v6_refusal(V6Mode::v4_only).empty());
+    CHECK(v6_refusal(V6Mode::refuse_tool_missing) == "ip6tables_missing");
+    CHECK(v6_refusal(V6Mode::refuse_stack_unknown) == "ipv6_stack_unknown");
+    CHECK(is_safe_token(v6_refusal(V6Mode::refuse_tool_missing)));
+    CHECK(is_safe_token(v6_refusal(V6Mode::refuse_stack_unknown)));
+}
+
+TEST_CASE("iptables: a host that may route IPv6 with no ip6tables is refused, not contained over IPv4 only",
+          "[agent][firewall_quarantine]") {
+    const std::pair<V6Mode, std::string_view> cases[] = {
+        {V6Mode::refuse_tool_missing, "ip6tables_missing"},
+        {V6Mode::refuse_stack_unknown, "ipv6_stack_unknown"},
+    };
+    for (const auto& [mode, token] : cases) {
+        INFO("mode token " << token);
+        SECTION("quarantine refuses through preflight before any command runs: " + std::string{token}) {
+            IptRig rig(mode);
+            auto dl = rig.dl();
+            const auto o = apply_and_verify(rig.env, rig.request(), dl);
+            CHECK(o.status == "refused");
+            CHECK(o.reason == token);
+            CHECK(rig.world.crash.calls == 0);
+            CHECK(rig.store.raw.empty());
+            CHECK(rig.chains(kIptablesPath).empty());
+            CHECK(render_rows(o)[1] == std::format("refused|{}", token));
+        }
+        SECTION("an init re-apply and an update do not pass preflight, and fail the same way: " +
+                std::string{token}) {
+            IptRig rig; // applied while ip6tables was usable
+            auto dl = rig.dl();
+            REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+            const auto before = *rig.store.state();
+
+            IptablesLeg refusing(rig.world.runner(), mode);
+            Env renv{refusing, rig.store, rig.probe.fn(), [] { return std::int64_t{1'700'000'100}; }};
+
+            const auto u = update(renv, true, {ex("10.0.0.9:443/tcp/in")}, dl);
+            CHECK(u.status == "update_failed");
+            CHECK(u.reason == token);
+            CHECK(rig.store.state()->allow == before.allow);
+            CHECK(rig.chains(kIptablesPath) == std::set<std::string>{"yuzu-fwq-1", "yuzu-fwq-1-f"});
+
+            // a reboot: the chains are gone, the record remains; the re-apply must not build a v4-only table
+            rig.world.fam.clear();
+            const auto mark = rig.world.log.size();
+            const auto r = recover_at_init(renv, dl);
+            CHECK(r.status == "degraded");
+            CHECK(r.reason == "reapply_failed:" + std::string{token});
+            CHECK(std::none_of(rig.world.log.begin() + mark, rig.world.log.end(), [](const Argv& a) {
+                return a.size() > 1 && (a[1] == "-N" || a[1] == "-A" || a[1] == "-I");
+            }));
+        }
+    }
 }
 
 TEST_CASE("iptables: idempotent re-apply leaves one generation, no duplicates",
@@ -2852,6 +3295,117 @@ TEST_CASE("pf: boot-time recovery repairs a disabled pf and re-applies after a r
     }
 }
 
+TEST_CASE("pf: a failed state flush is recorded on the state record; status stays partial until a flush succeeds",
+          "[agent][firewall_quarantine]") {
+    PfRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    CHECK_FALSE(rig.store.state()->os.state_flush_failed);
+
+    rig.world.fail_flush_states = 2;
+    const auto added = ex("10.0.0.9:22/tcp/in");
+    const auto o = update(rig.env, true, {added}, dl);
+    CHECK(o.status == "partial");
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->os.state_flush_failed);
+    CHECK(rig.store.raw.find("flush_failed=1") != std::string::npos);
+
+    // the NEXT status, read from the record: partial with the reason named, not active
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "state_flush_failed");
+    CHECK(contains(st.notes, "state_flush_failed=1"));
+    CHECK(result_kind(st).partial);
+
+    // a restart that finds the anchor enforcing does not flush, so the gap stays visible
+    const auto mark = rig.world.log.size();
+    const auto rec = recover_at_init(rig.env, dl);
+    CHECK(rec.status == "partial");
+    CHECK(rig.world.count("-F states", mark) == 0);
+    CHECK(rig.store.state()->os.state_flush_failed);
+    CHECK(report_status(rig.env, dl).status == "partial");
+
+    // a failed flush on a later update leaves it set; a successful one clears it
+    rig.world.fail_flush_states = 2;
+    CHECK(update(rig.env, false, {added}, dl).status == "partial");
+    CHECK(rig.store.state()->os.state_flush_failed);
+    const auto again = update(rig.env, true, {added}, dl);
+    CHECK(again.status == "active");
+    CHECK_FALSE(rig.store.state()->os.state_flush_failed);
+    CHECK(rig.store.raw.find("flush_failed") == std::string::npos);
+    CHECK(report_status(rig.env, dl).status == "active");
+}
+
+TEST_CASE("pf: a reboot re-apply whose flush fails is partial in the NEXT status too",
+          "[agent][firewall_quarantine]") {
+    PfRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    rig.world.reboot();
+    rig.world.fail_flush_states = 2;
+    const auto o = recover_at_init(rig.env, dl);
+    CHECK(o.status == "partial");
+    CHECK(rig.world.enforcing());
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->os.state_flush_failed);
+
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "state_flush_failed");
+}
+
+TEST_CASE("pf: converging an interrupted INITIAL apply is an update, so the record follows the anchor",
+          "[agent][firewall_quarantine]") {
+    // A crashed first apply left `applying`, gen 1, no previous generation, set A.
+    auto crashed_initial = [&](PfRig& rig) {
+        QuarantineState a;
+        a.phase = Phase::applying;
+        a.generation = 1;
+        a.applied_at = rig.now;
+        a.probe_target = kProbeTarget;
+        a.backend = BackendKind::pf;
+        a.allow = make_set();
+        REQUIRE(rig.store.save(a));
+    };
+    auto set_b = [] { return make_set({"203.0.113.53"}, {ex("10.0.0.9:22/tcp/in")}); };
+
+    SECTION("a retried quarantine with a changed set, both state flushes failing") {
+        PfRig rig;
+        crashed_initial(rig);
+        rig.world.fail_flush_states = 2;
+        auto req = rig.request();
+        req.allow = set_b();
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, req, dl);
+        CHECK(contains(o.notes, "incomplete_apply_converged=1"));
+        // the pf leg reports partial (not a failed initial apply), so the record is
+        // set B -- the set the anchor holds -- not the restored set A
+        CHECK(o.status == "partial");
+        CHECK(contains(o.notes, "state_flush_failed=1"));
+        CHECK(rig.world.anchor_text == pf_anchor_ruleset(set_b()));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->allow == set_b());
+        CHECK(rig.store.state()->phase == Phase::active);
+        CHECK(rig.store.state()->os.state_flush_failed);
+        CHECK(report_status(rig.env, dl).status == "partial");
+    }
+    SECTION("boot-time recovery of the same record") {
+        PfRig rig;
+        crashed_initial(rig);
+        rig.world.fail_flush_states = 2;
+        auto dl = rig.dl();
+        const auto o = recover_at_init(rig.env, dl);
+        CHECK(o.status == "partial");
+        CHECK(contains(o.notes, "state_flush_failed=1"));
+        CHECK(rig.world.anchor_text == pf_anchor_ruleset(make_set()));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::active);
+        CHECK(rig.store.state()->allow == make_set());
+        CHECK(rig.store.state()->os.state_flush_failed);
+        CHECK(report_status(rig.env, dl).reason == "state_flush_failed");
+    }
+}
+
 TEST_CASE("pf: a crash between -E and the token write leaks one reference, visible, never silent",
           "[agent][firewall_quarantine]") {
     PfRig rig;
@@ -3098,6 +3652,33 @@ TEST_CASE("nft: an active record the table no longer backs is re-applied from th
     CHECK(rig.world.table);
     CHECK(rig.store.state()->allow == stored);
     CHECK(rig.store.state()->generation == 2);
+}
+
+TEST_CASE("quarantine on an active record says when a new ttl_seconds was ignored",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl).status == "active");
+    const auto expires = rig.store.state()->ttl_expires;
+    REQUIRE(expires == rig.now + 120);
+
+    rig.now += 30;
+    const auto retry = apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl);
+    CHECK(retry.status == "active");
+    CHECK(contains(retry.notes, "already_active=1"));
+    CHECK(contains(retry.notes, "ttl_unchanged_release_then_quarantine=1"));
+    CHECK(rig.store.state()->ttl_expires == expires); // a retry never rewrites a contained host's expiry
+
+    // no ttl requested: nothing to say
+    const auto quiet = apply_and_verify(rig.env, rig.request(kProbeTarget, 0), dl);
+    CHECK_FALSE(contains(quiet.notes, "ttl_unchanged_release_then_quarantine=1"));
+
+    // the repaired branch (the table vanished) says it too
+    rig.world.table = false;
+    rig.world.text.clear();
+    const auto repaired = apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl);
+    CHECK(contains(repaired.notes, "repaired=1"));
+    CHECK(contains(repaired.notes, "ttl_unchanged_release_then_quarantine=1"));
 }
 
 // ── output rows ─────────────────────────────────────────────────────────────

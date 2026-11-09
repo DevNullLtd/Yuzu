@@ -994,8 +994,41 @@ struct OsPayload {
     std::uint32_t ipt_gen = 0;   // iptables: the live chain generation
     bool ipt_v6 = false;         // iptables: ip6tables was part of the apply (an IPv6 stack existed)
     std::uint32_t rules_not_disabled = 0; // Windows: enabled rules the policy store refused to disable
+    std::uint32_t stale_rules_left = 0;   // Windows: a previous generation's rules that would not delete
+    bool state_flush_failed = false;      // macOS: the anchor load committed but its state flush did not
     friend bool operator==(const OsPayload&, const OsPayload&) = default;
 };
+
+/// Facts the record carries that keep an otherwise enforcing quarantine from being
+/// reported `active`: each is a live gap (an Allow rule or an old connection that
+/// the record no longer lists), so each is persisted and read back by every status
+/// until a later apply clears it.
+[[nodiscard]] inline bool has_residue(const OsPayload& os) noexcept {
+    return os.rules_not_disabled > 0 || os.stale_rules_left > 0 || os.state_flush_failed;
+}
+
+/// The status reason for the first residue, in a fixed order.
+[[nodiscard]] inline std::string_view residue_reason(const OsPayload& os) noexcept {
+    if (os.rules_not_disabled > 0)
+        return "rules_not_disabled";
+    if (os.stale_rules_left > 0)
+        return "stale_rules_left";
+    if (os.state_flush_failed)
+        return "state_flush_failed";
+    return {};
+}
+
+/// `k=v` notes for every residue present.
+[[nodiscard]] inline std::vector<std::string> residue_notes(const OsPayload& os) {
+    std::vector<std::string> n;
+    if (os.rules_not_disabled > 0)
+        n.push_back(std::format("rules_not_disabled={}", os.rules_not_disabled));
+    if (os.stale_rules_left > 0)
+        n.push_back(std::format("stale_rules_left={}", os.stale_rules_left));
+    if (os.state_flush_failed)
+        n.emplace_back("state_flush_failed=1");
+    return n;
+}
 
 struct QuarantineState {
     int version = 1;
@@ -1034,6 +1067,10 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
         out += "ipt_v6=1\n";
     if (s.os.rules_not_disabled != 0)
         out += std::format("not_disabled={}\n", s.os.rules_not_disabled);
+    if (s.os.stale_rules_left != 0)
+        out += std::format("stale_left={}\n", s.os.stale_rules_left);
+    if (s.os.state_flush_failed)
+        out += "flush_failed=1\n";
     if (!s.last_verify.empty())
         out += std::format("verify={}\n", detail::sanitize_text(s.last_verify));
     for (const auto& c : s.allow.control)
@@ -1055,7 +1092,8 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
     bool seen_v = false, seen_phase = false, seen_gen = false, seen_backend = false;
     bool seen_prev = false, seen_applied = false, seen_ttl = false;
     bool seen_probe = false, seen_pf = false, seen_boot = false, seen_ipt = false,
-         seen_verify = false, seen_nd = false, seen_v6 = false;
+         seen_verify = false, seen_nd = false, seen_v6 = false, seen_stale = false,
+         seen_flush = false;
     for (const auto line : detail::split(text, '\n')) {
         if (line.empty())
             continue;
@@ -1085,7 +1123,7 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
             else
                 return std::nullopt;
         } else if (key == "gen" || key == "prev_gen" || key == "ipt_gen" ||
-                   key == "not_disabled") {
+                   key == "not_disabled" || key == "stale_left") {
             const auto v = detail::parse_uint(val, 0x7fffffff);
             if (!v)
                 return std::nullopt;
@@ -1101,6 +1139,10 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
                 if (!once(seen_ipt))
                     return std::nullopt;
                 s.os.ipt_gen = static_cast<std::uint32_t>(*v);
+            } else if (key == "stale_left") {
+                if (!once(seen_stale))
+                    return std::nullopt;
+                s.os.stale_rules_left = static_cast<std::uint32_t>(*v);
             } else {
                 if (!once(seen_nd))
                     return std::nullopt;
@@ -1144,6 +1186,10 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
             if (!once(seen_v6) || val != "1")
                 return std::nullopt;
             s.os.ipt_v6 = true;
+        } else if (key == "flush_failed") {
+            if (!once(seen_flush) || val != "1")
+                return std::nullopt;
+            s.os.state_flush_failed = true;
         } else if (key == "boot_time") {
             if (!once(seen_boot) || !is_safe_token(val))
                 return std::nullopt;
@@ -1495,6 +1541,49 @@ struct WinDisabledMerge {
             p.out == WinAction::allow ? WinAction::allow : WinAction::block};
 }
 
+inline constexpr std::array<std::string_view, 3> kWinProfileLabels{"Domain", "Private", "Public"};
+
+/// The master switch, per profile (same order as WinPriorPolicy): `INetFwPolicy2::
+/// get_FirewallEnabled` read through classify_fw_hr, so nullopt is "unreadable"
+/// (S_FALSE or an error) and never a guess in either direction.
+using WinSwitchReading = std::array<std::optional<bool>, 3>;
+
+struct WinSwitchVerdict {
+    enum class Kind : std::uint8_t { ok, disabled, unreadable } kind = Kind::ok;
+    std::size_t profile = 0; // index into kWinProfileLabels; meaningful unless ok
+};
+
+/// A profile whose firewall is switched off makes every rule and the default
+/// block inert, so containment there would be a lie under `active`. The leg
+/// REFUSES rather than enabling it: the switch is often policy-managed (an enable
+/// is then reverted, unseen), and turning on a firewall an administrator or
+/// another product turned off is not ours to undo on release. A definite "off"
+/// outranks an unreadable profile: it is the actionable fact.
+[[nodiscard]] constexpr WinSwitchVerdict win_firewall_switch_verdict(const WinSwitchReading& enabled) noexcept {
+    for (std::size_t i = 0; i < enabled.size(); ++i)
+        if (enabled[i] && !*enabled[i])
+            return {WinSwitchVerdict::Kind::disabled, i};
+    for (std::size_t i = 0; i < enabled.size(); ++i)
+        if (!enabled[i])
+            return {WinSwitchVerdict::Kind::unreadable, i};
+    return {};
+}
+
+/// The refusal / failure token for a verdict (empty when the switch is on
+/// everywhere): `firewall_disabled:<Profile>` or `firewall_state_unreadable:<Profile>`.
+[[nodiscard]] inline std::string win_firewall_switch_token(const WinSwitchVerdict& v) {
+    switch (v.kind) {
+    case WinSwitchVerdict::Kind::ok:
+        return {};
+    case WinSwitchVerdict::Kind::disabled:
+        return std::format("firewall_disabled:{}", kWinProfileLabels[v.profile % kWinProfileLabels.size()]);
+    case WinSwitchVerdict::Kind::unreadable:
+        return std::format("firewall_state_unreadable:{}",
+                           kWinProfileLabels[v.profile % kWinProfileLabels.size()]);
+    }
+    return {};
+}
+
 struct WinUpdatePlan {
     std::vector<WinRuleSpec> add;      // new rules, created FIRST
     std::vector<std::string> remove;   // stale rules in our group, removed LAST
@@ -1516,6 +1605,16 @@ struct WinUpdatePlan {
             plan.remove.push_back(n);
     }
     return plan;
+}
+
+/// What a finished update still has to answer for: names in our group that are
+/// still present AFTER the removal pass and that the current generation does not
+/// own. An Allow rule outranks the default block, so each is a live allowance the
+/// record no longer lists.
+[[nodiscard]] inline std::vector<std::string>
+win_stale_residue(const std::vector<std::string>& ours_after_remove,
+                  const std::vector<WinRuleSpec>& specs) {
+    return win_update_plan(ours_after_remove, specs).remove;
 }
 
 // ── Linux: nftables ─────────────────────────────────────────────────────────
@@ -2219,7 +2318,9 @@ public:
     /// state, which the caller removes with remove()). A leg that cannot meet
     /// that after its commit point (the pf anchor load) reports success with
     /// `partial` for an update (`prev_gen != 0`), so the record and the output
-    /// describe what is in force.
+    /// describe what is in force. `prev_gen == 0` means only "the driver rolls an
+    /// initial apply back to absence on failure": a convergence or a recovery
+    /// never does, so it passes the generation it replaces (replaced_generation).
     [[nodiscard]] virtual StepResult apply(const AllowSet& next, std::uint32_t gen,
                                            std::uint32_t prev_gen, OsPayload& os, Deadline& dl,
                                            const PersistOs& persist) = 0;
@@ -2381,25 +2482,65 @@ private:
     NftChainReader reader_;
 };
 
+/// What the iptables leg does about IPv6, from two independent facts: is the
+/// `ip6tables` binary there, and does the host have an IPv6 stack that could carry
+/// traffic (nullopt = could not be determined). A missing tool is NOT a missing
+/// stack, and an unreadable stack is NOT an absent one: containment that covers
+/// only IPv4 on a host that may route IPv6 would read `active` over an open path,
+/// so those cells refuse before anything is mutated.
+enum class V6Mode : std::uint8_t {
+    cover,                  // build the ip6tables mirror
+    v4_only,                // no IPv6 stack (proven): IPv4 is the whole host
+    refuse_tool_missing,    // a stack exists but ip6tables does not
+    refuse_stack_unknown,   // no ip6tables and the stack could not be read
+};
+
+[[nodiscard]] constexpr V6Mode iptables_v6_plan(bool has_ip6_tool, std::optional<bool> stack) noexcept {
+    if (stack && !*stack)
+        return V6Mode::v4_only;
+    if (has_ip6_tool)
+        return V6Mode::cover; // stack present, or unknown and `ip6tables -S` will decide
+    return stack ? V6Mode::refuse_tool_missing : V6Mode::refuse_stack_unknown;
+}
+
+/// The refusal token for a mode (empty when the mode applies).
+[[nodiscard]] constexpr std::string_view v6_refusal(V6Mode m) noexcept {
+    switch (m) {
+    case V6Mode::refuse_tool_missing:
+        return "ip6tables_missing";
+    case V6Mode::refuse_stack_unknown:
+        return "ipv6_stack_unknown";
+    case V6Mode::cover:
+    case V6Mode::v4_only:
+        break;
+    }
+    return {};
+}
+
 class IptablesLeg final : public Leg {
 public:
-    IptablesLeg(Runner run, bool has_v6) : run_(std::move(run)), has_v6_(has_v6) {}
+    IptablesLeg(Runner run, V6Mode v6) : run_(std::move(run)), v6_(v6) {}
 
     [[nodiscard]] BackendKind kind() const override { return BackendKind::iptables; }
 
     [[nodiscard]] std::optional<std::string> preflight(Deadline& dl) override {
+        if (const auto why = v6_refusal(v6_); !why.empty())
+            return std::string{why};
         return linux_legacy_preflight(run_, dl);
     }
 
     [[nodiscard]] StepResult apply(const AllowSet& next, std::uint32_t gen, std::uint32_t,
                                    OsPayload& os, Deadline& dl, const PersistOs&) override {
+        // An init re-apply and an update do not pass through preflight.
+        if (const auto why = v6_refusal(v6_); !why.empty())
+            return StepResult::fail(std::string{why});
         struct Fam {
             std::string_view tool;
             bool v6;
             IptablesListing before;
         };
         std::vector<Fam> fams{{kIptablesPath, false, {}}};
-        if (has_v6_)
+        if (cover_v6())
             fams.push_back({kIp6tablesPath, true, {}});
         detail::Exec ex(run_, dl);
         std::uint32_t max_gen = 0;
@@ -2479,14 +2620,14 @@ public:
             }
         }
         os.ipt_gen = eff;
-        os.ipt_v6 = has_v6_;
+        os.ipt_v6 = cover_v6();
         return ok;
     }
 
     [[nodiscard]] StepResult remove(OsPayload& os, Deadline& dl) override {
         detail::Exec ex(run_, dl);
         std::vector<std::string_view> tools{kIptablesPath};
-        if (has_v6_)
+        if (cover_v6())
             tools.push_back(kIp6tablesPath);
         for (int pass = 0; pass < 2; ++pass) {
             bool clean = true;
@@ -2524,7 +2665,7 @@ public:
         detail::Exec ex(run_, dl);
         std::vector<std::string_view> tools{kIptablesPath};
         // v6 is judged only where the apply covered it (an IPv6 stack existed then).
-        if (has_v6_ && os.ipt_v6)
+        if (cover_v6() && os.ipt_v6)
             tools.push_back(kIp6tablesPath);
         bool all = true;
         for (const auto tool : tools) {
@@ -2547,8 +2688,10 @@ public:
     }
 
 private:
+    [[nodiscard]] bool cover_v6() const noexcept { return v6_ == V6Mode::cover; }
+
     Runner run_;
-    bool has_v6_;
+    V6Mode v6_;
 };
 
 // ── macOS leg ───────────────────────────────────────────────────────────────
@@ -2687,12 +2830,15 @@ public:
             // created since it last was -- including, when another holder had pf on
             // since boot, connections opened between boot and agent start. The next
             // quarantine_allow (or a later repair) flushes again; a later agent start
-            // does not (recover_at_init leaves an enforcing anchor alone).
+            // does not (recover_at_init leaves an enforcing anchor alone). The gap is
+            // recorded on the state record (OsPayload::state_flush_failed), so every
+            // status reads `partial` until a flush succeeds.
             if (prev_gen == 0)
                 return StepResult::fail("state_flush_failed");
             ok.partial = true;
             ok.notes.emplace_back("state_flush_failed=1");
         }
+        os.state_flush_failed = !flushed;
         return ok;
     }
 
@@ -2826,10 +2972,22 @@ struct Outcome {
 
 namespace detail {
 
-/// Applied but not completely: the leg said so, or the record remembers rules
-/// the policy store refused to disable.
+/// The live generation a record's successor replaces. An `active` record IS the
+/// live one; an interrupted `applying` one names the one it was replacing, and an
+/// interrupted INITIAL apply (none recorded) is replaced by itself. Never 0: the
+/// legs read `prev_gen == 0` as "the driver rolls back to absence", which a
+/// convergence or a recovery never does -- they only move the record forward.
+[[nodiscard]] inline std::uint32_t replaced_generation(const QuarantineState& st) noexcept {
+    if (st.phase == Phase::active)
+        return st.generation;
+    return st.prev_generation != 0 ? st.prev_generation : st.generation;
+}
+
+/// Applied but not completely: the leg said so, or the record remembers a gap
+/// (rules the policy store refused to disable, a stale generation's rules that
+/// would not delete, a pf state flush that failed).
 [[nodiscard]] inline bool is_partial(const QuarantineState& st, const StepResult& ap) noexcept {
-    return ap.partial || st.os.rules_not_disabled > 0;
+    return ap.partial || has_residue(st.os);
 }
 
 [[nodiscard]] inline bool control_reachable(Env& env, const AllowSet& set, Deadline& dl) {
@@ -2875,23 +3033,30 @@ inline void add_notes(Outcome& o, const std::vector<std::string>& n) {
     o.notes.insert(o.notes.end(), n.begin(), n.end());
 }
 
-/// Undo an initial apply. A removal that fails leaves the record `releasing`, so
-/// the boot-time recovery finishes it on a fresh budget.
+/// Undo an initial apply. The release intent is saved FIRST, exactly as an explicit
+/// release does: a crash after the rules are gone, or an erase that fails, then
+/// leaves `releasing`, which boot recovery finishes -- never `applying`, which it
+/// would re-apply, bringing back the containment that just failed its own control
+/// check. A failed intent write is a note and the removal still proceeds: undoing a
+/// containment whose control channel failed is the safety path, never skipped. The
+/// record is dropped only when the removal and the erase both completed.
 inline Outcome roll_back(Env& env, QuarantineState st, std::string reason, std::string det,
                          Deadline& dl, Outcome o) {
+    st.phase = Phase::releasing;
+    bool saved = env.store.save(st);
     auto cdl = dl.fresh(kOperationBudget);
     const auto rm = env.leg.remove(st.os, cdl);
-    if (rm.ok) {
-        if (!env.store.erase())
-            o.notes.emplace_back("state_not_erased=1");
+    o.state = st;
+    if (!rm.ok) {
+        saved = env.store.save(st); // remove() may have changed the leg's facts
+        o.notes.emplace_back("rollback_incomplete=1");
+    } else if (env.store.erase()) {
         o.state.reset();
     } else {
-        st.phase = Phase::releasing;
-        if (!env.store.save(st))
-            o.notes.emplace_back("state_not_persisted=1");
-        o.notes.emplace_back("rollback_incomplete=1");
-        o.state = st;
+        o.notes.emplace_back("state_not_erased=1");
     }
+    if (o.state && !saved)
+        o.notes.emplace_back("state_not_persisted=1");
     o.status = "rolled_back";
     o.reason = std::move(reason);
     if (!det.empty())
@@ -2957,6 +3122,9 @@ struct ApplyRequest {
             }
             if (!(cur.allow == req.allow))
                 o.notes.emplace_back("allow_set_unchanged_use_quarantine_allow=1");
+            // Same rule for the TTL: a retry never rewrites a contained host's expiry.
+            if (req.ttl_seconds != 0)
+                o.notes.emplace_back("ttl_unchanged_release_then_quarantine=1");
             return o;
         }
         // An earlier apply never finished: converge to the requested set.
@@ -3027,7 +3195,7 @@ namespace detail {
     Outcome o;
     QuarantineState cand = prev;
     cand.phase = Phase::applying;
-    cand.prev_generation = prev.phase == Phase::active ? prev.generation : prev.prev_generation;
+    cand.prev_generation = replaced_generation(prev);
     cand.generation = prev.generation + 1;
     cand.allow = next;
     if (!env.store.save(cand))
@@ -3228,7 +3396,7 @@ struct ReleaseRequest {
         // A record exists, so mutating is permitted; a failed write is a note.
         QuarantineState cand = st;
         cand.phase = Phase::applying;
-        cand.prev_generation = st.phase == Phase::active ? st.generation : st.prev_generation;
+        cand.prev_generation = detail::replaced_generation(st);
         cand.generation = st.generation + 1;
         if (!env.store.save(cand))
             o.notes.emplace_back("state_not_persisted=1");
@@ -3345,11 +3513,10 @@ inline void settle_ttl(Outcome& o, TriggerRegistry& triggers) {
     } else if (ls.state == OsState::not_enforcing) {
         o.status = "degraded";
         o.reason = ls.reason.empty() ? "policy_not_blocking" : ls.reason;
-    } else if (ls.partial || st.os.rules_not_disabled > 0) {
+    } else if (ls.partial || has_residue(st.os)) {
         o.status = "partial";
-        o.reason = st.os.rules_not_disabled > 0 ? "rules_not_disabled" : ls.reason;
-        if (st.os.rules_not_disabled > 0)
-            o.notes.push_back(std::format("rules_not_disabled={}", st.os.rules_not_disabled));
+        o.reason = has_residue(st.os) ? std::string{residue_reason(st.os)} : ls.reason;
+        detail::add_notes(o, residue_notes(st.os));
     } else {
         o.status = st.last_verify.find("unproven") != std::string::npos ? "active_unproven"
                                                                         : "active";

@@ -729,7 +729,10 @@ YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigge
             // parse_trigger_config already logged the specific reason.
             return -3;
         }
-        impl->trigger_engine->register_trigger(std::move(*cfg));
+        // False = the engine's trigger table is full and nothing was registered; the
+        // caller must hear it (plugin.h: non-zero on failure), not read a silent 0.
+        if (!impl->trigger_engine->register_trigger(std::move(*cfg)))
+            return -5;
         return 0;
     } catch (const std::exception& e) {
         spdlog::error("yuzu_register_trigger('{}'): threw: {}", trigger_id, e.what());
