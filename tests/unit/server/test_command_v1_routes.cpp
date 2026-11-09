@@ -1425,29 +1425,6 @@ TEST_CASE("command_v1: check_command_v1_request is total over non-objects",
         CHECK(cv1::check_command_v1_request(v).has_value());
 }
 
-TEST_CASE("POST /api/v1/commands: a destructive pair whose securable is withdrawn inside the "
-          "execution-row write dispatches nothing, cancels the row; failure row reason=permission_revoked "
-          "(#7110)",
-          "[server][command_v1][dispatch][security][7110]") {
-    Rig rig;
-    rig.facts = {.legacy_open = true};
-    rig.visible_agents = Ids{kA};
-    rig.on_create = [&] { rig.perm_denied.insert("Infrastructure:Delete"); };
-    const auto res = rig.post(
-        {{"plugin", "echo"}, {"action", "purge_source"}, {"agent_ids", Ids{kA}}});
-    CHECK(res->status == 403);
-    CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
-    CHECK(rig.dispatch_calls == 0);
-    CHECK(rig.sent().empty());
-    CHECK(rig.exec_created == 1); // the execution row exists ...
-    CHECK(rig.cancelled == std::vector<std::string>{"exec-1"}); // ... and is closed, not left running
-    // Admission, then the recheck after the writes: the pair's own securable both times.
-    CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), "Infrastructure:Delete") == 2);
-    CHECK(rig.has_audit("requested"));
-    CHECK(rig.has_audit("failure", "reason=permission_revoked gate=securable"));
-    CHECK_FALSE(rig.has_audit("success"));
-}
-
 TEST_CASE("POST /api/v1/commands: the caller is re-derived after the writes (visible set shrunk "
           "mid-write confines the dispatch)",
           "[server][command_v1][dispatch][security][7110]") {
@@ -1478,42 +1455,74 @@ TEST_CASE("POST /api/v1/commands: a chokepoint denial on the outcome is zero-rea
 }
 
 TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the execution-row write (the session, "
-          "Execution:Execute at the route gate, or a chokepoint dry run that refuses) dispatches "
-          "nothing for a non-destructive pair, cancels the row; failure row reason=permission_revoked "
-          "(#7110)",
+          "Execution:Execute at the route gate, the pair's own securable, or a chokepoint dry run that "
+          "refuses) dispatches nothing, cancels the row; failure row reason=permission_revoked (#7110)",
           "[server][command_v1][dispatch][security][7110]") {
     struct Withdrawal {
         const char* name;
         std::function<void(Rig&)> mutate; // runs INSIDE the execution-row write
         const char* detail;
         bool counted; // a chokepoint refusal also counts yuzu_server_dispatch_denied_total
+        /// Exact perm_fn calls per "Securable:Operation": the pre-row gate, then the recheck (a
+        /// refusal at the session gate returns before the route gate, so it counts the pre-row one).
+        std::vector<std::pair<const char*, int>> perm_counts;
+        std::function<void(Rig&)> arrange{}; // runs before the post
+        json body = kRead;
     };
     const std::vector<Withdrawal> withdrawals = {
         // Red-before-fix probe for the post-write Execution:Execute recheck: the dry run alone
         // would not catch this (with RBAC off it admits every human principal).
         {"gate=route: Execution:Execute withdrawn inside the execution-row write",
          [](Rig& r) { r.perm_denied.insert("Execution:Execute"); },
-         "reason=permission_revoked gate=route", false},
+         "reason=permission_revoked gate=route", false, {{"Execution:Execute", 2}}},
         {"gate=session: the credentials no longer resolve",
-         [](Rig& r) { r.session_gone = true; }, "reason=permission_revoked gate=session", false},
+         [](Rig& r) { r.session_gone = true; }, "reason=permission_revoked gate=session", false,
+         {{"Execution:Execute", 1}}},
         {"gate=session: the credentials now resolve to another principal",
-         [](Rig& r) { r.principal_flips = true; }, "reason=permission_revoked gate=session", false},
+         [](Rig& r) { r.principal_flips = true; }, "reason=permission_revoked gate=session", false,
+         {{"Execution:Execute", 1}}},
         {"gate=dispatch: chokepoint dry run refuses after the writes",
          [](Rig& r) {
              r.authorize_denial = detail::DispatchDenial{detail::DispatchDenialReason::ApprovalRequired,
                                                          "Infrastructure", authz::Operation::Write};
          },
-         "gate=dispatch dispatch_reason=approval_required", true},
+         "gate=dispatch dispatch_reason=approval_required", true, {{"Execution:Execute", 2}}},
+        // The pair's own securable, decided before and after the writes (a Destructive pair).
+        {"gate=securable: the destructive pair's own securable withdrawn inside the write",
+         [](Rig& r) { r.perm_denied.insert("Infrastructure:Delete"); },
+         "reason=permission_revoked gate=securable", false,
+         {{"Execution:Execute", 2}, {"Infrastructure:Delete", 2}},
+         [](Rig& r) { r.visible_agents = Ids{kA}; },
+         json{{"plugin", "echo"}, {"action", "purge_source"}, {"agent_ids", Ids{kA}}}},
+        // The caller is derived from the session as it resolves AFTER the writes: an admin whose JIT
+        // elevation lapsed mid-write is a user by then and an AdminOrApproval pair refuses.
+        {"gate=dispatch: the caller is derived from the session as it resolves AFTER the writes (JIT "
+         "lapse)",
+         [](Rig& r) { r.session.role = auth::Role::user; },
+         // script_exec.exec's own securable IS Execution:Execute: the route gate and the pair's
+         // securable are one pair, each decided before and after the writes.
+         "gate=dispatch dispatch_reason=approval_required", true, {{"Execution:Execute", 4}},
+         [](Rig& r) {
+             r.session.role = auth::Role::admin; // admin at both pre-row resolutions
+             r.visible_agents = Ids{kA};
+         },
+         json{{"plugin", "script_exec"},
+              {"action", "exec"},
+              {"params", {{"command", "id"}}},
+              {"agent_ids", Ids{kA}}}},
     };
     for (const auto& w : withdrawals) {
         DYNAMIC_SECTION(w.name) {
             Rig rig;
             rig.facts = {.legacy_open = true};
+            if (w.arrange)
+                w.arrange(rig);
             rig.on_create = [&] { w.mutate(rig); };
-            const auto res = rig.post(kRead);
+            const auto res = rig.post(w.body);
             CHECK(res->status == 403);
             CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
             CHECK(rig.dispatch_calls == 0);
+            CHECK(rig.sent().empty());
             CHECK(rig.exec_created == 1);
             CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
             CHECK(rig.has_audit("requested"));
@@ -1523,29 +1532,8 @@ TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the execution-ro
             CHECK(rig.metrics
                       .counter("yuzu_server_dispatch_denied_total", {{"reason", "approval_required"}})
                       .value() == (w.counted ? 1 : 0));
-            if (std::string_view(w.name).starts_with("gate=route"))
-                // Admission, then the recheck after the writes: the route's own gate both times.
-                CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), "Execution:Execute") == 2);
+            for (const auto& [pair, n] : w.perm_counts)
+                CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), pair) == n);
         }
     }
-}
-
-TEST_CASE("POST /api/v1/commands: the caller is derived from the session as it resolves AFTER the "
-          "writes (a JIT elevation that lapsed mid-write refuses an AdminOrApproval pair) (#7110)",
-          "[server][command_v1][dispatch][security][7110]") {
-    Rig rig;
-    rig.facts = {.legacy_open = true};
-    rig.visible_agents = Ids{kA};
-    rig.session.role = auth::Role::admin; // admin at both pre-row resolutions
-    rig.on_create = [&] { rig.session.role = auth::Role::user; }; // the elevation lapses mid-write
-    const auto res = rig.post({{"plugin", "script_exec"},
-                               {"action", "exec"},
-                               {"params", {{"command", "id"}}},
-                               {"agent_ids", Ids{kA}}});
-    CHECK(res->status == 403);
-    CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
-    CHECK(rig.dispatch_calls == 0);
-    CHECK(rig.sent().empty());
-    CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
-    CHECK(rig.has_audit("failure", "gate=dispatch dispatch_reason=approval_required"));
 }

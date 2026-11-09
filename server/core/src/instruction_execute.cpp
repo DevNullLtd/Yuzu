@@ -710,36 +710,35 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                          def_token);
     }
 
-    // 8b. #7110: the surface's own writes are done (the `requested` row and the execution row),
-    //     so decide its permission AGAIN, as late as the core can, and re-derive the caller: a
-    //     grant or a JIT elevation can move while either row is written. A refusal closes both
-    //     rows (`failure` outcome, execution cancelled) and dispatches nothing. What is NOT
-    //     re-decided: the dispatch chokepoint's own provenance-record write sits between its
-    //     authorization and the send (docs/user-manual/rest-api.md).
+    // 8b. #7110: the surface's own writes are done (the requested row and the execution row); a
+    //     grant, a JIT elevation or a visible set can move while either is written, so decide
+    //     again here. Not re-decided: the chokepoint's own provenance-record write, see
+    //     docs/user-manual/rest-api.md 'Refused after the audit row'.
     std::optional<DispatchCaller> readmitted;
     try {
         readmitted = p.readmit();
     } catch (...) { // fail closed: a throwing recheck is a withdrawn permission
         readmitted = std::nullopt;
     }
-    if (!readmitted) {
-        c.audit("failure", "reason=permission_revoked definition=" + def_token +
-                               " execution_id=" + execution_id);
+    // Both refusals close the rows alike: a `failure` outcome, the execution cancelled.
+    const auto refuse_after_rows = [&](Refusal r, const std::string& detail) {
+        c.audit("failure", detail + " execution_id=" + execution_id);
         cancel_row(c, execution_id);
-        return Outcome{make_refusal(RefusalKind::kPermissionRevoked, "permission_revoked",
-                                    "permission revoked after the request was recorded",
-                                    "this request was not dispatched; the permission it needs was "
-                                    "withdrawn while it was being recorded, and retrying will not "
-                                    "help until it is granted again"),
-                       c.audit_dropped};
-    }
+        return Outcome{std::move(r), c.audit_dropped};
+    };
+    if (!readmitted)
+        return refuse_after_rows(
+            make_refusal(RefusalKind::kPermissionRevoked, "permission_revoked",
+                         "permission revoked after the request was recorded",
+                         "this request was not dispatched; the permission it needs was withdrawn "
+                         "while it was being recorded, and retrying will not help until it is "
+                         "granted again"),
+            "reason=permission_revoked definition=" + def_token);
     const DispatchCaller& caller = *readmitted; // the fresh caller is the one dispatched
     if (auto decision = p.authorize(caller, def.plugin, def.action); !decision) {
         Refusal r = dispatch_denied_refusal(p, def, decision.error());
-        c.audit("failure", "reason=" + r.reason + " definition=" + def_token +
-                               " execution_id=" + execution_id);
-        cancel_row(c, execution_id);
-        return Outcome{std::move(r), c.audit_dropped};
+        const std::string detail = "reason=" + r.reason + " definition=" + def_token;
+        return refuse_after_rows(std::move(r), detail);
     }
 
     // OMITTED agent_ids + OMITTED scope is a deliberate broadcast and is NAMED, never inferred

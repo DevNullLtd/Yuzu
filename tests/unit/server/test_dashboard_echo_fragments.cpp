@@ -1332,11 +1332,13 @@ TEST_CASE("echo-execute and the echo.status scan: a denial on the outcome is rep
         const char* body;
         const char* action;
         const char* no_agents_text; // what the pre-#7114 fold-in said
+        const char* metric;         // the counter the denied head bumps; null: it counts nothing
     };
     const Arm arms[] = {
-        {"/api/dashboard/echo-execute", "sql=SELECT+1", "echo.sql", "No agents connected"},
+        {"/api/dashboard/echo-execute", "sql=SELECT+1", "echo.sql", "No agents connected", nullptr},
         {"/fragments/echo/retention-paused/scan", "", "echo.status.scan",
-         "None of the agents in your scope are currently connected"},
+         "None of the agents in your scope are currently connected",
+         "yuzu_echo_scan_dispatched_total"},
     };
     for (const auto& arm : arms) {
         DYNAMIC_SECTION(arm.action) {
@@ -1356,8 +1358,8 @@ TEST_CASE("echo-execute and the echo.status scan: a denial on the outcome is rep
             CHECK(h.audit_detail(arm.action, "failure") ==
                   "reason=dispatch_denied dispatch_reason=forbidden");
             CHECK(h.audits_for(arm.action, "success") == 0);
-            if (std::string_view(arm.action) == "echo.status.scan")
-                CHECK(h.metric("yuzu_echo_scan_dispatched_total", "forbidden") == 1.0);
+            if (arm.metric)
+                CHECK(h.metric(arm.metric, "forbidden") == 1.0);
         }
     }
 }

@@ -235,11 +235,10 @@ struct Ports {
         authorize;
     /// #7110: the post-write recheck. Called ONCE, after the `requested` audit row AND the execution
     /// row (the core's last own writes) and before the dispatch: the surface re-decides its OWN route
-    /// permission and re-derives the caller (a grant, a JIT elevation or a visible set can change
-    /// while either write is in flight). Returns the freshly derived caller, which is the one
-    /// dispatched; `nullopt` = the surface's permission was withdrawn (`kPermissionRevoked`, the
-    /// execution row cancelled, nothing dispatched). Unset -> `Misconfigured` (fail closed, never
-    /// "no gate"), refused BEFORE the `requested` row.
+    /// permission and re-derives the caller (see instruction_execute.cpp 8b). Returns the freshly
+    /// derived caller, which is the one dispatched; `nullopt` = the surface's permission was
+    /// withdrawn (`kPermissionRevoked`, the execution row cancelled, nothing dispatched). Unset ->
+    /// `Misconfigured` (fail closed, never "no gate"), refused BEFORE the `requested` row.
     std::function<std::optional<DispatchCaller>()> readmit;
     /// `ApprovalManager::submit(def, user, scope, "", kInstruction, plugin, action)`. Unset means
     /// there is no approval manager: a non-auto definition then answers `ApprovalUnavailable`.

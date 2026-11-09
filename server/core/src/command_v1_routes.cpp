@@ -379,15 +379,10 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         }
     };
 
-    // #7110: the route's own writes are done (the `requested` row and the execution row), so decide
-    // the admission AGAIN, as late as the route can: a grant, a JIT elevation or a visible set can
-    // move while either row is written, and the first decision was taken before both. Same inputs
-    // as the first, the session first (the one the caller is derived from, and the one dispatched
-    // as), then the route's own Execution:Execute gate, for a Destructive/Targeted pair the pair's
-    // own securable (each gate wrote its 403 on refusal), then the chokepoint dry run on the
-    // re-derived caller. A refusal closes both rows (`failure` outcome, execution cancelled) and
-    // dispatches nothing. What is NOT re-decided: the dispatch chokepoint's own provenance-record
-    // write sits between its authorization and the send (docs/user-manual/rest-api.md).
+    // #7110: the route's own writes are done (the requested row and the execution row); a grant, a
+    // JIT elevation or a visible set can move while either is written, so decide again here.
+    // Not re-decided: the chokepoint's own provenance-record write, see
+    // docs/user-manual/rest-api.md 'Refused after the audit row'.
     {
         const auto revoked = [&](std::string_view how) {
             (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
