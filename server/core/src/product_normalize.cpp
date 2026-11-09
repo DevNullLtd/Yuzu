@@ -148,8 +148,13 @@ NormalizedTitle normalize_title(std::string_view raw) {
     std::vector<std::string> kept;
     for (auto& token : split_tokens(ascii_lower(raw))) {
         const std::string_view t = trim_wrapping(token);
-        if (t.empty() || is_version_token(t) || is_arch_token(t))
+        if (t.empty() || is_arch_token(t))
             continue;
+        if (is_version_token(t)) {
+            if (out.version.empty())
+                out.version = std::string{t.front() == 'v' ? t.substr(1) : t};
+            continue;
+        }
         if (is_edition_token(t)) {
             if (out.edition.empty())
                 out.edition = std::string{t};
@@ -162,6 +167,10 @@ NormalizedTitle normalize_title(std::string_view raw) {
 }
 
 std::string normalize_vendor(std::string_view raw) {
+    // FIRST, on the raw bytes: once ascii_lower/tokenising has run, a `via:` label could alias
+    // a real vendor.
+    if (raw.starts_with(kOriginLabelPrefix))
+        return {};
     std::vector<std::string> tokens;
     for (const auto& token : split_tokens(ascii_lower(raw))) {
         std::string t = trim_vendor_token(token);
@@ -183,16 +192,21 @@ std::string normalize_vendor(std::string_view raw) {
     return stripped;
 }
 
-std::string norm_key(std::string_view title, std::string_view vendor) {
-    const NormalizedTitle nt = normalize_title(title);
-    std::string key = normalize_vendor(vendor);
+std::string make_norm_key(std::string_view norm_vendor, std::string_view norm_title,
+                          std::string_view edition) {
+    std::string key{norm_vendor};
     key += ':';
-    key += nt.title;
-    if (!nt.edition.empty()) {
+    key += norm_title;
+    if (!edition.empty()) {
         key += ':';
-        key += nt.edition;
+        key += edition;
     }
     return key;
+}
+
+std::string norm_key(std::string_view title, std::string_view vendor) {
+    const NormalizedTitle nt = normalize_title(title);
+    return make_norm_key(normalize_vendor(vendor), nt.title, nt.edition);
 }
 
 double match_confidence(MatchTier tier) {

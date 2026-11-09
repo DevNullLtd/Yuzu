@@ -46,6 +46,7 @@
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
 #include "settings_security_render.hpp" // Security page: pure SSO / 2FA / HTTPS / mTLS renderers
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter (not a store outage)
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -1286,7 +1287,7 @@ function arFeedback(msg, isError) {
   fb.textContent = msg;
   fb.style.color = isError ? 'var(--bad)' : 'var(--ok)';
 }
-function arPost(url, body, onSuccess) {
+function arPost(url, body, onSuccess, onFailure) {
   fetch(url, {
     method: 'POST',
     credentials: 'include',
@@ -1297,8 +1298,13 @@ function arPost(url, body, onSuccess) {
       var data = {};
       try { data = JSON.parse(t); } catch (e) {}
       if (!r.ok) {
-        var msg = (data && (data.error || data.message)) || ('Action failed (' + r.status + ')');
+        // The error envelope is {error: {message, ...}}: read the message, not the object (a
+        // plain string `error` and a top-level `message` stay accepted).
+        var e = data && data.error;
+        var msg = (e && (typeof e === 'string' ? e : e.message)) || (data && data.message) ||
+                  ('Action failed (' + r.status + ')');
         arFeedback(msg, true);
+        if (onFailure) onFailure();
         return;
       }
       arFeedback('Done.', false);
@@ -1306,6 +1312,7 @@ function arPost(url, body, onSuccess) {
     });
   }).catch(function () {
     arFeedback('Network error — the action may not have applied', true);
+    if (onFailure) onFailure();
   });
 }
 function arLoadCampaign(id) {
@@ -1316,7 +1323,9 @@ function arOpenCampaign(form) {
   var title = (form.elements['title'].value || '').trim();
   if (!title) return false;
   arPost('/api/v1/access-reviews', {title: title}, function (data) {
-    if (data && data.campaign_id) arLoadCampaign(data.campaign_id);
+    // The success body is the A4 envelope {data: {campaign_id, grant_count}, meta}.
+    var d = data && data.data;
+    if (d && d.campaign_id) arLoadCampaign(d.campaign_id);
   });
   return false;
 }
@@ -1329,13 +1338,27 @@ function arAttest(btn) {
   }
   var row = btn.closest('tr');
   var justEl = row ? row.querySelector('[data-ar-justification]') : null;
+  // Every extra click would be a valid request that appends another decision, so every
+  // decision button in the campaign stays disabled until the answer arrives (re-enabled only on
+  // failure; on success the campaign is re-drawn).
+  var btns = document.querySelectorAll('#ar-campaign button');
+  function arSetBusy(busy) { for (var i = 0; i < btns.length; i++) btns[i].disabled = busy; }
+  arSetBusy(true);
   arPost('/api/v1/access-reviews/' + encodeURIComponent(d.campaignId) + '/attestations', {
     principal_type: d.principalType,
     principal_id: d.principalId,
     role_name: d.roleName,
     decision: d.decision,
     justification: justEl ? justEl.value : ''
-  }, function () { arLoadCampaign(d.campaignId); });
+  }, function (data) {
+    // The success body is the A4 envelope {data: {recorded, decision_seq, previous_decision}}.
+    // Another reviewer may have decided this grant since the page was drawn: say so.
+    var r = data && data.data;
+    if (r && typeof r.previous_decision === 'string' && r.previous_decision !== 'pending')
+      arFeedback('Done. This replaced an earlier "' + r.previous_decision + '" decision; the ' +
+                 'earlier decision stays in the history.', false);
+    arLoadCampaign(d.campaignId);
+  }, function () { arSetBusy(false); });
 }
 function arCloseCampaign(btn) {
   var id = btn.dataset.campaignId;
@@ -1465,7 +1488,7 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
                 "<div class=\"mini-field\" style=\"flex:1\">"
                 "<label>Campaign title</label>"
                 "<input type=\"text\" name=\"title\" placeholder=\"e.g. Q3 2026 access review\" "
-                "required>"
+                "maxlength=\"256\" required>"
                 "</div>"
                 "<button class=\"btn btn-primary\" type=\"submit\">Open review campaign</button>"
                 "</form>";
@@ -1492,12 +1515,26 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
         return html;
     }
 
+    // A malformed id never reaches the store; the shared validator is the one REST, MCP and the
+    // Access page use.
+    if (!valid_campaign_id(campaign_id)) {
+        html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
+        return html;
+    }
+
     auto view_res = access_review_store_->get_campaign(campaign_id);
     if (!view_res.has_value()) {
-        // Covers both the store's machine-checkable "not_found: ..." (unknown
-        // campaign id) and a genuine read failure — either way, an honest
-        // notice rather than a blank panel.
-        html += "<div class=\"feedback-error\">" + html_escape(view_res.error()) + "</div></div>";
+        // The store's machine-checkable "not_found: " prefix separates an unknown campaign id
+        // (it answered) from a genuine read failure. Neither shows the store's own text, which
+        // carries its classification prefix. A genuine read failure is logged.
+        if (view_res.error().starts_with("not_found:")) {
+            html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
+            return html;
+        }
+        spdlog::warn("settings access-review campaign: read failed: {}",
+                     ::yuzu::log_key_token(view_res.error()));
+        html += "<div class=\"feedback-error\">Access review campaign could not be read. "
+                "Please retry.</div></div>";
         return html;
     }
     const auto& view = *view_res;
@@ -1505,6 +1542,14 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     httplib::Response probe;
     bool can_attest = perm_fn_(req, probe, "AccessReview", "Attest");
     bool is_open_campaign = view.campaign.status == "open";
+    // The signed-in reviewer: the server refuses a reviewer who is the subject of a user grant,
+    // so that row shows no Attest or Flag (a courtesy, not the control), like the Access page.
+    std::string viewer;
+    if (can_attest && auth_fn_) {
+        httplib::Response who_probe;
+        if (auto who = auth_fn_(req, who_probe))
+            viewer = who->username;
+    }
 
     html += "<h4 style=\"margin:1rem 0 0.25rem\">Campaign: " + html_escape(view.campaign.title) +
             " <span class=\"role-badge " + (is_open_campaign ? "role-admin" : "role-user") +
@@ -1537,6 +1582,9 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     } else {
         for (const auto& a : view.attestations) {
             bool pending = a.decision == "pending";
+            const bool own =
+                !viewer.empty() && a.principal_type == "user" && a.principal_id == viewer;
+            const bool editable = pending && is_open_campaign && !own;
             std::string decision_cls = pending                         ? "role-user"
                                        : a.decision == "flagged_revoke" ? "role-warn"
                                                                         : "role-ok";
@@ -1556,14 +1604,16 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                     ar_fmt_epoch_ms(a.decided_at_ms) + "</td>";
             if (can_attest) {
                 html += "<td>";
-                if (pending && is_open_campaign) {
+                if (editable) {
                     html += "<input type=\"text\" data-ar-justification placeholder=\"optional\" "
                             "style=\"width:140px\">";
                 } else {
                     html += a.justification.empty() ? "—" : html_escape(a.justification);
                 }
                 html += "</td><td>";
-                if (pending && is_open_campaign) {
+                if (pending && is_open_campaign && own) {
+                    html += "<span class=\"hint\">Another reviewer must decide</span>";
+                } else if (editable) {
                     html += "<button class=\"btn btn-primary\" "
                             "data-campaign-id=\"" +
                             html_escape(campaign_id) + "\" data-principal-type=\"" +
@@ -4867,22 +4917,33 @@ void SettingsRoutes::register_routes(
                 // principal strings, not just the count — mirrors the SCIM
                 // seam's `revoke_linked_credentials_or_fail`.
                 enumerate_principals_for_audit(*principals);
-            if (!revoke_result.api_tokens_persisted) {
-                revoke_detail += " api_tokens_db_error=true";
-                spdlog::error("DELETE /api/settings/users: revoke_for_principal did not "
-                             "persist for one or more principals linked to '{}' — refusing to "
-                             "report a clean delete (ADR-2001 §3 fail-closed)",
+            if (!revoke_result.all_persisted()) {
+                // #4772: the durable session DELETE is held to the same fail-closed contract
+                // as the token revoke (a surviving session row is rehydrated by another
+                // replica or after a restart).
+                if (!revoke_result.api_tokens_persisted)
+                    revoke_detail += " api_tokens_db_error=true";
+                if (!revoke_result.sessions_persisted)
+                    revoke_detail += " sessions_db_error=true";
+                spdlog::error("DELETE /api/settings/users: the credential revoke did not "
+                             "persist (api_tokens={}, sessions={}) for one or more principals "
+                             "linked to '{}' — refusing to report a clean delete (ADR-2001 §3 "
+                             "fail-closed)",
+                             revoke_result.api_tokens_persisted, revoke_result.sessions_persisted,
                              username);
                 audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
+                // A fixed literal from `failed_legs_phrase` (never user data), so it is safe
+                // inside the HX-Trigger JSON below.
+                const std::string what(failed_legs_phrase(revoke_result));
                 res.status = 500;
-                res.set_header(
-                    "HX-Trigger",
-                    R"({"showToast":{"message":"Failed to revoke API tokens for one or more )"
-                    R"(linked identities — try again","level":"error"}})");
-                res.set_content(
-                    detail::a4_error(res, "Failed to revoke API tokens for one or more linked "
-                                           "identities — try again"),
-                    "application/json");
+                res.set_header("HX-Trigger",
+                               R"({"showToast":{"message":"Failed to revoke )" + what +
+                                   R"( for one or more linked identities — try again",)"
+                                   R"("level":"error"}})");
+                res.set_content(detail::a4_error(res, "Failed to revoke " + what +
+                                                          " for one or more linked "
+                                                          "identities — try again"),
+                                "application/json");
                 return;
             }
             erase_principals = std::move(*principals);
@@ -6998,6 +7059,7 @@ void SettingsRoutes::register_routes(
         }
         if (!init) {
             const char* msg = "Enrollment failed";
+            bool csprng_detail = false; // #6995: audit detail only; the operator msg is unchanged
             if (init.error() == AuthDBError::MfaAlreadyEnrolled) {
                 msg = "MFA is already enabled — disable it first to re-enroll";
             } else if (is_store_unavailable(init.error())) {
@@ -7006,13 +7068,21 @@ void SettingsRoutes::register_routes(
                 // never mislead the operator into retrying a fundamentally
                 // broken step; no MFA state changes either way.
                 msg = "Authentication store is temporarily unavailable — retry shortly";
-                if (metrics_registry_) {
+                if (is_entropy_failure(init.error())) {
+                    // #6995: a CSPRNG fault, not a store outage — own counter, same 503-class msg.
+                    mfa_entropy::count(metrics_registry_, mfa_entropy::kSiteEnroll);
+                    csprng_detail = true;
+                } else if (metrics_registry_) {
                     metrics_registry_
                         ->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                         .increment();
                 }
             }
-            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username, msg);
+            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
+                      csprng_detail
+                          ? std::string{"csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
+                                        "fail-closed)"}
+                          : std::string{msg});
             res.set_content(render_mfa_fragment(*session, {}, {}, {}, {}, msg),
                             "text/html; charset=utf-8");
             return;
@@ -7112,15 +7182,24 @@ void SettingsRoutes::register_routes(
                           return;
                       }
                       const bool store_unavailable = is_store_unavailable(codes_res.error());
-                      if (store_unavailable && metrics_registry_) {
+                      // #6995: a recovery-code CSPRNG fault rolled the enrolment back. Still the
+                      // same 503-class operator message, but counted in
+                      // yuzu_secure_random_failure_total, not as a store outage.
+                      const bool entropy_unavailable = is_entropy_failure(codes_res.error());
+                      if (entropy_unavailable) {
+                          mfa_entropy::count(metrics_registry_, mfa_entropy::kSiteRecovery);
+                      } else if (store_unavailable && metrics_registry_) {
                           metrics_registry_
                               ->counter("yuzu_auth_secret_unavailable_total",
                                        {{"route", "mfa_enroll"}})
                               .increment();
                       }
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
-                                store_unavailable ? "secret/store unavailable (fail-closed)"
-                                                  : "code rejected");
+                                entropy_unavailable
+                                    ? "csprng_unavailable: mfa_recovery (mfa_verify_enrollment, "
+                                      "fail-closed, enrollment rolled back)"
+                                : store_unavailable ? "secret/store unavailable (fail-closed)"
+                                                    : "code rejected");
                       const char* msg =
                           store_unavailable
                               ? "Authentication store is temporarily unavailable — retry shortly."
@@ -7226,8 +7305,26 @@ void SettingsRoutes::register_routes(
                   }
                   auto codes = db->mfa_regenerate_recovery_codes(session->username);
                   if (!codes) {
+                      // #6995: a refused regeneration is counted like its siblings. A CSPRNG
+                      // fault goes to yuzu_secure_random_failure_total; any other store fault to
+                      // yuzu_auth_secret_unavailable_total{route="mfa_recovery"}. A business
+                      // outcome (e.g. UserNotFound) stays audit-only: not an alertable fault.
+                      const bool entropy_unavailable = is_entropy_failure(codes.error());
+                      if (entropy_unavailable) {
+                          mfa_entropy::count(metrics_registry_, mfa_entropy::kSiteRecovery);
+                      } else if (is_store_fault(codes.error()) && metrics_registry_) {
+                          metrics_registry_
+                              ->counter("yuzu_auth_secret_unavailable_total",
+                                        {{"route", "mfa_recovery"}})
+                              .increment();
+                      }
                       audit_fn_(req, "mfa.recovery_codes.generated", "error", "User",
-                                session->username, "regeneration failed");
+                                session->username,
+                                entropy_unavailable
+                                    ? "csprng_unavailable: mfa_recovery "
+                                      "(mfa_regenerate_recovery_codes, fail-closed, existing codes "
+                                      "unchanged)"
+                                    : "regeneration failed");
                       res.set_content(
                           render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Could not regenerate codes. Your existing "

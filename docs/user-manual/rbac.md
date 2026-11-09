@@ -20,6 +20,12 @@ curl -s -b cookies.txt -X PUT \
 
 A call authorised by a session cookie must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`); without one, or with one naming another site, it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers need no header. The same rule applies to the two role-assignment routes under "Fleet-Wide Role Assignment" below.
 
+To read the current setting, any signed-in session may call `GET /api/v1/rbac/enforcement` (or the `get_rbac_enforcement` MCP tool). It returns `enabled` (this replica's cached view of the switch), `unconfirmed` (that view could not be re-confirmed) and an advisory `administrator` verdict (`may`, `may_not` or `unconfirmed`) on whether your own credential could change it. **Client rule: when `unconfirmed` is `true`, treat enforcement as ON whatever `enabled` says** (`enabled: false, unconfirmed: true` is a stale "off" that is being treated as on). The two uses of the word are different things: the top-level `unconfirmed` is about the cached view, the value `administrator: "unconfirmed"` is about the verdict, and every combination of the three fields is a legitimate answer; the combination table and next-action guidance are in [rest-api.md](rest-api.md#get-apiv1rbacenforcement).
+
+`administrator` means: `may`, the RBAC administration routes (role assignment and the toggle) would admit this credential's durable authority now; `may_not`, they would refuse it; `unconfirmed`, a required store could not answer, so retry. The verdict is decided from durable grant rows, or from the local account role when enforcement is off (the cached view only selects which applies); it is neither forced nor hidden when the view is unconfirmed. While the cached value is a stale off (`enabled: false` with `unconfirmed: true`), an account with no Administrator grant row reads `administrator: "unconfirmed"`, because the predicate cannot tell a missing grant from a stale view. While it is a stale on (`enabled: true` with `unconfirmed: true`), the same account reads `administrator: "may_not"`, because enforcement is on and a missing grant row is a confirmed absence. **`may` is advisory and is not a go signal for a mutation:** it excludes the REST MFA step-up, the MCP tier and approval ladder, and the `409` destination check below, so a readonly-tier MCP administrator reads `may` and `set_rbac_enforcement` still refuses it. With enforcement on, only durable user-type Administrator grants count; with enforcement off, the caller's local account role is what counts (an inactive account is a confirmed absence). So an account whose Administrator authority is not a durable grant on an active local account (for example a SAML sign-in, a SCIM-deactivated account, a temporarily elevated session, or an Administrator held only through a group) reads `may_not`; in practice an OpenID Connect principal reads `may_not` today: the assignment routes cannot write a grant for an `oidc:` principal id (see #5182), and a first sign-in whose account provisioning failed leaves no account row. A grant installed by other means (direct SQL, see "If the guard refuses an action you intend") on an active provisioned account would read `may` with enforcement on. A just-revoked Administrator reads `may_not` on a fresh read; what can lag on another replica is the cached `enabled` value, which only selects which source applies. A service-scoped token never receives a verdict (it is refused `403` first). On REST an engine session and an MCP-tier token read `may_not` (for an MCP-tier token that means this credential cannot administer RBAC through REST, which says nothing about its owner's roles); on MCP an administrator reads `may` whatever its tier.
+
+The value is a per-replica cached view, so a replica that never observed an enable can read `enabled: false, unconfirmed: false` while another replica enforces; for an auditor, the access-review export's `rbac_enforcement` label is the stronger read. The route is session-only (it is not RBAC-gated, like `GET /api/v1/me`), refuses a service-scoped token, returns nothing about other principals, and audits each successful read as `rbac.enforcement.read` on a deployment with a wired audit sink (REST fails closed with `503` and `Sec-Audit-Failed` when that row cannot be saved).
+
 The toggle refuses unless the **calling operator** passes BOTH of the following: a `403` unless they hold authority under the regime that is durably true **right now** (the SOURCE regime — this closes a cross-replica cache-staleness gap in the outer admin gate itself, see below), and a `409` unless they would remain a durable administrator under the **destination** regime after the switch — it never gambles with a lockout.
 
 - **Enabling** requires the caller's own fleet-wide `Administrator` grant (a `principal_roles` row, joined to an active `auth.users` account) as the destination check — the exact authority `is_rbac_administrator`'s RBAC-on branch will require of the caller on their very next request — **and**, as the source check (RBAC is currently off), the caller's own local account holding the `admin` role. Refused with a remediation naming the assignment call: `POST /api/v1/rbac/roles/Administrator/assignments` for yourself (or the `assign_rbac_role` MCP tool), then retry.
@@ -144,6 +150,16 @@ Recommended order for a fresh install:
 > body carries the same text for every caller, but htmx does not display it for this form). The store-degraded case above answers `503`
 > with its own error toast ("Agent count unavailable. The response store could not be read. Nothing
 > was created. Retry shortly.") on the same channel, and also creates nothing.
+> When the `group.create_from_results` `attempted` audit row cannot be stored (#3619, ADR-0033
+> §9: the row is written after every check above and before the group is created),
+> `group-from-results` answers `503` with `Sec-Audit-Failed: true` and the toast "The audit record
+> could not be stored. Nothing was created. Retry once the audit store recovers.", and creates
+> nothing. Because that write can wait on the audit store, the session, `ManagementGroup:Write`
+> and the visible agent set are decided again after it: a session that is gone answers `401`, a
+> withdrawn `ManagementGroup:Write` grant the permission gate's refusal (normally `403`),
+> and a visible set that no longer holds any matched
+> agent the `422` above; each creates nothing and records `group.create_from_results` `failure`
+> (`session_revoked`, `permission_revoked name=<group name>`, `scope_revoked`).
 >
 > **Admission on these three routes is unchanged (#1712 follow-up, tracked for
 > ADR-0017 PR-B).** Each route still gates on its own flat
@@ -311,7 +327,7 @@ Recommended order for a fresh install:
 
 ## The authorization topology floor (#2376)
 
-Eleven reads are treated as **authorization topology or audit evidence**
+Twelve reads are treated as **authorization topology or audit evidence**
 rather than ordinary operational data. Wherever the legacy RBAC-off fallback is the branch in
 effect, they require the `admin` session role — the generic “any Read is
 allowed” rule does not reach them. (With RBAC **enabled** they are ordinary
@@ -331,17 +347,18 @@ admitted; the floor never overrides a live RBAC grant.)
 | `AnalyticsConfig:Read` (#4028) | Analytics/offload configuration status, `GET /api/v1/settings/analytics` |
 | `Forensics:Read` | Windows forensic-artefact and per-device application-usage reads (Wave 7 PR7.2), per-app privacy-permission grants and per-account SSH access (`remote_access_audit`); also the stored responses of those Forensics-tier plugins on every response read path (REST, MCP, dashboard), which are served only to a caller holding it |
 | `AuditLog:Read` (#5771) | The audit trail itself (SOC 2 CC6.1/CC7.2 evidence): `GET /api/audit`, `GET /api/v1/audit`, `GET /api/v1/audit/auth-sample`, `GET /api/v1/engine-principals/audit/no-admin`, the `query_audit_log` and `audit_engine_no_admin` MCP tools, and the `yuzu://audit/recent` MCP resource; and the dashboard views that quote the audit trail's text, including the revoke Detail of the Settings **Engine Principals** panel, the revocation detail of the Access **Tokens and principals** page, the Access audit log and sample fragments (`/fragments/access/audit/log`, `/fragments/access/audit/sample`) and the Dashboard activity panel (`/fragments/dashboard/activity`, which first requires the Administrator account role and then the grant) |
+| `RevocationSource:Read` (ADR-0070 R1) | The registered CRL sources, `GET /api/v1/crypto/revocation-sources*` and `list_revocation_sources`/`get_revocation_source`: the operator-registered **egress targets** (CRL URLs the server will fetch, with their confirmed address classes and fetch status) map internal network topology. The surface is additionally behind the durable-administrator check in **both** RBAC states, so this floor is the RBAC-off half of a two-part control. |
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
-that includes these eleven. On a default install (RBAC ships disabled) that
+that includes these twelve. On a default install (RBAC ships disabled) that
 handed a plain `user` session read access to the authorization topology
 itself: who holds what role, and the complete access-review grant
 population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
 access — and, until #5771, the full audit trail (who did what, to which
 target, with what outcome, plus the free-text detail and, on the legacy
 `GET /api/audit` route, each actor's role and source IP). The floor closes
-that gap by denying these eleven reads to a
+that gap by denying these twelve reads to a
 non-admin whenever the legacy fallback is the branch in effect — never by
 changing behavior under a live RBAC grant.
 
@@ -352,7 +369,7 @@ particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
 + `AccessReview:Attest`) continues to reach the access-review export exactly
 as before — the floor never overrides that grant.
 
-**If you are relying on a non-admin reaching one of these eleven reads on an
+**If you are relying on a non-admin reaching one of these twelve reads on an
 RBAC-disabled install,** that access is now denied. The supported remedy is
 to enable RBAC and grant the appropriate role rather than to expect a
 non-admin session to reach authorization topology while RBAC is off:
@@ -530,7 +547,7 @@ Settings uses, so the two stay equivalent.
   persist, the page says so and waits for you to choose to continue instead of redirecting at once.
   "Sign out all other sessions" is shown as not available yet.
 - **Turning enforcement on or off.** The **RBAC enforcement** panel shows the current setting to
-  every signed-in user (the cached view that `GET /api/v1/me` reports as `rbac_enabled`, plus an unconfirmed state that `/me` cannot show) and gives a durable
+  every signed-in user (the cached view that `GET /api/v1/me` reports as `rbac_enabled`, plus an unconfirmed state that `/me` cannot show; `GET /api/v1/rbac/enforcement` returns both) and gives a durable
   Administrator (the same check as above) an **Enforce roles** switch. For anyone else the switch is disabled with
   "Only a durable Administrator can change this."; when the authority check cannot be answered it is disabled
   with "Your administrator authority could not be confirmed. Reload to try again." The switch always shows what the server holds: clicking it
@@ -539,9 +556,11 @@ Settings uses, so the two stay equivalent.
   not remain an administrator, or the source regime does not recognise you) are shown with their
   remediation text. When the server cannot confirm the setting the panel says **Unconfirmed**
   instead of On or Off; it treats enforcement as on until it can. See "Enabling RBAC" for the
-  lockout guards. An administrator who signs in through single sign-on always sees the switch
-  disabled: the controls need a local account that holds the `Administrator` grant (see
-  "SSO-only fleets" under Enabling RBAC). After **Assign role** or **Remove** only the Role
+  lockout guards. An administrator who signs in through SAML or OpenID Connect always sees the switch
+  disabled in practice: the controls need a local account that holds the `Administrator` grant,
+  and the assignment routes cannot write a grant for an `oidc:` principal id (see "SSO-only
+  fleets" under Enabling RBAC). A grant installed by direct SQL on an active provisioned OpenID
+  Connect account would enable it with enforcement on. After **Assign role** or **Remove** only the Role
   assignments panel reloads, so the switch can lag (for example after you grant yourself
   `Administrator`): reload the page once.
 - **Why is a control disabled or missing?** The Assign role button, the per-row Remove controls
@@ -551,15 +570,17 @@ Settings uses, so the two stay equivalent.
      an active local administrator account (the check reads the RBAC store for the regime and
      the authentication database for the account). The RBAC enforcement panel shows which
      regime applies; `rbac_enabled` in `GET /api/v1/me` is the server's cached view of the
-     switch, can lag a change, and does not report the could-not-confirm state.
+     switch, can lag a change, and does not report the could-not-confirm state;
+     `GET /api/v1/rbac/enforcement` reports that state and the same advisory `administrator` verdict the page draws the switch from (except while the view is unconfirmed: the page then skips the verdict and shows **Unconfirmed**, whereas the route still returns it).
   2. Enforcement is on and the account does not hold the fleet-wide `Administrator` grant, as
      with an account administrator created after RBAC was enabled. Another Administrator assigns
      it. The affected account often cannot read the Role assignments panel itself (it needs
      `AccessReview:Read`), so another Administrator has to check its grants there or in the
      access-review export.
-  3. The session is not a local account with an active row. SSO administrators, MCP-tier and
-     service-scoped tokens and engine credentials are never offered the controls, and JIT
-     elevation does not count. An account whose role is `user` that holds the grant sees the
+  3. The session is not a local account with an active row and a grant. SAML administrators
+     (no account row) and OpenID Connect administrators (an account row, but in practice no
+     durable grant today), MCP-tier and service-scoped tokens and engine credentials are never
+     offered the controls, and JIT elevation does not count. An account whose role is `user` that holds the grant sees the
      controls but still reads "not available to your account" on the Users and Account panels,
      which need the `Administrator` account role.
   4. The controls are disabled with "Your administrator authority could not be confirmed.
@@ -648,13 +669,13 @@ Eight roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 CRUD operations on all 38 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (193 permissions) | Server admins, security team leads |
+| **Administrator** | All 5 CRUD operations on all 39 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (198 permissions) | Server admins, security team leads |
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
 | **ApiTokenManager** | Read, Write, Delete, Rotate on ApiToken (4 permissions) | Create, revoke, rotate, and manage API tokens for programmatic access |
-| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Workflow:Read, plus Decommission:Delete (93 permissions). Excludes 20 of the 38 securable types, including UserManagement, Security, ApiToken, AccessReview and EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
+| **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState, plus Workflow:Read, plus Decommission:Delete (93 permissions). Excludes 21 of the 39 securable types, including UserManagement, Security, ApiToken, AccessReview and EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
 | **Viewer** | Read on 24 securable types (24 permissions) — an explicit allow-list in `rbac_store.cpp`'s seed, *not* “everything except” | Helpdesk staff, auditors, read-only dashboards |
-| **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant |
+| **Reviewer** | Read and Attest on AccessReview (2 permissions) | Periodic access reviews (SOC 2 CC6.2) — the non-admin role that can attest or flag a grant, other than a grant that names the reviewer (a user grant for the reviewer's own account, an engine principal the reviewer owns (now, or when the campaign opened: a former owner stays refused after a transfer; the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner), or a group the reviewer belongs to). Plan at least two reviewer identities, because nobody can decide a grant that names them. With RBAC off only administrators can attest, so create a second administrator account; with RBAC on, assign the role to a person who is not the subject of the grant and not a member of a group under review. A grant that no available reviewer may decide stays `pending`, and closing the campaign leaves it pending and counted in `pending_count`: an incomplete review is recorded as such |
 | **ForensicsAnalyst** | Read on Forensics, Response, Execution and Inventory (4 permissions). No Execute and no write of any kind | Read-only analysts of Forensics-tier response rows. Fleet-wide assignable only; cannot dispatch; not part of any other role |
 
 ### The ForensicsAnalyst role
@@ -698,6 +719,7 @@ Eight roles are created automatically and cannot be deleted:
 | `EnginePrincipal` | Engine-principal inventory and fleet-wide grant-graph reads (list/get engine principals, list their assigned roles) — cut away from `Security` (#2376) so this narrower read is not gated by the same broad permission that also covers CA/quarantine/KEK operational reads. See "The authorization topology floor" below. |
 | `Forensics` | Forensic-artefact reads (Windows execution artefacts — ShimCache/AmCache/Prefetch; per-device application-usage projection; per-app privacy-permission grants; per-account SSH authorized-key fingerprints and sshd settings). Held by default by Administrator and by the read-only `ForensicsAnalyst` role (absent from the Viewer read-list). The stored results of these plugins are served only to a caller who holds `Forensics:Read` in addition to `Response:Read`; to any other reader of the response APIs those rows are absent. With RBAC enforcement off, `Forensics:Read` is administrator-only, so a non-administrator session does not see them either. Only the `plugin` name is stored with a response row, so the filter is per plugin: a plugin that mixed Forensics and ordinary actions would have all of its rows treated as Forensics-tier until the action name is stored too (no such plugin exists today). Every catalogue row on it is single-target (exactly one agent id, no fleet/scope fan-out) and `AdminOrApproval`-gated. Wave 7 PR7.2/PR7.3. |
 | `Decommission` | Device-level agent-erasure gate for `DELETE /api/v1/sle/agents/{id}` (ADR-0024 Decision 9, amended Wave 7 PR7.2). `Decommission:Delete` authorizes for the whole decommission cascade's blast radius (eight per-agent stores: five spanning `Inventory`, `GuaranteedState`, and `SoftwareLicensing`, a sixth `Forensics`-governed store, the `endpoint_state` presence row read on `/hardware` and `/viz/fleet`, and the fleet certificate inventory, whose own read securable arrives with the certificate read surface) in one grant, replacing a hand-maintained per-store conjunction. |
+| `RevocationSource` | Registered CRL sources (ADR-0070 R1): the CAs and the CRL URLs the server may fetch for them (`/api/v1/crypto/revocation-sources*`, six MCP tools). Operations: `Read` (list, get) and `Write` (register, replace, remove, reset the anti-rollback marks; removal is a `Write`, there is no `Delete`). Seeded to **Administrator only**, and **not grantable**: every route and tool ALSO requires a durable Administrator role (the `is_rbac_administrator` check), so a custom role granted `RevocationSource:Read` or `:Write` is still refused, in both RBAC states. The access-review export lists any such grant, which is how it is found. Denied to a service-scoped token. |
 | `SoftwareLicensing` | Discovered software-licence facts synced from endpoints (ADR-0024) |
 | `AccessReview` | Periodic access-review campaigns and attestations (SOC 2 CC6.2). Seeded to Administrator and `Reviewer` only — deliberately NOT `AuditLog`, see "The authorization topology floor" above |
 | `Workflow` | Multi-step workflow definitions and executions |
@@ -751,7 +773,7 @@ The 8 routes/tools in this family authorize on `owner_principal == session.usern
 | `Execute` | Run an instruction against devices |
 | `Approve` | Approve or reject a pending approval request. Holding `Approval:Approve` is necessary but not sufficient: the reviewer must also be on an interactive cookie session (local or OIDC), must have an **enrolled MFA factor with a fresh proof** (#6079, at most 300 seconds old and tighter if `--mfa-step-up-window-secs` is set between `1` and `299`), and must not be an API-token, MCP-token or engine session, a SAML session, or the submitter (see `instructions.md`, "Who can approve", and `authentication.md`, "Approver MFA requirement"). A local account with no enrolled factor is refused `mfa_not_enrolled`; an OIDC session whose sign-in carried no MFA `amr` is refused `403` `mfa_proof_missing` (with step-up on, typed only when `--mfa-enforcement` does not protect the role), whereas a proof older than the window gets the `401` step-up with `challenge_url=/auth/oidc/start`; a live session whose account is deleted, deactivated or has an invalid username is refused (typed `account_unavailable` only with `--mfa-step-up-window-secs=0` or when the account is removed in the middle of the request; with step-up on, the central check normally answers `401` `MFA step-up required` first). The seeded `Operator` role holds `Approval:Approve`, and a non-admin cannot enrol itself under `--mfa-enforcement=optional` or `admin-only`, so an administrator must enrol each non-admin approver first (see [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver)). `--mfa-enforcement` and `--mfa-step-up-window-secs` do not weaken this (the window is `min(setting, 300)`, and 300 when the setting is `0`). |
 | `Push` | Distribute an existing rule set to scoped agents. Consumed **only** by `GuaranteedState` REST handlers and seeded **only** on `GuaranteedState` — separates deploy authority from authoring authority. Present in the operations catalogue so custom roles can adopt it, but the default seeds grant it on `GuaranteedState` alone. |
-| `Attest` | Record a reviewer's attestation decision on a periodic access review (SOC 2 CC6.2). Consumed **only** by `AccessReview` REST handlers and seeded **only** on `AccessReview` — gated via the dedicated `AccessReview` securable, never `AuditLog` (see "The authorization topology floor" below). |
+| `Attest` | Record a reviewer's attestation decision on a periodic access review (SOC 2 CC6.2). Consumed **only** by `AccessReview` REST handlers and seeded **only** on `AccessReview` — gated via the dedicated `AccessReview` securable, never `AuditLog` (see "The authorization topology floor" below). Holding it does not let a reviewer decide a grant that names them: the server refuses a decision when the reviewer is the subject of the grant (a `user` grant for the reviewer's own account, an engine principal the reviewer owns (now, or when the campaign opened: a former owner stays refused after a transfer; the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner), a group the reviewer belongs to), for `Administrator` as well as `Reviewer`, with RBAC on or off. |
 | `Rotate` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a human-owned API token. Consumed **only** by `ApiToken` REST/MCP handlers and seeded **only** on `ApiToken`, to the same two roles that already hold `ApiToken:Write` (`Administrator`, `ApiTokenManager`) — deliberately a separate operation from `Write` so a narrower MCP-tier allowance can be granted for rotation without also widening token-mint access. |
 
 ## Permission Resolution
@@ -1107,6 +1129,7 @@ Assign this role alongside any other roles. Because deny overrides allow, the us
 | `DELETE` | `/api/v1/rbac/roles/{name}` | Delete a custom role | Planned |
 | `POST` | `/api/v1/rbac/roles/{name}/assignments` | Assign one of the 7 non-`ITServiceOwner` built-in roles to a human user, fleet-wide (A2) | Implemented |
 | `DELETE` | `/api/v1/rbac/roles/{name}/assignments/{principal_id}` | Unassign a fleet-wide role from a human user (A2) | Implemented |
+| `GET` | `/api/v1/rbac/enforcement` | Read the enforcement state (cached view, unconfirmed bit) and the caller's advisory administrator verdict; any signed-in session (#6033) | Implemented |
 | `PUT` | `/api/v1/rbac/enforcement` | Enable or disable RBAC enforcement fleet-wide (A1) | Implemented |
 | `GET` | `/api/v1/rbac/roles/assignments` | Fleet-wide "who currently holds which role" — the complete grant table, gated `AccessReview:Read` (see the securable table below) | Implemented |
 

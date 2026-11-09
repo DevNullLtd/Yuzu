@@ -22,6 +22,7 @@
 #include "test_route_sink.hpp"
 #include "workflow_api_local.hpp"
 #include "workflow_engine.hpp"
+#include "workflow_model.hpp"
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -152,17 +153,24 @@ struct Rig {
                  {id, std::to_string(at)});
     }
 
-    std::string mint(const std::string& user, const std::string& service = {}) {
+    std::string mint(const std::string& user, const std::string& service = {},
+                     const std::string& tier = {}) {
         const auto expires = std::chrono::duration_cast<std::chrono::seconds>(
                                  std::chrono::system_clock::now().time_since_epoch())
                                  .count() +
                              3600;
-        auto t = rig.api_tokens->create_token("wf-page-authz", user, expires, service);
+        auto t = rig.api_tokens->create_token("wf-page-authz", user, expires, service, tier);
         REQUIRE(t.has_value());
         return *t;
     }
 
     std::unique_ptr<httplib::Response> get(const std::string& token, const std::string& target) {
+        return send(token, "GET", target, {}, "text/html");
+    }
+
+    std::unique_ptr<httplib::Response> send(const std::string& token, const std::string& method,
+                                            const std::string& target, const std::string& body,
+                                            const std::string& content_type) {
         yuzu::server::test::TestRouteSink sink;
         WorkflowRoutes routes;
         WorkflowRoutes::Deps d;
@@ -207,7 +215,7 @@ struct Rig {
         std::unordered_map<std::string, std::string> hdrs;
         if (!token.empty())
             hdrs = {{"Authorization", "Bearer " + token}};
-        auto res = sink.dispatch("GET", target, {}, "text/html", hdrs);
+        auto res = sink.dispatch(method, target, body, content_type, hdrs);
         REQUIRE(res);
         return res;
     }
@@ -282,6 +290,30 @@ TEST_CASE("workflows page real gate: a group-scoped reader sees its runs and not
     const auto rows = r.audit("workflow_execution.detail.fetch");
     CHECK(std::find(rows.begin(), rows.end(), "denied|r-alice") != rows.end());
     CHECK(std::find(rows.begin(), rows.end(), "denied|r-nope") == rows.end());
+}
+
+TEST_CASE("workflows page real gate: a truncated stored id list shows an unconfined viewer the true "
+          "device count and a confined viewer only its own scope (#2146)",
+          "[pg][workflow][workflows][page][confinement][authz][stored_ids]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, wf_page_tpl);
+    Rig r{db.dsn()};
+    // 12 ids named, the stored copy keeps 3 (bob-agent first) and a marker with total 12.
+    std::vector<std::string> named{"bob-agent"};
+    for (int i = 0; i < 11; ++i)
+        named.push_back("other-agent-" + std::to_string(i));
+    const auto stored = stored_agent_ids_json(named, {}, 3);
+    REQUIRE(stored_agent_ids_total(stored) == 12);
+    r.run("r-trunc", 400, stored);
+
+    auto open = r.get(r.mint("gary"), "/fragments/workflow-runs/r-trunc");
+    REQUIRE(open->status == 200);
+    CHECK(has(open->body, "<span>Devices</span><b>12</b>"));
+
+    auto confined = r.get(r.mint("bob"), "/fragments/workflow-runs/r-trunc");
+    REQUIRE(confined->status == 200);
+    CHECK(has(confined->body, "<span>Devices in your scope</span><b>1</b>"));
+    CHECK_FALSE(has(confined->body, "<b>12</b>"));
+    CHECK_FALSE(has(confined->body, "other-agent-"));
 }
 
 TEST_CASE("workflows page real gate: a service-scoped token is narrowed on runs and refused definitions",
@@ -440,4 +472,43 @@ TEST_CASE("workflows page real gate: schedule controls follow the grants and the
     // ron may read schedules and nothing else: every hint is 0.
     auto ron = r.get(r.mint("ron"), "/fragments/schedules?view=page");
     CHECK(has(ron->body, "data-can-write=\"0\" data-can-enable=\"0\" data-can-delete=\"0\""));
+}
+
+// A supervised-tier MCP token holds Workflow:Execute but is approval-gated on every non-MCP
+// transport. The legacy execute route refuses it and writes ONE auth.approval_required row (the
+// refusal is an attempt). The dashboard Workflows page only decides what to DRAW: it must write
+// none, however many times it renders, and must say the Run control is off because of the tier.
+TEST_CASE("workflows page real gate: a supervised-tier token writes one approval_required row on "
+          "the execute route and none on the page render",
+          "[pg][workflow][workflows][page][authz][mcp]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, wf_page_tpl);
+    Rig r{db.dsn()};
+
+    // The refusal: exactly one row, the route answers 403 and names the real entry point.
+    CHECK(r.audit("auth.approval_required").empty());
+    auto refused = r.send(r.mint("ivy", {}, "supervised"), "POST", "/api/workflows/" + r.wf + "/execute",
+                          R"({"agent_ids":["bob-agent"]})", "application/json");
+    CHECK(refused->status == 403);
+    CHECK(has(refused->body, "execute_workflow"));
+    const auto rows = r.audit("auth.approval_required");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].rfind("denied|", 0) == 0);
+
+    // The render, three times over: the Run control is off for the right reason, and the audit
+    // log did not move (Execute and Delete are both approval-gated for this tier).
+    for (int i = 0; i < 3; ++i) {
+        auto page = r.get(r.mint("ivy", {}, "supervised"), "/fragments/workflows");
+        CHECK(page->status == 200);
+        CHECK(has(page->body, "data-can-run=\"0\""));
+        CHECK(has(page->body, "data-run-gate=\"approval\""));
+        CHECK(has(page->body, "use the MCP execute_workflow tool"));
+        CHECK_FALSE(has(page->body, "Requires Workflow:Execute"));
+    }
+    CHECK(r.audit("auth.approval_required").size() == 1);
+
+    // Controls: an untiered token with the same grants is offered Run and sees no tier reason.
+    auto plain = r.get(r.mint("ivy"), "/fragments/workflows");
+    CHECK(has(plain->body, "data-can-run=\"1\""));
+    CHECK_FALSE(has(plain->body, "data-run-gate"));
+    CHECK(r.audit("auth.approval_required").size() == 1);
 }

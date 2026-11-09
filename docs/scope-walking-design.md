@@ -89,7 +89,7 @@ All shapes carry enough information to **re-evaluate the query against the curre
 
 // source_kind = "echo_query"
 {
-  "sql": "SELECT DISTINCT pid FROM process_live WHERE name = 'chrome.exe'",
+  "sql": "SELECT DISTINCT name FROM $Process_Hourly WHERE name = 'chrome.exe'",
   "scope_input_id": "rs_01HXYZ...",
   "evaluated_at": 1735689600,
   "result_columns_used": ["__device_id"]
@@ -161,6 +161,8 @@ rs_01HXYZ resolved to 2,798 devices (3 dropped: 2 offline > 24h, 1 decommissione
 
 `from_result_set:` never errors on stale members — operators iterating an IR chain need progress, not a stop. The audit row records the dropped IDs and reasons so the chain remains forensically complete.
 
+A `partial` parent does not propagate. A child produced inside a partial parent's scope (`parent_id`, or `from_result_set:<parent>`) dispatches to the parent's members only, so the agents the parent counted in `agents_failed` are never asked again and are not carried into the child: the child's `agents_failed` and `partial` describe its own dispatch alone, and a chain is read one set at a time. Lineage carries no partial flag.
+
 ## 5. Materialisation vs. lazy evaluation
 
 The default is **materialisation at create time** — the device IDs are written to `result_set_members` and never re-derived from the source query. An operator can run a live re-eval, which creates a new sibling set and leaves the original unchanged (only `echo_query` and `instruction_result` sets can be re-run). Trade-offs:
@@ -183,15 +185,15 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 | `POST` | `/api/v1/result-sets/from-echo-query` | `{name?, sql, parent_id?}` | `202` and the full set record (`status` shows progress) | Dispatches the SQL to Echo agents in `parent_id`'s scope; the device-ID set is the union of agents that returned ≥1 row (default) or all agents that responded (`include_empty=true`). |
 | `POST` | `/api/v1/result-sets/from-instruction-result` | `{name?, instruction_id, params, matcher, parent_id?}` | `202` and the full set record (`status` shows progress) | Runs the instruction in `parent_id`'s scope; the device set is filtered by `matcher`. Mirrors the Chrome hash-check step. |
 | `GET` | `/api/v1/result-sets` | — | `{result_sets: [...], next_cursor}` | Pagination by `?cursor=`. Default sort: `created_at DESC`. |
-| `GET` | `/api/v1/result-sets/{id}` | — | `{id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}` | |
+| `GET` | `/api/v1/result-sets/{id}` | — | `{id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}` | |
 | `GET` | `/api/v1/result-sets/{id}/members` | — | `{device_ids: [...], next_cursor}` | Pagination by `?cursor=`. |
 | `GET` | `/api/v1/result-sets/{id}/lineage` | — | `{chain: [{id, name, source_kind, device_count}, ...]}` | Walks `parent_id` to root. The dashboard breadcrumb does **not** call this REST route — it is rendered server-side via `/fragments/result-sets/*`, which calls the plain `lineage()` store wrapper directly, with no HTTP hop through the REST API. |
 | `POST` | `/api/v1/result-sets/{id}/pin` | — | the full set record | |
 | `POST` | `/api/v1/result-sets/{id}/unpin` | — | the full set record | |
-| `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `202` and the full set record of the new set | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). Only `echo_query` and `instruction_result` sets can be re-run; any other source kind is refused with `400`. |
+| `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `202` and the full set record of the new set | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). Only `echo_query` and `instruction_result` sets can be re-run; any other source kind is refused with `400`. A set whose stored SQL reads a raw Echo capture table (`$<Source>_Live` or `<source>_live`) is refused with `400 RESULT_SET_REEVAL_STALE_SOURCE` and nothing is dispatched; `from-echo-query` and `from-instruction-result` (an `echo.sql` definition whose `params.sql`, else its default, reads one) refuse such a query at create with the same code. |
 | `DELETE` | `/api/v1/result-sets/{id}` | — | `{deleted: true}` | Pinned sets must be unpinned first. |
 
-**Shipped behaviour (the table above is brought in line with it).** Every route answers inside the usual `{data, meta}` envelope. Create answers `201` with the full set record (`id`, `name`, `owner_principal`, `created_at`, `ttl_at`, `last_used_at`, `pinned`, `parent_id`, `source_kind`, `status`, `source_execution_id`, `device_count`); the two producers that dispatch to agents and `re-eval` answer `202` with that record while the set fills. `GET /api/v1/result-sets/{id}` does not return `source_payload`. `DELETE` answers `200` with `{"deleted": true}`; an unknown id is `404` and a pinned set `409`. Lineage nodes carry `id`, `name`, `source_kind` and `device_count` but no `narrowing`. `re-eval` writes the audit verb `result_set.create`; the `result_set.live_reeval` verb in the audit table below is not written by any handler.
+**Shipped behaviour (the table above is brought in line with it).** Every route answers inside the usual `{data, meta}` envelope. Create answers `201` with the full set record (`id`, `name`, `owner_principal`, `created_at`, `ttl_at`, `last_used_at`, `pinned`, `parent_id`, `source_kind`, `status`, `source_execution_id`, `device_count`, `agents_failed`, `partial`); the two producers that dispatch to agents and `re-eval` answer `202` with that record while the set fills. `GET /api/v1/result-sets/{id}` does not return `source_payload`. `agents_failed` counts the agents whose dispatch failed (a non-success status, output starting `error|`, or a success answer whose `__schema__` header lacks the column matcher's column) and never produced a matching row; `partial` is `true` when it is above zero. It covers answering agents only: an agent that never answered is neither a member nor counted, so a set filled at the five-minute timeout reflects the rows stored by then. The fill pages through every stored row of the execution (500 per read) up to 100,000 rows and marks the set `failed` past that bound instead of filling it as partial. Both are `0` / `false` for a set not filled from agent answers, and without information for a set filled before this release or by an older replica (`rest-api.md`, Result sets). `DELETE` answers `200` with `{"deleted": true}`; an unknown id is `404` and a pinned set `409`. Lineage nodes carry `id`, `name`, `source_kind` and `device_count` but no `narrowing`. `re-eval` writes the audit verb `result_set.create`; the `result_set.live_reeval` verb in the audit table below is not written by any handler.
 
 **`parent_id` is a targeting argument, and omitted is not the same as empty (#2500).** Omit
 `parent_id` to run against `__all__` deliberately. A **supplied** `parent_id` that is an empty
@@ -283,10 +285,13 @@ The DSL must make scope-walking *obvious*, not a footnote. Every place that take
 ```yaml
 spec:
   scope:
-    fromResultSet: "rs_01HXYZ..."         # by ID
-    # OR
-    fromResultSet: "windows-chrome-suspects"  # by per-operator alias
+    # by ID:
+    fromResultSet: "rs_01HXYZ..."
+    # OR by per-operator alias:
+    fromResultSet: "windows-chrome-suspects"
 ```
+
+(A comment on the same line as a value is read as part of the value and fails the scope-ident charset — see `docs/yaml-dsl-spec.md` §9.3 rule 6.)
 
 Coupled with the existing `selector:` form for refinement:
 

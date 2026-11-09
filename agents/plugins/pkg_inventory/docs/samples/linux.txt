@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-14 · euid 0 · leg-hash 5e3ad4e08431
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-14 · euid 0 · leg-hash 1b03567381e2
 == action=managers
 status|managers|supported|-
 manager|dpkg|present|-|-|-|-

@@ -106,6 +106,20 @@ Every test target carries a `suite:` label (`agent`, `echo`, `server`, `proto`, 
 meson test -C build-linux --suite <server|agent|echo> --print-errorlogs   # omit --suite for everything
 ```
 
+### The `/test` pre-push gate and its tooling
+
+`/test` (default and `--full`) installs two things the C++ build does not need, in its Phase 0b
+(`.claude/skills/test/SKILL.md`): the headless browser for the dashboard gates (`scripts/test/ensure-puppeteer.sh`)
+and `gcovr` for the coverage gate (`scripts/test/ensure-gcovr.sh`, Linux). They need **Node 22.12 or newer**,
+**python3 3.10 or newer with `venv`/`ensurepip`** (on Debian/Ubuntu `apt install python3-venv`) and `~/.local/bin`
+on `PATH`, plus network access to registry.npmjs.org, pypi.org and Google's Chrome for Testing CDN, and about
+0.5 GB of disk on the first run. A Puppeteer install that cannot finish (no Node, no route to the npm
+registry or the Chrome CDN) stops the run before the build, and so does a gcovr install that cannot finish in
+`--full`; in default mode a failed gcovr install is only a WARN and the coverage gate measures nothing.
+`PUPPETEER_EXECUTABLE_PATH` skips the browser download only: `npm ci` still runs whenever `node_modules` is
+missing or its lockfile stamp is absent or different.
+Details, recovery and the integrity posture: `tests/puppeteer/README.md` and `docs/ci-architecture.md`.
+
 Tests require `-Dbuild_tests=true`. vcpkg installs Catch2 (the default-on `tests` feature, see "Dependency features") only on `x64 | arm64`; the ARM64 cross-compile CI job intentionally skips tests.
 
 ### Direct binary invocation
@@ -125,10 +139,10 @@ Every `dependency()` is marked `include_type: 'system'` so vcpkg/gRPC/abseil/pro
 
 ## vcpkg
 
-- Manifest `vcpkg.json`; pinned baseline `4b77da7fed37817f124936239197833469f1b9a8` (matches `vcpkgGitCommitId` in CI). `builtin-baseline` is required by the abseil `version>=` constraint — without it vcpkg resolves against HEAD.
+- Manifest `vcpkg.json`; pinned baseline `9eec002df1cd109f8f104cd966a763daf9751489` (matches `vcpkgGitCommitId` in CI). `builtin-baseline` is required by the abseil `version>=` constraint — without it vcpkg resolves against HEAD.
 - OpenSSL is **required on every platform including Windows** — gRPC's TLS/JWT/PEM paths compile against OpenSSL headers regardless of linkage, so `grpc.lib` needs `libssl`+`libcrypto`; it is an unconditional top-level dep (the old `!windows`/schannel filter was disproven, #375).
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
-- **libpq (ADR-0006/0008):** on Windows it is a **DLL** (the static override covers only the grpc stack), shipped via the release zip's vcpkg-DLL sweep; `libpq_dep` is gated on `build_server` (agent stays SQLite); manifest pins `default-features: false, features: [openssl]`; the buildtype-conditional `_vcpkg_lib_win` pick is load-bearing (pure-C libpq has no `detect_mismatch`, so a wrong-CRT lib links silently). No cmake target carries static libpq's full closure (`libpgcommon`/`libpgport` live in `libpq.pc`'s `Libs.private`) — `meson.build`'s `libpq_dep` block wires it explicitly.
+- **libpq (ADR-0006/0008):** on Windows it is a **DLL** (the static override covers only the grpc stack), shipped via the release zip's vcpkg-DLL sweep; `libpq_dep` is gated on `build_server` (agent stays SQLite); manifest pins `default-features: false, features: [openssl]`; the buildtype-conditional `_vcpkg_lib_win` pick is load-bearing (pure-C libpq has no `detect_mismatch`, so a wrong-CRT lib links silently). No cmake target carries static libpq's full closure (`libpgcommon`/`libpgport` live in `libpq.pc`'s `Libs.private`) — `meson.build`'s `libpq_dep` block wires it explicitly. libpq 18 no longer installs `libpgcommon.lib`/`libpgport.lib` on Windows, so only `libpq.lib` is required there; the other two are linked when present.
 - **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND meson's hand-wired `protobuf_dep`/`grpcpp_dep` (`cxx.find_library()`) are the only config that avoids both LNK2038 and LNK2005 — don't simplify either half without reading `.claude/agents/build-ci.md` (full #375 timeline; the configuration is permanent — the #376 QUIC escape was withdrawn, ADR-0066). Linux/macOS unaffected.
 - **Linux sanitizer triplets (`x64-linux-asan`/`x64-linux-tsan`) are STATIC (#4019), matching the stock `x64-linux` triplet.** Dynamic linkage (the setting from each triplet's introduction through #4019) split grpc/protobuf/re2 into separate `.so` images in the sanitizer test binaries, each independently embedding abseil's `MixingHashState::kSeed` (self-referential, so copies legitimately diverge) — a `protobuf::Map` populated via one image's hash and queried via another's silently missed an existing key, corrupting Guardian spark-validation lookups nondeterministically under both ASan and TSan. Don't revert to dynamic linkage without reading the triplet files' own header comments — the `-fsanitize=...` flag propagation both triplets exist for works identically under static linkage. This is CI/test-tooling only; no shipped artifact is built from these triplets.
 - **TSan on vendored libpq**: `pqSaveParameterStatus` (`fe-exec.c`) races two connections' initial `ParameterStatus` writes into two process-wide statics; suppressed via a compiled-in `__tsan_default_suppressions` hook in `tests/unit/test_runner_main.cpp`, kept honest by the `tests/test_no_connless_pq_escape.py` tripwire (#1611).

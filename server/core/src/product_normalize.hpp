@@ -38,10 +38,12 @@ inline constexpr std::int64_t kRearmSecs = 7 * 24 * 3600;
 /// architecture, and edition tokens removed, plus the first edition token
 /// extracted (empty when the raw title carries none). The matcher operates on
 /// the stripped `title`; `edition` feeds the `products.edition` column and
-/// the `norm_key` suffix.
+/// the `norm_key` suffix; `version` is the first version-ish token that was
+/// stripped (the title dimension's `title_version`).
 struct NormalizedTitle {
     std::string title;
     std::string edition;
+    std::string version; ///< first stripped version-ish token, leading 'v' removed; empty when none
 };
 
 /// Normalise a raw product title deterministically:
@@ -61,13 +63,20 @@ struct NormalizedTitle {
 /// Total over arbitrary bytes; never throws.
 NormalizedTitle normalize_title(std::string_view raw);
 
+/// The origin-label prefix the agent writes into `publisher` when a source declares no vendor
+/// (`via:<ecosystem>`, ADR-0016 update 2026-11-04). It names where a row came from, never who
+/// made it. MUST equal the agent's kOriginLabelPrefix (sync_source_installed_software.hpp).
+inline constexpr std::string_view kOriginLabelPrefix = "via:";
+
 /// Normalise a raw vendor/publisher name deterministically: ASCII lowercase,
 /// commas/semicolons trimmed from token edges, legal-suffix tokens stripped
 /// (inc, inc., incorporated, corp, corp., corporation, ltd, ltd., llc, gmbh,
 /// s.a., co., company, technologies, software, systems, foundation),
 /// whitespace collapsed, then a tiny built-in alias table (Microsoft, Adobe,
 /// Oracle, JetBrains, VMware forms) maps well-known variants onto one
-/// canonical vendor. Total over arbitrary bytes; never throws.
+/// canonical vendor. A RAW value starting with kOriginLabelPrefix (case-sensitive, exact: the
+/// agent emits it lowercase, so a Windows Publisher of "VIA:..." is a vendor) is an origin label,
+/// not a vendor, and normalises to "". Total over arbitrary bytes; never throws.
 std::string normalize_vendor(std::string_view raw);
 
 /// Deterministic canonical product key — the `products.norm_key` UNIQUE
@@ -81,6 +90,12 @@ std::string normalize_vendor(std::string_view raw);
 /// vs Enterprise), so they mint distinct product rows; the `title_vendor`
 /// match tier below still relates them across editions.
 std::string norm_key(std::string_view title, std::string_view vendor);
+
+/// The key shape itself, from already-normalised parts: the ONE owner of
+/// `<vendor>:<title>[:<edition>]`. `norm_key()` ends in it, and the SAM.4 alias-pack
+/// parser calls it for a pack product's key, so the two can never drift.
+std::string make_norm_key(std::string_view norm_vendor, std::string_view norm_title,
+                          std::string_view edition);
 
 /// Strictly ordered deterministic match tiers (ADR-0024 Decision 6). Lower
 /// enumerators are stronger matches; the matcher returns the first tier that

@@ -96,10 +96,29 @@ inline constexpr std::string_view kMcpTransport =
     "MCP transport endpoint: tool calls are governed by the MCP tier and approval ladder";
 inline constexpr std::string_view kContentAuthoring =
     "content authoring: running the content is gated separately";
+inline constexpr std::string_view kReferenceDataReplace =
+    "fleet-wide software reference data (pack replace, curated aliases): not credentials, "
+    "identity or authority, but it steers cpe_product and CVE matching and fleet-wide title "
+    "resolution; audited before the write; whether it needs MFA step-up awaits an owner ruling";
+inline constexpr std::string_view kCollectionSettings =
+    "per-group software collection settings (interval, window, zone, collector switches): not "
+    "credentials, identity or authority, but a root document can switch collectors off "
+    "fleet-wide; audited ahead of the write; exempt by the project owner's SAM-34 decision while "
+    "the owner ruling on the plugin kill-switch route is pending";
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";
-inline constexpr std::string_view kStopsEffect = "stops an in-flight effect; reduces risk";
+/// A cancel that only closes a record. It marks a pending tracker or pipeline record cancelled and
+/// sends NOTHING to any device: it does not stop, recall or undo a command a device has already
+/// received. The class is exempt because it starts no new work, NOT because it halts a running
+/// effect; do not reword it into a claim that it does (#2146 CA-4).
+inline constexpr std::string_view kCancelsRecord =
+    "cancels a pending record; sends nothing to any device and starts no work";
+/// The v1 / MCP rerun twins only create a `pending` record linked through `rerun_of`; they send
+/// NOTHING to any device (the legacy `POST /api/executions/{id}/rerun` is a different route and
+/// keeps kExecutionDispatch). Exempt for the same reason as kCancelsRecord: no new work starts.
+inline constexpr std::string_view kCreatesRerunRecord =
+    "creates a pending rerun record; sends nothing to any device and starts no work";
 inline constexpr std::string_view kAlertingConfig = "alerting and notification configuration";
 inline constexpr std::string_view kMfaEnrolment =
     "MFA enrolment flow: cannot replace or remove an enabled factor";
@@ -151,6 +170,13 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     {"DELETE", R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",          StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/guaranteed-state/rules/{id}"},
     {"POST",   R"(/api/v1/guaranteed-state/push)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/push"},
     {"POST",   R"(/api/v1/guaranteed-state/policy-generation/raise)",           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/policy-generation/raise"},
+    // ADR-0070 R1 (slice 2b-1a): registered CRL sources. Registering adds an egress target the server
+    // will fetch from, a replace/remove changes what is fetched, and a reset reopens the CRL replay
+    // window - all admin-only and none of them reversible by the caller alone, so each is kRequired.
+    {"POST",   R"(/api/v1/crypto/revocation-sources)",                          StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/crypto/revocation-sources"},
+    {"PUT",    R"(/api/v1/crypto/revocation-sources/([0-9]+))",                 StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/crypto/revocation-sources/{id}"},
+    {"DELETE", R"(/api/v1/crypto/revocation-sources/([0-9]+))",                 StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/crypto/revocation-sources/{id}"},
+    {"POST",   R"(/api/v1/crypto/revocation-sources/([0-9]+)/reset-high-water)", StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/crypto/revocation-sources/{id}/reset-high-water"},
     // Approvals (approval_routes.cpp; the label is the handler's verb-based one)
     {"POST",   R"(/api/approvals/([^/]+)/approve)",                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/approvals/{id}/approve"},
     {"POST",   R"(/api/approvals/([^/]+)/reject)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/approvals/{id}/reject"},
@@ -245,6 +271,12 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     // hardware_routes.cpp
     step_up_detail::exempt("POST",  R"(/api/v1/hardware/([^/]+)/sync)",                                           step_up_detail::kSyncTrigger),
     step_up_detail::exempt("POST",  R"(/api/v1/hardware/sync)",                                                   step_up_detail::kSyncTrigger),
+    // software_curation_routes.cpp
+    step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/aliases)",                        step_up_detail::kReferenceDataReplace),
+    step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)",  step_up_detail::kOperationalData),
+    step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/pack)",                           step_up_detail::kReferenceDataReplace),
+    // software_collection_settings_routes.cpp
+    step_up_detail::exempt("PUT",   R"(/api/v1/inventory/software/collection-settings/([a-f0-9]+))",              step_up_detail::kCollectionSettings),
     // instruction_fragment_routes.cpp
     step_up_detail::exempt("POST",  R"(/fragments/instructions/yaml-preview)",                                    step_up_detail::kReadShaped),
     // instruction_routes.cpp
@@ -293,6 +325,10 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/fragments/auto/run)",                                                     step_up_detail::kExecutionDispatch),
     // rest_api_v1.cpp
     step_up_detail::exempt("POST",  R"(/api/v1/bundles)",                                                         step_up_detail::kExecutionDispatch),
+    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/cancel)",                        step_up_detail::kCancelsRecord),
+    step_up_detail::exempt("POST",  R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/rerun)",                         step_up_detail::kCreatesRerunRecord),
+    // command_v1_routes.cpp: the REST v1 twin of /api/command and MCP execute_instruction (kExecutionDispatch, like both)
+    step_up_detail::exempt("POST",  R"(/api/v1/commands)",                                                        step_up_detail::kExecutionDispatch),
     step_up_detail::pending("POST",  R"(/api/v1/echo/retention-paused/purge)"),
     step_up_detail::pending("POST",  R"(/api/v1/management-groups)"),
     step_up_detail::pending("PUT",   R"(/api/v1/management-groups/([a-f0-9]+))"),
@@ -330,7 +366,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::pending("DELETE",R"(/api/v1/device-tokens/([a-f0-9]+))"),
     step_up_detail::pending("POST",  R"(/api/v1/software-deployments)"),
     step_up_detail::pending("POST",  R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)"),
-    step_up_detail::exempt("POST",  R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",                         step_up_detail::kStopsEffect),
+    step_up_detail::exempt("POST",  R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",                         step_up_detail::kCancelsRecord),
     step_up_detail::pending("POST",  R"(/api/v1/license)"),
     step_up_detail::pending("DELETE",R"(/api/v1/license/([a-f0-9]+))"),
     step_up_detail::exempt("POST",  R"(/api/v1/dex/devices/([^/]+)/live)",                                        step_up_detail::kReadShaped),
@@ -403,7 +439,10 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/workflows)",                                                          step_up_detail::kContentAuthoring),
     step_up_detail::exempt("DELETE",R"(/api/workflows/([^/]+))",                                                  step_up_detail::kContentAuthoring),
     step_up_detail::exempt("POST",  R"(/api/workflows/([^/]+)/execute)",                                          step_up_detail::kExecutionDispatch),
+    step_up_detail::exempt("POST",  R"(/api/v1/workflows/([^/]+)/execute)",                                       step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/instructions/([^/]+)/execute)",                                       step_up_detail::kExecutionDispatch),
+    // instruction_execute_routes.cpp (#2146): the v1 twin of the row above, same class.
+    step_up_detail::exempt("POST",  R"(/api/v1/instructions/([^/]+)/execute)",                                    step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/product-packs)",                                                      step_up_detail::kContentAuthoring),
     step_up_detail::exempt("DELETE",R"(/api/product-packs/([^/]+))",                                              step_up_detail::kContentAuthoring),
 };

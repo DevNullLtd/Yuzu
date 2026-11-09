@@ -65,8 +65,8 @@ class HttpRouteSink;
 // ── Shared builders (REST-only today; #4033/#2146 Batch A) ─────────────────
 // PURE JSON builders — no httplib.h, no mcp_jsonrpc.hpp — used TODAY only by
 // REST's GET /api/v1/devices[/{id}]. MCP's pre-existing list_agents/
-// get_agent_details tools independently build an IDENTICAL 5-field shape
-// inline (mcp_server.cpp) — they are NOT refactored onto these by this PR
+// get_agent_details tools independently build the SAME 6-field shape (the 5 registry
+// fields plus `guardian_backend`, #2240) inline (mcp_server.cpp) — they are NOT refactored onto these by this PR
 // (out of scope; see #4033), so this pair does NOT yet satisfy the twin
 // recipe's Rule 1 (docs/api-twin-recipe.md §1: REST, MCP, and the dashboard
 // fragment must call the SAME function so no two transports can drift).
@@ -74,21 +74,25 @@ class HttpRouteSink;
 // comment claimed Rule 1 was already satisfied across REST+MCP — false; the
 // ledger's `twinned` status for these rows reflects the ledger's own
 // weaker, verified capability-level definition (docs/api-parity-ledger.md:
-// "a twin exists and is verified against the current source" — the 5-field
-// shape IS byte-identical across REST/MCP today), not Rule-1 same-function
-// conformance. Built from `DeviceApi`'s own typed rows (ADR-0031 WS-A4 wave 2
+// "a twin exists and is verified against the current source" — the key SET and
+// values match across REST/MCP; key ORDER does not, see below), not Rule-1
+// same-function conformance. Built from `DeviceApi`'s own typed rows (ADR-0031 WS-A4 wave 2
 // rewire — previously a raw `AgentRegistry` JSON entry; the served field set
-// is unchanged: agent_id/hostname/os/arch/agent_version) — deliberately NOT
+// is agent_id/hostname/os/arch/agent_version plus `guardian_backend`) — deliberately NOT
 // `DeviceRow` (the dashboard-fragment-only richer shape with online/tags/
 // dex_score; see this file's header). The builders exist so the NEW REST
-// routes match those tools' served shape byte-for-byte from day one, and so
+// routes match those tools' served shape from day one, and so
 // a future refactor of the MCP handlers has a function to call instead of a
 // third inline copy.
 
-/// PURE: one device row — `agent_id`/`hostname`/`os`/`arch`/`agent_version`,
-/// straight off `DeviceApi::DeviceListRow`'s fields (already defensively
-/// extracted at the seam — see `device_api.hpp`). Mirrors MCP
-/// `list_agents`'s inline row-building exactly.
+/// PURE: one device row: `agent_id`/`hostname`/`os`/`arch`/`agent_version`
+/// and `guardian_backend`, straight off `DeviceApi::DeviceListRow`'s fields (already
+/// defensively extracted at the seam, see `device_api.hpp`). `guardian_backend` is ALWAYS
+/// present (#2240): one of "legacy" | "spark" | "spark_failed" | "unwired", or JSON null when the
+/// device has not reported the heartbeat tag (never "legacy"; see
+/// `guardian_backend_fleet_tags.hpp`). MCP `list_agents` / `get_agent_details` mirror this by
+/// hand in `JObj` (same key set, same values, same null semantics; the key ORDER differs, so
+/// REST/MCP parity is semantic, not byte-identical).
 nlohmann::json device_agent_row_json(const DeviceListRow& row);
 
 /// PURE: the device DETAIL object — `device_agent_row_json`'s fields plus a
@@ -168,6 +172,8 @@ struct DeviceGuardRow {
     std::string name;       ///< the Guard's human name
     std::string state;      ///< "compliant" | "drifted" | "errored"
     std::string updated_at; ///< ISO of the evaluation that set it
+    bool order_uncertain{false};    ///< ordering of the persisted verdict cannot be proven
+    bool projection_pending{false}; ///< a retained event for this guard is not yet reflected
 };
 
 /// PURE: the DEX lens for one device — the per-device score + its signal summary
@@ -179,8 +185,21 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
 
 /// PURE: the Guardian lens for one device — compliance summary + per-guard state.
 /// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
+///
+/// `unrepresented_pending` / `unrepresented_ids` are the device's retained pending events that
+/// have NO census row yet (#7217: the count is exact, the id list is capped by the store and the
+/// ids are agent-reported identifiers). When the count is above zero the lens renders a notice and
+/// NEVER the clean tile state: the tile uses the same warn tone and "ordering uncertain" wording as
+/// an order-uncertain guard, and an empty `guards` list is not rendered as "No guards evaluated"
+/// (the device has evidence the census does not show). Defaults of 0 / empty are not a no-op for the
+/// tile label: a lens with every guard compliant (100%) and either `uncertain>0` (a guard whose
+/// ordering is uncertain or whose retained event is unreflected) or a nonzero `unrepresented_pending`
+/// now labels the tile "Compliant, ordering uncertain" in the warn tone, where it used to read
+/// "Compliant"; every other input renders as before.
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true,
+                                        std::int64_t unrepresented_pending = 0,
+                                        const std::vector<std::string>& unrepresented_ids = {});
 
 /// PURE: the "Get live info" snapshot SHELL — a header + one auto-loading panel per
 /// live instruction (each div hx-gets /fragments/device/live/run?kind=…, which
@@ -246,6 +265,9 @@ struct LiveCaptureSource {
     std::string name, dollar, category;
     bool enabled = false;
     long long live_rows = -1; ///< -1 = unknown (no count reported)
+    /// The agent reported `<src>_live_rows` only: it has not moved to the roll-up store, so its
+    /// count is raw capture rows and is not presented as the hourly count.
+    bool pre_rollup_agent = false;
 };
 
 /// PURE renderers — one `.ls-tbl`/tree per card body, dark-theme, CSP-safe.
@@ -315,7 +337,7 @@ public:
     /// `nullopt` = sees the whole fleet (global Infrastructure:Read grant, or
     /// RBAC enforcement is off); a present set = exactly those agent_ids (a
     /// present-EMPTY set on a degraded confinement read, fail-closed —
-    /// ADR-0042). Applied via `authz::in_scope` against `DeviceApi::list_devices()`'s
+    /// ADR-0042). Applied via `authz::in_scope` against `DeviceApi::list_devices_basic()`'s
     /// UNSCOPED rows — ADR-0031 WS-A4 wave 2 replaces the old pre-scoped
     /// `DevicesFn` provider with "unscoped API read + this seam's own filter",
     /// matching the REST/MCP siblings' pattern. An unwired closure is treated
@@ -341,7 +363,7 @@ public:
 
     /// `api` is the store-free `DeviceApi` seam (identity/list data — ADR-0031
     /// WS-A4 wave 2); `visible_set_fn` is this route's OWN confinement filter
-    /// over `api->list_devices()`'s unscoped rows; `dex_score_fn` backs the
+    /// over `api->list_devices_basic()`'s unscoped rows; `dex_score_fn` backs the
     /// per-row/per-page DEX score; `dispatch_fn`/`responses_fn`/`audit_fn` back
     /// the live-info instruction dispatch (all borrowed/may be empty/null →
     /// graceful placeholder).

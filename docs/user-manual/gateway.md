@@ -439,15 +439,27 @@ from those two settings, not an observed figure. Plan for these requirements:
   containment). Use addresses that stay the same (a virtual IP or fixed node addresses) for
   gateway-fronted fleets; if the addresses behind the name change, a quarantined agent
   cannot reach any node and cannot be released remotely.
+- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051; what to configure instead is tracked in #7062). Until then, use the shape the spike exercised: one address in front of all the gateway nodes that passes TCP through without terminating TLS and is reachable only from the server hosts. Every node's management certificate must carry that name, because the server checks it against the address it dials, and every node must admit the server (the same management peer settings on each). The nodes must be clustered. Spike finding 10: some commands to re-attached agents were accepted and never delivered behind that address. A multi-address DNS name was not tried, and the server's management channel sets no keepalive.
 - **A node that is up but has lost its server.** Failover does not cover this case. From
   the sources, the gateway acknowledges proxied heartbeats from its own node-local state
   whatever the state of its upstream (an unknown session gets `NOT_FOUND`), and the agent
   re-registers only on `NOT_FOUND` or `UNAUTHENTICATED`, so the agent sees every heartbeat
   succeed and its keepalives to the gateway stay healthy. It would stay on that node while
-  the server's 90 s route lease expires and the agent stops being dispatchable; look at the
-  gateway's `yuzu_gw_upstream_circuit_transitions_total`, `yuzu_gw_upstream_rpc_errors_total` and
-  `/readyz` rather than for `UNAVAILABLE` lines in the agent log. This
-  has not been observed end to end; the HA WS-13 spike measures it.
+  the server's 90 s route lease expires, and the agent may stop being dispatchable. Failover does not
+  repair this and the usual signals do not show it: in the HA WS-13 spike, on a quiet single-host
+  fleet, `/readyz` stayed 200 and the circuit breaker never opened in 400 s, and on one server replica
+  every dispatch probe was still delivered, so a probe does not rule it out either. Expected from
+  the code, not yet measured: `yuzu_gw_upstream_rpc_errors_total{rpc_name="batch_heartbeat"}` rising (about once
+  a second if the server refuses connections, about once every 6 s if the path silently drops them) and the
+  gateway log line `BatchHeartbeat failed`; the same counter rises when the server itself is down, so
+  compare gateways. The agent log will not show it. First restore the node's path to the server: in the spike
+  agents were routable again 2 to 6 s after the path returned. If that cannot be done soon and other gateway nodes can take
+  its agents, stopping the node so they re-register through the survivors is the action reasoned from the code; it was not
+  tried for this fault. Do it only if the counter rises on that node alone (a rise on every gateway means the server is the
+  problem), keep the node stopped, and confirm its agents are routable through a survivor. It disconnects every agent on
+  the node (agents older than 0.15.0 may wedge), and on a one-gateway deployment it takes the whole fleet offline. Whether a quarantine or
+  other protective action issued in this state reaches the endpoint, and the consequence for dispatch on
+  two server replicas, have not been measured.
 - **Agents older than 0.15.0** may wedge in their reconnect path and need a restart (see
   [Heartbeat admission](#heartbeat-admission)).
 
@@ -1767,6 +1779,10 @@ identity](#authorizing-the-server-by-its-identity)):
 | `mgmt_peer_auth_mode` | `pin` (when the key is unset; the boot logs a WARN that it was defaulted). The shipped reference configs set `identity` | `pin`, `identity_or_pin`, `identity` | What admits the server on the management listener (`:50063`). `pin`: an SPKI pin from `mgmt_peer_pins`, as before #6016. `identity_or_pin`: the server identity URI SAN **or** a pin. `identity`: the server identity, **and** any pin that is configured. The shipped reference configs (`gateway/config/sys.config.prod`, `deploy/docker/reference-gateway-sys.config`) set `{mgmt_peer_auth_mode, identity}` with no pin, so a server key renewal needs no gateway action. **Set `pin` explicitly** if you use bring-your-own certificates, `--no-default-certs` or a server given its own `--cert`/`--key`: they carry no identity, and under `identity` every command is refused (`no_uri_san`). A `sys.config` of your own that does not set the key is `pin`, as before: the identity is never implied by a missing key, so an upgrade changes nothing until you set `identity_or_pin` or `identity`, and a configuration with no pins and no mode still refuses to boot on an exposed listener. The identity trusts the issuing CA's issuance policy, so do not use it behind a CA that lets a requester choose a URI SAN (see "What this changes about trust" below). Any other value **refuses boot** (`Refusing to start: invalid management peer authorization configuration`). `mgmt_peer_pins` (default `[]` in the shipped configs) **must be a list**, even for one pin (`[{cert_file, Path}]`); any other value refuses boot in every mode (`{bad_mgmt_peer_pins,V}`). |
 | `mgmt_peer_identity` | not set (derived at boot) | a string or binary of exactly `yuzu://<install>/server`, where `<install>` is the upper-case SHA-256 of the install CA certificate with no colons | The identity the server's certificate must carry as a URI SAN. If unset it is derived at boot from the `cacertfile` of each management listener, **only if that file holds exactly one certificate**; a CA bundle, an empty, unreadable, half-written or absent file derives nothing, the identity stays unresolved and every peer that needs it is refused (`identity_unresolved`). Two management listeners that derive different values, and a value that is not in this form, **refuse boot**, and so does an identity over a `cacertfile` that is not demonstrably exactly one readable certificate (more than one, or empty, unreadable or half-written at boot) unless the mode is `identity` and at least one pin is configured (`identity_over_ca_bundle`). An explicit value that differs from the one derived from the listener's `cacertfile` boots, with a warning. Ignored in `pin` mode; the boot logs a warning saying so. |
 | `mgmt_peer_denied` | `[]` | a list of `{serial, Hex}`, `Hex` being 1 to 40 hexadecimal digits in either case, no `0x`, no colons. A decimal serial is read as hex | Certificate serial numbers the gateway refuses in **every** mode, even when the certificate carries the identity or a pinned key (`revoked`). It is keyed on the serial and never on the key: the server re-issues its leaf over the same key, so a key-based entry would also refuse the replacement. Read at boot only. A malformed entry **refuses boot**; so does a list of more than 4096 entries. |
+| `mgmt_crl_source` | not set (no CRL is read; the boot logs a WARN when the mode is `identity` or `identity_or_pin`; the shipped reference gateway config, `deploy/docker/reference-gateway-sys.config`, sets it) | `{url, "https://host:port/path"}`, `{url, Url, #{cacertfile => Path}}` or `{file, Path}` | Where the gateway reads the CA's CRL. The URL form fetches over verified TLS, trusting the management listener's `cacertfile` unless the three-element form names the CA that issued the server's HTTPS certificate; the URL host must be one of that certificate's names. Only `https` is accepted: no `http`, no userinfo, no fragment, no unknown option. Any defect refuses boot. Read at boot |
+| `mgmt_crl_grace_s` | `86400` | an integer 0 to 604800 | How long past the CRL's `nextUpdate` the gateway keeps admitting before it refuses every stream as `revocation_stale`. Read at boot |
+| `mgmt_crl_refresh_ms` | `5000` | an integer 1000 to 3600000 | How often the gateway fetches or re-reads the CRL (each fetch is bounded at 3 s). Each wait is shortened by a random 0 to 10 percent (down only, never longer), so a fleet restarted together does not poll the server in one burst; a withdrawal reaches a gateway within one `mgmt_crl_refresh_ms` of the server publishing it, plus the time the previous load takes (the next wait starts after the load). Read at boot |
+| `mgmt_crl_max_validity_s` | not set (no bound). The shipped reference gateway config (`deploy/docker/reference-gateway-sys.config`) sets `691200` (8 days); `sys.config.prod` carries it as a commented example | an integer 3600 to 31536000 | The widest `nextUpdate` minus `thisUpdate` a CRL may carry. A validly signed CRL wider than this is refused `validity_too_long` and the CRL held stays in force. Without it a CRL with a far-future `nextUpdate` is believed until that date and keeps `YuzuGatewayMgmtCrlStale` quiet. The width is read from the CRL's own two dates and is **never compared with the gateway's clock**. Keep it above the widest CRL your feed publishes (a server that publishes 7-day CRLs backdated 300 seconds needs more than 7 days plus 300 seconds, or every CRL is refused); the Yuzu server publishes 48 hours. **A bound below the width of the CRLs the server publishes (172,800 s plus the 300 s backdate, so anything under about 173,100 s) refuses every CRL the server publishes and fails the management plane closed** (`revocation_unknown` once any held CRL expires, immediately on a restart). A float, or any other value, refuses boot. Read at boot |
 
 **Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
 the replay keys above, it also has an environment override):
@@ -2332,7 +2348,7 @@ the identity is ignored and the boot logs a warning that says so.
 | Choose it when | You use bring-your-own certificates (`--cert`/`--key`), `--no-default-certs` or a corporate CA, or you keep the CA key apart from the server key and want a pin to be what admits | You are moving a default-certificate install to the identity and want the pin as a fallback while you watch `yuzu_gw_mgmt_auth_admitted_total` | The install CA is the Yuzu one, the move has been checked (see "Rolling it out"), and you want a key renewal with no gateway action. Add a pin if the CA key is kept apart from the server key |
 | A server key renewal needs | The pin to follow the new key. Until it does, the new leaf is refused `pin_mismatch` (up to `mgmt_pin_refresh_ms` for a `cert_file` pin) | Nothing: the identity admits the renewed leaf whatever the pin says | Nothing without a pin. With a pin, the pin must follow the renewal |
 | Who can command the fleet | A holder of the server's private key | A holder of the server's private key, or anyone with a certificate from the install CA that carries the server URI (a CA-key holder can mint one) | Without a pin, a CA-key holder. With a pin, a peer that has both the pinned key and a certificate carrying the URI (the server's own certificate is both) |
-| A certificate is withdrawn by | Replacing the pinned file (within `mgmt_pin_refresh_ms`), or removing the entry and restarting the gateway (only if its agents can take the disconnect); or `mgmt_peer_denied` and a restart | `mgmt_peer_denied` and a restart (only if the agents can take the disconnect). Replacing the pinned file withdraws only the pin path; a leaf that still carries the URI is admitted by the identity | `mgmt_peer_denied` and a restart (only if the agents can take the disconnect). With a pin, replacing the pinned file also withdraws the key. A restart disconnects the node's agents; do it only if they can take it, because agents without the #5183 fix stay wedged |
+| A certificate is withdrawn by | Replacing the pinned file (within `mgmt_pin_refresh_ms`), or removing the entry and restarting the gateway (only if its agents can take the disconnect); or `mgmt_peer_denied` and a restart With `mgmt_crl_source` set, the CA's CRL also withdraws it, with no restart (see "Withdrawing a server certificate"). | `mgmt_peer_denied` and a restart (only if the agents can take the disconnect). Replacing the pinned file withdraws only the pin path; a leaf that still carries the URI is admitted by the identity With `mgmt_crl_source` set, the CA's CRL also withdraws it, with no restart (see "Withdrawing a server certificate"). | `mgmt_peer_denied` and a restart (only if the agents can take the disconnect). With a pin, replacing the pinned file also withdraws the key. A restart disconnects the node's agents; do it only if they can take it, because agents without the #5183 fix stay wedged With `mgmt_crl_source` set, the CA's CRL also withdraws it, with no restart (see "Withdrawing a server certificate"). |
 | Default | Yes, when `mgmt_peer_auth_mode` is unset | No | No (the shipped configs set it) |
 
 **Admission order.** For every management stream the gateway decodes the peer certificate,
@@ -2354,7 +2370,7 @@ certificate's serial; when a deny-list is configured and the serial cannot be re
 would otherwise be admitted is refused (`revoked`). With an empty deny-list the serial is not read.
 
 **Rejection reasons.** The identity modes add four reasons to the closed set counted on
-`yuzu_gw_mgmt_auth_rejected_total{reason}` (eleven in all): `no_uri_san` (the certificate has no
+`yuzu_gw_mgmt_auth_rejected_total{reason}` (fourteen in all with the three the CRL adds, listed under "Withdrawing a server certificate"): `no_uri_san` (the certificate has no
 URI SAN), `identity_mismatch` (it has URI SANs but none is this install's `/server`),
 `identity_unresolved` (the gateway could not resolve the identity it must match) and `revoked` (the
 serial is in `mgmt_peer_denied`). All four raise `YuzuGatewayMgmtAuthRejected`, not
@@ -2449,8 +2465,9 @@ upgrade to add the identity does exactly that, and revokes the old serial as `su
 key-based entry would also refuse the replacement. The list is read at boot: a change takes
 effect when the gateway next restarts, which disconnects the agents on that node. Apply it only
 if those agents can take the disconnect, because agents without the #5183 fix stay wedged after
-a gateway restart. Applying revocations automatically from the CA's revocation list is the
-follow-up and does not exist yet.
+a gateway restart. A gateway that sets `mgmt_crl_source` applies the CA's revocations itself,
+without this list (see "Withdrawing a server certificate"); the list remains the way to refuse a
+certificate the CA has not revoked, and the only way where no source is set.
 
 *Getting the serial right.* The serial must be the **full** hex. Either read it from the certificate:
 
@@ -2548,14 +2565,12 @@ holder of another CA's key still needs the server key. For a single-certificate 
 gateway cannot tell, so the identity must **not** be enabled there: stay in `pin`, which is not
 affected, because a pin needs the server's private key.
 
-Until revocation from the CA's list exists,
-withdrawing an identity-mode server certificate is the deny-list above, at the speed of a
-gateway restart, where replacing a pinned file took effect within `mgmt_pin_refresh_ms`. Said
+Withdrawing an identity-mode server certificate is done by the CA's CRL when the gateway sets
+`mgmt_crl_source`, with no restart (see "Withdrawing a server certificate"). Without a source, said
 plainly: revoking the server certificate in the CA inventory does NOT remove its command-plane
-access (the gateway reads no CRL until the follow-up; under the old pin default, replacing the
-pinned file withdrew a key within a few seconds without a restart; now withdrawal is a serial in
-`mgmt_peer_denied` plus a gateway restart, which disconnects the node's agents, and agents without
-the #5183 fix stay wedged).
+access. Withdrawal is then the deny-list above, at the speed of a gateway restart (which disconnects
+the node's agents, and agents without the #5183 fix stay wedged), where replacing a pinned file
+under the old pin default took effect within `mgmt_pin_refresh_ms`.
 
 **During a CA re-root.** A clean re-root creates a new root, so the install id in the identity
 changes and every agent re-enrolls (see `docs/pki-architecture.md`, "Deliberate clean re-root");
@@ -2572,6 +2587,214 @@ disconnect, because agents without the #5183 fix stay wedged after a gateway res
 **What must be set to `pin`.** Bring-your-own certificates, `--no-default-certs` and a server given
 its own `--cert`/`--key` carry no identity. Set `{mgmt_peer_auth_mode, pin}` and list their pin; the
 shipped configs no longer do it for you.
+
+### Withdrawing a server certificate
+
+The identity admits whatever certificate carries it, for as long as that certificate verifies. When
+the install CA withdraws a server certificate (a re-issue supersedes the previous serial, and an
+operator can revoke one) the gateway has to learn of it, and `{yuzu_gw, mgmt_crl_source}` is how:
+the gateway reads the CA's CRL and refuses a listed certificate with `crl_revoked` on every stream
+it admits after it loads the new list, including a new stream on a connection the server already
+holds open; a stream already in progress is not cut (see "Limits").
+
+**Setting it up.** Point the gateway at the server's public CRL endpoint, over HTTPS:
+
+```erlang
+{mgmt_crl_source, {url, "https://server.example.com:8443/api/v1/ca/crl"}}
+```
+
+The gateway fetches it every `mgmt_crl_refresh_ms` (5 s by default) and verifies the server's
+HTTPS certificate against the management listener's `cacertfile`. If port 8443 presents a
+certificate that the install CA did **not** issue (a bring-your-own dashboard certificate), the
+fetch fails `fetch_tls` and every stream is refused `revocation_unknown`, so name the CA that
+issued it: `{url, Url, #{cacertfile => "/path/ca.pem"}}`. The **host in the URL must also be one of
+the names on that certificate** (`--cert-san`; the reference compose passes `dns:server`): a host it
+does not carry fails exactly like a CA it does not chain to, as `fetch_tls`, so check both. Or give
+the gateway the CRL as a file with `{file, "/path/crl.der"}` (DER or PEM, with a `cRLNumber`, and the CA's full base CRL: not a delta, not a scoped or indirect one):
+nothing keeps that file current, so you must (replace it atomically, well inside the CRL's 48-hour
+validity, for example hourly), and the file, and any `cacertfile`, must be mounted into the gateway
+container. A file left alone is read successfully every tick, so `YuzuGatewayMgmtCrlRefreshStalled`
+stays quiet; it goes stale at its `nextUpdate` (`YuzuGatewayMgmtCrlStale` warns) and every stream is
+refused `mgmt_crl_grace_s` later. The
+reference gateway configuration (`deploy/docker/reference-gateway-sys.config`) sets the URL form;
+`sys.config.prod` carries it as a commented example; the Docker, UAT and demo gateway configs, which
+run `pin` or a plaintext management listener, set no source by design. A source is read at boot:
+applying a change restarts the gateway, which disconnects the node's agents, and agents without the
+#5183 fix stay wedged after it, so do it only if they can take that.
+
+**What the gateway accepts.** A CRL is trusted only by its signature, checked against the
+certificates in the management listener's `cacertfile` (a matching issuer name or key id is not
+enough). It is refused if it is malformed, larger than 16 MiB, signed by another key
+(`unverified`), issued under a name other than that of the certificate that verified it
+(`issuer_mismatch`), wider than `mgmt_crl_max_validity_s` (`validity_too_long`, decided only after
+the signature verifies), dated more than an hour in the future (`future_dated`), or older than the one
+already loaded: a new CRL replaces the held one only when its `thisUpdate` is later or its
+`cRLNumber` is higher, and never when it is already past its own `nextUpdate` plus
+`mgmt_crl_grace_s` while the held one is still believed (`replay` in each case; so is a CRL with the
+same number and time as the held one but a different revoked set, which the server never publishes:
+it numbers each publish one higher under a table lock). A CRL whose `nextUpdate` is not after its
+`thisUpdate`, or that lists a serial that is negative or longer than 20 octets, or that does not
+decode, is refused as `malformed`. A CRL that decodes but is not the issuer's complete list (a delta
+CRL, or one with an `issuingDistributionPoint`, a `certificateIssuer` entry or a `removeFromCRL`
+reason) and one with an extension the gateway does not understand that the CA marked critical is
+refused `unsupported`: well formed, and refused by policy (`malformed` is kept for input that does not
+decode, so a corrupt file and a policy refusal can be told apart). The Yuzu server
+publishes none of these. A base CRL from a CA that also publishes deltas (`freshestCRL`) is accepted as the
+complete list as of its `thisUpdate`; the gateway never fetches or applies deltas. A loaded CRL covers
+a peer only if the peer's certificate verifies under a key that signed the CRL: a different root with
+the same subject name gets `revocation_unknown`, not the other root's revocations. A CA whose key is
+not RSA, EC or EdDSA (an RSA-PSS key, for example) cannot be bound and its CRL is refused `unverified`. A refused CRL never
+evicts the loaded one. The high-water mark lives in the gateway process: the watcher keeps it across
+its own restart, but a gateway process that starts afresh has nothing held and accepts the first
+validly signed CRL it is given (see "Limits"). Each refusal is counted on
+`yuzu_gw_mgmt_crl_rejected_total{reason}` and logged when the reason changes.
+
+**Rejected bytes are remembered.** When the bytes alone (with the verification certificates) decide a
+refusal (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`, `validity_too_long`), the gateway keeps a hash of the bytes and of the certificates and does not
+decode and verify the same bytes again on every refresh: it does so again only when the bytes or the
+certificates change, the `mgmt_crl_max_validity_s` in force changes, an hour passes (the memory lasts
+one hour, so a refusal pinned by a transient fault is looked at again and a persistent one is
+repeated hourly), or another CRL is accepted. A remembered refusal is **reported
+exactly as a fresh one**: the state gauges say the latest attempt obtained nothing usable, so
+`yuzu_gw_mgmt_crl_last_success_timestamp_seconds` does not advance and
+`YuzuGatewayMgmtCrlRefreshStalled` and `YuzuGatewayMgmtCrlNotLoaded` still fire. What changes is the
+counter: `yuzu_gw_mgmt_crl_rejected_total` counts such a refusal **once per distinct rejection in a
+row, repeated hourly while it persists, not once per refresh**, so a steady non-zero `rate()` is no
+longer the signature of a file refused on every tick; read the gauges, the log (which names each
+change of reason and repeats an hour later) and `increase()` over a window longer than an hour. The
+memory saves the decode and verify, not the download: the body is still fetched in full on every
+refresh (the server sets no `ETag` on the CRL, so there is no 304). The memory has one slot: a source that alternates two different refused bodies (G, X, G, X) is decoded and counted on every refresh, and a good CRL between two refusals of the same bytes ends the memory, so the same bytes are then counted again. `future_dated` (it
+clears when the clock catches up), `replay` (it depends on the CRL held and on how stale it is: a
+CRL refused as `replay` while the held one is believed is taken once the held one is itself stale)
+and the fetch failures are never remembered and are counted on every attempt, and so is `too_large`
+in practice: an oversized body is cut off by the fetch before there is anything to hash. No shipped
+alert rates on this counter.
+
+**What it does to each stream.** Once a source is set, **every** admitted peer is checked, in every
+mode including `pin`, after admission and the deny-list. Three more reasons join the closed set
+on `yuzu_gw_mgmt_auth_rejected_total{reason}`:
+
+| Reason | The gateway has | Meaning |
+|---|---|---|
+| `revocation_unknown` | no CRL for the peer's issuer | none has loaded yet, or the peer's certificate was issued by a CA other than the one the loaded CRL covers (a different name, or the same name under a different key: the CRL covers only peers the key that signed it issued). Every stream is refused until a CRL loads |
+| `revocation_stale` | a CRL past `nextUpdate` plus `mgmt_crl_grace_s` | the CRL is no longer being refreshed. Every stream is refused |
+| `crl_revoked` | a current CRL that lists the peer's serial | the certificate was withdrawn |
+
+An unreadable peer certificate is refused `bad_peer_cert`. The server publishes a CRL valid for 48
+hours and its elected leader republishes when under 24 hours remain, so with the default 24 hour
+grace a healthy gateway never sees a stale one. `YuzuGatewayMgmtCrlStale` warns when the loaded CRL
+passes its `nextUpdate`, which is `mgmt_crl_grace_s` before refusals start (24 hours by default);
+`YuzuGatewayMgmtCrlRefreshStalled` warns when a held CRL has not been refreshed for 30 minutes;
+`YuzuGatewayMgmtCrlNotLoaded` pages when a source is set and no CRL has loaded for 10 minutes.
+
+**Renewing the server certificate.** The server's one automatic re-issue (the upgrade that adds the
+identity) revokes the old serial as `superseded` and publishes the CRL at once, so the first replica
+to restart is enough for the gateway to learn of it within a refresh interval. A replica that has not
+restarted yet still presents the old certificate. In `identity` mode that certificate carries no
+identity and is refused `no_uri_san` (as it was before this change); where a configured pin admits
+it (`pin`, or `identity_or_pin` with a pin listed) it is refused `crl_revoked` from the next fetch. Either way only that replica's
+commands fail, and `YuzuGatewayMgmtIdentityOutage` stays quiet while another replica is admitted
+(the warning `YuzuGatewayMgmtAuthRejected` fires): restart every server replica back to back. Do not
+revoke a server serial by hand while a replica still uses it.
+
+**A server certificate revoked by hand.** The server does not re-certify a key that was revoked for
+any reason other than the automatic `superseded`, so a restart does not fix it: every command then
+fails `crl_revoked` and `YuzuGatewayMgmtIdentityOutage` pages. Re-key the default certificate set
+(rename `default-marker.json` aside; every default leaf gets a new key, so update any gateway
+`mgmt_peer_pins` at the same time) and restart every server replica; see
+[Upgrading](upgrading.md), "already revoked".
+
+**Limits.**
+
+- **Latency.** A gateway between a server's publish and its next fetch (up to `mgmt_crl_refresh_ms`,
+  plus the time the loads around it take: the next wait starts after a load ends)
+  still admits the withdrawn certificate. A server that cannot publish (no elected leader, or no
+  access to the CA key) leaves the gateway on the held CRL, which keeps being believed until its
+  `nextUpdate` plus the grace.
+- **Streams in progress.** The check runs when a management stream is admitted, so every new stream
+  is refused once the CRL lists the certificate, even on a connection the server already holds open.
+  A stream already running when the certificate is withdrawn (a `SendCommand` in flight) is not cut
+  and runs to its end.
+- **Replace rule and restart.** A CRL replaces the held one when its `thisUpdate` is later OR its
+  `cRLNumber` is higher, so a server whose database was restored from a backup (a lower number but a
+  fresh `thisUpdate`, and a smaller revoked set) is accepted even without a restart. A gateway process
+  that starts afresh has forgotten the CRL it held. Until it fetches again it
+  refuses every stream; if the source then serves an older validly signed CRL than the one held
+  before, the gateway accepts it, and a withdrawal published after that CRL is not enforced until the
+  next one arrives, for at most that CRL's `nextUpdate` plus the grace (about three days at the
+  server's 48-hour validity). Fetching is over verified TLS, so this needs the server (or a restored
+  server database), or a holder of a certificate for the server's HTTPS name, to serve the old CRL.
+- **Clocks.** A server whose clock is more than an hour ahead publishes CRLs the gateway refuses
+  `future_dated` (the held CRL stays, and new revocations do not land). One whose clock is days
+  behind publishes CRLs that are already stale; the gateway does not let them replace a CRL still in
+  force, so the revocations such a CRL carries (including a server re-issue) do not land either, and
+  the held CRL is believed until its own `nextUpdate` plus the grace. The log names both CRLs'
+  numbers and times when it refuses one. Fix the server's clock, then restart a server replica that
+  has the correct clock (a restart republishes the CRL at startup); see `docs/pki-architecture.md`,
+  "CRL dated in the future" (added with the CRL future-dated alert change).
+- **Size.** A CRL larger than 16 MiB (about 470,000 revoked certificates of the server's 36 bytes
+  each, which never leave the list; at most about 840,000 of the smallest possible 20-byte entries) is
+  refused `too_large` on every fetch; the held one keeps being believed until its
+  `nextUpdate` plus the grace, then every stream is refused. There is no separate cap on the entry
+  count: the byte bound limits it. The gateway logs a WARNING once a fetched CRL passes 12 MiB (75
+  percent of the bound), at most once an hour, saying how large it is; there is no metric for it, so
+  watch the log, and plan a raise of the bound before it is crossed.
+- **Parse cost near the bound.** The OTP decoder holds the whole decoded list, so parsing a CRL near
+  16 MiB costs the watcher process **about 1.1 GiB of transient memory (1,111 to 1,153 MiB measured; plan for 1.2 GiB) and 2 to 2.5 seconds**
+  (measured on OTP 28.5.0.1: 465,916 server-shaped entries, 16.00 MiB, 1.9 s and a 1,153 MiB peak;
+  755,405 smallest entries, 15.82 MiB, 2.5 s and a 1,111 MiB peak), after which the loaded CRL is about 21 to 24 MiB per copy and **two copies stay resident** (the watcher's state and `persistent_term`), about 45 to 50 MiB. The garbage of the parse is collected as soon as it returns. A
+  container or VM memory limit below that kills the gateway when a CRL of that size arrives, so size
+  it for the CRL you can reach, not for the CRL you have: about 2.5 KB per entry at the server's entry
+  size is the planning figure. The memory shedder (`yuzu_gw_memory_shedder`, described with the `memory_shedding` keys) counts `erlang:memory(total)`
+  against the cgroup limit, so on a limit below about 1.6 GiB (its default high-water mark is 0.75 of
+  the limit) a near-bound parse suspends the agent listeners and turns `/readyz` not-ready **before** an
+  out-of-memory kill; where the limit is below the peak the VM is killed, and because the boot load
+  parses synchronously it is killed again on every restart. The decode happens **before** the signature is verified (the verifier
+  decodes the CRL itself and no cheaper check exists), so unsigned bytes of that size cost the same;
+  it is paid in the watcher, never on the stream path, and once per distinct bytes (a CRL identical
+  to the held one, and bytes already refused, are not parsed again for an hour). Not saved: a source
+  serving different bytes every refresh is parsed every refresh, and so are **identical** bytes that
+  are never remembered, a validly signed CRL refused `future_dated` or `replay` (each costs the full
+  decode, about 2 s at the bound, on every tick for as long as it is served). A refused body is also
+  still **downloaded in full** on every refresh: the memory saves CPU, not bandwidth.
+- **Trust.** The gateway believes the validity the CRL states, up to `mgmt_crl_max_validity_s`. The
+  shipped reference config sets it to 8 days, so a validly signed CRL wider than that (only the CA's
+  signing key can make one) is refused `validity_too_long`; where the key is **not set** (the code
+  default, and `sys.config.prod` until you add it) a CRL with a far-future `nextUpdate` keeps being
+  believed, and keeps `YuzuGatewayMgmtCrlStale` quiet, until that date. Even with the bound, a CRL
+  of the full allowed width is believed for that long plus the grace. A holder of the install CA key can mint a certificate and a CRL that omits it. The
+  revocation is by serial, not by key: a re-issue over the same key is not blocked by the old
+  serial's entry.
+- **Network.** The gateway needs an outbound path to the server's HTTPS port (a flow that did not
+  exist before), and a server that has published a CRL when the gateway starts: the boot waits up to
+  5.5 seconds for the first one (and up to 2 more for reading the CA files), so an unreachable server
+  delays the agent listener by that long.
+- **Evidence.** The gateway has no audit store. A refusal is evidenced by the counters
+  (`yuzu_gw_mgmt_auth_rejected_total{reason}`, `yuzu_gw_mgmt_crl_rejected_total{reason}`), the gauges
+  and the rate-limited WARN log, which names the reason and not the certificate (no serial or
+  fingerprint is logged, by design).
+- **Not exercised end to end.** The reference configuration's live source has not been run against
+  the real stack: `scripts/integration-test.sh` sets none, and no Common Test case covers the CRL.
+  The unit, watcher and configuration tests are the evidence.
+- **A source or `cacertfile` that blocks.** A `{file, Path}` source, or a `cacertfile`, on a dead
+  mount or a FIFO blocks the read; the watcher waits a bounded time, then fails that attempt, and
+  does not start another read of the same file until the blocked one returns (a blocked file read
+  cannot be cancelled, and each pins an operating-system thread, so retrying every tick would exhaust
+  the VM's file threads). The CRL is not refreshed meanwhile; `YuzuGatewayMgmtCrlRefreshStalled`
+  warns, and every stream is refused at `nextUpdate` plus the grace. The watcher resumes by itself
+  when the blocked read returns (the mount answers, or something opens a FIFO for writing), and a
+  read that was only slow and did finish is used; the gateway logs that it is not starting another
+  read while one is blocked. If the read never returns, only a gateway restart (which disconnects
+  its agents; agents without the #5183 fix stay wedged) frees the thread.
+- **Off switch.** With no `mgmt_crl_source` the gateway reads no CRL, and removing the setting (or
+  rolling back to a release that predates it) silently turns this check off. The boot logs a WARN
+  when a source is absent under `identity` or `identity_or_pin`; a later release will refuse to boot
+  there.
+
+**Metrics.** `yuzu_gw_mgmt_crl_enforced`, `_loaded`, `_number`, `_next_update_timestamp_seconds`,
+`_last_success_timestamp_seconds` and `_revoked_entries` describe the held CRL; `yuzu_gw_mgmt_crl_rejected_total{reason}` counts refused
+ones (see [metrics.md](metrics.md)). None of them is part of any readiness probe: a gateway that
+cannot reach the CRL must not be taken out of rotation by it.
 
 ### Certificate rotation and expiry
 
@@ -2686,8 +2909,11 @@ someone has something to do:
 
 | Alert | Fires when | What to do |
 |---|---|---|
-| `YuzuGatewayMgmtAuthRejected` (warning) | a management peer was refused for any reason **other than** `pin_mismatch`, in the last hour | `missing_server_auth_eku`, `bad_peer_cert`: a holder of an install-CA certificate that is not the server reached `:50063`, or the server's leaf lacks the serverAuth usage; investigate the source, fix the server certificate. `no_pins_resolved`, `no_pins_configured`, `bad_pin_config`: the pins admit nobody and every forwarded command fails; restore the pinned file or correct `mgmt_peer_pins`. `no_uri_san`: the peer's certificate carries no server identity URI; read `yuzu_server_identity_uri_present` on the server. `0`: the in-place re-issue was skipped or failed (see `YuzuServerIdentityUriAbsent`; fix the cause, then restart the server so it re-issues). `1`: the certificate the server presents to the gateway is not `default-server.pem` (a server run with its own `--cert`/`--key`; the gauge describes the built-in file): set `{mgmt_peer_auth_mode, pin}` with that certificate's pin. Absent: either the server runs a release that does not mint the identity, or is not being scraped (upgrade the server first, it must re-issue its certificate; THEN restart the gateway only if it is not already on the shipped `identity` config and only if its agents can take the disconnect, because agents without the #5183 fix stay wedged; a gateway already on `identity` needs only the server upgrade and restart), or no surface uses the built-in certificates (own certificates: set `pin`). Do not put a gateway in `identity` until the server is upgraded and the gauge reads `1`; a gateway already in `identity` that refuses with `no_uri_san` needs the server to re-issue, or your server certificate's pin added with `identity_or_pin` set until it does (with no pin, `identity_or_pin` is still identity-only). This setting is read at boot, so applying it restarts the gateway and disconnects its agents (see "Rolling it out"; restart only if they can take it, because agents without the #5183 fix stay wedged). In `identity_or_pin` with pins configured this reason is not reported: a peer that fails both paths shows as `pin_mismatch` or `no_pins_resolved`. `identity_mismatch` (with pins configured in `identity_or_pin` it shows as `pin_mismatch`): the certificate names another install or another role (a certificate of a different CA, or an agent-style URI): treat it as a security incident unless the server was just re-keyed under another CA. `identity_unresolved`: this gateway could not work out the install identity (its management listener's `cacertfile` is a bundle, or is empty, unreadable or half-written): set `mgmt_peer_identity` (over such a file it also needs mode `identity` with a pin). It is reported as itself in `identity_or_pin` too, when the pin does not admit the peer. `mgmt_peer_identity` is read at boot, so applying it restarts the gateway and disconnects its agents (restart only if they can take it, because agents without the #5183 fix stay wedged). `revoked`: the peer presented a certificate whose serial is in `mgmt_peer_denied`: either the server is still using a withdrawn certificate (re-key it) or a holder of that certificate is connecting. Editing `mgmt_peer_denied` is read at boot, so applying it restarts the gateway and disconnects its agents (restart only if they can take it, because agents without the #5183 fix stay wedged). `internal_error`: collect the log, report it. A rotation never produces these, except `identity_unresolved` in `identity_or_pin` with an unresolved identity (a rotation then shows as that configuration defect, not as `pin_mismatch`). |
-| `YuzuGatewayMgmtIdentityOutage` (critical, 1 m) | `no_uri_san` or `identity_mismatch` rejections **and no admission by any method** (`yuzu_gw_mgmt_auth_admitted_total`) on the same gateway in the same five minutes, so a refusal amid normal traffic does not page | Commands to this gateway's agents are failing (`gateway_unauthenticated`, no server retry). It fires together with `YuzuGatewayMgmtAuthRejected` for the same cause. Under the shipped `identity` config: a server with no identity in its certificate (read `yuzu_server_identity_uri_present`: 0 means the re-issue failed, so fix the cause per `YuzuServerIdentityUriAbsent` and restart the server, which needs no gateway restart; absent means an old server binary or an unscraped server: upgrade the server first), or a server with its own certificates: set `{mgmt_peer_auth_mode, pin}` with that certificate's pin (read at boot: it applies when the gateway is restarted, which disconnects the node's agents; do it only if they can take the disconnect, because agents without the #5183 fix stay wedged). `identity_mismatch` is a security incident unless the server was just re-keyed under another CA. In `identity_or_pin` with pins configured these reasons are reported as `pin_mismatch` and raise `YuzuGatewayMgmtPinMismatch` instead. |
+| `YuzuGatewayMgmtAuthRejected` (warning) | a management peer was refused for any reason **other than** `pin_mismatch`, in the last hour | `missing_server_auth_eku`, `bad_peer_cert`: a holder of an install-CA certificate that is not the server reached `:50063`, or the server's leaf lacks the serverAuth usage; investigate the source, fix the server certificate. `no_pins_resolved`, `no_pins_configured`, `bad_pin_config`: the pins admit nobody and every forwarded command fails; restore the pinned file or correct `mgmt_peer_pins`. `no_uri_san`: the peer's certificate carries no server identity URI; read `yuzu_server_identity_uri_present` on the server. `0`: the in-place re-issue was skipped or failed (see `YuzuServerIdentityUriAbsent`; fix the cause, then restart the server so it re-issues). `1`: the certificate the server presents to the gateway is not `default-server.pem` (a server run with its own `--cert`/`--key`; the gauge describes the built-in file): set `{mgmt_peer_auth_mode, pin}` with that certificate's pin. Absent: either the server runs a release that does not mint the identity, or is not being scraped (upgrade the server first, it must re-issue its certificate; THEN restart the gateway only if it is not already on the shipped `identity` config and only if its agents can take the disconnect, because agents without the #5183 fix stay wedged; a gateway already on `identity` needs only the server upgrade and restart), or no surface uses the built-in certificates (own certificates: set `pin`). Do not put a gateway in `identity` until the server is upgraded and the gauge reads `1`; a gateway already in `identity` that refuses with `no_uri_san` needs the server to re-issue, or your server certificate's pin added with `identity_or_pin` set until it does (with no pin, `identity_or_pin` is still identity-only). This setting is read at boot, so applying it restarts the gateway and disconnects its agents (see "Rolling it out"; restart only if they can take it, because agents without the #5183 fix stay wedged). In `identity_or_pin` with pins configured this reason is not reported: a peer that fails both paths shows as `pin_mismatch` or `no_pins_resolved`. `identity_mismatch` (with pins configured in `identity_or_pin` it shows as `pin_mismatch`): the certificate names another install or another role (a certificate of a different CA, or an agent-style URI): treat it as a security incident unless the server was just re-keyed under another CA. `identity_unresolved`: this gateway could not work out the install identity (its management listener's `cacertfile` is a bundle, or is empty, unreadable or half-written): set `mgmt_peer_identity` (over such a file it also needs mode `identity` with a pin). It is reported as itself in `identity_or_pin` too, when the pin does not admit the peer. `mgmt_peer_identity` is read at boot, so applying it restarts the gateway and disconnects its agents (restart only if they can take it, because agents without the #5183 fix stay wedged). `revoked`: the peer presented a certificate whose serial is in `mgmt_peer_denied`: either the server is still using a withdrawn certificate (re-key it) or a holder of that certificate is connecting. Editing `mgmt_peer_denied` is read at boot, so applying it restarts the gateway and disconnects its agents (restart only if they can take it, because agents without the #5183 fix stay wedged). `crl_revoked`: the CA's CRL lists the peer's serial: the server is presenting a certificate the CA withdrew (a replica that has not restarted since a re-issue; see "Withdrawing a server certificate" for the renewal and the by-hand revoke recovery), or a holder of that certificate is connecting. `revocation_unknown` or `revocation_stale`: this gateway cannot vouch for the CRL (none loaded, or past `nextUpdate` plus `mgmt_crl_grace_s`); see `YuzuGatewayMgmtCrlNotLoaded` and `YuzuGatewayMgmtCrlStale`. `mgmt_crl_source` is read at boot, so applying it restarts the gateway (restart only if its agents can take it, because agents without the #5183 fix stay wedged). `internal_error`: collect the log, report it. A rotation does not produce these, except `crl_revoked` from a server replica still presenting a superseded certificate, and `identity_unresolved` in `identity_or_pin` with an unresolved identity (a rotation then shows as that configuration defect, not as `pin_mismatch`). |
+| `YuzuGatewayMgmtIdentityOutage` (critical, 1 m) | `no_uri_san`, `identity_mismatch`, `revocation_unknown`, `revocation_stale` or `crl_revoked` rejections **and no admission by any method** (`yuzu_gw_mgmt_auth_admitted_total`) on the same gateway in the same five minutes, so a refusal amid normal traffic does not page | Commands to this gateway's agents are failing (`gateway_unauthenticated`, no server retry). It fires together with `YuzuGatewayMgmtAuthRejected` for the same cause. Under the shipped `identity` config: a server with no identity in its certificate (read `yuzu_server_identity_uri_present`: 0 means the re-issue failed, so fix the cause per `YuzuServerIdentityUriAbsent` and restart the server, which needs no gateway restart; absent means an old server binary or an unscraped server: upgrade the server first), or a server with its own certificates: set `{mgmt_peer_auth_mode, pin}` with that certificate's pin (read at boot: it applies when the gateway is restarted, which disconnects the node's agents; do it only if they can take the disconnect, because agents without the #5183 fix stay wedged). `identity_mismatch` is a security incident unless the server was just re-keyed under another CA. In `identity_or_pin` with pins configured these reasons are reported as `pin_mismatch` and raise `YuzuGatewayMgmtPinMismatch` instead. |
+| `YuzuGatewayMgmtCrlNotLoaded` (critical, 10 m) | `yuzu_gw_mgmt_crl_enforced == 1` and `yuzu_gw_mgmt_crl_loaded == 0` for ten minutes: a CRL source is set and no CRL has verified, so every stream is refused `revocation_unknown` (the ten minutes absorb a server that is still starting) | Read the gateway log's `mgmt_crl_source:` lines and `yuzu_gw_mgmt_crl_rejected_total{reason}`. `fetch_tls`: the TLS to the server's 8443 failed, because its certificate is not issued by the CA the gateway verifies it with (name the issuing CA in the three-element `mgmt_crl_source`, or use `{file, Path}`) **or** the host in the URL is not one of that certificate's names (`--cert-san`). `fetch_connect`: unreachable. `fetch_timeout`: no answer in time. `fetch_status`: a status other than 200 (503 is "CRL not yet published": the server is still starting or its CA is unavailable). `malformed`, `too_large`: the bytes are not a usable CRL. `unsupported`: a well-formed one the gateway refuses by policy (not the issuer's complete base list: a delta, a scoped or indirect CRL, or one with an extension the gateway cannot process; the Yuzu server publishes none of these). `validity_too_long`: a CRL wider than `mgmt_crl_max_validity_s`. `unverified`, `issuer_mismatch`: the CRL was not signed by the CA the management listener trusts, or by a CA whose key type the gateway cannot bind (RSA, EC and EdDSA are supported). `future_dated`: dated more than an hour ahead of this gateway's clock (check the clock here and on the server; after fixing the server's clock restart a server replica that has the correct clock, see `docs/pki-architecture.md`, "CRL dated in the future", added with the CRL future-dated alert change). `file_unreadable`: a `{file, Path}` source or a `cacertfile` cannot be read. A CRL refused because of its bytes (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`, `validity_too_long`) is counted on `yuzu_gw_mgmt_crl_rejected_total` once in a row and again once an hour, not once per refresh: read its value or `increase()` over a long window, not its rate. |
+| `YuzuGatewayMgmtCrlStale` (warning, 5 m) | the loaded CRL is past its `nextUpdate` (`time() > yuzu_gw_mgmt_crl_next_update_timestamp_seconds`) | The gateway still admits until `nextUpdate` plus `mgmt_crl_grace_s` (24 h by default). Find why the CRL is not refreshing (the server's leader stopped publishing, or this gateway cannot fetch it) and restore it before the grace ends. A CRL refused because of its bytes (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`, `validity_too_long`) is counted on `yuzu_gw_mgmt_crl_rejected_total` once in a row and again once an hour, not once per refresh: read its value or `increase()` over a long window, not its rate. |
+| `YuzuGatewayMgmtCrlRefreshStalled` (warning, 10 m) | a CRL is held but `yuzu_gw_mgmt_crl_last_success_timestamp_seconds` is more than 30 minutes old: the watcher is stuck or every fetch is failing behind a still-valid CRL | A revocation published now will not reach this gateway, and nothing else alerts until `nextUpdate` (up to 48 h). Read `yuzu_gw_mgmt_crl_rejected_total{reason}` and the `mgmt_crl_source:` log lines; a stuck `{file, Path}` source or `cacertfile` shows as `file_unreadable`, and only a wedged watcher process shows nothing new at all. The rule compares the Prometheus clock with the gateway's, so keep both on NTP (`YuzuGatewayMgmtCrlStale` has the same dependency). Raise the 1800 in the rule if you raised `mgmt_crl_refresh_ms` above 15 minutes. A CRL refused because of its bytes (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`, `validity_too_long`) is counted on `yuzu_gw_mgmt_crl_rejected_total` once in a row and again once an hour, not once per refresh: read its value or `increase()` over a long window, not its rate. |
 | `YuzuGatewayMgmtPinMismatch` (critical) | `pin_mismatch` rejections that no pin rotation on this gateway explains: rejections are read one minute late and ignored for 4 minutes after `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` moves (the server's `YuzuGatewayForwardUnauthenticated` is not suppressed, see above) | Commands to this gateway's agents are failing. If the server's certificate changed, update the pinned file (picked up within one interval). If it did not change, someone is presenting another serverAuth certificate (for example the gateway's own key) to the command plane: treat it as a security incident. In `identity_or_pin` the peer also failed the identity check (a pin reason is only reported when both paths fail): check `yuzu_server_identity_uri_present` on the server before changing a pin. |
 | `YuzuServerIdentityUriAbsent` (warning, 15 m; a **server** alert, group `yuzu-pki`) | `yuzu_server_identity_uri_present == 0`: the built-in `default-server.pem` lacks the URI SAN `yuzu://<install>/server`, because the in-place re-issue was skipped or failed. The gauge is set whenever ANY surface (for example the HTTPS listener) runs on the built-in certificates, and is absent, not 0, only when none does; it describes the file, so it can read 1 while the gRPC/gateway-command certificate (`--cert`/`--key`) carries no identity. An installation whose surfaces all use its own certificates never fires it | The server log says why on every boot: the server key was withdrawn (re-key the set, which also changes the key every gateway `mgmt_peer_pins` entry refers to), the certificate directory is read-only, the CA key is not in it, or the CA inventory is unreachable. A gateway in `pin`, or in `identity_or_pin` with a pin listed, still admits the server by its pin, so nothing is failing; a gateway in `identity` (what the shipped configs set) refuses it (`no_uri_san`). Do not put a gateway in `identity` until the server is upgraded and this reads 1 on every server replica and real command traffic has been admitted by identity (see "Rolling it out"; the gauge describes the file, not the certificate the server presents). A gateway already in `identity` that refuses with `no_uri_san` needs the server to re-issue (fix the cause above, then restart the server), or your server certificate's pin added with `identity_or_pin` set until it does (with no pin, `identity_or_pin` is still identity-only; the mode is read at boot, so applying it restarts the gateway: only if its agents can take the disconnect, because agents without the #5183 fix stay wedged). |
 | `YuzuGatewayMgmtPinUnresolved` (warning, 2 m) | a configured pin has never resolved, or a pin file's latest read failed (`yuzu_gw_cert_file_readable{role="mgmt_peer_pin"} == 0`) | In `identity_or_pin` and `identity` this fires even while the identity is admitting the traffic: the pin is the fallback, and it is better to learn it is dead now. Correct the fingerprint, or put the server's current certificate back in the pinned file (owner, mode, contents). The fix is picked up within one interval. The key last read stays pinned meanwhile: deleting or damaging the file does not revoke it (see above). |
@@ -3307,7 +3533,7 @@ do not.
 | gateway | metric | `yuzu_gw_session_limit_rejected_total` rising | A `Register` or `Subscribe` was refused because one gRPC connection already holds `max_sessions_per_connection` agent sessions (default 8; see "Per-connection session cap" for what counts). A stock agent holds one session per connection (INFERRED), so a rise means an L4 balancer, forwarder or client is carrying several agents on one connection (see "Per-connection session cap" under Configuration). A refused `Register` is answered `UNAVAILABLE` (14); a refused `Subscribe` is also answered `UNAVAILABLE` (14) and is counted the same. The agent retries either way. If the topology is legitimate, raise the key in `sys.config`; the key is read once when the registry starts, so the change needs a gateway restart, which disconnects every agent the node holds, so plan it. The metric has no agent label. A refused `Register` leaves nothing on the server and no row on the gateway. Rows of a connection that closed stay counted for the dead connection key only, which no new connection uses, until `dead_connection_grace_ms` (default 15 s) has passed, so a reconnecting client is not refused because of them. |
 | gateway | WARN | `Register failed: registry_unavailable` | The agent was answered `INTERNAL` (13) "Registration failed: registry unavailable". The gateway's registry process could not be reached for this `Register`: its table is missing, a call timed out, or the registry restarted and lost the row (see the `Registration replay aborted: registry unavailable` row). This line no longer covers a superseded `Register` (see the next row). The agent registers again with its reconnect backoff (read from the agent code). A sustained run of lines is not expected: check `/readyz` and the registry process. |
 | gateway | INFO | `Register superseded by a newer registration` | Two `Register` calls of one agent id overlapped on one connection and the newer one committed first. The older one was answered `UNAVAILABLE` (14) and left no row; the registry is healthy. No action: the agent retries a non-OK `Register` with its reconnect backoff (read from the agent code). An occasional line is expected; a sustained run would mean an agent or forwarder keeps repeating `Register` for one agent id on one connection (INFERRED from the code, not observed). |
-| gateway | WARN | `mgmt-plane peer rejected: <reason> (CA-issued cert is not authorization to command the fleet — see mgmt_peer_auth_mode, mgmt_peer_pins)` | A management-listener (`:50063`) stream was refused `UNAUTHENTICATED` by the peer authorization: the SPKI pin (#1422) and/or the server identity (#6016). `<reason>` is one of the closed set counted on `yuzu_gw_mgmt_auth_rejected_total{reason}` (`pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `no_uri_san`, `identity_mismatch`, `identity_unresolved`, `revoked`, `internal_error`); no certificate contents are logged. At most one line per reason per second (any holder of an install-CA certificate that reaches the port can provoke one per stream, N4); a line that follows suppressed ones ends `(N similar line(s) suppressed since the last)`. The counter counts every rejection; read it, not the log, for how many there were. A `pin_mismatch` burst right after the server rotated its leaf that stops within `mgmt_pin_refresh_ms` is the rotation window, not an attack; the server does not retry those streams, so the commands it forwarded in that window failed as `gateway_unauthenticated` (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). |
+| gateway | WARN | `mgmt-plane peer rejected: <reason> (CA-issued cert is not authorization to command the fleet — see mgmt_peer_auth_mode, mgmt_peer_pins, mgmt_crl_source)` | A management-listener (`:50063`) stream was refused `UNAUTHENTICATED` by the peer authorization: the SPKI pin (#1422) and/or the server identity (#6016). `<reason>` is one of the closed set counted on `yuzu_gw_mgmt_auth_rejected_total{reason}` (`pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `no_uri_san`, `identity_mismatch`, `identity_unresolved`, `revoked`, `revocation_unknown`, `revocation_stale`, `crl_revoked`, `internal_error`); no certificate contents are logged. At most one line per reason per second (any holder of an install-CA certificate that reaches the port can provoke one per stream, N4); a line that follows suppressed ones ends `(N similar line(s) suppressed since the last)`. The counter counts every rejection; read it, not the log, for how many there were. A `pin_mismatch` burst right after the server rotated its leaf that stops within `mgmt_pin_refresh_ms` is the rotation window, not an attack; the server does not retry those streams, so the commands it forwarded in that window failed as `gateway_unauthenticated` (see [Certificate rotation and expiry](#certificate-rotation-and-expiry)). |
 | gateway | INFO | `Management peer authorization: mode=<m> identity=<resolved, unresolved or not used (mode pin)> pins=<n> denied_serials=<n>` | Written once at boot by the management peer authorization guard (#6016): the mode in force, whether the server identity resolved (`not used (mode pin)` in `pin` mode, e.g. `mode=pin identity=not used (mode pin) pins=1 denied_serials=0`), how many `mgmt_peer_pins` entries are configured and how many serials `mgmt_peer_denied` lists. Read it after changing `mgmt_peer_auth_mode`, `mgmt_peer_identity` or `mgmt_peer_denied`. See [Authorizing the server by its identity](#authorizing-the-server-by-its-identity). |
 | gateway | WARN | `Management peer authorization mode <m> could not resolve the server identity (no management listener whose cacertfile holds exactly one certificate, and no {yuzu_gw, mgmt_peer_identity}): <consequence>. Set {yuzu_gw, mgmt_peer_identity} to yuzu://<install>/server.` | The mode needs the identity and the gateway could not resolve it. The consequence text says `every management peer is refused (identity_unresolved)` in `identity` and `only a pinned key is admitted` in `identity_or_pin`. Set `mgmt_peer_identity`, which takes effect when the gateway next restarts. Written only where a management listener runs the authorization; a lab-rig plaintext listener never warns. |
 | gateway | WARN | `{yuzu_gw, mgmt_peer_identity} (<explicit>) is not the identity derived from the management listener's cacertfile (<derived>)[ (they differ only in letter case: the install id is UPPER-case hex)]: no peer certificate of this install will match it. ...` | An explicit `mgmt_peer_identity` differs from the one the listener's single-certificate `cacertfile` derives: a typo, a lower-case copy of the fingerprint, or a value left over from before a CA re-root. Not a refusal. Correct it, or remove it to use the derived one. Not written in `pin` mode. |
@@ -3317,6 +3543,14 @@ do not.
 | gateway | WARN | `{yuzu_gw, mgmt_peer_auth_mode} is not set; defaulting to pin (the SPKI pins of mgmt_peer_pins only, as before #6016). Set it explicitly: identity admits the server by the install CA's server identity, which the shipped reference configs set and which a later release may make the default for an unset key; pin keeps pins only and is what bring-your-own certificates, --no-default-certs and a server given its own --cert/--key need, since they carry no identity. See docs/user-manual/gateway.md.` | The mode is not set, so the gateway chose `pin`, exactly as before #6016; nothing about admission changed. Set `mgmt_peer_auth_mode` explicitly: `identity` to admit by the install CA's server identity (what the shipped reference configs set), `pin` for bring-your-own certificates, `--no-default-certs` or a server given its own `--cert/--key`, which carry no identity (under `identity` every command is refused `no_uri_san`). Written only for a gateway that runs the management `auth_fun`. |
 | gateway | WARN | `mgmt_peer_pins: the certificate at <path> cannot be read or is not a PEM certificate; it pins nothing until it is fixed (fail closed)` | The pin watcher (`yuzu_gw_mgmt_pins`) could not stat, read or parse a `{cert_file, Path}` pin that has never been read since the gateway started. That entry admits nothing until the file is readable and holds a certificate (picked up within `mgmt_pin_refresh_ms`); with no other pin resolved every management stream is refused `no_pins_resolved`. One line per change of state, not per stream. |
 | gateway | WARN | `mgmt_peer_pins: the certificate at <path> cannot be read or is not a PEM certificate; the key last read from it stays pinned and is still admitted (deleting or damaging the file does not revoke it). Fix the file before the server rotates; to change or revoke the pin, replace the file with the new certificate` | The same failure on a pin file that was read before. The key last read stays pinned, so commands still flow; `yuzu_gw_cert_file_readable{role="mgmt_peer_pin"}` reads 0 and `YuzuGatewayMgmtPinUnresolved` fires after 2 minutes. Fix the file before the server's next rotation, which would otherwise be refused. Deleting, emptying or corrupting the file does not revoke the pinned key; see "Certificate rotation and expiry". |
+| gateway | WARN | `{yuzu_gw, mgmt_crl_source} is not set: this gateway does not read the install CA's revocation list, so a server certificate the CA has revoked is still admitted ...` | The mode is `identity` or `identity_or_pin` and no CRL source is set, so a withdrawn server certificate is still admitted. Set `mgmt_crl_source` (see "Withdrawing a server certificate"); a later release will refuse to start without it |
+| gateway | WARN | `{yuzu_gw, mgmt_crl_source} is set while mgmt_peer_auth_mode is pin: the revocation check applies to the pinned server certificate too ...` | In `pin` mode the CRL check still applies to every admitted peer, so the pinned certificate must be issued by the CA that signs the CRL, or every management stream is refused `revocation_unknown` |
+| gateway | INFO | `Management CRL source: <source>; grace <n>s; refresh <n>ms; maximum validity <n>s` (or `not bounded`) | The resolved source at boot: for a URL, the host and path and the CA the gateway trusts to have issued the certificate presented there, and the `mgmt_crl_max_validity_s` in force (`not bounded` when unset) |
+| gateway | NOTICE | `{yuzu_gw, mgmt_crl_max_validity_s} is set but mgmt_crl_source is not: no CRL is read, so the key has no effect.` | The validity bound is set and no CRL source is configured, so nothing reads a CRL and the key is inert. Logged once at boot at NOTICE, so it is visible at the default log level |
+| gateway | WARN | `mgmt_crl_source: the CA's CRL is <n> bytes, <p>% of the <max> byte bound; past it every fetch is refused (too_large) ...` | A fetched CRL has passed 75 percent of the 16 MiB bound (12 MiB). Logged at most once an hour. The CRL only grows; plan a raise of the bound before it is crossed, and size the gateway's memory for parsing it (see "Limits", "Parse cost near the bound") |
+| gateway | CRITICAL | `Refusing to start: invalid management CRL configuration: <defects>` | `mgmt_crl_source` is not one of the three accepted forms, uses `http`, carries userinfo or a fragment, has an unknown option, names a missing `cacertfile` or has none to default to, or `mgmt_crl_grace_s`, `mgmt_crl_refresh_ms` or `mgmt_crl_max_validity_s` is out of range |
+| gateway | NOTICE | `mgmt_crl_source: loaded the CA's CRL number <n> (thisUpdate <t>, nextUpdate <t>, <n> revoked serial(s))` | A new CRL verified and replaced the held one (`<t>` is seconds since the epoch) |
+| gateway | WARN | `mgmt_crl_source: the CRL was not loaded (<reason>); ...` | A fetch or read was refused for `<reason>` (one of the fourteen on `yuzu_gw_mgmt_crl_rejected_total`). Logged when the reason changes, not on every tick. With no CRL held, every stream is refused `revocation_unknown` until one loads; with one held, it stays in force until `nextUpdate` plus the grace |
 | gateway | INFO | `mgmt_peer_pins: the certificate at <path> is readable again; the pinned key is unchanged` | A pin file that had failed is readable again with the key already pinned. No action. |
 | gateway | NOTICE | `mgmt_peer_pins: the certificate at <path> changed; the new key is pinned` | The pin watcher picked up a rotated server leaf and set `yuzu_gw_mgmt_pin_rotated_timestamp_seconds`. Management streams made with the old leaf are refused from now on (`pin_mismatch`). |
 | gateway | WARN | `certificate expiry refresh failed: <class>:<reason>; the expiry gauges keep their last values` | The expiry refresh on the pin watcher's tick raised. The pins are unaffected; the expiry and readable gauges stop updating until it succeeds. Not expected: collect the log line and report it. |
@@ -5300,7 +5534,14 @@ that are actually emitted are listed.
 | `yuzu_gw_upstream_backpressure_duty_cycle` | gauge | The backpressure duty cycle over the last 60 s, 0 to 1. Reads low for the first minute after a start (the missing seconds count as not saturated) |
 | `yuzu_gw_upstream_slow` | gauge | 1 when the duty cycle above is 0.5 or more (a slow server, as this gateway sees it), else 0. Not a readiness input |
 | `yuzu_gw_session_limit_rejected_total` | counter | Registrations refused because one connection already holds the configured number of agent sessions, pending plus live (`max_sessions_per_connection`, default 8). Unlabelled, created at 0 at start. A `Register` over the cap is answered `UNAVAILABLE` (14); a `Subscribe` over the cap is also answered `UNAVAILABLE` (14) and is counted the same. A stock agent holds one session per connection (INFERRED), so a rise points to an L4 balancer, forwarder or client that carries several agents on one connection; see "Per-connection session cap" under Configuration. |
-| `yuzu_gw_mgmt_auth_rejected_total` | counter | Management-listener (`:50063`) streams refused by the peer authorization (the SPKI pin and/or, since #6016, the server identity and the serial deny-list), by `reason` (closed set: `pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `no_uri_san`, `identity_mismatch`, `identity_unresolved`, `revoked`, `internal_error`; all created at 0 at start). Alerts: `YuzuGatewayMgmtAuthRejected` (every reason but `pin_mismatch`), `YuzuGatewayMgmtPinMismatch` |
+| `yuzu_gw_mgmt_auth_rejected_total` | counter | Management-listener (`:50063`) streams refused by the peer authorization (the SPKI pin and/or, since #6016, the server identity and the serial deny-list), by `reason` (closed set: `pin_mismatch`, `missing_server_auth_eku`, `no_pins_resolved`, `no_pins_configured`, `bad_peer_cert`, `bad_pin_config`, `no_uri_san`, `identity_mismatch`, `identity_unresolved`, `revoked`, `revocation_unknown`, `revocation_stale`, `crl_revoked`, `internal_error`; all created at 0 at start). Alerts: `YuzuGatewayMgmtAuthRejected` (every reason but `pin_mismatch`), `YuzuGatewayMgmtPinMismatch`, `YuzuGatewayMgmtIdentityOutage` |
+| `yuzu_gw_mgmt_crl_enforced` | gauge | 1 when a `mgmt_crl_source` is set, 0 when none is (no CRL check) |
+| `yuzu_gw_mgmt_crl_loaded` | gauge | 1 when a verified CRL is held, 0 before the first one loads (every stream is then refused `revocation_unknown` under a source). Alert: `YuzuGatewayMgmtCrlNotLoaded` |
+| `yuzu_gw_mgmt_crl_number` | gauge | The `cRLNumber` of the held CRL; 0 when none |
+| `yuzu_gw_mgmt_crl_next_update_timestamp_seconds` | gauge | `nextUpdate` (Unix seconds) of the held CRL; 0 when none. Alert: `YuzuGatewayMgmtCrlStale` |
+| `yuzu_gw_mgmt_crl_last_success_timestamp_seconds` | gauge | Unix seconds of the last successful read of the CRL source; 0 until then; not advanced by a failed fetch. Alert: `YuzuGatewayMgmtCrlRefreshStalled` |
+| `yuzu_gw_mgmt_crl_revoked_entries` | gauge | Revoked serials in the held CRL; 0 when none |
+| `yuzu_gw_mgmt_crl_rejected_total` | counter | CRLs not obtained or refused, by `reason` (closed set of fourteen: `malformed`, `unsupported`, `too_large`, `unverified`, `issuer_mismatch`, `validity_too_long`, `future_dated`, `replay`, `fetch_timeout`, `fetch_connect`, `fetch_tls`, `fetch_status`, `fetch_error`, `file_unreadable`; all created at 0 at start) |
 | `yuzu_gw_mgmt_auth_admitted_total` | counter | Management-listener streams let in, by `method` (`identity` or `pin`; both created at 0 at start). Which path carries the traffic. `mgmt_peer_auth_mode` can move from `identity_or_pin` to `identity` only after real command traffic has moved `method="identity"` while `method="pin"` stood still; `pin` standing still on an idle gateway proves nothing (see [Authorizing the server by its identity](#authorizing-the-server-by-its-identity)) |
 | `yuzu_gw_mgmt_auth_pin_unresolved_total` | counter | Management auth attempts during which at least one configured `mgmt_peer_pins` entry did not resolve (a typo'd fingerprint, or a pin file never readable since start). Counted in every mode that evaluates the pin, including `identity_or_pin` attempts the identity admits |
 | `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` | gauge | Unix time at which the pin watcher last published a different key for a `{cert_file, Path}` pin; 0 until the first such change in the process (created at 0 at start). Used by `YuzuGatewayMgmtPinMismatch` to stay quiet through a rotation |

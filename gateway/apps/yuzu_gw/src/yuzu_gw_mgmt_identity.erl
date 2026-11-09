@@ -62,7 +62,7 @@
 %%% the SERIAL and never on the key: the server re-issues its leaf over the SAME
 %%% key to add the identity, so a key deny would also refuse the replacement.
 %%% The list is read at boot; applying a change needs a restart. Applying it
-%%% automatically from the CA's revocation list is the follow-up of #6016.
+%%% automatically from the CA's revocation list is `mgmt_crl_source' (yuzu_gw_mgmt_crl_source).
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_mgmt_identity).

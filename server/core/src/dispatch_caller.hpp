@@ -97,21 +97,61 @@ struct DispatchCaller {
     ///      provenance here at send time (a re-authorized AlwaysApproval action
     ///      still clears the #1398 ExecuteGate because the approval that
     ///      admitted the occurrence already happened).
-    ///   2. MCP `execute_instruction` / `quarantine_device` handlers
-    ///      (`mcp_server.cpp`) — `Ticket`, stamped only after
-    ///      `approval_ticket_just_consumed` is true (supervised tier).
-    ///   3. `DeploymentEngine` / `DeploymentRoutes` (`deployment_engine.cpp`
-    ///      / `deployment_routes.cpp`) — `GovernedPipeline` on their
-    ///      content_dist dispatches.
+    ///   2. MCP `execute_instruction` / `quarantine_device` / `execute_bundle`
+    ///      handlers and the echo-query arm of the result-set producers'
+    ///      shared `rs_run_async` (`mcp_server.cpp`): `Ticket`, stamped only
+    ///      after `approval_ticket_just_consumed` is true (supervised tier).
+    ///      Each is safe because the (plugin, action) pair(s) it dispatches are
+    ///      bound by the ticket: `execute_instruction` takes them from its own
+    ///      arguments, `execute_bundle` from its `steps` argument (the C8 canon
+    ///      is the whole argument object and the recall rejects a row whose canon
+    ///      differs), `quarantine_device` dispatches one fixed pair, and the echo
+    ///      arm one fixed pair (`echo.sql`).
+    ///      `create_result_set_from_instruction_result` and
+    ///      `reevaluate_result_set` (the `kInstructionResult` arm of
+    ///      `rs_run_async`) are NOT stamping sites and must never become one
+    ///      (sg-1, the sec-F1 class): their pair is read from a STORED definition
+    ///      an editor can repoint between approval and recall, and
+    ///      `dispatch_pairs_for` returns no pair for them. Since L1 the ticket
+    ///      binds the RESOLVED pair (`effect_binding`), so a repoint is refused
+    ///      at the ticket match. The stamp stays withheld as a POLICY line, not a
+    ///      technical necessity: the stamping tools take their pair(s) from the
+    ///      caller's own arguments (or a fixed pair), whereas these resolve it
+    ///      from a store, and an approval of that indirectly resolved effect has
+    ///      not been ruled to lift the pair's own ExecuteGate. They force `None`;
+    ///      the pair's own gate decides.
+    ///      `execute_instruction_definition` (#2146) is NOT a stamping site and
+    ///      must never become one (sec-F1): its (plugin, action) comes from a
+    ///      STORED definition that an editor can repoint between approval and
+    ///      recall. Since L1 its C8 ticket binds that resolved effect as well as
+    ///      the arguments (a repoint is refused at the ticket match). The stamp
+    ///      stays withheld for the same policy reason as the producers above: the
+    ///      pair is resolved from a store, so an approval of it is not taken to
+    ///      lift that pair's ExecuteGate. The handler forces `None`; the pair's
+    ///      own gate decides (a non-admin caller on a gated pair is refused).
+    ///   3. `DeploymentEngine` (`deployment_engine.cpp`, the pipeline caller it
+    ///      builds for its content_dist dispatches) — `GovernedPipeline`. It is the
+    ///      only file that stamps it; `deployment_routes.cpp` reaches the engine and
+    ///      stamps nothing itself.
     /// `BundleOrchestrator::dispatch()` (`bundle_orchestrator.cpp`) is NOT a
-    /// fourth stamping site — it is a pass-through conduit: REST/MCP
-    /// `execute_bundle` derive provenance at one of the three sites above
-    /// (site 2, via `approval_ticket_just_consumed`) and thread it in as a
-    /// parameter, same as `principal`/`exec_visible`. `ServerImpl::
+    /// fourth stamping site — it is a pass-through conduit. MCP `execute_bundle`
+    /// derives provenance at site 2 above (via `approval_ticket_just_consumed`)
+    /// and threads it in as a parameter, same as `principal`/`exec_visible`.
+    /// REST `execute_bundle` (`rest_api_v1.cpp`) stamps NOTHING: it threads only
+    /// `principal_is_admin` (REST has no ticket flow), so its provenance is always
+    /// `None` and a non-admin REST caller never reaches a gated bundle step.
+    /// `ServerImpl::
     /// derive_dispatch_caller_for_username` stamps ONLY `principal_is_admin`
     /// (see that field's comment above), never this one — do not confuse the
     /// two; a caller can be admin-stamped there and still reach the gate
     /// with `approval_provenance == None`.
+    /// MCP `execute_workflow` / `POST /api/v1/workflows/{id}/execute` (`workflow_execute.hpp`)
+    /// are NOT stamping sites: they thread the caller's own `DispatchCaller` to every step
+    /// unchanged and leave this field `None` even after a consumed MCP ticket. That ticket binds
+    /// the workflow id, the agent list and the ordered step effects (a repoint is refused), but
+    /// the steps' pairs are resolved from stored instructions, so for the policy reason given
+    /// for the other store-resolved tools above an approval of them is not taken to lift a
+    /// step's own approval mode or ExecuteGate.
     /// A fifth stamping site (or a new pass-through conduit) is a diff
     /// against this stated list, not a silent addition — if you are adding
     /// one, update this comment too.

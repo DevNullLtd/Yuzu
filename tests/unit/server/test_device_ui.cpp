@@ -256,7 +256,8 @@ TEST_CASE("device live capture sources: toggle state + $-table + read-only link"
     std::vector<LiveCaptureSource> rows{{"process", "Process", "Activity", true, 1234},
                                         {"arp", "ARP", "Network", false, -1}};
     const auto h = render_device_live_capture_sources(rows);
-    CHECK(h.find("$Process_Live") != std::string::npos);
+    CHECK(h.find("$Process_Hourly") != std::string::npos);
+    CHECK(h.find("_Live") == std::string::npos);
     CHECK(h.find("1234") != std::string::npos);
     CHECK(h.find("ls-sw on") != std::string::npos);  // process enabled (toggle on)
     CHECK(h.find("src-off") != std::string::npos);   // arp disabled
@@ -300,4 +301,28 @@ TEST_CASE("device live disk: usage-bar tones, low-free floor, clamp, unmeasured,
         CHECK(h.find("<x>") == std::string::npos);
         CHECK(render_device_live_disk({}).find("No volume reported") != std::string::npos);
     }
+}
+
+TEST_CASE(
+    "device Guardian lens: the tile is never 'good' over an uncertain or pending guard (#5690)",
+    "[device][ui][ordering]") {
+    DeviceGuardRow clean{"Defender RTP", "compliant", "2026-06-16T10:00:00Z"};
+    DeviceGuardRow unc{"BitLocker", "compliant", "2026-06-16T10:00:00Z"};
+    unc.order_uncertain = true;
+    DeviceGuardRow pend{"Firewall", "compliant", "2026-06-16T10:00:00Z"};
+    pend.projection_pending = true;
+    const auto good = render_device_guardian_lens("a-1", {clean, clean});
+    CHECK(good.find("class=\"n good\"") != std::string::npos);
+    CHECK(good.find("uncertain ordering") == std::string::npos);
+    for (const auto& bad : {render_device_guardian_lens("a-1", {clean, unc}),
+                            render_device_guardian_lens("a-1", {clean, pend})}) {
+        CHECK(bad.find("100%") != std::string::npos);             // every guard reports compliant
+        CHECK(bad.find("class=\"n good\"") == std::string::npos); // but the tone is not clean
+        CHECK(bad.find("class=\"n warn\"") != std::string::npos);
+        CHECK(bad.find("1 with uncertain ordering or an unreflected verdict") != std::string::npos);
+        CHECK(bad.find("&middot; ordering uncertain") != std::string::npos); // the row marker
+        CHECK(bad.find("See the Guaranteed State guide, section 'When a verdict is flagged or does "
+                       "not move'.") != std::string::npos); // the row marker points at the runbook
+    }
+    CHECK(good.find("ordering uncertain") == std::string::npos);
 }

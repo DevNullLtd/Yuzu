@@ -1005,7 +1005,7 @@ Implement Ed25519-based signing, 3-level key hierarchy (org root → signing key
 **Scope:** Server
 **Depends on:** 2.5, 2.12
 
-Server-side orchestration: `workflow.if` (branch on expression), `workflow.foreach` (iterate result rows, dispatch child per row), `workflow.retry` (retry with backoff). Compose existing InstructionDefinitions — no new execution semantics. Uses `Execution.parent_id` for linking. Design: `docs/Instruction-Engine.md` Section 7.9.
+Server-side orchestration: `workflow.if` (branch on expression), `workflow.foreach` (iterate result rows, dispatch child per row), `workflow.retry` (retry with backoff). Compose existing InstructionDefinitions - no new execution semantics. Uses `Execution.parent_id` for linking. Design: `docs/Instruction-Engine.md` Section 7.9. Running a workflow is also exposed over REST v1 and MCP (`execute_workflow`, #2146 batch B); the residuals of that surface are listed in the ADR-1005 2026-11-05 entry.
 
 **Files:** New `server/core/src/workflow_engine.cpp`, `server/core/src/execution_tracker.cpp`, `server/core/src/instruction_store.cpp`
 
@@ -1499,7 +1499,7 @@ Server-side resource registry for versioned binary blobs:
 ### Issue 13.1: 2FA for Instruction Approval (TOTP)
 **Capability:** new | **Scope:** Server | **Status:** Open (stale: TOTP + MFA step-up landed generally and gates instruction approve and reject, and #6061 and #6079 require an interactive session and an enrolled factor with a fresh proof; the `totp_code` parameter this issue asked for is not wired, the code is entered at the step-up prompt)
 
-TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 37 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. MFA step-up now gates `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` among those routes. This issue's specific ask, a `totp_code` request parameter on instruction approval, is not wired; the step-up check reads the session's MFA proof instead. Original sketch:
+TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 41 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. MFA step-up now gates `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` among those routes. This issue's specific ask, a `totp_code` request parameter on instruction approval, is not wired; the step-up check reads the session's MFA proof instead. Original sketch:
 
 TOTP (RFC 6238) second factor on instruction approval:
 - Per-user TOTP secret stored encrypted in auth store
@@ -1601,7 +1601,7 @@ gateways against always at least two servers and a streaming-replication Postgre
 several upstream servers is the standard case. Open work, in priority order: explicit server-to-gateway
 backpressure (#5647), a per-endpoint circuit breaker with failover (#5648), the registration-reconcile
 decision for several replicas (#5649), herd jitter for hundreds of gateways (#5650), and multi-server
-defaults and guidance (#5651). Design record: ADR-2002 §7g.
+defaults and guidance (#5651). #5648 and #5649 are clauses of the HA safe-to-scale gate since 2026-11-04 (#6920); WS-13 slice 13.7 (#7062) is one too, for a deployment with more than one gateway node. Design record: ADR-2002 §7g.
 
 ### Issue 14.3: Database Sharding (Response Partitioning)
 **Capability:** new | **Scope:** Server | **Status:** **Partial** (#292 closed NOT_PLANNED, 2026-07-14) — not implemented as designed below (no sharding/partitioning code exists); **obsoleted by the Postgres substrate migration**, which addresses the underlying scaling need differently
@@ -2214,7 +2214,7 @@ before acting on any "open" / "in progress" claim:
    WS-3 3.2 exit-criteria note names a **hard prerequisite before a 2nd replica or any WS-9 failover
    scenario**, is distinct from WS-8-readyz's per-tier health contract already listed above, and has
    shipped (leader/epoch metrics and the `yuzu-ha-leader` alerts; the CRL-freshness gauge it once
-   also listed is split out as #6527 and the remediation-claim counters as #6526, neither shipped);
+   also listed is split out as #6527 (shipped) and the remediation-claim counters as #6526 (not shipped));
    the durable cluster-capability admission gate that would replace the procedural mixed-version
    hold is #6528, not built; and #4098 (verify webhook/offload emit sites are per-replica-origin
    before a 2nd replica — tracked against `store_worker_pool.worker_loop`'s `StoreWorkerPool::workers_`

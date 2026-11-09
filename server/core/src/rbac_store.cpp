@@ -45,7 +45,7 @@ using rbac_sql::kWriteTimeout;
 // Availability hardening (governance re-review, #2703 Gate 7 — Fable-reviewed
 // merge slice, item 1 commit A). The hot authz path (`maybe_refresh_generation`,
 // `check_permission`'s own acquire, and `resolve_perm_groups`'s two acquires via
-// `user_rbac_group_names`/`role_effects_for`) is on the request-serving critical
+// `user_rbac_group_names_checked`/`role_effects_for`) is on the request-serving critical
 // path for EVERY confined operator action, so it uses this short acquire budget
 // instead of `kReadTimeout` (2 s). PgPool clamps a bounded acquire that finds the
 // pool already saturated at entry to its `saturated_fast_fail` (500ms by default),
@@ -566,7 +566,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 38> types = {
+    const std::array<std::string_view, 39> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -677,7 +677,15 @@ void RbacStore::seed_defaults() {
         // PowerManagement/PluginConfig precedent — unused ops are harmless
         // and keep the loop uniform); ITServiceOwner gets a TARGETED
         // Decommission:Delete grant below (see that grant's comment).
-        "Decommission"
+        "Decommission",
+        // ADR-0070 R1 (slice 2b-1a): registered CRL sources - operator-registered egress targets
+        // (the URLs the server may fetch) plus the CA certificates a CRL is checked against.
+        // Only `Read` and `Write` are consumed (removal is a Write, not a Delete); the
+        // Administrator loop below grants every operation, and NO other role is seeded. The pair
+        // is ALSO gated on the durable-administrator predicate (revocation_source_admin_gate.hpp),
+        // so a custom role granted it under RBAC on is still refused, and `Read` is in the
+        // topology floor so an RBAC-off install stays admin-only.
+        "RevocationSource"
     };
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
@@ -1981,7 +1989,7 @@ RbacStore::role_permission_effect_authz_checked(const std::string& role_name,
                                                 const std::string& operation) const {
     if (!open_)
         return std::unexpected(std::string(kRbacErrStoreNotOpen));
-    // Same contract as the hot authz reads (user_rbac_group_names / role_effects_for):
+    // Same contract as the hot authz reads (user_rbac_group_names_checked / role_effects_for):
     // breaker-gated, short acquire budget, outcome fed back to the breaker. The degrade
     // metric is NOT bumped here; the gate that consumes the error owns the counter.
     if (!breaker_admit())
@@ -3089,7 +3097,7 @@ std::expected<bool, std::string> RbacStore::check_scoped_permission_checked(
 // ── ADR-0017 admit-then-filter list gate ─────────────────────────────────────
 
 std::expected<std::vector<std::string>, std::string>
-RbacStore::user_rbac_group_names(const std::string& username) const {
+RbacStore::user_rbac_group_names_checked(const std::string& username) const {
     std::vector<std::string> groups;
     if (!open_)
         return std::unexpected(std::string(kRbacErrStoreNotOpen));
@@ -3103,8 +3111,8 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         // existing regex needs no change.
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
-            spdlog::warn(
-                "RbacStore::user_rbac_group_names: circuit breaker open — DENY without pool touch");
+            spdlog::warn("RbacStore::user_rbac_group_names_checked: circuit breaker open — DENY "
+                         "without pool touch");
         return std::unexpected(std::string(kRbacErrCircuitBreakerOpen));
     }
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
@@ -3112,7 +3120,7 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         breaker_note_result(false);
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
-            spdlog::warn("RbacStore::user_rbac_group_names: pool acquire timed out — DENY");
+            spdlog::warn("RbacStore::user_rbac_group_names_checked: pool acquire timed out — DENY");
         return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
     pg::PgResult r = pg::exec_params(
@@ -3122,7 +3130,7 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         breaker_note_result(false);
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonQueryError, sampler))
-            spdlog::warn("RbacStore::user_rbac_group_names: query failed: {} — DENY",
+            spdlog::warn("RbacStore::user_rbac_group_names_checked: query failed: {} — DENY",
                          PQerrorMessage(lease.get()));
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
     }
@@ -3140,7 +3148,7 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
     // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
     // pool-fallback gate for the shared rationale.
     if (!breaker_admit()) {
-        // #2703 Gate 7 item 3 — see user_rbac_group_names' matching call for
+        // #2703 Gate 7 item 3 — see user_rbac_group_names_checked' matching call for
         // the ADR-0017 chokepoint-visibility rationale; same reason labels.
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
@@ -3191,7 +3199,7 @@ RbacStore::resolve_perm_groups(const std::string& username, const std::string& s
     if (!mgmt_store)
         return std::unexpected("management group store unavailable");
 
-    auto rbac_groups = user_rbac_group_names(username);
+    auto rbac_groups = user_rbac_group_names_checked(username);
     if (!rbac_groups)
         return std::unexpected(rbac_groups.error());
 

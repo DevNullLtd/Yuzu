@@ -18,7 +18,7 @@
     "windows_sdk": ["10.0.26100.0"]
   },
   "job_pins": {
-    "vcpkg_baseline": "4b77da7fed37817f124936239197833469f1b9a8"
+    "vcpkg_baseline": "9eec002df1cd109f8f104cd966a763daf9751489"
   },
   "required_env": [
     "CCACHE_DIR",

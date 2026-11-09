@@ -644,13 +644,13 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 - **Step-up on high-risk surfaces** — `cfg.mfa_step_up_window_secs` (300 s
   default) controls how long after a TOTP proof high-risk endpoints
   accept the session as "stepped up." PR 2 introduced the gate on 11
-  sites and the `/login/mfa/stepup` proof route; it now covers 39 mutating
-  routes (user delete and role change, token, session, engine-principal,
+  sites and the `/login/mfa/stepup` proof route; it now covers 44 mutating
+  routes (41 enforced by the chokepoint plus the 3 JIT-elevation routes) (user delete and role change, token, session, engine-principal,
   RBAC-assignment and enforcement-toggle lifecycle, password reset and
   unlock, Guardian rule write / push / policy-generation raise and guard update / delete,
   software-package write, software-deploy start, approval approve and reject
   (`POST /api/approvals/{id}/approve|reject`), MFA recovery-code
-  regeneration and MFA disable, JIT elevation). 37 are enforced by the
+  regeneration and MFA disable, JIT elevation). 41 are enforced by the
   central chokepoint described under "MFA step-up chokepoint" below; the
   three JIT-elevation routes apply their own stricter gate in the handler.
   Other mutating routes and all MCP tools are not MFA-step-up gated in
@@ -688,7 +688,7 @@ by each handler.
 - **One table.** `step_up_policy.hpp`'s `kStepUpPolicy` classifies every
   mutating (`POST`/`PUT`/`PATCH`/`DELETE`) route by its exact `(method,
   registered pattern)`; there are no prefixes or wildcards. The classes are
-  `kRequired` (a fresh proof is needed; today's 37 enforced routes, 34 of
+  `kRequired` (a fresh proof is needed; today's 41 enforced routes, 34 of
   them with the audit labels they always had), `kOwnGate` (the three JIT-elevation routes,
   whose handler applies a stricter gate that the chokepoint leaves alone),
   `kExempt` (a recorded reason: pre-session, self-service, read-shaped,
@@ -696,12 +696,28 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 235 REST rows: 37 `kRequired`, 3 `kOwnGate`, 122 `kExempt` and 73
+  table has 248 REST rows: 41 `kRequired`, 3 `kOwnGate`, 131 `kExempt` and 73
   `kPendingRuling`.
-- **Where it runs.** In `run_pre_request_stage` (`step_up_wiring.hpp`), the
-  body of the pre-request handler `server.cpp` installs: after the route
-  is matched and the body is read (and after the post-read body cap, which
-  lives in the same function), before any handler. The order for a `kRequired` route is therefore: session
+- **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
+  body of the post-read stage `server.cpp` installs through
+  `PostReadStageRegistry` and the route sink runs in front of every handler
+  registered through the sink: after the route is matched and the body is read
+  (and after the post-read body cap, which lives in the same function), before
+  the handler. Coverage is per route registered through the sink, not
+  server-wide: the stage is installed before the first route (`install` throws
+  if the server already has a route recorded, and `ScopedPostReadStage` owns the
+  registration), and the sink fails closed, so registering a route on a server
+  with no stage installed throws and a route owner on such a server cannot serve
+  an ungated route; the plaintext redirect listener is the one production
+  server built with the explicit `StageRequirement::ExemptNoStage`. A route
+  registered on the server outside the sink would be neither wrapped nor
+  inventoried; a best-effort source scan flags literal verb calls on `web_server_->` and
+  `redirect_server_->`, literal-path mutating registrations (Post, Put, Patch, Delete) on any
+  receiver other than `sink` in sources, any literal mutating registration in a header (so an alias
+  with a literal path is seen), and any second `ExemptNoStage`. It does not see an alias with a variable path, a
+  `ContentReader` overload or a custom-method route (a review concern). The stage is not
+  httplib's `set_pre_request_handler`, which runs before the body is read from
+  cpp-httplib v0.47.0. The order for a `kRequired` route is therefore: session
   resolution (`401` when there is none), for a cookie session the server-wide
   same-site gate (`403` `cross-site request refused`; pre-routing, see
   [Same-site gate for cookie-session writes](#same-site-gate-for-cookie-session-writes);
@@ -743,7 +759,7 @@ by each handler.
   `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement on
   `kRequired` rows, but neither the engine denial nor the null-store check
   below. The escape hatch precedes the SAML denial and the store read in
-  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 37
+  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 41
   routes and the authentication store is not read; no stale proof is refused
   (so none is recorded), while engine denials and unwired-store refusals are
   still recorded. The elevation routes use the global window when it is positive
@@ -821,7 +837,7 @@ by each handler.
   calls may be deleted once handlers consume the centrally resolved session or the
   repeated resolves are removed (#6200); the binding stays until then. Until then
   the in-handler calls remain
-  as defence in depth (39 distinct labels: one per `kRequired` row, 37, plus
+  as defence in depth (43 distinct labels: one per `kRequired` row, 41, plus
   the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through
   `AuthRoutes::audit_log`, so the actor is the resolved session. Every row is
@@ -871,19 +887,19 @@ by each handler.
   server's route table is sealed: a later mutating registration through the
   route sink that has no row is not registered, is logged as critical and
   makes the sink throw. Adding a mutating route therefore means adding a row.
-- **Scope.** A fresh MFA proof is required on 37 named high-risk routes (plus
+- **Scope.** A fresh MFA proof is required on 41 named high-risk routes (plus
   the three JIT-elevation routes, whose handlers apply their own gate) for
   MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
   un-enrolled accounts and API/MCP tokens pass; engine principals are denied.
-  "High-risk" names these 37 routes; it is not a completeness claim. Other
+  "High-risk" names these 41 routes; it is not a completeness claim. Other
   mutating routes and all MCP tools are not MFA-step-up gated in this release:
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (65 rows: 19 `kExempt`, 46
+  a second table, `step_up_mcp_policy.hpp` (73 rows: 23 `kExempt`, 50
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
-  plus a separate list of tools added after it (today two), legal only for a tool
+  plus a separate list of tools added after it (today six), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
   consumer enforces `kRequired` yet. PR 2 promotes pending rows; how it resolves the MCP rows
@@ -1447,7 +1463,7 @@ account policy)"* — this ships **both** halves.
   placeholder certificate strings). An earlier draft parsed the file with a
   different loader and disagreed with the verifier in both directions
   (`BEGIN TRUSTED CERTIFICATE` rejected, Ed25519 accepted), so the single shared
-  helper is load-bearing: do not add a second certificate probe.
+  helper is load-bearing: do not add a second certificate probe. The helper also refuses a key type outside the verifier's algorithm allowlist (RSA and EC key data), so a key that xmlsec can adopt but the verifier would refuse (Ed25519 and Ed448 on xmlsec 1.3.12) is reported broken at start-up, not at the first sign-in.
 
   Deliberate limits of that second check:
   - **Local only — no network.** OIDC discovery and signing-key fetches stay
@@ -2167,16 +2183,16 @@ applies to these two flags).
 ### MFA enforcement with SAML
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
-session hitting any step-up-gated route (the 39 listed in the REST API
+session hitting any step-up-gated route (the 44 listed in the REST API
 reference under "Step-up envelope on high-risk endpoints": token, session,
 engine-principal and RBAC lifecycle, Guardian rule and guard writes, software
 deploy, approval approve/reject, user delete/role change, MFA recovery-code regeneration and disable,
 JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
-`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 37 routes enforced by the
+`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 41 routes enforced by the
 central check, but not the three JIT-elevation routes, which own their gate and substitute a
-300 s window, so those still deny SAML). Approval approve/reject are among the 37 central
+300 s window, so those still deny SAML). Approval approve/reject are among the 41 central
 routes, so with the window enabled the central check answers a SAML session first with this
 generic 403, and the handler never runs. They also carry their own, stricter approver gate
 (#6079), which refuses a SAML session in every configuration; the typed
@@ -2691,11 +2707,12 @@ operator-facing matrix of every case, including what is not covered, is in
 |---|---|---|
 | `scim.user.provisioned` | `success` | `POST /scim/v2/Users` succeeds (new account, or a revived reprovision) |
 | `scim.user.provisioned` | `denied` | `POST` rejected `409` — `userName` collision against a currently-active account |
+| `scim.user.provisioned` | `partial` | `POST /scim/v2/Users` with `active:false`: the credential revoke before the immediate deactivation did not persist its API tokens (`500`, detail `api_tokens_db_error=true`; the account was already created or revived and mapped, so the IdP's retry meets `409`). `target_id` is the new resource's SCIM id, where the rollback `failure` rows below use the userName. A `success` row for the same request can carry `sessions_db_error=true session_leg_backstopped=true` (the session delete did not persist and the account removal's own wipe covered it); a deactivation whose wipe also failed is `failure` with `account deactivated; durable session wipe failed` |
 | `scim.user.provisioned` | `failure` | `POST` rolls back after a `500` (e.g. the account-creation transaction fails). (#6836) A revive whose post-reactivation role re-check could not be read is `failure` / `503` with `detail` `store_unavailable: revive role check` (`target_id` is the userName; the reactivation was undone and the account stays down); if the undo did not complete it is `failure` / `500` with `detail` `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed` |
 | `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500`; `failure` / `503` (#6836) with `detail` `store_unavailable: provenance check` or `store_unavailable: role check` when the provenance re-check, or the role re-check on an active resource (including straight after a reactivation), that a `PUT` (always) or a `PATCH` with `externalId` runs before its `externalId` write could not read the user store; when it follows an `active` change, that change was already applied and has its own `success` row |
-| `scim.user.deactivated` | `success` / `failure` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. |
+| `scim.user.deactivated` | `success` / `failure` / `partial` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. (#4772) `partial` / `500`: the credential revoke did not persist (`api_tokens_db_error=true` and/or `sessions_db_error=true` in `detail`); the account stays active, the SCIM resource and links are untouched (credentials that did revoke stay revoked) and a retry completes. |
 | `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`. `failure` causes (#4966): the tombstone's role could not be read (`500`, `tombstone role unreadable before reactivation`), the Administrator-grant read was unavailable (`503`, `administrator grant check unavailable`), or the account or mirror write failed (`500`). An elevated tombstone or a name holding an Administrator grant is a `scim.user.provenance_denied` (`404`), not a `reactivated` row. (#6836) The provenance check inside the reactivation, when the user store could not answer it, is `failure` / `503` with `detail` `store_unavailable: provenance check`; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard="provenance"}`. The role re-check that a `PUT`/`PATCH` carrying `externalId` runs straight after a reactivation is audited as `scim.user.updated`, not `scim.user.reactivated`. |
-| `scim.user.deleted` | `success` / `failure` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. |
+| `scim.user.deleted` | `success` / `failure` / `partial` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. (#4772) `partial` / `500`: the credential revoke did not persist (`api_tokens_db_error=true` and/or `sessions_db_error=true` in `detail`); the account stays active, the SCIM resource and links are untouched (credentials that did revoke stay revoked) and a retry completes. |
 | `scim.user.provenance_denied` | `denied` | A deactivate/reactivate/delete/update targets an account whose `provisioning_source != "scim"`, **or** whose current `role != "user"`; **or** (#4966) a `POST /Users` or an `active:true` reactivation names a username that already holds an `Administrator` grant or a deactivated record whose role is not `user`. Counted on `yuzu_scim_provenance_denied_total` for the same causes (including the group-recompute provenance skip, which writes no audit row; a FAILED provenance read in the recompute is not a provenance refusal and is recorded as an undetermined member instead). For a deactivate, delete, reactivate, update or a `POST` that revives a removed account, a store fault is not a denial (#6836): when the user store cannot answer the provenance or role read (a `POST` revive re-reads only the role), no `scim.user.provenance_denied` row is written, `yuzu_scim_provenance_denied_total` does not move and the linked-identity escalation does not fire; the request answers `503` and is audited as its own action with `store_unavailable`. The `POST` create reads (the provisioning-source read and the duplicate/race reads) are tracked in #6837; the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo) are not covered by this change either (same defect class as #6837, which does not list them). |
 | `scim.user.last_administrator_refused` | `denied` / `partial` | (#4966) The last-Administrator guard refused a deactivation, delete, `POST` with `active:false` or group-derived demotion (`409` `mutability` on the Users routes; a refused group-derived demotion is not a `409`: the Group request keeps its `2xx` and the member keeps the role). `partial` for a LATE refusal (the linked credentials were revoked before the guard refused); `denied` for an early refusal and for a refused demotion. Every refusal also raises a critical analytics event. Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}` |
 | `scim.user.compensation_failed` | `failure` | (#4966) The guarded undo of a half-finished create/revive was refused or failed (`outcome` = `guard_refused_last_administrator` / `deactivated_but_session_wipe_failed` / `store_failure`). Written with a critical analytics event and `yuzu_scim_compensation_failed_total{outcome}`; the account is left active only for the guard refusal |
@@ -2818,10 +2835,13 @@ and the dashboard's `DELETE /api/settings/users/{username}` all resolve the
 full principal set — the slug **plus every `oidc:<iss>#<sub>` identity
 currently linked to it** — and revoke API tokens (`ApiTokenStore::
 revoke_for_principal`) and sessions for **each** principal in that set,
-**before** the account is marked inactive/deleted. On any revoke that fails
+**before** the account is marked inactive/deleted. On any revoke (API tokens or sessions) that fails
 to persist, the caller does **not** report a clean success: SCIM returns
-`500` (so the IdP retries) and the audit result is `partial`; the dashboard
-delete likewise refuses to proceed to `remove_user`. This mirrors `/me`'s
+`500` (so the IdP retries, and the retry converges because the account
+stays active) and the audit result is `partial`; the dashboard
+delete likewise refuses to proceed to `remove_user`. SCIM `POST /Users` with
+`active:false` is the exception, described under "That bound holds only once
+the durable session delete has persisted" below. This mirrors `/me`'s
 own `api_tokens_revoked=N`/`sessions_revoked=N` detail-string pattern.
 Implementation: `deprovision_revoke.{hpp,cpp}` (the shared
 resolver/orchestrator, deliberately **not** a reuse of `session_revoke_fn`,
@@ -2865,7 +2885,66 @@ cache bounded by the 1 s generation refresh (`kSessionGenRefreshMs`) and
 widening to the 30 s stale-serve ceiling (`kSessionGenStaleServeBoundMs`) for
 as long as a Postgres brownout blocks refreshes. The honest guarantee is
 **"revoked within ~60s of the deprovision reaching Yuzu,"** not instant —
-do not describe this as instantaneous revocation.
+do not describe this as instantaneous revocation. **That bound holds only
+once the durable session delete has persisted** (#4772), exactly as the
+token sentence above holds only after `revoke_for_principal` has persisted:
+`revoke_deprovision_credentials` folds every principal's
+`invalidate_user_sessions(...).db_persisted` into
+`DeprovisionRevokeResult::sessions_persisted` (and the token results into
+`api_tokens_persisted`). At the three "required" sites — SCIM `PATCH`/`PUT`
+with `active:false`, SCIM `DELETE` of an active resource and the dashboard
+`DELETE /api/settings/users/{username}` — a `false` on either leg fails the
+deprovision closed: HTTP 500, the account stays active, the SCIM resource and
+links are untouched (credentials whose revoke did persist stay revoked, so a
+sessions-only failure leaves the API tokens already revoked and, across several
+linked principals, the other principals' sessions stay deleted), the audit result is `partial` and the detail carries
+`api_tokens_db_error=true` and/or `sessions_db_error=true`. A retry after the
+store recovers completes it. If the delete fails, the durable row survives
+and another replica, or this one after a restart, rehydrates it.
+
+The session leg was not always checked. Before #4772 the result of the
+session delete in the revoke step was dropped. For the local username the
+wipe inside the account removal (`remove_user_checked`) repeated the delete
+after the deactivation and failed closed, so a silent success needed both
+deletes to fail. For a linked `oidc:`/`saml:` principal that later wipe
+covers only the SCIM slug, so the revoke step was the only session delete
+and a failure there was silent.
+
+**SCIM `POST /Users` with `active:false` is deliberately different.** Its
+token leg fails closed as above (500, `scim.user.provisioned` / `partial`,
+`api_tokens_db_error=true`). Because the account was created or revived a
+moment earlier under a fresh `scim_id`, the IdP's retry meets `409`; the
+connector has to reconcile with `GET` and `PATCH` `active:false`, so the
+retry convergence promised for the three sites above does **not** apply
+here. Its session leg is not gated when the principal set is only the local
+username: a fresh `scim_id` has no sessions of its own, and the account
+removal that follows runs its own post-deactivation session wipe, which fails
+closed. If the set has any additional linked `oidc:`/`saml:` principal, the
+session leg is gated like the three sites above. A non-persisted session delete in the
+revoke step is recorded as `sessions_db_error=true
+session_leg_backstopped=true` (so a `success` row can carry it), and the call
+succeeds only if that later wipe persisted. If the wipe also fails, the
+account is deactivated and the call returns 500 with audit result `failure`
+and detail `account deactivated; durable session wipe failed`.
+
+**Known residual.** If that post-deactivation wipe itself fails
+(`RemovedSessionWipeFailed`), the account is deactivated but a surviving
+durable session row is not checked against account state by session
+validation and can keep validating until its expiry; a SCIM retry of an
+already-deactivated resource does not re-run the wipe.
+
+**Audit vocabulary.** Three tokens mean "the durable session delete did not
+persist", and each is kept where it is documented: `db_error=true` (logout,
+`session.revoke_all`, `/me`), `;db_persisted=false` (the OIDC/SAML
+post-mint re-check) and `sessions_db_error=true` (deprovision). Do not
+rename one to match another. `session_leg_backstopped=true` is a modifier on
+`sessions_db_error=true`, not a fourth token: it appears only on the SCIM
+create-inactive (`POST /Users` with `active:false`) `scim.user.provisioned`
+rows, and only when the call goes on to the account removal: the `success`
+row, and the later refusal rows of that request (the `failure` row `account
+deactivated; durable session wipe failed`, the `503` store-failure row, a rare
+late last-administrator refusal). It is not written on the row for a refused
+API-token revoke.
 
 **D1 — a SCIM slug elevated to admin outside SCIM (the #2021 guard
 interaction).** `deprovision_role_ok` still refuses (404, per the
@@ -3020,9 +3099,12 @@ reads (this guarantee assumes no read-replica routing).
 The existing `scim.user.deactivated`/`.deleted` rows (see Audit actions
 above) now also carry `api_tokens_revoked=N sessions_revoked=N
 principals=N` in `detail` on success, and `partial` is now a possible
-`result` for those two actions specifically (a non-persisted credential
-revoke — see "Deprovision-time revoke" above), in addition to the existing
-`success`/`failure`. When the detail lists the revoked principals
+`result` for those two actions (a non-persisted credential
+revoke, detail `api_tokens_db_error=true` and/or `sessions_db_error=true` —
+see "Deprovision-time revoke" above; `target_id` is the resource's SCIM id),
+in addition to the existing `success`/`failure`. `scim.user.provisioned` can
+also carry `partial` for a `POST` with `active:false` whose token revoke did
+not persist (`target_id` is again the SCIM id). When the detail lists the revoked principals
 (`revoked_principals=a,b,c`), each principal string is tokenized before it is
 written (#4966, CWE-117): `,`, space, `=`, control bytes and every byte
 >= 0x80 become `_`, and a string over 256 bytes is shortened. The tokenization
@@ -3509,10 +3591,10 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 38 securable types, per-operation permissions, deny-override logic.
+- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 39 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defense) and every endpoint an absolute URL on the issuer's scheme, at most 2048 bytes, with a well-formed `host[:port]` authority. Test Connection shares only the fetch and validation functions: it never reads or clears the provider's discovery state, so it is a connectivity check and not a guarantee of what a sign-in will hit.
-  - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution (on POSIX the resolver is capped at the per-operation timeout where httplib's non-blocking resolver is compiled in: the Linux build; not checked on macOS. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
-  - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib 0.37.1 waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
+  - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution on macOS (the resolver is capped at the per-operation timeout if httplib's non-blocking resolver is compiled in; that build setting has not been checked for macOS) and on Windows, but not on a Linux build with glibc: there cpp-httplib 0.59.0 cancels a lookup at that timeout and then waits for the resolver itself to finish, about 30 s with default resolver settings (cpp-httplib's header says the system resolver timeout, about 30 s by default, past the caller's timeout; read as about 30 s from the start of the lookup, not measured) (longer with several nameservers or search domains), and only an unresponsive resolver causes the wait (an answered NXDOMAIN fails at once). `resolve_host_addresses` calls `httplib::detail::getaddrinfo_with_timeout` directly, so the IdP GETs, the check before the token-exchange POST connects (`exchange_code` -> `vet_egress_target`) and the one-time NAT64 probe lookup, and with them sign-in and Test Connection, are not held to the 10 s figure on glibc; a musl build uses a bounded thread fallback. On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
+  - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib (0.37.1 and 0.59.0) waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
   - The token-exchange POST has per-operation timeouts only (10/15/15 s on Linux and macOS; Windows uses the WinHTTP defaults) and no total bound. Its response is capped at 256 KiB on every platform (on Windows the size of each chunk is checked against the remaining allowance before it is allocated), and the Windows request sets the WinHTTP redirect policy to never and accepts only HTTP status 200 (`WinHttpQueryHeaders`), so a 3xx answer fails the sign-in instead of being followed to an unchecked host or parsed as a token response.
   - Every IdP-directed fetch is vetted first (`oidc_egress_policy.hpp`): the host is resolved, every address classified, and the connection pinned to a permitted address; the Windows token POST is only pre-checked, and because WinHTTP may pick any address of its own answer the pre-check is strict there: one refused address in a mixed answer refuses the request outright (the other paths pin the permitted member instead). DNS rebinding between the check and WinHTTP's own lookup is not covered there (it does not follow redirects). Classification also treats the non-global parts of `2001::/23` (Teredo `2001::/32`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, the unallocated rest) as non-global, except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable (`2001:1::1`-`2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`). NAT64 prefixes learned from `ipv4only.arpa` are only ever added (union across answers, kept for the process lifetime; the TTL controls when to look again, never what is kept), at most 64: an answer that would exceed that is not installed partially, the fetch is refused with a fixed reason. A configured `--oidc-nat64-prefix` is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is immutable. Host names are ASCII only (`authority_well_formed` refuses a byte >= 0x80; an internationalized name is given as punycode), so the check and WinHTTP cannot be asked for different names. The process flag `--oidc-allow-private-networks` is the general private-network override (a configured NAT64 prefix has the classification exception above); see `docs/user-manual/authentication.md` "Network and trust".
   - Exactly one thread fetches discovery at a time (the in-flight mark is cleared by an RAII guard on every exit) and any other caller that needs it fails fast; a failed attempt is remembered for 30 s and a success for the provider's lifetime. Signing keys are not cached: every verification calls `fetch_jwks_snapshot()` and works from the answer it just obtained, so a key the IdP stops publishing stops verifying at the next login (#1901 UP-19; a failed or non-JWKS answer is `kJwksUnavailable`, with no stale-key fallback; related: #1900, #5983), and a token naming a `kid` the key set lacks is refused rather than checked against another key, while a token with no `kid` is checked against each usable key in turn (at most the first 16, in the order published). An RSA key with a modulus under 2048 bits, or an exponent below 3, even or over 32 bits, is skipped at parse: defence in depth against a weak IdP key, not against a tampered JWKS. Provider swaps: a Settings save is serialized by `oidc_save_mu_` (stored-secret read, provider build, swap, persist), replaces the provider under the exclusive `oidc_mu_`, and retires the old one after the lock drops; `/auth/oidc/start` and `/auth/callback` hold a `Lease` (taken under the shared lock) instead of the lock, and the callback compares the published provider with its leased one right after `handle_callback` (lease still held, so the address cannot be reused) and refuses with audit reason `provider_replaced` before any group, role or session work.
@@ -3709,6 +3791,514 @@ only when a change cannot be expressed as an idempotent additive re-seed
 it needed one — distinct from the PG schema's own migration sequence,
 ADR-0041, currently at v3).
 
+### The revocation-source surface: a registered-egress-target floor class and a further administrator-predicate call site (ADR-0070 R1)
+
+`RevocationSource:Read` is floored (`authz_topology_floor.hpp`) under a class the header's inclusion test now names: **the read discloses operator-registered egress targets** (registered CRL URLs, their confirmed address classes and fetch status map internal network topology). It fits none of the earlier classes, and the header says so rather than stretching one. The floor is only the RBAC-off half: the whole surface (`/api/v1/crypto/revocation-sources*` and the six `*_revocation_source*` MCP tools) is **also** gated on the durable-administrator predicate in **both** RBAC states, through `revocation_source_admin_gate.hpp`'s `decide_admin`, which composes `is_rbac_administrator` (`RbacAdminSurface::kRest` for the REST routes, `kMcp` for the tools) and, for a write, `RbacStore::check_caller_authorized_under_current_regime`. It adds no rule to the predicate (EXTEND it, never fork it). Consequences, each tested:
+
+- **Not grantable.** `RevocationSource` is seeded to `Administrator` only, but a custom role can still be granted `RevocationSource:Read`/`:Write` under RBAC on; such a holder is refused on every route and tool, because the securable is necessary and never sufficient. The access-review export lists any such grant. The reason the grant is refused: the fetch-status fields would otherwise make the fetcher a blind request-forgery and port-scan oracle for whoever holds it.
+- **Service-scoped tokens** are refused by the securable gate (neither pair is in `kServiceScopeGlobalSafe`) and by the predicate; **MCP-tier bearer tokens** are refused on REST by the predicate (`kRest`).
+- **`RevocationSource:Write` is a deliberate entry on `mcp::requires_approval`'s supervised list** (`mcp_policy.hpp`): removal, reset and registration are all a `Write`, never a `Delete`, so without the entry a supervised MCP token held by an administrator would change the registry with no ticket. On REST an MCP-tier token is refused outright (the predicate with `kRest` denies any non-empty `mcp_tier`), so the entry gates MCP only.
+- The four mutations are `kRequired` rows in `step_up_policy.hpp` (and `pending` on the MCP side with a `kRequired` twin).
+## Enforcement-state read (#6033)
+
+`GET /api/v1/rbac/enforcement` and the MCP tool `get_rbac_enforcement` are the machine twins of
+the enforcement fragment (`GET /fragments/access/enforcement`). Both call ONE builder,
+`read_rbac_enforcement` (`rbac_enforcement_read.hpp`), and return `enabled`, `unconfirmed` and
+an advisory `administrator` verdict (`may`, `may_not`, `unconfirmed`); the MCP tool adds
+`audit_persisted`.
+
+- **Two groups answering different questions.** `enabled`/`unconfirmed` are the serving replica's
+  cached view (`is_rbac_enabled()` and `rbac_enabled_view_degraded()`, read through the two display
+  accessors only, never `rbac_enforcement_label()`, which routed clause 4 of the A2/A1 row
+  reserves). **Client rule: when `unconfirmed` is true, treat enforcement as ON whatever `enabled`
+  says** (a stale off is treated as on; a stale on is on either way). `administrator` is
+  `rbac_admin_hint` on the caller's own surface (`kRest` for the route, `kMcp` for the tool; the
+  surface has no default, clause 5). The builder calls it once and neither forces nor suppresses
+  the result when the view is degraded. The predicate behind it does consult the cached enforcement
+  label, but only to choose which durable source answers (Administrator grant rows when enforcement
+  is on or unconfirmed, the local account role when it is off); the answer itself is read from those
+  rows and then the regime check. So it is not independent of cache state. While the cached value
+  is a stale off (`enabled:false` with `unconfirmed:true`), an account with no Administrator grant
+  row reads `administrator:"unconfirmed"`, because the predicate cannot tell a missing grant from
+  a stale view. While it is a stale on (`enabled:true` with `unconfirmed:true`), the same account
+  reads `administrator:"may_not"`, because enforcement is on and a missing grant row is a
+  confirmed absence.
+  The two uses of "unconfirmed" (the boolean about the view, the value about the verdict) can
+  appear in any combination. The hint now has two production callers, the `rbac_admin_hint_fn`
+  wiring in `server.cpp` and `read_rbac_enforcement`; the read consumes the answer and changes no
+  admission input of either function. The HTML fragment's habit of skipping the hint when the view
+  is degraded is a rendering decision and is deliberately not copied.
+- **`administrator` defined.** `may` = the RBAC administration routes (role assignment and
+  `PUT /rbac/enforcement`) would admit this credential's durable authority now; `may_not` = they
+  would refuse it; `unconfirmed` = a required store could not answer, retry. A client treats any
+  value it does not recognise as `unconfirmed`. Engine and (on REST) MCP-tier credentials are
+  `may_not` from structural checks before any store is read (a service-scoped token never receives
+  a verdict: it is refused 403 before any verdict, by the explicit REST deny and the C8 gate on
+  MCP). An account whose Administrator authority is not a durable grant on an active local
+  account (for example a SAML sign-in, a SCIM-deactivated account, a temporarily elevated
+  session, or an Administrator held only through a group) reads `may_not`, because only durable
+  user-type grants count with enforcement on, and the local account role with it off (clause 3).
+  In practice an OpenID Connect principal reads `may_not` today: the assignment routes cannot write
+  a grant for an `oidc:` principal id (see #5182), and a first sign-in whose account provisioning
+  failed leaves no account row (`provision_sso_identity` is fail-soft: a failure is logged and the
+  login proceeds). A grant installed by other means (direct SQL, see "If the guard refuses an action
+  you intend" in `docs/user-manual/rbac.md`) on an active provisioned account would read `may` with
+  enforcement on. A just-revoked Administrator
+  reads `may_not` on a fresh read; what can lag on another replica is the cached `enabled` value,
+  which only selects which source applies.
+- **Advisory, not a promise.** `may` means the RBAC administration routes would admit this
+  credential's durable authority now. It is not a go signal for a mutation. It excludes REST MFA step-up, the MCP tier and approval
+  ladder (a readonly-tier administrator reads `may` on MCP and `set_rbac_enforcement` still
+  refuses it), and the enforcement PUT's destination-regime `409`. On REST an MCP-tier token reads
+  `may_not` because the predicate denies it structurally on `kRest`: "this credential cannot
+  administer RBAC through REST", not "its owner lacks Administrator". The REST route does not add
+  `deny_mcp_token_session` or `deny_engine_session` to a read that discloses nothing about
+  anyone else.
+- **Gate (owner ruling, ADR-1005 2026-11-03 entry).** The REST route is session-only (`auth_fn`),
+  with no `perm_fn`, for parity with its fragment and `GET /api/v1/me`: a
+  `perm_fn(Infrastructure, Read)` gate would make the machine twin stricter than the fragment
+  and invent an authority the route does not have. It is therefore not RBAC-gated, the same
+  class as `GET /api/v1/me` and `POST /api/v1/rbac/check`, and is recorded as one
+  `GATE_PARITY_NO_GATE_ALLOWED` entry. A service-scoped token is refused on both transports
+  (REST `deny_fleet_wide_service_scoped` with no permission named, per clause 5 of the
+  service-scope row; MCP `ServiceScopeClass` `denied`) and the pair is never added to
+  `kServiceScopeGlobalSafe`. Nothing about other principals is returned, so the topology floor
+  (`kTopologyFloor`) is not engaged.
+- **Audit.** Every successful read writes `rbac.enforcement.read` with a server-derived detail
+  (`enabled=...; unconfirmed=...; administrator=...`) and nothing taken from the session. REST
+  fails closed (`503` plus `Sec-Audit-Failed`, body never sent); MCP also writes the generic
+  `mcp.get_rbac_enforcement` row, attempts both independently and reports
+  `audit_persisted:false` if either drops. An empty audit callback is audit-off and the read
+  succeeds, so "every read is audited" holds for a deployment with a wired sink. The null or
+  closed RBAC store `503` and a bare `401` write no row (matching the PUT and the fragment). A REST service-scoped refusal does write a `denied` row. The fragment and `GET /api/v1/me` read the same state unaudited.
+- **Residual: a cached view.** A replica that never observed an enable can read
+  `enabled:false, unconfirmed:false` while another replica enforces, bounded by the stale-serve
+  window (#2703). The access-review export's `rbac_enforcement` label is the stronger read.
+
+## Periodic access reviews (SOC 2 CC6.2)
+
+Fleet-wide grant export plus a durable attestation-campaign lifecycle (`open` freezes the complete grant
+population as `pending` rows, a reviewer records `attested` or `flagged_revoke` per grant, `close` ends the
+campaign) across all three RBAC principal types (user, group, engine). Routes: `/api/v1/access-reviews*` and
+the MCP twins `export_access_review`, `open_access_review`, `record_attestation`, `get_access_review`,
+`list_access_reviews`, `close_access_review`. The routed-concern row in
+`.claude/routed-concerns-access-control.md` carries the five catastrophic-if-violated clauses in short form;
+this section holds them in full, with the reasoning the row no longer carries. Per-surface reference:
+`docs/user-manual/rest-api.md` "Access Reviews", `docs/user-manual/mcp.md`; the original decision record is
+`docs/security-reviews/access-reviews-2026-07-21.md`.
+
+**#2225 round 2: the gate is the dedicated `AccessReview` securable, never `AuditLog:*`.** The gate is global
+and deliberately not `authorize_list_read` (clause 1 below). Its first implementation reused
+`AuditLog:Read`/`AuditLog:Attest`, assuming those were effectively `Reviewer`-only. They are not:
+`AuditLog:Read` is also seeded to `Operator` and `PlatformEngineer` for unrelated audit-log reads, and
+neither role holds `UserManagement:Read` (the permission gating `GET /api/v1/rbac/roles`) or
+`EnginePrincipal:Read` (gating the engine-principal grant reads, which moved off `Security:Read` in #2376).
+Under the first gate those two roles could still pull the whole grant population through the export, a wider
+disclosure than the routes they are deliberately refused. The fix cut a dedicated securable, `AccessReview`,
+with two operations: `Read` (export, get, list) and `Attest` (open, attest, close). It is seeded only to
+`Administrator` and the `Reviewer` role (`AccessReview:Read` plus `AccessReview:Attest`, nothing else), and
+`AuditLog:Read` alone no longer reaches any access-review route. Do not revert to `AuditLog:*`. Under RBAC
+off, `AccessReview:Read` is floored to the `admin` session role by the topology floor (see "The authorization
+topology floor" above); `AccessReview:Attest` is admin-only through the legacy rule, not through the floor.
+
+**The five clauses.**
+
+1. **Global gate, not `authorize_list_read` (#2225).** A grant has no per-agent or management-group boundary
+   to admit-then-filter against, and a confinement-filtered slice would be worthless as CC6.2 evidence: an
+   auditor needs the complete grant population every time. The dedicated-securable gate is the stronger
+   least-privilege posture, because a read-only reviewer can be appointed without `Administrator`.
+2. **Flag is not revoke.** `decision: "flagged_revoke"` records evidence only. It is never wired to an RBAC
+   or `EnginePrincipalStore` mutation; acting on a flag stays a separate, explicit, separately gated operator
+   action.
+3. **Grant-table-driven completeness (UP-1), never a roster walk.** `build_access_review` reads
+   `RbacStore::list_all_principal_roles_checked()`, so a grant belonging to a principal outside every roster
+   (a deleted user, a stale IdP row, an orphan SSO principal) is surfaced as `source="orphan"` and never
+   silently omitted.
+4. **Deliberate no-prune.** A closed campaign is the compliance evidence and persists indefinitely. No retention
+   pass is adopted; the disposition is recorded in `docs/clock-guarded-retention.md`, and any retention policy is
+   a separate, explicit, separately reviewed decision. The per-grant decision history
+   (`access_review_attestation_history`) is append-only against the application path by a database guard, with
+   the limits stated under "The decision history" below. It is not owner-proof. Nothing prunes it, so growth is
+   bounded only by the per-grant limit of 100 decisions; avoid scripted re-attest loops. Personal-data
+   redaction has no application path: it is a database-administrator procedure that must cover the state row's
+   latest reviewer and justification, the history rows, the subject id (part of a primary key and of a
+   restricted foreign key, so redacting key columns is not feasible without rewriting keys and the frozen
+   snapshot), the frozen `grant_snapshot` of each grant (it holds `display_name` and `owner_or_email`, an
+   email address for a user; the state row's guard trigger pins it as immutable, so redacting it needs that
+   trigger disabled too), the campaign's `title` (free text), `created_by` and `closed_by`, and the audit rows
+   (kept for the audit retention period); "re-verify" means checking that the guard triggers are enabled again and that the consistency
+   trigger holds. The procedure has not been exercised (SOC 2 data-inventory row in
+   `docs/enterprise-readiness-soc2-first-customer.md`).
+5. **The reviewer must differ from the subject of the grant (#4752).** The rules, the window and the residuals
+   are under "Separation of duties" below. Every decision is appended with the value it replaced, never
+   overwritten, and REST and MCP share one refusal helper, `server/core/src/access_review_attest_gate.hpp`.
+   Extend that header; do not write a second per-surface copy.
+
+**Separation of duties.** `evaluate_attestation_sod` runs as the last call before the store, after the
+permission, session, engine-session and (REST) browser-write checks, on both surfaces. By `principal_type`:
+
+- `user`: the reviewer is the subject when `session->username == principal_id`, compared byte-exact (the same
+  comparison `ApprovalManager::same_human_root` makes). This rule is decided in C++ from the arguments, before
+  any lease is taken: in the gate, and again in the store (a `forbidden:` result), so it holds even for a caller
+  that skips the gate, and it is answered before `not_found`. The UPDATE predicate and the history `CHECK` are
+  backstops. A self-subject attempt against a closed campaign is therefore refused with 403, not 404.
+- `engine`: refused when the reviewer owns the engine principal now, or owned it when the campaign opened (`owner_username`), revoked engines included.
+  The rule has two parts. The route layer reads the LIVE owner before the write (the window below applies to
+  it). The store then also refuses, inside the locked attest transaction, a reviewer who equals the owner frozen
+  into the grant at campaign open (`grant_snapshot` `owner_or_email`; `kStoreForbiddenEngineOwner`), answered
+  with the same 403 body, the audit reason `sod_engine_owner` and the metric reason `engine_owner` (these cover both the live-owner and the frozen-owner refusal and cannot tell them apart). So a FORMER
+  owner stays refused after an ownership transfer (refused when the reviewer was the owner at open OR is the
+  owner now). The way out is to ask another reviewer to record the decision, or to open a new campaign, which freezes the current owner as the grant's owner. An engine id with no row (an orphan grant), or a snapshot that is empty or cannot be parsed, has
+  no owner to compare against and is admitted.
+- `group`: refused when the reviewer is a member of the group. A group with no row, or one the reviewer is not
+  in, is admitted. Membership is read with `RbacStore::user_rbac_group_names_checked` from Yuzu's stored
+  membership, which also holds memberships reconciled from an identity provider at login
+  (`reconcile_idp_memberships`); see "How fresh the engine and group reads are" below.
+
+The group rule and the live-owner part of the engine rule are a pre-read through the owning stores (the frozen
+owner comparison is inside the store transaction and reads no other store). A lookup that cannot be answered fails
+CLOSED: REST answers 503 with `retry_after_ms`, MCP answers `kInternalError` with
+`mcp::kMcpStoreFaultRetryMs`, the audit row is `failure`, and nothing is written. It is never read as "not the
+owner" or "not a member". `get_group_members` is deliberately not used for this: it collapses a read failure
+into an empty list.
+
+The refusal is a 403 whose body names no `permission`: the caller already holds `AccessReview:Attest`, so
+naming it would claim a self-remediation grant that cannot help (clause 5 of the service-scope confinement
+row). The message is self-contained, because the browser renders only `error.message`. Both outcomes write one
+audit shape (see `docs/user-manual/audit-log.md`) and a refusal moves
+`yuzu_access_review_attestation_refused_total{surface,reason}`.
+
+Who reaches the gate: under RBAC on, `Administrator` and `Reviewer` both do, and the rule applies to both.
+Under RBAC off only administrators do, and the rule still applies: an administrator attesting their own
+`Administrator` grant is refused. Service-scoped tokens are refused earlier (the empty `kServiceScopeGlobalSafe`
+allow-list) and the MCP tier check precedes the gate. Engine principal sessions are refused before the gate.
+
+**The window (stated as a limit, not a guarantee).** The group-member rule, and an engine ownership acquired
+after the campaign opened, are decided by a read BEFORE the store's write transaction, not inside it. ADR-0012 s2(c) forbids a store method from calling
+another store, or re-entering the pool, while it holds a lease, so the attest transaction does not consult the
+engine or RBAC store. ADR-0012 s2(c) itself sends cross-store work to s3, a dedicated query owner that takes one
+lease and issues schema-qualified SQL across the schemas; the project chose the pre-read with a documented window
+instead of building one. The window runs from that read to the commit: a pool acquire of up to the store's 4 s
+write budget (spent before any lease exists), then, on the leased connection, row-lock waits and the
+statements themselves. The store sets `SET LOCAL lock_timeout = '3s'` as the first statement of the attest
+transaction, so the bound does not depend on the DSN (it replaces a stricter DSN value). It applies to each
+lock wait separately: the pre-read is one statement (`FOR UPDATE OF a FOR SHARE OF c`) that can wait up to
+3 s on the grant row and then up to 3 s on the campaign row (the second wait only behind a queued close), so
+lock waits can total about 6 s plus statement time while holding the connection, and the worst-case caller
+latency is about 4 s + 6 s.
+It is normally milliseconds but is not a bound the code promises. A membership change, or an engine ownership
+the reviewer acquired, that lands inside it is not seen, and there is no re-read after the commit. The frozen engine
+owner (checked inside the transaction) has no window; only an ownership the reviewer acquired after the campaign
+opened AND after the route layer's read is not seen, until the next read. The user rule also has no window. Revisit under the four-eyes primitive work (epic #6060).
+
+**How fresh the engine and group reads are.** This is separate from the window above. Both pre-reads see the
+state at the moment of the attest, not at the moment the campaign opened: a member who left a group before
+attesting is admitted, and a reviewer who owns the engine principal now is refused even if they did not own it
+at open. An owner who transferred the engine away is still refused, by the frozen owner comparison in the
+store. The way out is to ask another reviewer to record the decision, or to open a new campaign, which freezes the current owner as the grant's owner. The current owner is a live read (`EnginePrincipalStore::get` selects the current row). Group membership is read from Yuzu's stored membership
+(`rbac_store.group_members`), which an identity provider updates only when that member signs in (the Entra and
+SAML login paths call `reconcile_idp_memberships`). A change at the identity provider is not seen by the group
+rule until that member next signs in interactively (a long-lived API or MCP token can outlast it), and a sign-in whose token skips the
+membership refresh (for example an Entra groups-overage token) does not refresh it. For identity-provider-
+governed groups the rule is therefore not a current-membership check. The compensating step is a review of
+those groups at the identity provider at campaign close.
+
+**Recorded acceptance (owner, 2026-11-07).** Accepted by Dave Rae (project owner), questions-window ruling 2026-11-07, for the release
+carrying #4752. (1) The group-member check, and an engine ownership acquired after the campaign opened, are
+decided from a read made before the attest transaction; a membership or ownership change committed between that
+read and the attest COMMIT is not seen. Normally milliseconds; worst case about 4 s acquire plus up to 6 s of
+lock waits plus statement time; no bound is promised. (2) "Member" means a row in `rbac_store.group_members`.
+For identity-provider groups (entra, saml) that row is written only when the member signs in interactively;
+token sessions and groups-overage tokens do not refresh it. Precision notes (drafted by the session, from the code): membership held only at the provider or in the
+SCIM store is not consulted and bears no Yuzu role grant. This is not a current-membership check. Not covered by
+this acceptance: the user rule and the frozen engine owner (no window), in-flight reviewer revocation, anything
+after COMMIT. Compensating control: review of provider-governed groups at the provider at campaign close,
+procedural, not enforced by Yuzu. Precision notes (drafted by the session, from the code): the evidence of independence is the set-and-proceed `sod=pass` audit row only.
+
+**Evidence of independence for engine and group grants.** For these two types the history row does not record
+the ownership or membership basis. Independence is evidenced by the `sod=pass` audit row, which is written
+set-and-proceed and kept for the audit retention period, so export audit rows to the evidence store within
+that period. If that row was not persisted (`audit_persisted:false` on MCP, `Sec-Audit-Failed` on REST), an
+assessor should treat that grant's independence as unevidenced. Recording the basis in the history row is
+tracked under #6060.
+
+**Two identities of one person.** `Session::username` is the stable principal (a local name, `oidc:<iss>#<sub>`
+or `saml:...`; a token session carries its owner's). A person who holds a local account and an SSO identity, or
+two SSO identities, counts as two reviewers. This is the maintainer-accepted exception recorded in
+`docs/enterprise-readiness-soc2-first-customer.md` (the addendum "approver assurance for approve and reject",
+residual risk (e)); it is not a guarantee across identities.
+
+**It needs at least two people able to attest.** A sole Administrator (RBAC off, the default, admits only
+administrators) cannot decide that administrator's own grants. They stay `pending` until someone closes the
+campaign, and `close` has no separation of duties, so the campaign closes with unreviewed rows. Assign
+`Reviewer` to a second person.
+
+**It is not four-eyes.** Nothing stops two colluding reviewers deciding each other's grants. Four-eyes on
+distinct human roots is a separate control (ADR-0033 section 7 reserves human-root resolution for it); this
+rule compares usernames only, the same limit ADR-1005's 2026-10-19 addendum records for approvals. No separate
+acceptance of that limit is recorded for access reviews.
+
+**Open and close have no separation of duties.** The holder of `AccessReview:Attest` who is the subject of a
+grant can still open or close a campaign.
+
+**The completeness test an auditor should use.** A campaign is complete only when it is closed AND `GET /api/v1/access-reviews/{id}` (MCP `get_access_review`) shows `pending_count` 0; a campaign closed with `pending_count` above 0 is recorded as incomplete evidence, and the campaign list (metadata only) cannot show which of the two a campaign is.
+
+**"Reviewer" is an account, not proof of a person.** Engine principal sessions are refused (REST and MCP), as
+are service-scoped tokens (403) and the MCP read-only and operator tiers. An API-token caller acts as its owning
+user, so an API-token caller and a supervised-tier MCP token can still record a decision. The three write routes
+(open, attest, close) are step-up exempt (`kEvidenceCapture` in `step_up_policy.hpp`), so no fresh MFA proof is
+required; that exemption covers the REST and dashboard path only, because MCP is not step-up gated at all and
+token principals do not take the MFA path. The history row stores only `reviewer`. On the audit side, `principal_class` is a persisted column stamped only by how the credential was presented (an `Authorization` or `X-Yuzu-Token` header gives `agent`, a `yuzu_session` cookie gives `human`), so an API-token caller and an MCP-token caller cannot be told apart on the `access_review.attested` row, and there is no auth-source field. `AuditEvent::mcp_tool` is never persisted: on MCP the tool name is on the separate companion row `mcp.record_attestation` (`target_type=mcp_tool`). The domain row is set-and-proceed, so it can be absent (`Sec-Audit-Failed` on REST, `audit_persisted:false` on MCP). Audit rows are kept for the audit retention period (365 days by default). Do not describe a decision
+as signed by a human.
+
+**Revocation and timing limits.** A reviewer whose authority is revoked while their attest is in flight can
+still commit it (the same window as the engine and group reads above, and the documented revocation latency).
+`created_at_ms`, `decided_at_ms` and `closed_at_ms` are authored by the database clock (the write transaction's `now()`, in epoch milliseconds), not by each replica's system clock. A decision's stamp is the transaction START time, so it can precede the COMMIT by the lock wait, and the history entry and the state row carry the identical value. `decision_seq` is the ordering authority for the decisions on one grant: a decision queued behind a lock can carry an earlier stamp than the one it follows. A decision stamp later than the campaign's `closed_at_ms` is not a post-close decision: both stamps are the transaction START time, so an attest that begins after a close has begun can take its `FOR SHARE` lock on the campaign row and commit first while the close waits, and that decision then carries a `decided_at_ms` later than `closed_at_ms`. `decision_seq` and commit order, not the stamps, order decisions against each other and against the close. This holds for rows written by this build; rows imported or restored from an earlier build, and legacy rows that predate the history table, keep the replica-clock stamps they were written with. Audit rows are still stamped from the server replica's own system clock (epoch seconds), so comparing a `decided_at_ms` with the audit row's timestamp can differ by the clock skew between the application host and the PostgreSQL host. On an RBAC-off install a sole Administrator
+cannot decide their own user grant or a group they belong to, so the campaign can only close with those
+grants `pending`.
+
+**The decision history.** The current-state row in `access_review_attestation` keeps its four-part key and
+holds the latest decision plus `decision_seq` (0 while pending). The new table
+`access_review_attestation_history` holds one row per recorded decision, keyed by the same four parts and
+`seq`, with the decision it replaced (`previous_decision`; empty means "not recorded", for a decision
+backfilled by the schema v3 migration, and is never read as pending). Ordering is by `seq`, never by time.
+The store writes the history row in the same transaction as the state change; the database only guards:
+
+- a trigger on the state table refuses an insert that is not `pending` at seq 0, any delete, and any update
+  that is not exactly one appended, matching history row with `decision_seq` advanced by one;
+- a trigger on the history table refuses every update and delete;
+- a deferred constraint trigger refuses a commit in which a history row was written without the state
+  advancing to match;
+- both foreign keys are `ON DELETE RESTRICT`, and a `CHECK` on the history table refuses a `user` decision
+  whose reviewer is the subject.
+
+A bare UPDATE from an earlier binary against a migrated schema fails (SQLSTATE class 23) and does not bypass
+the reviewer rule; the deployment contract excludes earlier binaries, so this is a backstop, not a supported
+configuration. That is the claim, and its limits are part of it: append-only against the application path and
+ordinary SQL. It is NOT held against the application credential: the migration runner creates the schema under that
+role, so the owner can disable a trigger, drop a trigger, replace the guard function, forge a matching history row,
+truncate or drop the table. On these tables, which have foreign keys (whose system triggers a non-superuser cannot
+disable), `ALTER TABLE ... DISABLE TRIGGER ALL` is refused to a non-superuser while `DISABLE TRIGGER USER`
+succeeds, after which updates and deletes go through; `DROP TABLE` also succeeds. This is stated as a limit of the
+claim, not as a procedure. A role granted TRUNCATE can truncate, and a database administrator can do anything. A
+data-only restore into a migrated schema is refused by the guard; restore schema and data together. A future
+migration that touches attestation rows must run `DISABLE TRIGGER USER` on the table inside its own transaction.
+The guard triggers protect the frozen grants, the decisions and the history. The campaign row (`status`,
+`closed_at_ms`, `closed_by`, `title`) is protected by the application only, which refuses further decisions on a
+closed campaign, so a database credential holder can reopen one.
+
+**Evidence outside these tables, and detection.** The audit rows are evidence independent of THESE tables, not of the
+database credential: the audit store is in the same database and has no guard triggers (`audit_store.cpp` defines
+none), so a holder of the application or owner credential can edit audit rows as well. They are independent of that
+credential only to the extent audit rows are exported off the database (the audit export, or a log shipper). For a
+recorded decision the audit trail holds the `access_review.attested` / `access_review.flagged` row: the actor, the
+campaign, the grant, the decision, the previous decision and `seq` (and `sod=pass`); the justification text is not in
+it. Retention differs between the two records: a closed campaign and its history persist indefinitely, while audit
+rows are kept for the audit retention period (365 days by default), so after that period the campaign tables are
+the only on-database record of a decision unless the audit rows were exported. Nothing in Yuzu records a `DISABLE
+TRIGGER` or a `TRUNCATE`. Detection is outside the product: database statement logging (`pgaudit` classes `ddl` and `write`, or
+`log_statement = mod`; `log_statement = ddl` and the `ddl` class alone do not log a `TRUNCATE` or the INSERT of a forged
+history row), and reconciling each grant's `decision_seq` against its history row count and against the `seq` values in
+the audit rows. The reconciliation is the check that does not depend on database logging having been enabled, but it compares only
+counts and `seq` values: it cannot see an in-place edit of a history row's decision, reviewer or justification, or a
+forged matching row, and its audit half needs audit rows that are still within retention or were exported. The queries
+are under "Obtaining the full justification of a superseded decision" below. The authorised data-redaction procedure
+(see the erasure statement under "Deliberate no-prune" above) also disables the triggers, and Yuzu does not audit it.
+
+**Obtaining the full justification of a superseded decision.** The API and the Access page return a 64-character
+preview of a superseded entry, never the full record. The full text is in the table
+`access_review_store.access_review_attestation_history` (schema-qualified), one row per decision, with the key columns
+`campaign_id`, `principal_type`, `principal_id`, `role_name` and `seq`, and the columns `decision`,
+`previous_decision`, `reviewer`, `justification` and `decided_at_ms`. For one grant, in decision order:
+
+```sql
+SELECT seq, decision, previous_decision, reviewer, decided_at_ms, justification
+  FROM access_review_store.access_review_attestation_history
+ WHERE campaign_id = '<campaign id>' AND principal_type = 'user'
+   AND principal_id = '<principal id>' AND role_name = '<role name>'
+ ORDER BY seq;
+```
+
+To reconcile a campaign, list every grant whose `decision_seq` does not equal its number of history rows (or whose
+highest `seq` is not its `decision_seq`); an empty result is the expected answer:
+
+```sql
+SELECT a.principal_type, a.principal_id, a.role_name, a.decision_seq,
+       count(h.seq) AS history_rows, coalesce(max(h.seq), 0) AS highest_seq
+  FROM access_review_store.access_review_attestation a
+  LEFT JOIN access_review_store.access_review_attestation_history h
+    ON h.campaign_id = a.campaign_id AND h.principal_type = a.principal_type
+   AND h.principal_id = a.principal_id AND h.role_name = a.role_name
+ WHERE a.campaign_id = '<campaign id>'
+ GROUP BY a.principal_type, a.principal_id, a.role_name, a.decision_seq
+HAVING count(h.seq) <> a.decision_seq OR coalesce(max(h.seq), 0) <> a.decision_seq;
+```
+
+The audit side of the comparison is the `access_review.attested` and `access_review.flagged` rows, read with
+`GET /api/v1/audit` (`AuditLog:Read`) once per verb: `action=access_review.attested`, then
+`action=access_review.flagged`, each with `target_type=AccessReview` and `target_id=<campaign id>` (a result of up to
+1000 rows per request; page with `offset` or narrow with `since`/`until`). The `detail` of a success row carries
+`seq=<n>` and the grant, so a grant's `seq` values can be matched against its history rows; rows written before the
+build that introduced the history carry the earlier `target_id` shape and are not matched by that filter. Both
+queries were run for syntax and result against a throwaway PostgreSQL 18 database built from the schema DDL of
+migrations v1 to v3 (they returned the expected rows, and the reconciliation returned the grant after a history row was
+deleted with the guard trigger disabled); they were not run against a populated production database. Three caveats.
+This read is outside the product, and Yuzu does not audit it. It needs a database credential, the same trust class that
+could edit these rows, so it shows what the tables hold, not that they were never altered; the audit rows exported off
+the database and the reconciliation are the independent comparison. And the API and the Access page do not return the
+full text of a superseded decision at all: only this database read does.
+
+**Bounds.** `principal_type`, `principal_id` and `role_name` are 1 to 1024 bytes without a NUL byte (the
+longest ids the identity stores produce are about 520 bytes: `oidc:<iss>#<sub>` with each part capped at 255,
+and an IdP group `<source>:<external_id>` with an external id of up to 512) and
+`justification` is at most 4096 bytes and, when present, a string (any other type is refused with `400` /
+invalid-params and no audit row, because an entry cannot be corrected once recorded; `null` counts as absent). A
+campaign `title` is at most 256 bytes without a NUL byte (a longer or NUL-bearing one is refused in the handler with
+`400` / invalid-params and no audit row, with the store checking again as a backstop). The REST and MCP handlers
+enforce the grant-field limit before the gate (a `400` / invalid-params with the message `principal_type, principal_id and role_name must be 1-1024 bytes
+without NUL`, no audit row, and the same for all three grant types because it is decided before any lookup),
+and the store checks it again as a backstop; the schema `maxLength` values are discovery metadata only. A grant
+keeps at most 100 decisions: the 101st is refused inside the transaction with `400` / invalid-params and the
+message `this grant already has the maximum number of recorded decisions (100) in this campaign; no further
+decision can be recorded on it. To review it again, open a new campaign (closing this one is a separate choice: it leaves every undecided grant pending). If an earlier attempt
+may have been recorded, read the campaign first` (the store returns it with a `bad_request: ` classification
+prefix that the handlers strip, so it is not on the wire), nothing is written, and a `failure` audit row is
+written. The 100th decision is final: the grant takes no further decision in that campaign, the history and
+the audit rows identify who wrote the entries, and the remedy is to open a new campaign, which re-freezes the whole population as pending (closing the old one is a
+separate choice that leaves every undecided grant pending). A history read returns at most the latest
+100 entries of a grant; `decision_seq` stays the total, so `decision_seq` greater than the number of entries
+means earlier ones are not shown. That bound holds for rows written through the application path; rows added by
+other means (owner-level SQL with the guard triggers disabled, for example a forged pending state row with more than
+100 history rows) are outside the guarantee and are returned as they stand. The entry count alone does not bound the
+response of a campaign with many grants (100 entries of 4096 bytes each, per grant), so every entry except the
+grant's latest also returns at most its first 64 characters of justification, cut in SQL (`left()` counts
+characters, so on a UTF8 database a multibyte sequence is never split; see "Database encoding" below) and flagged by
+`justification_truncated`; the latest entry is whole and equals the state row. The full text of a superseded entry
+stays in the database and is not returned, so an export of it is a database read of
+`access_review_attestation_history` (see "Obtaining the full justification of a superseded decision" above). A grant
+adds at most 99 entries of 64 characters plus one whole entry to a response, and the latest text appears twice (once
+in the grant's own `justification`, which is the state-row copy, and once as the latest `history` entry). The
+response therefore grows linearly with the number of frozen grants: the per-grant ceiling is a bound on one grant, not
+on the response, because there is no cap on the factor. There is no per-campaign budget and the number of frozen grants
+is not capped (a recorded residual, accepted by the project owner on 2026-11-04 at the measured figures).
+
+*Measured response sizes.* On 2026-11-04, on Linux (glibc), with a FRESH server process for each case (baseline
+server peak RSS about 104 to 105 MB), one `GET /api/v1/access-reviews/{id}` against a campaign of 1000 frozen grants with 100
+decisions each (built by inserting rows directly into a throwaway database, not by 100,000 attest calls), with the
+64-character preview: 4096-character ASCII text gave a 32.3 MB response and a server peak (`VmHWM`) of about 331 MB;
+1024 four-byte (emoji) characters gave 51.3 MB and about 464 MB; 4096 control characters, each of which JSON escapes
+to six bytes, gave 105.0 MB and about 779 MB. 200 grants of ASCII text gave 6.47 MB and about 154 MB. For comparison,
+the same measurement with the former 512-character preview gave 76.7 MB and about 716 MB (ASCII) and 371.1 MB and
+about 2.4 GB (control characters). For the three 1000-grant cases the server peak was about 7 to 10 times the response,
+baseline included (10.2 times for ASCII, 9.0 for emoji, 7.4 for control characters); the 200-grant case, which is mostly baseline, was about 24 times. The
+ratio depends on the allocator. (A response is in units of 10^6 bytes and a peak is `VmHWM` divided by 1024, so the
+ratios are approximate.) The 64-character cases were run three times each, in fresh processes, and their peaks agreed
+within about 1 percent; the 512-character comparison is one run per case. These are measurements on one host, not a
+guarantee.
+Reviewer ids of about 520 bytes would add about 50 MB (100,000 history entries of about 520 bytes each; an estimate,
+not measured, because the measured campaigns used short reviewer names).
+
+The response is built whole in memory: the REST handler holds the store result, the view structures, the JSON
+builders and the serialised body at once, and there is no per-campaign budget, no cap on the frozen grant count and
+no concurrency limit on the route itself, so each request in flight holds its own copies. The grant's top-level
+`justification` repeats its latest history entry, so the latest entry's text is in the response twice. The MCP twin
+puts its payload in the tool result twice (the `content` text and `structuredContent`), so its response is larger than
+the REST body: measured at 2.04 to 2.16 times its bytes, and at about 1.3 to 1.5 times its peak memory for 1000
+grants with 100 decisions each (about 453 MB against 323 MB for the 32 MB ASCII case, 1.09 GB against 0.75 GB for the
+105 MB control-character case; at 200 grants the ratio is about 1.14 because the baseline dominates; the growth above
+the baseline is about 1.4 to 1.6 times the REST growth, the figure to scale by when sizing for concurrent requests). These were
+fresh processes on one host, three runs for each MCP figure and one run for each REST figure in the comparison, on the
+`VmHWM` divided by 1024 convention above; the three-run REST figures above agree with those single runs within about 3
+percent at 1000 grants (about 7 percent at 200 grants, where the baseline is most of the peak). The Access page's campaign fragment, measured the same way, peaks at about 195 MB for 1000 grants with 100
+decisions each (about 255 MB with four-byte characters), and the page renders at most 1000 grants: it shows only the
+latest justification whole and 64 characters of each earlier one, so its body is 27 to 46 MB. The browser's own cost
+for a document of that size was not measured. No shipped deployment configuration (the `deploy/docker` compose files, the `deploy/systemd` unit, the HA compose file)
+sets a memory limit, and the only shipped server-restart alert is `YuzuServerRestartLoop` (more than 3 resets of
+`yuzu_server_uptime_seconds` in 3 hours, sustained for 15 minutes, `docs/prometheus/yuzu-alerts.yml`). One out-of-memory
+kill is one uptime reset, below that threshold, so that alert will not fire on a single kill. Size the server's memory
+for several times the response per concurrent request, set an explicit memory limit above that, and alert on server
+memory and restarts yourself. The server already exports its resident memory as `yuzu_server_memory_bytes{type="rss"}`
+on `/metrics`; it is a sampled gauge and the measured reads took about 2 to 3 seconds, so a scrape can miss the peak of
+one read.
+
+*Scaling (scaled from the 1000-grant measurement, not measured).* The measured net cost (peak minus the baseline) was
+about 690 kB per grant for the control-character text and about 233 kB per grant for the ASCII text (about 368 kB for
+the four-byte characters); the 200-grant ASCII case gave about 255 kB per grant (251 to 257 over three runs), so the cost is roughly linear in the
+number of grants over that range. On that scaling one request alone would reach 1 GiB of server memory at about 1,400
+frozen grants of control-character text or about 4,000 of ASCII text, and with several requests in flight the per-request
+costs are assumed to add: two concurrent reads at 1000 control-character grants would exceed 1 GiB. The assumption that
+concurrent peaks add, and the extrapolation beyond 1000 grants, were not measured. The only limit on how many such
+requests run at once is the server's shared HTTP worker pool; the route has no limit of its own, and the pool is not a
+memory bound.
+
+The Access page marks a cut entry "(truncated)" and never labels a pair in which either entry was cut as a
+re-recording, because a cut text cannot be shown equal to the next one. With a 64-character preview an earlier entry is
+cut whenever its justification is longer than 64 characters, so a lost-answer retry that appended an identical decision
+is labelled "superseded" rather than "re-recorded" on the Access page for any such justification; compare
+`decided_at_ms` and the full text with the database read above. A successful attest answers
+`{recorded, decision_seq, previous_decision}`.
+
+**Database encoding.** The truncation counts characters and assumes a UTF8-encoded database. The server neither
+checks nor sets the encoding. Measured on 2026-11-04: the image the compose files build from `Dockerfile.postgres`
+(`docker-compose.yml`, `docker-compose.full-uat.yml`, `docker-compose.sanitizer-uat.yml`, `docker-compose.viz-uat.yml`;
+the reference, reference-gateway and demo compose files and the root `docker-compose.uat.yml` pull the published
+`yuzu-postgres` image instead), the `postgres:18.4-bookworm` image that `scripts/ci/ensure-postgres.sh` pins for the
+Linux Docker CI leg and the `postgres:18` image the playbook names all create UTF8 databases (`en_US.utf8`), and the HA
+entrypoint (`deploy/docker/ha-postgres/patroni-entrypoint.sh`) sets `encoding: UTF8` explicitly.
+`install-server-postgres.sh` creates a DATABASE in an existing cluster (`CREATE DATABASE`, which inherits the
+encoding of `template1`) and creates no cluster; only `setup-rhel9.sh` runs `initdb` (`postgresql-setup --initdb`),
+and it sets no encoding, so that cluster follows the host's locale, and a host in the `C` locale yields `SQL_ASCII`.
+To check, run `SHOW server_encoding;` in the Yuzu database: it must answer `UTF8`. A database in another encoding
+cannot be converted in place (`ALTER DATABASE` has no encoding option). Back up first, then create a NEW database
+under a different name, for example
+`CREATE DATABASE yuzu_utf8 OWNER yuzu ENCODING 'UTF8' TEMPLATE template0;` (the same command against the existing
+name fails with "already exists"; the command was verified on a `postgres:18` cluster initialised with the `C` locale,
+and a cluster whose locale is not compatible with UTF8 may need locale options as well, not tested), move the data
+across, and repoint the server's DSN at the new database. A dump taken from a single-byte database can contain bytes
+that are not valid UTF8 and may need cleaning before it loads; that step was not verified in detail. On a database
+with a single-byte encoding `left()` counts bytes, so a cut can fall inside a multibyte sequence; what that does to
+the validity of the JSON response was not verified.
+
+**Frozen grants whose ids exceed 1024 bytes.** No known creation path produces an id longer than the limit, but a
+frozen grant whose `principal_id` or `role_name` exceeds 1024 bytes cannot be attested (`400`); it stays pending
+and is reported as an incomplete review when the campaign closes.
+
+**Lost COMMIT.** One history event is one committed decision transaction. When the connection drops after
+COMMIT was sent, the server cannot tell whether the decision was recorded and answers a write failure (503 on
+REST). Before retrying, GET the campaign and compare `decision_seq`. A retry after an unacknowledged commit
+appends an identical decision at seq+1; it is kept and visible, not an error, until the grant reaches its
+limit of 100 decisions, after which the request is refused (read the campaign first if your earlier attempt
+may have been recorded). The first attempt writes a
+`result=failure` audit row whose fixed text says the decision store is unavailable or the decision may not have
+been committed (`kStoreFailureMessage`), so an auditor sees a failure row next to a committed decision. To tell
+whether a decision landed, read the campaign, compare `decision_seq` with the value you last saw and match your
+entry on reviewer, justification (an earlier entry shows at most its first 64 characters) and `decided_at_ms`. A
+store failure that is not the caller's is answered with that fixed message and `retry_after_ms` 5000 (`503` on REST,
+an internal error on MCP), never database text, which goes to the server log. There is no idempotency key yet.
+A close has the same ambiguity: if its COMMIT acknowledgement is lost the campaign may already be closed while the
+caller sees the 503, and a retry then answers 404 `not_found`, so read the campaign before retrying the close.
+
+**Close starvation.** A queued `close_campaign` does not block a new attestation's lock on the campaign row, so
+under a continuous stream of attestations a close can wait up to 3 s (`SET LOCAL lock_timeout = '3s'`, set
+inside the close transaction so the bound does not depend on the DSN; a close has one lock wait) and answer
+503 (an internal error with `retry_after_ms` 5000 on MCP). The fixed store-failure message belongs to attest
+only: a close fault returns the store string unchanged (`close_campaign lock_timeout failed`,
+`close_campaign write failed`, or `database unavailable — try again`), and its server log has only the
+`AccessReviewStore::close_campaign: failed (campaign=..., sqlstate=...)` line (SQLSTATE 55P03 for the lock
+wait). Nothing was committed on that path, so retry the close. An attestation queuing on its grant row is
+bounded by the same 3 s per wait (it can wait on the grant row and then on the campaign row). A close whose
+COMMIT acknowledgement is lost may leave the campaign closed while the caller sees the 503; a retry then
+answers 404 `not_found` (campaign missing or already closed), so read the campaign before retrying.
+
+**Hard cutover.** A database that holds a `user` grant decided by the account it names (an earlier build
+allowed it) makes the schema v3 migration fail, the store stay closed at version 2, and the server refuse to
+start (`server.cpp` treats a store that did not open as a startup failure) with a message that names the cause.
+It refuses again on every boot until the database is replaced. Deploy into a fresh database. Only that one case
+is detected: decisions on engine or group grants made by earlier builds are not checked and read as "previous:
+not recorded". This is the project's "Deployment contract (hard cutover)" posture, a decision of the project
+owner recorded in `docs/user-manual/upgrading.md`; the executable refuses a schema state, it does not verify
+where the database came from.
+
 ## Render-time permission probes (capability hints)
 
 Six `AuthRoutes` methods answer a permission question without writing a denial row for an
@@ -3719,9 +4309,11 @@ only where the gate itself writes one, such as an engine principal with the stor
 read that fails (breaker open, pool timeout, a failed role or permission query) is a `403` here and
 cannot be told apart from a refusal), `probe_permission_unavailable_aware` (`probe_permission`
 with one difference: such a failed RBAC read is answered with a retryable `503`, `retry_after_ms`
-5000 and no `permission` field. It exists for the one consumer whose correctness depends on telling
-"could not determine" from "definitively denied", the Forensics-tier resolver, where a collapsed
-answer would serve a `200` with the Forensics rows silently missing; a new caller needs the same
+5000 and no `permission` field. It exists for the two consumers whose correctness depends on telling
+"could not determine" from "definitively denied": the Forensics-tier resolver, where a collapsed
+answer would serve a `200` with the Forensics rows silently missing, and the software collection
+settings per-group read and write (`software_collection_settings_routes.cpp`), where a collapsed
+answer would record an RBAC outage as a refused or withdrawn grant; a new caller needs the same
 justification, and `require_permission` itself stays a `403` on a degrade, ADR-0041), `probe_admin` (`require_admin`'s decision), `probe_fleet_read` (`require_fleet_read`'s decision and
 scope) and `probe_global_list_read` (`require_list_read`'s decision, with a management-group-
 confined admission refused as a denial, for a resource that is not agent-scoped; its loud twin
@@ -3955,7 +4547,7 @@ A **service-scoped API token** is bound to one IT service's agents (`session->to
 
 **Second migration (#1712/#1700, this ADR-0017 continuation).** Closes the "World A" gap this ADR flagged (`Fail-closed list-read gate (HIGH)` finding) for three readers that previously had NO per-agent filter at all: dashboard `/fragments/results`, the workflow executions-drawer detail route (its responses section AND its per-agent status grid/table — both read per-agent data, from `ResponseStore` and `ExecutionTracker` respectively, and the route's gate migration admits the same newly-in-scope caller to both), and MCP `get_agent_details` — all three routes migrated onto `require_fleet_read` as their sole gate, replacing `perm_fn`/`perm_fn_`/`tier_allows`+`perm_fn` outright. `get_agent_details` is reclassified from `ServiceScopeClass::denied` to `confined` (`kToolSecurityRows`, `mcp_server.cpp`) since it now has this same real confinement mechanism; a correctly-confined service-scoped token gets a real filtered/404-collapsed answer instead of a blanket 403.
 
-Out of scope for this migration, flagged not fixed (none newly reachable by this migration's admission change — unlike the status grid above, these were already reachable by their current caller class before #1712, so leaving them unmigrated does not widen anything): MCP `list_agents` (same unscoped-fleet-read shape `get_agent_details` had), the dashboard results workflow's sidecar routes — `/fragments/results/filter-bar`, `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results` (all still on flat `perm_fn_`, reading unscoped `ResponseStore` facet queries — tracked as #3489, #3525 tracked the same finding and was closed as its duplicate; see ADR-0017's "In scope" Responses bullet for the detailed reachability analysis distinguishing `filter-bar`'s latent-only exposure from `group-from-results`' real, pre-existing `ManagementGroup:Write`-vs-`Response:Read` privilege-crossing risk — this same risk is why the dashboard's "Create Group from N Agents" button is now withheld from a confined caller entirely, #1712 hardening round), REST `GET /api/v1/execution-statistics/agents` (was on the same flat `perm_fn(Execution,Read)` gate, returning per-agent execution stats with no confinement — found by Gate 4 consistency-auditor's re-derivation of the sibling-handler check on this PR's exact `(securable, operation)` pairs, tracked as #3526; **now migrated onto `fleet_read_fn`, see "Execution-statistics per-agent rollup (#3526)" below**; the workflow executions LIST fragment `/fragments/executions`, noted in the same issue, has since been migrated onto `require_fleet_read` too - see the Sixth migration paragraph below). `/sse/executions/{id}` and REST `/api/v1/events` (formerly tracked here as #3699) are now migrated — see the Third migration paragraph below.
+Out of scope for this migration, flagged not fixed (none newly reachable by this migration's admission change — unlike the status grid above, these were already reachable by their current caller class before #1712, so leaving them unmigrated does not widen anything): MCP `list_agents` (same unscoped-fleet-read shape `get_agent_details` had; since moved onto `require_fleet_read`, #4041), the dashboard results workflow's sidecar routes — `/fragments/results/filter-bar`, `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results` (all still on flat `perm_fn_`, reading unscoped `ResponseStore` facet queries — tracked as #3489, #3525 tracked the same finding and was closed as its duplicate; see ADR-0017's "In scope" Responses bullet for the detailed reachability analysis distinguishing `filter-bar`'s latent-only exposure from `group-from-results`' real, pre-existing `ManagementGroup:Write`-vs-`Response:Read` privilege-crossing risk — this same risk is why the dashboard's "Create Group from N Agents" button is now withheld from a confined caller entirely, #1712 hardening round), REST `GET /api/v1/execution-statistics/agents` (was on the same flat `perm_fn(Execution,Read)` gate, returning per-agent execution stats with no confinement — found by Gate 4 consistency-auditor's re-derivation of the sibling-handler check on this PR's exact `(securable, operation)` pairs, tracked as #3526; **now migrated onto `fleet_read_fn`, see "Execution-statistics per-agent rollup (#3526)" below**; the workflow executions LIST fragment `/fragments/executions`, noted in the same issue, has since been migrated onto `require_fleet_read` too - see the Sixth migration paragraph below). `/sse/executions/{id}` and REST `/api/v1/events` (formerly tracked here as #3699) are now migrated — see the Third migration paragraph below.
 
 **Third migration (#1634, this ADR-0017 continuation).** Closes the systemic gap #1634 tracked since 2026-06-23: the legacy REST `/api/responses/{id}/aggregate`/`/export`/catch-all-list routes (`server.cpp`), MCP `query_responses`/`aggregate_responses`, and REST `GET /api/v1/executions/{id}/visualization` all carried a per-row post-filter (`response_agent_in_scope`/`response_scope_fn`) that sat BEHIND a still-flat global gate — the exact "inert filter" shape #1711/#1550 shipped and this ADR names as the systemic defect. All five migrated onto `require_fleet_read`/`fleet_read_fn_` as their sole gate; the response list/export routes and `query_responses` additionally push the resolved visible-agent set into `ResponseStore::query`/`query_by_execution` as SQL `agent_id = ANY(...)` **before** `LIMIT`/`OFFSET` (a new optional scope parameter, ADR-0017 INV-3) rather than post-filtering a capped/paginated read — the INV-3-compliant fix an adversarial review (Kimi + Codex) found the first migration pass had missed. `GET /api/v1/executions/{id}` (REST final-state lookup), `GET /api/v1/events` (REST SSE), `GET /sse/executions/{id}` (dashboard SSE — closing the #3699 gap above), and MCP `get_execution_status`/`list_executions` also migrated: all four collapse an invisible execution to the same 404/not-found shape a genuinely nonexistent one gets (no existence oracle), and a confined non-dispatcher's view is a redacted projection (recomputed per-agent counts from only the visible agent-status rows, `scope_expression`/`parameter_values` replaced with a fixed placeholder) — dispatcher ownership admits VISIBILITY only (avoids a false 404 on a just-dispatched execution with zero responses yet) and never bypasses this projection, a distinction the same adversarial-review round caught the first attempt getting wrong. `list_executions` has a weaker mechanism than the others — execution rows carry no single `agent_id` to filter by, so a confined caller is restricted to `dispatched_by = session->username` (`ExecutionQuery::dispatched_by`) rather than a real visible-agent intersection. As of the PR #3793 review round, `agents_targeted`/`agents_responded` on this route ARE now projected (a batched, non-N+1 `get_agent_statuses_for_executions` call) the same way `get_execution_status` projects them, closing that specific gap; the confinement AXIS itself remains own-dispatches-only, not a real visible-agent intersection. **Disclosure gap (found in the same review round, not fixed):** `dispatched_by = session->username` is scoped to the minting principal, not intersected against a service-scoped token's own service-tag scope — an admitted service token sees its minting user's full dispatch-history metadata (status/timing/lineage, no agent identities), not narrowed to its own service. Recorded here as disclosed, not fixed. The two SSE routes share one event projector (`execution_event_scope.hpp`): `agent-transition` events are filtered by `agent_id`, `execution-progress` is dropped for confined subscribers (execution-wide counts, no `agent_id`), and `execution-completed` is sanitized (real `status` field preserved, counts stripped) rather than dropped, so the client still closes its stream. `query_responses`/`aggregate_responses`/`get_execution_status`/`list_executions` are reclassified `ServiceScopeClass::confined` (`kToolSecurityRows`), matching the real `fleet_read_fn_` mechanism they now have.
 
@@ -3981,10 +4573,10 @@ This migration also closed a **second, load-bearing gap it exposed**: `Enrollmen
 
 **Operate pages built on the same gate (Executions and Approvals).** The `/executions` page's fleet statistics strip (today, all time, device success rate, average duration) is rendered only when `require_fleet_read` returns no scope, i.e. for unconfined operators, because `ExecutionTracker::get_fleet_summary_checked` is fleet-wide and cannot be projected to a scope; a confined caller gets no strip and a store failure omits it rather than printing zeros. The page's Cancel button is rendered enabled for a live execution only when a render-only probe of `Execution:Execute` passes (the detail read itself already required `Execution:Read`); a caller without the grant sees it disabled, an unprobed render leaves it enabled, and the cancel route re-checks both permissions, so the probe is never an authorization decision. The list route does not audit, so the strip adds no audit row.
 
-**Operate pages (`view=page`).** The Executions and Approvals page views sit behind the same admission prelude as the fragments they extend and receive only projected rows and the redaction constant; the Approvals page keeps the bare `Approval:Read` namespace gate, since approvals are workflow rows and not per-agent fleet data. The Workflows page's definitions fragment is gated by `Workflow:Read` through `perm_fn` alone (never stacked with `fleet_read_fn`) and reads the instruction store only behind a render-only `InstructionDefinition:Read` probe, so a role holding `Workflow:Read` without it is shown ids and labels only (the run detail follows the same rule for step titles). The same fragment probes `Workflow:Execute`, `Workflow:Write` and `Workflow:Delete` once per render to decide which controls to offer (Run now, New workflow, Delete workflow); a probe is never an authorization decision and each write route re-checks its own grant, with one `auth.permission_required` audit row per refused probe; its Schedules panel is the existing two-stage schedule gate, with the owner decision made server-side and only a boolean sent to the page, and probes `Schedule:Write`, `Execution:Execute` and `Schedule:Delete` once per render for the Enable, Disable, Delete and New schedule controls (the owner-scoped write routes remain the gate and answer 200 when they change nothing, so the page re-reads the stored state). The run fragments (`/fragments/workflow-runs`, `/fragments/workflow-runs/{id}`) are gated by `fleet_read_fn(Workflow, Read)` alone, never stacked with `perm_fn`, hand its scope to the store (list) or to `workflow_execution_visible` and the confined projections (detail), answer a hidden and an unknown run id with identical bytes, and audit the detail read as `workflow_execution.detail.fetch`.
+**Operate pages (`view=page`).** The Executions and Approvals page views sit behind the same admission prelude as the fragments they extend and receive only projected rows and the redaction constant; the Approvals page keeps the bare `Approval:Read` namespace gate, since approvals are workflow rows and not per-agent fleet data. The Workflows page's definitions fragment is gated by `Workflow:Read` through `perm_fn` alone (never stacked with `fleet_read_fn`) and reads the instruction store only behind a render-only `InstructionDefinition:Read` probe, so a role holding `Workflow:Read` without it is shown ids and labels only (the run detail follows the same rule for step titles). The same fragment probes `Workflow:Execute`, `Workflow:Write` and `Workflow:Delete` once per render to decide which controls to offer (Run now, New workflow, Delete workflow); a probe is never an authorization decision and each write route re-checks its own grant, with one `auth.permission_required` audit row per refused probe (a supervised-tier MCP token's approval-gated pairs, Execute and Delete, are decided from the session without probing, so a render writes no `auth.approval_required` row for it, and Run now is disabled with the tier as its reason; the execute route itself writes the one `auth.approval_required` row for the refusal); its Schedules panel is the existing two-stage schedule gate, with the owner decision made server-side and only a boolean sent to the page, and probes `Schedule:Write`, `Execution:Execute` and `Schedule:Delete` once per render for the Enable, Disable, Delete and New schedule controls (the owner-scoped write routes remain the gate and answer 200 when they change nothing, so the page re-reads the stored state). The run fragments (`/fragments/workflow-runs`, `/fragments/workflow-runs/{id}`) are gated by `fleet_read_fn(Workflow, Read)` alone, never stacked with `perm_fn`, hand its scope to the store (list) or to `workflow_execution_visible` and the confined projections (detail), answer a hidden and an unknown run id with identical bytes, and audit the detail read as `workflow_execution.detail.fetch`.
 **Seventh migration (the workflow RUN list, `GET /api/v1/workflow-executions` + MCP `list_workflow_executions`): a new surface born on the chokepoint, not a migration of an existing one.** `Workflow:Read` through `require_fleet_read` is its sole gate (never stacked with `perm_fn` on the same pair), and the composed scope is passed to the `WorkflowApi` seam as a required argument, where `WorkflowEngine::query_executions_page` applies it in SQL BEFORE `ORDER BY`/`LIMIT` (ADR-0017 INV-3): a run is returned only if at least one string element of its `agent_ids_json` is in scope, so a hidden run never takes a page slot, and `next_cursor` is always the position of a row the caller was served. The SQL image of `workflow_execution_visible()` fails closed the same way (malformed, empty or non-array `agent_ids_json` is invisible to a confined caller) and is pinned against the C++ predicate over a corpus; it is not a byte-for-byte image, because PostgreSQL's jsonb and nlohmann accept different JSON, and each divergence is recorded with its direction in the store's tests. A document jsonb refuses (a `\u0000` escape, a UTF-8 byte-order mark) is invisible to a confined caller in the list while the detail route's nlohmann parse would still show it, the safe direction. A document jsonb accepts but nlohmann rejects (a number past double range, `["a1",1e400]`) is shown by the list to a caller whose scope holds `a1` while the detail route answers not-found for it: a listed run the caller cannot open, never an out-of-scope run, since the shown run always names an in-scope agent; in `latest_per_workflow` mode it can also change which run a workflow's latest is. Only a write that bypasses the engine can store either shape (`execute()` writes a JSON array of strings, which both parsers read identically). Workflow runs carry no dispatcher column, so there is no owner disjunct and #5557's defect class (a service token inheriting its minter's own runs) cannot occur. Rows are metadata only (no agent ids, step results, `agents_reached`), and `pagination.total` is the page's row count, never a fleet-wide count, so neither leaks fleet size or out-of-scope existence. `kServiceScopeGlobalSafe` stays empty; the MCP row is `ServiceScopeClass::confined` (a real downstream mechanism exists), and `Workflow:Read` is deliberately NOT in the authorization-topology floor: a run list is operational metadata, not authorization topology. A successful list writes no audit row (metadata, like `GET /api/v1/executions`); a refusal is audited by the gate as `auth.fleet_read_required`; MCP writes only the generic `mcp.list_workflow_executions` row. The confined predicate parses `agent_ids_json` per candidate row and `workflow_executions` has no `started_at` index, so the read runs under a 1.5 s `SET LOCAL statement_timeout` and a timeout is an honest `503`, never a short or empty page.
 
-**`require_fleet_read` now applies the `ITServiceOwner` authority ceiling on its service axis (found while working #3526, which stays open for other surfaces).** Before this change `require_fleet_read`'s service-scoped branch checked only that RBAC enforcement is in effect and then met the minter's `authorize_list_read` result with the service tag set; unlike `AuthRoutes::require_permission` it never asked whether the `ITServiceOwner` role itself holds the pair. It now does, at `authz_gates.cpp` right after the "service-scoped tokens require RBAC to be enabled" check, through ONE shared helper, `authz::service_ceiling_check` (declared in `authz_gates.hpp`, defined in `authz_gates.cpp`), which `require_permission` and `require_scoped_permission` (`auth_routes.cpp`) now call too. The helper asks `RbacStore::role_permission_allowed_checked("ITServiceOwner", ...)`, the one read, which fetches the single `role_permissions` row for the pair (`SELECT effect` keyed by role, securable and operation, the table's primary key) rather than every row of the role, and returns a tri-state: Admit (an `allow` row), Deny (an explicit `deny` row, any other effect text, or the pair absent, which is also how an operator revoke looks), Degraded (the checked read failed). **That read is breaker-gated and short-budget:** it asks the RBAC authz breaker for admission first, acquires with `kAuthzAcquireTimeout` (250 ms) and reports its outcome to the breaker, so a degraded store fails fast and, once the breaker is open, requests are answered without touching the pool. Before this change the read acquired with `kReadTimeout` (2000 ms) and was not breaker-gated, but `PgPool` clamps a bounded acquire to `min(timeout, 500 ms)` when the pool is already saturated at entry (`saturated_fast_fail`, `pg_pool.hpp`), so on a saturated pool the wait was about 500 ms, not 2 s (a pool that saturated only after the call entered it was bounded by the full 2 s). The change therefore lowers that bound from up to 500 ms to up to 250 ms and adds breaker shedding. An open breaker is reported as "circuit breaker open", which `authz::ceiling_degrade_reason` counts under `pool_acquire_timeout`. The breaker bounds how many requests wait, not how long an already admitted read holds its connection: a read that has acquired one can still wait up to the pool's `lock_timeout` (10 s default) or `statement_timeout` (30 s default) before failing; on a dark network path (no reply at all) the wait is bounded instead by the pool's `tcp_user_timeout` (10 s, per `pg_pool.hpp`: confirmed on Linux, unconfirmed on Windows, a no-op on macOS), and until two failures have returned, up to the pool size (16 by default, `--postgres-pool-size`) of these reads can each hold a connection for that long. **The breaker is shared with operator permission checks:** the ceiling read's failures feed the same per-replica RBAC authz breaker as `check_permission`, `user_rbac_group_names` and `role_effects_for`, so a degraded store seen through service-scoped tokens can open it, and an open breaker denies operators' cache-miss permission checks too (fail closed; a cache hit is still served). The `require_permission` and `require_scoped_permission` sibling gates use the same 250 ms budget behind that breaker; before, they acquired with `kReadTimeout` (2000 ms), clamped by the pool to 500 ms when it was saturated at entry, and were not breaker-gated. **Degraded is a retryable `503` only where a retry can succeed.** On `require_fleet_read` and `require_scoped_permission`, a Degraded verdict (the checked read failed) is a retryable `503` (`retry_after_ms` 5000, no `.permission`, `yuzu_server_rbac_read_degrade_total{reason}` incremented with `pool_acquire_timeout` or `query_error`, and an audit row whose detail says the read degraded: `auth.fleet_read_required` / "fleet read blocked: RBAC read degraded resolving the ITServiceOwner ceiling for <pair>", `auth.scoped_permission_required` / "service-scoped token blocked: RBAC read degraded resolving the ITServiceOwner ceiling"), produced by ONE shared private helper, `AuthRoutes::respond_ceiling_degraded` (`authz_gates.cpp`), because an outage is not a missing grant and the caller can retry. Before this change `require_scoped_permission` answered Degraded with the same `403` as Deny and recorded no degrade metric. `require_permission` does NOT answer `503`: its service-scope allow-list (`kServiceScopeGlobalSafe`) is empty, so no pair is admitted whatever the ceiling read returns, and a retry hint would advertise a recovery that cannot happen. A Degraded verdict there continues to the allow-list check and is answered by the same default-deny `403` (audit "service-scoped token blocked: default-deny (<pair> not on the service-scope global-safe allow-list)", `yuzu_auth_service_scope_default_denied_total` incremented) as a healthy read, with no `retry_after_ms` and no `yuzu_server_rbac_read_degrade_total` increment; the one difference is in the audit detail, which ends with "; ceiling read degraded" after a failed read and does not after a healthy one, so an outage is visible in that row. A guard at the point where the allow-list would admit answers the `503` instead, so a future populated allow-list can never admit on a failed ceiling read; it is unreachable in production (the allow-list is empty) and is pinned by a test that populates the allow-list through its test override. Every case fails CLOSED; a definitive deny stays `403` on all three gates with different bodies and audit rows (`require_fleet_read`: "does not grant <pair> (the ITServiceOwner role does not hold it)" / `auth.fleet_read_required`; `require_permission` / `require_scoped_permission` keep their own bodies and the audit detail "service-scoped token blocked: lacks ITServiceOwner permission"). The `403` body reads `service-scoped token does not grant <securable>:<operation> (the ITServiceOwner role does not hold it)` and omits `.permission` (clause 5: granting the pair to the minter would not admit this caller); the audit row is `auth.fleet_read_required` / `denied` / `fleet read blocked: service-scoped token lacks ITServiceOwner permission <pair>`. Branch order is unchanged (elevated, engine, mcp_tier, service, RBAC, legacy; the `mcp_tier` branch still never admits on its own), and `kServiceScopeGlobalSafe` is neither applied nor widened here: that allow-list guards routes that return fleet-wide data UNCONFINED, whereas this gate's service axis always narrows to the tagged set. **Behaviour with the seeded defaults:** unchanged for every securable the seeded `ITServiceOwner` role holds (`Infrastructure`, `Execution`, `Response`, `Policy`, `GuaranteedState`, `Inventory`, all five CRUD operations, plus `Workflow:Read`), which is every pair the routes below pass except one: `Enrollment:Read` is NOT held by `ITServiceOwner`, so a service-scoped token is now refused (`403`) on `GET /api/v1/enrollment/pending-agents`, where before it received the minter's pending-agent view narrowed to the service's tagged agents (a deliberate tightening, the same answer `require_permission` gives). **Behaviour under a non-default revocation** (a pair absent from `ITServiceOwner`: `RbacStore::remove_permission` records the removal in `revoked_seed_defaults` so a reboot does not re-seed it, but no REST, MCP or CLI surface calls it today, and a direct database `DELETE` of the row is re-seeded at the next boot unless the pair is recorded in `revoked_seed_defaults`): service-scoped tokens are refused on EVERY route that gates on that pair through `require_fleet_read`, even when the minter keeps the grant and the tag meet would admit; non-service callers, elevated sessions and engine principals are unaffected. The constrained callers are every call site of `fleet_read_fn`/`require_fleet_read` in `server/core/src` (grep for those two names; over 50 sites). The securables they pass, all with `Read`, are `Execution` (the executions drawer's `/fragments/executions/{id}/detail` fragment, the legacy `/api/executions*` routes (the GET routes, and the POST `/rerun` and `/cancel` routes, which call `fleet_read_fn` after `perm_fn("Execution", "Execute")`; a service token never gets past that first gate because `kServiceScopeGlobalSafe` is empty), `GET /api/v1/executions` and its `/{id}`, `/children` and `/api/v1/events` twins), `Response`, `Inventory`, `Infrastructure`, `Policy`, `GuaranteedState`, `Workflow` and `Enrollment`. MCP tools on `fleet_read_fn_` whose C8 class is `confined` reach the same check; the ones that are `denied` at C8 never get that far for a service token. Coverage: `tests/unit/server/test_authz_gates.cpp` (ceiling absent is `403` although the minter holds the grant and the tag meet would admit, with a non-service control and a pair-specific control; a degraded permission read is `503` with `retry_after_ms`, the degrade metric and a truthful audit row on `require_fleet_read` and `require_scoped_permission`, while `require_permission` answers its default-deny `403` with no retry hint and no degrade count, and its audit detail ends with the "; ceiling read degraded" marker that the healthy default-deny row lacks; a definitive deny stays `403` on all three (explicit `deny` row included), a service token through an MCP tier is not admitted by the ceiling on its own, and a table-driven pass over the eight fleet-read securables incl. the `Enrollment:Read` refusal, and a starved pool that trips the authz breaker so the real gate answers `503` under the `pool_acquire_timeout` label) and `tests/unit/server/test_fleet_read_ceiling_routes_authz.cpp` (the same revocation through three real `(Execution, Read)` routes: the detail fragment, legacy `/api/executions` and `GET /api/v1/executions`; the `Enrollment:Read` refusal through the real enrollment route; and one real route each for `Response`, `Inventory`, `Infrastructure` and `GuaranteedState`, each answering the ceiling for exactly its own pair).
+**`require_fleet_read` now applies the `ITServiceOwner` authority ceiling on its service axis (found while working #3526, which stays open for other surfaces).** Before this change `require_fleet_read`'s service-scoped branch checked only that RBAC enforcement is in effect and then met the minter's `authorize_list_read` result with the service tag set; unlike `AuthRoutes::require_permission` it never asked whether the `ITServiceOwner` role itself holds the pair. It now does, at `authz_gates.cpp` right after the "service-scoped tokens require RBAC to be enabled" check, through ONE shared helper, `authz::service_ceiling_check` (declared in `authz_gates.hpp`, defined in `authz_gates.cpp`), which `require_permission` and `require_scoped_permission` (`auth_routes.cpp`) now call too. The helper asks `RbacStore::role_permission_allowed_checked("ITServiceOwner", ...)`, the one read, which fetches the single `role_permissions` row for the pair (`SELECT effect` keyed by role, securable and operation, the table's primary key) rather than every row of the role, and returns a tri-state: Admit (an `allow` row), Deny (an explicit `deny` row, any other effect text, or the pair absent, which is also how an operator revoke looks), Degraded (the checked read failed). **That read is breaker-gated and short-budget:** it asks the RBAC authz breaker for admission first, acquires with `kAuthzAcquireTimeout` (250 ms) and reports its outcome to the breaker, so a degraded store fails fast and, once the breaker is open, requests are answered without touching the pool. Before this change the read acquired with `kReadTimeout` (2000 ms) and was not breaker-gated, but `PgPool` clamps a bounded acquire to `min(timeout, 500 ms)` when the pool is already saturated at entry (`saturated_fast_fail`, `pg_pool.hpp`), so on a saturated pool the wait was about 500 ms, not 2 s (a pool that saturated only after the call entered it was bounded by the full 2 s). The change therefore lowers that bound from up to 500 ms to up to 250 ms and adds breaker shedding. An open breaker is reported as "circuit breaker open", which `authz::ceiling_degrade_reason` counts under `pool_acquire_timeout`. The breaker bounds how many requests wait, not how long an already admitted read holds its connection: a read that has acquired one can still wait up to the pool's `lock_timeout` (10 s default) or `statement_timeout` (30 s default) before failing; on a dark network path (no reply at all) the wait is bounded instead by the pool's `tcp_user_timeout` (10 s, per `pg_pool.hpp`: confirmed on Linux, unconfirmed on Windows, a no-op on macOS), and until two failures have returned, up to the pool size (16 by default, `--postgres-pool-size`) of these reads can each hold a connection for that long. **The breaker is shared with operator permission checks:** the ceiling read's failures feed the same per-replica RBAC authz breaker as `check_permission`, `user_rbac_group_names_checked` and `role_effects_for`, so a degraded store seen through service-scoped tokens can open it, and an open breaker denies operators' cache-miss permission checks too (fail closed; a cache hit is still served). The `require_permission` and `require_scoped_permission` sibling gates use the same 250 ms budget behind that breaker; before, they acquired with `kReadTimeout` (2000 ms), clamped by the pool to 500 ms when it was saturated at entry, and were not breaker-gated. **Degraded is a retryable `503` only where a retry can succeed.** On `require_fleet_read` and `require_scoped_permission`, a Degraded verdict (the checked read failed) is a retryable `503` (`retry_after_ms` 5000, no `.permission`, `yuzu_server_rbac_read_degrade_total{reason}` incremented with `pool_acquire_timeout` or `query_error`, and an audit row whose detail says the read degraded: `auth.fleet_read_required` / "fleet read blocked: RBAC read degraded resolving the ITServiceOwner ceiling for <pair>", `auth.scoped_permission_required` / "service-scoped token blocked: RBAC read degraded resolving the ITServiceOwner ceiling"), produced by ONE shared private helper, `AuthRoutes::respond_ceiling_degraded` (`authz_gates.cpp`), because an outage is not a missing grant and the caller can retry. Before this change `require_scoped_permission` answered Degraded with the same `403` as Deny and recorded no degrade metric. `require_permission` does NOT answer `503`: its service-scope allow-list (`kServiceScopeGlobalSafe`) is empty, so no pair is admitted whatever the ceiling read returns, and a retry hint would advertise a recovery that cannot happen. A Degraded verdict there continues to the allow-list check and is answered by the same default-deny `403` (audit "service-scoped token blocked: default-deny (<pair> not on the service-scope global-safe allow-list)", `yuzu_auth_service_scope_default_denied_total` incremented) as a healthy read, with no `retry_after_ms` and no `yuzu_server_rbac_read_degrade_total` increment; the one difference is in the audit detail, which ends with "; ceiling read degraded" after a failed read and does not after a healthy one, so an outage is visible in that row. A guard at the point where the allow-list would admit answers the `503` instead, so a future populated allow-list can never admit on a failed ceiling read; it is unreachable in production (the allow-list is empty) and is pinned by a test that populates the allow-list through its test override. Every case fails CLOSED; a definitive deny stays `403` on all three gates with different bodies and audit rows (`require_fleet_read`: "does not grant <pair> (the ITServiceOwner role does not hold it)" / `auth.fleet_read_required`; `require_permission` / `require_scoped_permission` keep their own bodies and the audit detail "service-scoped token blocked: lacks ITServiceOwner permission"). The `403` body reads `service-scoped token does not grant <securable>:<operation> (the ITServiceOwner role does not hold it)` and omits `.permission` (clause 5: granting the pair to the minter would not admit this caller); the audit row is `auth.fleet_read_required` / `denied` / `fleet read blocked: service-scoped token lacks ITServiceOwner permission <pair>`. Branch order is unchanged (elevated, engine, mcp_tier, service, RBAC, legacy; the `mcp_tier` branch still never admits on its own), and `kServiceScopeGlobalSafe` is neither applied nor widened here: that allow-list guards routes that return fleet-wide data UNCONFINED, whereas this gate's service axis always narrows to the tagged set. **Behaviour with the seeded defaults:** unchanged for every securable the seeded `ITServiceOwner` role holds (`Infrastructure`, `Execution`, `Response`, `Policy`, `GuaranteedState`, `Inventory`, all five CRUD operations, plus `Workflow:Read`), which is every pair the routes below pass except one: `Enrollment:Read` is NOT held by `ITServiceOwner`, so a service-scoped token is now refused (`403`) on `GET /api/v1/enrollment/pending-agents`, where before it received the minter's pending-agent view narrowed to the service's tagged agents (a deliberate tightening, the same answer `require_permission` gives). **Behaviour under a non-default revocation** (a pair absent from `ITServiceOwner`: `RbacStore::remove_permission` records the removal in `revoked_seed_defaults` so a reboot does not re-seed it, but no REST, MCP or CLI surface calls it today, and a direct database `DELETE` of the row is re-seeded at the next boot unless the pair is recorded in `revoked_seed_defaults`): service-scoped tokens are refused on EVERY route that gates on that pair through `require_fleet_read`, even when the minter keeps the grant and the tag meet would admit; non-service callers, elevated sessions and engine principals are unaffected. The constrained callers are every call site of `fleet_read_fn`/`require_fleet_read` in `server/core/src` (grep for those two names; over 50 sites). The securables they pass, all with `Read`, are `Execution` (the executions drawer's `/fragments/executions/{id}/detail` fragment, the legacy `/api/executions*` routes (the GET routes, and the POST `/rerun` and `/cancel` routes, which call `fleet_read_fn` after `perm_fn("Execution", "Execute")`; a service token never gets past that first gate because `kServiceScopeGlobalSafe` is empty), `GET /api/v1/executions` and its `/{id}`, `/children` and `/api/v1/events` twins), `Response`, `Inventory`, `Infrastructure`, `Policy`, `GuaranteedState`, `Workflow` and `Enrollment`. MCP tools on `fleet_read_fn_` whose C8 class is `confined` reach the same check; the ones that are `denied` at C8 never get that far for a service token. Coverage: `tests/unit/server/test_authz_gates.cpp` (ceiling absent is `403` although the minter holds the grant and the tag meet would admit, with a non-service control and a pair-specific control; a degraded permission read is `503` with `retry_after_ms`, the degrade metric and a truthful audit row on `require_fleet_read` and `require_scoped_permission`, while `require_permission` answers its default-deny `403` with no retry hint and no degrade count, and its audit detail ends with the "; ceiling read degraded" marker that the healthy default-deny row lacks; a definitive deny stays `403` on all three (explicit `deny` row included), a service token through an MCP tier is not admitted by the ceiling on its own, and a table-driven pass over the eight fleet-read securables incl. the `Enrollment:Read` refusal, and a starved pool that trips the authz breaker so the real gate answers `503` under the `pool_acquire_timeout` label) and `tests/unit/server/test_fleet_read_ceiling_routes_authz.cpp` (the same revocation through three real `(Execution, Read)` routes: the detail fragment, legacy `/api/executions` and `GET /api/v1/executions`; the `Enrollment:Read` refusal through the real enrollment route; and one real route each for `Response`, `Inventory`, `Infrastructure` and `GuaranteedState`, each answering the ceiling for exactly its own pair).
 
 **`GET /api/v1/upload-grants` refuses a service-scoped token (found while working #3526).** That route's only gate was `list_read_fn(session->username)`, which evaluates the MINTER's username, so a service-scoped token inherited its minter's `UploadGrant:Read` view (every grant, for a minter holding a global grant); it is not a `require_fleet_read` route. `file_retrieval_routes.cpp`'s `register_list` now refuses a service-scoped session with `403` before the store or the list-admit resolver is touched, through the shared `deny_service_scoped_session` closure (audit `upload_grant.list.access_denied`; no `.permission`, because no grant would admit the caller; `register_file_retrieval_routes` throws `std::invalid_argument` at registration if the closure is unbound, and a bound closure that writes no response still gets the route's generic `403`). It matches the MCP twin `list_upload_grants`. Coverage: `tests/unit/server/test_upload_grants_service_scope.cpp`. This is an explicit service-scope deny on one `authorize_list_read` caller, shaped like the ADR-1006 §3e explicit denies (although this route did have a gate: it evaluated the minter's username, so the service token inherited the minter's view). It is not the §3d supersede-to-intersect migration, which stays deferred for the `authorize_list_read` callers, this one included (see `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`).
 
@@ -4997,6 +5589,21 @@ Operators can extend the CSP via `--csp-extra-sources "https://cdn.example.com h
 
 Header construction lives in `server/core/src/security_headers.{hpp,cpp}` (`yuzu::server::security` namespace) — the production server and the unit/integration tests in `tests/unit/server/test_security_headers.cpp` (38 cases) share the same `HeaderBundle::make()`/`apply()` code path. The resolved bundle is logged at INFO at startup so operators can confirm activation: `Security headers active: CSP=N bytes, HSTS=on/off, Referrer-Policy="...", Permissions-Policy=N bytes`.
 
+### Close rule for an unread request body (cpp-httplib 0.59)
+
+The main listener's post-routing handler calls `close_if_unread_framed_body`
+(`server/core/src/body_cap_httplib.hpp`) on every response, a pre-routing `Handled`
+answer included: a response below `400` that left a declared request body
+unread carries `Connection: close` (httplib closes a `400`-or-above response
+itself). Keep that single call in the post-routing handler: never add a
+per-return `set_header` in the pre-routing handler, where a new early return
+would forget it, and never move `close_if_unread_framed_body` to
+`set_pre_request_handler`, which runs before the body is read. The plain-HTTP
+redirect listener closes its redirect answer unconditionally instead (`health_routes.cpp`). The
+wiring is pinned by a lexical case in `test_step_up_wiring.cpp`. This rule is
+not part of the MFA step-up chokepoint: it sits next to the security-headers
+call because both run in the same post-routing handler.
+
 ## Self-target principal-destruction guard (hard invariant, #397/#403/ca-B1)
 
 Any handler that destroys, demotes, or otherwise revokes a principal's privileges MUST reject the case where the URL/form target equals the caller's `session->username` (or differs from `session->role` for upserts that demote). UI suppression alone is insufficient — a hand-crafted HTTP request bypasses the dashboard.
@@ -5129,6 +5736,13 @@ outage** — the latter also moves on a plain pool blip (it counts every
 store-unavailable `503` on the secret path, not only secret-decrypt failures).
 The approve and reject routes (`route="approval"`) increment only the coarser counter, never
 `yuzu_auth_read_degrade_total`, so that series does not cover them.
+One refusal in the initial `POST /login` handler is deliberately in NEITHER of those two
+counters: an MFA enrol-init that fails because the host's random-number generator failed
+(`AuthDBError::EntropyUnavailable`, #6995). No query failed, so it is counted in
+`yuzu_secure_random_failure_total{reason="prng_failure",site="mfa_enroll"}` instead; it is still
+the same fail-closed `503`. Test `is_entropy_failure()` before `is_store_unavailable()` at any site
+that attributes a refusal to a metric (`is_store_fault()` is the "count as a store outage"
+predicate).
 The other `is_store_unavailable`→`503` auth sites (`/login/mfa`, step-up,
 enrollment, elevate) are not yet reason-instrumented (finer cardinality and
 wider coverage tracked as #2401).

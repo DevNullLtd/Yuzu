@@ -374,6 +374,44 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   single `dev`-sync cycle should re-sync frequently: a smaller delta is easier to triage for
   which changed test file touches the store's old constructor.
 
+## Registry-backed tables (a migration must not be generated from a live table)
+
+Some stores drive their tables from a compile-time registry (the device-CI section registry
+`kDeviceCiSections` in `device_ci_kinds.hpp`, one child table per kind). The registry is the
+right source for the RUNTIME (ingest and read both iterate it). It is the wrong source for a
+MIGRATION, because the runner skips a version it has already recorded: a migration generated
+from the registry changes what a FRESH database gets and nothing about a deployed one (#7164).
+
+- **A migration is a literal.** `kMigrationV2Sql` in `device_inventory_store.cpp` is the checked-in
+  text of what v2 creates, marked FROZEN. Never edit it, and never rebuild it from the registry.
+  (A migration that has not shipped in a release tag may be frozen as it stands; one that has
+  shipped may not be edited at all.)
+- **A new table-backed kind ships its own migration** (the next free version) that creates its
+  table, in the same change that adds the registry entry.
+- **A column change ships a migration that ALTERs the table AND sets `row_count` and
+  `content_digest` to NULL for that kind** (or bumps `kSectionDigestPrefix`), because the stored
+  digest binds `n_fields`, the section name and the cell order. Append new columns to the END of
+  the registry list and ADD them by migration: a migration appends the column at the end of the
+  table, and the schema test compares column order.
+- **Two guards enforce it**, and both fail when the registry moves without a migration: the
+  schema test in `test_device_inventory_store.cpp` ("schema created by the frozen migrations
+  matches the section registry"), and the post-migration projection check in the store's
+  constructor (a `LIMIT 0` SELECT of every table and column the runtime reads, which refuses to
+  open the store and names the table, so a registry ahead of its database fails at boot and not
+  as `42P01`/`42703` on the first sections read).
+- **This is not the runner's drift detection** (#7158, a version recorded with different text).
+  That is a different question (same version, different SQL) and does not replace the projection
+  check: do not consolidate the two. The projection is column PRESENCE only (an extra column is
+  tolerated, in line with the ahead-database stance of #3894); names, types, nullability, order and
+  the key shape (primary key, cascading foreign key) are pinned for the shipped literals by the
+  schema test, and column defaults are pinned by nothing. A third test pins each registry kind's
+  column list to the stored digest layout, so a column change cannot land without this rule.
+- **The refusal is a boot failure.** The store's `is_open()` is checked in `server.cpp` and a
+  closed store stops the server from starting, so a registry ahead of its database never runs
+  degraded. The log message distinguishes SQLSTATE 42P01/42703 (a schema defect) from any other
+  failure (a restart is the retry) and names no destructive step; the reset recipe for a dev/UAT
+  database lives in `docs/user-manual/upgrading.md`.
+
 ## Anti-patterns reviewers reject
 
 - An **authoritative** store that returns an empty result on a DB error (fail-open). Surface it.
@@ -552,6 +590,25 @@ back, and `IF NOT EXISTS` keeps a re-run after a rewound version stamp safe. The
 rolls back and the server refuses to start; retry when writers are quiescent, or build the index by
 hand with `CREATE INDEX CONCURRENTLY` (`IF NOT EXISTS` makes the re-boot safe). It ends with the
 contract. ADR-0039's "Update (2026-11-02) — migration v4" section records the index.
+
+A sixth entry: `SoftwareInventoryStore` v10 (`installed_software_instance_idx`, a partial
+unique index on `(agent_id, instance_key) WHERE instance_key <> ''`, and
+`installed_software_purl_idx`, a partial btree on `(purl) WHERE purl <> ''`) builds two plain
+transactional indexes, each holding `ACCESS EXCLUSIVE` on `installed_software` (the table already
+holds rows on a carried-forward database) for the whole migration transaction. Its basis is the
+2026-10-24 fresh-database hard-cutover ruling recorded in `docs/user-manual/upgrading.md`
+"Deployment contract (hard cutover)": the table is empty when v10 runs, so the build returns at
+once. It is not the v7 entry's basis (v7 rests on the no-rolling-upgrade decision, and its own
+text says a later build on a large table must be online). What the entry records is that the
+contract is procedural (the executable does not verify it): on a populated table the two builds
+would hold the lock through two heap scans (measured in the ladder row, about 0.15 s with no keys
+set and up to about 3.5 s with every row keyed, at 1.8M rows), the migration's
+`SET LOCAL statement_timeout = 0` keeps the pool's statement timeout from rolling it back, and the
+pool's 10 s `lock_timeout` bounds only the wait for the lock, so a migration queued behind a long
+reader rolls back and the server refuses to start. It ends with the contract. It does not change
+the rule for new work.
+
+A seventh plain build, `WorkflowEngine` `workflow_executions` v3 (#2146, `idx_wf_exec_idem`, a partial UNIQUE index on `(principal, idempotency_key) WHERE idempotency_key IS NOT NULL`, with four nullable columns (`principal`, `idempotency_key`, `request_fingerprint`, `correlation_id`) and a CHECK added in the same migration; `principal` and `correlation_id` are stored on every run the execute twins start, keyed or not, and only the CHECK ties `principal` to a key), rests on the same basis as the fourth and fifth: the deployment contract is a fresh database only (`docs/user-manual/upgrading.md` "Deployment contract"), so `workflow_executions` is empty when v3 runs and the empty-table rule above already applies; the entry records that the contract is procedural. The migration is re-run safe (`ADD COLUMN IF NOT EXISTS`, `DROP CONSTRAINT IF EXISTS` before `ADD CONSTRAINT`, `CREATE UNIQUE INDEX IF NOT EXISTS`), so a rewound version stamp, or an index built by hand ahead of it, does not fail it. On a carried-forward table the migration would be heavier than the index build alone: `ADD COLUMN` and `ADD CONSTRAINT` each take `ACCESS EXCLUSIVE` on `workflow_executions` (reads and writes blocked, and `ADD CONSTRAINT` validates every existing row under it), and the non-concurrent `CREATE UNIQUE INDEX` takes `SHARE` (writes blocked, reads allowed). The migration is one transaction, so the `ACCESS EXCLUSIVE` locks are held to its end, and the pool's 10 s `lock_timeout` could roll it back when the lock cannot be taken so the server refuses to start; retry when the table is quiescent. Building the index by hand with `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` shortens only the `SHARE` part, and the migration then skips it; the index names `principal` and `idempotency_key`, so those columns have to be added by hand first (the migration's `ADD COLUMN IF NOT EXISTS` then skips them); check `pg_index.indisvalid` first, because a failed concurrent build leaves an INVALID index that `IF NOT EXISTS` also skips, so the migration would succeed with no working constraint. The index is partial, so a keyless run never touches it. It ends with the contract.
 
 ## Substrate quick facts (pool / runner / helpers)
 

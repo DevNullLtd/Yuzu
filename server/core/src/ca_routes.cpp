@@ -1,4 +1,5 @@
 #include "ca_routes.hpp"
+#include "model_param_helpers.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "ca_panel_render.hpp"
@@ -589,7 +590,7 @@ void CaRoutes::serve_filtered_issued(const FilteredIssuedDeps& filtered,
         admit_issued_read(filtered, req, res, audit_fn, cid, /*needs_api=*/true, "filtered");
     if (!standing)
         return;
-    const auto q = cw::parse_cert_params(req.params);
+    const auto q = cw::parse_cert_params(model_detail::to_params(req.params));
     if (!q) {
         fail(400, q.error(), false);
         return;
@@ -771,7 +772,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
                     return;
                 // ADR-0070 R2-2: any filter parameter selects the filtered list behind one
                 // /crypto count. Additive: a request without one never reaches this branch.
-                if (crypto_widgets::has_cert_filter_params(req.params)) {
+                if (crypto_widgets::has_cert_filter_params(model_detail::to_params(req.params))) {
                     serve_filtered_issued(filtered, req, res, audit_fn);
                     return;
                 }

@@ -236,8 +236,9 @@ Every enrolled agent reports identity attributes during registration and heartbe
 | `arch` | CPU architecture | `x86_64`, `aarch64` |
 | `os_version` | OS version string | `Windows 11 Pro 10.0.26200` |
 | `agent_version` | Running agent binary version | `0.9.3` |
+| `guardian_backend` | Guardian detection backend from the heartbeat: `legacy`, `spark`, `spark_failed`, `unwired`, or `null` when not reported (never assumed `legacy`). Served on the device REST and MCP surfaces (`GET /api/v1/devices[/{id}]`, `list_agents`, `get_agent_details`), not on the legacy `/api/agents` list | `legacy` |
 
-These fields are used by the [Scope Engine](scope-engine.md) for device targeting and by [Management Groups](management-groups.md) for access scoping.
+These fields, except `guardian_backend`, are used by the [Scope Engine](scope-engine.md) for device targeting and by [Management Groups](management-groups.md) for access scoping; `guardian_backend` is read-only posture and is not usable in a scope expression.
 
 ---
 
@@ -259,9 +260,11 @@ Every per-device route is scoped to the device's management group (a global gran
 |---|---|---|
 | **Device info** | Identity (agent ID, OS, arch, version), tags, group membership. | `Infrastructure:Read`, scoped to the device |
 | **DEX** | Per-device DEX score + a summary of recent signal observations, with a link to the full DEX drill-down (which carries an *Application performance over time* panel — retained daily per-app-version CPU/memory from the central store, no live query, no `Execute`). | `GuaranteedState:Read`, scoped to the device. Signal-history view audited as `dex.device.view`; the app-perf panel audited as `dex.device.app_perf.view` (separate verb) |
-| **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). | `GuaranteedState:Read`, scoped to the device (audited as `guardian.device.view`) |
+| **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). The compliance tile is not shown as clean while any guard's ordering is uncertain or has an unreflected event: the tile counts them and the guard row carries an "ordering uncertain" marker. The tile and a notice also account for pending evidence that has no census row yet: when a guard has recorded events that are not yet reflected in the compliance census, the notice says how many (and lists the first identifiers, as the device reported them), and the tile never shows the all-compliant state. A lens whose guards are all compliant but with uncertain verdicts or pending evidence that has no census row yet labels the tile "Compliant, ordering uncertain" instead of "Compliant". | `GuaranteedState:Read`, scoped to the device (audited as `guardian.device.view`) |
 
-A device with zero reported guards renders "No guards evaluated" even if the fleet-wide rule catalogue read is itself degraded — the per-device read no longer depends on the catalogue's own health for a zero-row device (a small, disclosed rendering delta from the ADR-0031 WS-A4 seam rewire).
+A device with zero reported guards and no pending evidence renders "No guards evaluated" even if the fleet-wide rule catalogue read is itself degraded — the per-device read no longer depends on the catalogue's own health for a zero-row device (a small, disclosed rendering delta from the ADR-0031 WS-A4 seam rewire).
+
+A device with no census rows but with pending evidence renders the notice and "No guards in the compliance census" instead. If the pending-evidence read itself times out (most likely a large retained pending backlog; a lock wait, a loaded database or an administrator cancel can also cause it), the tab shows "Guardian pending-evidence read timed out" and says reloading usually will not help until the cause clears; any other store failure shows "Guardian store degraded.". Either way the open is audited as `guardian.device.view` with result `failure`.
 
 #### Get live info
 
@@ -280,7 +283,7 @@ Each card has its own audit verb so a usage-class read (what a person is running
 | **Listening ports** | `network_diag/listening` | `device.live.listening` | all |
 | **Active connections** | `network_diag/connections` | `device.live.connections` | all |
 | **Logged-in users** | `users/logged_on` | `device.live.users` | all |
-| **Capture sources** — read-only view of which Echo warehouse sources are capturing locally (toggle state + `$`-table + live row count); configure on the Echo page | `echo/status` | `device.live.capture_sources` | all |
+| **Capture sources** — read-only view of which Echo warehouse sources are capturing locally (toggle state, the `$<Source>_Hourly` table and its row count; a dash with "This device runs an agent without the roll-up tables; upgrade the agent" for an agent that has not moved to the roll-up store); configure on the Echo page | `echo/status` | `device.live.capture_sources` | all |
 | **Disk space** — free/used for the root volume with a colour-coded usage bar (>=90% used or <5 GiB free = red) | `disk_space/free` | `device.live.disk` | all |
 
 Every card requires **`Execution:Execute`** in addition to `GuaranteedState:Read`, each scoped to the device's management group; without Execute the card shows an explanatory note rather than failing silently, and a device outside your scope cannot be live-queried at all. The process tree, connections, logged-in-user, and **DNS-cache** reads are **usage-class behavioral telemetry** (a person's running software, active connections, sessions, and resolved names) and are individually audit-logged; the remaining kinds (uptime, services, adapters/IP, listening ports, ARP, capture sources, disk space) are machine-health reads.

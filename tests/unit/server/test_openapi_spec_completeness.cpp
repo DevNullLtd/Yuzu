@@ -44,9 +44,12 @@
 #include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
 #include "dex_score_policy_json.hpp" // the serializer the DexScorePolicyDocument schema mirrors
 #include "dex_score_policy_writer.hpp" // dex_score_policy_in_force_json: the data envelope's keys
+#include "guaranteed_state_store.hpp" // kUnrepresentedPendingIdCap: the cap the maxItems literals mirror
+#include "guardian_backend_fleet_tags.hpp" // #2240: the closed backend token table the device enum mirrors
 #include "license_store.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
+#include "result_set_model.hpp"
 #include "settings_model.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_deployment_store.hpp"
@@ -62,6 +65,7 @@
 #include <cctype>
 #include <cstddef>
 #include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -496,6 +500,71 @@ TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the
     const auto& perms = paths["/rbac/roles/{role}/permissions"]["get"];
     CHECK(response_keys(perms) == std::set<std::string>{"200", "403", "404", "503"});
     CHECK(perms.value("description", "").find("retry_after_ms") != std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the audit header, the "
+          "unreadable pending count, the misconfigured arm and the dispatch_exception fields",
+          "[openapi][instruction_execute]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/instructions/{id}/execute"));
+    const auto& op = spec["paths"]["/instructions/{id}/execute"]["post"];
+    const auto& rsp = op["responses"];
+    // Sec-Audit-Failed is a typed response header on every status that can carry a lost
+    // best-effort row, not prose alone.
+    for (const char* code : {"200", "202", "400"}) {
+        INFO(code);
+        REQUIRE(rsp.contains(code));
+        REQUIRE(rsp[code].contains("headers"));
+        REQUIRE(rsp[code]["headers"].contains("Sec-Audit-Failed"));
+        CHECK(rsp[code]["headers"]["Sec-Audit-Failed"]["schema"]["enum"] == json::array({"true"}));
+    }
+    REQUIRE(rsp.contains("503"));
+    REQUIRE(rsp.contains("500"));
+    REQUIRE(rsp.contains("429"));
+    const std::string d503 = rsp["503"].value("description", "");
+    CHECK(d503.find("pending-approval count unreadable") != std::string::npos);
+    CHECK(d503.find("retry_after_ms 5000") != std::string::npos);
+    const std::string d500 = rsp["500"].value("description", "");
+    CHECK(d500.find("dispatch_unconfigured") != std::string::npos);
+    CHECK(d500.find("dispatch_exception") != std::string::npos);
+    CHECK(d500.find("error.execution_id") != std::string::npos);
+    CHECK(d500.find("error.agents_sent") != std::string::npos);
+    // The cap is a soft bound everywhere the manual says so.
+    const std::string desc = op.value("description", "");
+    CHECK(desc.find("about 25 pending approvals") != std::string::npos);
+    CHECK(desc.find("soft bound") != std::string::npos);
+    CHECK(rsp["429"].value("description", "").find("about 25 pending approvals") !=
+          std::string::npos);
+    CHECK(rsp["400"].value("description", "").find("invalid_definition_id") != std::string::npos);
+    // The id refusal names invalid UTF-8 beside the control character, in the 400 text and in the
+    // "Order:" prose (both were once control-character-only).
+    CHECK(rsp["400"].value("description", "").find("invalid UTF-8") != std::string::npos);
+    const auto order_at = desc.find("Order: body depth and JSON parse, the definition id");
+    REQUIRE(order_at != std::string::npos);
+    CHECK(desc.find("invalid_definition_id for a control byte (below 0x20 or 0x7F) or invalid UTF-8", order_at) !=
+          std::string::npos);
+    // The gateway caveat on the lower-bound count.
+    CHECK(desc.find("counts once queued for forwarding, which can still fail") != std::string::npos);
+}
+
+// The command twin's 500 carries the same typed fields as the instruction twin's (docs-writer p4-1):
+// the sent count is a lower bound recorded as the targeted count only when the write succeeds.
+TEST_CASE("openapi_spec_json(): POST /commands documents the dispatch_exception fields and the "
+          "lower-bound, write-dependent targeted count",
+          "[openapi][command_v1]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/commands"));
+    const auto& rsp = spec["paths"]["/commands"]["post"]["responses"];
+    REQUIRE(rsp.contains("500"));
+    const std::string d500 = rsp["500"].value("description", "");
+    CHECK(d500.find("dispatch_exception") != std::string::npos);
+    CHECK(d500.find("error.execution_id") != std::string::npos);
+    CHECK(d500.find("error.agents_sent") != std::string::npos);
+    CHECK(d500.find("lower bound") != std::string::npos);
+    CHECK(d500.find("only when the write succeeds") != std::string::npos);
+    CHECK(d500.find("cancel_execution") != std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out request and every refusal",
@@ -1506,8 +1575,8 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
     }
 
     SECTION("a field sent on several lines is read as one comma-joined list (RFC 9110 5.3)") {
-        // The occurrences are added in whatever order the underlying unordered multimap keeps,
-        // so each case gives the same answer whichever line is read first.
+        // The occurrences are added in wire order (httplib keeps them in an insertion-ordered
+        // multimap), so each case gives the same answer whichever line is read first.
         const std::string stale = "\"0000000000000000\"";
         struct Case {
             std::string first;
@@ -1731,6 +1800,38 @@ const std::string& document_text(bool with_guides) {
 
 const char* form_name(bool with_guides) { return with_guides ? "with guides" : "default"; }
 
+/// The member names of a JSON object.
+std::set<std::string> keys_of(const json& obj) {
+    std::set<std::string> out;
+    for (auto it = obj.begin(); it != obj.end(); ++it)
+        out.insert(it.key());
+    return out;
+}
+
+/// The elements of a JSON array of strings.
+std::set<std::string> set_of(const json& arr) {
+    std::set<std::string> out;
+    for (const auto& k : arr)
+        out.insert(k.get<std::string>());
+    return out;
+}
+
+/// The node at the end of a chain of object keys, or nullptr when any step is missing or its
+/// parent is not an object. Lets a pin report a missing node with CHECK and move on to the next
+/// row, where a chain of `.at()` would throw and abandon the rest of the test case.
+const json* find_at(const json& root, std::initializer_list<const char*> keys) {
+    const json* node = &root;
+    for (const char* key : keys) {
+        if (!node->is_object())
+            return nullptr;
+        const auto it = node->find(key);
+        if (it == node->end())
+            return nullptr;
+        node = &*it;
+    }
+    return node;
+}
+
 /// The node a `$ref` names, or the node itself when it is not a reference.
 json resolve_ref(const json& spec, const json& node) {
     if (!node.is_object() || !node.contains("$ref"))
@@ -1779,7 +1880,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"22536dd3060e5782\"";
+    static const std::string kOperationIdChecksum = "\"22a3dbe209974a9b\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -1921,6 +2022,31 @@ TEST_CASE("openapi documents: x-yuzu-guide is on every tag in the guides form on
     }
 }
 
+TEST_CASE("openapi documents: every tag an operation uses is declared in the tag list",
+          "[openapi][structure][guides]") {
+    // An undeclared tag renders in a viewer with no description and, in the guides form, no
+    // guide. The Commands tag was used for a release's worth of review before anyone noticed.
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        std::set<std::string> declared;
+        for (const auto& tag : spec["tags"])
+            declared.insert(tag.at("name").get<std::string>());
+        std::set<std::string> used;
+        for (const auto& o : all_operations(spec)) {
+            for (const auto& t : o.op.value("tags", json::array()))
+                used.insert(t.get<std::string>());
+        }
+        std::set<std::string> undeclared;
+        for (const auto& t : used) {
+            if (!declared.contains(t))
+                undeclared.insert(t);
+        }
+        CHECK(undeclared == std::set<std::string>{});
+        CHECK(declared.size() == 48);
+    }
+}
+
 TEST_CASE("openapi documents: all but two operations declare a typed success response",
           "[openapi][structure][typed]") {
     // These two answer 204 with no body, so there is nothing to type. A third name here is a
@@ -1965,6 +2091,9 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
           "[openapi][structure][envelope]") {
     const std::set<std::string> kList = {"data", "pagination", "meta"};
     const std::set<std::string> kOne = {"data", "meta"};
+    // Not in this table: the plugin-config value, secret, kill-switch and DELETE responses (pinned
+    // by the plugin-config test case further down), GET /plugin-config (a list, not pinned by
+    // either), and the upload agent routes, whose 200 bodies are bare objects with no envelope.
     // Each key list was read from the named handler, not from the schema:
     //  inventory/tables: JObj of plugin, agent_count, last_collected, through list_json.
     //  rules list: rule_to_jobj (14 fields) through list_json.
@@ -1999,7 +2128,7 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
         {"/guaranteed-state/rules/{rule_id}/status",
          kList,
          true,
-         {"agent_id", "state", "updated_at"},
+         {"agent_id", "state", "updated_at", "order_uncertain", "projection_pending"},
          true,
          "",
          {}},
@@ -2016,21 +2145,24 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
         {"/guaranteed-state/agents/{agent_id}/rules",
          kOne,
          false,
-         {"agent_id", "guards", "total_guards"},
+         {"agent_id", "guards", "total_guards", "unrepresented_pending_guards",
+          "unrepresented_pending_rule_ids"},
          true,
          "guards",
-         {"rule_id", "name", "state", "updated_at"}},
+         {"rule_id", "name", "state", "updated_at", "order_uncertain", "projection_pending"}},
         {"/guaranteed-state/status",
          kOne,
          false,
-         {"total_rules", "compliant_rules", "drifted_rules", "errored_rules", "note"},
+         {"total_rules", "compliant_rules", "drifted_rules", "errored_rules", "uncertain_rules",
+          "note"},
          false,
          "",
          {}},
         {"/guaranteed-state/status/{agent_id}",
          kOne,
          false,
-         {"agent_id", "total_rules", "compliant_rules", "drifted_rules", "errored_rules", "note"},
+         {"agent_id", "total_rules", "compliant_rules", "drifted_rules", "errored_rules",
+          "uncertain_rules", "note"},
          false,
          "",
          {}},
@@ -2038,10 +2170,12 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
          kOne,
          false,
          {"baseline", "deployed", "assessable", "agent_id", "total_guards", "snapshot_total",
-          "compliant", "drifted", "errored", "pending", "last_updated", "guards"},
+          "compliant", "drifted", "errored", "pending", "uncertain_guards",
+          "unrepresented_pending_guards", "unrepresented_pending_rule_ids", "last_updated",
+          "guards"},
          true,
          "guards",
-         {"rule_id", "name", "status", "updated_at"}},
+         {"rule_id", "name", "status", "updated_at", "order_uncertain", "projection_pending"}},
     };
 
     // The properties a response can carry: writeOnly ones are input-only and never in a response.
@@ -2106,17 +2240,108 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
     }
 }
 
+// #7217: the per-device reads declare the unrepresented-pending summary with its bounds and the two
+// per-guard flags. Neither schema declares a `required` list for its data object (the pin above
+// checks the key sets), so what is pinned here is each new property's type and bounds.
+TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are typed and bounded",
+          "[openapi][guardian][ordering]") {
+    for (const bool with_guides : {false, true}) {
+        const json spec = json::parse(document_text(with_guides));
+        INFO("form: " << form_name(with_guides));
+
+        const auto check_summary = [&](const json& data) {
+            REQUIRE(data.contains("properties"));
+            const json& props = data["properties"];
+            REQUIRE(props.contains("unrepresented_pending_guards"));
+            CHECK(props["unrepresented_pending_guards"].value("type", "") == "integer");
+            CHECK(props["unrepresented_pending_guards"].value("minimum", -1) == 0);
+            REQUIRE(props.contains("unrepresented_pending_rule_ids"));
+            const json& ids = props["unrepresented_pending_rule_ids"];
+            CHECK(ids.value("type", "") == "array");
+            // The served literal is bound to the store's cap: a change to one without the other fails here.
+            CHECK(ids.value("maxItems", std::size_t{0}) == yuzu::server::kUnrepresentedPendingIdCap);
+            CHECK(ids.value("uniqueItems", false));
+            REQUIRE(ids.contains("items"));
+            CHECK(ids["items"].value("type", "") == "string");
+        };
+        const auto check_flags = [&](const json& guard_items) {
+            REQUIRE(guard_items.contains("properties"));
+            for (const char* k : {"order_uncertain", "projection_pending"}) {
+                INFO("guard flag: " << k);
+                REQUIRE(guard_items["properties"].contains(k));
+                CHECK(guard_items["properties"][k].value("type", "") == "boolean");
+            }
+        };
+
+        // device-compliance: the shared component.
+        const json& cget = spec["paths"].at("/guaranteed-state/device-compliance").at("get");
+        const json cdata = resolve_ref(spec, cget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        check_summary(cdata);
+        REQUIRE(cdata["properties"].contains("uncertain_guards"));
+        CHECK(cdata["properties"]["uncertain_guards"].value("type", "") == "integer");
+        CHECK(cdata["properties"]["uncertain_guards"].value("minimum", -1) == 0);
+        check_flags(cdata["properties"].at("guards").at("items"));
+        // The old caveat that disclaimed these fields is gone from the route text.
+        const std::string cdesc = cget.value("description", "");
+        CHECK(cdesc.find("do not report ordering uncertainty") == std::string::npos);
+        CHECK(cdesc.find("unrepresented_pending_guards") != std::string::npos);
+        // A5 machine metadata (#7217 gate 8, CA-7): the consumer rule lives on the `assessable`
+        // property, and the per-agent status route points at the per-device reads.
+        CHECK(cdata["properties"].at("assessable").value("description", "").find(
+                  "Never render a clean state") != std::string::npos);
+        CHECK(cdata["properties"].at("assessable").value("description", "").find(
+                  "unrepresented_pending_guards") != std::string::npos);
+        const std::string sdesc =
+            spec["paths"].at("/guaranteed-state/status/{agent_id}").at("get").value("description", "");
+        CHECK(sdesc.find("reads all-zero here") != std::string::npos);
+        CHECK(sdesc.find("unrepresented_pending_guards") != std::string::npos);
+        const std::string fdesc =
+            spec["paths"].at("/guaranteed-state/status").at("get").value("description", "");
+        CHECK(fdesc.find("counts only pairs that have a census row") != std::string::npos);
+        CHECK(fdesc.find("/api/v1/guaranteed-state/agents/{agent_id}/rules") != std::string::npos);
+        CHECK(fdesc.find("/api/v1/guaranteed-state/device-compliance") != std::string::npos);
+
+        // all-guards: the inline schema.
+        const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
+        const json gdata = resolve_ref(spec, gget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        check_summary(gdata);
+        check_flags(gdata["properties"].at("guards").at("items"));
+        CHECK(gget.value("description", "").find("unrepresented_pending_guards") !=
+              std::string::npos);
+        // The 200 description names the new keys, not only the old three.
+        const std::string g200 = gget.at("responses").at("200").value("description", "");
+        CHECK(g200.find("unrepresented_pending_guards") != std::string::npos);
+        CHECK(g200.find("unrepresented_pending_rule_ids") != std::string::npos);
+        // The pending-evidence statement timeout is documented as NOT retryable on both routes, with
+        // the metric that counts it; the ordinary degrade keeps its retryable text.
+        for (const json* route : {&cget, &gget}) {
+            const std::string r503 = route->at("responses").at("503").value("description", "");
+            INFO(r503);
+            CHECK(r503.find("NOT") != std::string::npos);
+            CHECK(r503.find("retry_after_ms is null") != std::string::npos);
+            CHECK(r503.find("guardian_census_device") != std::string::npos);
+            CHECK(r503.find("statement_timeout") != std::string::npos);
+            CHECK(route->value("description", "").find("ascending byte order") !=
+                  std::string::npos);
+        }
+    }
+}
+
 TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the response builder",
           "[openapi][retention][echo]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(spec.is_discarded());
     const json& schema = spec.at("components").at("schemas").at("SettingsDataRetention");
-    const auto keys_of = [](const json& obj) {
-        std::set<std::string> out;
-        for (auto it = obj.begin(); it != obj.end(); ++it)
-            out.insert(it.key());
-        return out;
-    };
 
     Config cfg;
     const json real = yuzu::server::settings_model::build_data_retention_settings(cfg);
@@ -2127,18 +2352,14 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     REQUIRE(real["echo"].contains("tiers"));
     REQUIRE_FALSE(real["echo"]["tiers"].empty());
 
-    const auto set_of = [](const json& arr) {
-        std::set<std::string> out;
-        for (const auto& k : arr)
-            out.insert(k.get<std::string>());
-        return out;
-    };
     // The JSON type a value has, as the OpenAPI `type` keyword spells it.
     const auto type_of = [](const json& v) -> std::string {
         if (v.is_number_integer())
             return "integer";
         if (v.is_string())
             return "string";
+        if (v.is_boolean())
+            return "boolean";
         if (v.is_object())
             return "object";
         if (v.is_array())
@@ -2190,6 +2411,11 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     CHECK(echo.at("properties").at("tick_seconds").value("type", "") ==
           type_of(real["echo"]["tick_seconds"]));
     CHECK_FALSE(echo.at("properties").at("tick_seconds").value("nullable", false));
+    // The byte budget is published once at the echo level, as the agent's default.
+    REQUIRE(real["echo"].contains("db_budget_bytes"));
+    CHECK(echo.at("properties").at("db_budget_bytes").value("type", "") ==
+          type_of(real["echo"]["db_budget_bytes"]));
+    CHECK_FALSE(echo.at("properties").at("db_budget_bytes").value("nullable", false));
 
     // Every real tier: the declared keys, the declared types, and a null depth exactly on rows
     // tiers (so `nullable` is needed and is not decoration).
@@ -2232,6 +2458,10 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     }
     CHECK(saw_rows);
     CHECK(saw_seconds);
+    // Every row says whether the byte budget can shorten it.
+    const json& budget_dep = item.at("properties").at("budget_dependent");
+    CHECK(budget_dep.value("type", "") == "boolean");
+    CHECK_FALSE(budget_dep.value("nullable", false));
     const json& depth = item.at("properties").at("guaranteed_depth_seconds");
     CHECK(depth.value("type", "") == "integer");
     CHECK(depth.value("nullable", false));
@@ -2263,7 +2493,50 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the Echo 
     CHECK(ok.find("echo: {tick_seconds, tiers") != std::string::npos);
 }
 
-TEST_CASE("openapi documents: the response status set of the ten hand-checked operations matches "
+TEST_CASE("openapi_spec_json(): the ResultSet schema declares what result_set_json emits",
+          "[openapi][result_set][agents_failed]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& schema = spec.at("components").at("schemas").at("ResultSet");
+    const json real = yuzu::server::result_set_json(yuzu::server::ResultSet{});
+
+    std::set<std::string> emitted;
+    for (auto it = real.begin(); it != real.end(); ++it)
+        emitted.insert(it.key());
+    std::set<std::string> declared;
+    for (auto it = schema.at("properties").begin(); it != schema.at("properties").end(); ++it)
+        declared.insert(it.key());
+    std::set<std::string> required;
+    for (const auto& k : schema.at("required"))
+        required.insert(k.get<std::string>());
+    CHECK(declared == emitted);
+    CHECK(required == emitted);
+
+    // The failure signal: a count and a flag derived from it.
+    CHECK(schema.at("properties").at("agents_failed").value("type", "") == "integer");
+    CHECK(schema.at("properties").at("partial").value("type", "") == "boolean");
+    CHECK(real.at("agents_failed").get<long long>() == 0);
+    CHECK_FALSE(real.at("partial").get<bool>());
+    yuzu::server::ResultSet failed;
+    failed.agents_failed = 2;
+    const json partial = yuzu::server::result_set_json(failed);
+    CHECK(partial.at("agents_failed").get<long long>() == 2);
+    CHECK(partial.at("partial").get<bool>());
+}
+
+TEST_CASE("openapi_spec_json(): the re-eval and from-echo-query routes document the stale-source refusal",
+          "[openapi][result_set][stale_source]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    for (const char* path : {"/result-sets/{id}/re-eval", "/result-sets/from-echo-query"}) {
+        INFO(path);
+        const json& bad = spec.at("paths").at(path).at("post").at("responses").at("400");
+        CHECK(bad.at("description").get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("openapi documents: the response status set of the hand-checked operations matches "
           "what their handlers return",
           "[openapi][structure][responses]") {
     // Pins WHICH statuses the document declares per route, not their wording. Each expected set
@@ -2311,18 +2584,189 @@ TEST_CASE("openapi documents: the response status set of the ten hand-checked op
         // and 403 (perm_fn_ PluginSigning:Read); 500 (bundle on disk unreadable); 503 (audit
         // unavailable, runtime config store unavailable, bundle changed while serving).
         {"/v2/agent/plugin-policy", "get", {"200", "401", "403", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Put(.../([^/]+)/([^/]+)): 200; 400 (JSON body, missing
+        // value, parse_plugin_key, value and actor grammar); 413 (parse_json_object_body over
+        // kMaxBodyBytes); 500 (set_config WriteFailed); 503 (store not open, Unavailable, attempt
+        // audit unavailable). 401 (auth_fn) and 403 (perm_fn) are the auth layer, which the
+        // plugin-config rows leave undeclared.
+        {"/plugin-config/{plugin}/{key}", "put", {"200", "400", "413", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Put(.../([^/]+)/([^/]+)/secret): the same shape as the
+        // plain PUT; 503 also covers SecretUnavailable (encrypt failed).
+        {"/plugin-config/{plugin}/{key}/secret", "put", {"200", "400", "413", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Delete(.../([^/]+)/([^/]+)): 200; 400 (the existence
+        // pre-check get_config answers InvalidInput for a bad plugin/key); 404 (pre-check
+        // NotFound, or a concurrent delete); 500 (delete_config WriteFailed); 503 (store not
+        // open, Unavailable, attempt audit unavailable). 403 (perm_fn) is left undeclared.
+        {"/plugin-config/{plugin}/{key}", "delete", {"200", "400", "404", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Delete(.../([^/]+)/([^/]+)/secret): 200; 400
+        // (parse_plugin_key); 404 (delete_secret NotFound, after the attempted audit row); 500
+        // (delete_secret WriteFailed); 503 (store not open, Unavailable, attempt audit
+        // unavailable). 403 (perm_fn) is left undeclared.
+        {"/plugin-config/{plugin}/{key}/secret", "delete", {"200", "400", "404", "500", "503"}},
+        // file_retrieval_routes.cpp register_chunk(): 200; 400 (Content-Range, body length, and
+        // the TLS gate, require_tls kTlsRequired); 401 (session_unknown); 409
+        // (offset_mismatch, session_terminal); 410 (expired); 413 (chunk_too_large,
+        // size_exceeded); 500 (open or write failed); 503 (store null or unavailable,
+        // advance_offset error).
+        {"/uploads/{upload_id}/chunk",
+         "put",
+         {"200", "400", "401", "409", "410", "413", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Get("/api/v1/plugin-config"): 200; 400 (list_config
+        // InvalidInput for a plugin filter that is not a valid identifier); 403 (list_read_fn
+        // admitted a management-group-confined grant, refused by design, so it is declared); 503
+        // (list_read_fn unwired or degraded, store not open, Unavailable). A 401 from the gate is
+        // left undeclared.
+        {"/plugin-config", "get", {"200", "400", "403", "503"}},
+        // plugin_config_routes.cpp, sink.Get(.../([^/]+)/kill-switch): 200; 400 (get_kill_switch
+        // InvalidInput, and a present-but-empty os); 503 (store not open, Unavailable). A missing
+        // row reads as enabled=true, so there is no 404. 401 and 403 (perm_fn) are left
+        // undeclared.
+        {"/plugin-config/{plugin}/kill-switch", "get", {"200", "400", "503"}},
+        // plugin_config_routes.cpp, sink.Put(.../([^/]+)/kill-switch): 200; 400 (JSON body,
+        // enabled, reason, scope and actor grammar); 413 (parse_json_object_body over
+        // kMaxBodyBytes); 500 (set_kill_switch WriteFailed); 503 (store not open, Unavailable,
+        // attempt audit unavailable). 401 and 403 are left undeclared.
+        {"/plugin-config/{plugin}/kill-switch", "put", {"200", "400", "413", "500", "503"}},
+        // file_retrieval_routes.cpp register_status(): 200 (open or terminal session); 400 (TLS
+        // gate); 401 (session_unknown); 410 (expired); 503 (store null or unavailable). A
+        // terminal session answers 200, so there is no 409.
+        {"/uploads/{upload_id}", "get", {"200", "400", "401", "410", "503"}},
+        // file_retrieval_routes.cpp register_cancel(): 204; 400 (TLS gate); 401; 409
+        // (session_terminal, including a lost cancel race); 410 (expired); 503 (store null or
+        // unavailable, cancel_session error).
+        {"/uploads/{upload_id}", "delete", {"204", "400", "401", "409", "410", "503"}},
+        // file_retrieval_routes.cpp register_commit(): 200; 400 (TLS gate, sha256 missing); 401;
+        // 409 (session_terminal); 410 (expired); 422 (hash_mismatch); 500 (blob cannot be read
+        // back to verify); 503 (store null or unavailable, cancel_session or commit_session
+        // error).
+        {"/uploads/{upload_id}/commit",
+         "post",
+         {"200", "400", "401", "409", "410", "422", "500", "503"}},
     };
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
         for (const auto& row : rows) {
             INFO(row.method << " " << row.path);
-            REQUIRE(spec["paths"].contains(row.path));
-            REQUIRE(spec["paths"][row.path].contains(row.method));
+            // CHECK, not REQUIRE: a missing route must report itself and let the remaining rows
+            // and the second document form still run.
+            const bool has_path = spec.at("paths").contains(row.path);
+            CHECK(has_path);
+            if (!has_path)
+                continue;
+            const bool has_method = spec.at("paths").at(row.path).contains(row.method);
+            CHECK(has_method);
+            if (!has_method)
+                continue;
+            const json* responses = find_at(spec, {"paths", row.path, row.method, "responses"});
+            CHECK(responses != nullptr);
+            if (responses == nullptr)
+                continue;
+            CHECK(responses->is_object());
+            if (!responses->is_object())
+                continue;
             std::set<std::string> declared;
-            for (const auto& [code, response] : spec["paths"][row.path][row.method]["responses"].items())
+            for (const auto& [code, response] : responses->items())
                 declared.insert(code);
             CHECK(declared == row.statuses);
+        }
+    }
+}
+
+TEST_CASE("openapi_spec_json(): DevicesListRow carries a nullable guardian_backend pinned to the token table",
+          "[openapi][devices][guardian_backend]") {
+    // #2240. OpenAPI 3.0.3 has no `type: [string, null]`: a nullable enum needs BOTH
+    // `nullable: true` and `null` among the enum values. The enum is compared against the
+    // server's own closed token table, so a fifth token is a red test here, not a client that
+    // silently rejects it.
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& row = spec["components"]["schemas"]["DevicesListRow"];
+    REQUIRE(row["properties"].contains("guardian_backend"));
+    const auto& prop = row["properties"]["guardian_backend"];
+    CHECK(prop["type"] == "string");
+    CHECK(prop["nullable"] == true);
+
+    json expected = json::array();
+    for (const char* t : yuzu::server::detail::kGuardianBackendTokens)
+        expected.push_back(t);
+    expected.push_back(nullptr);
+    CHECK(prop["enum"] == expected);
+
+    // The key is always present in the response, so it is a required property.
+    bool required = false;
+    for (const auto& r : row["required"])
+        required = required || r == "guardian_backend";
+    CHECK(required);
+
+    // The detail schema inherits the row via allOf, so it carries the field too.
+    CHECK(spec["components"]["schemas"]["DevicesDetail"].dump().find("DevicesListRow") !=
+          std::string::npos);
+
+    // The prose that used to say "5 fields" must not.
+    const auto desc = spec["paths"]["/devices"]["get"]["description"].get<std::string>();
+    CHECK(desc.find("5 fields") == std::string::npos);
+    CHECK(desc.find("guardian_backend") != std::string::npos);
+}
+
+TEST_CASE("openapi documents: the plugin-config success responses reference the {data, meta} "
+          "envelope schemas the handlers return",
+          "[openapi][structure][responses]") {
+    // plugin_config_routes.cpp answers GET/PUT of a value as {data: <entry>, meta}, the secret
+    // PUT as {data: <metadata>, meta}, GET/PUT of a kill switch as {data: <switch>, meta}, and
+    // both DELETEs as {deleted: true, meta} (no data wrapper). Each row names the operation, the
+    // schema its 200 must reference, and that schema's required members. The schema's property
+    // keys must equal its required members exactly, on purpose: a new optional top-level member is
+    // an envelope change a client should be told about, so it has to update this table. The 200
+    // description must also state the envelope, because a generated client reads that text.
+    struct Row {
+        const char* path;
+        const char* method;
+        const char* schema;
+        std::set<std::string> required;
+    };
+    const std::vector<Row> rows = {
+        {"/plugin-config/{plugin}/{key}", "get", "PluginConfigEntryResponse", {"data", "meta"}},
+        {"/plugin-config/{plugin}/{key}", "put", "PluginConfigEntryResponse", {"data", "meta"}},
+        {"/plugin-config/{plugin}/{key}/secret", "put", "PluginConfigSecretMetaResponse",
+         {"data", "meta"}},
+        {"/plugin-config/{plugin}/{key}", "delete", "PluginConfigDeleteResponse",
+         {"deleted", "meta"}},
+        {"/plugin-config/{plugin}/{key}/secret", "delete", "PluginConfigDeleteResponse",
+         {"deleted", "meta"}},
+        {"/plugin-config/{plugin}/kill-switch", "get", "PluginConfigKillSwitchResponse",
+         {"data", "meta"}},
+        {"/plugin-config/{plugin}/kill-switch", "put", "PluginConfigKillSwitchResponse",
+         {"data", "meta"}},
+    };
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        for (const auto& row : rows) {
+            INFO(row.method << " " << row.path);
+            const json* ok = find_at(spec, {"paths", row.path, row.method, "responses", "200"});
+            CHECK(ok != nullptr);
+            if (ok == nullptr)
+                continue;
+            const json* ref_node = find_at(*ok, {"content", "application/json", "schema", "$ref"});
+            CHECK((ref_node != nullptr && ref_node->is_string()));
+            if (ref_node != nullptr && ref_node->is_string())
+                CHECK(ref_node->get<std::string>() ==
+                      std::string("#/components/schemas/") + row.schema);
+            const json* description = find_at(*ok, {"description"});
+            CHECK((description != nullptr && description->is_string()));
+            if (description != nullptr && description->is_string())
+                CHECK(description->get<std::string>().find("meta: {api_version}") !=
+                      std::string::npos);
+            const json* required = find_at(spec, {"components", "schemas", row.schema, "required"});
+            const json* properties =
+                find_at(spec, {"components", "schemas", row.schema, "properties"});
+            CHECK((required != nullptr && required->is_array()));
+            CHECK((properties != nullptr && properties->is_object()));
+            if (required != nullptr && required->is_array())
+                CHECK(set_of(*required) == row.required);
+            if (properties != nullptr && properties->is_object())
+                CHECK(keys_of(*properties) == row.required);
         }
     }
 }

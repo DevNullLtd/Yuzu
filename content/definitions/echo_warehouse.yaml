@@ -11,7 +11,7 @@ metadata:
   version: 1.0.0
   description: >
     Execute an arbitrary SELECT query against the Echo warehouse tables on each
-    targeted agent. Use $-prefixed table names ($Process_Live, $TCP_Hourly, etc.)
+    targeted agent. Use $-prefixed table names ($Process_Hourly, $TCP_Daily, etc.)
     which are translated to real table names on the agent. Only SELECT queries
     are permitted.
   tags: [echo, warehouse, sql, query]
@@ -32,11 +32,12 @@ spec:
         type: string
         displayName: SQL Query
         description: >
-          A SELECT query using $-prefixed table names. Available tables include
-          $Process_Live, $Process_Hourly, $Process_Daily, $Process_Monthly,
-          $TCP_Live, $TCP_Hourly, $TCP_Daily, $TCP_Monthly,
-          $Service_Live, $Service_Hourly, $User_Live, $User_Daily, and
-          $ARP_Live/$ARP_Hourly and $DNS_Live/$DNS_Hourly (ADR-0015; need
+          A SELECT query using $-prefixed table names. Echo keeps roll-up tiers
+          only, so hourly is the finest. Available tables include
+          $Process_Hourly, $Process_Daily, $Process_Monthly,
+          $TCP_Hourly, $TCP_Daily, $TCP_Monthly,
+          $Service_Hourly, $User_Hourly, $User_Daily, and
+          $ARP_Hourly and $DNS_Hourly (ADR-0015; need
           arp_enabled / dns_enabled left on; $ARP_* is collected on Windows, Linux and
           macOS (constrained), $DNS_* on Windows only today — empty elsewhere).
     required: [sql]
@@ -75,7 +76,8 @@ metadata:
   displayName: "Echo: Recent Processes"
   version: 1.0.0
   description: >
-    Show all processes that started or stopped in the last 24 hours.
+    Show process starts and stops per hour for the last 24 hours, from the
+    hourly roll-up.
   tags: [echo, warehouse, processes, forensics]
 
 spec:
@@ -92,7 +94,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT name, pid, cmdline, user, ts FROM $Process_Live WHERE ts > strftime('%s','now','-24 hours') ORDER BY ts DESC LIMIT 500"
+        default: "SELECT hour_ts, name, user, start_count, stop_count FROM $Process_Hourly WHERE hour_ts > strftime('%s','now','-24 hours') ORDER BY hour_ts DESC, start_count DESC LIMIT 500"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
@@ -154,7 +156,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT process_name, remote_addr, remote_port, proto, COUNT(*) as conn_count FROM $TCP_Live GROUP BY process_name, remote_addr, remote_port, proto ORDER BY conn_count DESC LIMIT 200"
+        default: "SELECT process_name, remote_addr, remote_port, proto, SUM(connect_count) AS conn_count FROM $TCP_Hourly WHERE remote_addr != '*' GROUP BY process_name, remote_addr, remote_port, proto ORDER BY conn_count DESC LIMIT 200"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
@@ -197,7 +199,10 @@ metadata:
   displayName: "Echo: Listening Ports"
   version: 1.0.0
   description: >
-    Show all listening TCP ports with the process that owns them.
+    Show the TCP ports that opened a listening socket, with the owning process
+    and how many listening sockets opened and closed, from the hourly roll-up.
+    The roll-up keeps counts per hour, not a list of the sockets open right
+    now, and no pid.
   tags: [echo, warehouse, network, listeners]
 
 spec:
@@ -214,7 +219,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT local_port, proto, pid, process_name FROM $TCP_Live WHERE state = 'LISTEN' ORDER BY local_port"
+        default: "SELECT remote_port AS local_port, proto, process_name, SUM(listen_open_count) AS open_count, SUM(listen_close_count) AS close_count FROM $TCP_Hourly WHERE remote_addr = '*' GROUP BY remote_port, proto, process_name HAVING SUM(listen_open_count) > 0 ORDER BY local_port"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
@@ -317,7 +322,7 @@ metadata:
   displayName: "Echo: Service State Changes"
   version: 1.0.0
   description: >
-    Show recent service start/stop/state_changed events.
+    Show recent service state changes per hour, from the hourly roll-up.
   tags: [echo, warehouse, services]
 
 spec:
@@ -334,7 +339,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT ts, name, action, status, prev_status FROM $Service_Live WHERE action = 'state_changed' ORDER BY ts DESC LIMIT 200"
+        default: "SELECT hour_ts, name, status_changes, last_status, last_ts FROM $Service_Hourly WHERE status_changes > 0 ORDER BY hour_ts DESC LIMIT 200"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
@@ -399,7 +404,7 @@ spec:
         type: string
         displayName: SQL Query
         description: "Query with target IP. Edit the IP address in the WHERE clause."
-        default: "SELECT ts, process_name, pid, remote_port, proto FROM $TCP_Live WHERE remote_addr = '10.0.0.1' ORDER BY ts DESC LIMIT 500"
+        default: "SELECT hour_ts, process_name, remote_port, proto, connect_count FROM $TCP_Hourly WHERE remote_addr = '10.0.0.1' ORDER BY hour_ts DESC LIMIT 500"
     required: [sql]
 
   result:
@@ -498,7 +503,7 @@ metadata:
   displayName: "Echo: User Sessions"
   version: 1.0.0
   description: >
-    Show recent user login and logout events.
+    Show recent user logins and logouts per hour, from the hourly roll-up.
   tags: [echo, warehouse, users, sessions]
 
 spec:
@@ -515,7 +520,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT ts, user, domain, logon_type, action FROM $User_Live ORDER BY ts DESC LIMIT 200"
+        default: "SELECT hour_ts, user, domain, logon_type, login_count, logout_count FROM $User_Hourly ORDER BY hour_ts DESC LIMIT 200"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
@@ -558,8 +563,10 @@ metadata:
   displayName: "Echo: Process Tree"
   version: 1.0.0
   description: >
-    Show recently started processes with parent-child relationships
-    for the last hour.
+    Show the processes started in the last complete hour and the current one
+    with the name of their parent, from the hourly roll-up (a bucket is keyed by
+    its start, so the window reaches back two hours). The roll-up keeps names
+    and counts per hour, not pids, so the tree is by parent name.
   tags: [echo, warehouse, processes, tree, forensics]
 
 spec:
@@ -576,7 +583,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT pid, ppid, name, user, ts FROM $Process_Live WHERE action = 'started' AND ts > strftime('%s','now','-1 hours') ORDER BY ts"
+        default: "SELECT hour_ts, parent_name, name, user, start_count FROM $Process_Hourly WHERE start_count > 0 AND hour_ts > strftime('%s','now','-2 hours') ORDER BY hour_ts, parent_name, name"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
@@ -613,8 +620,8 @@ status:
 
 ---
 ## Issue #60 — daily aggregation example reading from $Process_Daily.
-## Demonstrates the live-to-aggregate rollup tier shape (start_count /
-## stop_count are SUM-aggregated by day_ts + name + user). The
+## Demonstrates the daily roll-up tier shape (start_count / stop_count
+## are SUM-aggregated by day_ts + name + user). The
 ## `datetime(day_ts, 'unixepoch')` conversion is the SQLite-native
 ## equivalent of competing platforms' `EPOCHTOJSON(TS)` helper.
 apiVersion: yuzu.io/v1alpha1
@@ -628,7 +635,7 @@ metadata:
     $Process_Daily. Each row is (date, process_name, user, start_count,
     stop_count). Useful for trend questions ("did $process_name run more
     often last week than the week before?") that would be O(N) over
-    $Process_Live.
+    $Process_Hourly.
   tags: [echo, warehouse, processes, daily, examples]
 
 spec:
@@ -694,7 +701,7 @@ metadata:
   version: 1.0.0
   description: >
     Same as `echo.recent_processes` but emits human-readable ISO-8601
-    timestamps via `datetime(ts, 'unixepoch')` instead of epoch seconds.
+    timestamps via `datetime(hour_ts, 'unixepoch')` instead of epoch seconds.
     Use this when piping query output to a human reader; use
     `echo.recent_processes` when piping to another tool that expects
     epoch seconds.
@@ -714,7 +721,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT datetime(ts, 'unixepoch') AS event_time, action, name, pid, user FROM $Process_Live WHERE ts > strftime('%s', 'now', '-24 hours') ORDER BY ts DESC LIMIT 500"
+        default: "SELECT datetime(hour_ts, 'unixepoch') AS hour, name, user, start_count, stop_count FROM $Process_Hourly WHERE hour_ts > strftime('%s', 'now', '-24 hours') ORDER BY hour_ts DESC, start_count DESC LIMIT 500"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
@@ -758,12 +765,9 @@ metadata:
   version: 1.0.0
   description: >
     Force an immediate maintenance pass (normally runs every 15 minutes).
-    Aggregates raw capture rows into hourly, daily, and monthly summary tables,
-    permanently deletes rows older than each tier's retention limit, and then
+    Permanently deletes rows older than each tier's retention limit, and then
     enforces the database byte budget (db_budget_bytes): while the database is
-    over it, the pass permanently deletes the oldest raw capture rows that
-    their first summary tier has already passed (hourly, or daily for user
-    and software), never the newest 24 hours, then hourly rows older than 48
+    over it, the pass permanently deletes hourly rows older than 48
     hours (5 days for procperf), even inside their retention window; paused or
     errored sources (an unreadable <source>_enabled counts as errored) are
     exempt. It may also run the one-off VACUUM that converts an older database
@@ -797,11 +801,11 @@ spec:
       - name: rows_aggregated
         type: int32
         description: >-
-          Number of rows the aggregation pass moved into the hourly/daily/monthly tiers this cycle (run_aggregation's return value); carried as the third field of the `echo|rollup|<n>|rows_aggregated` line rather than a named column. Values: non-negative integer.
+          Always 0: Echo folds every event into the hourly, daily and monthly tiers as it arrives, so there is no aggregation pass to count. The field stays in the reply shape so a stored client that parses it keeps working; it is the third field of the `echo|rollup|<n>|rows_aggregated` line rather than a named column. Values: 0.
         example: "-"
         platforms: [windows, linux, darwin]
 
-  readablePayload: "Force Echo warehouse rollup aggregation"
+  readablePayload: "Force Echo warehouse maintenance pass"
 
   gather:
     ttlSeconds: 300
@@ -829,8 +833,9 @@ metadata:
   version: 1.0.0
   description: >
     Recent ARP / neighbour-table activity (ADR-0015) — IP<->MAC bindings per
-    interface with their appeared/removed action. Requires the `arp`
-    capture source to be enabled on the device (the default).
+    interface with their appeared and removed counts per hour, from the hourly
+    roll-up. Requires the `arp` capture source to be enabled on the device
+    (the default).
   tags: [echo, warehouse, arp, network, forensics]
 
 spec:
@@ -847,7 +852,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT interface, ip_address, mac_address, entry_type, action, ts FROM $ARP_Live ORDER BY ts DESC LIMIT 500"
+        default: "SELECT hour_ts, interface, ip_address, mac_address, appear_count, remove_count, is_router, rebind_count FROM $ARP_Hourly ORDER BY hour_ts DESC LIMIT 500"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
@@ -890,9 +895,10 @@ metadata:
   displayName: "Echo: DNS cache (recent)"
   version: 1.0.0
   description: >
-    Recent DNS resolver-cache state (ADR-0015) — name/record_type/data/TTL with
-    their appeared/removed action. Device-level (no per-process attribution).
-    Requires the `dns` capture source to be enabled on the device (the default).
+    Recent DNS resolver-cache state (ADR-0015) — name/record_type/data with
+    their appeared and removed counts per hour, from the hourly roll-up.
+    Device-level (no per-process attribution). Requires the `dns` capture
+    source to be enabled on the device (the default).
   tags: [echo, warehouse, dns, network, forensics]
 
 spec:
@@ -909,7 +915,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT name, record_type, data, ttl_remaining_s, source, action, ts FROM $DNS_Live ORDER BY ts DESC LIMIT 500"
+        default: "SELECT hour_ts, name, record_type, data, appear_count, remove_count, negative_count FROM $DNS_Hourly ORDER BY hour_ts DESC LIMIT 500"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
@@ -954,10 +960,11 @@ metadata:
   description: >
     Mapped network-share activity (capability-map §3.8) in both directions —
     outbound (drives this host maps to remote shares) and inbound (remote hosts
-    mapping this host's shares). Live rows carry appeared/removed; historical
-    rows (origin='historical', from registry / fstab / event-log backfill) carry
-    action='historical'. Requires the `mapdrive` capture source to be
-    enabled on the device (the default); rows expose usernames + share paths.
+    mapping this host's shares), as appeared and removed counts per hour from
+    the hourly roll-up. Mappings found by the one-time historical backfill
+    (registry / fstab / event-log) are counted in historical_count. Requires
+    the `mapdrive` capture source to be enabled on the device (the default);
+    rows expose share paths.
   tags: [echo, warehouse, mapdrive, network, lateral-movement, forensics]
 
 spec:
@@ -974,7 +981,7 @@ spec:
     properties:
       sql:
         type: string
-        default: "SELECT direction, local_mount, remote_path, remote_host, username, provider, origin, action, ts FROM $MapDrive_Live ORDER BY ts DESC LIMIT 500"
+        default: "SELECT hour_ts, direction, local_mount, remote_path, remote_host, appear_count, remove_count, historical_count, last_ts FROM $MapDrive_Hourly ORDER BY hour_ts DESC LIMIT 500"
         description: >
           The preset SQL text this canned query runs. Hidden from the
           operator UI (not editable via the dashboard); see
