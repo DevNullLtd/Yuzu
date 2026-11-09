@@ -855,6 +855,71 @@ TEST_CASE("writer: DELETE with a stale If-Match is 409", "[dex][score_policy_wri
     CHECK(w.car_calls == 0);
 }
 
+TEST_CASE("writer: a retry with the old If-Match is applied again only while the stored policy "
+          "is at that revision",
+          "[dex][score_policy_writer]") {
+    // The served PUT/DELETE texts state this rule: 409 unless the stored policy is again at the
+    // revision sent, otherwise applied again (a PUT writes the document, a DELETE removes it).
+    const std::string original = doc_with_excellent(90.0);
+    const std::string original_rev = dex_score_policy_revision(original);
+    const std::string mine = doc_with_excellent(95.0);
+
+    SECTION("PUT of the text already stored is applied again with the same revision") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.put(original_rev, original).status == St::Ok);
+        const auto r = w.put(original_rev, original);
+        REQUIRE(r.status == St::Ok);
+        CHECK(r.in_force.revision == original_rev);
+        CHECK(w.stored == original);
+    }
+    SECTION("PUT retry is refused while the first PUT stands") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.put(original_rev, mine).status == St::Ok);
+        const auto r = w.put(original_rev, mine);
+        CHECK(r.status == St::Stale);
+        CHECK(w.stored == mine);
+    }
+    SECTION("PUT retry after another writer restored the original overwrites it") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.put(original_rev, mine).status == St::Ok);
+        w.stored = original; // another writer puts the original text back
+        const auto r = w.put(original_rev, mine);
+        REQUIRE(r.status == St::Ok);
+        CHECK(r.previous_revision == original_rev);
+        CHECK(r.in_force.revision == dex_score_policy_revision(mine));
+        CHECK(w.stored == mine);
+    }
+    SECTION("PUT sent with default is applied again after another writer removed the policy") {
+        World w;
+        REQUIRE(w.put("default", mine).status == St::Ok);
+        w.stored.reset(); // another writer removes it
+        const auto r = w.put("default", mine);
+        REQUIRE(r.status == St::Ok);
+        CHECK(w.stored == mine);
+    }
+    SECTION("DELETE retry is refused while the first DELETE stands") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.del(original_rev).status == St::Ok);
+        CHECK(w.del(original_rev).status == St::Stale);
+        CHECK_FALSE(w.stored);
+    }
+    SECTION("DELETE retry after another writer restored the original removes it") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.del(original_rev).status == St::Ok);
+        w.stored = original; // another writer puts the original text back
+        const auto r = w.del(original_rev);
+        REQUIRE(r.status == St::Ok);
+        CHECK(r.in_force.revision == "default");
+        CHECK_FALSE(w.stored);
+        CHECK(w.car_calls == 2);
+    }
+}
+
 // ── outcome unknown ─────────────────────────────────────────────────────────
 
 TEST_CASE("writer: a store error with the intended text observed afterwards is a 200",

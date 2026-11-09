@@ -206,7 +206,8 @@ bool ref_resolves(const json& spec, const std::string& ref) {
 }
 
 json param(const json& op, const char* name) {
-    // value(), not operator[]: on a const json a missing key asserts and aborts the whole shard.
+    // value(), not operator[]: on a const json a missing key asserts (undefined behaviour in an
+    // NDEBUG build) instead of failing the test.
     for (const auto& p : op.value("parameters", json::array()))
         if (p.value("name", "") == name)
             return p;
@@ -2888,6 +2889,7 @@ TEST_CASE("openapi body checker: bounds, nullable, oneOf and additionalPropertie
     CHECK_FALSE(bad(one_of, 1));
     CHECK(bad(one_of, true));
     // Known limit: oneOf is checked as at-least-one, so a value matching two alternatives passes.
+    // Flip this to CHECK when the checker enforces exactly one.
     const json overlapping = {{"oneOf", json::array({{{"type", "integer"}}, {{"type", "number"}}})}};
     CHECK_FALSE(bad(overlapping, 1));
 
@@ -2936,8 +2938,9 @@ TEST_CASE("openapi documents: the score-policy request-size text matches the bod
         CHECK_FALSE(response_text(method, "411").empty());
     }
 
-    // Every figure any of the request-size texts states must be one of the two limits, so a stale
-    // figure in the PUT 400 text or in a 413 text fails here whatever its phrasing.
+    // Every figure written as `N KiB` in the request-size texts must be one of the two limits, so a
+    // stale figure in the PUT 400 text or in a 413 text fails here. A figure in another unit or
+    // spelling (`1 MiB`, `320KiB`) is not seen.
     const json* put_400 =
         find_at(spec, {"paths", "/dex/score-policy", "put", "responses", "400", "description"});
     REQUIRE((put_400 != nullptr && put_400->is_string()));

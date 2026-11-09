@@ -2097,8 +2097,8 @@ TEST_CASE("config_routes: the v1 200 bodies conform to the served ConfigState an
         const auto violations = oa::body_violations(spec, schema, b);
         INFO(json(violations).dump(2));
         // REQUIRE, not CHECK: the lines below index members the schema requires, and a const
-        // operator[] on a missing member aborts instead of failing. Optional members are read
-        // with .at(), which throws and fails the test.
+        // operator[] on a missing member asserts (undefined behaviour under NDEBUG) instead of
+        // failing. Optional members are read with .at(), which throws and fails the test.
         REQUIRE(violations.empty());
         // meta is declared through ApiMeta; its one member is pinned here too.
         CHECK(b["meta"] == json{{"api_version", "v1"}});

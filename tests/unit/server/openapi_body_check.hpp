@@ -10,10 +10,9 @@
  * it here together with the schema taken from openapi_spec_json().
  *
  * What is checked, recursively, at every level the schema describes:
- *   - `type` (OpenAPI 3.0 spelling, one name: an array `type` throws nlohmann::type_error rather than being
- *     reported as a violation): string, integer (a JSON integer:
- *     5.0 is a float and fails), number (any), boolean, object, array; `nullable: true` admits
- *     null.
+ *   - `type` (OpenAPI 3.0 spelling, one name: an array `type` throws nlohmann::type_error
+ *     rather than being reported as a violation): string, integer (a JSON integer: 5.0 is a
+ *     float and fails), number (any), boolean, object, array; `nullable: true` admits null.
  *   - `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `minItems`, `maxItems`. Lengths are
  *     counted in bytes, not code points.
  *   - every `required` member is present.
