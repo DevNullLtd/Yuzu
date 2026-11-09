@@ -13,9 +13,10 @@
  * one audit row per (agent, quarantine identity) across store prunes, server
  * restarts and HA node switches (per server process: another HA node ingesting
  * the same agent can add a second row for the same identity); a failed write is
- * retried after the degraded window and a candidate skipped because that
- * agent's lookup was already in flight on the next heartbeat (the pair is only
- * marked once the row is durable).
+ * retried after the degraded window, and a candidate skipped because that
+ * agent's lookup was already in flight, or because the in-flight set was at its
+ * bound, is retried on the next heartbeat (the pair is only marked once the row
+ * is durable).
  *
  * The identity is agent-asserted and only shape-validated, so the gate also
  * bounds a rotating identity: at most one row per agent per
@@ -32,8 +33,8 @@
  * Reservation contract: a true from should_log() reserves that AGENT's
  * in-flight slot (a set of agent ids, bounded by kMaxAgents: at the bound a
  * new agent is refused, never an in-flight entry evicted); the caller completes
- * it with exactly one of mark_logged() (row durable) or mark_failed() (write
- * failed) -- or, more safely, via the nested Reservation RAII type, whose
+ * it with exactly one of mark_logged() (row durable) or mark_failed(agent_id)
+ * (write failed) -- or, more safely, via the nested Reservation RAII type, whose
  * destructor completes an abandoned reservation as failed() so a throw between
  * the reservation and the write cannot strand the slot. While an agent's slot
  * is held every other should_log() for THAT agent returns false (retried on a
@@ -51,11 +52,12 @@
  * + an agent-asserted, rotating identity here vs. a small fixed rotation-pair
  * set there) -- pick per-case, don't copy whichever file you find first.
  *
- * A throw between a true should_log() and its completion (whether via
- * Reservation's destructor or a direct mark_failed()) is turned into
- * mark_failed(agent_id), which itself takes a lock -- an exceedingly rare failure
- * there (OS mutex-resource exhaustion) terminates the process rather than
- * silently stranding the slot; a restart clears it either way.
+ * A throw between a true should_log() and its completion is turned into
+ * mark_failed(agent_id), which itself takes a lock. Inside ~Reservation an
+ * exceedingly rare failure there (OS mutex-resource exhaustion) terminates the
+ * process rather than silently stranding the slot; on the direct mark_failed()
+ * and the lookup-catch paths it would propagate and strand that agent's slot
+ * until restart. Not producible on the supported platforms.
  *
  * The lookup and the write are synchronous audit-store calls on the heartbeat
  * ingest thread, outside AgentHealthStore's mutex. Once the row is durable the
@@ -285,7 +287,8 @@ private:
     std::mutex mu_;
     std::unordered_map<std::string, Entry> agents_;
     int64_t degraded_until_{0};
-    std::unordered_set<std::string> in_flight_; // agents with a true should_log() awaiting mark_logged / mark_failed
+    // Agents holding a true should_log() that is awaiting mark_logged / mark_failed.
+    std::unordered_set<std::string> in_flight_;
 };
 
 } // namespace yuzu::server::detail

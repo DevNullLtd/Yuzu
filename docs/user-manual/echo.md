@@ -446,14 +446,14 @@ agent forwards on every heartbeat as `yuzu.plugin.echo.db_corruption_total` /
 deduplicated against the audit store and bounded to one row per agent per 10
 minutes per server process (intermediate quarantines inside that window collapse
 to the newest identity; another HA node can add a second row for the same
-identity) — see the audit-log reference. Agents are no longer serialised against
-each other, so a quarantine that hits many devices at once produces each device's
-audit row on its own next heartbeat while the audit store is healthy; a repeat
-report from a device whose lookup is already in flight, a report arriving inside
-the 60 s back-off after a failed lookup or write, or one arriving while the
-in-flight set is at capacity, is deferred to a later heartbeat. A plugin that failed to initialise
-(including Echo when the corrupt file cannot be moved aside) is reported
-in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
+identity) — see the audit-log reference. Devices are not queued behind one
+another, so a quarantine that hits many devices at once writes each device's
+audit row on the heartbeat that reports it while the audit store is healthy. A
+report is deferred to a later heartbeat if the same device's lookup is already
+in flight, if it arrives inside the server-wide 60 s back-off that follows any
+failed lookup or write, or if the in-flight set is at capacity. A plugin that
+failed to initialise (including Echo when the corrupt file cannot be moved
+aside) is reported in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
 which distinguishes "failed to load" from "not installed". The plugin keeps its
 count in a private storage record; if that record is present but unreadable the
 plugin logs `ECHO: db_health.ledger unreadable; not overwriting` and stops updating
@@ -471,10 +471,12 @@ gauge counts affected agents, not events, so this narrows to a small undercount
 rather than a lost signal; tracked as #5037.
 
 Two things worth knowing about the timing of this signal. **A mass event** (many
-devices quarantining near-simultaneously, e.g. a bad storage-driver rollout) still
-updates the fleet gauge in real time, but individual audit rows serialize behind
-one another server-wide, so the audit trail can lag well behind the gauge during a
-burst — don't read row latency as gauge inaccuracy. **A device already quarantined
+devices quarantining near-simultaneously, e.g. a bad storage-driver rollout) updates
+the fleet gauge in real time, and each device's audit row lands as its heartbeat
+is ingested while the audit store is healthy. The trail can still lag the gauge
+during the server-wide 60 s back-off that follows a failed lookup or write, and
+by up to the 10-minute per-device limit for a device whose quarantine identity
+keeps rotating — don't read row latency as gauge inaccuracy. **A device already quarantined
 before this fleet-visibility mechanism shipped** has no durable epoch/basename
 recorded yet, so it produces no fleet signal until its *next* corruption event —
 there is no backfill of pre-existing quarantines.

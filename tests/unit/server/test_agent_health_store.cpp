@@ -2162,6 +2162,7 @@ TEST_CASE("EchoCorruptionAuditGate: a second call for the same agent while its l
     CHECK(lookups == 2);
     gate.mark_logged("a", "1:f");
     CHECK_FALSE(gate.should_log("a", "1:f")); // the map answers now
+    CHECK_FALSE(gate.should_log("b", "2:g")); // a's completion leaves b's slot held
     CHECK(lookups == 2);
 
     // mark_failed releases the agent's slot (after the degraded window).
@@ -2170,7 +2171,7 @@ TEST_CASE("EchoCorruptionAuditGate: a second call for the same agent while its l
     CHECK(gate.should_log("b", "2:g"));
     gate.mark_logged("b", "2:g");
 
-    // Degraded outer lookup under overlap: exactly one probe, re-admitted after the window.
+    // Degraded lookup for a third agent: exactly one probe, re-admitted after the window.
     answer = std::nullopt;
     reenter = true;
     const int before = lookups;
@@ -2192,8 +2193,8 @@ TEST_CASE("EchoCorruptionAuditGate: a degraded store is probed once per admitted
     int64_t clock = 1000;
     EchoCorruptionAuditGate* gp = nullptr;
     bool reenter = true;
-    bool inner_b = true, inner_c = true;
-    int lookups_after_b = 0;
+    bool inner_b = true, inner_c = true, inner_a = true;
+    int lookups_after_b = 0, lookups_after_a = 0;
     EchoCorruptionAuditGate gate(
         [&](const std::string&) {
             ++lookups;
@@ -2202,6 +2203,11 @@ TEST_CASE("EchoCorruptionAuditGate: a degraded store is probed once per admitted
                 inner_b = gp->should_log("b", "2:g"); // distinct agent: admitted, probes too
                 lookups_after_b = lookups;
                 inner_c = gp->should_log("c", "3:h"); // b's failure already re-opened the window
+                // Step past the window: a is still in flight, and b's degraded release must
+                // not have freed a's slot, so a is refused without a lookup.
+                clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+                inner_a = gp->should_log("a", "1:f");
+                lookups_after_a = lookups;
             }
             return std::optional<std::optional<std::string>>{}; // degraded store
         },
@@ -2216,6 +2222,8 @@ TEST_CASE("EchoCorruptionAuditGate: a degraded store is probed once per admitted
     // ... but the first nullopt re-opened the window, so a third agent is refused without a
     // lookup, from inside a's still-in-flight probe and afterwards.
     CHECK_FALSE(inner_c);
+    CHECK_FALSE(inner_a);
+    CHECK(lookups_after_a == 2);
     CHECK(lookups == 2);
     CHECK_FALSE(gate.should_log("c", "3:h"));
     CHECK(lookups == 2);

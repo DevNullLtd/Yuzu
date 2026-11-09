@@ -6387,7 +6387,7 @@ public:
                         return;
                     if (!gate->should_log(agent_id, quarantine))
                         return;
-                    // Reservation completes the slot even if AuditEvent construction
+                    // Reservation completes that agent's slot even if AuditEvent construction
                     // or audit_store_->log() throws (log() is not noexcept).
                     detail::EchoCorruptionAuditGate::Reservation res(*gate, agent_id);
                     AuditEvent ev;
