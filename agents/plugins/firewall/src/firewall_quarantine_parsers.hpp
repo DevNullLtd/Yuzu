@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +45,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -175,40 +177,21 @@ namespace detail {
                                                              std::int64_t max) {
     if (s.empty() || s.size() > 18)
         return std::nullopt;
-    std::int64_t v = 0;
-    for (char c : s) {
-        if (c < '0' || c > '9')
-            return std::nullopt;
-        v = v * 10 + (c - '0');
-        if (v > max)
-            return std::nullopt;
-    }
-    return v;
+    // from_chars on an unsigned type takes no sign and no leading space; 18
+    // digits cannot overflow 64 bits, so the cast below is exact.
+    std::uint64_t v = 0;
+    const char* const end = s.data() + s.size();
+    const auto [ptr, ec] = std::from_chars(s.data(), end, v);
+    if (ec != std::errc{} || ptr != end || static_cast<std::int64_t>(v) > max)
+        return std::nullopt;
+    return static_cast<std::int64_t>(v);
 }
 
 /// A pf reference token: decimal digits only (a full 64-bit value, which does
 /// not fit parse_uint's 18-digit bound), between `min` and `max` characters.
 [[nodiscard]] inline bool is_digits(std::string_view s, std::size_t min, std::size_t max) noexcept {
-    if (s.size() < min || s.size() > max)
-        return false;
-    for (char c : s)
-        if (c < '0' || c > '9')
-            return false;
-    return true;
-}
-
-[[nodiscard]] inline bool starts_with(std::string_view s, std::string_view p) noexcept {
-    return s.size() >= p.size() && s.substr(0, p.size()) == p;
-}
-
-[[nodiscard]] inline int hexval(char c) noexcept {
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
+    return s.size() >= min && s.size() <= max &&
+           s.find_first_not_of("0123456789") == std::string_view::npos;
 }
 
 /// Free-text safe for a state value or an output field: control characters,
@@ -286,12 +269,10 @@ namespace detail {
             if (g.size() > 4)
                 return false;
             unsigned v = 0;
-            for (char c : g) {
-                const int d = hexval(c);
-                if (d < 0)
-                    return false;
-                v = v * 16 + static_cast<unsigned>(d);
-            }
+            const char* const gend = g.data() + g.size();
+            const auto [gp, gec] = std::from_chars(g.data(), gend, v, 16);
+            if (gec != std::errc{} || gp != gend)
+                return false;
             out.push_back(static_cast<std::uint16_t>(v));
         }
         if (last)
@@ -584,6 +565,17 @@ struct AllowSet {
     }
 };
 
+/// Add operator exceptions; the cap is cumulative across every add.
+[[nodiscard]] inline std::expected<AllowSet, std::string>
+add_exceptions(AllowSet set, const std::vector<Endpoint>& add) {
+    for (const auto& e : add)
+        if (std::find(set.exceptions.begin(), set.exceptions.end(), e) == set.exceptions.end())
+            set.exceptions.push_back(e);
+    if (set.exceptions.size() > kMaxExceptions)
+        return std::unexpected("exception_cap_exceeded");
+    return set;
+}
+
 /// The port of a `host:port` / `[v6]:port` control target; nullopt when absent
 /// or malformed. (A bracket-less v6 literal carries no unambiguous port.)
 [[nodiscard]] inline std::optional<int> extract_server_port(std::string_view target) {
@@ -675,23 +667,7 @@ build_allow_set(std::string_view control_ips_csv, std::string_view server_addres
     if (resolver_invalid > 0)
         set.notes.push_back(std::format("resolvers_invalid={}", resolver_invalid));
 
-    for (const auto& e : exceptions)
-        if (std::find(set.exceptions.begin(), set.exceptions.end(), e) == set.exceptions.end())
-            set.exceptions.push_back(e);
-    if (set.exceptions.size() > kMaxExceptions)
-        return std::unexpected("too_many_exceptions");
-    return set;
-}
-
-/// Add operator exceptions; the cap is cumulative across every add.
-[[nodiscard]] inline std::expected<AllowSet, std::string>
-add_exceptions(AllowSet set, const std::vector<Endpoint>& add) {
-    for (const auto& e : add)
-        if (std::find(set.exceptions.begin(), set.exceptions.end(), e) == set.exceptions.end())
-            set.exceptions.push_back(e);
-    if (set.exceptions.size() > kMaxExceptions)
-        return std::unexpected("exception_cap_exceeded");
-    return set;
+    return add_exceptions(std::move(set), exceptions);
 }
 
 /// True when `e` names an allowance the quarantine cannot work without:
@@ -894,14 +870,9 @@ enum class VerifyAction : std::uint8_t { keep, rollback_to_absence, revert_to_pr
                                            : VerifyOutcome::probe_still_reachable;
 }
 
-/// Rollback-to-absence exists only for an INITIAL apply.
-[[nodiscard]] constexpr bool must_rollback(VerifyOutcome o, bool initial_apply) noexcept {
-    return initial_apply && (o == VerifyOutcome::control_unreachable ||
-                             o == VerifyOutcome::probe_still_reachable);
-}
-
-/// What to do about a verify result, by operation. An update reverts to the
-/// previous generation, never to absence; a boot-time re-apply NEVER undoes
+/// What to do about a verify result, by operation. Rollback-to-absence exists
+/// only for an INITIAL apply; an update reverts to the previous generation,
+/// never to absence; a boot-time re-apply NEVER undoes
 /// anything on an unreachable server (never auto-release on lost contact).
 [[nodiscard]] constexpr VerifyAction verify_action(VerifyOutcome o, VerifyMode mode) noexcept {
     switch (o) {
@@ -945,7 +916,6 @@ struct ProbeTarget {
         return ip.v6 ? std::format("[{}]:{}", format_ip(ip), port)
                      : std::format("{}:{}", format_ip(ip), port);
     }
-    [[nodiscard]] std::string ip_text() const { return format_ip(ip); }
 };
 
 /// `ip:port` or `[v6]:port`, an IP LITERAL only: a hostname would be resolved
@@ -1290,7 +1260,14 @@ struct WinRuleSpec {
 }
 
 [[nodiscard]] inline bool is_legacy_marker(std::string_view rule_name) noexcept {
-    return detail::starts_with(rule_name, kLegacyWinRulePrefix);
+    return rule_name.starts_with(kLegacyWinRulePrefix);
+}
+
+/// A rule is ours when it is in our group or carries our name prefix; the one
+/// test the disable list, the removal sweep and status all share.
+[[nodiscard]] constexpr bool is_our_win_rule(std::string_view name,
+                                             std::string_view group) noexcept {
+    return group == kWinGroup || name.starts_with(kWinRulePrefix);
 }
 
 struct WinRuleInfo {
@@ -1306,7 +1283,7 @@ struct WinRuleInfo {
 win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
     std::vector<std::string> out;
     for (const auto& r : rules) {
-        if (!r.enabled || r.group == kWinGroup || detail::starts_with(r.name, kWinRulePrefix))
+        if (!r.enabled || is_our_win_rule(r.name, r.group))
             continue;
         out.push_back(r.name);
     }
@@ -1615,19 +1592,19 @@ struct NftTableListing {
     NftChainRow* cur = nullptr;
     for (const auto raw : detail::split(text, '\n')) {
         const auto line = detail::trim(raw);
-        if (detail::starts_with(line, "table inet ") && line.find(kNftTable) != line.npos) {
+        if (line.starts_with("table inet ") && line.find(kNftTable) != line.npos) {
             out.found = true;
             continue;
         }
         if (!out.found)
             continue;
-        if (detail::starts_with(line, "chain ") && line.back() == '{') {
+        if (line.starts_with("chain ") && line.back() == '{') {
             const auto name = detail::trim(line.substr(6, line.size() - 7));
             out.chains.push_back({std::string{name}, {}, {}});
             cur = &out.chains.back();
             continue;
         }
-        if (cur && detail::starts_with(line, "type ")) {
+        if (cur && line.starts_with("type ")) {
             if (const auto h = line.find(" hook "); h != line.npos) {
                 auto rest = line.substr(h + 6);
                 cur->hook = std::string{rest.substr(0, rest.find(' '))};
@@ -1757,7 +1734,7 @@ struct IptablesListing {
 };
 
 [[nodiscard]] inline std::optional<std::uint32_t> ipt_chain_gen(std::string_view name) {
-    if (!detail::starts_with(name, kIptablesChainPrefix))
+    if (!name.starts_with(kIptablesChainPrefix))
         return std::nullopt;
     auto rest = name.substr(kIptablesChainPrefix.size());
     if (rest.size() > 2 && rest.substr(rest.size() - 2) == "-f")
@@ -1932,7 +1909,7 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
 [[nodiscard]] inline std::optional<std::string> parse_pfctl_token(std::string_view text) {
     for (const auto raw : detail::split(text, '\n')) {
         const auto line = detail::trim(raw);
-        if (!detail::starts_with(line, "Token"))
+        if (!line.starts_with("Token"))
             continue;
         const auto colon = line.find(':');
         if (colon == std::string_view::npos)
@@ -1986,7 +1963,7 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
 /// closing `block drop quick all` is there. An empty anchor reads as absent.
 [[nodiscard]] inline bool pf_anchor_enforcing(std::string_view anchor_rules_text) {
     for (const auto raw : detail::split(anchor_rules_text, '\n'))
-        if (detail::starts_with(detail::trim(raw), "block drop quick all"))
+        if (detail::trim(raw).starts_with("block drop quick all"))
             return true;
     return false;
 }
@@ -2003,7 +1980,7 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
         auto name = detail::trim(raw);
         if (name.empty() || name.find_first_of(" \t") != std::string_view::npos)
             continue;
-        if (detail::starts_with(name, prefix))
+        if (name.starts_with(prefix))
             name.remove_prefix(prefix.size());
         if (name.find('/') != std::string_view::npos || !is_safe_token(name))
             continue;
@@ -2016,7 +1993,7 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
 
 [[nodiscard]] inline bool pf_enabled(std::string_view info_text) {
     for (const auto raw : detail::split(info_text, '\n'))
-        if (detail::starts_with(detail::trim(raw), "Status: Enabled"))
+        if (detail::trim(raw).starts_with("Status: Enabled"))
             return true;
     return false;
 }
@@ -2047,7 +2024,7 @@ enum class PfEnablePlan : std::uint8_t { enable, reuse, repair };
         auto line = detail::trim(raw);
         if (line.empty() || line.front() == '#' || line.front() == ';')
             continue;
-        if (!detail::starts_with(line, "nameserver"))
+        if (!line.starts_with("nameserver"))
             continue;
         line.remove_prefix(10);
         if (line.empty() || (line.front() != ' ' && line.front() != '\t'))
@@ -2225,9 +2202,9 @@ namespace detail {
 [[nodiscard]] inline std::string pf_error_line(std::string_view out) {
     for (const auto raw : split(out, '\n')) {
         const auto line = trim(raw);
-        if (line.empty() || starts_with(line, "pfctl: Use of -f option") ||
-            starts_with(line, "present in the main ruleset") ||
-            starts_with(line, "See /etc/pf.conf"))
+        if (line.empty() || line.starts_with("pfctl: Use of -f option") ||
+            line.starts_with("present in the main ruleset") ||
+            line.starts_with("See /etc/pf.conf"))
             continue;
         return sanitize_text(line, 80);
     }
@@ -2812,7 +2789,7 @@ struct VerifyResult {
     v.control_ok = control_reachable(env, st.allow, vdl);
     v.before = before;
     if (const auto t = parse_probe_target(st.probe_target))
-        v.after = env.probe(t->ip_text(), t->port, vdl.cap(kProbeTimeout));
+        v.after = env.probe(format_ip(t->ip), t->port, vdl.cap(kProbeTimeout));
     v.outcome = decide_verify(v.control_ok, v.before, v.after);
     v.row = verify_row(v.control_ok, v.before, v.after);
     return v;
@@ -2924,7 +2901,7 @@ struct ApplyRequest {
 
     std::optional<ProbeOutcome> before;
     if (target) {
-        before = env.probe(target->ip_text(), target->port, dl.cap(kProbeTimeout));
+        before = env.probe(format_ip(target->ip), target->port, dl.cap(kProbeTimeout));
         if (*before == ProbeOutcome::timeout)
             return refused("probe_unreachable_before_apply");
     }

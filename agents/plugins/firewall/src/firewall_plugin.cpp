@@ -1704,8 +1704,10 @@ private:
 
 /// The host's DNS resolvers, read at quarantine time. A loopback stub
 /// (systemd-resolved's 127.0.0.53) is followed one hop to the real upstream list
-/// so the stub can still forward.
-[[maybe_unused]] std::vector<std::string> posix_resolvers() {
+/// so the stub can still forward. On macOS /etc/resolv.conf is configd's own
+/// list of the primary resolvers (scoped per-interface resolvers in
+/// `scutil --dns` are not read).
+[[nodiscard]] std::vector<std::string> host_resolvers() {
     return fq::resolver_chain(read_small_file("/etc/resolv.conf"),
                               read_small_file("/run/systemd/resolve/resolv.conf"));
 }
@@ -1778,8 +1780,6 @@ private:
     }
     return nullptr;
 }
-
-[[nodiscard]] std::vector<std::string> host_resolvers() { return posix_resolvers(); }
 
 #endif // __linux__
 
@@ -1927,7 +1927,7 @@ public:
             return fq::StepResult::fail("legacy_quarantine_active");
         std::vector<std::string> ours;
         for (const auto& i : infos)
-            if (i.group == fq::kWinGroup || i.name.starts_with(fq::kWinRulePrefix))
+            if (fq::is_our_win_rule(i.name, i.group))
                 ours.push_back(i.name);
 
         // 2. Capture the prior profile policy, write-once, BEFORE any write.
@@ -2010,7 +2010,7 @@ public:
             if (!rule_enabled(r))
                 return true;
             const auto name = rule_name_of(r);
-            if (rule_group_of(r) == fq::kWinGroup || name.starts_with(fq::kWinRulePrefix))
+            if (fq::is_our_win_rule(name, rule_group_of(r)))
                 return true;
             if (r.put_Enabled(VARIANT_FALSE) != S_OK)
                 ++refused;
@@ -2071,7 +2071,7 @@ public:
         const auto collect_ours = [&](std::vector<std::string>& out) {
             return for_each_rule(*rules.get(), [&](INetFwRule& r) {
                 auto name = rule_name_of(r);
-                if (rule_group_of(r) == fq::kWinGroup || name.starts_with(fq::kWinRulePrefix))
+                if (fq::is_our_win_rule(name, rule_group_of(r)))
                     out.push_back(std::move(name));
                 return true;
             });
@@ -2328,10 +2328,6 @@ private:
     return std::make_unique<fq::PfLeg>(sudo_runner(), temp_file_stage(raw), kern_boot_time);
 }
 
-/// /etc/resolv.conf on macOS is configd's own list of the primary resolvers
-/// (scoped per-interface resolvers in `scutil --dns` are not read).
-[[nodiscard]] std::vector<std::string> host_resolvers() { return posix_resolvers(); }
-
 #endif // __APPLE__
 
 // ── Action handlers (all OSes) ──────────────────────────────────────────────
@@ -2351,9 +2347,7 @@ void emit(yuzu::CommandContext& ctx, const fq::Outcome& o) {
 }
 
 int emit_refusal(yuzu::CommandContext& ctx, std::string reason) {
-    fq::Outcome o;
-    o.status = "refused";
-    o.reason = std::move(reason);
+    const auto o = fq::detail::refused(std::move(reason));
     emit(ctx, o);
     return o.rc();
 }

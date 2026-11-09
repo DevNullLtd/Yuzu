@@ -214,7 +214,7 @@ void close_sock(SockT s) { ::close(s); }
     const auto ip = fq::parse_probe_target(s);
     if (!ip)
         return std::nullopt;
-    return std::make_pair(ip->ip_text(), ip->port);
+    return std::make_pair(fq::format_ip(ip->ip), ip->port);
 }
 
 /// One TCP connect to ip:port with a bounded wait; the tri-state outcome.

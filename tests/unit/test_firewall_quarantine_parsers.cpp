@@ -598,17 +598,11 @@ TEST_CASE("verify decision matrix over tri-state probes", "[agent][firewall_quar
     // unreachable before the mutation: nothing to prove against
     CHECK(decide_verify(true, P::timeout, P::timeout) == V::probe_unreachable_before_apply);
 
-    CHECK(must_rollback(V::control_unreachable, true));
-    CHECK(must_rollback(V::probe_still_reachable, true));
-    CHECK_FALSE(must_rollback(V::verified, true));
-    CHECK_FALSE(must_rollback(V::unproven, true));
-    CHECK_FALSE(must_rollback(V::probe_unreachable_before_apply, true));
-    // rollback-to-absence exists only for an initial apply
-    CHECK_FALSE(must_rollback(V::control_unreachable, false));
-    CHECK_FALSE(must_rollback(V::probe_still_reachable, false));
-
     using A = VerifyAction;
     using M = VerifyMode;
+    // a verified or unproven apply is kept, never undone
+    CHECK(verify_action(V::verified, M::initial) == A::keep);
+    CHECK(verify_action(V::unproven, M::initial) == A::keep);
     CHECK(verify_action(V::control_unreachable, M::initial) == A::rollback_to_absence);
     CHECK(verify_action(V::probe_still_reachable, M::initial) == A::rollback_to_absence);
     CHECK(verify_action(V::control_unreachable, M::update) == A::revert_to_previous);
@@ -715,7 +709,7 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     // no control endpoint: not a record we could ever have written
     std::string no_ctl;
     for (const auto line : detail::split(text, '\n'))
-        if (!detail::starts_with(line, "ctl="))
+        if (!line.starts_with("ctl="))
             no_ctl += std::string{line} + "\n";
     CHECK_FALSE(parse_state(no_ctl));
     CHECK_FALSE(parse_state(std::string(kMaxStateBytes + 1, 'x')));
@@ -747,9 +741,9 @@ TEST_CASE("windows rule specs: names, group, directions", "[agent][firewall_quar
     REQUIRE_FALSE(specs.empty());
     std::set<std::string> names;
     for (const auto& s : specs) {
-        CHECK(detail::starts_with(s.name, "YuzuFirewall_Quarantine_3_"));
+        CHECK(s.name.starts_with("YuzuFirewall_Quarantine_3_"));
         CHECK_FALSE(is_legacy_marker(s.name));
-        CHECK_FALSE(detail::starts_with(s.name, kLegacyWinRulePrefix));
+        CHECK_FALSE(s.name.starts_with(kLegacyWinRulePrefix));
         CHECK(names.insert(s.name).second); // unique
     }
     CHECK(kWinGroup == "Yuzu Firewall Quarantine");
@@ -797,7 +791,12 @@ TEST_CASE("windows: every enabled rule outside our group is disabled", "[agent][
     CHECK(off[1] == "Remote Desktop - User Mode (TCP-In)");
     CHECK(off[2] == "No group at all");
     for (const auto& n : off)
-        CHECK_FALSE(detail::starts_with(n, kWinRulePrefix));
+        CHECK_FALSE(n.starts_with(kWinRulePrefix));
+    // the one "is ours" test: our group, or our name prefix without the group
+    CHECK(is_our_win_rule("anything", kWinGroup));
+    CHECK(is_our_win_rule("YuzuFirewall_Quarantine_1_2", ""));
+    CHECK_FALSE(is_our_win_rule("YuzuQuarantine_allow_1", "")); // the legacy plugin's
+    CHECK_FALSE(is_our_win_rule("No group at all", ""));
 }
 
 TEST_CASE("windows: prior policy image and the write-once decision", "[agent][firewall_quarantine]") {
@@ -1044,7 +1043,7 @@ TEST_CASE("pf anchor ruleset: no nat/rdr, lo0, stateless control channel, block 
     CHECK(lines.back() == "block drop quick all");
     for (const auto& l : lines) {
         INFO(l);
-        CHECK((l.find("quick") != l.npos || detail::starts_with(l, "no ")));
+        CHECK((l.find("quick") != l.npos || l.starts_with("no ")));
         CHECK(is_safe_ruleset_line(l));
     }
     CHECK(text.find("set skip") == text.npos);
@@ -2128,7 +2127,7 @@ struct PfWorld {
                 return done(1, "pfctl: DIOCGETRULES: Invalid argument");
             std::string out;
             for (const auto l : detail::split(anchor_text, '\n'))
-                if (!l.empty() && !detail::starts_with(l, "no "))
+                if (!l.empty() && !l.starts_with("no "))
                     out += std::string{l} + "\n";
             return done(0, out);
         }
