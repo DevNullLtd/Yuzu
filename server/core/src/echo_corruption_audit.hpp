@@ -13,9 +13,9 @@
  * one audit row per (agent, quarantine identity) across store prunes, server
  * restarts and HA node switches (per server process: another HA node ingesting
  * the same agent can add a second row for the same identity); a failed write is
- * retried after the degraded window and a candidate skipped because the slot
- * was busy on the next heartbeat (the pair is only marked once the row is
- * durable).
+ * retried after the degraded window and a candidate skipped because that
+ * agent's lookup was already in flight on the next heartbeat (the pair is only
+ * marked once the row is durable).
  *
  * The identity is agent-asserted and only shape-validated, so the gate also
  * bounds a rotating identity: at most one row per agent per
@@ -26,14 +26,19 @@
  * degraded audit store is probed at most once per
  * kEchoCorruptionAuditDegradedRetry seconds gate-wide.
  *
- * Reservation contract: a true from should_log() reserves the gate's single
- * in-flight slot; the caller completes it with exactly one of mark_logged()
- * (row durable) or mark_failed() (write failed) -- or, more safely, via the
- * nested Reservation RAII type, whose destructor completes an abandoned
- * reservation as failed() so a throw between the reservation and the write
- * cannot strand the slot. While the slot is held every other should_log()
- * returns false (retried on a later heartbeat), so at most one audit-store
- * call is in flight gate-wide.
+ * Reservation contract: a true from should_log() reserves that AGENT's
+ * in-flight slot (a set of agent ids, bounded by kMaxAgents: at the bound a
+ * new agent is refused, never an in-flight entry evicted); the caller completes
+ * it with exactly one of mark_logged() (row durable) or mark_failed() (write
+ * failed) -- or, more safely, via the nested Reservation RAII type, whose
+ * destructor completes an abandoned reservation as failed() so a throw between
+ * the reservation and the write cannot strand the slot. While an agent's slot
+ * is held every other should_log() for THAT agent returns false (retried on a
+ * later heartbeat); other agents are admitted, so a burst of distinct agents
+ * (a mass quarantine) is not serialised to one row per heartbeat (#5033). The
+ * lookup and the write are synchronous on the heartbeat ingest threads, so at
+ * most one store call per ingest thread is in flight regardless; the former
+ * gate-wide slot bought nothing beyond that.
  *
  * Durability choice, stated for a future third case: this gate round-trips
  * the audit store itself so dedup survives a restart/HA switch, unlike the
@@ -45,7 +50,7 @@
  *
  * A throw between a true should_log() and its completion (whether via
  * Reservation's destructor or a direct mark_failed()) is turned into
- * mark_failed(), which itself takes a lock -- an exceedingly rare failure
+ * mark_failed(agent_id), which itself takes a lock -- an exceedingly rare failure
  * there (OS mutex-resource exhaustion) terminates the process rather than
  * silently stranding the slot; a restart clears it either way.
  *
@@ -65,6 +70,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace yuzu::server::detail {
@@ -154,15 +160,15 @@ public:
         : latest_(std::move(latest)), now_s_(std::move(now_s)) {}
 
     /// True iff a new audit row should be written for (agent, quarantine).
-    /// A true return holds the in-flight slot: complete it with mark_logged or mark_failed.
+    /// A true return holds the agent's in-flight slot: complete it with mark_logged or mark_failed.
     [[nodiscard]] bool should_log(const std::string& agent_id, const std::string& quarantine) {
         const auto now = now_s_();
         {
             std::lock_guard lock(mu_);
             if (now < degraded_until_)
                 return false; // degraded store: no lookup until the window ends
-            if (in_flight_)
-                return false; // one store call in flight gate-wide; retried next heartbeat
+            if (in_flight_.contains(agent_id))
+                return false; // this agent's lookup is in flight; retried next heartbeat
             if (const auto it = agents_.find(agent_id); it != agents_.end()) {
                 if (it->second.identity == quarantine)
                     return false; // already durable
@@ -170,24 +176,28 @@ public:
                     now - *it->second.last_row_at < kEchoCorruptionAuditMinRowInterval)
                     return false; // rotating identity: rate-limited, retried later
             }
-            in_flight_ = true;
+            if (in_flight_.size() >= kMaxAgents)
+                return false; // bounded: refuse, never evict an in-flight entry
+            // The only allocation on the admit path. Inside the lock and before the slot
+            // counts as held: a throw here leaves nothing inserted (strong guarantee).
+            in_flight_.insert(agent_id);
         }
         std::optional<std::optional<std::string>> latest;
         try {
             latest = latest_(agent_id); // outside mu_: a store round-trip
         } catch (...) {
             std::lock_guard lock(mu_); // never strand the slot on a throwing lookup
-            in_flight_ = false;
+            in_flight_.erase(agent_id);
             throw;
         }
         std::lock_guard lock(mu_);
         if (!latest) {
-            in_flight_ = false;
+            in_flight_.erase(agent_id);
             degraded_until_ = now_s_() + kEchoCorruptionAuditDegradedRetry;
             return false; // no write, not marked -> retried after the window
         }
         if (*latest && **latest == quarantine) {
-            in_flight_ = false;
+            in_flight_.erase(agent_id);
             remember_locked(agent_id, quarantine, std::nullopt); // durable (prior run / other node)
             return false;
         }
@@ -199,42 +209,51 @@ public:
     /// one of logged() (row durable) or failed() (write failed). If neither
     /// runs — including a throw unwinding through the reservation's scope —
     /// the destructor completes it as failed(), so an exception between the
-    /// reservation and the write can never strand the in-flight slot (which
-    /// would otherwise wedge should_log() false for every agent forever).
+    /// reservation and the write can never strand the agent's in-flight slot (which
+    /// would otherwise wedge should_log() false for that agent forever).
+    ///
+    /// Lifetime rule: `agent_id` is referenced, not copied (the constructor stays
+    /// noexcept and non-allocating), so it must outlive the Reservation. At the one
+    /// production site (the server.cpp corruption sink) it is the sink lambda's
+    /// parameter, which outlives the scoped reservation.
     class Reservation {
     public:
-        explicit Reservation(EchoCorruptionAuditGate& gate) noexcept : gate_(&gate) {}
+        Reservation(EchoCorruptionAuditGate& gate, const std::string& agent_id) noexcept
+            : gate_(&gate), agent_(&agent_id) {}
         Reservation(const Reservation&) = delete;
         Reservation& operator=(const Reservation&) = delete;
         Reservation(Reservation&&) = delete;
         Reservation& operator=(Reservation&&) = delete;
         ~Reservation() {
             if (gate_)
-                gate_->mark_failed();
+                gate_->mark_failed(*agent_);
         }
+        /// `agent_id` must be the one this Reservation was constructed with.
         void logged(const std::string& agent_id, const std::string& quarantine) {
             gate_->mark_logged(agent_id, quarantine);
             gate_ = nullptr;
         }
         void failed() {
-            gate_->mark_failed();
+            gate_->mark_failed(*agent_);
             gate_ = nullptr;
         }
 
     private:
         EchoCorruptionAuditGate* gate_;
+        const std::string* agent_;
     };
 
     void mark_logged(const std::string& agent_id, const std::string& quarantine) {
         std::lock_guard lock(mu_);
-        in_flight_ = false;
+        in_flight_.erase(agent_id);
         remember_locked(agent_id, quarantine, now_s_());
     }
 
-    /// The caller's audit write failed: release the slot and open the degraded window.
-    void mark_failed() {
+    /// The caller's audit write failed: release the agent's slot and open the
+    /// (gate-wide: a degraded store is a store property) degraded window.
+    void mark_failed(const std::string& agent_id) {
         std::lock_guard lock(mu_);
-        in_flight_ = false;
+        in_flight_.erase(agent_id);
         degraded_until_ = now_s_() + kEchoCorruptionAuditDegradedRetry;
     }
 
@@ -260,7 +279,7 @@ private:
     std::mutex mu_;
     std::unordered_map<std::string, Entry> agents_;
     int64_t degraded_until_{0};
-    bool in_flight_{false}; // a true should_log() awaiting mark_logged / mark_failed
+    std::unordered_set<std::string> in_flight_; // agents with a true should_log() awaiting mark_logged / mark_failed
 };
 
 } // namespace yuzu::server::detail

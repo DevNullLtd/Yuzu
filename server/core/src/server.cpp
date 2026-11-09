@@ -6388,8 +6388,9 @@ public:
                     if (!gate->should_log(agent_id, quarantine))
                         return;
                     // Reservation completes the slot even if AuditEvent construction
-                    // or audit_store_->log() throws (log() is not noexcept).
-                    detail::EchoCorruptionAuditGate::Reservation res(*gate);
+                    // or audit_store_->log() throws (log() is not noexcept). It
+                    // references agent_id, which outlives `res` (lambda parameter).
+                    detail::EchoCorruptionAuditGate::Reservation res(*gate, agent_id);
                     AuditEvent ev;
                     ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())

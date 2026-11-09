@@ -2117,7 +2117,7 @@ TEST_CASE("EchoCorruptionAuditGate: a failed audit write is retried, a durable o
     answer = std::optional<std::string>{};
     REQUIRE(gate.should_log("a", "1:f"));
     const int before_fail = lookups;
-    gate.mark_failed();
+    gate.mark_failed("a");
     CHECK_FALSE(gate.should_log("a", "1:f"));
     CHECK(lookups == before_fail);
     clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
@@ -2129,7 +2129,8 @@ TEST_CASE("EchoCorruptionAuditGate: a failed audit write is retried, a durable o
     CHECK(lookups == before);
 }
 
-TEST_CASE("EchoCorruptionAuditGate: overlapping calls hold one in-flight slot gate-wide",
+TEST_CASE("EchoCorruptionAuditGate: a second call for the same agent while its lookup is in "
+          "flight is refused; a different agent is admitted",
           "[health_store][echo][corruption][gate]") {
     using yuzu::server::detail::EchoCorruptionAuditGate;
     int lookups = 0;
@@ -2137,7 +2138,7 @@ TEST_CASE("EchoCorruptionAuditGate: overlapping calls hold one in-flight slot ga
     std::optional<std::optional<std::string>> answer = std::optional<std::string>{};
     EchoCorruptionAuditGate* gp = nullptr;
     bool reenter = true;
-    bool inner_same = true, inner_other = true;
+    bool inner_same = true, inner_other = false;
     EchoCorruptionAuditGate gate(
         [&](const std::string&) {
             ++lookups;
@@ -2151,20 +2152,20 @@ TEST_CASE("EchoCorruptionAuditGate: overlapping calls hold one in-flight slot ga
         [&] { return clock; });
     gp = &gate;
 
-    // Same-agent and other-agent calls from inside the lookup: no admit, no lookup.
+    // From inside a's lookup: the same agent is refused (no lookup), another agent is admitted.
     REQUIRE(gate.should_log("a", "1:f"));
     CHECK_FALSE(inner_same);
-    CHECK_FALSE(inner_other);
-    CHECK(lookups == 1);
-    CHECK_FALSE(gate.should_log("a", "1:f")); // slot still held until completion
-    CHECK(lookups == 1);
+    CHECK(inner_other);
+    CHECK(lookups == 2);
+    CHECK_FALSE(gate.should_log("a", "1:f")); // a's slot still held until completion
+    CHECK_FALSE(gate.should_log("b", "2:g")); // so is b's
+    CHECK(lookups == 2);
     gate.mark_logged("a", "1:f");
     CHECK_FALSE(gate.should_log("a", "1:f")); // the map answers now
-    CHECK(lookups == 1);
+    CHECK(lookups == 2);
 
-    // mark_failed releases the slot (after the degraded window).
-    REQUIRE(gate.should_log("b", "2:g"));
-    gate.mark_failed();
+    // mark_failed releases the agent's slot (after the degraded window).
+    gate.mark_failed("b");
     clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
     CHECK(gate.should_log("b", "2:g"));
     gate.mark_logged("b", "2:g");
@@ -2183,6 +2184,73 @@ TEST_CASE("EchoCorruptionAuditGate: overlapping calls hold one in-flight slot ga
     gate.mark_logged("c", "3:h");
 }
 
+TEST_CASE("EchoCorruptionAuditGate: eight agents presenting distinct identities in one tick are "
+          "all admitted in that tick (#5033)",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    constexpr int kM = 8;
+    std::vector<std::string> ids, quarantines;
+    for (int i = 0; i < kM; ++i) {
+        ids.push_back("agent-" + std::to_string(i));
+        quarantines.push_back(std::to_string(i + 1) + ":f");
+    }
+    int lookups = 0;
+    int next = 1;
+    std::vector<char> admitted(kM, 0);
+    EchoCorruptionAuditGate* gp = nullptr;
+    // Each lookup re-enters for the next agent, so all eight are in flight at once on one
+    // clock reading: the burst a mass quarantine produces.
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            if (next < kM) {
+                const int i = next++;
+                admitted[i] = gp->should_log(ids[i], quarantines[i]);
+            }
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [] { return int64_t{1000}; });
+    gp = &gate;
+
+    admitted[0] = gate.should_log(ids[0], quarantines[0]);
+    for (int i = 0; i < kM; ++i)
+        CHECK(admitted[i]);
+    CHECK(lookups == kM);
+
+    // Each completes through its own Reservation; afterwards every identity is durable.
+    for (int i = 0; i < kM; ++i) {
+        EchoCorruptionAuditGate::Reservation res(gate, ids[i]);
+        res.logged(ids[i], quarantines[i]);
+    }
+    for (int i = 0; i < kM; ++i)
+        CHECK_FALSE(gate.should_log(ids[i], quarantines[i]));
+    CHECK(lookups == kM);
+}
+
+TEST_CASE("EchoCorruptionAuditGate: the in-flight set refuses at the bound, never evicts",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int lookups = 0;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) {
+            ++lookups;
+            return std::optional<std::optional<std::string>>{std::optional<std::string>{}};
+        },
+        [] { return int64_t{1000}; });
+    constexpr int kBound = 65536;
+    for (int i = 0; i < kBound; ++i)
+        REQUIRE(gate.should_log("agent-" + std::to_string(i), "1:f"));
+    CHECK(lookups == kBound);
+    // At the bound a new agent is refused without a lookup; no held slot was evicted.
+    CHECK_FALSE(gate.should_log("extra", "1:f"));
+    CHECK_FALSE(gate.should_log("agent-0", "1:f"));
+    CHECK(lookups == kBound);
+    // Completing one frees exactly one slot.
+    gate.mark_logged("agent-0", "1:f");
+    CHECK(gate.should_log("extra", "1:f"));
+    CHECK(lookups == kBound + 1);
+}
+
 TEST_CASE("EchoCorruptionAuditGate::Reservation: a throw between reservation and "
           "completion releases the slot",
           "[health_store][echo][corruption][gate]") {
@@ -2196,7 +2264,8 @@ TEST_CASE("EchoCorruptionAuditGate::Reservation: a throw between reservation and
 
     REQUIRE(gate.should_log("a", "1:f"));
     try {
-        EchoCorruptionAuditGate::Reservation r(gate);
+        const std::string agent = "a";
+        EchoCorruptionAuditGate::Reservation r(gate, agent);
         throw std::runtime_error("boom");
     } catch (...) {
     }
@@ -2207,11 +2276,35 @@ TEST_CASE("EchoCorruptionAuditGate::Reservation: a throw between reservation and
     CHECK(gate.should_log("b", "2:g")); // proves the slot was released, not stranded
 
     {
-        EchoCorruptionAuditGate::Reservation r(gate);
+        const std::string agent = "b";
+        EchoCorruptionAuditGate::Reservation r(gate, agent);
         r.logged("b", "2:g");
     }
     // A committed reservation opens no degraded window: admitted immediately.
     CHECK(gate.should_log("c", "3:h"));
+}
+
+TEST_CASE("EchoCorruptionAuditGate::Reservation releases only its own agent on throw",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string&) -> std::optional<std::optional<std::string>> {
+            return std::optional<std::string>{}; // no prior row
+        },
+        [&] { return clock; });
+
+    REQUIRE(gate.should_log("a", "1:f"));
+    REQUIRE(gate.should_log("b", "2:g"));
+    try {
+        const std::string agent = "a";
+        EchoCorruptionAuditGate::Reservation r(gate, agent);
+        throw std::runtime_error("boom");
+    } catch (...) {
+    }
+    clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
+    CHECK_FALSE(gate.should_log("b", "2:g")); // b's slot is untouched by a's unwind
+    CHECK(gate.should_log("a", "1:f"));       // a's slot was released
 }
 
 TEST_CASE("EchoCorruptionAuditGate: per-agent map is bounded by fleet, never wiped",
@@ -2240,7 +2333,7 @@ TEST_CASE("EchoCorruptionAuditGate: per-agent map is bounded by fleet, never wip
     for (int i = 0; i < kAgents; ++i) {
         if (gate.should_log("agent-" + std::to_string(i), "1:f")) {
             ++admitted;
-            gate.mark_failed();
+            gate.mark_failed("agent-" + std::to_string(i));
             clock += yuzu::server::detail::kEchoCorruptionAuditDegradedRetry;
         }
     }
@@ -2303,7 +2396,7 @@ TEST_CASE("echo corruption audit detail: encode/decode round-trip and sink compo
         if (!gate.should_log(a, q))
             return;
         // Mirrors server.cpp's sink shape: a Reservation, not raw mark_logged/mark_failed.
-        EchoCorruptionAuditGate::Reservation res(gate);
+        EchoCorruptionAuditGate::Reservation res(gate, a);
         if (log_ok) {
             rows.push_back(encode_echo_corruption_detail(t, q));
             res.logged(a, q);
