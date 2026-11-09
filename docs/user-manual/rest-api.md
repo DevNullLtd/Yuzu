@@ -13407,9 +13407,12 @@ and nothing is created (audited `schedule.create`, `result=denied`, `detail=fiel
 value the store refuses as invalid text (for example a byte sequence that is not valid UTF-8) or as a
 constraint violation is also `400`, audited `result=denied`, `detail=invalid_field_value` (empty target,
 the value is never echoed). A body that is not valid JSON is `400` with the fixed message
-`invalid JSON in request body`, and no audit row. A store fault (the database is not open, or the
+`invalid JSON in request body`, and no audit row. A store fault before any write (the database is not open, or the
 insert failed) answers `503` with `retry_after_ms` and is audited `result=failure`,
-`detail=store_error`; a `503` is never a created schedule.
+`detail=store_error`; nothing was created and a retry is safe. A fault after the insert ran (the
+transaction did not report success) answers `503` with `error.outcome` set to `unknown` and **no**
+`retry_after_ms`, audited `result=failure`, `detail=outcome_unknown`: the schedule may or may not
+exist, so list schedules before creating it again.
 
 #### `DELETE /api/schedules/{id}`
 
