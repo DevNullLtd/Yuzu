@@ -915,8 +915,8 @@ bool GuaranteedStateStore::delete_agent(std::string_view agent_id) {
     // deletes of this method and of delete_rule's cascade take row locks in heap order, so two
     // transactions that overlap on several census rows could in principle deadlock; Postgres
     // aborts one, this method then returns false and the re-issue is idempotent. A pending event
-    // committed after the list is read is not retired here (the gap delete_rule documents too,
-    // #6829; the sweep of stranded pending evidence is tracked in #7147). Every statement result is
+    // committed after the list is read is not retired here (delete_rule has the same list-read
+    // gap; the sweep of stranded pending evidence is tracked in #7147). Every statement result is
     // checked: a false return rolls the whole transaction back, so the decommission cascade records
     // Failed and the re-issue is idempotent. The failure reason is logged at warn level, because
     // the pool's last_error() is set only by connect and acquire failures and never by a failed

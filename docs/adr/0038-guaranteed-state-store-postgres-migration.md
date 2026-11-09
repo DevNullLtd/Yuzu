@@ -277,12 +277,12 @@ erasure position for them. Widening the decommission to erase the events or the 
 follow-up that needs its own Update to this ADR and the store header; it is not made here and the
 follow-up issue is not yet filed.
 
-Known gap (tracker #7147; `delete_rule` documents the same list-read gap, #6829): a pending event committed after `delete_agent` read the
+Known gap (tracker #7147, which also covers the sweep of stranded pending evidence; `delete_rule` has the same list-read gap): a pending event committed after `delete_agent` read the
 agent's pending list but before it deleted the census rows is not retired by that transaction. A later
 pending event for a decommissioned agent likewise stays pending and is exempt from the events reaper
 until something retires it (a rule delete, a later decommission, a redelivery repair, or a later
-verdict that out-ranks it). A still-running agent re-creates its census row only at its next
-census-bearing state change (not on a schedule), and a journal replay cannot rebuild the census from retired
+verdict that out-ranks it). A still-running agent re-creates its census row on its next
+census-bearing event (after a state change, an agent restart or a rule push; not on a schedule), and a journal replay cannot rebuild the census from retired
 evidence (the retained events are redelivered with no repair), so the agent is stopped first.
 
 ## Follow-ups

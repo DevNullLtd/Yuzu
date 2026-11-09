@@ -203,8 +203,9 @@
             'Guardian event history and DEX observations are kept until retention expires (30 ' +
             'days by default). It cannot be undone.',
           'It does not unenrol the device; a connected agent will report again, but Guardian ' +
-            'compliance results return only when the device next changes state. Tags, custom ' +
-            'properties, quarantine records and property schemas are not removed.'
+            'compliance results return when the agent next reports a rule result (after a ' +
+            'state change, a restart or a rule push). Tags, custom properties, quarantine ' +
+            'records and property schemas are not removed.'
         ],
         fields: [],
         danger: true,

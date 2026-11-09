@@ -1,8 +1,9 @@
 // AgentDecommission cascade tests (ADR-0024 Decision 11 / roadmap D-3): the
 // single decommission entry point that fans `delete_agent(agent_id)` across
 // EVERY per-agent store, so an operator decommission durably erases a machine's
-// stored rows — the GDPR-erasure path the per-store `delete_agent` methods could
-// not deliver on their own (zero production callers before this seam).
+// stored rows (see agent_decommission.hpp for what Deleted means per store), the
+// GDPR-erasure path the per-store `delete_agent` methods could not deliver on their own
+// (zero production callers before this seam).
 //
 // Two layers:
 //   * pure fan-out logic ([decommission]) — order, counts, null-skip,

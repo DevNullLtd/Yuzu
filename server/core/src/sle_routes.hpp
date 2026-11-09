@@ -41,7 +41,8 @@
 ///     PR 2a-2b), plus `GuaranteedStateStore` (#5675: the Guardian compliance census,
 ///     `guardian_agent_rule_status`, read-gated by `GuaranteedState`; the device's pending census
 ///     evidence is retired, while its Guardian event log and DEX observations are not erased and
-///     expire by retention). This was originally a
+///     expire by retention, which is 30 days by default; rows written while the retention
+///     setting is 0 or below never expire). This was originally a
 ///     hand-maintained conjunction over the per-store securables (rejected as of
 ///     Decision 9's reversal — see the ADR): it stopped scaling once a fourth
 ///     securable (`Forensics`, via `AppUsageStore`) was set to join the cascade, per

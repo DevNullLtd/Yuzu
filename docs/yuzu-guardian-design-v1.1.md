@@ -1311,7 +1311,7 @@ retained pending backlog; a lock wait, a loaded database or an administrator can
 overview for the operator-facing contract. A device decommission (the ninth agent-decommission cascade store, key
 `guaranteed_state`, #5675) takes the same two steps in the same order for one agent: it locks the agent's pending events
 in `ingest_seq` order, sets `projection_pending` false on them, then deletes the agent's census rows, adding no lock; the
-event log and DEX observations are not erased by it and expire by retention.
+event log and DEX observations are not erased by it and expire by retention (30 days by default; rows written while the retention setting is 0 or below never expire).
 
 ### 9.2 REST API endpoints
 

@@ -333,9 +333,11 @@ public:
     /// row is locked. True iff the transaction committed; zero rows is still true (idempotent).
     /// False on an empty id, a store that is not open, a lease timeout, a failed statement or a
     /// failed COMMIT (the whole transaction is rolled back). The event log and the DEX
-    /// observations are NOT erased (they expire by retention). This is not a rule mutation: no
-    /// policy-generation bump, no `on_rule_mutation_` hook, no push. A still-running agent's next
-    /// census-bearing event re-creates its row (stop the agent first).
+    /// observations are NOT erased (they expire by retention, which is 30 days by default; rows
+    /// written while the retention setting is 0 or below never expire). This is not a rule
+    /// mutation: no policy-generation bump, no `on_rule_mutation_` hook, no push. A still-running
+    /// agent's next census-bearing event (after a state change, an agent restart or a rule push;
+    /// not on a schedule) re-creates its row (stop the agent first).
     [[nodiscard]] bool delete_agent(std::string_view agent_id);
     /// Three-state read (ADR-0038 catastrophic-read set): found / genuinely
     /// absent (`std::nullopt`) / degraded (`std::unexpected`). Callers MUST

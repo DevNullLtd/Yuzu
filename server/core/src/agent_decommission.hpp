@@ -3,7 +3,8 @@
 /// @file agent_decommission.hpp
 /// The agent-decommission cascade (ADR-0024 Decision 11 / roadmap D-3): a single
 /// entry point that fans `delete_agent(agent_id)` across EVERY per-agent store,
-/// so that an operator decommission CAN durably erase a machine's stored rows.
+/// so that an operator decommission CAN durably erase a machine's stored rows (see
+/// "WHAT `Deleted` MEANS IS PER STORE" below for what that means per store).
 /// This is the GDPR-erasure MECHANISM half; the per-store `delete_agent` methods
 /// exist on each store but had ZERO production callers before this seam (they
 /// were invoked only from unit tests). The PRODUCTION TRIGGER is now LIVE:

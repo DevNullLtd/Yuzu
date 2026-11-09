@@ -484,7 +484,7 @@ Decision numbers are stable, since other documents cite them.
     after `AppPerfDailyStore`. The Guardian event log and DEX observations are NOT erased by this
     decommission; they are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire). Widening the erasure to them is a separate follow-up, not yet filed, that needs an
     ADR-0038 Update. The "five per-agent stores" list in Decisions 9 and 11 is left as written; it is history.
-    A still-running agent re-creates its census row on its next census-bearing event, so stop the agent first.)*
+    A still-running agent re-creates its census row on its next census-bearing event (after a state change, an agent restart or a rule push; not on a schedule), so stop the agent first.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`

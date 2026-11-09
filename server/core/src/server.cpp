@@ -10903,9 +10903,9 @@ public:
 
     /// Decommission an agent for good: fan `delete_agent(agent_id)` across every
     /// per-agent store this server owns, durably erasing the rows each store deletes
-    /// for the machine (the Guardian store keeps its event log and DEX observations
-    /// until retention expiry, see agent_decommission.hpp) (ADR-0024 Decision 11 — the GDPR-erasure
-    /// path; the per-store `delete_agent` methods had no production caller before this).
+    /// for the machine (ADR-0024 Decision 11, the GDPR-erasure path; the per-store
+    /// `delete_agent` methods had no production caller before this). The Guardian store keeps
+    /// its event log and DEX observations until retention expiry (see agent_decommission.hpp).
     /// Best-effort in execution, ACCOUNTABLE in result, and null-tolerant: a store that is not
     /// configured (e.g. no Postgres reachable, so every per-agent store — all born-on-PG — is
     /// absent) is skipped, and one store's failure never aborts the others — but each
