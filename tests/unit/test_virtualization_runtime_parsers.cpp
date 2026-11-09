@@ -559,7 +559,7 @@ TEST_CASE("runtime inspect: privileged, network mode and the host-socket mount f
     }
     // unrelated mounts, and a path that merely shares a prefix
     for (const char* src : {"/data", "/run/dockerx", "/var/lib/docker", "/runx", "/run/user/1000",
-                            "/home/a", "relative/run"}) {
+                            "/home/jsmith", "relative/run"}) {
         ContainerRow r = make();
         REQUIRE(apply_inspect(r, json{{"HostConfig", json::object()},
                                       {"Mounts", json::array({{{"Source", src}}})}}));
