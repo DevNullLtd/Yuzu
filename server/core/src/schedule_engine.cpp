@@ -89,6 +89,19 @@ constexpr const char* kSelectAllCols =
     "requires_approval, enabled, next_execution_at, last_executed_at, "
     "execution_count, created_by, created_at, parameter_values";
 
+/// SQLSTATE of a failed result, or empty when the result carries none (a null result, a pool
+/// failure before any statement ran).
+std::string result_sqlstate(const pg::PgResult& res) {
+    const char* p = res.get() ? PQresultErrorField(res.get(), PG_DIAG_SQLSTATE) : nullptr;
+    return p ? std::string(p) : std::string();
+}
+
+/// SQLSTATE class 22 (data exception: invalid byte sequence, NUL byte, value out of range) or
+/// class 23 (integrity violation): the statement refused the request's values, not a store fault.
+bool sqlstate_is_value_refusal(const std::string& state) {
+    return state.size() == 5 && (state.compare(0, 2, "22") == 0 || state.compare(0, 2, "23") == 0);
+}
+
 bool is_valid_frequency(const std::string& freq) {
     return freq == "once" || freq == "interval" || freq == "daily" || freq == "weekly" ||
            freq == "monthly";
@@ -294,7 +307,7 @@ ScheduleEngine::query_schedules_checked(const ScheduleQuery& q) const {
 std::expected<std::string, std::string>
 ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
     if (!open_)
-        return std::unexpected("database not open");
+        return std::unexpected(kScheduleCreateNotOpenError);
     if (sched.name.empty())
         return std::unexpected("name is required");
     if (sched.definition_id.empty())
@@ -347,6 +360,7 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
                     ? sched.next_execution_at
                     : compute_initial_next_execution(sched.frequency_type, sched.interval_minutes);
 
+    std::string failed_sqlstate;
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult res = pg::exec_params(
             conn,
@@ -366,6 +380,7 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
                 sched.created_by, std::to_string(sched.created_at > 0 ? sched.created_at : now),
                 *canon_params});
         if (res.status() != PGRES_COMMAND_OK) {
+            failed_sqlstate = result_sqlstate(res);
             spdlog::error("ScheduleEngine::create_schedule: insert failed: {}",
                           PQresultErrorMessage(res.get()));
             return false;
@@ -373,12 +388,40 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
         return true;
     });
 
-    if (!ok)
-        return std::unexpected("insert failed (pool degraded or transaction failed)");
+    if (!ok) {
+        if (sqlstate_is_value_refusal(failed_sqlstate))
+            return std::unexpected(kScheduleCreateValueRefusedError);
+        return std::unexpected(kScheduleCreateInsertFailedError);
+    }
 
     spdlog::info("ScheduleEngine: created schedule '{}' (id={}, freq={})", sched.name, id,
                  sched.frequency_type);
     return id;
+}
+
+// ---------------------------------------------------------------------------
+// Owned-row point read
+// ---------------------------------------------------------------------------
+
+OwnedScheduleLookup
+ScheduleEngine::owned_schedule_exists_checked(const std::string& id,
+                                              const std::string& created_by) const {
+    if (!open_)
+        return OwnedScheduleLookup::Unreadable;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return OwnedScheduleLookup::Unreadable;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT 1 FROM schedule_engine.schedules WHERE id=$1 AND created_by=$2 LIMIT 1",
+        std::vector<std::string>{id, created_by});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ScheduleEngine::owned_schedule_exists_checked: query failed: {}",
+                     PQresultErrorMessage(res.get()));
+        return OwnedScheduleLookup::Unreadable;
+    }
+    return PQntuples(res.get()) > 0 ? OwnedScheduleLookup::Exists : OwnedScheduleLookup::Absent;
 }
 
 // ---------------------------------------------------------------------------

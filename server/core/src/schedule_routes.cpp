@@ -2,6 +2,7 @@
 
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "mcp_retry.hpp"   // mcp::kMcpStoreFaultRetryMs: the shared transient-fault retry floor
 #include "query_int_parse.hpp"
 #include "rbac_text.hpp" // rbac_text_is_clean: the shared clean-identifier predicate
 #include "schedule_engine.hpp"
@@ -64,28 +65,47 @@ enum class MissCause {
 };
 
 /// The engine's write methods return a bare bool, so a store fault and an absent row look the
-/// same. Classify a false result with one checked, owner-filtered read: an unreadable store, or a
-/// row that exists and belongs to `user`, is a store fault; a listing that was cut at its cap
-/// cannot prove absence and is treated the same way. Only an answered read that shows no such
-/// owned row is NotFound (a row owned by someone else is deliberately the same answer, so ids
-/// cannot be probed across owners).
+/// same. Classify a false result with one owner-filtered point read by (id, owner), independent
+/// of any listing cap: an unreadable store, or a row that exists and belongs to `user`, is a
+/// store fault (the write did not apply to a row it should have matched). Only an answered read
+/// that shows no such owned row is NotFound (a row owned by someone else is deliberately the
+/// same answer, so ids cannot be probed across owners).
 [[nodiscard]] MissCause classify_write_miss(const ScheduleEngine& engine, const std::string& id,
                                             const std::string& user) {
-    const auto listed = engine.query_schedules_checked();
-    if (!listed)
-        return MissCause::StoreFault;
-    for (const auto& s : listed->schedules) {
-        if (s.id == id && s.created_by == user)
-            return MissCause::StoreFault;
+    switch (engine.owned_schedule_exists_checked(id, user)) {
+    case OwnedScheduleLookup::Absent:
+        return MissCause::NotFound;
+    case OwnedScheduleLookup::Exists:
+    case OwnedScheduleLookup::Unreadable:
+        break;
     }
-    return listed->truncated ? MissCause::StoreFault : MissCause::NotFound;
+    return MissCause::StoreFault;
 }
 
-/// True when `create_schedule` failed because of the store (not the request). These two texts are
-/// the engine's own store-fault results; every other create error is a request-validation text.
+/// True when `create_schedule` failed because the store could not take the write (not the
+/// request). `kScheduleCreateValueRefusedError` (a field value the store refused as invalid text
+/// or as violating a constraint) and every request-validation text are answered 400 instead.
 [[nodiscard]] bool create_error_is_store_fault(const std::string& err) {
-    return err == "database not open" ||
-           err == "insert failed (pool degraded or transaction failed)";
+    return err == kScheduleCreateNotOpenError || err == kScheduleCreateInsertFailedError;
+}
+
+/// A NUL byte in a free-text create field (the store cannot hold one).
+[[nodiscard]] bool contains_nul(const std::string& s) noexcept {
+    return s.find('\0') != std::string::npos;
+}
+
+/// The 503 for a store fault: the same A4 envelope as `send_error` plus the shared transient-fault
+/// `retry_after_ms` hint.
+void send_store_fault(httplib::Response& res) {
+    res.status = 503;
+    res.set_content(
+        nlohmann::json({{"error",
+                         {{"code", 503},
+                          {"message", "schedule store unavailable"},
+                          {"retry_after_ms", mcp::kMcpStoreFaultRetryMs}}},
+                        {"meta", {{"api_version", "v1"}}}})
+            .dump(),
+        "application/json");
 }
 
 } // namespace
@@ -187,6 +207,22 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             sched.time_of_day = j.value("time_of_day", "00:00");
             sched.scope_expression = j.value("scope_expression", "");
             sched.requires_approval = j.value("requires_approval", false);
+            // A NUL byte cannot be stored in a text column: refuse it here, before the engine,
+            // so the answer is a client error with a denied row rather than a store fault.
+            for (const std::string* field :
+                 {&sched.name, &sched.definition_id, &sched.frequency_type, &sched.time_of_day,
+                  &sched.scope_expression}) {
+                if (contains_nul(*field)) {
+                    (void)deps.audit_fn(req, "schedule.create", "denied", "schedule", "",
+                                        "field_contains_nul");
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", "a schedule field must not contain a NUL byte"}})
+                            .dump(),
+                        "application/json");
+                    return;
+                }
+            }
             // Strict integers with the documented ranges (#4644): a wrapped or fractional value
             // used to become a different, valid-looking schedule, and nothing is created on a 400.
             for (const auto& err :
@@ -243,7 +279,7 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
                 if (create_error_is_store_fault(result.error())) {
                     (void)deps.audit_fn(req, "schedule.create", "failure", "schedule", "",
                                         "store_error");
-                    send_error(res, 503, "schedule store unavailable");
+                    send_store_fault(res);
                     return;
                 }
                 res.status = 400;
@@ -307,7 +343,7 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
         } else if (classify_write_miss(*deps.schedule_engine, id, user) ==
                    MissCause::StoreFault) {
             (void)deps.audit_fn(req, "schedule.delete", "failure", "schedule", id, "store_error");
-            send_error(res, 503, "schedule store unavailable");
+            send_store_fault(res);
             return;
         }
         res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
@@ -380,7 +416,7 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             // No row changed: answer what actually happened, never the requested state.
             if (classify_write_miss(*deps.schedule_engine, id, user) == MissCause::StoreFault) {
                 (void)deps.audit_fn(req, audit_action, "failure", "schedule", id, "store_error");
-                send_error(res, 503, "schedule store unavailable");
+                send_store_fault(res);
                 return;
             }
             send_error(res, 404, "schedule not found");

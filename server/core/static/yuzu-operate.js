@@ -1437,6 +1437,10 @@
       return YuzuDialog.request('POST', '/api/schedules/' + encodeURIComponent(id) + '/enable',
         { json: { enabled: want } }).then(function (r) {
         if (!r.ok) {
+          if (r.status === 404) {
+            showToast('The schedule was not changed. Only its creator can enable or disable it.', 'warning');
+            return;
+          }
           showToast(r.status === 403 ? 'You do not have permission to change this schedule.'
             : errText(r, 'Could not change the schedule (HTTP ' + r.status + ').'), 'error');
           return;
@@ -1468,6 +1472,7 @@
             { json: { enabled: true } }).then(function (r) {
             if (r.ok) return null;
             if (r.status === 403) return 'You do not have permission to enable schedules.';
+            if (r.status === 404) return 'The schedule was not changed. Only its creator can enable or disable it.';
             return errText(r, 'Could not enable the schedule (HTTP ' + r.status + ').');
           });
         }
