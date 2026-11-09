@@ -458,7 +458,7 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl
 # These lines NARROW the argv shape; they do not confine pfctl: sudo globs match concatenated
 # args, and the anchor file named by -f is agent-generated. The confinement is the firewall
 # plugin's token validation (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp).
-# The bare grant is removed with the quarantine plugin (PRQ.2); until then these lines are
+# The bare grant is removed when the quarantine plugin is removed; until then these lines are
 # cosmetic next to it. The anchor name sorts first among Apple's com.apple/* sub-anchors, and
 # the release flush is -F rules / -F nat on that anchor only (never -F all: that is global).
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E

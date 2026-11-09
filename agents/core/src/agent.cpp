@@ -669,7 +669,14 @@ YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key)
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->exists(impl->plugin_name, key) ? 0 : 1;
+    // 0 present, 1 absent, negative on error (plugin.h): a store that could not answer
+    // (closed handle, SQLITE_BUSY after the busy budget, a failed prepare) is -3, never
+    // "absent" -- a plugin that treats absent as "nothing to recover" would otherwise
+    // act on a fault as if it were the answer.
+    const auto present = impl->kv_store->exists_checked(impl->plugin_name, key);
+    if (!present)
+        return -3;
+    return *present ? 0 : 1;
 }
 
 YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char* prefix) {

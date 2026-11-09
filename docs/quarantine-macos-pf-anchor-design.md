@@ -335,11 +335,11 @@ in `pfctl -s rules` that a second plugin could test for. On Windows and Linux th
 `firewall` actions refuse (`refused|legacy_quarantine_active`) when the legacy
 plugin's own objects are present (rules named `YuzuQuarantine_*`; the iptables
 chain `yuzu-quarantine`). On macOS that check is not possible, so the clash is a
-**stated residual until the legacy plugin is deleted (PRQ.2)**:
+**stated residual until the legacy plugin is deleted**:
 
-- if the legacy plugin is quarantined first, the `firewall` leg's anchor loads but
-  the main ruleset is the legacy one, which does not reference `com.apple/*`: the
-  apply fails `anchor_not_referenced` (nothing is loaded);
+- if the legacy plugin is quarantined first, the main ruleset is the legacy one,
+  which does not reference `com.apple/*`: the `firewall` apply fails
+  `anchor_not_referenced` before the anchor is loaded (nothing is loaded);
 - if `firewall` is quarantined first and the legacy plugin then quarantines, the
   legacy single-call load replaces the main ruleset and our anchor goes dangling
   the same way; the legacy `unquarantine` then reloads `/etc/pf.conf`, which makes
@@ -347,7 +347,7 @@ chain `yuzu-quarantine`). On macOS that check is not possible, so the clash is a
   anchor.
 
 Neither order strands the host (both end in a block-all), but the operator can
-see two quarantines that disagree. PRQ.2 removes the legacy plugin.
+see two quarantines that disagree. Removing the legacy plugin ends it.
 
 ## 4. Persistence across reboot, and the gap before it
 
@@ -407,8 +407,8 @@ action. The same statement applies to the Linux `nft -f *` grant and is repeated
 agent account can already author any ruleset these grants will load; that is an
 accepted property of the grant, not a reason to widen it.
 
-**PRQ.2 obligation: remove the bare `/sbin/pfctl` grant** when the legacy plugin
-is deleted. Until then the narrow lines above are cosmetic next to it, and the real
+**Obligation when the quarantine plugin is removed: remove the bare `/sbin/pfctl`
+grant.** Until then the narrow lines above are cosmetic next to it, and the real
 boundary is server dispatch plus the integrity of the agent process.
 
 **Private staging.** The ruleset is written to `<agent.data_dir>/firewall-staging`,
@@ -437,11 +437,11 @@ fake clock for the 60 second operation deadline, an in-memory record, and a cras
 simulated after every runner call. What no unit test can cover is how pf itself
 behaves; that is section 8.
 
-## 7. Preflight signals for the server cut-over (PRQ.2)
+## 7. Preflight signals for the server cut-over
 
 A quarantine whose allow set cannot reach the control channel strands the host.
 The agent verifies after applying and rolls back on failure (so the agent is safe
-on its own), but the server should warn before dispatching. Signals PRQ.2 should
+on its own), but the server should warn before dispatching. Signals the cut-over should
 read, recorded here because they size the contract:
 
 - **Hostname-only server address.** The control endpoints are the addresses the
@@ -455,7 +455,7 @@ read, recorded here because they size the contract:
 - **A re-addressed server.** ADR-2002 (lines 487-489) already records that a
   server that moves to a new address strands a quarantined agent, because an
   agent never auto-releases on lost contact. The optional TTL is the offline
-  bound; break-glass is PRQ.2.
+  bound; break-glass belongs to the cut-over.
 
 ## 8. Open questions and the reproduction plan
 
@@ -554,7 +554,7 @@ condition landed:
 | MEDIUM 4 | Disabled with a stored token is repaired; `-X` failure tolerated | 2.4, `pf_enable_plan`, `apply_and_verify` repair |
 | MEDIUM 5 | honest undo; compare rules, Status line, references; flush is one-way; no `-a -F all` | 2.3, 2.4, 2.6 |
 | MEDIUM 6 | `-F states` failure is a failed apply; record before `-E`, leak as residual | 2.3, 2.4 |
-| MEDIUM 7 | bare grant removal; private 0700 `O_EXCL` staging; digits-only token | 5 (bare grant: PRQ.2) |
+| MEDIUM 7 | bare grant removal; private 0700 `O_EXCL` staging; digits-only token | 5 (bare grant: when the quarantine plugin is removed) |
 | MEDIUM 8 | reboot gap stated | 4, catalogue row, README |
 | LOW 9 | tighter DHCP and ICMPv6; DNS tunnelling residual | 2.2, 2.7 |
 | LOW 10 | exact anchor-reference match; necessary, not sufficient | 2.5 |

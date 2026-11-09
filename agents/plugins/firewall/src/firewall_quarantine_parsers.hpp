@@ -22,8 +22,9 @@
  * agent-generated file content). What actually confines the privileged call is
  * that every token reaching an argv or a ruleset line is built here from a
  * typed, validated value and then re-checked against a strict charset
- * (is_safe_token / is_safe_ruleset_line: no whitespace in a token, no `;`,
- * quote, `$`, backtick, `|`, `&`, `#`, `\` or newline anywhere). Operator text
+ * (is_safe_token: no whitespace, `;`, quote, `$`, backtick, `|`, `&`, `#`, `\` or
+ * newline; is_safe_ruleset_line adds only space, braces, `,`, the `;` between nft
+ * chain properties and one fixed TCP-flags clause, nothing else). Operator text
  * is never interpolated: an address is parsed to bytes and re-formatted, a port
  * is a bounded integer, a protocol and a direction are enums. Do not add a code
  * path that puts a caller-supplied string into an argv or a ruleset.
@@ -109,19 +110,51 @@ inline constexpr std::chrono::milliseconds kProbeTimeout{2'000};
     return true;
 }
 
+/// The one fixed nft clause that carries operator characters: the stateless reply
+/// path's "not a bare SYN" (a peer must not open a NEW connection from its service
+/// port). It is a literal, never built from input, and the only place `&`, `|`,
+/// `(`, `)`, `!` and `=` are admitted, so no operator text can use them.
+inline constexpr std::string_view kNftReplyFlagsMatch = "tcp flags & (syn|ack) != syn";
+
 /// A whole generated ruleset line: the token charset plus the structural
 /// characters our own templates use (space, braces, `;` between nft chain
-/// properties, `,` inside a set). Still no quote, `$`, backtick, `|`, `&`, `#`,
-/// `\`, tab or newline.
+/// properties, `,` inside a set) and kNftReplyFlagsMatch verbatim. Still no quote,
+/// `$`, backtick, `#`, `\`, tab or newline, and `|` / `&` only inside that literal.
 [[nodiscard]] constexpr bool is_safe_ruleset_line(std::string_view line) noexcept {
     if (line.size() > 512)
         return false;
-    for (char c : line) {
+    for (std::size_t i = 0; i < line.size();) {
+        if (line.substr(i).starts_with(kNftReplyFlagsMatch)) {
+            i += kNftReplyFlagsMatch.size();
+            continue;
+        }
+        const char c = line[i++];
         if (is_safe_token_char(c) || c == ' ' || c == '{' || c == '}' || c == ';' || c == ',')
             continue;
         return false;
     }
     return true;
+}
+
+/// A staged ruleset file's path, the ONE argv token allowed outside is_safe_token's
+/// charset: it is produced by us (a mkstemps name inside the agent's own 0700
+/// staging directory `dir`) and passed as a single argv element, never through a
+/// shell, so a space in the data directory (macOS `/Library/Application Support/`)
+/// is safe. Absolute, directly under `dir`, a plain token-charset file name, no
+/// control character anywhere, no `..` component.
+[[nodiscard]] constexpr bool is_safe_staged_path(std::string_view path, std::string_view dir) noexcept {
+    if (path.size() > 512 || dir.empty() || dir.front() != '/' || dir.back() == '/')
+        return false;
+    for (const char c : path)
+        if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f)
+            return false;
+    if (dir.find("/../") != std::string_view::npos || dir.ends_with("/.."))
+        return false;
+    if (path.size() <= dir.size() + 1 || !path.starts_with(dir) || path[dir.size()] != '/')
+        return false;
+    const auto leaf = path.substr(dir.size() + 1);
+    return leaf != "." && leaf != ".." && leaf.find('/') == std::string_view::npos &&
+           is_safe_token(leaf);
 }
 
 /// Every line of a multi-line ruleset passes is_safe_ruleset_line.
@@ -937,6 +970,22 @@ parse_probe_target(std::string_view text) {
     return ProbeTarget{*ip, *port};
 }
 
+/// Does an operator exception already admit the probe target (outbound, TCP, the
+/// target's address and port)? Then the block could never be proven and the apply
+/// would only verify `probe_still_reachable` and roll back (an update would revert,
+/// flushing pf states twice): refused up front, before any mutation.
+[[nodiscard]] inline bool exception_covers_probe_target(const AllowSet& set, const ProbeTarget& t) {
+    for (const auto& e : set.exceptions) {
+        if (e.dir != Dir::out || e.proto == Proto::udp || e.ip.v6 != t.ip.v6)
+            continue;
+        if (e.port != 0 && e.port != t.port)
+            continue;
+        if (mask_to_prefix(t.ip, e.prefix) == mask_to_prefix(e.ip, e.prefix))
+            return true;
+    }
+    return false;
+}
+
 // ── TTL ─────────────────────────────────────────────────────────────────────
 
 [[nodiscard]] constexpr bool validate_ttl(std::int64_t seconds) noexcept {
@@ -952,6 +1001,22 @@ parse_probe_target(std::string_view text) {
     if (!v || !validate_ttl(*v))
         return std::unexpected("ttl_out_of_bounds");
     return *v;
+}
+
+/// A time limit is NOT offered in this release: it rides the wall clock (a restored
+/// snapshot or a dead RTC lifts containment early or never, and NTP is not in the
+/// allow set), and an expiry release is invisible to the server (the trigger's
+/// output is discarded). The TTL core, trigger seam and records below stay, so
+/// PRQ.2 flips this one constant once releases are recorded server-side and a time
+/// source is allowed.
+inline constexpr bool kTtlAvailable = false;
+
+/// `refused|ttl_unavailable` for any `ttl_seconds` value while kTtlAvailable is
+/// false; checked before anything else so nothing is validated, probed or written.
+[[nodiscard]] inline std::optional<std::string> ttl_param_refusal(std::string_view param) {
+    if (!kTtlAvailable && !param.empty())
+        return std::string{"ttl_unavailable"};
+    return std::nullopt;
 }
 
 // ── State record ────────────────────────────────────────────────────────────
@@ -996,6 +1061,7 @@ struct OsPayload {
     std::uint32_t rules_not_disabled = 0; // Windows: enabled rules the policy store refused to disable
     std::uint32_t stale_rules_left = 0;   // Windows: a previous generation's rules that would not delete
     bool state_flush_failed = false;      // macOS: the anchor load committed but its state flush did not
+    bool ttl_unregistered = false;        // the TTL trigger could not be registered: nothing will expire it
     friend bool operator==(const OsPayload&, const OsPayload&) = default;
 };
 
@@ -1004,7 +1070,8 @@ struct OsPayload {
 /// the record no longer lists), so each is persisted and read back by every status
 /// until a later apply clears it.
 [[nodiscard]] inline bool has_residue(const OsPayload& os) noexcept {
-    return os.rules_not_disabled > 0 || os.stale_rules_left > 0 || os.state_flush_failed;
+    return os.rules_not_disabled > 0 || os.stale_rules_left > 0 || os.state_flush_failed ||
+           os.ttl_unregistered;
 }
 
 /// The status reason for the first residue, in a fixed order.
@@ -1015,6 +1082,8 @@ struct OsPayload {
         return "stale_rules_left";
     if (os.state_flush_failed)
         return "state_flush_failed";
+    if (os.ttl_unregistered)
+        return "ttl_unregistered";
     return {};
 }
 
@@ -1027,6 +1096,8 @@ struct OsPayload {
         n.push_back(std::format("stale_rules_left={}", os.stale_rules_left));
     if (os.state_flush_failed)
         n.emplace_back("state_flush_failed=1");
+    if (os.ttl_unregistered)
+        n.emplace_back("ttl_unregistered=1");
     return n;
 }
 
@@ -1071,6 +1142,8 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
         out += std::format("stale_left={}\n", s.os.stale_rules_left);
     if (s.os.state_flush_failed)
         out += "flush_failed=1\n";
+    if (s.os.ttl_unregistered)
+        out += "ttl_unreg=1\n";
     if (!s.last_verify.empty())
         out += std::format("verify={}\n", detail::sanitize_text(s.last_verify));
     for (const auto& c : s.allow.control)
@@ -1082,9 +1155,10 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
     return out;
 }
 
-/// Strict: an unknown key, a duplicate scalar, a bad number or a version other
-/// than 1 is "malformed" (nullopt) -- reported as `degraded|state_unreadable`,
-/// never silently dropped.
+/// A duplicate scalar, a bad number, a bad value for a key this build knows or a
+/// version other than 1 is "malformed" (nullopt) -- reported as
+/// `degraded|state_unreadable`, never silently dropped. A key this build does not
+/// know is skipped (a downgrade over a newer record must still read it).
 [[nodiscard]] inline std::optional<QuarantineState> parse_state(std::string_view text) {
     if (text.empty() || text.size() > kMaxStateBytes)
         return std::nullopt;
@@ -1093,7 +1167,7 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
     bool seen_prev = false, seen_applied = false, seen_ttl = false;
     bool seen_probe = false, seen_pf = false, seen_boot = false, seen_ipt = false,
          seen_verify = false, seen_nd = false, seen_v6 = false, seen_stale = false,
-         seen_flush = false;
+         seen_flush = false, seen_ttl_unreg = false;
     for (const auto line : detail::split(text, '\n')) {
         if (line.empty())
             continue;
@@ -1190,6 +1264,10 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
             if (!once(seen_flush) || val != "1")
                 return std::nullopt;
             s.os.state_flush_failed = true;
+        } else if (key == "ttl_unreg") {
+            if (!once(seen_ttl_unreg) || val != "1")
+                return std::nullopt;
+            s.os.ttl_unregistered = true;
         } else if (key == "boot_time") {
             if (!once(seen_boot) || !is_safe_token(val))
                 return std::nullopt;
@@ -1213,9 +1291,12 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
             if (!e)
                 return std::nullopt;
             s.allow.exceptions.push_back(*e);
-        } else {
-            return std::nullopt;
         }
+        // Any other key is skipped: a newer build may add keys under the same `v=1`,
+        // and refusing the record on a downgrade would strand a contained host (no
+        // re-apply at start, no TTL, a pf token that release then never frees). The
+        // record is this plugin's own KV entry, not an input boundary, so strictness
+        // buys nothing here; a `v` bump remains the incompatibility signal.
     }
     if (!seen_v || !seen_phase || !seen_gen || !seen_backend || s.generation == 0 ||
         s.allow.control.empty() || s.allow.control.size() > kMaxControlIps ||
@@ -1244,6 +1325,11 @@ struct WinRuleSpec {
     std::string local_ports;
     std::string remote_ports;
     std::string icmp_types;   // e.g. "133:*,134:*"; empty otherwise
+    /// INetFwRule::ServiceName: scopes a rule to one Windows service's traffic. The
+    /// DHCP allowances name `dhcp`, as Core Networking's own DHCP rules do, so
+    /// UDP 68 -> 67 is open to the DHCP client service only, not to any process
+    /// that can bind port 68. Empty: no service restriction.
+    std::string service_name;
     friend bool operator==(const WinRuleSpec&, const WinRuleSpec&) = default;
 };
 
@@ -1284,6 +1370,7 @@ struct WinRuleSpec {
                 s.protocol = 17;
                 s.local_ports = "68";
                 s.remote_ports = "67";
+                s.service_name = "dhcp";
                 add(std::move(s));
             }
             break;
@@ -1320,20 +1407,74 @@ struct WinRuleInfo {
     std::string name;
     std::string group;
     bool enabled = false;
+    int direction = 0; // INetFwRule::Direction (1 in, 2 out)
+    int profiles = 0;  // INetFwRule::Profiles bitmask
 };
 
-/// Every ENABLED rule outside our group (an Allow RULE beats a profile-default
-/// block, so leaving them enabled would leave the host reachable). Ours are
-/// never listed, whatever their group string says.
+/// The identity of one stock rule across a quarantine: Windows ships rules that
+/// share a NAME and differ by direction or profile (File and Printer Sharing,
+/// WinRM HTTP-In), one on and one off. The disable list and the release match on
+/// all three, so a rule that was OFF before is never switched on by a release.
+[[nodiscard]] inline std::string win_rule_key(std::string_view name, int direction, int profiles) {
+    return std::format("{}|{}|{}", name, direction, profiles);
+}
+[[nodiscard]] inline std::string win_rule_key(const WinRuleInfo& r) {
+    return win_rule_key(r.name, r.direction, r.profiles);
+}
+
+/// The keys of every ENABLED rule outside our group (an Allow RULE beats a
+/// profile-default block, so leaving them enabled would leave the host reachable).
+/// Ours are never listed, whatever their group string says.
 [[nodiscard]] inline std::vector<std::string>
 win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
     std::vector<std::string> out;
     for (const auto& r : rules) {
         if (!r.enabled || is_our_win_rule(r.name, r.group))
             continue;
-        out.push_back(r.name);
+        out.push_back(win_rule_key(r));
     }
     return out;
+}
+
+/// INetFwPolicy2::LocalPolicyModifyState value NET_FW_MODIFY_STATE_GP_OVERRIDE (1):
+/// a Group Policy default action overrides the local profile defaults this plugin
+/// writes, so a default-block we put there is not in force and the reply path
+/// cannot be proven.
+inline constexpr long kWinModifyStateGpOverride = 1;
+[[nodiscard]] constexpr bool win_policy_overridden(long modify_state) noexcept {
+    return modify_state == kWinModifyStateGpOverride;
+}
+inline constexpr std::string_view kWinGpoOverrideReason = "gpo_override";
+
+/// What one Windows release found, as counts the COM leg tallies.
+struct WinReleaseTally {
+    bool reenable_unread = false;     // the rule enumeration failed part-way: unknown
+    int not_reenabled = 0;            // rules the policy store refused to switch back on
+    int policy_restore_failed = 0;    // profile default actions that would not restore
+    bool our_rules_left = false;      // a rule of ours would not go
+    bool images_not_deleted = false;  // a restore image or the disabled list would not delete
+};
+
+struct WinReleaseDecision {
+    bool incomplete = false;
+    std::vector<std::string> notes;
+};
+
+/// Complete or not. A rule a GPO will not let us switch back on is the GPO's, not
+/// our containment: it is a note on a COMPLETED release (the record is erased and
+/// the next quarantine is not wedged behind `release_in_progress`). Anything that
+/// leaves our block, our rules, a default action or a stale restore image behind
+/// stays incomplete, so the record stays `releasing` and the next release or
+/// start retries (the removal is idempotent on a clean host).
+[[nodiscard]] inline WinReleaseDecision win_release_decision(const WinReleaseTally& t) {
+    WinReleaseDecision d;
+    if (t.not_reenabled > 0)
+        d.notes.push_back(std::format("rules_not_reenabled={}", t.not_reenabled));
+    if (t.images_not_deleted)
+        d.notes.emplace_back("images_not_deleted=1");
+    d.incomplete = t.reenable_unread || t.policy_restore_failed > 0 || t.our_rules_left ||
+                   t.images_not_deleted;
+    return d;
 }
 
 enum class WinAction : std::uint8_t { unknown, allow, block };
@@ -1648,7 +1789,12 @@ inline void add_unique(std::vector<std::string>& v, std::string line) {
         }
         const auto l4 = l4_name(r.l4);
         // One stateless line: [family saddr|daddr ADDR] [l4 sport N] [l4 dport N] accept.
-        auto line = [&](bool match_src, int sport, int dport) {
+        // A TCP REPLY line also refuses a bare SYN (`reply`): without it, a peer that
+        // sources its packets from the allowed service port would open a NEW
+        // connection to any local port (the path has no conntrack on purpose). UDP
+        // replies stay stateless: a UDP allowance admits datagrams from the peer's
+        // service port to any local port, which README states.
+        auto line = [&](bool match_src, int sport, int dport, bool reply) {
             std::vector<std::string> parts;
             if (!r.any_addr) {
                 parts.push_back(r.ip.v6 ? "ip6" : "ip");
@@ -1663,6 +1809,8 @@ inline void add_unique(std::vector<std::string>& v, std::string line) {
                 if (dport > 0)
                     parts.insert(parts.end(), {std::string{l4}, "dport", std::to_string(dport)});
             }
+            if (reply && r.l4 == Proto::tcp)
+                parts.emplace_back(kNftReplyFlagsMatch);
             parts.emplace_back("accept");
             std::string s;
             for (const auto& p : parts) {
@@ -1675,11 +1823,11 @@ inline void add_unique(std::vector<std::string>& v, std::string line) {
         if (r.dir == Dir::out) {
             // request leaves: the peer is the destination and the service is remote;
             // the reply returns: the peer is the source and the service is the source port.
-            detail::add_unique(out_rules, line(false, r.local_port, r.svc_port));
-            detail::add_unique(in_rules, line(true, r.svc_port, r.local_port));
+            detail::add_unique(out_rules, line(false, r.local_port, r.svc_port, false));
+            detail::add_unique(in_rules, line(true, r.svc_port, r.local_port, true));
         } else {
-            detail::add_unique(in_rules, line(true, r.local_port, r.svc_port));
-            detail::add_unique(out_rules, line(false, r.svc_port, r.local_port));
+            detail::add_unique(in_rules, line(true, r.local_port, r.svc_port, false));
+            detail::add_unique(out_rules, line(false, r.svc_port, r.local_port, true));
         }
     }
     std::string t;
@@ -1767,11 +1915,25 @@ struct NftTableListing {
     return true;
 }
 
-/// `nft delete table` of an already-absent table fails with ENOENT text; that
-/// is a successful release, not an error.
+/// A failed `nft delete table` / `nft list table` of an already-absent table is a
+/// clean release, not an error -- but only when NFT said so. The runner merges
+/// stderr, so the text of `sudo` (`sudo: unable to ... No such file or directory`)
+/// or the loader (`error while loading shared libraries: libnftables.so.1: cannot
+/// open shared object file: No such file or directory`) must never read as "the
+/// table is gone" while it is still in force. nft's own errors are lines that
+/// START with `Error:` (`Error: No such file or directory` from a list,
+/// `Error: Could not process rule: No such file or directory` from a delete);
+/// both are accepted, anything else is not.
 [[nodiscard]] inline bool nft_output_means_absent(std::string_view out) {
-    return out.find("No such file or directory") != out.npos ||
-           out.find("does not exist") != out.npos;
+    for (const auto raw : detail::split(out, '\n')) {
+        const auto line = detail::trim(raw);
+        if (!line.starts_with("Error:"))
+            continue;
+        if (line.find("No such file or directory") != line.npos ||
+            line.find("does not exist") != line.npos)
+            return true;
+    }
+    return false;
 }
 
 // ── Linux: iptables generation chains ───────────────────────────────────────
@@ -1826,7 +1988,9 @@ using Argv = std::vector<std::string>;
         if (r.any_addr && r.v6 != v6)
             continue;
         const std::string l4{l4_name(r.l4)};
-        auto rule = [&](bool match_src, int sport, int dport) {
+        // `flags` is empty, or the two tcp-flags arguments (mask, comparison).
+        auto rule = [&](bool match_src, int sport, int dport,
+                        std::vector<std::string> flags = {}) {
             std::vector<std::string> a;
             if (!r.any_addr) {
                 a.push_back(match_src ? "-s" : "-d");
@@ -1842,16 +2006,33 @@ using Argv = std::vector<std::string>;
                 a.push_back("--dport");
                 a.push_back(std::to_string(dport));
             }
+            if (!flags.empty()) {
+                a.push_back("--tcp-flags");
+                for (auto& f : flags)
+                    a.push_back(std::move(f));
+            }
             a.push_back("-j");
             a.push_back("ACCEPT");
             return a;
         };
+        // A TCP REPLY refuses a bare SYN (see nft_ruleset_text). `! --syn` cannot be
+        // an argv token (`!` is outside the charset that confines the privileged
+        // call), so the same set is two positive rules: ACK set (SYN-ACK, ACK, FIN-ACK,
+        // data) or RST set; a bare SYN matches neither.
+        auto reply = [&](bool match_src, int sport, int dport) {
+            if (r.l4 != Proto::tcp) {
+                append(rule(match_src, sport, dport));
+                return;
+            }
+            append(rule(match_src, sport, dport, {"ACK", "ACK"}));
+            append(rule(match_src, sport, dport, {"RST", "RST"}));
+        };
         if (r.dir == Dir::out) {
             append(rule(false, r.local_port, r.svc_port));
-            append(rule(true, r.svc_port, r.local_port));
+            reply(true, r.svc_port, r.local_port);
         } else {
             append(rule(true, r.local_port, r.svc_port));
-            append(rule(false, r.svc_port, r.local_port));
+            reply(false, r.svc_port, r.local_port);
         }
     }
     plan.push_back(Argv{std::string{tool}, "-A", chain, "-j", "DROP"});
@@ -1859,14 +2040,6 @@ using Argv = std::vector<std::string>;
     plan.push_back(Argv{std::string{tool}, "-A", fwd, "-j", "DROP"});
     return plan;
 }
-
-/// What `iptables -S` shows of us (and of the legacy plugin).
-struct IptablesListing {
-    std::vector<std::string> chains;                          // yuzu-fwq-* user chains
-    std::vector<std::pair<std::string, std::string>> jumps;   // {builtin, our chain}
-    bool legacy_chain = false;                                // `yuzu-quarantine` exists
-    std::uint32_t max_gen = 0;
-};
 
 [[nodiscard]] inline std::optional<std::uint32_t> ipt_chain_gen(std::string_view name) {
     if (!name.starts_with(kIptablesChainPrefix))
@@ -1880,8 +2053,27 @@ struct IptablesListing {
     return static_cast<std::uint32_t>(*v);
 }
 
+/// What `iptables -S` shows of us (and of the legacy plugin).
+inline constexpr std::array<std::string_view, 3> kIptBuiltins{"INPUT", "OUTPUT", "FORWARD"};
+
+struct IptablesListing {
+    std::vector<std::string> chains;                          // yuzu-fwq-* user chains
+    std::vector<std::pair<std::string, std::string>> jumps;   // {builtin, our chain}
+    bool legacy_chain = false;                                // `yuzu-quarantine` exists
+    std::uint32_t max_gen = 0;
+    /// The target of the FIRST `-A <builtin>` rule of INPUT / OUTPUT / FORWARD, empty
+    /// when that rule has no `-j` (or the chain has no rule). A jump of ours that is
+    /// present but not first does not govern: dockerd re-inserts its own FORWARD jump
+    /// at position 1 on restart, ahead of our DROP.
+    std::array<std::string, 3> first_target{};
+    [[nodiscard]] bool first_is_ours(std::size_t builtin) const {
+        return builtin < first_target.size() && ipt_chain_gen(first_target[builtin]).has_value();
+    }
+};
+
 [[nodiscard]] inline IptablesListing parse_iptables_listing(std::string_view text) {
     IptablesListing out;
+    std::array<bool, 3> seen_first{};
     for (const auto raw : detail::split(text, '\n')) {
         const auto line = detail::trim(raw);
         const auto f = detail::split(line, ' ');
@@ -1895,6 +2087,18 @@ struct IptablesListing {
         } else if (f.size() == 4 && f[0] == "-A" && f[2] == "-j") {
             if (ipt_chain_gen(f[3]))
                 out.jumps.emplace_back(std::string{f[1]}, std::string{f[3]});
+        }
+        // The first rule of each built-in chain, whatever it is: `-S` lists a chain's
+        // rules in order, so the first `-A <builtin>` line is the one that governs.
+        if (f.size() >= 2 && f[0] == "-A") {
+            for (std::size_t b = 0; b < kIptBuiltins.size(); ++b) {
+                if (f[1] != kIptBuiltins[b] || seen_first[b])
+                    continue;
+                seen_first[b] = true;
+                for (std::size_t i = 2; i + 1 < f.size(); ++i)
+                    if (f[i] == "-j")
+                        out.first_target[b] = std::string{f[i + 1]};
+            }
         }
     }
     return out;
@@ -2218,10 +2422,13 @@ using Runner = std::function<ToolResult(const Argv& argv, std::chrono::milliseco
 using TcpProbe =
     std::function<ProbeOutcome(const std::string& ip, int port, std::chrono::milliseconds timeout)>;
 
-/// A staged ruleset file; `keepalive` owns its deletion.
+/// A staged ruleset file; `keepalive` owns its deletion. `dir` is the private
+/// staging directory the file was created in (is_safe_staged_path checks the path
+/// against it).
 struct StagedFile {
     std::string path;
     std::shared_ptr<void> keepalive;
+    std::string dir;
 };
 using Stage = std::function<std::optional<StagedFile>(std::string_view stem,
                                                       std::string_view suffix,
@@ -2342,6 +2549,21 @@ public:
     [[nodiscard]] virtual LegStatus read_status(const OsPayload& os, Deadline& dl) = 0;
 };
 
+/// A plugin-KV key's presence as the C ABI reports it (`yuzu_ctx_storage_exists`:
+/// 0 present, 1 absent, negative on error). A fault is `unknown` and must never be
+/// folded into `absent`: acting on an absent record or restore image means starting
+/// a fresh generation-1 record over the stored one, skipping the re-apply at start,
+/// or restoring a prior policy from nothing.
+enum class KvPresence : std::uint8_t { present, absent, unknown };
+
+[[nodiscard]] constexpr KvPresence kv_presence(int abi_rc) noexcept {
+    if (abi_rc == 0)
+        return KvPresence::present;
+    if (abi_rc == 1)
+        return KvPresence::absent;
+    return KvPresence::unknown;
+}
+
 struct StateLoad {
     enum class Kind : std::uint8_t { absent, ok, unreadable } kind = Kind::absent;
     QuarantineState state;
@@ -2377,6 +2599,13 @@ namespace detail {
 }
 
 /// Every command goes through here: argv charset check, then the deadline.
+///
+/// Two refusals to run and one outcome that is NOT a refusal:
+///  - `unsafe_argv`, `deadline_exceeded` (checked BEFORE the call): nothing ran.
+///  - `call_timed_out`: the command RAN and did not finish inside its budget. A
+///    mutating tool (`nft -f`, `pfctl -f`, an iptables insert) may have committed
+///    anyway, so the OS state is UNKNOWN; drivers treat it as an ambiguous commit,
+///    never as a clean failure that left the previous state intact.
 class Exec {
 public:
     Exec(const Runner& run, Deadline& dl) : run_(run), dl_(dl) {}
@@ -2385,20 +2614,36 @@ public:
             reason_ = "unsafe_argv";
             return std::nullopt;
         }
+        return run(argv);
+    }
+    /// A command whose LAST token is a staged file: that one token is checked with
+    /// is_safe_staged_path (a space in the data directory is fine), every other with
+    /// the strict charset.
+    [[nodiscard]] std::optional<ToolResult> call_staged(const Argv& argv, const StagedFile& staged) {
+        if (argv.size() < 2 || argv.back() != staged.path ||
+            !is_safe_staged_path(staged.path, staged.dir) ||
+            !all_tokens_safe(Argv(argv.begin(), argv.end() - 1))) {
+            reason_ = "unsafe_argv";
+            return std::nullopt;
+        }
+        return run(argv);
+    }
+    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+
+private:
+    [[nodiscard]] std::optional<ToolResult> run(const Argv& argv) {
         if (dl_.expired()) {
             reason_ = "deadline_exceeded";
             return std::nullopt;
         }
         auto r = run_(argv, dl_.cap(kCallBudget));
-        if (r.timed_out && dl_.expired()) {
-            reason_ = "deadline_exceeded";
+        if (r.timed_out) {
+            reason_ = "call_timed_out";
             return std::nullopt;
         }
         return r;
     }
-    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
 
-private:
     const Runner& run_;
     Deadline& dl_;
     std::string reason_;
@@ -2422,6 +2667,21 @@ private:
     return std::nullopt;
 }
 
+/// Can the Linux agent run the privileged tool at all? The packaged systemd unit
+/// runs as `yuzu-agent` with NoNewPrivileges=true, a one-capability bounding set and
+/// no sudoers grant, so `sudo` cannot elevate: every containment tool call would
+/// fail AFTER the `applying` record was written, and the failed delete would then
+/// strand it. A non-root agent under no_new_privs is refused up front, before any
+/// record, `privilege_unavailable` (the privilege path is PRQ.2's). `no_new_privs`
+/// is prctl(PR_GET_NO_NEW_PRIVS): 1 set, 0 clear, negative when it could not be
+/// read, which is NOT a refusal (sudo will say so itself).
+[[nodiscard]] constexpr std::optional<std::string_view> linux_privilege_refusal(bool euid_root,
+                                                                               int no_new_privs) noexcept {
+    if (!euid_root && no_new_privs == 1)
+        return std::string_view{"privilege_unavailable"};
+    return std::nullopt;
+}
+
 class NftLeg final : public Leg {
 public:
     NftLeg(Runner run, Stage stage, NftChainReader reader = {})
@@ -2442,7 +2702,7 @@ public:
         if (!staged)
             return StepResult::fail("stage_failed");
         detail::Exec ex(run_, dl);
-        const auto r = ex.call(nft_apply_argv(staged->path));
+        const auto r = ex.call_staged(nft_apply_argv(staged->path), *staged);
         if (!r)
             return StepResult::fail(ex.reason());
         if (!r->ok())
@@ -2686,13 +2946,11 @@ public:
             if (!r || !r->ok())
                 return st;
             const auto l = parse_iptables_listing(r->output);
-            bool in = false, out = false, fwd = false;
-            for (const auto& [from, to] : l.jumps) {
-                in = in || from == "INPUT";
-                out = out || from == "OUTPUT";
-                fwd = fwd || from == "FORWARD";
-            }
-            all = all && in && out && fwd;
+            // Our jump must be the FIRST rule of each built-in chain: a jump that merely
+            // exists behind another (dockerd re-inserts its own at position 1) does not
+            // govern, and a retried quarantine repairs it by inserting a new generation
+            // at position 1.
+            all = all && l.first_is_ours(0) && l.first_is_ours(1) && l.first_is_ours(2);
         }
         st.state = all ? OsState::enforcing : OsState::not_enforcing;
         if (!all)
@@ -2755,6 +3013,14 @@ public:
         const auto boot = boot_ ? boot_() : std::nullopt;
         if (!boot || !is_safe_token(*boot))
             return StepResult::fail("boot_time_unreadable");
+        // Stage and vet the file BEFORE the first pfctl call: an unusable staged path
+        // must fail here, not after `-E` has taken a reference that then has to be
+        // given back (a packaged macOS data directory contains a space).
+        const auto staged = stage_("yuzu-fwq-", ".pf", text);
+        if (!staged)
+            return StepResult::fail("stage_failed");
+        if (!is_safe_staged_path(staged->path, staged->dir))
+            return StepResult::fail("unsafe_argv");
         detail::Exec ex(run_, dl);
 
         const OsPayload before = os;
@@ -2817,10 +3083,7 @@ public:
             ok.notes.emplace_back("anchor_not_first=1");
         }
 
-        const auto staged = stage_("yuzu-fwq-", ".pf", text);
-        if (!staged)
-            return give_back(StepResult::fail("stage_failed"));
-        const auto ld = ex.call(pfctl_load_argv(staged->path));
+        const auto ld = ex.call_staged(pfctl_load_argv(staged->path), *staged);
         if (!ld)
             return give_back(StepResult::fail(ex.reason()));
         if (!ld->ok())
@@ -2969,7 +3232,7 @@ struct Outcome {
     std::optional<QuarantineState> state; // the effective record after the operation
     [[nodiscard]] int rc() const noexcept {
         return (status == "refused" || status == "rolled_back" || status == "update_failed" ||
-                status == "busy")
+                status == "busy" || (status == "degraded" && reason == "exception"))
                    ? 1
                    : 0;
     }
@@ -3046,6 +3309,30 @@ inline void add_notes(Outcome& o, const std::vector<std::string>& n) {
     o.notes.insert(o.notes.end(), n.begin(), n.end());
 }
 
+/// `active` only when the record's proof STARTS with `verified`. Every other
+/// proof text (`control_unreachable ...`, `probe_still_reachable ...`, `unproven
+/// ...`, none at all) is `active_unproven`: a substring test for one failing
+/// spelling read `active` over a proof that had failed. The one rule behind every
+/// status path.
+[[nodiscard]] inline std::string_view active_token(const QuarantineState& st) noexcept {
+    return st.last_verify.starts_with("verified") ? std::string_view{"active"}
+                                                  : std::string_view{"active_unproven"};
+}
+
+/// The status of a finished apply, convergence or recovery: `partial` (with the
+/// recorded residue as its reason) when the leg or the record names a gap, else
+/// `active` / `active_unproven` from the verification.
+inline void finish_status(Outcome& o, const QuarantineState& st, const StepResult& ap,
+                          const VerifyResult& v) {
+    if (is_partial(st, ap)) {
+        o.status = "partial";
+        if (has_residue(st.os))
+            o.reason = std::string{residue_reason(st.os)};
+    } else {
+        o.status = v.outcome == VerifyOutcome::verified ? "active" : "active_unproven";
+    }
+}
+
 /// What an `active` record earns against one live read of its leg: the ONE ladder
 /// behind `quarantine_status` and a retried `quarantine`, so the two answer alike
 /// over the same host -- except that a retry re-applies (`repaired=1`) a gap a
@@ -3065,8 +3352,7 @@ inline void status_from_record(Outcome& o, const QuarantineState& st, const LegS
         o.reason = has_residue(st.os) ? std::string{residue_reason(st.os)} : ls.reason;
         add_notes(o, residue_notes(st.os));
     } else {
-        o.status = st.last_verify.find("unproven") != std::string::npos ? "active_unproven"
-                                                                        : "active";
+        o.status = std::string{active_token(st)};
     }
 }
 
@@ -3127,6 +3413,8 @@ struct ApplyRequest {
         return refused("control_set_empty");
     if (req.ttl_seconds != 0 && !validate_ttl(req.ttl_seconds))
         return refused("ttl_out_of_bounds");
+    if (target && exception_covers_probe_target(req.allow, *target))
+        return refused("probe_target_covered_by_exception");
 
     const auto loaded = env.store.load();
     if (loaded.kind == StateLoad::Kind::unreadable)
@@ -3147,7 +3435,8 @@ struct ApplyRequest {
             Outcome o;
             if (ls.state == OsState::not_enforcing && ls.reapply_helps) {
                 o = detail::converge(env, cur, cur.allow, dl);
-                o.notes.emplace_back("repaired=1");
+                if (o.status == "active" || o.status == "active_unproven" || o.status == "partial")
+                    o.notes.emplace_back("repaired=1");
             } else {
                 // Nothing a re-apply would repair: answer what `quarantine_status`
                 // would (residue, an unreadable host and a failed proof included),
@@ -3165,9 +3454,29 @@ struct ApplyRequest {
                 o.notes.emplace_back("ttl_unchanged_release_then_quarantine=1");
             return o;
         }
-        // An earlier apply never finished: converge to the requested set.
-        auto o = detail::converge(env, cur, req.allow, dl);
-        o.notes.emplace_back("incomplete_apply_converged=1");
+        // An earlier apply never finished: converge to the requested set. Unlike an
+        // `active` host (whose expiry a retry must not rewrite), an incomplete apply
+        // has no settled TTL or probe to protect, so the request's own are taken: a
+        // retry that names a time limit gets one, and a changed probe target is
+        // proven reachable FIRST, exactly as the initial apply does, so a dead target
+        // can never read as a proven block.
+        QuarantineState seed = cur;
+        std::vector<std::string> overlay;
+        if (req.ttl_seconds != 0) {
+            seed.ttl_expires = env.epoch_now() + req.ttl_seconds;
+            overlay.emplace_back("ttl_from_retry=1");
+        }
+        if (target && target->text() != cur.probe_target) {
+            const auto before = env.probe(format_ip(target->ip), target->port, dl.cap(kProbeTimeout));
+            if (before == ProbeOutcome::timeout)
+                return refused("probe_unreachable_before_apply");
+            seed.probe_target = target->text();
+            overlay.emplace_back("probe_from_retry=1");
+        }
+        auto o = detail::converge(env, seed, req.allow, dl);
+        if (o.status == "active" || o.status == "active_unproven" || o.status == "partial")
+            o.notes.emplace_back("incomplete_apply_converged=1");
+        detail::add_notes(o, overlay);
         return o;
     }
 
@@ -3212,8 +3521,7 @@ struct ApplyRequest {
 
     st.phase = Phase::active;
     st.last_verify = detail::verify_text(v);
-    o.status = detail::is_partial(st, ap) ? "partial"
-               : (v.outcome == VerifyOutcome::verified ? "active" : "active_unproven");
+    detail::finish_status(o, st, ap, v);
     if (!env.store.save(st)) {
         // Contained but the record still says `applying`: boot recovery re-applies.
         o.status = "partial";
@@ -3246,6 +3554,22 @@ namespace detail {
     };
     const auto ap = env.leg.apply(cand.allow, cand.generation, cand.prev_generation, cand.os, dl,
                                   persist);
+    if (!ap.ok && ap.reason == "call_timed_out") {
+        // A mutating tool ran and overran its budget: it may have committed the new
+        // set, so neither generation is known to be the one in force. The candidate
+        // record stays `applying` (with the OS facts the leg learned) and says so; a
+        // retried `quarantine` or the next start converges, which re-applies the full
+        // set. Putting the previous record back would describe a host that may no
+        // longer match it.
+        if (!env.store.save(cand))
+            o.notes.emplace_back("state_not_persisted=1");
+        if (!ap.detail.empty())
+            o.notes.push_back("detail=" + ap.detail);
+        o.status = "update_failed";
+        o.reason = "commit_unknown";
+        o.state = cand;
+        return o;
+    }
     if (!ap.ok) {
         // The previous generation is still in force: put its record back. The leg's
         // OS facts are carried over: a pf enable token taken before the failure is
@@ -3299,8 +3623,7 @@ namespace detail {
 
     cand.phase = Phase::active;
     cand.last_verify = verify_text(v);
-    o.status = is_partial(cand, ap) ? "partial"
-               : (v.outcome == VerifyOutcome::verified ? "active" : "active_unproven");
+    finish_status(o, cand, ap, v);
     if (!env.store.save(cand)) {
         o.status = "partial";
         o.notes.emplace_back("state_not_persisted=1");
@@ -3328,6 +3651,9 @@ namespace detail {
         auto r = add_exceptions(cur.allow, exceptions);
         if (!r)
             return refused(r.error());
+        if (const auto t = parse_probe_target(cur.probe_target);
+            t && exception_covers_probe_target(*r, *t))
+            return refused("probe_target_covered_by_exception");
         changed = static_cast<int>(r->exceptions.size()) -
                   static_cast<int>(cur.allow.exceptions.size());
         next = std::move(*r);
@@ -3347,8 +3673,7 @@ namespace detail {
             o.reason = std::string{residue_reason(cur.os)};
             detail::add_notes(o, residue_notes(cur.os));
         } else {
-            o.status = cur.last_verify.find("unproven") != std::string::npos ? "active_unproven"
-                                                                             : "active";
+            o.status = std::string{detail::active_token(cur)};
         }
         o.state = cur;
         o.notes.emplace_back("exceptions_unchanged=1");
@@ -3374,9 +3699,34 @@ struct ReleaseRequest {
             return o;
         }
         if (!ttl_expired(loaded.state, env.epoch_now())) {
-            o.status = loaded.state.phase == Phase::active ? "active" : "partial";
-            o.state = loaded.state;
+            // The 30-second tick reads no leg (deliberately: no tool call per tick),
+            // so it answers from the record alone and never `active` over a gap or a
+            // failed proof the record remembers.
+            const auto& st = loaded.state;
+            if (has_residue(st.os)) {
+                o.status = "partial";
+                o.reason = std::string{residue_reason(st.os)};
+                detail::add_notes(o, residue_notes(st.os));
+            } else if (st.phase != Phase::active) {
+                o.status = "partial";
+                o.reason = "operation_in_progress";
+            } else {
+                o.status = std::string{detail::active_token(st)};
+            }
+            o.state = st;
             o.notes.emplace_back("ttl_not_expired=1");
+            return o;
+        }
+        // The TTL has passed. A containment from the retained quarantine plugin may
+        // have been applied underneath ours since; releasing here would restore
+        // rules and defaults under it (a manual release is stopped by the dispatch
+        // gate, this agent-local tick is not). Only a legacy marker defers: any other
+        // preflight answer must not stop a lapsed time limit from ending.
+        if (const auto why = env.leg.preflight(dl); why && *why == "legacy_quarantine_active") {
+            o.status = "partial";
+            o.reason = "legacy_quarantine_active";
+            o.state = loaded.state;
+            o.notes.emplace_back("ttl_deferred_legacy=1");
             return o;
         }
     }
@@ -3399,6 +3749,7 @@ struct ReleaseRequest {
         o.reason = "release_failed:" + rm.reason;
         if (!rm.detail.empty())
             o.notes.push_back("detail=" + rm.detail);
+        detail::add_notes(o, rm.notes); // what the leg learned (e.g. images_not_deleted=1)
         return o;
     }
     detail::add_notes(o, rm.notes);
@@ -3437,6 +3788,10 @@ struct ReleaseRequest {
     auto st = loaded.state;
     if (st.phase == Phase::releasing)
         return release(env, ReleaseRequest{}, dl);
+    // A time limit that lapsed while the agent was down is released, not re-applied
+    // (re-containing a host only to lift it one tick later flushes every pf state).
+    if (ttl_expired(st, env.epoch_now()))
+        return release(env, ReleaseRequest{.if_ttl_expired = true}, dl);
 
     const auto ls = env.leg.read_status(st.os, dl);
     const bool enforcing = ls.state == OsState::enforcing;
@@ -3469,7 +3824,8 @@ struct ReleaseRequest {
             if (!env.store.save(back))
                 o.notes.emplace_back("state_restore_failed=1");
             o.status = "degraded";
-            o.reason = "reapply_failed:" + ap.reason;
+            o.reason = "reapply_failed:" + (ap.reason == "call_timed_out" ? std::string{"commit_unknown"}
+                                                                          : ap.reason);
             o.state = back;
             return o;
         }
@@ -3484,10 +3840,25 @@ struct ReleaseRequest {
         before = ProbeOutcome::connected;
     const auto v = detail::run_verify(env, st, before, dl);
     o.verify = v.row;
+    if (st.last_verify.empty() && !v.control_ok) {
+        // The record's initial apply never completed (no proof was ever recorded) and
+        // the control set does not answer: promoting it to `active` would present an
+        // unproven containment as settled, and nothing would ever revisit it. It
+        // stays `applying` -- `partial|operation_in_progress` -- and the next
+        // retried `quarantine` converges and verifies it. Rolling back at boot stays
+        // excluded by design: the network may simply not be up yet.
+        st.phase = Phase::applying;
+        if (!env.store.save(st))
+            o.notes.emplace_back("state_not_persisted=1");
+        o.status = "partial";
+        o.reason = "operation_in_progress";
+        o.notes.emplace_back("control_unreachable_unproven=1");
+        o.state = st;
+        return o;
+    }
     st.phase = Phase::active;
     st.last_verify = detail::verify_text(v);
-    o.status = detail::is_partial(st, ap) ? "partial"
-               : (v.outcome == VerifyOutcome::verified ? "active" : "active_unproven");
+    detail::finish_status(o, st, ap, v);
     if (!env.store.save(st))
         o.notes.emplace_back("state_not_persisted=1");
     o.state = st;
@@ -3520,17 +3891,54 @@ public:
 /// included: the TTL still bounds the quarantine, and the expiry release works on
 /// a record in any phase); a completed release removes it. A failed registration
 /// keeps the quarantine (lifting containment is never the safe response to a
-/// bookkeeping failure) and says so: PARTIAL, retried at the next start.
-inline void settle_ttl(Outcome& o, TriggerRegistry& triggers) {
+/// bookkeeping failure) and says so PERSISTENTLY: it is recorded as residue on the
+/// state record (`ttl_unregistered`), so every later status reads
+/// `partial|ttl_unregistered` until a registration succeeds, instead of `active`
+/// over a time limit nothing enforces. A no-op poll (`ttl_not_expired`) skips the
+/// registration: it is already in place and re-registering every 30 s logs a
+/// replace and a fire each time.
+inline void settle_ttl(Outcome& o, TriggerRegistry& triggers, StateStore& store) {
     if (o.state && o.state->ttl_expires > 0 && o.status != "inactive") {
+        if (std::find(o.notes.begin(), o.notes.end(), "ttl_not_expired=1") != o.notes.end())
+            return;
+        auto& st = *o.state;
         if (!triggers.register_trigger(kTtlTriggerId, "interval", ttl_trigger_config())) {
             o.notes.emplace_back("ttl_trigger_unregistered=1");
+            if (!st.os.ttl_unregistered) {
+                st.os.ttl_unregistered = true;
+                if (!store.save(st))
+                    o.notes.emplace_back("state_not_persisted=1");
+            }
             if (o.status == "active" || o.status == "active_unproven")
                 o.status = "partial";
+            if (o.status == "partial" && o.reason.empty())
+                o.reason = "ttl_unregistered";
+        } else if (st.os.ttl_unregistered) {
+            st.os.ttl_unregistered = false;
+            if (!store.save(st))
+                o.notes.emplace_back("state_not_persisted=1");
+            std::erase(o.notes, "ttl_unregistered=1");
+            if (o.status == "partial" && o.reason == "ttl_unregistered") {
+                o.reason.clear();
+                o.status = std::string{detail::active_token(st)};
+            }
         }
     } else if (o.status == "inactive") {
         (void)triggers.unregister_trigger(kTtlTriggerId);
     }
+}
+
+/// What a throw out of an action leaves: `degraded|exception`, never `refused`
+/// (which means nothing was changed -- a throw can follow the `applying` record and
+/// part of the mutation). The record, when it loads, is attached so the TTL trigger
+/// of an `applying` record is still registered; `quarantine_status` reads the rest.
+[[nodiscard]] inline Outcome exception_outcome(const StateLoad& loaded) {
+    Outcome o;
+    o.status = "degraded";
+    o.reason = "exception";
+    if (loaded.kind == StateLoad::Kind::ok)
+        o.state = loaded.state;
+    return o;
 }
 
 /// `quarantine_status`: record x live OS. Never mutates, never takes the gate.

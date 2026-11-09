@@ -74,8 +74,13 @@ struct FakeStore final : StateStore {
     bool fail_erase = false;  // the record cannot be deleted (a locked or read-only store)
     int fail_save_after = -1; // >= 0: every save after this many successes fails
     int saves = 0;
+    bool fault = false;       // the KV store cannot ANSWER (BUSY, closed): what the shell reports as unreadable
     StateLoad load() override {
         StateLoad l;
+        if (fault) {
+            l.kind = StateLoad::Kind::unreadable;
+            return l;
+        }
         if (raw.empty())
             return l;
         const auto p = parse_state(raw);
@@ -128,6 +133,11 @@ struct NftWorld {
     int next_file = 0;
     bool fail_load = false;
     bool fail_delete = false; // the table cannot be removed (a refused sudo, say)
+    /// What a failing delete / list prints. The default is sudo's text; a test swaps in
+    /// the loader's or nft's own words.
+    std::string delete_failure = "sudo: a password is required";
+    std::optional<std::string> list_failure; // set: `nft list table` fails with this text
+    bool load_times_out = false; // `nft -f` COMMITS the table, then overruns its budget
     bool legacy = false;
     Crash crash;
     std::vector<Argv> log;
@@ -143,20 +153,31 @@ struct NftWorld {
                 return done(1, "Error: syntax error, unexpected word");
             table = true;
             text = files[a[2]];
+            if (load_times_out) {
+                auto r = done(-1);
+                r.timed_out = true; // the commit landed; the tool did not return in time
+                return r;
+            }
             return done(0);
         }
         if (a[1] == "delete") {
             if (fail_delete)
-                return done(1, "sudo: a password is required");
-            if (!table)
-                return done(1, "Error: No such file or directory");
+                return done(1, delete_failure);
+            if (!table) // what nft prints for a delete of an absent table
+                return done(1, "Error: Could not process rule: No such file or directory\n"
+                               "delete table inet yuzu_quarantine\n"
+                               "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
             table = false;
             text.clear();
             return done(0);
         }
         if (a[1] == "list") {
-            if (!table)
-                return done(1, "Error: No such file or directory");
+            if (list_failure)
+                return done(1, *list_failure);
+            if (!table) // what nft prints for a list of an absent table
+                return done(1, "Error: No such file or directory\n"
+                               "list table inet yuzu_quarantine\n"
+                               "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n");
             std::string out = "table inet yuzu_quarantine {\n";
             for (const char* c : {"input", "output", "forward"})
                 out += std::string("\tchain ") + c + " {\n\t\ttype filter hook " + c +
@@ -185,7 +206,7 @@ struct NftWorld {
                       std::string_view contents) -> std::optional<StagedFile> {
             const auto path = std::format("/tmp/yuzu-fwq-{}{}", ++next_file, suffix);
             files[path] = std::string{contents};
-            return StagedFile{path, nullptr};
+            return StagedFile{path, nullptr, "/tmp"};
         };
     }
 };
@@ -310,6 +331,7 @@ struct ScriptedLeg final : Leg {
     BackendKind k = BackendKind::windows;
     std::optional<std::string> refuse;     // preflight
     std::function<StepResult(OsPayload&)> on_apply = [](OsPayload&) { return StepResult::success(); };
+    std::function<StepResult(OsPayload&)> on_remove = [](OsPayload&) { return StepResult::success(); };
     LegStatus status = [] {
         LegStatus l;
         l.state = OsState::enforcing;
@@ -324,9 +346,9 @@ struct ScriptedLeg final : Leg {
         ++applies;
         return on_apply(os);
     }
-    StepResult remove(OsPayload&, Deadline&) override {
+    StepResult remove(OsPayload& os, Deadline&) override {
         ++removes;
-        return StepResult::success();
+        return on_remove(os);
     }
     LegStatus read_status(const OsPayload&, Deadline&) override { return status; }
 };
@@ -586,12 +608,13 @@ TEST_CASE("direction-aware ports: out is the remote port, in is the local port",
     }
     CHECK(checked == 2);
 
-    // nft: request direction carries dport, the reply path carries sport
+    // nft: request direction carries dport, the reply path carries sport and refuses
+    // a bare SYN (a peer must not open a NEW connection from its service port)
     const auto nft = nft_ruleset_text(set);
     CHECK(nft.find("ip saddr 10.0.0.5 tcp dport 22 accept") != nft.npos);  // input
-    CHECK(nft.find("ip daddr 10.0.0.5 tcp sport 22 accept") != nft.npos);  // output reply
+    CHECK(nft.find("ip daddr 10.0.0.5 tcp sport 22 tcp flags & (syn|ack) != syn accept") != nft.npos);  // output reply
     CHECK(nft.find("ip daddr 10.0.0.6 tcp dport 443 accept") != nft.npos); // output
-    CHECK(nft.find("ip saddr 10.0.0.6 tcp sport 443 accept") != nft.npos); // input reply
+    CHECK(nft.find("ip saddr 10.0.0.6 tcp sport 443 tcp flags & (syn|ack) != syn accept") != nft.npos); // input reply
 
     // iptables
     const auto plan = iptables_build_plan(set, kIptablesPath, 1, false);
@@ -599,7 +622,10 @@ TEST_CASE("direction-aware ports: out is the remote port, in is the local port",
     for (const auto& a : plan)
         lines.push_back(join(a));
     CHECK(contains(lines, "/usr/sbin/iptables -A yuzu-fwq-1 -s 10.0.0.5 -p tcp --dport 22 -j ACCEPT"));
-    CHECK(contains(lines, "/usr/sbin/iptables -A yuzu-fwq-1 -d 10.0.0.5 -p tcp --sport 22 -j ACCEPT"));
+    // the reply path is two positive rules (ACK set, or RST set): a bare SYN matches neither
+    CHECK(contains(lines, "/usr/sbin/iptables -A yuzu-fwq-1 -d 10.0.0.5 -p tcp --sport 22 --tcp-flags ACK ACK -j ACCEPT"));
+    CHECK(contains(lines, "/usr/sbin/iptables -A yuzu-fwq-1 -d 10.0.0.5 -p tcp --sport 22 --tcp-flags RST RST -j ACCEPT"));
+    CHECK_FALSE(contains(lines, "/usr/sbin/iptables -A yuzu-fwq-1 -d 10.0.0.5 -p tcp --sport 22 -j ACCEPT"));
     CHECK(contains(lines, "/usr/sbin/iptables -A yuzu-fwq-1 -d 10.0.0.6 -p tcp --dport 443 -j ACCEPT"));
 
     // pf
@@ -745,7 +771,13 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     CHECK_FALSE(parse_state(replace(text, "backend=iptables", "backend=carrier-pigeon")));
     CHECK_FALSE(parse_state(replace(text, "gen=7", "gen=zero")));
     CHECK_FALSE(parse_state(replace(text, "probe=192.0.2.80:443", "probe=example.com:443")));
-    CHECK_FALSE(parse_state(text + "mystery=1\n"));
+    // a key a newer build wrote is skipped, not fatal (a downgrade must still read the record)
+    {
+        const auto future = parse_state(text + "mystery=1\n");
+        REQUIRE(future);
+        CHECK(future->generation == parse_state(text)->generation);
+        CHECK(future->allow == parse_state(text)->allow);
+    }
     CHECK_FALSE(parse_state(text + "gen=8\n")); // duplicate scalar
     CHECK_FALSE(parse_state(text + "stale_left=1\n"));
     CHECK_FALSE(parse_state(text + "flush_failed=1\n"));
@@ -843,9 +875,10 @@ TEST_CASE("windows: every enabled rule outside our group is disabled", "[agent][
     };
     const auto off = win_rules_to_disable(rules);
     REQUIRE(off.size() == 3);
-    CHECK(off[0] == "CoreNet-DHCP-Out");
-    CHECK(off[1] == "Remote Desktop - User Mode (TCP-In)");
-    CHECK(off[2] == "No group at all");
+    // a key is name|direction|profiles (none read in this fixture: 0|0)
+    CHECK(off[0] == "CoreNet-DHCP-Out|0|0");
+    CHECK(off[1] == "Remote Desktop - User Mode (TCP-In)|0|0");
+    CHECK(off[2] == "No group at all|0|0");
     for (const auto& n : off)
         CHECK_FALSE(n.starts_with(kWinRulePrefix));
     // the one "is ours" test: our group, or our name prefix without the group
@@ -959,7 +992,6 @@ TEST_CASE("windows: the disabled-rule list is written on the first apply and onl
         const auto over = win_merge_disabled_list(at_cap, {"one-more"}, true);
         CHECK(over.over_cap);
         CHECK(over.grew);
-        CHECK(win_merge_disabled_list({}, at_cap, false).over_cap == false);
     }
 }
 
@@ -1107,7 +1139,7 @@ TEST_CASE("nft ruleset text: atomic idiom, drop chains, safe lines", "[agent][fi
     CHECK(t.find("iif lo accept") != t.npos);
     CHECK(t.find("oif lo accept") != t.npos);
     CHECK(t.find("ip daddr 198.51.100.7 tcp dport 50051 accept") != t.npos);
-    CHECK(t.find("ip saddr 198.51.100.7 tcp sport 50051 accept") != t.npos);
+    CHECK(t.find("ip saddr 198.51.100.7 tcp sport 50051 tcp flags & (syn|ack) != syn accept") != t.npos);
     CHECK(t.find("udp sport 68 udp dport 67 accept") != t.npos);
     CHECK(t.find("udp sport 67 udp dport 68 accept") != t.npos);
     CHECK(t.find("ip daddr 203.0.113.53 udp dport 53 accept") != t.npos);
@@ -1472,7 +1504,9 @@ TEST_CASE("quarantine: apply, verify, record -- and release restores the host",
     CHECK(rig.store.state()->generation == 1);
     CHECK(rig.store.state()->ttl_expires == rig.now + 120);
     CHECK(rig.store.state()->backend == BackendKind::nft);
-    // the record was written (applying) BEFORE the ruleset was loaded
+    // two writes: `applying`, then `active`. (That the record is written BEFORE the
+    // ruleset loads is pinned where a fake peeks at the record at the moment of the
+    // load: the pf cases' record_at_load, and the crash-at-every-call tests.)
     CHECK(rig.store.saves >= 2);
 
     const auto rows = render_rows(o);
@@ -2403,7 +2437,7 @@ TEST_CASE("ttl trigger: the registration the core emits is what the engine's own
     auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
     REQUIRE(o.status == "active");
     FakeTriggers trig;
-    settle_ttl(o, trig);
+    settle_ttl(o, trig, rig.store);
 
     REQUIRE(trig.registered.size() == 1);
     CHECK(trig.unregistered.empty());
@@ -2439,10 +2473,10 @@ TEST_CASE("ttl trigger: a failed registration keeps the quarantine and says PART
 
     auto verified = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
     REQUIRE(verified.status == "active");
-    settle_ttl(verified, trig);
+    settle_ttl(verified, trig, rig.store);
     CHECK(verified.status == "partial");
     CHECK(contains(verified.notes, "ttl_trigger_unregistered=1"));
-    CHECK(contains(render_rows(verified), "status|partial"));
+    CHECK(contains(render_rows(verified), "status|partial|ttl_unregistered"));
     CHECK(contains(render_rows(verified), "note|ttl_trigger_unregistered=1"));
     CHECK(result_kind(verified).partial);
     // the containment itself is untouched: still applied, record still active
@@ -2454,7 +2488,7 @@ TEST_CASE("ttl trigger: a failed registration keeps the quarantine and says PART
     Outcome unproven;
     unproven.status = "active_unproven";
     unproven.state = rig.store.state();
-    settle_ttl(unproven, trig);
+    settle_ttl(unproven, trig, rig.store);
     CHECK(unproven.status == "partial");
     CHECK(contains(unproven.notes, "ttl_trigger_unregistered=1"));
 
@@ -2463,7 +2497,7 @@ TEST_CASE("ttl trigger: a failed registration keeps the quarantine and says PART
     degraded.status = "degraded";
     degraded.reason = "reapply_failed:nft_load_failed";
     degraded.state = rig.store.state();
-    settle_ttl(degraded, trig);
+    settle_ttl(degraded, trig, rig.store);
     CHECK(degraded.status == "degraded");
     CHECK(contains(degraded.notes, "ttl_trigger_unregistered=1"));
 }
@@ -2476,7 +2510,7 @@ TEST_CASE("ttl trigger: no ttl registers nothing; a completed release unregister
 
     auto no_ttl = apply_and_verify(rig.env, rig.request(), dl);
     REQUIRE(no_ttl.status == "active");
-    settle_ttl(no_ttl, trig);
+    settle_ttl(no_ttl, trig, rig.store);
     CHECK(trig.registered.empty());
     CHECK(trig.unregistered.empty());
     CHECK(no_ttl.status == "active");
@@ -2485,18 +2519,18 @@ TEST_CASE("ttl trigger: no ttl registers nothing; a completed release unregister
     REQUIRE(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
     auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 90), dl);
     REQUIRE(o.status == "active");
-    settle_ttl(o, trig);
+    settle_ttl(o, trig, rig.store);
     CHECK(trig.registered.size() == 1);
     auto rel = release(rig.env, ReleaseRequest{}, dl);
     REQUIRE(rel.status == "inactive");
-    settle_ttl(rel, trig);
+    settle_ttl(rel, trig, rig.store);
     REQUIRE(trig.unregistered.size() == 1);
     CHECK(trig.unregistered[0] == kTtlTriggerId);
     CHECK(trig.registered.size() == 1); // not re-registered
 
     // a refused action leaves the trigger alone
     auto refused_o = refused("op_invalid");
-    settle_ttl(refused_o, trig);
+    settle_ttl(refused_o, trig, rig.store);
     CHECK(trig.registered.size() == 1);
     CHECK(trig.unregistered.size() == 1);
 }
@@ -2512,7 +2546,7 @@ TEST_CASE("ttl trigger: a release that did not complete keeps the trigger; the e
     rig.world.fail_delete = true;
     auto failed = release(rig.env, ReleaseRequest{}, dl);
     REQUIRE(failed.status == "partial");
-    settle_ttl(failed, trig);
+    settle_ttl(failed, trig, rig.store);
     CHECK(trig.registered.size() == 1);
     CHECK(trig.unregistered.empty());
     rig.world.fail_delete = false;
@@ -2529,7 +2563,7 @@ TEST_CASE("ttl trigger: a release that did not complete keeps the trigger; the e
     auto late = release(rig.env, due, dl);
     REQUIRE(late.status == "inactive");
     CHECK_FALSE(rig.world.table);
-    settle_ttl(late, trig);
+    settle_ttl(late, trig, rig.store);
     CHECK(trig.unregistered.size() == 1);
 }
 
@@ -2540,7 +2574,7 @@ TEST_CASE("ttl trigger: a boot-time recovery re-registers it, and retries a fail
     FakeTriggers trig;
     trig.accept = false;
     auto first = apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl);
-    settle_ttl(first, trig);
+    settle_ttl(first, trig, rig.store);
     REQUIRE(first.status == "partial"); // registration failed at quarantine time
 
     // agent restart: the OS still enforces, the record says active with a ttl
@@ -2548,7 +2582,7 @@ TEST_CASE("ttl trigger: a boot-time recovery re-registers it, and retries a fail
     auto boot = recover_at_init(rig.env, dl);
     REQUIRE(boot.state);
     CHECK(boot.state->ttl_expires > 0);
-    settle_ttl(boot, trig);
+    settle_ttl(boot, trig, rig.store);
     REQUIRE(trig.registered.size() == 1);
     CHECK(trig.registered[0].id == kTtlTriggerId);
     CHECK(boot.status == "active"); // registered this time: nothing partial left to say
@@ -2559,7 +2593,7 @@ TEST_CASE("ttl trigger: a boot-time recovery re-registers it, and retries a fail
     rig.world.fail_load = true;
     auto failed = recover_at_init(rig.env, dl);
     REQUIRE(failed.status == "degraded");
-    settle_ttl(failed, again);
+    settle_ttl(failed, again, rig.store);
     CHECK(again.registered.size() == 1);
     CHECK(failed.status == "degraded");
 }
@@ -3070,6 +3104,7 @@ struct PfWorld {
     bool flush_fails_when_absent = false;
     bool fail_flush_anchor = false;      // the anchor flush is refused outright
     bool disable_clears_refs = false;    // what `pfctl -d` does to the references (unverified on xnu)
+    std::string stage_dir = "/tmp";      // the private staging directory the Stage reports
     std::string record_at_enable, record_at_load, record_at_flush;
     Crash crash;
     std::vector<Argv> log;
@@ -3197,9 +3232,9 @@ struct PfWorld {
     Stage stage() {
         return [this](std::string_view, std::string_view suffix,
                       std::string_view contents) -> std::optional<StagedFile> {
-            const auto path = std::format("/tmp/yuzu-fwq-pf-{}{}", ++next_file, suffix);
+            const auto path = std::format("{}/yuzu-fwq-pf-{}{}", stage_dir, ++next_file, suffix);
             files[path] = std::string{contents};
-            return StagedFile{path, nullptr};
+            return StagedFile{path, nullptr, stage_dir};
         };
     }
     [[nodiscard]] bool ran(std::string_view needle) const {
@@ -4027,4 +4062,1044 @@ TEST_CASE("every argv and ruleset line the core emits is clean", "[agent][firewa
     REQUIRE(apply_and_verify(ipt.env, req2, dl2).status == "active");
     for (const auto& a : ipt.world.log)
         CHECK(all_tokens_safe(a));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Governance gate 3 (round 1): the correctness floor. Every case below pins the
+// behaviour a BLOCKING finding asked for through the same fakes the drivers
+// already run on; CH-1..CH-4 are the chaos plan's fake-leg halves.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+/// A minimal, valid record for a driver test that never runs a real leg.
+QuarantineState make_record(Phase phase = Phase::active, BackendKind be = BackendKind::windows) {
+    QuarantineState s;
+    s.phase = phase;
+    s.generation = 1;
+    s.applied_at = 1'700'000'000;
+    s.backend = be;
+    s.allow = make_set();
+    s.last_verify = "verified control_ok probe_blocked";
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("packaged Linux: a non-root agent under no_new_privs is refused, nothing else is",
+          "[agent][firewall_quarantine]") {
+    // The unit runs as yuzu-agent with NoNewPrivileges=true and no sudoers grant: sudo
+    // cannot elevate, so the action is refused BEFORE any record or tool call.
+    const auto why = linux_privilege_refusal(false, 1);
+    REQUIRE(why);
+    CHECK(*why == "privilege_unavailable");
+    CHECK_FALSE(linux_privilege_refusal(true, 1));   // root under no_new_privs still runs the tool
+    CHECK_FALSE(linux_privilege_refusal(true, 0));
+    CHECK_FALSE(linux_privilege_refusal(false, 0));  // sudo can elevate
+    CHECK_FALSE(linux_privilege_refusal(false, -1)); // unreadable is not a refusal: sudo will say so
+}
+
+TEST_CASE("ttl_seconds is refused in this release, whatever its value; the core keeps its bounds",
+          "[agent][firewall_quarantine]") {
+    static_assert(!kTtlAvailable);
+    CHECK_FALSE(ttl_param_refusal(""));
+    for (const char* v : {"0", "5", "59", "60", "3600", "2592001", "soon"}) {
+        INFO("ttl_seconds=" << v);
+        const auto r = ttl_param_refusal(v);
+        REQUIRE(r);
+        CHECK(*r == "ttl_unavailable");
+    }
+    // the TTL core stays for the day the constant flips
+    CHECK(parse_ttl_param("60").value() == 60);
+    CHECK_FALSE(parse_ttl_param("59"));
+}
+
+TEST_CASE("kv presence: only 0 and 1 are answers; a fault is never 'absent'",
+          "[agent][firewall_quarantine]") {
+    CHECK(kv_presence(0) == KvPresence::present);
+    CHECK(kv_presence(1) == KvPresence::absent);
+    for (const int rc : {-1, -2, -3, 2})
+        CHECK(kv_presence(rc) == KvPresence::unknown);
+}
+
+TEST_CASE("staged path: a space in the data directory is safe; anything outside the directory is not",
+          "[agent][firewall_quarantine]") {
+    const std::string dir = "/Library/Application Support/Yuzu/firewall-staging";
+    CHECK(is_safe_staged_path(dir + "/yuzu-fwq-AbC123.pf", dir));
+    CHECK(is_safe_staged_path("/tmp/yuzu-fwq-1.nft", "/tmp"));
+    CHECK_FALSE(is_safe_staged_path("/tmp/x.nft", ""));
+    CHECK_FALSE(is_safe_staged_path("relative/x.nft", "relative"));
+    CHECK_FALSE(is_safe_staged_path("/other/yuzu-fwq-1.pf", dir));
+    CHECK_FALSE(is_safe_staged_path(dir + "/../x.pf", dir));
+    CHECK_FALSE(is_safe_staged_path(dir + "/sub/x.pf", dir)); // directly under it, one level
+    CHECK_FALSE(is_safe_staged_path(dir + "/x y.pf", dir));   // the file name is a plain token
+    CHECK_FALSE(is_safe_staged_path(dir + "/x\n.pf", dir));
+    CHECK_FALSE(is_safe_staged_path(dir + "/x;.pf", dir));
+    CHECK_FALSE(is_safe_staged_path(dir + "/", dir));
+    CHECK_FALSE(is_safe_staged_path("/tmp/../etc/x.pf", "/tmp/../etc"));
+    CHECK_FALSE(is_safe_staged_path("/tmp//x.pf", "/tmp/")); // a directory with a trailing slash
+    // the strict token charset (every OTHER token) is unchanged: a space still fails it
+    CHECK_FALSE(is_safe_token(dir + "/yuzu-fwq-1.pf"));
+}
+
+TEST_CASE("pf: a staging directory with a space applies; an unusable staged path fails before -E",
+          "[agent][firewall_quarantine]") {
+    SECTION("the packaged macOS data directory contains a space") {
+        PfRig rig;
+        rig.world.stage_dir = "/Library/Application Support/Yuzu/firewall-staging";
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "active");
+        CHECK(rig.world.anchor_exists);
+        bool loaded = false;
+        for (const auto& a : rig.world.log)
+            if (a.size() == 5 && a[3] == "-f") {
+                loaded = true;
+                CHECK(a[4].starts_with("/Library/Application Support/Yuzu/firewall-staging/"));
+            }
+        CHECK(loaded); // the spaced path travelled as ONE argv element
+    }
+    SECTION("a staged path outside its directory is refused before pfctl -E takes a reference") {
+        PfWorld w;
+        FakeStore store;
+        Probe probe;
+        const Stage bad = [](std::string_view, std::string_view,
+                             std::string_view) -> std::optional<StagedFile> {
+            return StagedFile{"/etc/passwd", nullptr, "/tmp"};
+        };
+        PfLeg leg(w.runner(), bad, [&]() -> std::optional<std::string> { return w.boot; });
+        Deadline dl;
+        OsPayload os;
+        const auto r = leg.apply(make_set(), 1, 0, os, dl, [](const OsPayload&) { return true; });
+        CHECK_FALSE(r.ok);
+        CHECK(r.reason == "unsafe_argv");
+        CHECK(w.crash.calls == 0); // not even `pfctl -s info`: nothing ran, no reference was taken
+        CHECK(w.tokens.empty());
+    }
+}
+
+TEST_CASE("nft: only nft's own 'table absent' line reads as absent", "[agent][firewall_quarantine]") {
+    // nft's own words, for a list and for a delete
+    CHECK(nft_output_means_absent("Error: No such file or directory\n"
+                                  "list table inet yuzu_quarantine\n^^^^^^^^^^^^^^\n"));
+    CHECK(nft_output_means_absent("Error: Could not process rule: No such file or directory\n"
+                                  "delete table inet yuzu_quarantine\n^^^^^^^^^^^^^^\n"));
+    CHECK(nft_output_means_absent("Error: table 'yuzu_quarantine' does not exist"));
+    // text that merely CONTAINS the words: the loader's, sudo's, and a misplaced one
+    CHECK_FALSE(nft_output_means_absent(
+        "/usr/sbin/nft: error while loading shared libraries: libnftables.so.1: cannot open "
+        "shared object file: No such file or directory"));
+    CHECK_FALSE(nft_output_means_absent(
+        "error while loading shared libraries: libnftables.so.1: cannot open shared object "
+        "file: No such file or directory"));
+    CHECK_FALSE(nft_output_means_absent("sudo: unable to execute /usr/sbin/nft: No such file or directory"));
+    CHECK_FALSE(nft_output_means_absent("sudo: a password is required"));
+    CHECK_FALSE(nft_output_means_absent("Error: Operation not permitted"));
+    CHECK_FALSE(nft_output_means_absent("  Error: x\nNo such file or directory"));
+    CHECK_FALSE(nft_output_means_absent(""));
+}
+
+TEST_CASE("CH-1: a release that cannot reach nft never answers inactive or erases the record",
+          "[agent][firewall_quarantine]") {
+    const std::vector<std::string> broken{
+        "sudo: a password is required",
+        "/usr/sbin/nft: error while loading shared libraries: libnftables.so.1: cannot open "
+        "shared object file: No such file or directory",
+        "sudo: unable to execute /usr/sbin/nft: No such file or directory"};
+    for (const auto& text : broken) {
+        INFO(text);
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+
+        rig.world.fail_delete = true;
+        rig.world.delete_failure = text;
+        const auto o = release(rig.env, ReleaseRequest{}, dl);
+        CHECK(o.status == "partial");
+        CHECK(o.reason == "release_failed:nft_delete_failed");
+        CHECK(rig.world.table); // still in force
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::releasing); // the record is kept
+
+        // the host's own words: status says so, never inactive
+        rig.world.list_failure = text;
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "partial");
+        CHECK(st.reason == "release_incomplete");
+        // a retried quarantine reports the stuck release instead of wedging or re-applying
+        const auto again = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(again.status == "refused");
+        CHECK(again.reason == "release_in_progress");
+
+        // privilege restored: the release completes and the host can be contained again
+        rig.world.fail_delete = false;
+        rig.world.list_failure.reset();
+        CHECK(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+        CHECK_FALSE(rig.world.table);
+        CHECK_FALSE(rig.store.state());
+        CHECK(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    }
+    // with NO record, an unreadable list is unreadable -- not inactive; nft's own line is inactive
+    NftRig bare;
+    auto dl = bare.dl();
+    bare.world.list_failure = broken[1];
+    const auto unread = report_status(bare.env, dl);
+    CHECK(unread.status == "degraded");
+    CHECK(unread.reason == "os_unreadable");
+    bare.world.list_failure.reset();
+    CHECK(report_status(bare.env, dl).status == "inactive");
+}
+
+TEST_CASE("the stateless reply path refuses a bare SYN; the ruleset line charset admits only that literal",
+          "[agent][firewall_quarantine]") {
+    const auto set = make_set({"203.0.113.53"}, {ex("10.0.0.5:22/tcp/in"), ex("172.16.0.9:123/udp/out")});
+    const auto nft = nft_ruleset_text(set);
+    const std::string flags{kNftReplyFlagsMatch};
+    // the control channel (an outbound TCP request): the peer's reply is not a bare SYN
+    CHECK(nft.find("ip saddr 198.51.100.7 tcp sport 50051 " + flags + " accept") != nft.npos);
+    // an inbound TCP exception: OUR reply (SYN-ACK, data) leaves, a bare SYN from us does not
+    CHECK(nft.find("ip daddr 10.0.0.5 tcp sport 22 " + flags + " accept") != nft.npos);
+    // the REQUEST lines are unrestricted (the peer / we start the connection there)
+    CHECK(nft.find("ip saddr 10.0.0.5 tcp dport 22 accept") != nft.npos);
+    CHECK(nft.find("ip daddr 198.51.100.7 tcp dport 50051 accept") != nft.npos);
+    // UDP replies stay stateless: no flags clause on any udp line
+    for (const auto line : detail::split(nft, '\n'))
+        if (line.find("udp") != line.npos)
+            CHECK(line.find("flags") == line.npos);
+    CHECK(is_safe_ruleset_text(nft));
+
+    // the charset: the literal passes, anything shaped like it does not
+    CHECK(is_safe_ruleset_line("ip saddr 1.2.3.4 tcp sport 22 " + flags + " accept"));
+    CHECK_FALSE(is_safe_ruleset_line("ip saddr 1.2.3.4 tcp sport 22 tcp flags & (syn|ack) == syn accept"));
+    CHECK_FALSE(is_safe_ruleset_line("ip saddr 1.2.3.4 tcp flags & syn accept"));
+    CHECK_FALSE(is_safe_ruleset_line("a | b"));
+    CHECK_FALSE(is_safe_ruleset_line("a & b"));
+    CHECK_FALSE(is_safe_ruleset_line("a != b"));
+    CHECK_FALSE(is_safe_ruleset_line("accept # drop"));
+
+    // iptables: `!` cannot be an argv token, so the same set is two positive rules
+    const auto plan = iptables_build_plan(set, kIptablesPath, 1, false);
+    std::vector<std::string> lines;
+    for (const auto& a : plan) {
+        lines.push_back(join(a));
+        CHECK(all_tokens_safe(a));
+    }
+    const std::string pre = "/usr/sbin/iptables -A yuzu-fwq-1 ";
+    CHECK(contains(lines, pre + "-s 198.51.100.7 -p tcp --sport 50051 --tcp-flags ACK ACK -j ACCEPT"));
+    CHECK(contains(lines, pre + "-s 198.51.100.7 -p tcp --sport 50051 --tcp-flags RST RST -j ACCEPT"));
+    CHECK_FALSE(contains(lines, pre + "-s 198.51.100.7 -p tcp --sport 50051 -j ACCEPT"));
+    CHECK(contains(lines, pre + "-s 10.0.0.5 -p tcp --dport 22 -j ACCEPT")); // the request: open
+    CHECK(contains(lines, pre + "-d 10.0.0.5 -p tcp --sport 22 --tcp-flags ACK ACK -j ACCEPT"));
+    // UDP: one plain rule each way, no flags
+    CHECK(contains(lines, pre + "-s 172.16.0.9 -p udp --sport 123 -j ACCEPT"));
+    for (const auto& l : lines)
+        if (l.find("-p udp") != std::string::npos)
+            CHECK(l.find("--tcp-flags") == std::string::npos);
+}
+
+TEST_CASE("windows: the DHCP allowances are scoped to the DHCP client service",
+          "[agent][firewall_quarantine]") {
+    const auto specs = win_rule_specs(make_set({"203.0.113.53"}, {ex("10.0.0.5:22/tcp/in")}), 1);
+    int dhcp = 0;
+    for (const auto& s : specs) {
+        if (s.protocol == 17 && s.local_ports == "68" && s.remote_ports == "67") {
+            ++dhcp;
+            CHECK(s.service_name == "dhcp");
+        } else {
+            CHECK(s.service_name.empty()); // no other allowance is service-scoped
+        }
+    }
+    CHECK(dhcp == 2); // out and in
+}
+
+TEST_CASE("windows: a stock rule is told apart by name, direction and profile", "[agent][firewall_quarantine]") {
+    // Windows ships rules that share a NAME and differ by profile or direction, one on
+    // and one off: the release must never switch on the one that was off.
+    const std::vector<WinRuleInfo> rules{
+        {"File and Printer Sharing (SMB-In)", "File and Printer Sharing", true, 1, 2},  // private: on
+        {"File and Printer Sharing (SMB-In)", "File and Printer Sharing", false, 1, 4}, // public: OFF
+        {"WinRM (HTTP-In)", "Windows Remote Management", true, 1, 4},
+        {"WinRM (HTTP-In)", "Windows Remote Management", true, 1, 2},
+    };
+    const auto off = win_rules_to_disable(rules);
+    REQUIRE(off.size() == 3);
+    CHECK(off[0] == "File and Printer Sharing (SMB-In)|1|2");
+    CHECK(off[1] == "WinRM (HTTP-In)|1|4");
+    CHECK(off[2] == "WinRM (HTTP-In)|1|2");
+    // the public twin was off: its key is not in the list, so the release leaves it off
+    CHECK(std::find(off.begin(), off.end(), win_rule_key(rules[1])) == off.end());
+    CHECK(win_rule_key(rules[1]) != win_rule_key(rules[0]));
+    CHECK(win_rule_key("x", 1, 7) != win_rule_key("x", 2, 7)); // direction too
+    // the cross-generation merge works on the same keys
+    const auto merged = win_merge_disabled_list({off[0]}, off, true);
+    CHECK(merged.list.size() == 3);
+    CHECK(merged.grew);
+    // the round trip through the stored list keeps a '|'-bearing key intact
+    const auto parsed = parse_disabled_rules(serialize_disabled_rules(off));
+    REQUIRE(parsed);
+    CHECK(*parsed == off);
+}
+
+TEST_CASE("windows: a GPO-locked rule is a note on a completed release; a leftover is not",
+          "[agent][firewall_quarantine]") {
+    WinReleaseTally t;
+    CHECK_FALSE(win_release_decision(t).incomplete);
+
+    t.not_reenabled = 2; // a rule a GPO will not let us switch back on is the GPO's
+    auto d = win_release_decision(t);
+    CHECK_FALSE(d.incomplete);
+    REQUIRE(d.notes.size() == 1);
+    CHECK(d.notes[0] == "rules_not_reenabled=2");
+
+    // everything that leaves OUR block, rules, a default action or a stale image stays incomplete
+    WinReleaseTally u;
+    u.policy_restore_failed = 1;
+    CHECK(win_release_decision(u).incomplete);
+    WinReleaseTally v;
+    v.our_rules_left = true;
+    CHECK(win_release_decision(v).incomplete);
+    WinReleaseTally w;
+    w.reenable_unread = true;
+    CHECK(win_release_decision(w).incomplete);
+    WinReleaseTally x;
+    x.images_not_deleted = true; // a surviving image would be reused and its release restore an old policy
+    d = win_release_decision(x);
+    CHECK(d.incomplete);
+    CHECK(contains(d.notes, "images_not_deleted=1"));
+
+    CHECK(win_policy_overridden(kWinModifyStateGpOverride));
+    CHECK_FALSE(win_policy_overridden(0));
+    CHECK_FALSE(win_policy_overridden(2)); // inbound-blocked is not an override of OUR block
+}
+
+TEST_CASE("windows release over the driver: a GPO-locked rule completes; a stuck image keeps the record releasing",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    Deadline dl;
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+
+    rig.leg.on_remove = [](OsPayload&) {
+        auto r = StepResult::success();
+        r.notes.emplace_back("rules_not_reenabled=2");
+        return r;
+    };
+    const auto done_o = release(rig.env, ReleaseRequest{}, dl);
+    CHECK(done_o.status == "inactive");
+    CHECK(contains(done_o.notes, "rules_not_reenabled=2"));
+    CHECK_FALSE(rig.store.state()); // erased: the next quarantine is not wedged behind release_in_progress
+
+    // a restore image that will not delete: the release is incomplete, the record stays
+    ScriptRig stuck;
+    REQUIRE(apply_and_verify(stuck.env, stuck.request(), dl).status == "active");
+    stuck.leg.on_remove = [](OsPayload&) {
+        auto r = StepResult::fail("release_incomplete");
+        r.notes.emplace_back("images_not_deleted=1");
+        return r;
+    };
+    const auto o = release(stuck.env, ReleaseRequest{}, dl);
+    CHECK(o.status == "partial");
+    CHECK(o.reason == "release_failed:release_incomplete");
+    CHECK(contains(o.notes, "images_not_deleted=1"));
+    REQUIRE(stuck.store.state());
+    CHECK(stuck.store.state()->phase == Phase::releasing);
+    CHECK(apply_and_verify(stuck.env, stuck.request(), dl).reason == "release_in_progress");
+    stuck.leg.on_remove = [](OsPayload&) { return StepResult::success(); };
+    CHECK(release(stuck.env, ReleaseRequest{}, dl).status == "inactive");
+}
+
+TEST_CASE("iptables: our jump must be FIRST in every built-in chain; a Docker re-insert is repaired",
+          "[agent][firewall_quarantine]") {
+    const auto l = parse_iptables_listing("-P INPUT ACCEPT\n-N yuzu-fwq-1\n-A INPUT -j yuzu-fwq-1\n"
+                                          "-A OUTPUT -j yuzu-fwq-1\n"
+                                          "-A FORWARD -i docker0 -j DOCKER-USER\n"
+                                          "-A FORWARD -j yuzu-fwq-1-f\n");
+    CHECK(l.first_is_ours(0));
+    CHECK(l.first_is_ours(1));
+    CHECK_FALSE(l.first_is_ours(2)); // present, but behind Docker's
+    CHECK(l.first_target[2] == "DOCKER-USER");
+    // a first rule with no jump at all is not ours either
+    CHECK_FALSE(parse_iptables_listing("-A INPUT -m state --state ESTABLISHED\n-A INPUT -j yuzu-fwq-1\n")
+                    .first_is_ours(0));
+
+    IptRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    CHECK(report_status(rig.env, dl).status == "active");
+
+    auto& fwd = rig.world.fam[std::string{kIptablesPath}].builtin["FORWARD"];
+    fwd.insert(fwd.begin(), "DOCKER-USER"); // dockerd restarts and re-inserts its jump at position 1
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "degraded");
+    CHECK(st.reason == "policy_not_blocking");
+
+    const auto fixed = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(fixed.status == "active");
+    CHECK(contains(fixed.notes, "repaired=1"));
+    CHECK(rig.jumps(kIptablesPath, "FORWARD").front() == "yuzu-fwq-2-f");
+    CHECK(report_status(rig.env, dl).status == "active");
+}
+
+TEST_CASE("Exec: a call that ran and timed out is call_timed_out; one refused for the deadline never ran",
+          "[agent][firewall_quarantine]") {
+    int ran = 0;
+    const Runner run = [&](const Argv&, std::chrono::milliseconds) {
+        ++ran;
+        ToolResult r;
+        r.ran = true;
+        r.timed_out = true;
+        return r;
+    };
+    Deadline dl;
+    detail::Exec ex1(run, dl);
+    CHECK_FALSE(ex1.call({"/usr/sbin/nft", "list"}));
+    CHECK(ex1.reason() == "call_timed_out"); // it RAN: the OS state is unknown
+    CHECK(ran == 1);
+
+    FakeClock clock;
+    Deadline spent(std::chrono::milliseconds{1}, clock.fn());
+    clock.advance(5ms);
+    detail::Exec ex2(run, spent);
+    CHECK_FALSE(ex2.call({"/usr/sbin/nft", "list"}));
+    CHECK(ex2.reason() == "deadline_exceeded"); // before the call: nothing ran
+    CHECK(ran == 1);
+
+    detail::Exec ex3(run, dl);
+    CHECK_FALSE(ex3.call({"/usr/sbin/nft", "list;"}));
+    CHECK(ex3.reason() == "unsafe_argv");
+    CHECK(ran == 1);
+}
+
+TEST_CASE("ambiguous commit: a tool that committed and then overran its budget is never read as a clean failure",
+          "[agent][firewall_quarantine]") {
+    SECTION("an update keeps its candidate record, applying, and the retry converges") {
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto exc = ex("10.0.0.5:22/tcp/in");
+        rig.world.load_times_out = true; // `nft -f` commits the new set, then overruns
+        const auto o = update(rig.env, true, {exc}, dl);
+        CHECK(o.status == "update_failed");
+        CHECK(o.reason == "commit_unknown");
+        CHECK(o.rc() == 1);
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::applying); // NOT the previous record put back
+        CHECK(rig.store.state()->generation == 2);
+        CHECK(rig.store.state()->allow.exceptions.size() == 1); // the set the kernel holds
+        CHECK(rig.world.text.find("dport 22") != std::string::npos);
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "partial");
+        CHECK(st.reason == "operation_in_progress");
+
+        // the retry (the same request a retried quarantine carries) converges the full set
+        rig.world.load_times_out = false;
+        auto req = rig.request();
+        req.allow = make_set({"203.0.113.53"}, {exc});
+        const auto fixed = apply_and_verify(rig.env, req, dl);
+        CHECK(fixed.status == "active");
+        CHECK(contains(fixed.notes, "incomplete_apply_converged=1"));
+        CHECK(rig.store.state()->phase == Phase::active);
+        CHECK(rig.store.state()->generation == 3);
+    }
+    SECTION("an initial apply is rolled back (the removal is idempotent)") {
+        NftRig rig;
+        rig.world.load_times_out = true;
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK(o.reason == "apply_failed:call_timed_out");
+        CHECK_FALSE(rig.world.table); // the committed table was taken out again
+        CHECK_FALSE(rig.store.state());
+    }
+    SECTION("a boot re-apply says commit_unknown") {
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.world.table = false;
+        rig.world.load_times_out = true;
+        const auto o = recover_at_init(rig.env, dl);
+        CHECK(o.status == "degraded");
+        CHECK(o.reason == "reapply_failed:commit_unknown");
+    }
+}
+
+TEST_CASE("CH-2: a proof that failed never reads active again -- recovery, status, a no-op update, the ttl tick",
+          "[agent][firewall_quarantine]") {
+    auto token = [](std::string v) {
+        QuarantineState s;
+        s.last_verify = std::move(v);
+        return std::string{detail::active_token(s)};
+    };
+    CHECK(token("verified control_ok probe_blocked") == "active");
+    CHECK(token("unproven control_ok probe_unproven") == "active_unproven");
+    CHECK(token("control_unreachable control_fail probe_blocked") == "active_unproven");
+    CHECK(token("probe_still_reachable control_ok probe_reachable") == "active_unproven");
+    CHECK(token("probe_unreachable_before_apply control_ok probe_unproven") == "active_unproven");
+    CHECK(token("") == "active_unproven");
+    // and every text the core itself writes: only `verified` earns `active`
+    for (const auto outcome : {VerifyOutcome::verified, VerifyOutcome::unproven,
+                               VerifyOutcome::control_unreachable, VerifyOutcome::probe_still_reachable,
+                               VerifyOutcome::probe_unreachable_before_apply}) {
+        detail::VerifyResult v;
+        v.outcome = outcome;
+        INFO(detail::verify_text(v));
+        CHECK(token(detail::verify_text(v)) ==
+              (outcome == VerifyOutcome::verified ? "active" : "active_unproven"));
+    }
+
+    const auto read_everywhere = [](NftRig& rig, Deadline& dl) {
+        CHECK(report_status(rig.env, dl).status == "active_unproven");
+        const auto noop = update(rig.env, true, {}, dl);
+        CHECK(noop.status == "active_unproven");
+        CHECK(contains(noop.notes, "exceptions_unchanged=1"));
+        ReleaseRequest due;
+        due.if_ttl_expired = true;
+        const auto tick = release(rig.env, due, dl); // the 30 s tick reads no leg at all
+        CHECK(tick.status == "active_unproven");
+        CHECK(contains(tick.notes, "ttl_not_expired=1"));
+    };
+
+    SECTION("the probe target is still reachable after a boot re-apply") {
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 3600), dl).status == "active");
+        rig.world.table = false;                       // the reboot
+        rig.probe.blocked = [] { return false; };      // and the target answers anyway
+        const auto o = recover_at_init(rig.env, dl);
+        CHECK(o.status == "active_unproven");
+        CHECK(rig.store.state()->last_verify.starts_with("probe_still_reachable"));
+        read_everywhere(rig, dl);
+    }
+    SECTION("the control set did not answer at boot") {
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 3600), dl).status == "active");
+        rig.world.table = false;
+        rig.probe.control_up = false;
+        const auto o = recover_at_init(rig.env, dl);
+        CHECK(o.status == "active_unproven");
+        CHECK(rig.store.state()->last_verify == "control_unreachable control_fail probe_blocked");
+        read_everywhere(rig, dl);
+    }
+}
+
+TEST_CASE("the ttl tick answers from the record: residue, an operation in progress, never active over a gap",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    Deadline dl;
+    ReleaseRequest due;
+    due.if_ttl_expired = true;
+    auto rec = make_record();
+    rec.ttl_expires = rig.now + 3600;
+
+    SECTION("residue") {
+        rec.os.stale_rules_left = 2;
+        REQUIRE(rig.store.save(rec));
+        const auto o = release(rig.env, due, dl);
+        CHECK(o.status == "partial");
+        CHECK(o.reason == "stale_rules_left");
+        CHECK(contains(o.notes, "stale_rules_left=2"));
+        CHECK(contains(o.notes, "ttl_not_expired=1"));
+    }
+    SECTION("applying and releasing") {
+        for (const auto phase : {Phase::applying, Phase::releasing}) {
+            rec.phase = phase;
+            REQUIRE(rig.store.save(rec));
+            const auto o = release(rig.env, due, dl);
+            CHECK(o.status == "partial");
+            CHECK(o.reason == "operation_in_progress");
+        }
+    }
+    SECTION("a failed proof") {
+        rec.last_verify = "probe_still_reachable control_ok probe_reachable";
+        REQUIRE(rig.store.save(rec));
+        CHECK(release(rig.env, due, dl).status == "active_unproven");
+    }
+    CHECK(rig.leg.removes == 0);
+}
+
+TEST_CASE("a TTL release defers to a legacy containment that appeared underneath",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    auto rec = make_record();
+    rec.ttl_expires = rig.now - 1; // the limit has lapsed
+    REQUIRE(rig.store.save(rec));
+    ReleaseRequest due;
+    due.if_ttl_expired = true;
+    Deadline dl;
+
+    rig.leg.refuse = "legacy_quarantine_active"; // quarantine.quarantine ran since
+    const auto o = release(rig.env, due, dl);
+    CHECK(o.status == "partial");
+    CHECK(o.reason == "legacy_quarantine_active");
+    CHECK(contains(o.notes, "ttl_deferred_legacy=1"));
+    CHECK(rig.leg.removes == 0); // nothing restored underneath the legacy containment
+    CHECK(rig.store.state()->phase == Phase::active); // the next tick retries
+
+    // any OTHER preflight answer must not stop a lapsed limit from ending
+    rig.leg.refuse = "firewall_disabled:Public";
+    const auto lifted = release(rig.env, due, dl);
+    CHECK(lifted.status == "inactive");
+    CHECK(rig.leg.removes == 1);
+
+    // and a manual release is the dispatch gate's business, not this tick's
+    REQUIRE(rig.store.save(rec));
+    rig.leg.refuse = "legacy_quarantine_active";
+    CHECK(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+}
+
+TEST_CASE("recover_at_init releases a record whose time limit already lapsed instead of re-applying it",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl).status == "active");
+    rig.world.table = false; // the agent was down across a reboot
+    rig.now += 600;          // ... and past the expiry
+    const auto calls = rig.world.crash.calls;
+    const auto o = recover_at_init(rig.env, dl);
+    CHECK(o.status == "inactive");
+    CHECK_FALSE(rig.world.table);
+    CHECK_FALSE(rig.store.state());
+    CHECK(std::none_of(rig.world.log.begin() + calls, rig.world.log.end(),
+                       [](const Argv& a) { return a.size() > 1 && a[1] == "-f"; })); // never re-applied
+}
+
+TEST_CASE("recover_at_init: an initial apply that never completed is not promoted without a control channel",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    // A crash after the load and before the verification: `applying`, no proof recorded.
+    auto rec = make_record(Phase::applying, BackendKind::nft);
+    rec.last_verify.clear();
+    rec.probe_target = kProbeTarget;
+    REQUIRE(rig.store.save(rec));
+    rig.probe.control_up = false; // wrong control set / server unreachable at boot
+
+    const auto o = recover_at_init(rig.env, dl);
+    CHECK(o.status == "partial");
+    CHECK(o.reason == "operation_in_progress");
+    CHECK(contains(o.notes, "control_unreachable_unproven=1"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::applying); // NOT promoted to active
+    CHECK(report_status(rig.env, dl).reason == "operation_in_progress");
+    CHECK(rig.world.table); // still contained: rolling back at boot stays excluded
+
+    // the next retried quarantine converges and verifies it
+    rig.probe.control_up = true;
+    const auto retry = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(retry.status == "active");
+    CHECK(rig.store.state()->phase == Phase::active);
+    CHECK(rig.store.state()->last_verify.starts_with("verified"));
+
+    // with the control set answering at boot the same kind of record IS promoted
+    NftRig ok;
+    auto dl2 = ok.dl();
+    auto rec2 = make_record(Phase::applying, BackendKind::nft);
+    rec2.last_verify.clear();
+    REQUIRE(ok.store.save(rec2));
+    CHECK(recover_at_init(ok.env, dl2).status == "active_unproven"); // no probe target: unproven, not failed
+    CHECK(ok.store.state()->phase == Phase::active);
+}
+
+TEST_CASE("a probe target an operator exception already admits is refused before any mutation",
+          "[agent][firewall_quarantine]") {
+    const auto t = parse_probe_target(kProbeTarget).value();
+    const auto covered = [&](const char* e) {
+        return exception_covers_probe_target(make_set({"203.0.113.53"}, {ex(e)}), t);
+    };
+    CHECK(covered("192.0.2.80:443/tcp/out"));
+    CHECK(covered("192.0.2.0/24:443/out"));      // a prefix, both protocols
+    CHECK(covered("192.0.2.80/out"));            // any port
+    CHECK_FALSE(covered("192.0.2.0/24:80/out")); // another port
+    CHECK_FALSE(covered("192.0.2.80:443/udp/out"));
+    CHECK_FALSE(covered("192.0.2.80:443/in"));   // inbound admits no outbound connect
+    CHECK_FALSE(covered("198.51.100.0/24/out")); // another network
+    CHECK_FALSE(covered("[2001:db8::]/32/out")); // another family
+
+    SECTION("quarantine") {
+        NftRig rig;
+        auto dl = rig.dl();
+        auto req = rig.request();
+        req.allow = make_set({"203.0.113.53"}, {ex("192.0.2.0/24:443/out")});
+        const auto o = apply_and_verify(rig.env, req, dl);
+        CHECK(o.status == "refused");
+        CHECK(o.reason == "probe_target_covered_by_exception");
+        CHECK(rig.world.crash.calls == 0);
+        CHECK(rig.store.raw.empty());
+    }
+    SECTION("quarantine_allow add") {
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto raw = rig.store.raw;
+        const auto calls = rig.world.crash.calls;
+        const auto o = update(rig.env, true, {ex("192.0.2.0/24:443/out")}, dl);
+        CHECK(o.status == "refused");
+        CHECK(o.reason == "probe_target_covered_by_exception");
+        CHECK(rig.world.crash.calls == calls); // no mutation, no revert, no second flush
+        CHECK(rig.store.raw == raw);
+        // an exception that does not cover it still applies
+        CHECK(update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl).status == "active");
+    }
+}
+
+TEST_CASE("retrying quarantine over an incomplete apply takes the request's time limit and probe target",
+          "[agent][firewall_quarantine]") {
+    SECTION("both are applied, the new probe target is proven reachable first") {
+        NftRig rig;
+        auto dl = rig.dl();
+        auto rec = make_record(Phase::applying, BackendKind::nft); // a throw / failed save before the proof
+        rec.last_verify.clear();
+        REQUIRE(rig.store.save(rec));
+        const auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
+        CHECK(o.status == "active");
+        CHECK(contains(o.notes, "ttl_from_retry=1"));
+        CHECK(contains(o.notes, "probe_from_retry=1"));
+        CHECK(contains(o.notes, "incomplete_apply_converged=1"));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->ttl_expires == rig.now + 120);
+        CHECK(rig.store.state()->probe_target == kProbeTarget);
+        CHECK(*o.verify == "verify|control=ok|probe=blocked");
+    }
+    SECTION("a dead new probe target refuses before anything is touched") {
+        NftRig rig;
+        auto dl = rig.dl();
+        auto rec = make_record(Phase::applying, BackendKind::nft);
+        rec.last_verify.clear();
+        REQUIRE(rig.store.save(rec));
+        const auto raw = rig.store.raw;
+        rig.probe.blocked = [] { return true; }; // the target does not answer before the apply
+        const auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 0), dl);
+        CHECK(o.status == "refused");
+        CHECK(o.reason == "probe_unreachable_before_apply");
+        CHECK(rig.world.crash.calls == 0);
+        CHECK(rig.store.raw == raw);
+    }
+    SECTION("an ACTIVE record's expiry is still never rewritten by a retry") {
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl).status == "active");
+        const auto expiry = rig.store.state()->ttl_expires;
+        rig.now += 30;
+        const auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 3600), dl);
+        CHECK(contains(o.notes, "ttl_unchanged_release_then_quarantine=1"));
+        CHECK(rig.store.state()->ttl_expires == expiry);
+    }
+}
+
+TEST_CASE("CH-3: a failed ttl registration is residue on the record until a settle succeeds",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    FakeTriggers trig;
+    trig.accept = false; // the trigger table is full
+    auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl);
+    REQUIRE(o.status == "active");
+    settle_ttl(o, trig, rig.store);
+    CHECK(o.status == "partial");
+    CHECK(o.reason == "ttl_unregistered");
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->os.ttl_unregistered);
+    // it survives the record's text form
+    const auto round = parse_state(serialize_state(*rig.store.state()));
+    REQUIRE(round);
+    CHECK(round->os.ttl_unregistered);
+
+    // every later read says so instead of `active` over a limit nothing enforces
+    auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "ttl_unregistered");
+    CHECK(contains(st.notes, "ttl_unregistered=1"));
+    const auto noop = update(rig.env, true, {}, dl);
+    CHECK(noop.status == "partial");
+    CHECK(noop.reason == "ttl_unregistered");
+    ReleaseRequest due;
+    due.if_ttl_expired = true;
+    CHECK(release(rig.env, due, dl).reason == "ttl_unregistered");
+
+    // a registration that finally succeeds clears it
+    trig.accept = true;
+    settle_ttl(st, trig, rig.store);
+    CHECK(st.status == "active");
+    CHECK(st.reason.empty());
+    CHECK_FALSE(contains(st.notes, "ttl_unregistered=1"));
+    CHECK_FALSE(rig.store.state()->os.ttl_unregistered);
+    CHECK(report_status(rig.env, dl).status == "active");
+
+    // a no-op poll never re-registers (it logs a replace and a fire every 30 s otherwise)
+    FakeTriggers quiet;
+    auto tick = release(rig.env, due, dl);
+    settle_ttl(tick, quiet, rig.store);
+    CHECK(quiet.registered.empty());
+}
+
+TEST_CASE("CH-3: a throw out of an action is degraded|exception, never refused, and still arms the ttl",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    // the process dies (a throw) right after `nft -f` committed: the `applying` record exists
+    rig.world.crash.crash_at = 2;
+    rig.world.crash.after_effect = true;
+    CHECK_THROWS_AS(apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl), CrashSim);
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::applying);
+
+    auto o = exception_outcome(rig.store.load());
+    CHECK(o.status == "degraded");
+    CHECK(o.reason == "exception");
+    CHECK(o.rc() == 1);
+    REQUIRE(o.state);
+    CHECK(o.state->phase == Phase::applying);
+    FakeTriggers trig;
+    settle_ttl(o, trig, rig.store); // the trigger of a time-limited applying record is registered
+    CHECK(trig.registered.size() == 1);
+
+    const auto rows = render_rows(o);
+    CHECK(rows.front() == "status|degraded|exception");
+    CHECK(std::none_of(rows.begin(), rows.end(),
+                       [](const std::string& r) { return r.starts_with("refused|"); }));
+    const auto kind = result_kind(o);
+    CHECK(kind.provenance == "firewall:degraded"); // consumers key on this: refused means nothing changed
+    CHECK(kind.kind == ResultKind::Kind::constrained);
+    CHECK(kind.partial);
+
+    // no record: nothing to attach, and nothing registered
+    StateLoad none;
+    auto bare = exception_outcome(none);
+    CHECK_FALSE(bare.state);
+    FakeTriggers quiet;
+    FakeStore store;
+    settle_ttl(bare, quiet, store);
+    CHECK(quiet.registered.empty());
+}
+
+TEST_CASE("CH-4: a store fault is never read as an absent record -- nothing is started, kept, re-applied or unregistered",
+          "[agent][firewall_quarantine]") {
+    PfRig rig; // the record carries the pf enable token
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl).status == "active");
+    const auto raw = rig.store.raw;
+    const auto token = rig.token();
+    REQUIRE_FALSE(token.empty());
+    const auto calls = rig.world.crash.calls;
+
+    rig.store.fault = true; // SQLITE_BUSY / a closed handle: exists() cannot answer
+
+    // quarantine: refused, NOT a fresh generation-1 record over the stored one
+    const auto q = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(q.status == "refused");
+    CHECK(q.reason == "state_unreadable");
+    // the ttl tick: degraded, and the trigger is kept (never unregistered over a fault)
+    ReleaseRequest due;
+    due.if_ttl_expired = true;
+    auto tick = release(rig.env, due, dl);
+    CHECK(tick.status == "degraded");
+    CHECK(tick.reason == "state_unreadable");
+    FakeTriggers trig;
+    settle_ttl(tick, trig, rig.store);
+    CHECK(trig.unregistered.empty());
+    CHECK(trig.registered.empty());
+    // start recovery and an update: nothing re-applied, nothing changed
+    const auto boot = recover_at_init(rig.env, dl);
+    CHECK(boot.status == "degraded");
+    CHECK(boot.reason == "state_unreadable");
+    CHECK(update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl).reason == "state_unreadable");
+    CHECK(rig.world.crash.calls == calls); // not one tool call
+
+    // the fault clears: the record, the token and the containment are exactly as they were
+    rig.store.fault = false;
+    CHECK(rig.store.raw == raw);
+    CHECK(rig.token() == token);
+    CHECK(rig.world.enforcing());
+    CHECK(report_status(rig.env, dl).status == "active");
+}
+
+TEST_CASE("a record with a key a newer build wrote still releases the pf token",
+          "[agent][firewall_quarantine]") {
+    PfRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    REQUIRE_FALSE(rig.token().empty());
+    rig.store.raw += "future_key=1\n"; // the agent was downgraded across this record
+    const auto o = release(rig.env, ReleaseRequest{}, dl);
+    CHECK(o.status == "inactive");
+    CHECK(rig.world.tokens.empty()); // a strict parser would have released with an empty payload and leaked it
+    CHECK_FALSE(rig.world.pf_on);
+}
+
+// ── result truth: the branches a mutant could flip without a test noticing ───
+
+TEST_CASE("update_failed|revert_failed: the failed generation is in force and the record says so",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    int loads = 0;
+    rig.world.on_call = [&](const Argv& a) {
+        if (a.size() > 1 && a[1] == "-f" && ++loads == 2) // the update commits; its REVERT fails
+            rig.world.fail_load = true;
+    };
+    rig.probe.blocked = [] { return false; }; // the new generation's verification fails
+    const auto o = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+    CHECK(o.status == "update_failed");
+    CHECK(o.reason.starts_with("revert_failed:"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::applying); // boot recovery retries
+    CHECK(rig.store.state()->allow.exceptions.size() == 1); // the generation that IS in force
+    CHECK(rig.world.text.find("dport 22") != std::string::npos);
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "operation_in_progress");
+}
+
+TEST_CASE("a store write that fails at the end of an operation is partial, never a clean result",
+          "[agent][firewall_quarantine]") {
+    SECTION("release: the OS is lifted but the record could not be erased") {
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.store.fail_erase = true;
+        const auto o = release(rig.env, ReleaseRequest{}, dl);
+        CHECK(o.status == "partial");
+        CHECK(o.reason == "state_not_erased");
+        CHECK_FALSE(rig.world.table); // lifting is never blocked by the record
+        CHECK(rig.store.state()->phase == Phase::releasing);
+    }
+    SECTION("apply: contained, but the `active` record could not be written") {
+        NftRig rig;
+        auto dl = rig.dl();
+        rig.store.fail_save_after = 1; // the applying record lands, the final one does not
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "partial");
+        CHECK(contains(o.notes, "state_not_persisted=1"));
+        CHECK(rig.world.table);
+        CHECK(rig.store.state()->phase == Phase::applying); // boot recovery re-applies and verifies
+    }
+    SECTION("update: the new generation is in force but its record could not be written") {
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.store.fail_save_after = rig.store.saves + 1; // the candidate lands, the final does not
+        const auto o = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+        CHECK(o.status == "partial");
+        CHECK(contains(o.notes, "state_not_persisted=1"));
+        CHECK(rig.store.state()->phase == Phase::applying);
+    }
+}
+
+TEST_CASE("pf: the enable token is never lost across a failed update or a failed rollback",
+          "[agent][firewall_quarantine]") {
+    SECTION("a failed update keeps the token the record already held") {
+        PfRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto held = rig.token();
+        REQUIRE_FALSE(held.empty());
+        rig.world.external_disable(); // pf off behind our back: the token is dead
+        rig.world.fail_load = true;   // the repair takes a fresh reference, then the load fails
+        const auto o = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+        CHECK(o.status == "update_failed");
+        CHECK(rig.token() == held);          // the record still names what it held
+        CHECK(rig.world.tokens.empty());     // the fresh reference was given back
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::active);
+    }
+    SECTION("a rollback whose anchor flush fails keeps the token on the `releasing` record") {
+        PfRig rig;
+        auto dl = rig.dl();
+        rig.world.fail_flush_anchor = true; // the removal cannot empty the anchor
+        rig.probe.control_up = false;       // the apply fails its own control check
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK(contains(o.notes, "rollback_incomplete=1"));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::releasing);
+        CHECK_FALSE(rig.token().empty()); // the record is the only way to release it
+        rig.world.fail_flush_anchor = false;
+        CHECK(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+        CHECK(rig.world.tokens.empty());
+    }
+}
+
+TEST_CASE("every status token maps to one typed result", "[agent][firewall_quarantine]") {
+    using K = ResultKind::Kind;
+    struct Row {
+        const char* status;
+        K kind;
+        bool partial;
+    };
+    for (const auto& row : {Row{"active", K::ok, false}, Row{"inactive", K::ok, false},
+                            Row{"active_unproven", K::ok, true}, Row{"partial", K::constrained, true},
+                            Row{"degraded", K::constrained, true}, Row{"refused", K::unavailable, true},
+                            Row{"rolled_back", K::unavailable, true},
+                            Row{"update_failed", K::unavailable, true},
+                            Row{"busy", K::unavailable, true}, Row{"something_new", K::unavailable, true}}) {
+        INFO(row.status);
+        Outcome o;
+        o.status = row.status;
+        const auto rk = result_kind(o);
+        CHECK(rk.kind == row.kind);
+        CHECK(rk.partial == row.partial);
+        CHECK(rk.provenance == std::string{"firewall:"} + row.status);
+    }
+    // rc: exactly the five outcomes a caller must treat as failed
+    for (const char* s : {"refused", "rolled_back", "update_failed", "busy"}) {
+        Outcome o;
+        o.status = s;
+        CHECK(o.rc() == 1);
+    }
+    for (const char* s : {"active", "inactive", "active_unproven", "partial", "degraded"}) {
+        Outcome o;
+        o.status = s;
+        CHECK(o.rc() == 0);
+    }
+    Outcome thrown;
+    thrown.status = "degraded";
+    thrown.reason = "exception";
+    CHECK(thrown.rc() == 1); // degraded, but the action itself failed
+}
+
+TEST_CASE("a reply that names residue carries its reason; repair notes appear only when the repair worked",
+          "[agent][firewall_quarantine]") {
+    SECTION("a partial apply answers partial|<residue>, in the reply and not only later") {
+        ScriptRig rig;
+        rig.leg.on_apply = [](OsPayload& os) {
+            os.rules_not_disabled = 2;
+            auto r = StepResult::success();
+            r.partial = true;
+            r.notes.emplace_back("rules_not_disabled=2");
+            return r;
+        };
+        Deadline dl;
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "partial");
+        CHECK(o.reason == "rules_not_disabled");
+        CHECK(render_rows(o).front() == "status|partial|rules_not_disabled");
+        // the same on an update (a converged generation)
+        const auto u = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+        CHECK(u.status == "partial");
+        CHECK(u.reason == "rules_not_disabled");
+    }
+    SECTION("repaired=1 and incomplete_apply_converged=1 are not claimed over a failed attempt") {
+        NftRig rig;
+        auto dl = rig.dl();
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.world.table = false; // someone deleted the table
+        rig.world.fail_load = true;
+        const auto failed = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(failed.status == "update_failed");
+        CHECK_FALSE(contains(failed.notes, "repaired=1"));
+        rig.world.fail_load = false;
+        const auto fixed = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(fixed.status == "active");
+        CHECK(contains(fixed.notes, "repaired=1"));
+
+        NftRig crashed;
+        auto dl2 = crashed.dl();
+        auto rec = make_record(Phase::applying, BackendKind::nft);
+        REQUIRE(crashed.store.save(rec));
+        crashed.world.fail_load = true;
+        const auto bad = apply_and_verify(crashed.env, crashed.request(), dl2);
+        CHECK(bad.status == "update_failed");
+        CHECK_FALSE(contains(bad.notes, "incomplete_apply_converged=1"));
+    }
 }

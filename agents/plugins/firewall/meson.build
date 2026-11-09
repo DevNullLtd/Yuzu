@@ -1,4 +1,4 @@
-firewall_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
+firewall_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 firewall_cpp_args = []
 
 if host_machine.system() == 'windows'

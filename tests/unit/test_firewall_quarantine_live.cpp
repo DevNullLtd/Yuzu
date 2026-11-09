@@ -114,7 +114,9 @@ constexpr const char* kPluginFile = "firewall.dylib";
 constexpr const char* kPluginFile = "firewall.so";
 #endif
 
-std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall() {
+/// The built plugin file, wherever this test binary was started from; nullopt when
+/// no candidate exists (a partial build with no agent plugins).
+std::optional<fs::path> find_firewall_plugin_file() {
     std::vector<fs::path> dirs{
         fs::path{"agents"} / "plugins" / "firewall",
         fs::path{".."} / "agents" / "plugins" / "firewall",
@@ -128,8 +130,14 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall()
         std::error_code ec;
         const auto candidate = d / kPluginFile;
         if (fs::exists(candidate, ec) && !ec)
-            return yuzu::agent::PluginHandle::load(candidate);
+            return candidate;
     }
+    return std::nullopt;
+}
+
+std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall() {
+    if (const auto file = find_firewall_plugin_file())
+        return yuzu::agent::PluginHandle::load(*file);
     return yuzu::agent::PluginHandle::load(fs::path{"agents"} / "plugins" / "firewall" / kPluginFile);
 }
 
@@ -429,7 +437,14 @@ struct LiveEnv {
 
 /// Is the built plugin in this tree? A partial build (no agent plugins) has none,
 /// and the neighbouring local-dispatcher tests skip the same way.
-[[nodiscard]] bool firewall_plugin_built() { return load_firewall().has_value(); }
+[[nodiscard]] bool firewall_plugin_built() {
+    if (!find_firewall_plugin_file())
+        return false; // a partial build: the neighbouring tests skip the same way
+    // The file is THERE: a load failure is a defect, never a green skip.
+    const auto loaded = load_firewall();
+    REQUIRE(loaded.has_value());
+    return true;
+}
 
 #define PLUGIN_RIG_OR_RETURN(rig)                                                                  \
     if (!firewall_plugin_built()) {                                                                \
@@ -525,11 +540,11 @@ TEST_CASE("quarantine: the plugin action checks its parameters before it touches
           "[agent][firewall_quarantine]") {
     PLUGIN_RIG_OR_RETURN(rig);
 
-    // below 60 s, above 30 days, and not a number
-    check_refused(rig.run("quarantine", {{"ttl_seconds", "5"}}), "ttl_out_of_bounds");
-    check_refused(rig.run("quarantine", {{"ttl_seconds", "59"}}), "ttl_out_of_bounds");
-    check_refused(rig.run("quarantine", {{"ttl_seconds", "2592001"}}), "ttl_out_of_bounds");
-    check_refused(rig.run("quarantine", {{"ttl_seconds", "soon"}}), "ttl_out_of_bounds");
+    // A time limit is not offered in this release: ANY ttl_seconds is refused first,
+    // in range or not, before a value is even validated (the wall clock cannot be
+    // trusted and an expiry release is invisible to the server).
+    for (const char* v : {"5", "59", "60", "3600", "2592001", "soon", "0"})
+        check_refused(rig.run("quarantine", {{"ttl_seconds", v}}), "ttl_unavailable");
     const auto bad = rig.run("quarantine", {{"exceptions", "garbage"}});
     CHECK(has_prefix(bad.captured, "status|refused|exceptions_invalid:"));
     CHECK(bad.rc == 1);
@@ -778,19 +793,24 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
     CHECK(has_row(rig.run("quarantine_status").captured, "status|active"));
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
 
-    // a quarantine with a TTL, then a restart: init retries the TTL trigger (the
-    // standalone harness has no trigger engine, so it fails again, deterministically).
-    // This is the only place the init-time retry line executes against the built plugin.
-    REQUIRE(has_row(rig.run("release").captured, "status|inactive"));
-    auto ttl_params = env.quarantine_params();
-    ttl_params.emplace_back("ttl_seconds", "60");
-    REQUIRE(has_row(rig.run("quarantine", ttl_params).captured, "status|partial"));
+    // A record that carries a time limit (a time limit cannot be requested in this
+    // release, so one is written the way a later build would), then a restart: init
+    // retries the TTL trigger (the standalone harness has no trigger engine, so it
+    // fails again, deterministically) and the failure is recorded as residue. This is
+    // the only place the init-time retry line executes against the built plugin.
+    REQUIRE(has_row(rig.run("quarantine_status").captured, "status|active"));
+    rec = rig.record();
+    REQUIRE(rec.has_value());
+    auto timed = *rec;
+    timed.ttl_expires = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+    rig.put_record(timed);
     rig.restart();
     CHECK(has_row(rig.run("quarantine_status").captured,
-                  "note|init_recovery=partial,ttl_trigger_unregistered=1"));
+                  "note|init_recovery=partial:ttl_unregistered,ttl_trigger_unregistered=1"));
     rec = rig.record();
     REQUIRE(rec.has_value());
     CHECK(rec->ttl_expires > 0);
+    CHECK(rec->os.ttl_unregistered); // recorded: every later status reads it
 }
 
 TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
@@ -799,18 +819,13 @@ TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
 
-    auto params = env.quarantine_params();
-    params.emplace_back("ttl_seconds", "60");
-    const auto q = rig.run("quarantine", params);
-    // the standalone harness has no trigger engine, so the TTL trigger cannot register:
-    // the quarantine stays applied and says so, deterministically (the registration
-    // contract itself is pinned against the engine's own parser in
-    // test_firewall_quarantine_parsers.cpp)
-    CHECK(has_row(q.captured, "status|partial"));
-    CHECK(has_row(q.captured, "note|ttl_trigger_unregistered=1"));
+    // No ttl_seconds parameter is accepted in this release, so the time limit is
+    // written onto the record directly (what a later build's `quarantine` would do).
+    REQUIRE(has_row(rig.run("quarantine", env.quarantine_params()).captured, "status|active"));
     auto rec = rig.record();
     REQUIRE(rec.has_value());
-    REQUIRE(rec->ttl_expires > 0);
+    rec->ttl_expires = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+    rig.put_record(*rec);
 
     const auto early = rig.run("release", {{"if_ttl_expired", "1"}});
     CHECK(has_row(early.captured, "note|ttl_not_expired=1"));
@@ -887,7 +902,10 @@ fq::Stage real_stage() {
             f.write(contents.data(), static_cast<std::streamsize>(contents.size()));
         }
         auto holder = std::make_shared<yuzu::TempFile>(std::move(*tmp));
-        return fq::StagedFile{holder->path(), holder};
+        // The core vets the staged path against the directory it was created in
+        // (a TMPDIR that ends in a slash is normalised so the two agree).
+        const auto norm = std::filesystem::path(holder->path()).lexically_normal();
+        return fq::StagedFile{norm.string(), holder, norm.parent_path().string()};
     };
 }
 

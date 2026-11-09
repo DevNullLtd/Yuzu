@@ -465,9 +465,13 @@ bool KvStore::del(std::string_view plugin, std::string_view key) {
 }
 
 bool KvStore::exists(std::string_view plugin, std::string_view key) {
+    return exists_checked(plugin, key).value_or(false);
+}
+
+std::optional<bool> KvStore::exists_checked(std::string_view plugin, std::string_view key) {
     CallLock lock(mu_);
     if (!db_)
-        return false;
+        return std::nullopt;
 
     const char* sql = "SELECT 1 FROM kv_store WHERE plugin = ? AND key = ? LIMIT 1";
 
@@ -475,7 +479,7 @@ bool KvStore::exists(std::string_view plugin, std::string_view key) {
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("KvStore::exists prepare failed: {}", sqlite3_errmsg(db_));
-        return false;
+        return std::nullopt;
     }
     StmtPtr stmt(raw_stmt);
 
@@ -483,7 +487,13 @@ bool KvStore::exists(std::string_view plugin, std::string_view key) {
     sqlite3_bind_text(stmt.get(), 2, key.data(), static_cast<int>(key.size()), SQLITE_STATIC);
 
     rc = sqlite3_step(stmt.get());
-    return rc == SQLITE_ROW;
+    if (rc == SQLITE_ROW)
+        return true;
+    if (rc == SQLITE_DONE)
+        return false;
+    // BUSY / IOERR / CORRUPT / ...: the row's presence is unknown, not proven absent.
+    spdlog::error("KvStore::exists step failed: {}", sqlite3_errmsg(db_));
+    return std::nullopt;
 }
 
 std::vector<std::string> KvStore::list(std::string_view plugin, std::string_view prefix) {

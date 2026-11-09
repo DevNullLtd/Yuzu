@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 with CAP_NET_ADMIN in the host network namespace · leg-hash d8f66c5959ab
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 with CAP_NET_ADMIN in the host network namespace · leg-hash cbc89fa3247c
 == action=state
 backend|nftables
 state|active
@@ -63,7 +63,7 @@ rule|nftables|ip|raw|PREROUTING|handle|3
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=quarantine
-[not captured] Destructive/Reversible: not executed on a live host (it contains the host: every rule outside the quarantine group is disabled or blocked until release)
+[not captured] Destructive/Reversible: not executed on a live host (it contains the host: its own chains drop everything the allow set does not name until release)
 
 == action=release
 [not captured] Mutating/Reversible: not executed on a live host (lifts a containment; needs one in force)
