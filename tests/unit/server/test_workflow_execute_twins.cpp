@@ -3875,13 +3875,13 @@ TEST_CASE("run outcome counter: the closed (outcome, reason) set is reachable-on
                          WorkflowRunOutcome::kAborted})
         tokens.emplace(std::string(workflow_run_outcome_token(o)));
     CHECK(outcomes == tokens);
-    CHECK(series.size() == 25);
+    CHECK(series.size() == 27);
     // Each zero-reach cause the dispatch can note is a `failed` AND an `aborted` reason; `invalid_scope`
     // is not (a workflow names its agents).
-    for (const auto cause : {ZeroReachCause::ContainmentUnreadable, ZeroReachCause::RouteUnreadable,
-                             ZeroReachCause::OsGateUnreadable, ZeroReachCause::Quarantined,
-                             ZeroReachCause::PluginNotFound, ZeroReachCause::KillSwitchedOs,
-                             ZeroReachCause::Generic}) {
+    for (const auto cause : {ZeroReachCause::Denied, ZeroReachCause::ContainmentUnreadable,
+                             ZeroReachCause::RouteUnreadable, ZeroReachCause::OsGateUnreadable,
+                             ZeroReachCause::Quarantined, ZeroReachCause::PluginNotFound,
+                             ZeroReachCause::KillSwitchedOs, ZeroReachCause::Generic}) {
         const auto t = zero_reach_token(cause);
         INFO(t);
         CHECK(seen.count({"failed", std::string(t)}) == 1);

@@ -578,7 +578,8 @@ namespace {
 
 /// The zero-reach causes a workflow step's dispatch can note (`classify_zero_reach` minus
 /// `invalid_scope`: a workflow names its agents, so the dispatch never parses a scope).
-constexpr std::array<std::string_view, 7> kStepZeroReachCauses{
+constexpr std::array<std::string_view, 8> kStepZeroReachCauses{
+    zero_reach_token(ZeroReachCause::Denied),
     zero_reach_token(ZeroReachCause::ContainmentUnreadable),
     zero_reach_token(ZeroReachCause::RouteUnreadable),
     zero_reach_token(ZeroReachCause::OsGateUnreadable),
