@@ -698,12 +698,13 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21,
             CHECK_FALSE(row.system_reserved);
         }
     }
-    // 21: re-verified fresh against the merged tree (see the TEST_CASE-level
+    // 22: re-verified fresh against the merged tree (see the TEST_CASE-level
     // comment above) rather than carried forward unchecked — a FUTURE
     // Destructive row in any fragment must land with the aggregate tripwire
     // still passing, which is exactly the drift this test's own title
-    // forbids. (19 + registry.delete_user_value and registry.apply, registry 2.1.0.)
-    CHECK(destructive_count == 21);
+    // forbids. (19 + registry.delete_user_value and registry.apply, registry 2.1.0,
+    // + firewall.quarantine, firewall 1.0.0.)
+    CHECK(destructive_count == 22);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's
     // AdminOrApproval gate as their elevation ceiling. This sub-claim WAS

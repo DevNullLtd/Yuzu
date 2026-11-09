@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 8ef7b004fc8a
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-09 · euid 501 · leg-hash e6a3841cfbc0
 == action=state
 backend|appfirewall
 state|disabled
@@ -17,4 +17,32 @@ app|/usr/libexec/sshd-keygen-wrapper|allow
 app|/usr/sbin/smbd|allow
 ruleset|unknown
 [result_status] UNDECLARED / UNKNOWN / 
+
+== action=quarantine
+note|macos=pending_design_review
+status|refused|unsupported_platform
+refused|unsupported_platform
+[result_status] UNAVAILABLE / PARTIAL / firewall:refused
+[rc] 1
+
+== action=release
+note|macos=pending_design_review
+status|refused|unsupported_platform
+refused|unsupported_platform
+[result_status] UNAVAILABLE / PARTIAL / firewall:refused
+[rc] 1
+
+== action=quarantine_status
+note|macos=pending_design_review
+status|refused|unsupported_platform
+refused|unsupported_platform
+[result_status] UNAVAILABLE / PARTIAL / firewall:refused
+[rc] 1
+
+== action=quarantine_allow
+note|macos=pending_design_review
+status|refused|unsupported_platform
+refused|unsupported_platform
+[result_status] UNAVAILABLE / PARTIAL / firewall:refused
+[rc] 1
 

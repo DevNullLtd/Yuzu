@@ -256,12 +256,17 @@ TEST_CASE("capability catalogue: every securable and operation is one rbac_store
 /// explicit allowlist so a NEW Destructive+Reversible row still fails loudly
 /// and has to be justified here, which is the property the original assertion
 /// was really providing.
-constexpr std::array<std::pair<std::string_view, std::string_view>, 1> kReversibleDestructive{{
+constexpr std::array<std::pair<std::string_view, std::string_view>, 2> kReversibleDestructive{{
     {"power_health.set_power_plan",
      "switching the active Windows power scheme is undone by setting the previous scheme back; "
      "the action captures and emits previous_guid precisely so the operator can. It is "
      "Destructive (not Mutating) because it must inherit the destructive-targeting gate — "
      "explicit device IDs, no unapproved broadcast — not because the effect is unrecoverable."},
+    {"firewall.quarantine",
+     "true undo on all three legs: release restores the captured Windows profile policy and "
+     "re-enables every rule quarantine disabled, deletes the nft table / iptables chain, and "
+     "unloads the pf anchor and releases its enable token. Destructive only for the "
+     "destructive-targeting gate."},
 }};
 // `printing.clear_queue` is deliberately NOT allowlisted here: it is
 // Destructive+Irreversible. Cancelling a job has no compensating Yuzu

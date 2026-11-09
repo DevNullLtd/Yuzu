@@ -453,6 +453,21 @@ EOF
 # quarantine plugin — pf firewall management
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl
 
+# firewall plugin — pf anchor containment (the narrowed argv the firewall.quarantine* actions
+# run; the bare /sbin/pfctl grant above stays for the quarantine plugin until it is retired).
+# These lines NARROW the argv shape; they do not confine pfctl: sudo globs match concatenated
+# args, and the anchor file named by -f is agent-generated. The confinement is the firewall
+# plugin's token validation (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp).
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -X *
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/yuzu_quarantine -f *
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/yuzu_quarantine -F all
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/yuzu_quarantine -s rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -F states
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s info
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s rules
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s References
+
 # services.set_start_mode — launchd system domain
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl bootstrap system *
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl bootout system *
@@ -469,10 +484,18 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/security delete-certificate -t /Libr
 EOF
     else  # linux
         cat <<EOF
-# quarantine plugin — iptables / ip6tables / nftables
+# quarantine plugin — iptables / ip6tables
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables, /usr/sbin/iptables-save, /usr/sbin/iptables-restore
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables, /usr/sbin/ip6tables-save, /usr/sbin/ip6tables-restore
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft
+
+# firewall plugin — nftables containment (own table inet yuzu_quarantine). These lines NARROW
+# the argv shape; they do not confine nft: sudo globs match concatenated args, and the file
+# named by -f is agent-generated. The confinement is the firewall plugin's token validation
+# (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp). The bare /usr/sbin/nft grant
+# that used to sit here was never called by any plugin and is replaced by these three.
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft -f *
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft delete table inet yuzu_quarantine
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft list table inet yuzu_quarantine
 
 # services.set_start_mode — systemd unit lifecycle
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/systemctl enable *,  /bin/systemctl disable *

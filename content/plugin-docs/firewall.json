@@ -1,6 +1,102 @@
 {
   "actions": [
     {
+      "action": "quarantine",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sudo nft -f of an own inet table applied as one transaction (policy-drop chains); iptables/ip6tables generation chain via run_bounded_subprocess when nft is absent",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "pending the reviewed design note",
+          "mechanism": "pf sub-anchor com.apple/yuzu_quarantine via sudo pfctl",
+          "rung": "2",
+          "support": "planned"
+        },
+        "windows": {
+          "fallback": "rules the policy store refuses to disable (GPO) leave the result partial",
+          "mechanism": "INetFwPolicy2 COM rule group + per-profile default-block; other enabled rules disabled for the duration",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "quarantine_allow",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "atomic nft reload / iptables build-then-swap of a new generation",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "pending the reviewed design note",
+          "mechanism": "pf anchor reload (atomic per anchor) + state flush",
+          "rung": "2",
+          "support": "planned"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "INetFwPolicy2 COM: new generation's rules added first, stale ones removed last",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "quarantine_status",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "netlink needs CAP_NET_ADMIN, which the unprivileged agent lacks: the sudo read is the usual path",
+          "mechanism": "own nftables table over NETLINK_NETFILTER (rung 1), else sudo nft list table (rung 2); iptables chain jumps via argv",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "pending the reviewed design note",
+          "mechanism": "pfctl anchor rules, enable state and references",
+          "rung": "2",
+          "support": "planned"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "INetFwPolicy2 COM rule group presence + per-profile default actions",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "release",
+      "definition_ids": [],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "sudo nft delete table / iptables chain removal",
+          "rung": "2",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "pending the reviewed design note",
+          "mechanism": "pf anchor flush + pfctl -X enable-token release",
+          "rung": "2",
+          "support": "planned"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "INetFwPolicy2 COM rule-group removal, prior-policy restore, disabled rules re-enabled",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
       "action": "rules",
       "definition_ids": [
         "security.firewall.rules"
@@ -54,11 +150,11 @@
     }
   ],
   "caveats": [
-    "**Row shape is a key/value contract, not the YAML column list.** The server clamps this plugin to two fields, so a `profile|Domain|enabled` row reaches the dashboard as key `profile`, value `Domain|enabled`. Splitting the value into its own axes is tracked under #626.",
-    "**macOS pf reads need root, and no capture has used root.** Under the least-privilege model the `pf|` row and the pf rules degrade to unknown or empty on purpose, and the macOS sample shows exactly that at `euid 501`. The Application Firewall `state|` and `app|` rows are unaffected.",
-    "**Two Linux paths are unmeasured.** The firewalld leg has never been run against a live firewalld, and it lists services only (zone ports and rich rules are not queried), so a firewalld host can hold open ports this plugin does not show. The unprivileged nftables denial path is likewise reasoned from the code, not measured, and it depends on which of `ufw` and `iptables` are installed.",
-    "**Windows rules stop at 100 and omit what they match.** The `truncated|true` row is emitted only when a genuine 101st rule exists, so exactly 100 rules is not marked truncated; `state` reports the true total, so compare the two. Each rule row has no port, program or address, so the list cannot answer what a rule allows.",
-    "**A mixed fleet shows three macOS shapes.** Agents older than the Application Firewall change report pf as the sole state source (`backend|pf`); agents after that change but before the per-app list report `backend|appfirewall` plus a `pf|` row only; current agents add the `app|` list, `anchor|` rows and the `ruleset|` count or `unknown`."
+    "**The read actions' row shape and coverage are limited.** The server clamps `state` and `rules` to two fields, so a `profile|Domain|enabled` row reaches the dashboard as key `profile`, value `Domain|enabled` (#626). Windows `rules` stop at 100 (the `truncated|true` row appears only when a genuine 101st rule exists; `state` reports the true total) and omit ports, programs and addresses. macOS pf reads need root and no capture has used root; the Application Firewall `state|` and `app|` rows are unaffected. A mixed fleet shows three macOS shapes (`backend|pf` only, `backend|appfirewall` plus `pf|`, and the current form with `app|`, `anchor|` and `ruleset|`). The firewalld leg has never run against a live firewalld and lists services only, and the unprivileged nftables denial path is reasoned from the code, not measured.",
+    "**A containment is only as proven as its probe.** Without a `probe_target` the block is reported `active_unproven`: the agent can show the control channel works, not that anything else is blocked. The resolvers are read on the host being contained, at quarantine time (the same trust window #3429 closed for the server address), bounded to eight and to port 53, and listed in the reply so the server can audit them. The boot-time re-apply cannot roll back on an unreachable server, so an allow set that stopped matching the server's address strands the host until an operator releases locally; the TTL is the bound.",
+    "**Windows containment has three known edges.** Rules the policy store refuses to disable (Group Policy) stay enabled, so on a hardened domain host the result may never read `active`. Rule names are not unique in Windows Firewall, so a duplicate-named pair is re-enabled together on release. A Group Policy refresh during the quarantine can re-enable rules; the status read does not detect it. COM calls cannot be cancelled from a plugin (#1391), so a host with thousands of rules makes the enumeration and the disable loop slow, bounded only by the deadline checks between batches.",
+    "**Linux containment cuts more than the agent's traffic.** The input, output and forward chains are at policy drop and the rules are stateless, so established connections that no allowance matches are cut, and a hypervisor or router host loses its guests' and clients' traffic through the forward chain. IPv6 neighbour discovery is newly allowed so an IPv6 control channel can work. Unprivileged agents have no `CAP_NET_ADMIN`, so `quarantine_status` normally reads the table through `sudo nft list table` rather than netlink.",
+    "**The retained `quarantine` plugin overlaps until it is removed.** The new actions refuse while its objects exist on Windows and Linux, but nothing can stop it being applied over a containment already in force; a legacy release can restore the Windows profile defaults (reported `degraded|policy_not_blocking`, repaired at the next start), and macOS has no legacy marker to refuse on. The related netsh text parsing issue (#3488) stays open because the retained plugin still parses it."
   ],
   "definitions": [
     {
@@ -106,15 +202,15 @@
       ]
     }
   ],
-  "description": "Firewall status and rule listing",
-  "how_it_works": "Both actions are reads; the plugin has no rule-mutation surface despite its name. `state` answers \"is the host firewall on, and which firewall answered\"; `rules` lists what the same source exposes. Every parse is a pure function in `firewall_parsers.hpp`, and every subprocess runs through the bounded runner with a fixed 5 second deadline and no shell.\n\n- **Windows.** The `INetFwPolicy2` COM interface is called in process. `state` asks each of the Domain, Private and Public profiles whether `FirewallEnabled` is set and adds the true total rule count (`INetFwRules` count). `rules` enumerates `INetFwRules` and stops after 100 rules with a `truncated|true` marker row.\n- **macOS.** Two separate firewalls are read. The Application Firewall is primary, because it is the firewall a Mac administrator means: `socketfilterfw --getglobalstate` gives `state|`, plus `mode|block_all` when block-all is set, and `socketfilterfw --listapps` gives the per-app allow or block list. The pf packet filter, off by default and unrelated to the Application Firewall, is secondary: `pfctl -s info` gives the `pf|` row, and `pfctl -s Anchors` and `pfctl -s rules` give the anchor names, the raw pf rule lines and the rule count. The anchor, rule and rule-count reads are published only when the command exited zero, did not time out and was not truncated, so a refused read yields no anchor rows and `ruleset|unknown` rather than a partial answer presented as the whole. The `pf|` row is always written; it reads `unknown` when `pfctl -s info` is refused.\n- **Linux.** A fixed ladder stops at the first source that answers: firewalld over sd-bus (only in builds with libsystemd; otherwise this rung is skipped), then nftables over `NETLINK_NETFILTER` dumps, then `ufw status numbered`, then `iptables -S`, else `backend|none`. The nftables leg checks that each dump reply came from the kernel (`nl_pid == 0`) and splits its 5 second deadline across three dumps (table, then chain, then rule, with cumulative cut-offs at 1, 2.5 and 5 seconds). A run that walks every rung takes about 20 seconds in the worst case.\n\nThe honest-status rule holds on every leg: empty, truncated or unrecognised output parses to `unknown` (state) or no rows (rules), never to a false-safe \"disabled\" or an invented rule. If nftables' table dump succeeds but a later chain or rule dump fails, the leg writes a `fallthrough|nftables:<dump>:<reason>` row and continues to `ufw` then `iptables`, with their verdicts clamped so a downstream \"disabled\" cannot contradict tables already seen.\n\n### What you can decide with it\n\n| Question | Action | Windows | macOS | Linux |\n|---|---|---|---|---|\n| Is the host firewall on? | `state` | Three `profile\\|` rows, each `enabled`, `disabled` or `unknown`. Only Windows Firewall's own switches are read. | `state\\|` is the Application Firewall only (`enabled`, `disabled`, `unknown`); pf is the separate `pf\\|` row | `state\\|` is `running` (firewalld), `active`/`inactive` (nftables, ufw, iptables) or `unknown` |\n| Which firewall answered? | `state` or `rules` | Always Windows Firewall | `backend\\|appfirewall` | `backend\\|` names the first source that answered, which is not necessarily the tool an administrator uses (rules managed by another tool but held in nftables report `nftables`) |\n| What is it enforcing? | `rules` | The first 100 rules: name, enabled, direction, allow or block, profile bitmask. No ports, programs or addresses. | `app\\|` rows (per-app allow or block, no root needed); pf `rule\\|` lines, anchors and a count (root only) | firewalld: services per active zone. nftables: base-chain hook and policy plus one handle row per rule. ufw: numbered rules. iptables: the `-S` entries. |\n| Is a particular port open? | neither | No: rows omit ports, and the list is capped | No: pf lines are raw text and the per-app list is not port-based | Not reliably: firewalld lists services only, and nftables handle rows carry no match detail |\n\nHow to read the answers:\n\n- `unknown` and `ruleset|unknown` mean the read did not complete (refused, timed out, truncated or unrecognised). They never mean \"off\" or \"empty\"; a cleanly read empty ruleset reports `ruleset|0`.\n- `active` from nftables or iptables means there is at least one rule or a base-chain policy other than accept (for iptables, a user-defined chain also counts). A container runtime's own rules make a host `active`, so it is not evidence of a restrictive policy; `inactive` is reported only on a complete read.\n- On Windows `enabled` says a profile's firewall switch is on, not what its default inbound action is, and on macOS an Application Firewall `enabled` does not imply pf is filtering.\n- A fleet roll-up that counts `state` values should count `unknown` separately, since it hides both permission failures and absent tools.\n\n### Diagrams\n\nThis is the whole Linux decision. A refused read does not stop the ladder early except at the last rung: `ufw` falls through on any failure, while a failed `iptables -S` is final and reports `backend|iptables` with `unknown`. `backend|none` appears when no nftables table was read and neither `/usr/sbin/ufw` (exit 0) nor `/usr/sbin/iptables` (ran) answered. A host with `iptables` therefore ends at `backend|iptables`, but a host with only `ufw` whose `ufw status` fails (for example when not run as root) ends at `none`.\n\nThe macOS plugin keeps the two firewalls apart: the Application Firewall answers without privilege, while every pf read opens `/dev/pf` and needs root, so a non-root run still returns the Application Firewall answer plus `pf|unknown` and `ruleset|unknown`. Each rows-publishing read is gated on a clean exit, so a partial read yields no rows rather than a partial list.\n\n### Reading the Linux error and fallthrough rows\n\n| Row | Meaning |\n|---|---|\n| `error\\|nftables:socket:eperm` | The netlink socket could not be opened or bound, typically a hardened host denying `AF_NETLINK` through systemd `RestrictAddressFamilies=`, seccomp or AppArmor |\n| `error\\|nftables:<table or chain or rule>:eperm` | The socket opened but the kernel refused the dump; grant `CAP_NET_ADMIN` or use firewalld |\n| `error\\|nftables:<dump>:timeout` | A dump did not finish in its budget, usually a long nft transaction holding the table lock |\n| `error\\|nftables:<dump>:foreign_flood` | Another local process is writing to the same netlink family and drowning out the agent's replies |\n| `error\\|nftables:<dump>:errno:undecoded` | The kernel's error reply could not be decoded; treat as an undiagnosed refusal, not errno 0 |\n| `error\\|nftables:<dump>:truncated`, `oversized` or `io_error` | The dump exceeded the read buffer, exceeded the 4 MiB cap, or hit a socket failure; the ladder still falls through rather than report a clipped count |\n| `error\\|fd_exhausted` | `EMFILE` or `ENFILE` on the nftables socket |\n| `fallthrough\\|nftables:<dump>:torn` | The kernel flagged the dump as interrupted by a concurrent ruleset change; the ladder continues |\n\nWhich row kind carries a reason depends on the dump. A failed table dump (including `torn`) writes `error|nftables:table:<reason>`. A failed chain or rule dump, after the table dump succeeded, writes `fallthrough|nftables:chain:<reason>` or `fallthrough|nftables:rule:<reason>` with any of the reasons above, and the `error|nftables:chain|rule:<reason>` form appears only on the terminal `unknown` result.\n\nAn `error|nftables:table:<reason>` row can appear next to a later successful `backend|ufw` or `backend|iptables`, because it is written the moment the dump fails. Only a terminal `unknown` after it means no backend could answer.",
+  "description": "Firewall status, rule listing and device containment",
+  "how_it_works": "`state` and `rules` are reads. `state` answers \"is the host firewall on, and which firewall answered\"; `rules` lists what the same source exposes. Every parse is a pure function in `firewall_parsers.hpp`, and every subprocess runs through the bounded runner with a fixed 5 second deadline and no shell.\n\n- **Windows.** The `INetFwPolicy2` COM interface is called in process. `state` asks each of the Domain, Private and Public profiles whether `FirewallEnabled` is set and adds the true total rule count (`INetFwRules` count). `rules` enumerates `INetFwRules` and stops after 100 rules with a `truncated|true` marker row.\n- **macOS.** Two separate firewalls are read. The Application Firewall is primary, because it is the firewall a Mac administrator means: `socketfilterfw --getglobalstate` gives `state|`, plus `mode|block_all` when block-all is set, and `socketfilterfw --listapps` gives the per-app allow or block list. The pf packet filter, off by default and unrelated to the Application Firewall, is secondary: `pfctl -s info` gives the `pf|` row, and `pfctl -s Anchors` and `pfctl -s rules` give the anchor names, the raw pf rule lines and the rule count. The anchor, rule and rule-count reads are published only when the command exited zero, did not time out and was not truncated, so a refused read yields no anchor rows and `ruleset|unknown` rather than a partial answer presented as the whole. The `pf|` row is always written; it reads `unknown` when `pfctl -s info` is refused.\n- **Linux.** A fixed ladder stops at the first source that answers: firewalld over sd-bus (only in builds with libsystemd; otherwise this rung is skipped), then nftables over `NETLINK_NETFILTER` dumps, then `ufw status numbered`, then `iptables -S`, else `backend|none`. The nftables leg checks that each dump reply came from the kernel (`nl_pid == 0`) and splits its 5 second deadline across three dumps (table, then chain, then rule, with cumulative cut-offs at 1, 2.5 and 5 seconds). A run that walks every rung takes about 20 seconds in the worst case.\n\nThe honest-status rule holds on every leg: empty, truncated or unrecognised output parses to `unknown` (state) or no rows (rules), never to a false-safe \"disabled\" or an invented rule. If nftables' table dump succeeds but a later chain or rule dump fails, the leg writes a `fallthrough|nftables:<dump>:<reason>` row and continues to `ufw` then `iptables`, with their verdicts clamped so a downstream \"disabled\" cannot contradict tables already seen.\n\n### Device containment\n\nFour more actions contain a host and lift the containment again: `quarantine`, `release`, `quarantine_status` and `quarantine_allow`. All of them run through one OS-neutral core (`firewall_quarantine_parsers.hpp`) that decides everything and is unit-tested on every host; the plugin only wires an OS mechanism to it. Windows and Linux are implemented. On macOS the four actions answer one `status|refused|unsupported_platform` row until the pf-anchor design in `docs/quarantine-macos-pf-anchor-design.md` has been reviewed; nothing is changed on the host.\n\n- **What stays reachable.** Loopback, the agent's own control channel (every address the server name resolved to at agent start, on the server's port only, so the host being contained never chooses which address survives), DHCP (UDP 67 and 68), DNS to the host's configured resolvers (at most eight, port 53), IPv6 neighbour discovery, and any operator exceptions. Nothing else is reachable and nothing that existed before is: Linux has no \"established\" accept, so a connection that predates the quarantine is cut unless an allowance matches it.\n- **Windows.** A Windows Firewall rule group named `Yuzu Firewall Quarantine` holds one allowance rule per entry, and every profile's default action is set to block, inbound and outbound. An Allow rule beats a profile-default block, so every other enabled rule is disabled for the duration, its name written to the plugin's storage before the first one is touched, and re-enabled on release. The pre-quarantine default actions are captured once and restored. A rule the policy store refuses to disable (typically one delivered by Group Policy) is counted, and the result is `partial`, never `active`.\n- **Linux.** With `/usr/sbin/nft` present, the plugin loads its own `inet yuzu_quarantine` table with a single `nft -f` transaction: input, output and forward base chains at policy drop plus the allowances, replacing the previous generation atomically, so a failed load leaves the old table in force. Release is one `delete table`. Without nft it builds a new `yuzu-fwq-<generation>` chain in iptables and ip6tables (INPUT, OUTPUT and FORWARD jump to it), inserts the new jumps, then removes the old generation, so both exist during the swap and an update only ever tightens. The whole operation runs under one 60 second deadline.\n- **Verify after applying.** The agent connects to a control endpoint (it must succeed) and to the optional `probe_target`, an IP literal that answered before the change and must now time out. A refused connection after the change means the packet got through, so it counts as reachable. A failed initial apply removes its own rules and reports `rolled_back`; with no probe target the result is `active_unproven`.\n- **Generations and phases.** The record `quarantine.state` in the plugin's storage is written, with phase `applying`, before any change to the host, and the action refuses (`refused|state_not_persisted`) when it cannot be written. It then moves to `active`, or `releasing` during a release. A `quarantine_allow` update writes the next generation first, applies it as an update, and on failure puts the previous generation's record back (`update_failed`); rollback to nothing exists only for the first apply.\n- **At agent start.** `init()` finishes an interrupted release, and re-applies a stored containment the host no longer enforces (a reboot, a legacy release) as a generation update. It never rolls back and never releases because the server is unreachable. An optional `ttl_seconds` (60 to 2,592,000) is enforced by an interval trigger that runs `release` with `if_ttl_expired=1`; if the trigger cannot be registered the quarantine stays applied and the result is `partial` with `note|ttl_trigger_unregistered`, retried at the next start.\n- **The retained `quarantine` plugin** is unchanged until it is removed. The new actions refuse (`refused|legacy_quarantine_active`) while its objects exist (Windows rules named `YuzuQuarantine_*`, the Linux chain `yuzu-quarantine`). The reverse is not enforced here: a legacy release can put the Windows profile defaults back, which `quarantine_status` reports as `degraded|policy_not_blocking` and the next start repairs.\n\n| Action | Parameters | Reply rows |\n|---|---|---|\n| `quarantine` | `probe_target` (`ip:port` or `[v6]:port`, a literal; optional), `ttl_seconds` (optional), `exceptions` (comma-separated, optional) | `status\\|<token>[\\|<reason>]`, `verify\\|control=<ok\\|fail>\\|probe=<blocked\\|reachable\\|refused\\|unproven>`, `allow\\|<kind>\\|<value>`, `rolled_back\\|<reason>`, `refused\\|<reason>`, `note\\|<k>=<v>` |\n| `release` | `if_ttl_expired=1` (optional; a no-op until the TTL has passed) | the same rows |\n| `quarantine_status` | none | the same rows, read from the record and the live host; never takes the mutation gate |\n| `quarantine_allow` | `op` (`add` or `remove`), `exceptions` (required) | the same rows |\n\nAn exception is `addr[/prefix][:port][/tcp\\|udp][/in\\|out]`, with a v6 address bracketed when it carries a port. Without a protocol it covers TCP and UDP, without a direction it is outbound, without a port it covers every port; the port is the service port (the remote port outbound, the local port inbound). At most 64 exceptions exist across every add; a removal never removes loopback, the control channel, a resolver or DHCP. The mutating actions run one at a time (`status|busy` after two seconds).\n\n### What you can decide with it\n\n| Question | Action | Windows | macOS | Linux |\n|---|---|---|---|---|\n| Is the host firewall on? | `state` | Three `profile\\|` rows, each `enabled`, `disabled` or `unknown`. Only Windows Firewall's own switches are read. | `state\\|` is the Application Firewall only (`enabled`, `disabled`, `unknown`); pf is the separate `pf\\|` row | `state\\|` is `running` (firewalld), `active`/`inactive` (nftables, ufw, iptables) or `unknown` |\n| Which firewall answered? | `state` or `rules` | Always Windows Firewall | `backend\\|appfirewall` | `backend\\|` names the first source that answered, which is not necessarily the tool an administrator uses (rules managed by another tool but held in nftables report `nftables`) |\n| What is it enforcing? | `rules` | The first 100 rules: name, enabled, direction, allow or block, profile bitmask. No ports, programs or addresses. | `app\\|` rows (per-app allow or block, no root needed); pf `rule\\|` lines, anchors and a count (root only) | firewalld: services per active zone. nftables: base-chain hook and policy plus one handle row per rule. ufw: numbered rules. iptables: the `-S` entries. |\n| Is a particular port open? | neither | No: rows omit ports, and the list is capped | No: pf lines are raw text and the per-app list is not port-based | Not reliably: firewalld lists services only, and nftables handle rows carry no match detail |\n\nHow to read the answers:\n\n- `unknown` and `ruleset|unknown` mean the read did not complete (refused, timed out, truncated or unrecognised). They never mean \"off\" or \"empty\"; a cleanly read empty ruleset reports `ruleset|0`.\n- `active` from nftables or iptables means there is at least one rule or a base-chain policy other than accept (for iptables, a user-defined chain also counts). A container runtime's own rules make a host `active`, so it is not evidence of a restrictive policy; `inactive` is reported only on a complete read.\n- On Windows `enabled` says a profile's firewall switch is on, not what its default inbound action is, and on macOS an Application Firewall `enabled` does not imply pf is filtering.\n- A fleet roll-up that counts `state` values should count `unknown` separately, since it hides both permission failures and absent tools.\n\n### Diagrams\n\nThis is the whole Linux decision. A refused read does not stop the ladder early except at the last rung: `ufw` falls through on any failure, while a failed `iptables -S` is final and reports `backend|iptables` with `unknown`. `backend|none` appears when no nftables table was read and neither `/usr/sbin/ufw` (exit 0) nor `/usr/sbin/iptables` (ran) answered. A host with `iptables` therefore ends at `backend|iptables`, but a host with only `ufw` whose `ufw status` fails (for example when not run as root) ends at `none`.\n\nThe macOS plugin keeps the two firewalls apart: the Application Firewall answers without privilege, while every pf read opens `/dev/pf` and needs root, so a non-root run still returns the Application Firewall answer plus `pf|unknown` and `ruleset|unknown`. Each rows-publishing read is gated on a clean exit, so a partial read yields no rows rather than a partial list.\n\n### Reading the Linux error and fallthrough rows\n\n| Row | Meaning |\n|---|---|\n| `error\\|nftables:socket:eperm` | The netlink socket could not be opened or bound, typically a hardened host denying `AF_NETLINK` through systemd `RestrictAddressFamilies=`, seccomp or AppArmor |\n| `error\\|nftables:<table or chain or rule>:eperm` | The socket opened but the kernel refused the dump; grant `CAP_NET_ADMIN` or use firewalld |\n| `error\\|nftables:<dump>:timeout` | A dump did not finish in its budget, usually a long nft transaction holding the table lock |\n| `error\\|nftables:<dump>:foreign_flood` | Another local process is writing to the same netlink family and drowning out the agent's replies |\n| `error\\|nftables:<dump>:errno:undecoded` | The kernel's error reply could not be decoded; treat as an undiagnosed refusal, not errno 0 |\n| `error\\|nftables:<dump>:truncated`, `oversized` or `io_error` | The dump exceeded the read buffer, exceeded the 4 MiB cap, or hit a socket failure; the ladder still falls through rather than report a clipped count |\n| `error\\|fd_exhausted` | `EMFILE` or `ENFILE` on the nftables socket |\n| `fallthrough\\|nftables:<dump>:torn` | The kernel flagged the dump as interrupted by a concurrent ruleset change; the ladder continues |\n\nWhich row kind carries a reason depends on the dump. A failed table dump (including `torn`) writes `error|nftables:table:<reason>`. A failed chain or rule dump, after the table dump succeeded, writes `fallthrough|nftables:chain:<reason>` or `fallthrough|nftables:rule:<reason>` with any of the reasons above, and the `error|nftables:chain|rule:<reason>` form appears only on the terminal `unknown` result.\n\nAn `error|nftables:table:<reason>` row can appear next to a later successful `backend|ufw` or `backend|iptables`, because it is written the moment the dump fails. Only a terminal `unknown` after it means no backend could answer.",
   "inputs": [],
   "kind": {
-    "collector": true,
+    "collector": false,
     "gathered": true,
-    "mutating": false
+    "mutating": true
   },
-  "leg_hash": "8ef7b004fc8a",
+  "leg_hash": "e6a3841cfbc0",
   "manifest_version": 1,
   "name": "firewall",
   "outputs": [
@@ -220,7 +316,7 @@
       "definition_id": "security.firewall.state"
     }
   ],
-  "outputs_note": "Pipe-delimited key rows; the first field is the row kind. `state` emits `profile|<Domain|Private|Public>|<enabled|disabled|unknown|error:0x…>` plus `ruleset|<count>` on Windows, and `backend|<name>`, `state|<value>`, optional `mode|block_all`, `pf|<value>`, optional `anchor|<name>` and `ruleset|<count|unknown>` rows on macOS and Linux. `rules` emits `rule|<name>|<enabled|disabled>|<in|out|unknown>|<allow|block|unknown>|<profile mask>` on Windows (plus `truncated|true` after 100 rows and a trailing `ruleset|<count>` counting the rules actually emitted this call, capped at 100 — distinct from `state`'s `ruleset|<count>`, which is the true policy total from `INetFwRules::get_Count`), on macOS `app|<path>|<allow|block|unknown>` rows from `socketfilterfw --listapps`, `rule|<raw pf line>` rows, optional `anchor|<name>` rows and a trailing `ruleset|<count|unknown>`, and per backend on Linux: `rule|firewalld|<zone>|service|<service>`, `rule|nftables|<family>|<table>|<chain>|<hook>|<policy>` and `rule|nftables|<family>|<table>|<chain>|handle|<n>`, `rule|<index>|<to>|<action>|<from>` for ufw, and `rule|<policy|new_chain|append>|<chain>|<spec>` for iptables — so on Linux the field after `rule` is the backend name for firewalld and nftables, a numeric index for ufw and the entry kind for iptables. On macOS the `app|` row's third field is the per-app decision, `allow`, `block` or `unknown`, never dropped or coerced; `ruleset|unknown` on macOS means the backing `pfctl -s rules` read was refused or incomplete (typically a permissions denial), not that the ruleset is empty — a cleanly-read empty ruleset reports `ruleset|0`. A backend that answers `backend|<name>` but whose rule dump is refused emits `rules|unknown`. On Linux, a refused or fd-exhausted nftables read additionally emits an `error|nftables:<dump>:<reason>` or `error|fd_exhausted` row naming the failure, a handed-off-to-the-next-backend dump emits `fallthrough|nftables:<dump>:<reason>`, and the rule count follows the same `ruleset|<n>` / `ruleset|unknown` convention as macOS — never a fabricated `ruleset|0`. The server parses this plugin as key/value rows (`profile_or_backend`, `state`), so the value column carries the remainder of each row verbatim. Windows rules sharing a display name (one per profile, protocol or direction, e.g. six `ChatGPT` rows) are each real rules, not a capture defect. A run that reads nothing emits no `rule` rows and, for state, `unknown` values; it never fabricates a row.",
+  "outputs_note": "The Inputs block above is generated from instruction definitions and so covers `state` and `rules` only: the four containment actions have no instruction definition yet (they are reached through raw dispatch, gated by the capability catalogue), and their parameters and reply rows are in the table under \"Device containment\". Pipe-delimited key rows; the first field is the row kind. `state` emits `profile|<Domain|Private|Public>|<enabled|disabled|unknown|error:0x…>` plus `ruleset|<count>` on Windows, and `backend|<name>`, `state|<value>`, optional `mode|block_all`, `pf|<value>`, optional `anchor|<name>` and `ruleset|<count|unknown>` rows on macOS and Linux. `rules` emits `rule|<name>|<enabled|disabled>|<in|out|unknown>|<allow|block|unknown>|<profile mask>` on Windows (plus `truncated|true` after 100 rows and a trailing `ruleset|<count>` counting the rules actually emitted this call, capped at 100 — distinct from `state`'s `ruleset|<count>`, which is the true policy total from `INetFwRules::get_Count`), on macOS `app|<path>|<allow|block|unknown>` rows from `socketfilterfw --listapps`, `rule|<raw pf line>` rows, optional `anchor|<name>` rows and a trailing `ruleset|<count|unknown>`, and per backend on Linux: `rule|firewalld|<zone>|service|<service>`, `rule|nftables|<family>|<table>|<chain>|<hook>|<policy>` and `rule|nftables|<family>|<table>|<chain>|handle|<n>`, `rule|<index>|<to>|<action>|<from>` for ufw, and `rule|<policy|new_chain|append>|<chain>|<spec>` for iptables — so on Linux the field after `rule` is the backend name for firewalld and nftables, a numeric index for ufw and the entry kind for iptables. On macOS the `app|` row's third field is the per-app decision, `allow`, `block` or `unknown`, never dropped or coerced; `ruleset|unknown` on macOS means the backing `pfctl -s rules` read was refused or incomplete (typically a permissions denial), not that the ruleset is empty — a cleanly-read empty ruleset reports `ruleset|0`. A backend that answers `backend|<name>` but whose rule dump is refused emits `rules|unknown`. On Linux, a refused or fd-exhausted nftables read additionally emits an `error|nftables:<dump>:<reason>` or `error|fd_exhausted` row naming the failure, a handed-off-to-the-next-backend dump emits `fallthrough|nftables:<dump>:<reason>`, and the rule count follows the same `ruleset|<n>` / `ruleset|unknown` convention as macOS — never a fabricated `ruleset|0`. The server parses this plugin as key/value rows (`profile_or_backend`, `state`), so the value column carries the remainder of each row verbatim. Windows rules sharing a display name (one per profile, protocol or direction, e.g. six `ChatGPT` rows) are each real rules, not a capture defect. A run that reads nothing emits no `rule` rows and, for state, `unknown` values; it never fabricates a row.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -228,21 +324,21 @@
   },
   "privileges": [
     {
-      "grant": "None. `INetFwPolicy2` profile and rule reads need no elevation.",
+      "grant": "None for the reads: `INetFwPolicy2` profile and rule reads need no elevation. The containment actions write rules and profile defaults and need Administrator, which LocalSystem is.",
       "if_refused": "`error|com_init`, `error|policy2_create:<hresult>` or `error|rules_count:<hresult>` rows; a profile that cannot be read shows `unknown` or `error:<hresult>`",
       "measured": "2026-09-15, bare-metal, elevated interactive user: three profiles `enabled`, `ruleset|717`, 100 `rule|` rows plus the `truncated|true` marker",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
     {
-      "grant": "None for the Application Firewall reads (`socketfilterfw --getglobalstate` and `--listapps` are unprivileged). The pf reads (`pfctl -s info`, `Anchors`, `rules`) open `/dev/pf` and need root; the plugin deliberately does not ride the quarantine plugin's `pfctl` sudoers grant.",
+      "grant": "None for the Application Firewall reads (`socketfilterfw --getglobalstate` and `--listapps` are unprivileged). The pf reads (`pfctl -s info`, `Anchors`, `rules`) open `/dev/pf` and need root; the plugin deliberately does not ride the quarantine plugin's `pfctl` sudoers grant. The containment leg is not built yet; the installer already grants the narrowed `pfctl` lines the design note sizes (`-E`, `-X *`, `-a com.apple/yuzu_quarantine -f *` and `-F all` and `-s rules`, `-F states`, `-s info`, `-s rules`, `-s References`) beside the bare grant the `quarantine` plugin keeps.",
       "if_refused": "`pf|unknown` and `ruleset|unknown`, no anchor or pf rule rows, never a false-safe value; `app|` rows are unaffected",
       "measured": "2026-09-15, bare-metal, unprivileged (`euid 501`): `--listapps` succeeds, while pf is refused, so `pf|unknown`, no anchors and `ruleset|unknown`. No capture has been taken as root.",
       "os": "macOS",
       "runs_as": "LaunchDaemon (root today)"
     },
     {
-      "grant": "The firewalld read is a D-Bus method call and the plugin requests no grant for it. The nftables netlink dump conventionally needs `CAP_NET_ADMIN`; `ufw status` and `iptables -S` need root. No sudoers entry is granted for any of them.",
+      "grant": "The firewalld read is a D-Bus method call and the plugin requests no grant for it. The nftables netlink dump conventionally needs `CAP_NET_ADMIN`; `ufw status` and `iptables -S` need root. No sudoers entry is granted for the reads. The containment actions run `sudo -n --` with exactly `/usr/sbin/nft -f *`, `/usr/sbin/nft delete table inet yuzu_quarantine` and `/usr/sbin/nft list table inet yuzu_quarantine`, or the existing `iptables` and `ip6tables` grants.",
       "if_refused": "A refused nftables read falls through to `ufw`, then `iptables`; when the table dump had succeeded and only a later dump failed, each is clamped so neither reports a false \"disabled\" over tables already seen; if neither answers, the run ends at `backend|nftables` with `unknown` and an `error|nftables:<dump>:<reason>` row. A refused `iptables -S` alone reports `backend|iptables` with `unknown`. `backend|none` only when neither `/usr/sbin/ufw` nor `/usr/sbin/iptables` ran.",
       "measured": "2026-09-06, container, `euid 0` with `CAP_NET_ADMIN` in the host network namespace: nftables answered. The no-capability path is reasoned from the code (sender-verified reads, EPERM and EMFILE decoding, the fall-through ladder), not measured on a live host.",
       "os": "Linux",
@@ -255,7 +351,31 @@
       "completeness": "UNKNOWN",
       "provenance": "(empty)",
       "status": "`UNDECLARED`",
-      "when": "Every run on every OS, including degraded reads"
+      "when": "`state` and `rules`, every run on every OS, including degraded reads"
+    },
+    {
+      "completeness": "FULL",
+      "provenance": "`firewall:active`, `firewall:inactive`",
+      "status": "`OK`",
+      "when": "A containment is in force and verified; or none is in force (after `release`, or `quarantine_status` on a clean host)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`firewall:active_unproven`",
+      "status": "`OK`",
+      "when": "Contained, but the block was not proven: no `probe_target` was supplied, or the boot-time re-apply could not reach the server"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`firewall:partial`, `firewall:degraded`",
+      "status": "`CONSTRAINED`",
+      "when": "`partial`: contained but incomplete (rules the policy store would not disable, the TTL trigger not registered, a record that could not be updated, an operation in progress). `degraded`: the record and the host disagree (policy not blocking, rules present without a record, a record that cannot be read, a failed boot-time re-apply)"
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`firewall:refused`, `firewall:rolled_back`, `firewall:update_failed`, `firewall:busy`",
+      "status": "`UNAVAILABLE`",
+      "when": "`refused`: nothing was changed (bad input, a legacy quarantine in force, no recovery record could be written, macOS before its leg exists). `rolled_back`: an initial apply failed verification or loading and was removed. `update_failed`: a `quarantine_allow` update failed and the previous generation is still in force. `busy`: another mutating action held the gate for two seconds"
     }
   ],
   "samples": {
@@ -297,12 +417,52 @@
             "rule|nftables|ip6|filter|FORWARD|forward|accept"
           ],
           "truncated": false
+        },
+        {
+          "action": "quarantine",
+          "not_captured": "Destructive/Reversible: not executed on a live host (it contains the host: every rule outside the quarantine group is disabled or blocked until release)",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "release",
+          "not_captured": "Mutating/Reversible: not executed on a live host (lifts a containment; needs one in force)",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "quarantine_status",
+          "not_captured": "agent-context: the containment record lives in the plugin KV store, which plugin-capture does not provide",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "quarantine_allow",
+          "not_captured": "Mutating/Reversible: not executed on a live host (changes the allow set of a containment in force)",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
         }
       ],
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "8ef7b004fc8a",
+        "leg_hash": "e6a3841cfbc0",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0 with CAP_NET_ADMIN in the host network namespace"
@@ -348,12 +508,84 @@
             "app|/usr/sbin/cupsd|allow"
           ],
           "truncated": false
+        },
+        {
+          "action": "quarantine",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "firewall:refused",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 3,
+          "rows": [
+            "note|macos=pending_design_review",
+            "status|refused|unsupported_platform",
+            "refused|unsupported_platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "release",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "firewall:refused",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 3,
+          "rows": [
+            "note|macos=pending_design_review",
+            "status|refused|unsupported_platform",
+            "refused|unsupported_platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "quarantine_status",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "firewall:refused",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 3,
+          "rows": [
+            "note|macos=pending_design_review",
+            "status|refused|unsupported_platform",
+            "refused|unsupported_platform"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "quarantine_allow",
+          "not_captured": null,
+          "params": "",
+          "rc": 1,
+          "result_status": {
+            "completeness": "PARTIAL",
+            "provenance": "firewall:refused",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 3,
+          "rows": [
+            "note|macos=pending_design_review",
+            "status|refused|unsupported_platform",
+            "refused|unsupported_platform"
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-15",
+        "date": "2026-11-09",
         "host_class": "bare-metal",
-        "leg_hash": "8ef7b004fc8a",
+        "leg_hash": "e6a3841cfbc0",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -399,12 +631,52 @@
             "rule|Logi Options+ Updater|enabled|in|allow|2147483647"
           ],
           "truncated": false
+        },
+        {
+          "action": "quarantine",
+          "not_captured": "Destructive/Reversible: not executed on a live host (it contains the host: every rule outside the quarantine group is disabled or blocked until release)",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "release",
+          "not_captured": "Mutating/Reversible: not executed on a live host (lifts a containment; needs one in force)",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "quarantine_status",
+          "not_captured": "agent-context: the containment record lives in the plugin KV store, which plugin-capture does not provide",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "quarantine_allow",
+          "not_captured": "Mutating/Reversible: not executed on a live host (changes the allow set of a containment in force)",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
         }
       ],
       "stamp": {
         "date": "2026-09-15",
         "host_class": "bare-metal",
-        "leg_hash": "8ef7b004fc8a",
+        "leg_hash": "e6a3841cfbc0",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "interactive user (elevated)"
@@ -429,32 +701,75 @@
       "operation": "Read",
       "risk_tier": "Low",
       "securable": "Security"
+    },
+    {
+      "action": "quarantine",
+      "dispatch_class": "Destructive",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Execute",
+      "risk_tier": "Critical",
+      "securable": "Security"
+    },
+    {
+      "action": "release",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Execute",
+      "risk_tier": "High",
+      "securable": "Security"
+    },
+    {
+      "action": "quarantine_status",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
+    },
+    {
+      "action": "quarantine_allow",
+      "dispatch_class": "Mutating",
+      "execute_gate": "AdminOrApproval",
+      "mutability": "Reversible",
+      "operation": "Execute",
+      "risk_tier": "High",
+      "securable": "Security"
     }
   ],
   "source": {
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/prq1-firewall-containment-actions.added.md"
+    ],
     "definitions": [
       "content/definitions/firewall.yaml"
     ],
     "plugin": [
       "agents/plugins/firewall/src/firewall_parsers.hpp",
-      "agents/plugins/firewall/src/firewall_plugin.cpp"
+      "agents/plugins/firewall/src/firewall_plugin.cpp",
+      "agents/plugins/firewall/src/firewall_quarantine_parsers.hpp"
     ],
     "privilege_row": true,
     "tests": [
       "tests/unit/test_firewall_local_dispatcher.cpp",
-      "tests/unit/test_firewall_parsers.cpp"
+      "tests/unit/test_firewall_parsers.cpp",
+      "tests/unit/test_firewall_quarantine_live.cpp",
+      "tests/unit/test_firewall_quarantine_parsers.cpp"
     ]
   },
-  "version": "0.6.0",
+  "version": "1.0.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`; `security.firewall.state` aggregates by `state` and drives the fleet pie \"Firewall profile state across the fleet\" (profile rows, labelled by value).",
     "**Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics. Both definitions carry a gather TTL (120 s and 300 s) but no schedule; they run when dispatched.",
     "**Sensitivity.** `rules` rows name installed applications on the host (Windows rule display names are application names — an installed-software inventory by another route; macOS `rules` rows carry the same kind of disclosure via unprivileged per-app allow/block entries, `app|<path>|...`, naming installed executables by absolute path) and, on Linux, the host's network policy; on macOS, both `state` and `rules` rows may also carry pf anchor names, which can identify installed network/security software (VPN clients, security tools) or local pf policy structure — `state` is otherwise limited to the device id.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"security.firewall.state\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.",
-    "**Siblings:** `quarantine` (mutates firewall state through its own sudoers-granted `pfctl` anchor and Windows firewall rules), `rdp_control` (toggles the Remote Desktop rule group through `INetFwPolicy2`), `network_config`."
+    "**Containment state.** `quarantine.state` (the phase, generation, allow set, probe target, TTL and the iptables generation) lives in the plugin's SQLite key-value storage on the endpoint, as do the Windows restore images `win.prior_firewall_policy` and `win.disabled_rules`. None of it leaves the endpoint except as reply rows.",
+    "**Containment sensitivity.** `allow|` and `note|` rows name the control-channel addresses, the host's DNS resolvers, the operator's exception addresses and the probe target, which together describe the network the device sits in. The Windows disabled-rule list holds rule display names (installed application names) but is kept on the endpoint and never echoed.",
+    "**Siblings:** `quarantine` (the retained plugin that mutates firewall state through its own sudoers-granted `pfctl` anchor, `iptables` chain and Windows firewall rules until it is removed), `rdp_control` (toggles the Remote Desktop rule group through `INetFwPolicy2`), `network_config`."
   ]
 }
