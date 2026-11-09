@@ -77,24 +77,15 @@ dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op op, const nlohmann::
     return rq;
 }
 
-/// JSON-RPC code of a refused or failed write. The 428/400/409 class is the caller's input
-/// (non-retryable -32602); every 503 class is a retryable internal error.
+/// JSON-RPC code of a refused or failed write, derived from the writer's own HTTP table
+/// (dex_score_policy_http_status) so the classification lives in one place: the 4xx class
+/// (428/400/409) is the caller's input (non-retryable -32602); the 5xx class (every 503) is a
+/// retryable internal error. Ok has no error code: 0.
 [[nodiscard]] constexpr int dex_score_policy_mcp_code(DexScorePolicyWriteStatus s) noexcept {
-    switch (s) {
-    case DexScorePolicyWriteStatus::Ok:
-        return 0;
-    case DexScorePolicyWriteStatus::IfMatchMissing:
-    case DexScorePolicyWriteStatus::IfMatchMalformed:
-    case DexScorePolicyWriteStatus::Invalid:
-    case DexScorePolicyWriteStatus::Stale:
-        return mcp::kInvalidParams;
-    case DexScorePolicyWriteStatus::WriterBusy:
-    case DexScorePolicyWriteStatus::StoreUnavailable:
-    case DexScorePolicyWriteStatus::OutcomeUnknown:
-    case DexScorePolicyWriteStatus::AuditUnavailable:
-        return mcp::kInternalError;
-    }
-    return mcp::kInternalError;
+    return s == DexScorePolicyWriteStatus::Ok
+               ? 0
+               : (dex_score_policy_http_status(s) >= 500 ? mcp::kInternalError
+                                                         : mcp::kInvalidParams);
 }
 
 /// A fixed token naming the status, for the generic mcp.<tool> row: never the message (which

@@ -33,7 +33,9 @@
 // equivalent of REST's Sec-Audit-Failed header.
 //
 // ONE handler per tool, never a shared one: the A5 retry-hint gate
-// (scripts/ci/check-mcp-retry-hints.py) scans each tool's own handler body.
+// (scripts/ci/check-mcp-retry-hints.py) scans each tool's own handler body. The one shared
+// helper, writer_actor, holds only answer_unwired (non-retryable by design): no a4_error, so no
+// retry site hides outside a handler.
 
 #include "mcp_tool_registry.hpp"
 
@@ -46,6 +48,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -89,12 +92,6 @@ void refuse_params(const ToolCallContext& ctx, const std::string& message) {
     answer(ctx, error_response(ctx.id, kInvalidParams, message)); // retry-hint-exempt: caller-input rejection
 }
 
-/// The generic mcp.<tool> row.
-bool mcp_row(const ToolCallContext& ctx, const std::string& result_status,
-             const std::string& detail = {}) {
-    return ctx.audit(result_status, detail);
-}
-
 /// The handler's own tier check (the generic C8 gate has already run; this is the defence in
 /// depth every registry handler repeats). False = the answer is written.
 bool tier_admits(const ToolCallContext& ctx, const char* securable, const char* operation) {
@@ -121,6 +118,31 @@ ToolDeps::DexScorePolicyAuditFn audit_hook(const ToolCallContext& ctx, bool& per
     };
 }
 
+/// The preamble the two write handlers share, run after the arguments parse and before any
+/// row: the apply and audit closures must be wired (an unwired sink would be called
+/// "persisted" by the kernel, so it is refused here; stricter than REST, which treats an empty
+/// sink as audit-off: "no audit row, no mutation") and the caller's username must resolve (it
+/// would name no one). Either refusal is answered here (answer_unwired: non-retryable by
+/// design, no retry hint) and yields nullopt; otherwise the actor for the audit rows.
+std::optional<std::string> writer_actor(const ToolCallContext& ctx, std::string_view tool) {
+    if (ctx.deps == nullptr || !ctx.deps->dex_score_policy_apply_fn || !ctx.deps->audit_fn) {
+        answer_unwired(ctx, "service unavailable",
+                       "dex score policy provider unwired; policy not changed", {},
+                       std::string(tool) + ": apply or audit closure unwired - misconfigured call "
+                                           "site; failing closed, policy not changed");
+        return std::nullopt;
+    }
+    auto resolved = ctx.deps->username_fn ? ctx.deps->username_fn(ctx.req) : std::nullopt;
+    if (!resolved || resolved->empty()) {
+        answer_unwired(ctx, "service unavailable", "caller identity unresolved; policy not changed",
+                       {},
+                       std::string(tool) + ": the caller's username could not be resolved - "
+                                           "failing closed, policy not changed");
+        return std::nullopt;
+    }
+    return resolved;
+}
+
 // ── get_dex_score_policy ──────────────────────────────────────────────────────────────────
 void handle_get_dex_score_policy(const ToolCallContext& ctx) {
     // ctx.args is a JSON object here (the dispatch chain's central check refuses anything else
@@ -141,13 +163,13 @@ void handle_get_dex_score_policy(const ToolCallContext& ctx) {
     }
     const auto stored = ctx.deps->dex_score_policy_read_fn();
     if (!stored) {
-        mcp_row(ctx, "failure", "store read failed");
+        (void)ctx.audit("failure", "store read failed");
         answer(ctx, ctx.a4_error(kInternalError, kDexScorePolicyStoreUnavailableMessage,
                                  "retry shortly", /*retry_after_ms=*/kDexScorePolicyRetryMs, {},
                                  true));
         return;
     }
-    mcp_row(ctx, "success");
+    (void)ctx.audit("success", "");
     answer(ctx, success_response(ctx.id, ctx.tool_result(
                                              dump_replace(dex_score_policy_in_force_json(
                                                  dex_policy_in_force_from_stored(*stored))),
@@ -167,26 +189,14 @@ void handle_set_dex_score_policy(const ToolCallContext& ctx) {
         refuse_params(ctx, rq.error());
         return;
     }
-    // "No audit row, no mutation": an unwired sink would be called "persisted" by the kernel,
-    // so it is refused here (stricter than REST, which treats an empty sink as audit-off).
-    if (ctx.deps == nullptr || !ctx.deps->dex_score_policy_apply_fn || !ctx.deps->audit_fn) {
-        answer_unwired(ctx, "service unavailable", "dex score policy provider unwired; policy not changed", {},
-                       "set_dex_score_policy: apply or audit closure unwired - misconfigured call "
-                       "site; failing closed, policy not changed");
-        return;
-    }
-    const auto resolved = ctx.deps->username_fn ? ctx.deps->username_fn(ctx.req) : std::nullopt;
-    if (!resolved || resolved->empty()) { // refused BEFORE any row: it would name no one
-        answer_unwired(ctx, "service unavailable", "caller identity unresolved; policy not changed", {},
-                       "set_dex_score_policy: the caller's username could not be resolved - "
-                       "failing closed, policy not changed");
-        return;
-    }
-    rq->actor = *resolved;
+    const auto actor = writer_actor(ctx, "set_dex_score_policy");
+    if (!actor)
+        return; // refused BEFORE any row; the answer is written
+    rq->actor = *actor;
     bool persisted = true;
     const auto r = ctx.deps->dex_score_policy_apply_fn(*rq, audit_hook(ctx, persisted));
     if (r.status == DexScorePolicyWriteStatus::Ok) {
-        if (!mcp_row(ctx, "success", r.dry_run ? "dry_run" : ""))
+        if (!ctx.audit("success", r.dry_run ? "dry_run" : ""))
             persisted = false;
         answer(ctx, success_response(ctx.id, ctx.tool_result(
                                                  dump_replace(dex_score_policy_mcp_success_json(
@@ -195,8 +205,8 @@ void handle_set_dex_score_policy(const ToolCallContext& ctx) {
         return;
     }
     const int code = dex_score_policy_mcp_code(r.status);
-    if (!mcp_row(ctx, code == kInvalidParams ? "denied" : "failure",
-                 std::string(dex_score_policy_mcp_status_token(r.status))))
+    if (!ctx.audit(code == kInvalidParams ? "denied" : "failure",
+                   std::string(dex_score_policy_mcp_status_token(r.status))))
         persisted = false;
     const std::string remediation = dex_score_policy_mcp_remediation(r.remediation);
     if (code == kInvalidParams) {
@@ -223,24 +233,14 @@ void handle_reset_dex_score_policy(const ToolCallContext& ctx) {
         refuse_params(ctx, rq.error());
         return;
     }
-    if (ctx.deps == nullptr || !ctx.deps->dex_score_policy_apply_fn || !ctx.deps->audit_fn) {
-        answer_unwired(ctx, "service unavailable", "dex score policy provider unwired; policy not changed", {},
-                       "reset_dex_score_policy: apply or audit closure unwired - misconfigured call "
-                       "site; failing closed, policy not changed");
+    const auto actor = writer_actor(ctx, "reset_dex_score_policy");
+    if (!actor)
         return;
-    }
-    const auto resolved = ctx.deps->username_fn ? ctx.deps->username_fn(ctx.req) : std::nullopt;
-    if (!resolved || resolved->empty()) {
-        answer_unwired(ctx, "service unavailable", "caller identity unresolved; policy not changed", {},
-                       "reset_dex_score_policy: the caller's username could not be resolved - "
-                       "failing closed, policy not changed");
-        return;
-    }
-    rq->actor = *resolved;
+    rq->actor = *actor;
     bool persisted = true;
     const auto r = ctx.deps->dex_score_policy_apply_fn(*rq, audit_hook(ctx, persisted));
     if (r.status == DexScorePolicyWriteStatus::Ok) {
-        if (!mcp_row(ctx, "success"))
+        if (!ctx.audit("success", ""))
             persisted = false;
         answer(ctx, success_response(ctx.id, ctx.tool_result(
                                                  dump_replace(dex_score_policy_mcp_success_json(
@@ -249,8 +249,8 @@ void handle_reset_dex_score_policy(const ToolCallContext& ctx) {
         return;
     }
     const int code = dex_score_policy_mcp_code(r.status);
-    if (!mcp_row(ctx, code == kInvalidParams ? "denied" : "failure",
-                 std::string(dex_score_policy_mcp_status_token(r.status))))
+    if (!ctx.audit(code == kInvalidParams ? "denied" : "failure",
+                   std::string(dex_score_policy_mcp_status_token(r.status))))
         persisted = false;
     // The approval ticket was spent before this handler ran, so every refusal or failure here
     // has burned it: say how to recover.
