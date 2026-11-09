@@ -411,7 +411,14 @@ SELECT platform, arch, version FROM update_registry.update_packages
  WHERE platform ~ '[\x01-\x1f\x7f]' OR arch ~ '[\x01-\x1f\x7f]' OR version ~ '[\x01-\x1f\x7f]';
 ```
 
-To remove it, delete the row in SQL (`DELETE FROM update_registry.update_packages WHERE <the same condition> RETURNING platform, arch, version, filename;` names the binary), remove the binary and its `.sig` sidecar from the update directory by hand, and restart every serving replica. This SQL is unsupported and not audited, so record it in the change ticket.
+To remove it, follow these steps in order. Do not remove any file before step 3.
+
+1. Delete the row in SQL and note each `filename` it returns: `DELETE FROM update_registry.update_packages WHERE <the same condition> RETURNING platform, arch, version, filename;`
+2. For each returned `filename`, run `SELECT platform, arch, version FROM update_registry.update_packages WHERE lower(filename) = lower('<filename>');`
+3. Only when that query returns no row, and the `filename` is a plain file name with no path separator, remove that binary and its `.sig` sidecar from the update directory by hand. When it returns a row, leave both files in place. Pause package uploads while you do this.
+4. Restart every serving replica.
+
+This SQL is unsupported and not audited, so record it in the change ticket.
 
 **Other effects.**
 

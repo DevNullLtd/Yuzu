@@ -53,13 +53,19 @@ SELECT platform, arch, version FROM update_registry.update_packages
  WHERE platform ~ '[\x01-\x1f\x7f]' OR arch ~ '[\x01-\x1f\x7f]' OR version ~ '[\x01-\x1f\x7f]';
 ```
 
-An empty result means nothing is affected. To remove such a package, delete the row in SQL, remove its binary and `.sig` signature sidecar from the update directory by hand (the `filename` column names the binary), and restart every serving replica:
+An empty result means nothing is affected. To remove such a package, follow these steps in order. Do not remove any file before step 3.
 
-```sql
-DELETE FROM update_registry.update_packages
- WHERE platform ~ '[\x01-\x1f\x7f]' OR arch ~ '[\x01-\x1f\x7f]' OR version ~ '[\x01-\x1f\x7f]'
- RETURNING platform, arch, version, filename;
-```
+1. Delete the row in SQL and note each `filename` it returns (the `filename` column names the binary):
+
+   ```sql
+   DELETE FROM update_registry.update_packages
+    WHERE platform ~ '[\x01-\x1f\x7f]' OR arch ~ '[\x01-\x1f\x7f]' OR version ~ '[\x01-\x1f\x7f]'
+    RETURNING platform, arch, version, filename;
+   ```
+
+2. For each returned `filename`, run `SELECT platform, arch, version FROM update_registry.update_packages WHERE lower(filename) = lower('<filename>');`
+3. Only when that query returns no row, and the `filename` is a plain file name with no path separator, remove that binary and its `.sig` signature sidecar from the update directory by hand. When it returns a row, leave both files in place. Pause package uploads while you do this.
+4. Restart every serving replica.
 
 This SQL is unsupported and is not recorded in the in-product audit log, so record it in the change ticket.
 
