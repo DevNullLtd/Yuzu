@@ -45,9 +45,17 @@
 // committed rows. Only a foreign-owned file moves; an owner-verified sidecar stays and pairs with
 // tar.db as in any resume. FAIL CLOSED: when the owner of echo.db or of any existing sidecar
 // cannot be resolved nothing is moved, the warning above is the only effect and echo.db wins, so
-// an unreadable owner can never be turned into a move. Adoption proceeds only if echo.db itself
-// was moved aside. The POSIX arm is unchanged: the state directory is root-owned there, so a
-// local user cannot plant a file in it.
+// an unreadable owner can never be turned into a move.
+//
+// The second shape a planted file takes is a SIDECAR with no echo.db: a planted echo.db-wal
+// beside the real tar.db-wal, which the collision refusal below would otherwise stop for good.
+// So when echo.db is absent, every echo.db sidecar whose tar.db twin also exists is probed the
+// same way; a foreign-owned one is moved aside alone (`echo.db-wal.planted-<epoch>[-n]`), an
+// owner-verified or unresolved one is left where it is and the refusal below stands. A lone
+// echo.db sidecar with no tar.db twin is the resume state and is never probed or moved. Adoption
+// proceeds only once everything in its way was moved aside: echo.db itself when present, the
+// colliding sidecars otherwise. The POSIX arm is unchanged: the state directory is root-owned
+// there, so a local user cannot plant a file in it.
 //
 // A sidecar present at BOTH names while tar.db is being adopted (for example a downgrade wrote a
 // fresh tar.db-wal beside an already-moved echo.db-wal) cannot be paired safely: moving tar.db
@@ -131,9 +139,11 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db,
     if (ec)
         return std::unexpected(std::format("cannot stat {}: {}", legacy.string(), ec.message()));
 
-    if (echo_present && legacy_present && owner_of) {
-        // Probe every existing echo.db file BEFORE moving any: a file whose owner cannot be
-        // resolved cancels the whole step (nothing moved), and echo.db must itself be foreign.
+    if (legacy_present && owner_of) {
+        // The planted-file self-heal (#6695, header comment). Probe every candidate BEFORE moving
+        // any: a file whose owner cannot be resolved cancels the whole step (nothing moved). With
+        // echo.db present every echo.db file is a candidate and echo.db must itself be foreign;
+        // without it only a sidecar colliding with tar.db's own is (a lone one is the resume state).
         std::vector<fs::path> foreign;
         bool echo_foreign = false;
         bool unresolved = false;
@@ -147,6 +157,17 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db,
             }
             if (!present)
                 continue;
+            if (!echo_present) {
+                fs::path twin = legacy;
+                twin += suffix;
+                const bool collides = fs::exists(twin, ec);
+                if (ec) {
+                    unresolved = true;
+                    break;
+                }
+                if (!collides)
+                    continue;
+            }
             switch (owner_of(file)) {
             case EchoFileOwner::ours:
                 break;
@@ -159,7 +180,8 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db,
                 break;
             }
         }
-        if (echo_foreign && !unresolved) {
+        const bool heal = !unresolved && (echo_present ? echo_foreign : !foreign.empty());
+        if (heal) {
             const auto epoch = yuzu::shared::sqlite_quarantine::now_epoch_seconds();
             // One at a time. The sidecars first, the main file last, so an interruption leaves
             // "echo.db still planted" (re-detected on the next start), never a stranded sidecar.
@@ -178,9 +200,10 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db,
                              "agent's: moved aside to {} so the legacy {} can be adopted",
                              it->string(), moved->string(), legacy.string());
             }
-            echo_present = false; // echo.db is gone: carry on to the adoption proper
+            if (echo_foreign)
+                echo_present = false; // echo.db is gone: carry on to the adoption proper
         }
-        if (echo_present && unresolved) {
+        if (unresolved) {
             spdlog::warn("Could not resolve the owner of every file at {}: none moved aside",
                          echo_db.string());
         }

@@ -4069,6 +4069,150 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption plus a planted echo.db 
     CHECK(db->get_config("wal_marker", "") == "x"); // the committed WAL-only row is still there
 }
 
+// The second planted shape (#6695): no echo.db at all, only a foreign echo.db-wal beside the real
+// tar.db-wal. Before the self-heal this was refused as a sidecar collision for good.
+TEST_CASE("adopt_legacy_echo_db: a foreign-owned echo.db-wal beside tar.db-wal is moved aside alone and tar.db adopted (#6695)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path()); // tar.db + tar.db-wal holding wal_marker=x
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(d.path() / "echo.db-wal", "planted sidecar");
+
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(
+                echo_db, probe_by_name({{"echo.db-wal", EchoFileOwner::foreign}}))
+                .has_value());
+    const auto planted = names_with_prefix(d.path(), "echo.db-wal.planted-");
+    REQUIRE(planted.size() == 1);
+    CHECK(slurp_file(d.path() / planted[0]) == "planted sidecar"); // kept as evidence
+    CHECK(names_with_prefix(d.path(), "echo.db.planted-").empty()); // nothing else moved
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "tar.db-wal"));
+    auto db = EchoDatabase::open(echo_db);
+    REQUIRE(db.has_value());
+    CHECK(db->get_config("wal_marker", "") == "x"); // the legitimate WAL came along, not the plant
+}
+
+TEST_CASE("adopt_legacy_echo_db: an echo.db-wal that is ours or unresolvable beside tar.db-wal still fails closed (#6695)",
+          "[echo][store][adopt]") {
+    for (const auto owner : {EchoFileOwner::ours, EchoFileOwner::unknown}) {
+        INFO("echo.db-wal owner = " << static_cast<int>(owner));
+        ScratchDir d;
+        make_legacy_tar_db_with_wal(d.path());
+        spit_file(d.path() / "echo.db-wal", "a WAL with distinct bytes");
+
+        auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db",
+                                                         probe_by_name({{"echo.db-wal", owner}}));
+        REQUIRE_FALSE(adopted.has_value());
+        CHECK(adopted.error().find("both exist") != std::string::npos);
+        CHECK(fs::exists(d.path() / "tar.db"));
+        CHECK(fs::exists(d.path() / "tar.db-wal"));
+        CHECK(slurp_file(d.path() / "echo.db-wal") == "a WAL with distinct bytes");
+        CHECK(names_with_prefix(d.path(), "echo.db-wal.planted-").empty());
+    }
+}
+
+// A lone echo.db-wal with no tar.db-wal twin is the documented resume state: never probed, never
+// moved, whatever the probe would say about it.
+TEST_CASE("adopt_legacy_echo_db: a lone echo.db-wal is the resume state and is never probed (#6695)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal"); // the interrupted step
+    bool probed = false;
+    auto probe = [&](const fs::path&) {
+        probed = true;
+        return EchoFileOwner::foreign;
+    };
+
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db", probe).has_value());
+    CHECK_FALSE(probed);
+    CHECK(names_with_prefix(d.path(), "echo.db-wal.planted-").empty());
+    auto db = EchoDatabase::open(d.path() / "echo.db");
+    REQUIRE(db.has_value());
+    CHECK(db->get_config("wal_marker", "") == "x");
+}
+
+TEST_CASE("adopt_legacy_echo_db: two foreign files are both moved aside, one at a time (#6695)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(echo_db, "planted main");
+    spit_file(d.path() / "echo.db-wal", "planted sidecar");
+
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db, probe_by_name({
+                                                           {"echo.db", EchoFileOwner::foreign},
+                                                           {"echo.db-wal", EchoFileOwner::foreign},
+                                                       }))
+                .has_value());
+    const auto main_planted = names_with_prefix(d.path(), "echo.db.planted-");
+    const auto wal_planted = names_with_prefix(d.path(), "echo.db-wal.planted-");
+    REQUIRE(main_planted.size() == 1);
+    REQUIRE(wal_planted.size() == 1);
+    CHECK(slurp_file(d.path() / main_planted[0]) == "planted main");
+    CHECK(slurp_file(d.path() / wal_planted[0]) == "planted sidecar");
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    auto db = EchoDatabase::open(echo_db);
+    REQUIRE(db.has_value());
+    CHECK(db->get_config("wal_marker", "") == "x");
+}
+
+// An owner-verified echo.db wins even when a sidecar beside it is foreign: adoption moves nothing
+// (open() replaces a foreign sidecar on Windows; that is its job, not adoption's).
+TEST_CASE("adopt_legacy_echo_db: an owner-verified echo.db with a foreign sidecar moves nothing (#6695)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db(d.path());
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(echo_db, "ours");
+    spit_file(d.path() / "echo.db-wal", "planted sidecar");
+
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(
+                echo_db, probe_by_name({{"echo.db-wal", EchoFileOwner::foreign}}))
+                .has_value());
+    CHECK(slurp_file(echo_db) == "ours");
+    CHECK(slurp_file(d.path() / "echo.db-wal") == "planted sidecar");
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK(names_with_prefix(d.path(), "echo.db.planted-").empty());
+    CHECK(names_with_prefix(d.path(), "echo.db-wal.planted-").empty());
+}
+
+#ifdef _WIN32
+// The real probe (default_echo_owner_probe, the owner test open() applies), not a fake: a file
+// owned by Users is foreign and moves; a file we created is ours and stays. SeRestorePrivilege is
+// needed to hand the plant to another owner, so the case SKIPs without it (as the open() cases do).
+TEST_CASE("adopt_legacy_echo_db (Windows): the real owner probe moves a Users-owned echo.db and keeps ours (#6695)",
+          "[echo][store][adopt][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    {
+        ScratchDir d;
+        make_legacy_tar_db(d.path());
+        const auto echo_db = d.path() / "echo.db";
+        spit_file(echo_db, "planted by another account");
+        set_owner(echo_db, kUsers);
+
+        REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db).has_value());
+        const auto planted = names_with_prefix(d.path(), "echo.db.planted-");
+        REQUIRE(planted.size() == 1);
+        CHECK(slurp_file(d.path() / planted[0]) == "planted by another account");
+        CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+        CHECK(EchoDatabase::open(echo_db).has_value());
+    }
+    {
+        ScratchDir d;
+        make_legacy_tar_db(d.path());
+        const auto echo_db = d.path() / "echo.db";
+        spit_file(echo_db, "ours"); // created by this process: owner-verified
+
+        REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db).has_value());
+        CHECK(slurp_file(echo_db) == "ours");
+        CHECK(fs::exists(d.path() / "tar.db"));
+        CHECK(names_with_prefix(d.path(), "echo.db.planted-").empty());
+    }
+}
+#endif // _WIN32
+
 // =============================================================================
 // Storage budget primitives (auto_vacuum, db_size_bytes, delete_counted, hygiene)
 // =============================================================================
