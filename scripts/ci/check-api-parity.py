@@ -511,7 +511,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # `twinned-rest-only` to `twinned` (GET /api/v1/rbac/enforcement + the get_rbac_enforcement MCP tool, #6033).
 # 204 -> 208 (DEX Scoring tab): four dashboard routes (GET /fragments/dex/scoring and the save,
 # preview and reset POSTs) born `planned:#6087`, each with its merged REST v1 twin named and the MCP twin owed.
-BASELINE_UNTWINNED = 208
+# 208 -> 204 (#6087): get_/set_/reset_dex_score_policy retire all four (preview twins onto the dry-run PUT).
+BASELINE_UNTWINNED = 204
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -2388,8 +2389,16 @@ GATE_PARITY_KNOWN_MISMATCHES = {
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
 # gates such as sw_admit, member-function gates) cannot be compared, so it fails closed unless it
 # is named here.
-GATE_PARITY_NO_GATE_MAX = 14
+GATE_PARITY_NO_GATE_MAX = 16
 GATE_PARITY_NO_GATE_ALLOWED = {
+    ("DELETE", "/api/v1/dex/score-policy", "reset_dex_score_policy"): (
+        "the REST handler's Infrastructure:Write check lives in the shared `score_policy_write` "
+        "lambda (perm_fn at its top, rest_api_v1.cpp), which this script's per-route lexical read "
+        "cannot see from the registration lambda. Read in review: the tool's Infrastructure:Write "
+        "(Delete for the MCP reset: stricter than REST DELETE, which needs Infrastructure:Write "
+        "only; the approval ticket is the generic supervised Delete rule) row matches the REST "
+        "gate, and the tool ADDS a loud GuaranteedState:Read gate and the supervised tier ladder "
+        "(ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> 16 for this pair)"),
     ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent, kToolSecurityRows comment)"),
@@ -2435,6 +2444,13 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "owner-scoped on the session via auth_fn; no RBAC gate call (result-set precedent)"),
     ("POST", "/api/v1/scope/validate", "validate_scope"): (
         "auth_fn only: validates an expression the caller supplied and reads no fleet data"),
+    ("PUT", "/api/v1/dex/score-policy", "set_dex_score_policy"): (
+        "the REST handler's Infrastructure:Write check lives in the shared `score_policy_write` "
+        "lambda (perm_fn at its top, rest_api_v1.cpp), which this script's per-route lexical read "
+        "cannot see from the registration lambda. Read in review: the tool's Infrastructure:Write "
+        "row matches the REST gate, and the tool ADDS a loud GuaranteedState:Read gate and the "
+        "supervised tier ladder (ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> "
+        "16 for this pair)"),
 }
 
 # Check 7 allowlist: registry tool -> reason, for a tool whose domain test file lacks the

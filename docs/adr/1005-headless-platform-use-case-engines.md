@@ -991,8 +991,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        then amended. No ledger row is added for the REST routes, as for the
        2026-10-23 entry: the parity ledger admits an `exception:` row for a
        `/api/v1` route but does not require one. The four dashboard routes
-       over them do carry ledger rows (`planned:#6087`; see the 2026-11-06
-       entry).
+       over them carry ledger rows (`planned:#6087` under the 2026-11-06 entry,
+       flipped to `twinned` by the 2026-11-09 entry).
      - **The exception relaxes no control.** Same gates, `If-Match`, audit-first
        and fail-closed audit, A4 envelope, and discovery in `openapi_spec()` and
        `/api/v1/discover/routes`; the new parameters are validated by the same
@@ -1602,7 +1602,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        each; the dex closure is the second shape, not literally the first.
      - **Still open on #6087.** The headless tier-change diff (a preview twin)
        needs a REST and core precursor and then its own MCP change; the preview
-       POST of the Settings page keeps its ledger exception. `prior_document`
+       POST's ledger row is flipped to twinned onto the dry-run `set_dex_score_policy`
+       (its validation half); the tier-change diff it adds has no headless twin and
+       stays the exception recorded in the 2026-11-06 entry. `prior_document`
        on reset audit rows is a core audit-row change, deferred as a follow-up.
        Reader size is tracked as #6619. The REST registration lambdas hold no
        readable gate call (the `perm_fn` sits in the shared
