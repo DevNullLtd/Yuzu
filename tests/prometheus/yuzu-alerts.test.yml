@@ -8456,18 +8456,20 @@ tests:
         eval_time: 125m
         exp_samples: []
 
-  # -- YuzuEchoDbCorruptionDetected / YuzuPluginInitFailed (#5033, #6696) -------
+  # -- YuzuEchoDbCorruptionDetected / YuzuPluginInitFailed (#5065, #6696; alert half of #5033) --
   #
   # Mutation-checked, YuzuEchoDbCorruptionDetected: [1h] -> [5m] reddens A and D; [1h] -> [2h]
-  # reddens A (91m); dropping the uptime guard or 3600 reddens C and D; `<= 3900` reddens D;
-  # `increase` reddens E; `unless on (job)` reddens E3; `sum by (job)` reddens E2.
+  # reddens A (90m); [59m] or [61m] redden A (the 89m and 90m evals pin the window to the minute);
+  # dropping the uptime guard or 3600 reddens C and D; `<= 3900` reddens D; `increase` reddens E;
+  # `unless on (job)` reddens E3; a plain `unless` without `on` reddens C (its gauge series carries
+  # a stray label); `sum by (job)` reddens E2; the shipped annotations are pinned by E2 at 40m.
   # Mutation-checked, YuzuPluginInitFailed: `for:` 5m or 16m, the bare gauge, a [1m], [4m] or [6m]
-  # window, `sum by` keeping `instance` or dropping `plugin`, and an Echo-only selector each
-  # redden at least one case.
+  # window, `sum by` keeping `instance` or dropping `plugin`, `max by` for `sum by` (case F has two
+  # replicas reporting), and an Echo-only selector each redden at least one case.
 
   # CASE A -- the corruption gauge steps 0 -> 1 at minute 31 (no uptime series present: an absent
-  # right-hand side must not suppress). Fires at 31m and still at 80m, and is gone at 91m once the
-  # window start passes the step: pins the [1h] window.
+  # right-hand side must not suppress). Fires at 31m and still at 89m (the last eval whose window
+  # reaches back to the 0 sample at 30m), and is gone at 90m: pins the [1h] window to the minute.
   - interval: 1m
     name: echo corruption gauge rising by one fires, window is 1h
     input_series:
@@ -8480,12 +8482,12 @@ tests:
           - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 80m
+        eval_time: 89m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
-        eval_time: 91m
+        eval_time: 90m
         exp_samples: []
 
   # CASE B -- negative control: a flat non-zero gauge (old, already-counted quarantines) stays quiet.
@@ -8503,13 +8505,14 @@ tests:
 
   # CASE C -- a server restart: the gauge is 3, the replica restarts (absent for the gap), then
   # the gauge ramps 0 1 2 3 as agents reconnect, with the uptime counter reset at the same moment.
-  # An hour later the 1h window start lands in the ramp (165m-167m) and a bare delta fires with no
-  # new corruption; the guard keeps it quiet. Uptime is exactly 3600 s at 166m, which pins the
-  # threshold against 3600.
+  # An hour later the 1h window start lands in the ramp (a bare delta is positive from 160m to
+  # 167m) and fires with no new corruption; the guard keeps it quiet. Uptime is exactly 3600 s at
+  # 166m, which pins the threshold against 3600. The gauge series carries a stray `pod` label the
+  # uptime series lacks, so a plain `unless` (no `on`) would not match and the rule would fire.
   - interval: 1m
     name: echo corruption gauge ramp after a server restart stays quiet
     input_series:
-      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
+      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1",pod="a"}'
         values: "3x100 _x5 0 1 2 3x120"
       - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
         values: "100000x100 _x5 0+60x130"
@@ -8518,7 +8521,7 @@ tests:
         eval_time: 166m
         exp_samples: []
 
-  # CASE D -- a genuine rise 30 minutes into a replica's life is held back by the guard until
+  # CASE D -- a genuine rise 31 minutes into a replica's life is held back by the guard until
   # uptime reaches 3900 s (65m), then fires: quiet at 64m, firing at 65m (pins `<` against `<=`).
   - interval: 1m
     name: echo corruption rise inside the guard window fires once uptime passes 65m
@@ -8556,10 +8559,12 @@ tests:
 
   # CASE E2 -- a failover (or the agent shuffle of a rolling upgrade) moves 3 agents from old
   # replica s1 to old replica s2: s2 gains agents, so its per-instance gauge rises with no new
-  # corruption and pages once (accepted for a warning; the description says so). s1 falling is
+  # corruption and fires once (accepted for a warning; the description says so). s1 falling is
   # quiet. RED if the rule becomes `sum by (job)` (the sum stays flat at 3 and 40m goes empty).
+  # The 40m alert also pins the shipped annotations, verbatim: this is the only case that does, so
+  # a change to the summary, description or runbook link must update the strings here.
   - interval: 1m
-    name: echo corruption - a failover onto an old replica pages that replica once
+    name: echo corruption - a failover onto an old replica fires that replica once
     input_series:
       - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
         values: "3x30 0x60"
@@ -8569,6 +8574,18 @@ tests:
         values: "100000x90"
       - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s2"}'
         values: "100000x90"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: YuzuEchoDbCorruptionDetected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: yuzu
+              instance: s2
+            exp_annotations:
+              summary: "The count of agents with a quarantined Echo database rose in the last hour"
+              description: "At least one more agent than an hour ago reports that its Echo database failed its integrity check and was quarantined. This is a net rise in the agents reporting a quarantine history, not an event count: the gauge counts agents once per sweep, so an agent returning from offline with an old quarantine raises it, a repeat quarantine on an agent already counted does not, and an agent leaving in the same window can mask one arriving. A rise seen while the reporting replica has been up under 65 minutes is held until the guard lifts. A failover, a rolling upgrade, agents returning after a site or gateway outage, or ordinary endpoint churn can all raise it with no new corruption, once per replica that gains agents; treat it as a ticket, not a page. The signal is agent-self-reported, so one agent can raise or mask it; the echo.db.corruption_quarantined audit rows name the affected agents but corroborate rather than prove it."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuEchoDbCorruptionDetected", alertstate="firing"}'
         eval_time: 40m
@@ -8601,11 +8618,15 @@ tests:
             value: 1
 
   # CASE F -- held for the full 15m: quiet at 14m, firing at 15m and 16m, with the plugin label and
-  # no `instance` (the sum drops it). RED if `for:` is shortened (fires at 14m) or lengthened.
+  # no `instance` (the sum drops it). Two replicas report the failure, so the annotations read
+  # "2 agent(s)": RED if `max by` replaces `sum by`. RED if `for:` is shortened (fires at 14m) or
+  # lengthened; the shipped annotations are pinned here, verbatim, for the Echo plugin.
   - interval: 1m
     name: plugin init failed held past 15m fires, not before
     input_series:
       - series: 'yuzu_fleet_plugin_init_failed{job="yuzu",instance="s1",plugin="echo"}'
+        values: "1x30"
+      - series: 'yuzu_fleet_plugin_init_failed{job="yuzu",instance="s2",plugin="echo"}'
         values: "1x30"
     alert_rule_test:
       - eval_time: 16m
@@ -8616,8 +8637,8 @@ tests:
               job: yuzu
               plugin: echo
             exp_annotations:
-              summary: "About 1 agent(s) report plugin echo failed to initialise"
-              description: "For more than 10 minutes, about 1 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that plugin echo failed init (heartbeat tag yuzu.plugins_failed); it is loaded but not running, as distinct from not installed. plugin=\"other\" is the sum over plugins past the first 64 names the server labels per sweep; the agent log names them. For plugin=\"echo\" the usual causes are a failed tar.db adoption after the rename (including a sidecar present under both names) and a corrupt echo.db that could not be moved aside; the upgrade notes cover adoption, and the corrupt-database case is under Corrupt-database quarantine in the Echo manual. The value is agent-self-reported."
+              summary: "About 2 agent(s) report plugin echo failed to initialise"
+              description: "For more than 10 minutes, about 2 agent(s) (summed across core replicas, so a failover can count one twice for a few minutes) have reported that plugin echo failed init (heartbeat tag yuzu.plugins_failed); it is loaded but not running, as distinct from not installed. plugin=\"other\" is the sum over plugins past the first 64 names the server labels per sweep; the agent log names them. The runbook link is the Echo upgrade note; for any other plugin the agent log is the source. For plugin=\"echo\" the usual causes are a failed tar.db adoption after the rename (including a sidecar present under both names) and a corrupt echo.db that could not be moved aside; the upgrade notes cover adoption under 'Two cases the agent refuses, and what to do', and the corrupt-database case is under Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack of free space is not counted here (#7290). The value and the plugin label are agent-self-reported: agent-minted names can displace a real plugin into plugin=\"other\", so the label is not authoritative."
               runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing"}'
