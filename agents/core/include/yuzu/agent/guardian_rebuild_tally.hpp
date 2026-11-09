@@ -10,12 +10,25 @@
  * this line existed nothing said why: a reader could tell that the ruleset paid a re-arm, not which
  * condition forced it. This line names the cause per rule so a rebuild storm can be attributed.
  *
- * Reasons and precedence. When several rebuild conditions hold at once, the FIRST of these wins
- * (this is the declaration order of GuardianRebuildReason after None):
- *   key_busy, first_attach, faulted_key, dead_key, health_unknown, subscription_replaced,
- *   unknown_episode, content_changed, baseline_empty, baseline_differs, other.
- * Health terms outrank content terms on purpose: a rule on a broken key must be reported as a
- * broken key even when its content also changed.
+ * Reasons and precedence. When several rebuild conditions hold at once, one reason is reported:
+ * the first that GuardianSparkRuntime::reuse_existing_locked evaluates, in the order below. That
+ * order is NOT the declaration order of GuardianRebuildReason and NOT the print order of the line.
+ *   1. The key has any claim: this rule's own live arm with other content, spec or ownership
+ *      reports content_changed (even if the key is also unhealthy); any other claim reports
+ *      key_busy. (This rule's own live arm with identical content is a skip, not a rebuild.)
+ *   2. No committed entry for the rule or the key: first_attach.
+ *   3. Committed path, health before content: the key's recorded faulted bit (reports the cause
+ *      recorded with it, else faulted_key); an absent health probe (health_unknown); a probe of a
+ *      different subscription (subscription_replaced); a Dead probe (dead_key); any other
+ *      non-Healthy probe (faulted_key); an Unknown evaluation episode (unknown_episode).
+ *   4. Content: a changed content id (content_changed), then, for a file-hash rule, an empty
+ *      (baseline_empty) or differing (baseline_differs) pushed hash.
+ *   5. Defensive invariants that no public path violates: other.
+ * So on the committed path (steps 3 and 4) a rule on a broken key is reported as a broken key even
+ * when its content also changed, but step 1 comes first: a changed rule that still has its own
+ * arm in flight is content_changed even when the key is unhealthy. For a kept rule that a
+ * full_sync's scoped detach tore down because its key was faulted, dead or unreadable, the engine
+ * reports the key's recorded cause instead of what the later attach observes (see (h)).
  *
  * Line format (one per full_sync that reaches the end of its rule loop; best-effort under
  * allocation failure; absent when apply_rules returns early on a persist failure). Counts are
@@ -30,25 +43,47 @@
  * log_id_token()-sanitised (CWE-117; ',' and ' ' cannot appear inside one). The nine id-bearing
  * groups share ONE budget (kMaxIds entries, kMaxIdBytes in total); M is the sum of the counts of
  * all id-bearing groups minus the ids listed, so M > 0 means a list is incomplete and the reader
- * must not treat an unlisted rule as failed. first_attach and content_changed are COUNT-ONLY: on
+ * must not treat an unlisted rule as failed. Once the budget is spent the ids that were listed are
+ * the first ones noted, in the order the engine reconciled the rules (the push's rule order, not
+ * grouped by reason); an id that no longer fits in the remaining bytes is left off while a later,
+ * shorter one can still be listed. first_attach and content_changed are COUNT-ONLY: on
  * a first push or a rename every rule lands there and an id list would only repeat the push.
  * The line deliberately matches none of the fullsync_blackout_diag.py driver patterns.
  *
  * Contract a reader of this file must keep:
- *   (a) note() and format() run on the engine apply thread under GuardianEngine::mtx_, never
- *       under GuardianSparkRuntime::registry_mu_ and never on a mechanism worker or callback.
- *   (b) The precedence order above is the order reuse_existing_locked evaluates its terms.
- *   (c) first_attach means no committed arm and no scoped-detach record. That INCLUDES a rule the
- *       heartbeat poll backstop (on_subscription_lost) lost between pushes, which looks the same
- *       to the attach path as a rule never armed.
+ *   (a) note() and format() run under GuardianEngine::mtx_ (apply_rules, or start_local's boot
+ *       re-arm loop for note()), never under GuardianSparkRuntime::registry_mu_ and never on a
+ *       mechanism worker or callback.
+ *   (b) The precedence order above is the order reuse_existing_locked evaluates its terms. It is
+ *       not the enum order; the two differ in the health block (the code tests the recorded bit,
+ *       then an absent probe, then subscription_replaced, then Dead, then any other non-Healthy
+ *       state).
+ *   (c) first_attach means no committed arm and no scoped-detach record. That INCLUDES a rule
+ *       on_subscription_lost detached between pushes (a Lost event, or the convergence
+ *       scheduler's dead-key poll check), which looks the same to the attach path as a rule
+ *       never armed.
  *   (d) A genuinely new rule queued behind a forced disarm of the same key reports key_busy with
  *       its id, not first_attach.
  *   (e) The count includes Pending and Accepted outcomes that may still fail. There is no
- *       pending/committed split, hence "rebuild attempted".
+ *       pending/committed split, hence "rebuild attempted". A rule whose attach is refused
+ *       synchronously (the `spark arm failed` warning) appears in neither this line nor the
+ *       preserved line, and any cause recorded for it by the scoped detach is lost.
  *   (f) A wedge re-observation (a retained wedged arm seen again) appears in NEITHER this line nor
- *       the preserved line: it carries no rebuild reason.
- *   (g) On a legacy-path agent (prefer_spark_ false, the production default) the attach path is
- *       never reached, so this line is always `rebuilt 0` and every counter stays zero.
+ *       the preserved line: both retained-wedge re-observation returns in attach_core leave the
+ *       rebuild reason None, and the engine consults the scoped detach's recorded cause only for an attach that
+ *       reported a reason, so even a kept rule on a faulted key is not tallied for one.
+ *   (g) path=legacy means the Spark attach path was not used for this push, so the tally was not
+ *       fed and the line reads `rebuilt 0`. On a legacy-path agent (prefer_spark_ false, the
+ *       production default) that does NOT mean nothing was rebuilt: every legacy guard is stopped
+ *       and every carried rule is re-armed on each full push. (With prefer_spark_ set but Spark
+ *       Unwired or SparkFailed the carried rules are withdrawn and armed on neither backend, and
+ *       the line still reads path=legacy.) The runtime's three failure counters are not all
+ *       confined to the Spark attach path: see the accessors in guardian_spark_runtime.hpp.
+ *   (h) The cause recorded on a key (PerKey::unhealthy_why) is first-cause-wins for the backend
+ *       health sweep and the attach probe repair, but the mechanism's own Faulted/Recovered event
+ *       is authoritative: it overwrites a sweep-recorded cause and a Recovered event clears it.
+ *       The tally is fed from exactly one place, reconcile_rule_locked's Spark branch; the line
+ *       itself is logged by every full_sync that reaches the end of its rule loop, fed or not.
  *
  * Threading: see (a). It logs nothing itself.
  */
@@ -66,8 +101,10 @@
 namespace yuzu::agent {
 
 /// Why a rule the push carried was rebuilt instead of skipped. The declaration order after None is
-/// the documented precedence order (first match wins); do not reorder without updating the header
-/// comment above, the runtime's evaluation order and the golden fixture.
+/// NOT the precedence order (reuse_existing_locked's evaluation order is, see the header comment
+/// above) and NOT the print order (kLineOrder); it fixes the bucket index, so adding or reordering
+/// an enumerator needs kReasons, kLineOrder, the token table, the unit tests and the golden
+/// fixture updated together.
 enum class GuardianRebuildReason : std::uint8_t {
     None = 0,
     KeyBusy,
@@ -83,9 +120,11 @@ enum class GuardianRebuildReason : std::uint8_t {
     Other,
 };
 
-/// Which arm path the push took: the legacy path (prefer_spark_ false or Spark not Available), where
-/// every carried rule is stopped and re-armed on each full_sync and the tally is never fed, or the
-/// Spark path, where the skip/rebuild decision applies. Printed as `path=legacy|spark`.
+/// Which arm path the push took: the Spark path (prefer_spark_ true and Spark Available), where the
+/// skip/rebuild decision applies, or the legacy label for every other case, where the tally is never
+/// fed. In production (prefer_spark_ false) the legacy guards are all stopped and every carried rule
+/// is re-armed on each full_sync; with prefer_spark_ set but Spark Unwired or SparkFailed the carried
+/// rules are armed on neither backend. Printed as `path=legacy|spark`.
 enum class GuardianRebuildPath : std::uint8_t { Legacy = 0, Spark };
 
 [[nodiscard]] constexpr std::string_view guardian_rebuild_path_token(GuardianRebuildPath p) noexcept {

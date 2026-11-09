@@ -439,7 +439,7 @@ public:
     /// #5719: the kept rules this call detaches because their key's faulted bit was set (reported
     /// by the mechanism, or found Faulted, Dead or unreadable by the backend health sweep it runs
     /// first), one entry per such rule (a key shared by several kept rules yields one entry per
-    /// sibling), each with `why` = the key's recorded first cause (PerKey::unhealthy_why, else
+    /// sibling), each with `why` = the cause recorded for the key (PerKey::unhealthy_why, else
     /// KeyFaulted). Rules omitted from `keep` are NOT listed (they are not "kept"), and a healthy
     /// kept rule is not listed. Built under the same registry_mu_ hold as the detach (not
     /// pre-reserved); detach_all() discards it. It exists because, after this call, the
@@ -861,31 +861,39 @@ public:
     [[nodiscard]] std::uint64_t claim_drain_failures() const noexcept {
         return claim_drain_failures_.load(std::memory_order_relaxed);
     }
-    /// #5719 item 4: times probe_key_health's backend-health query threw. Operator meaning: that
-    /// attach found the key's health unknown, so it did NOT skip: the rule was rebuilt (torn down
-    /// and re-armed) although it may have been healthy and unchanged, and it is reported as
-    /// health_unknown on the full_sync rebuild line. A steady rise means the backend's health
-    /// query itself is failing, not that rules are unhealthy. In-process only (no export), zero
-    /// until Spark enforcement is enabled (prefer_spark_), since the attach path is not reached
-    /// before. Lock-free relaxed read.
+    /// #5719 item 4: times probe_key_health's backend-health query threw. Effect: that attach
+    /// found the key's health unknown, so it did NOT skip: the rule was rebuilt (torn down and
+    /// re-armed) although it may have been healthy and unchanged, and it is tallied as
+    /// health_unknown on the full_sync rebuild line. Read by tests only: no log, heartbeat or
+    /// export reads it, so a swallowed failure is counted here but not visible to an operator.
+    /// probe_key_health is called only from attach_core, which the engine reaches only on the
+    /// Spark path (prefer_spark_ true), so this stays zero while prefer_spark_ is false.
+    /// Lock-free relaxed read.
     [[nodiscard]] std::uint64_t health_probe_failures() const noexcept {
         return health_probe_failures_.load(std::memory_order_relaxed);
     }
     /// #5719 item 4: times sweep_key_health could not take its snapshot of the armed keys (an
-    /// allocation failure). Operator meaning: the dead-key repair was skipped for that ONE call
-    /// and nothing else changed. On the heartbeat tick the poll backstop (revalidate_subscriptions)
-    /// did not run once; on a scoped detach (a full_sync) the kept rules' faulted bits were not
-    /// refreshed from the backend for that push, so a key that was already deaf was not torn down
-    /// by it. The next full_sync or heartbeat tick repairs it. In-process only, zero until Spark
-    /// enforcement is enabled. Lock-free relaxed read.
+    /// allocation failure). Effect: the sweep was skipped for that ONE call and nothing else
+    /// changed. From the convergence scheduler's poll backstop (revalidate_subscriptions, which
+    /// the engine starts only while prefer_spark_ is true) it means a Dead key was not reported on
+    /// that tick; from a full_sync's scoped detach (detach_rules_except runs the sweep whenever
+    /// the push carries a rule) it means the kept rules' faulted bits were not refreshed from the
+    /// backend for that push, so a key that was already deaf was not torn down by it. A later
+    /// full_sync or poll tick repairs it. Unlike health_probe_failures, the scoped-detach call
+    /// site IS reached with prefer_spark_ false (the runtime is wired regardless of it), but no
+    /// key is armed on the Spark path then, so the snapshot is of an empty registry and
+    /// allocates nothing: the counter is zero in practice. Read by tests only (no log, heartbeat
+    /// or export). Lock-free relaxed read.
     [[nodiscard]] std::uint64_t sweep_snapshot_failures() const noexcept {
         return sweep_snapshot_failures_.load(std::memory_order_relaxed);
     }
     /// #5719 item 4: times sweep_key_health's backend-health query threw for one key, counted once
-    /// per throwing key per sweep (the sweep still visits the other keys). Operator meaning: that
-    /// key was treated as unhealthy by the scoped detach (so its rules were torn down and
-    /// re-armed for that push) or ignored by the poll backstop (it was not reported dead on that
-    /// tick), for that one sweep. In-process only, zero until Spark enforcement is enabled.
+    /// per throwing key per sweep (the sweep still visits the other keys). Effect: that key was
+    /// treated as unhealthy by the scoped detach (so its rules were torn down and re-armed for
+    /// that push) or ignored by the poll backstop (it was not reported dead on that tick), for
+    /// that one sweep. The sweep runs in production full_syncs that carry rules, but over an
+    /// empty key registry while prefer_spark_ is false, so there is no query to throw and the
+    /// counter is zero for that reason. Read by tests only (no log, heartbeat or export).
     /// Lock-free relaxed read.
     [[nodiscard]] std::uint64_t sweep_health_query_failures() const noexcept {
         return sweep_health_query_failures_.load(std::memory_order_relaxed);
@@ -1350,7 +1358,11 @@ private:
         /// the attach_core probe repair (only while None: the FIRST cause wins; the sweep maps
         /// Faulted to KeyFaulted, Dead to KeyDead and an unreadable answer to HealthUnknown, the
         /// probe repair writes KeyFaulted). Read by reuse_existing_locked and
-        /// detach_rules_except. Never written from a mechanism worker or callback thread.
+        /// detach_rules_except. Written only under registry_mu_ (never mtx_), from those three
+        /// sites. One of them, on_subscription_faulted, runs on the SparkEngine consumer thread
+        /// (SparkEngine::consumer_loop, through on_event); the sweep runs on the engine apply
+        /// thread (detach_rules_except) or the convergence scheduler's priority lane, and the
+        /// probe repair on the thread that is attaching.
         GuardianRebuildReason unhealthy_why{GuardianRebuildReason::None};
     };
 
@@ -2116,14 +2128,15 @@ private:
     /// means health is unknown, which is not healthy. Reads only; may not throw.
     ///
     /// #5719 reason semantics. The error is the FIRST rebuild condition that holds, evaluated in
-    /// this order (the order of GuardianRebuildReason after None, and the precedence documented in
-    /// guardian_rebuild_tally.hpp):
+    /// the order below, which is the precedence documented in guardian_rebuild_tally.hpp. It is
+    /// the code's order, not the declaration order of GuardianRebuildReason (the health terms in
+    /// step 3 are tested in a different sequence from the enum):
     ///   1. the key has any claim: this rule's own live arm with identical content is the
     ///      Reobserved success; this rule's own live arm with other content, spec or ownership is
     ///      ContentChanged; any other claim (another rule's arm, a disarm, a parked or retained
     ///      head) is KeyBusy;
     ///   2. no committed rules_ entry for the rule or keys_ entry for the key: FirstAttach;
-    ///   3. health, before content: the recorded faulted bit (PerKey::unhealthy_why, KeyFaulted
+    ///   3. committed path, health before content: the recorded faulted bit (PerKey::unhealthy_why, KeyFaulted
     ///      when none was recorded), an absent probe (HealthUnknown), a probe of another
     ///      subscription (SubscriptionReplaced), a Dead probe (KeyDead), any other non-Healthy
     ///      probe (KeyFaulted), an Unknown evaluation episode (UnknownEpisode);
@@ -2131,8 +2144,10 @@ private:
     ///      (BaselineEmpty) or differing (BaselineDiffers) pushed hash;
     ///   5. defensive invariants (inactive generation, spec mismatch, index ownership): Other,
     ///      unreachable through the public API.
-    /// The reason only labels conditions that already rebuilt; it never decides skip versus
-    /// rebuild. It is never None.
+    /// Health outranks content only on the committed path (steps 3 and 4); step 1 comes first, so
+    /// a changed-content rule that still has its own arm in flight is ContentChanged even when
+    /// the key is unhealthy. The reason only labels conditions that already rebuilt; it never
+    /// decides skip versus rebuild. It is never None.
     [[nodiscard]] std::expected<AttachCoreResult, GuardianRebuildReason>
     reuse_existing_locked(const std::string& key, const std::string& rule_id,
                           const SparkSpec& spec, const RuleGeneration& pushed,

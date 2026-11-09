@@ -2165,11 +2165,11 @@ std::map<SparkType, std::uint64_t> GuardianEngine::unsupported_counts_by_type() 
 std::expected<std::size_t, std::string>
 GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     std::lock_guard lock(mtx_);
-    // #5719: a previous push's forced-rebuild record must never outlive that push. Cleared
-    // before ANY early return below (stopped, no kv, lower generation, invalid id, a later
-    // put_rule_locked failure), so a delta that follows a push which bailed out cannot consume
-    // stale reasons. noexcept (unordered_map::clear), so it cannot itself throw before the lock
-    // is released.
+    // #5719: the forced-rebuild record of the previous push survives until here (it is not
+    // cleared when its own push ends), so it is cleared first thing, before ANY early return
+    // below (stopped, no kv, lower generation, invalid id, a later put_rule_locked failure): a
+    // push that follows one which bailed out can then never consume stale reasons. noexcept
+    // (unordered_map::clear), so it cannot itself throw before the lock is released.
     forced_rebuilds_.clear();
     if (stopped_)
         return std::unexpected("guardian engine stopped");
@@ -2561,20 +2561,22 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             stop_all_guards_locked();
             if (spark_runtime_) {
                 // #5719: the scoped detach returns the kept rules it tore down because their key
-                // was faulted, dead or unreadable, with the key's recorded first cause. It is
-                // installed as the engine's override so reconcile_rule_locked reports THAT reason
-                // for them: after the detach the kept rule's own attach sees KeyBusy (an io-class
-                // mechanism whose disarm claim is still queued) or FirstAttach (an inline type, or
-                // a disarm that already completed) depending on timing, never the key's cause.
-                // The local map is built first and installed with a move-assign (noexcept), in its
-                // own firewall below. The line is diagnostic only: no arm, skip or generation
-                // decision reads it.
+                // was faulted, dead or unreadable, each with the cause recorded for the key. It is
+                // installed as the engine's override so that, for such a rule whose attach is then
+                // rebuilt and reports a reason, reconcile_rule_locked tallies THAT cause: after the
+                // detach the kept rule's own attach sees KeyBusy (an io-class mechanism whose
+                // disarm claim is still queued) or FirstAttach (an inline type, or a disarm that
+                // already completed) depending on timing, not the key's cause. The local map is
+                // built first and installed with a move-assign (noexcept), in its own firewall
+                // below. The record is diagnostic only: no arm, skip or generation decision reads
+                // it, and it is cleared at the top of the next apply_rules.
                 const auto forced = spark_runtime_->detach_rules_except(push_ids);
                 // The map is diagnostic only, so it is built in its OWN firewall: an allocation
                 // failure here must not count a reconcile failure or hold the generation (the
-                // detach above has already succeeded and origin/dev had no throw site at this
-                // point). On failure forced_rebuilds_ stays empty and the affected rules are
-                // reported under whichever reason their own attach observes.
+                // detach above has already succeeded, so a throw here would only mislabel a
+                // completed teardown as a failed one). On failure forced_rebuilds_ stays empty
+                // and the affected rules are reported under whichever reason their own attach
+                // observes.
                 try {
                     std::unordered_map<std::string, GuardianRebuildReason> forced_map;
                     forced_map.reserve(forced.size());
@@ -2686,10 +2688,11 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // #5719: one bounded line per full_sync naming WHY each carried rule was rebuilt rather
         // than preserved. In its OWN try so a throw formatting one line never suppresses the
         // other. Notes the reader needs:
-        //  - It prints `rebuilt 0` on a legacy-path agent (prefer_spark_ false, the production
-        //    default): the attach path that feeds the tally is never reached, so the counters
-        //    stay zero until Spark enforcement is enabled. The line itself is NOT gated on
-        //    prefer_spark_.
+        //  - It prints `path=legacy ... rebuilt 0` on a legacy-path agent (prefer_spark_ false,
+        //    the production default): the only note() site is in the Spark branch of
+        //    reconcile_rule_locked, which that agent never reaches. `rebuilt 0` there does NOT
+        //    mean nothing was rebuilt: the legacy guards were all stopped and every carried rule
+        //    re-armed. The line itself is NOT gated on prefer_spark_.
         //  - The count includes Pending/Accepted outcomes that may still fail asynchronously
         //    (hence "rebuild attempted"): there is no pending split.
         //  - Only a full_sync logs it. A delta push and the boot re-arm loop populate the tally
@@ -2697,8 +2700,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         //    put_rule_locked return above) logs neither this line nor the preserved one.
         //  - A wedge re-observation carries no reason and appears in neither line.
         try {
-            // The path marker uses the SAME expression reconcile_rule_locked uses to pick the arm
-            // path, so `path=legacy` means every carried rule was stopped and re-armed.
+            // The path marker uses the SAME expression reconcile_rule_locked uses to choose the
+            // Spark attach path (its try_spark), so `path=spark` is exactly the case in which the
+            // tally can have been fed. `path=legacy` means it was not: in production
+            // (prefer_spark_ false) the legacy guards were stopped and every carried rule
+            // re-armed; with prefer_spark_ set but Spark Unwired or SparkFailed the carried rules
+            // are armed on neither backend.
             const auto path = prefer_spark_ && spark_availability_ == SparkAvailability::Available
                                   ? GuardianRebuildPath::Spark
                                   : GuardianRebuildPath::Legacy;

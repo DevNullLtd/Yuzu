@@ -2964,14 +2964,17 @@ GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::s
     //   3. committed path, HEALTH before content: the recorded bit (its recorded cause, else
     //      KeyFaulted), an absent probe (HealthUnknown), a probe of another subscription
     //      (SubscriptionReplaced), a Dead probe (KeyDead), any other non-Healthy probe
-    //      (KeyFaulted), an Unknown evaluation episode (UnknownEpisode);
+    //      (KeyFaulted), an Unknown evaluation episode (UnknownEpisode); this is the code's
+    //      order, not the declaration order of GuardianRebuildReason;
     //   4. content: a changed content id (ContentChanged), then for FileHashEquals an empty
     //      (BaselineEmpty) or differing (BaselineDiffers) pushed hash;
     //   5. defensive invariants no public path violates (inactive generation, spec mismatch, an
     //      index that does not own the generation) -> Other.
-    // Health outranks content so that a rule on a broken key is reported as a broken key even
-    // when its content also changed. Pure map reads under registry_mu_, no allocation: the
-    // noexcept contract holds.
+    // On the committed path (steps 3 and 4) health outranks content, so a committed rule on a
+    // broken key is reported as a broken key even when its content also changed; step 1 comes
+    // first, so a changed rule that still has its own arm in flight is ContentChanged even when
+    // the key is unhealthy. Pure map reads under registry_mu_, no allocation: the noexcept
+    // contract holds.
     const auto cit = claims_.find(key);
     if (cit != claims_.end() && !cit->second.fifo.empty()) {
         // A key with ANY claim never takes the committed path below (a disarm, a parked or
@@ -3038,8 +3041,9 @@ GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::s
             return std::unexpected(GuardianRebuildReason::BaselineDiffers);
     }
     // Defensive invariants (precedence step 5): unreachable through the public API, which keeps
-    // an active generation, the key's spec and the index's ownership in step. Tests assert that
-    // `other` stays zero.
+    // an active generation, the key's spec and the index's ownership in step. The runtime
+    // tests check that no attach (attach_nw) and no forced cause (forced_summary) is `other`,
+    // in test_guardian_spark_reapply_skip_runtime.cpp.
     if (!live.active || !(kit->second->spec == spec) ||
         !index_->owns(key, rule_id, live.generation))
         return std::unexpected(GuardianRebuildReason::Other);
@@ -3066,8 +3070,9 @@ GuardianSparkRuntime::probe_key_health(const std::string& key, const std::string
         return KeyHealthProbe{.subscription = subscription,
                               .health = backend_->subscription_health(subscription)};
     } catch (...) {
-        // #5719 item 4: counted, no longer silent. registry_mu_ is not held here (the lock above
-        // is scoped to its own block), and a relaxed fetch_add takes no lock and allocates nothing.
+        // #5719 item 4: counted, in-process only (read by tests; no log, heartbeat or export
+        // reads it). registry_mu_ is not held here (the lock above is scoped to its own block),
+        // and a relaxed fetch_add takes no lock and allocates nothing.
         health_probe_failures_.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt; // unknown health is not healthy: the rule is rebuilt
     }
@@ -3089,8 +3094,9 @@ void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
         for (const auto& [key, pk] : keys_)
             snapshot.emplace_back(key, pk->subscription);
     } catch (...) {
-        // #5719 item 4: counted, no longer silent. The lock_guard above was destroyed during the
-        // unwind, so registry_mu_ is released here; the counter is a relaxed atomic add.
+        // #5719 item 4: counted, in-process only (read by tests; no log, heartbeat or export
+        // reads it). The lock_guard above was destroyed during the unwind, so registry_mu_ is
+        // released here; the counter is a relaxed atomic add.
         sweep_snapshot_failures_.fetch_add(1, std::memory_order_relaxed);
         return; // best-effort: the caller's teardown must still run (same posture as the probe)
     }
@@ -3295,7 +3301,8 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             if (const auto kit = keys_.find(key);
                 kit != keys_.end() && kit->second->subscription == health_probe->subscription) {
                 kit->second->faulted = true;
-                // #5719: first cause wins, as in sweep_key_health.
+                // #5719: first cause wins here, as in sweep_key_health; only the mechanism's own
+                // event edge (on_subscription_faulted) overwrites a recorded cause.
                 if (kit->second->unhealthy_why == GuardianRebuildReason::None)
                     kit->second->unhealthy_why = GuardianRebuildReason::KeyFaulted;
             }
@@ -3760,8 +3767,12 @@ GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<
             (void)withdraw_rule_after_wedge_sweep_locked(rid, "disarmed");
         std::vector<std::string> rule_ids;
         rule_ids.reserve(rules_.size());
-        // #5719: at most one entry per kept rule. Deliberately not reserved: that would be an
-        // allocation sized to the whole ruleset on every scoped detach, under registry_mu_.
+        // #5719: at most one entry per kept rule. Deliberately not reserved, so a push that
+        // tears down no kept rule allocates nothing for it. The consequence: `forced` grows by
+        // push_back under registry_mu_ and that can throw std::bad_alloc part-way through this
+        // loop, before the withdrawals below have run. Nothing catches it here; it propagates to
+        // apply_rules' teardown firewall, which counts a reconcile failure and holds the
+        // generation so the server retries the push.
         for (const auto& [rid, rg] : rules_) {
             // A kept rule on a key the mechanism reported faulted is detached too. Every rule on
             // a key shares its bit, so the key's refcount reaches zero and its deaf watcher is
