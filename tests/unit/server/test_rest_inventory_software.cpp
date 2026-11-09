@@ -1802,8 +1802,10 @@ TEST_CASE("REST inventory/software: match=prefix and contains filter; exact is u
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
-    seed(store, "dev-a", {{"git", "1", "", ""}, {"gitk", "1", "", ""}, {"libgit2", "1", "", ""},
-                          {"g_t%", "1", "", ""}});
+    // "Git" differs from "git" only by case: exact and prefix are case-sensitive (documented in
+    // the OpenAPI parameter), contains is not.
+    seed(store, "dev-a", {{"git", "1", "", ""}, {"Git", "1", "", ""}, {"gitk", "1", "", ""},
+                          {"libgit2", "1", "", ""}, {"g_t%", "1", "", ""}});
     InvHarness h{&store};
     auto names = [&](const std::string& query) {
         std::set<std::string> out;
@@ -1814,13 +1816,59 @@ TEST_CASE("REST inventory/software: match=prefix and contains filter; exact is u
     };
     CHECK(names("?name=git") == std::set<std::string>{"git"});
     CHECK(names("?name=git&match=exact") == std::set<std::string>{"git"});
+    CHECK(names("?name=Git") == std::set<std::string>{"Git"});
+    CHECK(names("?name=GIT").empty());
     CHECK(names("?name=git&match=prefix") == std::set<std::string>{"git", "gitk"});
-    CHECK(names("?name=GIT&match=contains") == std::set<std::string>{"git", "gitk", "libgit2"});
+    CHECK(names("?name=Git&match=prefix") == std::set<std::string>{"Git"});
+    CHECK(names("?name=GIT&match=prefix").empty());
+    CHECK(names("?name=GIT&match=contains") ==
+          std::set<std::string>{"git", "Git", "gitk", "libgit2"});
     // LIKE metacharacters in the term are literal.
     CHECK(names("?name=g_t&match=prefix") == std::set<std::string>{"g_t%"});
     CHECK(names("?name=%25&match=contains") == std::set<std::string>{"g_t%"});
     CHECK(get_lookup(h, "?name=git&match=prefix").at("data").at("totals_omitted") == "filters");
     CHECK(get_lookup(h, "?name=git&match=regex", 400).contains("error"));
+}
+
+TEST_CASE("REST inventory/software: a failed last-poll read after a good page read is a 503 with one failure audit row, never a page with null last_seen",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"git", "2.1", "", ""}});
+    { // The page read joins installed_software and the facet state only; the per-page bulk
+      // last-poll read is the request's first statement over inventory_state, so dropping that
+      // table degrades exactly the facts read, after the page read succeeded.
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(), "DROP TABLE software_inventory_store.inventory_state",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    InvHarness h{&store};
+    h.hostnames = {{"dev-a", "host-a"}};
+    auto res = h.sink.Get("/api/v1/inventory/software?name=git");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body.at("error").at("message") ==
+          "software inventory store degraded — last-poll read failed");
+    CHECK(body.at("error").at("retry_after_ms") == 5000);
+    std::size_t failures = 0;
+    std::size_t successes = 0;
+    for (const auto& a : h.audit_log) {
+        if (a.action != "inventory.software.query")
+            continue;
+        failures += a.result == "failure";
+        successes += a.result == "success";
+    }
+    CHECK(failures == 1);
+    CHECK(successes == 0);
 }
 
 TEST_CASE("REST inventory/software: version_min/version_max resolve through the title's live versions, with or without a catalogue refresh",

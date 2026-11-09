@@ -7100,6 +7100,12 @@ TEST_CASE("query_components: keyset order, scope push-down, prefix and contains 
     CHECK(store.query_components(q)->size() == 1); // only lib_fo, not libfoo / libXfo
     q.name = "lib";
     CHECK(store.query_components(q)->size() == 5); // libfoo x3, lib_fo, libXfo; not zlib
+    // Exact and prefix are case-sensitive, contains is not (the documented contract).
+    q.name = "LIB";
+    CHECK(store.query_components(q)->empty());
+    q.name = "LIBFOO";
+    q.match = NameMatch::kExact;
+    CHECK(store.query_components(q)->empty());
     q.name = "LIBFO";
     q.match = NameMatch::kContains;
     CHECK(store.query_components(q)->size() == 3);

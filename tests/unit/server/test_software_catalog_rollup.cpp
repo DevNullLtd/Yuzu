@@ -123,13 +123,15 @@ TEST_CASE("SoftwareCatalogRollup::request_stop — no NEW recompute starts, the 
     CHECK(std::chrono::steady_clock::now() - t < std::chrono::seconds{1});
 }
 
-TEST_CASE("SoftwareCatalogRollup worker refreshes the components rollup and emits its three metrics",
+TEST_CASE("SoftwareCatalogRollup worker refreshes the components rollup and emits its three metrics, "
+          "independently of a failed catalogue refresh",
           "[pg][software_inventory][rollup]") {
     // The hourly worker is the ONLY caller of refresh_component_rollup: delete that call and every
     // store-level test stays green while the components totals stay `building` forever. This pins
     // the wiring: one tick of a long-interval worker stamps the rollup, counts a success and sets
-    // the liveness gauge. The test waits on the last thing the tick emits (the success timestamp),
-    // never on a sleep.
+    // the liveness gauge. The catalogue leg of the same tick is made to fail (its table is
+    // dropped), so the case also pins that the components leg does not depend on it. The test
+    // waits on the last thing the tick emits (the success timestamp), never on a sleep.
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -144,6 +146,10 @@ TEST_CASE("SoftwareCatalogRollup worker refreshes the components rollup and emit
             "path, name, version, row_hash, first_seen) VALUES ('dev-a', 'jar', 'ph', '/a', "
             "'libfoo', '1.0', 'rh', 1)",
             std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+        r = yuzu::server::pg::exec_params(lease.get(),
+                                          "DROP TABLE software_inventory_store.catalog_rollup",
+                                          std::vector<std::string>{});
         REQUIRE(r.status() == PGRES_COMMAND_OK);
     }
     const auto before = store.component_rollup_meta();
@@ -166,6 +172,10 @@ TEST_CASE("SoftwareCatalogRollup worker refreshes the components rollup and emit
 
     CHECK(metrics.counter(std::string(kStem) + "_total", {{"outcome", "success"}}).value() == 1);
     CHECK(metrics.counter(std::string(kStem) + "_total", {{"outcome", "error"}}).value() == 0);
+    // The catalogue leg failed (keep-last-good) and the components leg still ran after it.
+    constexpr const char* kCatalog = "yuzu_inventory_catalog_rollup_total";
+    CHECK(metrics.counter(kCatalog, {{"outcome", "error"}}).value() == 1);
+    CHECK(metrics.counter(kCatalog, {{"outcome", "success"}}).value() == 0);
     CHECK(metrics.gauge(stamp).value() > 0);
     CHECK(metrics.gauge(std::string(kStem) + "_duration_seconds").value() >= 0);
     const auto after = store.component_rollup_meta();

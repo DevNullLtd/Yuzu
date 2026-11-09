@@ -660,6 +660,39 @@ TEST_CASE("REST components: a failed version read for a range is a 503 with retr
     CHECK(h.audits("inventory.components.view", "failure") == 1);
 }
 
+TEST_CASE("REST components: a failed last-poll read after a good page read is a 503 with one failure audit row, never a page with null last_seen",
+          "[pg][rest][inventory_components]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_components(store, "dev-a", {comp("libfoo", "/a", "1.0")});
+    { // The page read joins software_components and the facet state only; the per-page bulk
+      // last-poll read is the request's first statement over inventory_state, so dropping that
+      // table degrades exactly the facts read, after the page read succeeded.
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(lease.get(),
+                                         "DROP TABLE software_inventory_store.inventory_state",
+                                         std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    CompHarness h{&store};
+    h.hostnames = {{"dev-a", "host-a"}};
+    auto res = h.sink.Get(std::string(kPath) + "?name=libfoo");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body.at("error").at("message") ==
+          "software inventory store degraded — last-poll read failed");
+    CHECK(body.at("error").at("retry_after_ms") == 5000);
+    CHECK(h.audits("inventory.components.view", "failure") == 1);
+    CHECK(h.audits("inventory.components.view", "success") == 0);
+}
+
 TEST_CASE("REST components: a degraded totals read alone is a 503 with retry_after_ms",
           "[pg][rest][inventory_components]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -696,8 +729,8 @@ TEST_CASE("REST components: a 100k-row CSV export walks every page with a contin
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
     // The CMP-3 acceptance line: a 100k-row CSV stream (100 devices x 1000 components) walked
-    // under the DEFAULT export cap (kExportCap, 10000), not a smaller cap or a smaller seed. About
-    // 20 s on a local Postgres 18 (the seed is 100 apply calls of 1000 rows); the cost is the
+    // under the DEFAULT export cap (kExportCap, 10000), not a smaller cap or a smaller seed. 6-11 s
+    // on a local Postgres 18 (the seed is 100 apply calls of 1000 rows); the cost is the
     // acceptance's own, so this case stays at full size.
     constexpr int kDevices = 100;
     constexpr int kPerDevice = 1000;

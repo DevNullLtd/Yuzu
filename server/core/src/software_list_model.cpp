@@ -337,7 +337,9 @@ namespace {
 // A rollup row and its refresh epoch are read on separate pool leases, so a refresh committing
 // between the two would pair the new generation's counts with the old as_of. The same bracket as
 // software_catalogue_model's page read: epoch, row, epoch again; a moved epoch is read once more
-// against the new one, a second move is kDegraded (a 503, never a mismatched pair).
+// against the new one, a second move is kDegraded (a 503, never a mismatched pair). The epoch is
+// the refresh transaction's start time at one-second resolution, so two refreshes committing
+// inside one second read as one; unreachable at the hourly cadence, noted so nobody shortens it.
 template <class MetaFn, class RowFn>
 TotalsOutcome read_rollup_totals(const MetaFn& meta_fn, const RowFn& row_fn) {
     TotalsOutcome out;
