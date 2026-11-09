@@ -1091,10 +1091,10 @@ TEST_CASE("OTA upload refuses invalid UTF-8 in platform or arch and writes nothi
 
 TEST_CASE("OTA upload refuses invalid UTF-8 or a control byte in the filename and writes nothing",
           "[ota][settings_routes][pg][validation]") {
-    // Whether the HTTP layer lets these bytes through in a multipart filename is its own
-    // behaviour: if it refuses the request first, no handler runs and no audit row exists.
-    // Either way the answer is a 400 and nothing is written. When the handler does run,
-    // the row is the fixed denied token.
+    // The HTTP layer refuses some of these bytes in a multipart filename before any handler
+    // runs (no audit row then); three of the five reach the handler. Every one answers 400
+    // and writes nothing, and each request that reaches the handler leaves the fixed denied
+    // token.
     YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
     OtaAuditHarness h{db.dsn()};
     OtaWireServer wire{h};
@@ -1114,6 +1114,7 @@ TEST_CASE("OTA upload refuses invalid UTF-8 or a control byte in the filename an
     }
     wire.stop();
 
+    REQUIRE(h.audited.size() == 3);
     for (const auto& row : h.audited) {
         CHECK(row.action == "ota.package.uploaded");
         CHECK(row.result == "denied");
@@ -1179,4 +1180,231 @@ TEST_CASE("OTA delete whose package listing cannot be read reports failure and r
     CHECK(scalar_sql(db.dsn(), "SELECT count(*) FROM update_registry.update_packages") == "1");
     CHECK(fs::exists(h.update_dir.path / "yuzu-agent-1.2.3"));
     CHECK(fs::exists(h.update_dir.path / "yuzu-agent-1.2.3.sig"));
+}
+
+// ── Keeping the previous package, and what a failed restore reports ─────────
+
+TEST_CASE("OTA upload refuses when the package path holds something other than a file",
+          "[ota][settings_routes][pg][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    OtaWireServer wire{h};
+    httplib::Client cli("127.0.0.1", wire.port);
+    cli.set_read_timeout(10, 0);
+    const std::string url = std::string(kUploadUrl) + "?platform=linux&arch=x86_64";
+    const httplib::UploadFormDataItems items{
+        {"file", "new-bytes", "yuzu-agent-1.0.0", "application/octet-stream"}};
+    const auto binary = h.update_dir.path / "yuzu-agent-1.0.0";
+
+    SECTION("a directory at the binary path") {
+        fs::create_directories(binary);
+        write_file(binary / "inner", "keep");
+
+        auto res = cli.Post(url, items);
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(res->body.find("Could not prepare the package directory") != std::string::npos);
+        wire.stop();
+
+        CHECK(fs::is_directory(binary));
+        CHECK(read_file(binary / "inner") == "keep");
+        CHECK(entries_in(h.update_dir.path) == 1);
+        CHECK_FALSE(any_entry_contains(h.update_dir.path, "yuzu_prev_"));
+        CHECK(h.registry->list_packages().empty());
+        CHECK(h.audited.empty());
+    }
+
+    SECTION("a directory at the signature path beside an existing binary") {
+        write_file(binary, "old-bytes");
+        fs::create_directories(h.update_dir.path / "yuzu-agent-1.0.0.sig");
+
+        auto res = cli.Post(url, items);
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(res->body.find("Could not prepare the package directory") != std::string::npos);
+        wire.stop();
+
+        // The binary was kept for a moment and is back, byte for byte, with no kept name.
+        CHECK(read_file(binary) == "old-bytes");
+        CHECK(fs::is_directory(h.update_dir.path / "yuzu-agent-1.0.0.sig"));
+        CHECK(entries_in(h.update_dir.path) == 2);
+        CHECK_FALSE(any_entry_contains(h.update_dir.path, "yuzu_prev_"));
+        CHECK(h.registry->list_packages().empty());
+        CHECK(h.audited.empty());
+    }
+}
+
+TEST_CASE("OTA upload whose restore fails answers 500 and names the kept file",
+          "[ota][settings_routes][pg][validation]") {
+    // The re-upload's registry write is held by an advisory lock this test owns and then
+    // fails. While it is held the new binary is published, so the test replaces the live
+    // binary name with a non-empty directory: the restore of the binary cannot rename the
+    // kept copy over it. The signature, restored first, is put back.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    OtaWireServer wire{h};
+    httplib::Client cli("127.0.0.1", wire.port);
+    cli.set_read_timeout(10, 0);
+    const std::string url = std::string(kUploadUrl) + "?platform=linux&arch=x86_64";
+
+    auto r0 = cli.Post(url, httplib::UploadFormDataItems{
+                                {"file", "old-bytes", "yuzu-agent-1.0.0", "application/octet-stream"},
+                                {"signature", kTestCms, "old.cms", "application/octet-stream"}});
+    REQUIRE(r0);
+    REQUIRE(r0->status == 200);
+    const auto before = h.registry->list_packages();
+    REQUIRE(before.size() == 1);
+    const std::string old_sha = before.front().sha256;
+
+    pg::PgConn holder{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    {
+        pg::PgResult lock{PQexec(holder.get(), "SELECT pg_advisory_lock(424242)")};
+        REQUIRE(lock.ok());
+    }
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult fn{PQexec(
+            conn.get(), "CREATE FUNCTION update_registry.yuzu_test_hold_then_fail() "
+                        "RETURNS trigger LANGUAGE plpgsql AS "
+                        "$$ BEGIN PERFORM pg_advisory_xact_lock(424242); "
+                        "RAISE EXCEPTION 'write blocked'; END $$")};
+        REQUIRE(fn.ok());
+        pg::PgResult trg{PQexec(
+            conn.get(), "CREATE TRIGGER yuzu_test_hold_then_fail BEFORE INSERT OR UPDATE ON "
+                        "update_registry.update_packages FOR EACH ROW EXECUTE FUNCTION "
+                        "update_registry.yuzu_test_hold_then_fail()")};
+        REQUIRE(trg.ok());
+    }
+
+    int status = -1;
+    std::string body;
+    std::thread upload([&] {
+        httplib::Client c2("127.0.0.1", wire.port);
+        c2.set_read_timeout(30, 0);
+        auto r = c2.Post(
+            url, httplib::UploadFormDataItems{
+                     {"file", "new-bytes-longer", "yuzu-agent-1.0.0", "application/octet-stream"},
+                     {"signature", kNewCms, "new.cms", "application/octet-stream"}});
+        if (r) {
+            status = r->status;
+            body = r->body;
+        }
+    });
+
+    // Wait until the upload's registry write is parked on the lock: by then the new files
+    // are published.
+    pg::PgConn probe{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(probe.get()) == CONNECTION_OK);
+    bool parked = false;
+    for (int i = 0; i < 400 && !parked; ++i) {
+        pg::PgResult q{PQexec(
+            probe.get(), "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND "
+                         "objid = 424242 AND NOT granted AND database = "
+                         "(SELECT oid FROM pg_database WHERE datname = current_database())")};
+        if (q.ok() && PQntuples(q.get()) == 1 && std::string(PQgetvalue(q.get(), 0, 0)) != "0")
+            parked = true;
+        else
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+
+    const auto live = h.update_dir.path / "yuzu-agent-1.0.0";
+    bool prepared = false;
+    if (parked) {
+        std::error_code ec;
+        fs::remove(live, ec);
+        const bool made = !ec && fs::create_directory(live, ec) && !ec;
+        if (made) {
+            write_file(live / "inner", "occupied");
+            prepared = true;
+        }
+    }
+    {
+        pg::PgResult unlock{PQexec(holder.get(), "SELECT pg_advisory_unlock(424242)")};
+        CHECK(unlock.ok());
+    }
+    upload.join();
+    wire.stop();
+    REQUIRE(parked);
+    REQUIRE(prepared);
+
+    CHECK(status == 500);
+    CHECK(body.find("previous package could not be fully restored") != std::string::npos);
+    CHECK(body.find("yuzu-agent-1.0.0.yuzu_prev_") != std::string::npos);
+
+    // The failed write is still audited as a failure, never as a success.
+    REQUIRE(h.audited.size() == 2);
+    CHECK(h.audited[0].result == "success");
+    CHECK(h.audited[1].action == "ota.package.uploaded");
+    CHECK(h.audited[1].result == "failure");
+    CHECK(h.audited[1].detail == "store_error");
+
+    // The registry row is the old one; the signature was put back byte for byte; the
+    // previous binary is still on disk under exactly one kept name, which the answer names.
+    const auto after = h.registry->list_packages();
+    REQUIRE(after.size() == 1);
+    CHECK(after.front().sha256 == old_sha);
+    CHECK(read_file(h.update_dir.path / "yuzu-agent-1.0.0.sig") == kTestCms);
+    CHECK(fs::is_directory(live));
+    std::size_t kept = 0;
+    std::string kept_name;
+    std::error_code it_ec;
+    for (fs::directory_iterator it(h.update_dir.path, it_ec), end; !it_ec && it != end;
+         it.increment(it_ec)) {
+        const auto name = it->path().filename().string();
+        if (name.find("yuzu_prev_") != std::string::npos) {
+            ++kept;
+            kept_name = name;
+        }
+    }
+    REQUIRE(kept == 1);
+    CHECK(kept_name.rfind("yuzu-agent-1.0.0.yuzu_prev_", 0) == 0);
+    CHECK(body.find(kept_name) != std::string::npos);
+    CHECK(read_file(h.update_dir.path / kept_name) == "old-bytes");
+}
+
+// The reconcile decision after a registry write reported failure: the row read back must
+// carry exactly what the request wrote. Defined in settings_routes.cpp.
+namespace yuzu::server {
+[[nodiscard]] bool row_carries_upload(const std::vector<UpdatePackage>& rows,
+                                      const UpdatePackage& pkg);
+}
+
+TEST_CASE("an upload is reconciled as written only when the stored row carries all of it",
+          "[ota][settings_routes][validation]") {
+    UpdatePackage wrote;
+    wrote.platform = "linux";
+    wrote.arch = "x86_64";
+    wrote.version = "1.0.0";
+    wrote.sha256 = std::string(64, 'a');
+    wrote.filename = "yuzu-agent-1.0.0";
+    wrote.mandatory = false;
+    wrote.rollout_pct = 100;
+    wrote.file_size = 9;
+
+    CHECK_FALSE(row_carries_upload({}, wrote));
+
+    UpdatePackage stored = wrote;
+    stored.uploaded_at = "2026-11-09T00:00:00Z"; // the row carries a time the request did not set
+    CHECK(row_carries_upload({stored}, wrote));
+
+    UpdatePackage other_key = stored;
+    other_key.version = "2.0.0";
+    CHECK_FALSE(row_carries_upload({other_key}, wrote));
+    CHECK(row_carries_upload({other_key, stored}, wrote));
+
+    // The same key holding a different upload is not this upload.
+    auto differs = [&](auto mutate) {
+        UpdatePackage row = stored;
+        mutate(row);
+        return row_carries_upload({row}, wrote);
+    };
+    CHECK_FALSE(differs([](UpdatePackage& r) { r.sha256 = std::string(64, 'b'); }));
+    CHECK_FALSE(differs([](UpdatePackage& r) { r.filename = "other"; }));
+    CHECK_FALSE(differs([](UpdatePackage& r) { r.mandatory = true; }));
+    CHECK_FALSE(differs([](UpdatePackage& r) { r.rollout_pct = 50; }));
+    CHECK_FALSE(differs([](UpdatePackage& r) { r.file_size = 10; }));
+    CHECK_FALSE(differs([](UpdatePackage& r) { r.platform = "darwin"; }));
+    CHECK_FALSE(differs([](UpdatePackage& r) { r.arch = "aarch64"; }));
 }

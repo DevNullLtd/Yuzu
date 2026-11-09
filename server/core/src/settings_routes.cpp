@@ -11,6 +11,7 @@
 #include "rollout_pct_reject.hpp" // the shared malformed-rollout_pct 400 + toast
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <format>
 
@@ -697,6 +698,25 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
     return html;
 }
 
+/// Does the registry already hold exactly what this upload wrote? The row for the
+/// package key must carry the same file name, hash, size, mandatory flag and rollout.
+/// Used after a registry write reported failure: a connection lost after the commit
+/// looks like a failed write, and the row read back tells the two apart.
+///
+/// Declared here, not in a header, so the unit test can reach it; it has no other caller.
+[[nodiscard]] bool row_carries_upload(const std::vector<UpdatePackage>& rows,
+                                      const UpdatePackage& pkg);
+bool row_carries_upload(const std::vector<UpdatePackage>& rows, const UpdatePackage& pkg) {
+    for (const auto& row : rows) {
+        if (row.platform != pkg.platform || row.arch != pkg.arch || row.version != pkg.version)
+            continue;
+        return row.sha256 == pkg.sha256 && row.filename == pkg.filename &&
+               row.mandatory == pkg.mandatory && row.rollout_pct == pkg.rollout_pct &&
+               row.file_size == pkg.file_size;
+    }
+    return false;
+}
+
 namespace {
 // #5342 Gate 8 (F4): the Settings MFA init/verify refusal when the account's
 // password changed during the enrolment (AuthDBError::CredentialChanged).
@@ -742,34 +762,44 @@ std::mutex& ota_package_files_mutex() {
 /// instead of leaving the directory without it.
 ///
 /// `preserve(path)` is called for every path the upload may replace or remove,
-/// BEFORE the first publish. A present file is kept under a unique name in the same
-/// directory (`<name>.yuzu_prev_<unique>`): a hard link when the filesystem allows
-/// it, so the live name is never absent while the new file is published over it,
-/// otherwise a rename aside. `commit()` deletes the kept copies. The destructor
-/// rolls back unless `commit()` ran: a path that had a predecessor gets it back
-/// (rename over whatever was published there), a path that had none is removed.
-/// Paths are restored independently, and a restore that fails leaves the kept copy
-/// in place and logs its name so the predecessor is never deleted unreplaced.
+/// BEFORE the first publish. A present regular file is kept under a unique name in
+/// the same directory (`<name>.yuzu_prev_<unique>`): a hard link when the
+/// filesystem allows it, otherwise a copy that never overwrites an existing name.
+/// The live name is never renamed aside, so it is never absent while the new file
+/// is published over it. A name that already exists is retried with a fresh suffix
+/// (a bounded number of times). `commit()` deletes the kept copies.
+///
+/// `rollback()` puts everything back: a path that had a predecessor gets it back
+/// (rename over whatever was published there; when the kept name and the live name
+/// are still the same file the kept name is just removed), a path that had none is
+/// removed. Paths are restored in the reverse order they were kept. It returns
+/// whether every path ended as intended; a restore that fails leaves the kept copy
+/// in place and logs its name, so a predecessor is never deleted unreplaced, and
+/// `restore_failure_text()` names the copies still on disk. The caller calls it
+/// explicitly before answering, so the answer can say whether the restore held; the
+/// destructor calls it only when neither `commit()` nor `rollback()` ran.
 class OtaPredecessorGuard {
 public:
-    OtaPredecessorGuard() = default;
+    OtaPredecessorGuard() { entries_.reserve(2); }
     OtaPredecessorGuard(const OtaPredecessorGuard&) = delete;
     OtaPredecessorGuard& operator=(const OtaPredecessorGuard&) = delete;
     OtaPredecessorGuard(OtaPredecessorGuard&&) = delete;
     OtaPredecessorGuard& operator=(OtaPredecessorGuard&&) = delete;
     ~OtaPredecessorGuard() {
         if (!settled_)
-            rollback();
+            (void)rollback();
     }
 
     /// False when something is at `path` and cannot be kept (not a regular file, an
-    /// unreadable status, or neither link nor rename succeeded). True when nothing
-    /// is there or the existing file is now kept.
+    /// unreadable status, or neither a link nor a copy could be made). True when
+    /// nothing is there or the existing file is now kept. A false return leaves no
+    /// entry and no partial kept copy behind.
     [[nodiscard]] bool preserve(const std::filesystem::path& path) {
+        constexpr int kMaxAttempts = 8;
         std::error_code ec;
         const auto st = std::filesystem::symlink_status(path, ec);
         if (st.type() == std::filesystem::file_type::not_found) {
-            entries_.push_back({path, {}});
+            entries_.push_back({path, {}, Predecessor::absent});
             return true;
         }
         if (ec || st.type() != std::filesystem::file_type::regular) {
@@ -777,73 +807,194 @@ public:
                           path.filename().string());
             return false;
         }
-        auto backup = path;
-        backup += ".yuzu_prev_" + unique_suffix();
-        std::filesystem::create_hard_link(path, backup, ec);
-        if (ec) {
-            std::error_code ren_ec;
-            std::filesystem::rename(path, backup, ren_ec);
-            if (ren_ec) {
-                spdlog::error("OTA upload: cannot keep the existing {}: {}",
-                              path.filename().string(), ren_ec.message());
-                return false;
+
+        // The entry exists BEFORE any kept copy does, so an exception between the two
+        // cannot leave a copy nothing tracks. Its backup name is set only to a name
+        // this call is about to create (and cleared again when that name turned out
+        // to be someone else's), so a rollback in that state removes only our own.
+        entries_.push_back({path, {}, Predecessor::pending});
+        Entry& entry = entries_.back();
+        bool links_usable = true;
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            auto backup = path;
+            backup += ".yuzu_prev_" + unique_suffix();
+            entry.backup = std::move(backup);
+
+            if (links_usable) {
+                std::error_code link_ec;
+                std::filesystem::create_hard_link(path, entry.backup, link_ec);
+                if (!link_ec) {
+                    entry.state = Predecessor::kept;
+                    return true;
+                }
+                if (link_ec == std::errc::file_exists) {
+                    entry.backup.clear();
+                    continue;
+                }
+                // Links are not available here (another filesystem, a refusal, a link
+                // limit): keep a copy instead.
+                links_usable = false;
             }
+
+            std::error_code time_ec;
+            const auto mtime = std::filesystem::last_write_time(path, time_ec);
+            std::error_code copy_ec;
+            std::filesystem::copy_file(path, entry.backup, std::filesystem::copy_options::none,
+                                       copy_ec);
+            if (!copy_ec) {
+                // A copy gets a new modification time; the binary/signature pair is
+                // judged by those times, so the copy carries the original's.
+                if (!time_ec) {
+                    std::error_code set_ec;
+                    std::filesystem::last_write_time(entry.backup, mtime, set_ec);
+                }
+                entry.state = Predecessor::kept;
+                return true;
+            }
+            if (copy_ec == std::errc::file_exists) {
+                entry.backup.clear();
+                continue;
+            }
+            spdlog::error("OTA upload: cannot keep the existing {}: {}", path.filename().string(),
+                          copy_ec.message());
+            break;
         }
-        entries_.push_back({path, std::move(backup)});
-        return true;
+
+        // Failed: drop a partial copy of ours (the name is cleared whenever it was
+        // not ours) and forget the entry, so the live file is untouched and untracked.
+        if (!entry.backup.empty()) {
+            std::error_code rm_ec;
+            std::filesystem::remove(entry.backup, rm_ec);
+        }
+        entries_.pop_back();
+        return false;
     }
 
-    /// The new files stay; the kept copies are deleted.
+    /// The new files stay; the kept copies are deleted. A copy that cannot be
+    /// deleted is logged by name and left, and the rest are still deleted.
     void commit() noexcept {
         settled_ = true;
         for (const auto& e : entries_) {
-            if (e.backup.empty())
+            if (e.state != Predecessor::kept)
                 continue;
             std::error_code ec;
             std::filesystem::remove(e.backup, ec);
+            if (ec)
+                log_kept_copy_left(e.backup, ec);
         }
     }
 
-    void rollback() noexcept {
+    /// True when every path was put back (or removed) as intended. Safe to call more
+    /// than once: later calls return the first result without touching the disk.
+    [[nodiscard]] bool rollback() noexcept {
+        if (settled_)
+            return restore_ok_;
         settled_ = true;
-        for (const auto& e : entries_) {
-            std::error_code ec;
-            if (e.backup.empty()) {
-                std::filesystem::remove(e.live, ec);
-                continue;
-            }
-            std::filesystem::rename(e.backup, e.live, ec);
-            if (ec) {
-                spdlog::error("OTA upload: the previous {} could not be restored; it is kept as {}",
-                              e.live.filename().string(), e.backup.filename().string());
-                continue;
-            }
-            // Two names for one file (nothing was published over it) make rename a
-            // no-op that leaves the kept name behind; drop it.
-            std::filesystem::remove(e.backup, ec);
+        try {
+            for (auto it = entries_.rbegin(); it != entries_.rend(); ++it)
+                restore_one(*it);
+        } catch (...) {
+            restore_ok_ = false;
         }
+        return restore_ok_;
+    }
+
+    /// Plain text (not markup) for the answer to a request whose restore failed.
+    [[nodiscard]] std::string restore_failure_text() const {
+        std::string text = "The upload failed and the previous package could not be fully restored";
+        if (kept_names_.empty())
+            return text + "; see the server log.";
+        text += kept_names_.size() == 1 ? ". The previous file is kept as "
+                                        : ". The previous files are kept as ";
+        for (std::size_t i = 0; i < kept_names_.size(); ++i) {
+            if (i)
+                text += ", ";
+            text += kept_names_[i];
+        }
+        return text + "; see the server log.";
     }
 
 private:
+    enum class Predecessor {
+        absent,  ///< nothing was at the path
+        pending, ///< a kept copy is being made (it may or may not exist yet)
+        kept,    ///< the previous file is kept under `backup`
+    };
     struct Entry {
         std::filesystem::path live;
-        std::filesystem::path backup; ///< empty when nothing was there to keep
+        std::filesystem::path backup; ///< the kept copy; empty when none is named
+        Predecessor state;
     };
+
+    static void log_kept_copy_left(const std::filesystem::path& backup,
+                                   const std::error_code& ec) noexcept {
+        try {
+            spdlog::warn("OTA upload: the kept copy {} could not be removed: {}",
+                         backup.filename().string(), ec.message());
+        } catch (...) {
+        }
+    }
+
+    void restore_one(const Entry& e) {
+        std::error_code ec;
+        switch (e.state) {
+        case Predecessor::absent:
+            std::filesystem::remove(e.live, ec);
+            if (ec) {
+                restore_ok_ = false;
+                spdlog::error("OTA upload: the new {} could not be removed: {}",
+                              e.live.filename().string(), ec.message());
+            }
+            return;
+        case Predecessor::pending:
+            // The live file was never touched; only a partial kept copy can exist.
+            if (!e.backup.empty())
+                std::filesystem::remove(e.backup, ec);
+            return;
+        case Predecessor::kept:
+            break;
+        }
+        // Nothing was published over the path: the kept name and the live name are one
+        // file, and a rename of one onto the other would leave both. Drop the kept name.
+        std::error_code same_ec;
+        const bool same = std::filesystem::equivalent(e.backup, e.live, same_ec);
+        if (same && !same_ec) {
+            std::filesystem::remove(e.backup, ec);
+            if (ec)
+                log_kept_copy_left(e.backup, ec);
+            return;
+        }
+        std::filesystem::rename(e.backup, e.live, ec);
+        if (ec) {
+            restore_ok_ = false;
+            kept_names_.push_back(e.backup.filename().string());
+            spdlog::error("OTA upload: the previous {} could not be restored; it is kept as {}",
+                          e.live.filename().string(), e.backup.filename().string());
+        }
+    }
 
     static std::string unique_suffix() {
         static std::atomic<unsigned long long> seq{0};
+        const unsigned long long n = seq.fetch_add(1);
         unsigned long long salt = 0;
         try {
             std::random_device rd;
             salt = (static_cast<unsigned long long>(rd()) << 32) ^ rd();
         } catch (...) {
-            salt = 0;
+            // No entropy source: never a constant. The clock, the counter and the
+            // counter's address keep two names apart across requests and processes.
+            const auto ticks = static_cast<unsigned long long>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            salt = ticks ^ (n * 0x9E3779B97F4A7C15ULL) ^
+                   static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(&seq));
         }
-        return std::format("{:016x}_{}", salt, seq.fetch_add(1));
+        return std::format("{:016x}_{}", salt, n);
     }
 
     std::vector<Entry> entries_;
+    std::vector<std::string> kept_names_;
     bool settled_{false};
+    bool restore_ok_{true};
 };
 } // namespace
 
@@ -6766,7 +6917,25 @@ void SettingsRoutes::register_routes(
         // guard so the rollback runs while it is still held.
         const std::lock_guard<std::mutex> package_files_lock(ota_package_files_mutex());
         OtaPredecessorGuard predecessors;
+
+        // Every failure answer below first puts the previous files back, explicitly, so
+        // the answer can say whether that held. True: everything is as it was and the
+        // "nothing was changed" wording that follows is accurate. False: the restore
+        // failed, the response is already the 500 that names the kept file, and the
+        // caller returns without writing its own.
+        const auto restored_or_answered = [&]() -> bool {
+            if (predecessors.rollback())
+                return true;
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">" +
+                                html_escape(predecessors.restore_failure_text()) + "</span>",
+                            "text/html; charset=utf-8");
+            return false;
+        };
+
         if (!predecessors.preserve(out_path) || !predecessors.preserve(sidecar_path)) {
+            if (!restored_or_answered())
+                return;
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Could not prepare the package "
                             "directory. Nothing was changed; retry the upload.</span>",
@@ -6780,6 +6949,8 @@ void SettingsRoutes::register_routes(
             spdlog::error("OTA upload for {}/{}: the signature sidecar could not be written; "
                           "the previous package is unchanged",
                           platform, arch);
+            if (!restored_or_answered())
+                return;
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Could not store the signature. "
                             "Nothing was changed \u2014 retry the upload.</span>",
@@ -6804,6 +6975,8 @@ void SettingsRoutes::register_routes(
         const auto fail_binary = [&](const char* msg) {
             std::error_code rm_ec;
             std::filesystem::remove(bin_tmp, rm_ec);
+            if (!restored_or_answered())
+                return;
             res.status = 500;
             res.set_content(std::string("<span class=\"feedback-error\">") + msg + "</span>",
                             "text/html; charset=utf-8");
@@ -6846,10 +7019,11 @@ void SettingsRoutes::register_routes(
             spdlog::error("OTA upload for {}/{}: the previous signature could not be removed; "
                           "the previous package is being restored",
                           platform, arch);
+            if (!restored_or_answered())
+                return;
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">The old signature could not be "
-                            "removed, so the previous package was restored and the new one "
-                            "was not published. Retry the upload.</span>",
+                            "removed, so the upload was rolled back. Retry the upload.</span>",
                             "text/html; charset=utf-8");
             return;
         }
@@ -6878,12 +7052,29 @@ void SettingsRoutes::register_routes(
         // written, `predecessors` puts back whatever they replaced (and removes
         // them where there was nothing), so the update directory and the registry
         // agree again, and the request reports the failure instead of success.
-        if (!update_registry_->upsert_package(pkg)) {
+        bool recorded = update_registry_->upsert_package(pkg);
+        if (!recorded) {
+            // A connection lost after the commit looks like a failed write although the
+            // row is there. Read it back: when it carries exactly what this request
+            // wrote, the upload did happen, so the new files stay and the request goes
+            // down the success path. Any other outcome (no such row, a different row,
+            // an unreadable listing) is a failed write.
+            if (const auto listing = update_registry_->list_packages_checked();
+                listing && row_carries_upload(*listing, pkg)) {
+                spdlog::warn("OTA upload for {}/{}: the registry write reported failure but "
+                             "the row carries this upload; treating it as written",
+                             platform, arch);
+                recorded = true;
+            }
+        }
+        if (!recorded) {
             spdlog::error("OTA upload for {}/{}: the registry row could not be written; the "
                           "previous files are being restored",
                           platform, arch);
             audit_fn_(req, "ota.package.uploaded", "failure", "UpdatePackage",
                       platform + "/" + arch + "/" + version, "store_error");
+            if (!restored_or_answered())
+                return;
             respond_lifecycle_store_unavailable(
                 res, "The package could not be recorded. Nothing was changed; retry the "
                      "upload.");
