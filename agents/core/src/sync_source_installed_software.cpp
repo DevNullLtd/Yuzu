@@ -903,7 +903,7 @@ struct CollectorState {
         if (r.result_completeness != YUZU_RESULT_COMPLETENESS_FULL) {
             // Only a plugin that declares FULL is believed to have read everything. PARTIAL
             // overrides rows the plugin did hand over (a partial roster); an answer that declares
-            // nothing (UNKNOWN) is not FULL either; each one is counted and persisted at once
+            // nothing (UNKNOWN) is not FULL either and is the one counted and persisted at once
             // (rare).
             const bool partial = r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL;
             if (partial) {
@@ -1025,6 +1025,10 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
         for (std::size_t i = 0; i < st->facets.size(); ++i) {
             FacetState& f = st->facets[i];
             f.pending_rows = false;
+            // A status section sent and never acknowledged (the response was lost) leaves the
+            // server's state unknown, so what was last acknowledged proves nothing about it.
+            if (f.pending_status)
+                f.last_status.reset();
             f.pending_status.reset();
             f.pending = AckedSet{};
             // A pass inside the cooldown rebuilds from the rows already collected. Everything

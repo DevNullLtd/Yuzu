@@ -1558,7 +1558,7 @@ reconnect waits up to the limit.
 Every degraded answer is a status-only section: a non-zero return, a truncated capture, a
 `constrained` status row, a typed PARTIAL completeness (the provenance is the token), an answer that
 declared no completeness at all (UNKNOWN is never read as FULL: token `unknown`, counted in the
-heartbeat tag `yuzu.sync.installed_software.completeness_unknown_total`; every plugin of the table
+heartbeat tag `yuzu.sync.installed_software.completeness_unknown_total`, a per-device heartbeat tag which no server page, API or fleet gauge returns yet; every plugin of the table
 declares `OK`/`FULL` on a clean pass, so this fires only for a plugin that stopped declaring) and an
 `installed_apps` listing with no rows (`no_rows`; never a deleting `full`). The server keeps the facet's rows
 and reads them as unconfirmed (R23) until a `full` section confirms them again. This changes what a

@@ -15,6 +15,7 @@ reordering the call compiles and every behavioural test stays green while plugin
   3. `collector_workers_` is a class-scope member created once. The factory runs inside the
      per-CONNECTION sync thread, so a worker object created there would be rebuilt on every
      reconnect while a worker from the previous connection is still inside a plugin.
+It also pins the heartbeat call site of `emit_sync_completeness_unknown_tag(tags, sync_kv);`.
 
 Lexical only: it cannot see a relocation that keeps the tokens but changes control flow
 (review-enforced). agent.cpp has non-ASCII lines, so it is read as UTF-8.
@@ -37,6 +38,8 @@ HINT = (
 QUIESCE = r"quiesce_run_workers\( ?\);"
 DRAIN = r"drain_detached_collectors_or_exit\( ?\);"
 STOP = r"trigger_engine_\.stop\( ?\);"
+SKIP_TAGS = r"emit_sync_skip_tags\("
+UNKNOWN_TAG = r"emit_sync_completeness_unknown_tag\( ?tags, ?sync_kv ?\);"
 
 
 def normalise(src):
@@ -85,6 +88,13 @@ def problems(src):
     if len(re.findall(r"make_shared<CollectorWorkers>", t)) != 1:
         out.append("CollectorWorkers is not created exactly once (a per-connection object would "
                    "be rebuilt on every reconnect)")
+
+    # 4. The heartbeat block publishes the unknown-completeness tag beside the skip tags; this is
+    #    the tag's only production call, so deleting it leaves every behavioural test green.
+    skip = re.search(SKIP_TAGS, t)
+    if len(re.findall(UNKNOWN_TAG, t)) != 1 or not skip or not re.search(UNKNOWN_TAG, t[skip.end():]):
+        out.append("`emit_sync_completeness_unknown_tag(tags, sync_kv);` is not called exactly once "
+                   "in the heartbeat block after `emit_sync_skip_tags(`")
     return out
 
 
@@ -114,6 +124,9 @@ MUTATIONS = [
     (r"make_installed_software_source\(",
      "(void)std::make_shared<CollectorWorkers>(); make_installed_software_source(", 0, 1,
      "created exactly once"),
+    # 8. the heartbeat tag call deleted
+    (r"yuzu::agent::emit_sync_completeness_unknown_tag\(tags, sync_kv\);", "", 0, 1,
+     "heartbeat block after"),
 ]
 
 

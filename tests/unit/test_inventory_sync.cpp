@@ -2621,13 +2621,37 @@ TEST_CASE("collector: typed completeness - FULL collects; UNKNOWN is constrained
         REQUIRE(c.collect().has_value());
         CHECK(c.kv.at(kUnknownTotal) == "2");
     }
+    SECTION("the persisted counter is reloaded by a rebuilt source and the heartbeat tag publishes it") {
+        fake_mac();
+        g_fake[1].undeclared.insert("packages");
+        std::map<std::string, std::string> saved;
+        {
+            Collector first(all_plugins());
+            REQUIRE(first.collect().has_value());
+            REQUIRE(first.kv.at(kUnknownTotal) == "1");
+            saved = first.kv;
+        }
+        // A reconnect or restart builds a new source over the same KV: the count continues.
+        Collector rebuilt(all_plugins());
+        rebuilt.kv = saved;
+        REQUIRE(rebuilt.collect().has_value());
+        CHECK(rebuilt.kv.at(kUnknownTotal) == "2");
+        std::map<std::string, std::string> tags;
+        yuzu::agent::emit_sync_completeness_unknown_tag(
+            tags, [&rebuilt](const std::string& k) -> std::optional<std::string> {
+                const auto it = rebuilt.kv.find(k);
+                return it == rebuilt.kv.end() ? std::nullopt : std::optional<std::string>(it->second);
+            });
+        CHECK(tags.at("yuzu.sync.installed_software.completeness_unknown_total") == "2");
+    }
     SECTION("PARTIAL is constrained but is not an UNKNOWN answer: not counted") {
         fake_mac();
         g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_OK, kPartial, "x"};
         Collector c(all_plugins());
         const auto got = c.collect();
         REQUIRE(got.has_value());
-        const V3Sec* pk = find_sec(sections_of(got->first), "pkg_inventory.packages");
+        const auto pk_secs = sections_of(got->first);
+        const V3Sec* pk = find_sec(pk_secs, "pkg_inventory.packages");
         REQUIRE(pk != nullptr);
         CHECK(pk->status == "constrained");
         CHECK(pk->token == "x");
@@ -4976,8 +5000,8 @@ TEST_CASE("collector: a section header carries the measured bytes_read and a non
     CHECK(never_ran->bytes_read == "0");
 }
 
-TEST_CASE("collector: a status-only section is re-sent only on a change, a nack, a forced send or after "
-          "its facet returned rows",
+TEST_CASE("collector: a status-only section is re-sent only on a change, a nack, a forced send, a lost "
+          "response or after its facet returned rows",
           "[sync][collector][v3]") {
     fake_mac_host();
     Collector c(every_plugin());
@@ -5018,6 +5042,21 @@ TEST_CASE("collector: a status-only section is re-sent only on a change, a nack,
         REQUIRE(c.collect().has_value()); // not acknowledged (the send failed)
         const auto retry = c.collect();   // inside the cooldown: the cached answer
         CHECK(statuses_only(retry->first) == std::vector<std::string>{kMsi});
+    }
+    SECTION("a send whose response was lost: the status that reverts is sent again") {
+        c.pass_cooldown();
+        g_fake[3].rc["list_inventory"] = 1; // not_collected -> constrained `rc=1`
+        const auto lost = c.collect();
+        REQUIRE(lost.has_value());
+        CHECK(statuses_only(lost->first) == std::vector<std::string>{kMsi});
+        // The server applied it but the response never arrived, so there is no on_ack: what the
+        // server holds is unknown, and the acknowledged `not_collected` proves nothing about it.
+        c.pass_cooldown();
+        g_fake[3].rc.erase("list_inventory"); // back to the acknowledged `not_collected`
+        const auto back = c.collect();
+        REQUIRE(back.has_value());
+        CHECK(statuses_only(back->first) == std::vector<std::string>{kMsi});
+        CHECK(c.src.wants_blob());
     }
     SECTION("a nack of that facet sends it again") {
         c.pass_cooldown();
@@ -5243,6 +5282,34 @@ TEST_CASE("collector: the acked state survives a restart, and a garbled value is
             CHECK(secs[0].facet == kFacetApps);
             CHECK(secs[0].status == "full");
         }
+    }
+    SECTION("an acknowledged status-only section is not persisted: the restarted source sends it again") {
+        fake_mac_host();
+        constexpr const char* kMsi = "msi_packages.list_inventory";
+        std::map<std::string, std::string> saved;
+        std::string status, token;
+        {
+            Collector first(every_plugin());
+            const auto sent = first.collect_forced();
+            REQUIRE(sent.has_value());
+            const auto secs = sections_of(sent->first);
+            const V3Sec* msi = find_sec(secs, kMsi);
+            REQUIRE(msi != nullptr);
+            status = msi->status;
+            token = msi->token;
+            first.ack();
+            saved = first.kv;
+        }
+        CHECK(status == "not_collected");
+        Collector rebuilt(every_plugin());
+        rebuilt.kv = saved;
+        const auto again = rebuilt.collect();
+        REQUIRE(again.has_value());
+        const auto secs = sections_of(again->first);
+        const V3Sec* msi = find_sec(secs, kMsi);
+        REQUIRE(msi != nullptr);
+        CHECK(msi->status == status);
+        CHECK(msi->token == token);
     }
     SECTION("a persisted need_full flag survives a restart") {
         Collector c(every_plugin());

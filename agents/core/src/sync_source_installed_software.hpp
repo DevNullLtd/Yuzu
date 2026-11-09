@@ -295,8 +295,10 @@ struct CollectorTuning {
 ///     plugin, `rejected` when no worker could be started), `oversize` (`rows=<n>` / `bytes=<n>`),
 ///     `not_collected` (`not_loaded`, or the plugin's own `unsupported` answer).
 /// A status-only section is sent when its {status, token} differs from the one the server last
-/// acknowledged for that facet, and not again while it stays the same. The server keeps the rows
-/// of a facet it holds through any status-only section.
+/// acknowledged for that facet, and again after a forced send (Sync now), a nack, a reconnect or
+/// restart, a send whose response was lost, and once the facet has carried rows; not while it stays
+/// the same and acknowledged. The server keeps the rows of a facet it holds through any
+/// status-only section.
 ///
 /// Each action runs on a bounded detached worker (agents/shared/bounded_wait.hpp), one at a
 /// time, under its table time limit. `workers` is the agent-owned single-flight state above;

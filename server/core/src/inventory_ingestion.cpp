@@ -277,8 +277,11 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
     if (!validate_inventory_report_source_count(agent_id, report, metrics)) {
         // Whole-report reject (malformed/abusive). Deliberately NO need_full nack — we do
         // not amplify resends to a misbehaving agent; the empty ack means the agent records
-        // the cycle done until the weekly floor. Safety rests on the legit source count
-        // (1 today) staying far below kMaxSources, so a legit report is never dropped here.
+        // the cycle done (and commits the sections it sent as acknowledged). For
+        // installed_software that divergence heals on the next delta, which the server refuses
+        // with a per-facet need_full; the weekly floor applies only to the other sources.
+        // Safety rests on the legit source count (1 today) staying far below kMaxSources, so a
+        // legit report is never dropped here.
         // Emit a DISTINCT `rejected` outcome (NOT `dropped` — that label's alert/runbook is
         // oversized-blob-specific: nacked + never-self-heals; this reject is neither) so a
         // flooding agent is observable without misdirecting the dropped-blob runbook (gov

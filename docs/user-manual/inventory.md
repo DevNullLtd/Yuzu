@@ -30,7 +30,8 @@ cadences.
   `constrained` or malformed status row or an `unavailable` answer, the status tokens; a typed result
   completeness of `PARTIAL`, the plugin's provenance token, or none declared at all, `unknown`
   (never read as complete; counted in the heartbeat tag
-  `yuzu.sync.installed_software.completeness_unknown_total`); no feature rows from
+  `yuzu.sync.installed_software.completeness_unknown_total`, a per-device heartbeat tag which no
+  server page, API or fleet gauge returns yet); no feature rows from
   `windows_optional_features`; or no applications at all from `installed_apps`, `no_rows`) is
   reported `constrained` with that token and contributes **no rows**: the server keeps the source's
   last confirmed rows and shows them as unconfirmed until a later `full` section confirms them, so a
@@ -1174,12 +1175,14 @@ APIs, which return the system code page (cp1252 on Western installs), so any
 non-ASCII character in an app or publisher name was stored as `?` (e.g. `Café` →
 `Caf?`). This is fixed in the release containing #1662 (the plugin now reads via
 `Reg*W` + UTF-8). After upgrading an agent, the corrected names land on that
-agent's **next daily sync** — typically within hours, not the weekly full-floor,
-because the changed bytes change the content hash and force a full re-send (it is
-*not* gated behind the weekly floor). Until then, an exact-match query
-(`WHERE name = 'Café'`) returns zero rows for that device. To force the refresh
-immediately on a device, **restart the Yuzu agent** there — the first sync after
-restart sends a full list. Note that app *counts* can rise slightly after the
+agent's **next daily sync** — typically within hours, as a delta of the changed
+rows (the old `?`-mangled rows leave the section and their corrected twins
+arrive); this source has no weekly full resend to wait for. Until then, an
+exact-match query (`WHERE name = 'Café'`) returns zero rows for that device. To
+force the refresh immediately on a device, use **Sync now** for it (or the REST
+or MCP sync request), which sends every section in full; restarting the agent
+does not, because the agent reloads what it last reported and sends only the
+changes. Note that app *counts* can rise slightly after the
 fix: names that previously collapsed to the same `?`-mangled string (e.g. two
 different non-ASCII apps) now separate into distinct rows.
 

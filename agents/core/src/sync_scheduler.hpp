@@ -67,15 +67,16 @@ struct SyncSource {
     /// payload heals divergence by itself, section by section: installed_software (blob v3)
     /// names the facets it holds in its report hash, and the server refuses a delta over a base
     /// that no longer matches (`installed_software:<facet>` nack -> that facet is resent in
-    /// full), so a weekly blanket resend of every facet would only add load. A force, a whole-source
-    /// nack and a never-acknowledged hash still send full.
+    /// full), so a weekly blanket resend of every facet would only add load. A force, a
+    /// whole-source nack and a never-acknowledged hash still send full.
     bool no_full_floor{false};
 
     /// A source that keeps its own per-section state (installed_software, blob v3) is told when
     /// the scheduler is about to send FULL regardless of what it collects: the operator forced
     /// the source (request_now), the server nacked it (force_full), no hash has ever been
-    /// acknowledged, or the weekly floor is due (never for a no_full_floor source). Called on the ticking thread immediately
-    /// BEFORE collect(), in both tick passes, so a forced send always carries a full payload.
+    /// acknowledged, or the weekly floor is due (never for a no_full_floor source). Called on
+    /// the ticking thread immediately BEFORE collect(), in both tick passes, so a forced send
+    /// always carries a full payload.
     /// Unset for every other source.
     std::function<void()> on_force_full;
 
