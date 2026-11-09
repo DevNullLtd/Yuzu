@@ -2,6 +2,14 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the DEX Scoring tab edits the score policy from the dashboard
+
+**What changed.** The DEX page gains a **Scoring** tab that shows the score policy in force and edits all of it: tier edges and names, weights, model parameters and per-application overrides, with a pre-save tier-change preview and a reset to the shipped defaults. It writes through the same function as `PUT` and `DELETE /api/v1/dex/score-policy`, so validation, the `If-Match` revision check and the audit rows are the same, and editing needs the same `Infrastructure:Write` grant (viewing needs `GuaranteedState:Read`). See [DEX](dex.md#scoring).
+
+**The rule.** The version 2 rule in [Behaviour change: the DEX score policy document gains model parameters and version 2](#behaviour-change-the-dex-score-policy-document-gains-model-parameters-and-version-2), below, applies to the dashboard too: do not save or reset the policy from the Scoring tab during a rolling upgrade or rollback. The tab does not exist on a server that predates it, so behind a load balancer `GET /fragments/dex/scoring` is a `404` from a replica still on the previous release.
+
+**No action on upgrade.** There is no schema change and no existing setting is reinterpreted.
+
 ## ⚠️ Breaking: Echo reads roll-up tables on the server (a stored result set over a raw capture table is refused)
 
 **What changed.** The server reads Echo as roll-up only. The canned Echo queries (`crossplatform.echo.*`, from `content/definitions/echo_warehouse.yaml`) read the hourly tier and return counts per hour with no pid; `GET /api/v1/settings/data-retention` lists no `live` tier and adds `budget_dependent` per tier and `echo.db_budget_bytes`; the Device page's Capture sources panel and the Echo retention-paused list show a source's hourly row count. Creating a result set from a query over a `$<Source>_Live` name or a `<source>_live` table (`POST /api/v1/result-sets/from-echo-query`, `from-instruction-result` with an `echo.sql` definition, and the MCP twins), and re-evaluating such a set, formerly answered 201 or 202 and now answers 400 (MCP `-32602`) with `RESULT_SET_REEVAL_STALE_SOURCE`; nothing is dispatched, and no audit row is written for the refusal. Result sets filled from agent answers now report `agents_failed` and `partial` (`result_set_store` schema v4 adds the `agents_failed` column).
@@ -171,6 +179,17 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - **Affected:** the server's `ReportInventory` load. A fleet in one time zone reports within four hours (about six times the per-second rate of an even spread, roughly 70 calls a second per million agents), and after a mass reboot or an outage every overdue agent reports within 30 minutes (roughly 550 a second per million). An endpoint with no time zone configured uses UTC.
 - **Sync now:** the agent's `__sync__.now` command accepts a comma-separated source list and an optional `delay_max_s`; the server sends neither yet, so an operator's Sync now is immediate.
 - **Not configurable yet:** the window is built into the agent; there is no setting and no settings push for it.
+
+## Behaviour change: installed-software schema v11 (delta sections are applied, the change ledger and the component store)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a database forward.
+
+- **What the schema adds:** three new empty tables, `software_changes` (the install, removal and upgrade history), `software_components` (the components found on each device) and `retention_meta`.
+- **What the server does in this build:** a `delta` section of the sectioned report is applied to the device's stored software and checked against the hash the device reports holding once it has applied the section; a section that does not check out is undone on its own and asked for again in full. The `component_inventory` section is stored per device. Every stored installed-software section writes its install, removal and upgrade entries to the change history in the same transaction (a component section writes none); an upgrade includes a release-only or epoch-only change, and the from and to versions read `[epoch:]version[-release]`. The first full section the server receives for a collector, and the first one once that collector is switched off and on, sets the starting point and writes none. Removed software is deleted from the device's list, with its history entry as the record. No shipped agent sends the sectioned report, so none of this moves until agents that do are deployed.
+- **Contract for agent writers:** the `S` section record has a seventh field, `expect`, the section hash after the agent applies the section. A `delta` section without a valid `expect` (64 lowercase hex) is refused. In a fresh deployment, bring up every server replica before the agents of the same build enroll.
+- **Retention:** change-history entries older than 400 days are deleted under the clock guard (see `docs/clock-guarded-retention.md`): once an hour, at most 50,000 rows per pass and up to 12 passes in a row while each pass fills its cap (600,000 rows per replica-hour at most). The first pass over a table that holds rows and has no recorded anchor declines and records the anchor, so deletion begins on the next hourly tick; a pass whose clock reading has jumped declines and logs why instead of deleting. Components are not pruned: they are the current list and are removed with the device.
+- **Metric and alert:** `yuzu_software_changes_total{kind}` counts history entries. A delta or component section that does not verify is counted under the section outcome `mismatch`, and the warning alert `YuzuInventorySectionDeltaMismatch` fires when a facet has had at least 5 of them in the last day and they are more than 5% of that facet's sections, held for an hour.
+- **Backups:** the new tables are ordinary tables, so a `pg_dump` backup of the database covers them.
 
 ## ⚠️ Breaking: the Compose files that run Grafana require `YUZU_GRAFANA_ADMIN_PASSWORD`, and an existing Grafana keeps `admin`/`admin` (#4817)
 

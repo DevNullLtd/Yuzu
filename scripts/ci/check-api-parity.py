@@ -509,9 +509,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # planned to twinned (POST /api/v1/workflows/{id}/execute + the execute_workflow MCP tool).
 # 206 -> 205 (enforcement read twins, ADR-1005 2026-11-03 entry): get.fragments-access-enforcement flipped from
 # `twinned-rest-only` to `twinned` (GET /api/v1/rbac/enforcement + the get_rbac_enforcement MCP tool, #6033).
-# 206 -> 204 (merge of origin/dev into the workflow execute twin branch): the two flips above are
-# disjoint rows, so 206 - 1 - 1 = 204.
-BASELINE_UNTWINNED = 204
+# 204 -> 208 (DEX Scoring tab): four dashboard routes (GET /fragments/dex/scoring and the save,
+# preview and reset POSTs) born `planned:#6087`, each with its merged REST v1 twin named and the MCP twin owed.
+BASELINE_UNTWINNED = 208
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
