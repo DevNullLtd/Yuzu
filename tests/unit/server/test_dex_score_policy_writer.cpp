@@ -35,8 +35,10 @@ std::string doc_with_excellent(double e) {
 
 const std::string kPrefixedError = std::string(kDbErrorPrefix) + "database write failed";
 
-// The recovery hint of every unknown-outcome 503, pinned whole: the OpenAPI text and the
-// rest-api.md runbook repeat it.
+// The recovery hint of every unknown-outcome 503, pinned whole as the live response body. The
+// served OpenAPI text and the rest-api.md runbook word its first branch as state ("the policy is
+// as it was before your request") and no longer repeat "the write did not apply"; that wording
+// difference is left to a later change to the writer's own string.
 const std::string kUnknownRemediation =
     "GET /api/v1/dex/score-policy and compare its revision: if it is the If-Match revision you "
     "sent, the write did not apply; if it is any other revision, review the policy before "
@@ -872,6 +874,7 @@ TEST_CASE("writer: a retry with the old If-Match is applied again only while the
         REQUIRE(r.status == St::Ok);
         CHECK(r.in_force.revision == original_rev);
         CHECK(w.stored == original);
+        CHECK(w.cas_calls == 2); // the retry reaches the store, it is not skipped as a no-op
     }
     SECTION("PUT retry is refused while the first PUT stands") {
         World w;
