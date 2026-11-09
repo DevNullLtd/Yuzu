@@ -372,7 +372,8 @@ std::string devices_fingerprint(const SoftwareFleetQuery& q) {
     // The SAM-17 filters join the key ONLY when set, so a default-filter request keeps the exact
     // fingerprint it had before they existed (an in-flight cursor must not flip to a mismatch).
     // The resolved `versions` set is deliberately NOT in it: it is derived from the request's
-    // version_min/version_max (bound by the list model) and moves with each rollup refresh.
+    // version_min/version_max (bound by the list model) and is a live distinct-version read that
+    // changes as devices report.
     if (q.match != NameMatch::kExact || !q.status.empty()) {
         const std::string match = q.match == NameMatch::kExact    ? "exact"
                                   : q.match == NameMatch::kPrefix ? "prefix"

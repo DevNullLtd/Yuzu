@@ -124,8 +124,9 @@ resolve_version_range(const std::vector<std::string>& distinct_versions, std::st
 
 // ── Fingerprints, audit targets, cursors ─────────────────────────────────────
 
-/// Bound to the request's filters including the RANGE INPUTS (not the resolved set, which moves
-/// with each rollup refresh). A default-filter request keeps devices_fingerprint's exact value.
+/// Bound to the request's filters including the RANGE INPUTS (not the resolved set, which is a live
+/// distinct-version read that changes as devices report). A default-filter request keeps
+/// devices_fingerprint's exact value.
 [[nodiscard]] std::string list_fingerprint(const ListRequest& rq);
 [[nodiscard]] std::string components_fingerprint(const ComponentsRequest& rq);
 

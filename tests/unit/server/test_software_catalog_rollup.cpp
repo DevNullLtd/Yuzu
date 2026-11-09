@@ -155,9 +155,13 @@ TEST_CASE("SoftwareCatalogRollup worker refreshes the components rollup and emit
     const std::string stamp = std::string(kStem) + "_last_success_timestamp";
     SoftwareCatalogRollup rollup{store, std::chrono::hours{1}, &metrics};
     rollup.start();
+    // The worker publishes a finished tick only through this gauge (it has no completion hook or
+    // CV), so the wait polls it. The 60 s is a deadlock guard, not a timing assumption: the test
+    // proceeds the instant the success stamp lands, and the 10 ms step keeps it off a core while
+    // Postgres runs the refresh.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{60};
     while (metrics.gauge(stamp).value() <= 0 && std::chrono::steady_clock::now() < deadline)
-        std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
     rollup.stop(); // joins: everything the tick wrote is visible below
 
     CHECK(metrics.counter(std::string(kStem) + "_total", {{"outcome", "success"}}).value() == 1);

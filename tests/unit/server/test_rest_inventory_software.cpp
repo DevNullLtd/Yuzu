@@ -1889,6 +1889,61 @@ TEST_CASE("REST inventory/software: a range sees a version first reported after 
     CHECK(get_lookup(h, "?name=git&version_max=2.0").at("data").at("software").size() == 1);
 }
 
+TEST_CASE("REST inventory/software: a range over a title with kCatalogRowCap distinct versions is a 400 and writes no audit row",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // One device carrying a distinct version per cap slot: the live distinct-version read comes
+    // back exactly full, so it may have been cut and the range cannot be resolved against it.
+    std::vector<SoftwareEntry> rows;
+    rows.reserve(static_cast<std::size_t>(kCatalogRowCap));
+    for (int i = 0; i < kCatalogRowCap; ++i)
+        rows.push_back(lookup_entry("git", std::to_string(i)));
+    seed_v3(store, "dev-a", V3Status::kFull, std::move(rows));
+
+    InvHarness h{&store};
+    auto res = h.sink.Get("/api/v1/inventory/software?name=git&version_min=1");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body.at("error").at("message") == std::string(software_list::kRangeNotResolvable));
+    CHECK(h.audit_log.empty()); // a refused request is not a read, so it writes nothing
+
+    // The documented way out: an exact version is a plain equality predicate and still serves.
+    const auto exact = get_lookup(h, "?name=git&version=7").at("data");
+    CHECK(exact.at("software").size() == 1);
+}
+
+TEST_CASE("REST inventory/software: a failed version read for a range is a 503 with retry_after_ms and one failure audit row",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    // size-1 pool held by the test: the range's distinct-version read is the first store read of
+    // the request and times out, so the route must answer 503, never an empty or unresolved 200.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto held = pool.acquire();
+    REQUIRE(held);
+    InvHarness h{&store};
+    auto res = h.sink.Get("/api/v1/inventory/software?name=git&version_min=1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body.at("error").at("retry_after_ms") == 5000);
+    CHECK(h.audit_log.size() == 1);
+    CHECK(count_audit(h, "inventory.software.query", "failure") == 1);
+}
+
 TEST_CASE("REST inventory/software: the audit target carries the lookup filters",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);

@@ -603,6 +603,63 @@ TEST_CASE("REST components: a closed pool -> 503 with a failure audit row, never
     CHECK(h.audits("inventory.components.view", "success") == 0);
 }
 
+TEST_CASE("REST components: a range over a component with kCatalogRowCap distinct versions is a 400 and writes no audit row",
+          "[pg][rest][inventory_components]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // One device, one component name, a distinct version (and path) per cap slot: the live
+    // distinct-version read comes back exactly full, so it may have been cut and the range cannot
+    // be resolved against it.
+    std::vector<V3Component> rows;
+    rows.reserve(static_cast<std::size_t>(kCatalogRowCap));
+    for (int i = 0; i < kCatalogRowCap; ++i)
+        rows.push_back(comp("libfoo", "/p/" + std::to_string(i), std::to_string(i)));
+    seed_components(store, "dev-a", std::move(rows));
+
+    CompHarness h{&store};
+    auto res = h.sink.Get(std::string(kPath) + "?name=libfoo&kind=jar&version_min=1");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body.at("error").at("message") == std::string(software_list::kRangeNotResolvable));
+    CHECK(h.audit_log.empty()); // a refused request is not a read, so it writes nothing
+
+    // The documented way out: an exact version is a plain equality predicate and still serves.
+    const auto exact = get_json(h, "?name=libfoo&kind=jar&version=7");
+    CHECK(exact.at("data").at("components").size() == 1);
+}
+
+TEST_CASE("REST components: a failed version read for a range is a 503 with retry_after_ms and one failure audit row",
+          "[pg][rest][inventory_components]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    // size-1 pool held by the test: the range's distinct-version read is the first store read of
+    // the request and times out, so the route must answer 503, never an empty or unresolved 200.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto held = pool.acquire();
+    REQUIRE(held);
+    CompHarness h{&store};
+    auto res = h.sink.Get(std::string(kPath) + "?name=libfoo&kind=jar&version_min=1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body.at("error").at("retry_after_ms") == 5000);
+    CHECK(h.audit_log.size() == 1);
+    CHECK(h.audits("inventory.components.view", "failure") == 1);
+}
+
 TEST_CASE("REST components: a degraded totals read alone is a 503 with retry_after_ms",
           "[pg][rest][inventory_components]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -631,15 +688,21 @@ TEST_CASE("REST components: a degraded totals read alone is a 503 with retry_aft
     CHECK(h.audits("inventory.components.view", "failure") == 1);
 }
 
-TEST_CASE("REST components: a 100k-row CSV export walks every page with a continuation",
+TEST_CASE("REST components: a CSV export walks every page with a continuation",
           "[pg][rest][inventory_components][export]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
-    constexpr int kDevices = 100;
-    constexpr int kPerDevice = 1000;
+    // The continuation walk and the exact-multiple-of-the-cap rule below do not depend on the cap's
+    // size, and in export mode `limit` IS the per-call cap, so the cap is set to 1000 here and the
+    // seed shrinks to 3000 rows over 10 apply calls. The default (kExportCap, 10000) is pinned by
+    // the pure parse case in test_software_list_model.cpp, and the shared read_limit's default and
+    // ceiling by the devices-params case in test_software_catalogue_model.cpp.
+    constexpr int kDevices = 10;
+    constexpr int kPerDevice = 300;
+    constexpr int kCap = 1000;
     for (int d = 0; d < kDevices; ++d) {
         std::vector<V3Component> rows;
         rows.reserve(kPerDevice);
@@ -653,14 +716,14 @@ TEST_CASE("REST components: a 100k-row CSV export walks every page with a contin
     std::size_t data_rows = 0;
     int pages = 0;
     for (;;) {
-        std::string q = "?format=csv";
+        std::string q = "?format=csv&limit=" + std::to_string(kCap);
         if (!cursor.empty())
             q += "&cursor=" + cursor;
         auto res = h.sink.Get(std::string(kPath) + q);
         REQUIRE(res);
         REQUIRE(res->status == 200);
         ++pages;
-        REQUIRE(pages <= 12);
+        REQUIRE(pages <= 5);
         std::size_t lines = 0;
         for (char c : res->body)
             if (c == '\n')
@@ -679,12 +742,12 @@ TEST_CASE("REST components: a 100k-row CSV export walks every page with a contin
         cursor = res->get_header_value("X-Next-Cursor");
     }
     CHECK(data_rows == static_cast<std::size_t>(kDevices) * kPerDevice);
-    // The export cap is 10000 rows per call. A page that comes back full always carries a
-    // continuation (the documented count == limit rule, "more rows may exist", shared with the
-    // installs route), so a total that is an exact multiple of the cap ends on one more page.
-    CHECK(pages == 11);
-    CHECK(h.audits("inventory.components.export", "success", "page=continuation") == 10);
-    CHECK(h.audits("inventory.components.export", "success") == 11);
+    // A page that comes back full always carries a continuation (the documented count == limit
+    // rule, "more rows may exist", shared with the installs route), so a total that is an exact
+    // multiple of the cap ends on one more, header-only page: 3 full pages + 1 closing page.
+    CHECK(pages == 4);
+    CHECK(h.audits("inventory.components.export", "success", "page=continuation") == 3);
+    CHECK(h.audits("inventory.components.export", "success") == 4);
 }
 
 TEST_CASE("REST components: every JSON page is audited, continuation pages are tagged",

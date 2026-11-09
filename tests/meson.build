@@ -4739,6 +4739,14 @@ test('collection settings wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# SAM-17: the software lookup routes' hostname roster must be handed to RestApiV1 before
+# register_routes(); an unset function leaves every hostname null with no other signal.
+test('software lookup wiring lexical',
+  _python3_test,
+  args: [files('test_software_lookup_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
