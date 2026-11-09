@@ -24,7 +24,6 @@
 #include <expected>
 #include <string>
 #include <string_view>
-#include <utility>
 
 namespace yuzu::server {
 
@@ -33,14 +32,13 @@ namespace yuzu::server {
 /// non-boolean `dry_run` are refused with a message naming the argument and never echoing a
 /// value. `approval_id` is accepted on a reset only (the generic approval gate consumes it
 /// before the handler runs); `dry_run` and `document` exist on a put only. An absent `if_match`
-/// stays nullopt so apply answers its own 428-class refusal and writes its own denied row.
+/// stays nullopt so apply answers its own 428-class refusal and writes its own denied row. The
+/// request's `actor` is left empty: the handler sets it from the resolved caller.
 [[nodiscard]] inline std::expected<DexScorePolicyWriteRequest, std::string>
-dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op op, const nlohmann::json& args,
-                             std::string actor) {
+dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op op, const nlohmann::json& args) {
     using Op = DexScorePolicyWriteRequest::Op;
     DexScorePolicyWriteRequest rq;
     rq.op = op;
-    rq.actor = std::move(actor);
     if (!args.is_object())
         return std::unexpected(std::string("arguments must be a JSON object"));
     const bool put = op == Op::Put;

@@ -33,10 +33,13 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -281,48 +284,47 @@ TEST_CASE("dex score policy mcp: the request builder is strict and maps dry_run 
           "[mcp][dex][score_policy][pure]") {
     SECTION("a valid put") {
         const auto rq = dex_score_policy_mcp_request(
-            Op::Put, {{"document", doc_json(95.0)}, {"if_match", "default"}, {"dry_run", true}},
-            "alice");
+            Op::Put, {{"document", doc_json(95.0)}, {"if_match", "default"}, {"dry_run", true}});
         REQUIRE(rq);
         CHECK(rq->op == Op::Put);
-        CHECK(rq->actor == "alice");
+        CHECK(rq->actor.empty()); // the handler sets the actor from the resolved caller
         CHECK(rq->if_match == std::optional<std::string>("default"));
         CHECK(rq->dry_run == std::optional<std::string>("true"));
         CHECK(json::parse(rq->body) == doc_json(95.0));
     }
     SECTION("dry_run false maps to the raw string 'false'; absent stays nullopt") {
         const auto f = dex_score_policy_mcp_request(
-            Op::Put, {{"document", doc_json(95.0)}, {"dry_run", false}}, "a");
+            Op::Put, {{"document", doc_json(95.0)}, {"dry_run", false}});
         REQUIRE(f);
         CHECK(f->dry_run == std::optional<std::string>("false"));
-        const auto n = dex_score_policy_mcp_request(Op::Put, {{"document", doc_json(95.0)}}, "a");
+        const auto n = dex_score_policy_mcp_request(Op::Put, {{"document", doc_json(95.0)}});
         REQUIRE(n);
         CHECK_FALSE(n->dry_run.has_value());
         CHECK_FALSE(n->if_match.has_value()); // absent if_match is left to apply's 428-class refusal
     }
     SECTION("refusals") {
         const json doc = doc_json(95.0);
-        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, json::array(), "a"));
-        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, {{"document", doc}, {"bogus", 1}}, "a"));
-        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, {{"document", "text"}}, "a"));
-        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, {{"document", json::array()}}, "a"));
-        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, json::object(), "a")); // no document
-        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, {{"document", doc}, {"if_match", 5}}, "a"));
+        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, json::array()));
+        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, {{"document", doc}, {"bogus", 1}}));
+        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, {{"document", "text"}}));
+        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, {{"document", json::array()}}));
+        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, json::object())); // no document
+        CHECK_FALSE(dex_score_policy_mcp_request(Op::Put, {{"document", doc}, {"if_match", 5}}));
         CHECK_FALSE(dex_score_policy_mcp_request(
-            Op::Put, {{"document", doc}, {"if_match", std::string(65, 'a')}}, "a"));
+            Op::Put, {{"document", doc}, {"if_match", std::string(65, 'a')}}));
         CHECK_FALSE(dex_score_policy_mcp_request(
-            Op::Put, {{"document", doc}, {"dry_run", "true"}}, "a")); // a string, not a boolean
+            Op::Put, {{"document", doc}, {"dry_run", "true"}})); // a string, not a boolean
     }
     SECTION("approval_id is accepted on a reset only; dry_run and document never on a reset") {
-        CHECK(dex_score_policy_mcp_request(Op::Reset, {{"if_match", "default"}, {"approval_id", "x"}}, "a"));
+        CHECK(dex_score_policy_mcp_request(Op::Reset, {{"if_match", "default"}, {"approval_id", "x"}}));
         CHECK_FALSE(dex_score_policy_mcp_request(
-            Op::Put, {{"document", doc_json(95.0)}, {"approval_id", "x"}}, "a"));
-        CHECK_FALSE(dex_score_policy_mcp_request(Op::Reset, {{"dry_run", true}}, "a"));
-        CHECK_FALSE(dex_score_policy_mcp_request(Op::Reset, {{"document", doc_json(95.0)}}, "a"));
+            Op::Put, {{"document", doc_json(95.0)}, {"approval_id", "x"}}));
+        CHECK_FALSE(dex_score_policy_mcp_request(Op::Reset, {{"dry_run", true}}));
+        CHECK_FALSE(dex_score_policy_mcp_request(Op::Reset, {{"document", doc_json(95.0)}}));
     }
     SECTION("an unknown key is named, neutralised and capped, and no value is echoed") {
         const auto rq = dex_score_policy_mcp_request(
-            Op::Reset, {{std::string("evil key\n") + std::string(200, 'z'), "SECRET-VALUE"}}, "a");
+            Op::Reset, {{std::string("evil key\n") + std::string(200, 'z'), "SECRET-VALUE"}});
         REQUIRE_FALSE(rq);
         CHECK(rq.error().starts_with("unknown argument '"));
         CHECK(rq.error().size() < 100);
@@ -421,6 +423,8 @@ TEST_CASE("dex score policy mcp: the three tools are served with their security 
     CHECK(std::count(writes.begin(), writes.end(), std::string("reset_dex_score_policy")) == 1);
     CHECK(std::count(writes.begin(), writes.end(), std::string("get_dex_score_policy")) == 0);
     for (const auto& e : listed["result"]["tools"]) {
+        if (e["name"] == "get_dex_score_policy") // the handler refuses any argument: say so
+            CHECK(e["inputSchema"]["additionalProperties"] == false);
         if (e["name"] == "set_dex_score_policy") {
             CHECK(e["inputSchema"]["required"] == json::array({"document", "if_match"}));
             CHECK(e["inputSchema"]["additionalProperties"] == false);
@@ -461,6 +465,23 @@ TEST_CASE("get_dex_score_policy: nothing stored serves the defaults at revision 
     CHECK(sc["source"] == "default");
     CHECK(sc["revision"] == "default");
     CHECK(schema_violation(t.output_schema("get_dex_score_policy"), sc) == "");
+}
+
+TEST_CASE("get_dex_score_policy: invalid stored text serves the defaults with the fault and the "
+          "revision of the text as stored",
+          "[mcp][dex][score_policy]") {
+    Twin t;
+    t.stored = R"({"version":3})"; // newer than this server reads: refused, never half-applied
+    const json r = t.call("get_dex_score_policy");
+    REQUIRE_FALSE(r.contains("error"));
+    const json& sc = r["result"]["structuredContent"];
+    CHECK(sc["source"] == "default");
+    CHECK(sc["fault"] == "unsupported_version at version: 3 above the supported 2");
+    CHECK(sc["revision"] == rev_of(*t.stored)); // the refused document's own revision, not 'default'
+    CHECK(sc == dex_score_policy_in_force_json(dex_policy_in_force_from_stored(t.stored)));
+    CHECK(schema_violation(t.output_schema("get_dex_score_policy"), sc) == "");
+    CHECK(audit_count(t.generic_rows, "mcp.get_dex_score_policy|success") == 1);
+    CHECK(t.domain_rows.empty());
 }
 
 TEST_CASE("get_dex_score_policy: any argument is refused, every tier reads, a refused gate and a "
@@ -694,6 +715,7 @@ TEST_CASE("set_dex_score_policy: no audit row, no mutation", "[mcp][dex][score_p
             REQUIRE(r.contains("error"));
             CHECK(r["error"]["code"] == mcp::kInternalError);
             CHECK(r["error"]["data"]["retry_after_ms"].is_null());
+            CHECK(r["error"]["data"]["remediation"].is_null()); // set spends no ticket
             CHECK(t.cas_calls == 0);
             CHECK_FALSE(t.stored.has_value());
             CHECK(audit_count(t.generic_rows, "mcp.set_dex_score_policy|failure") == 1);
@@ -767,6 +789,126 @@ TEST_CASE("set_dex_score_policy: store faults are retryable; the outcome after a
         CHECK(rem.find("compare its revision") != std::string::npos);
         CHECK(rem.find("get_dex_score_policy") != std::string::npos);
     }
+}
+
+TEST_CASE("set_dex_score_policy: a second writer in this process is told to retry, through the "
+          "adapter",
+          "[mcp][dex][score_policy]") {
+    Twin t;
+    // The first write parks inside its commit holding the provider's writer lock. It runs on its
+    // own deps and sink, sharing with the Twin only the provider and the stored text (read, not
+    // written, until it is released), so the two calls touch no common mutable state.
+    std::promise<void> entered_p;
+    std::promise<void> release_p;
+    auto entered = entered_p.get_future();
+    const auto gate = release_p.get_future().share();
+    DexScorePolicyWriteDeps d1;
+    d1.read_stored = [&t]() -> std::expected<std::optional<std::string>, std::string> {
+        return t.stored;
+    };
+    d1.compare_and_set = [&](const std::optional<std::string>&, const std::string&,
+                             const std::string&) -> std::expected<bool, std::string> {
+        entered_p.set_value();
+        gate.wait();
+        return true;
+    };
+    d1.compare_and_remove = [](const std::string&) -> std::expected<bool, std::string> {
+        return true;
+    };
+    d1.provider = t.provider;
+    d1.audit = [](std::string_view, std::string_view, const std::string&) { return true; };
+    DexScorePolicyWriteRequest rq1;
+    rq1.if_match = "default";
+    rq1.body = doc_with_excellent(95.0);
+    rq1.actor = "first";
+    std::optional<DexScorePolicyWriteResult> first;
+    std::thread parked([&] { first = apply_dex_score_policy(rq1, d1); });
+    // Bounded: a first write that never reaches its commit fails the case instead of hanging it.
+    if (entered.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
+        release_p.set_value();
+        parked.join();
+        FAIL("the first write never reached its commit");
+    }
+    const json r = t.call("set_dex_score_policy", set_args(96.0, "default"));
+    release_p.set_value();
+    parked.join();
+
+    REQUIRE(r.contains("error"));
+    CHECK(r["error"]["code"] == mcp::kInternalError);
+    CHECK(r["error"]["data"]["retry_after_ms"] == kDexScorePolicyRetryMs);
+    CHECK(t.cas_calls == 0); // this call's commit never ran
+    CHECK_FALSE(t.stored.has_value());
+    REQUIRE(t.domain_rows.size() == 2);
+    CHECK(t.domain_rows[0] == kAttemptedUpdate);
+    CHECK(t.domain_rows[1] == "dex.score_policy.update|failure|RuntimeConfig|dex_score_policy");
+    CHECK(audit_count(t.generic_rows, "mcp.set_dex_score_policy|failure") == 1);
+    REQUIRE(first);
+    CHECK(first->status == St::Ok);
+}
+
+TEST_CASE("set_dex_score_policy: a dropped generic mcp.<tool> row is reported on the success body "
+          "and on the error envelope, on every write",
+          "[mcp][dex][score_policy]") {
+    SECTION("a set: the write stands, audit_persisted false, both domain rows written") {
+        Twin t;
+        t.generic_audit_ok = false;
+        const json r = t.call("set_dex_score_policy", set_args(95.0, "default"));
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(t.cas_calls == 1);
+        const json& sc = r["result"]["structuredContent"];
+        CHECK(sc["audit_persisted"] == false);
+        CHECK(schema_violation(t.output_schema("set_dex_score_policy"), sc) == "");
+        CHECK(t.domain_rows.size() == 2);
+    }
+    SECTION("a dry run") {
+        Twin t;
+        t.generic_audit_ok = false;
+        json args = set_args(95.0, "default");
+        args["dry_run"] = true;
+        const json r = t.call("set_dex_score_policy", args);
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(r["result"]["structuredContent"]["dry_run"] == true);
+        CHECK(r["result"]["structuredContent"]["audit_persisted"] == false);
+    }
+    SECTION("a refused set reaches the A4 envelope's audit flag") {
+        Twin t;
+        t.generic_audit_ok = false;
+        const json r = t.call("set_dex_score_policy", {{"document", doc_json(95.0)}});
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["data"]["audit_persisted"] == false);
+        CHECK(t.cas_calls == 0);
+    }
+    SECTION("a reset") {
+        Twin t;
+        t.tier = ""; // not ticket-gated: the body is under test, the round trip is below
+        t.generic_audit_ok = false;
+        t.stored = doc_with_excellent(80.0);
+        const json r = t.call("reset_dex_score_policy", {{"if_match", rev_of(*t.stored)}});
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(t.car_calls == 1);
+        CHECK(r["result"]["structuredContent"]["audit_persisted"] == false);
+    }
+}
+
+TEST_CASE("set_dex_score_policy: resending the same document with the current revision is a second "
+          "success that stores the same policy",
+          "[mcp][dex][score_policy]") {
+    Twin t;
+    const json first = t.call("set_dex_score_policy", set_args(95.0, "default"));
+    REQUIRE_FALSE(first.contains("error"));
+    const std::string rev = first["result"]["structuredContent"]["revision"];
+    const json again = t.call("set_dex_score_policy", set_args(95.0, rev));
+    REQUIRE_FALSE(again.contains("error"));
+    const json& sc = again["result"]["structuredContent"];
+    CHECK(sc["revision"] == rev);
+    CHECK(sc["previous_revision"] == rev);
+    CHECK(schema_violation(t.output_schema("set_dex_score_policy"), sc) == "");
+    CHECK(t.cas_calls == 2);
+    REQUIRE(t.stored.has_value());
+    CHECK(*t.stored == doc_with_excellent(95.0));
+    CHECK(audit_count(t.domain_rows, kAttemptedUpdate) == 2);
+    CHECK(audit_count(t.domain_rows, kSuccessUpdate) == 2);
 }
 
 // ───────────────────────── reset_dex_score_policy ───────────────────────────────
@@ -852,6 +994,26 @@ TEST_CASE("reset_dex_score_policy: a store error after the remove with another d
     CHECK(rem.find("get_dex_score_policy") != std::string::npos);
     CHECK(rem.find("compare its revision") != std::string::npos);
     CHECK(rem.find("without approval_id") != std::string::npos);
+}
+
+TEST_CASE("reset_dex_score_policy: a sink that refuses the attempted row removes nothing, is "
+          "retryable with the audit hint and names the ticket recovery",
+          "[mcp][dex][score_policy]") {
+    Twin t;
+    t.tier = "";
+    t.stored = doc_with_excellent(80.0);
+    t.domain_fail_result = "attempted";
+    const json r = t.call("reset_dex_score_policy", {{"if_match", rev_of(*t.stored)}});
+    REQUIRE(r.contains("error"));
+    CHECK(r["error"]["code"] == mcp::kInternalError);
+    CHECK(r["error"]["data"]["retry_after_ms"] == kDexScorePolicyAuditRetryMs);
+    const std::string rem = r["error"]["data"]["remediation"].get<std::string>();
+    CHECK(rem.find("retry the request") != std::string::npos); // apply's own remediation first
+    CHECK(rem.find("fresh ticket") != std::string::npos);
+    CHECK(rem.find("without approval_id") != std::string::npos);
+    CHECK(t.car_calls == 0);
+    CHECK(t.stored.has_value());
+    CHECK(audit_count(t.generic_rows, "mcp.reset_dex_score_policy|failure") == 1);
 }
 
 TEST_CASE("reset_dex_score_policy: at the supervised tier it is approval-gated, and without an "
@@ -983,6 +1145,14 @@ TEST_CASE("reset_dex_score_policy: an unwired apply closure, audit sink or usern
         const json r = t.call("reset_dex_score_policy", {{"if_match", rev_of(*t.stored)}});
         REQUIRE(r.contains("error"));
         CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"].is_null());
+        // The approval ticket was consumed before the handler ran, so this refusal spent it:
+        // the recovery is carried even though the policy was never touched.
+        const std::string rem = r["error"]["data"]["remediation"].get<std::string>();
+        CHECK(rem.find("spent") != std::string::npos);
+        CHECK(rem.find("without approval_id") != std::string::npos);
+        CHECK(rem.find("fresh ticket") != std::string::npos);
+        CHECK(audit_count(t.generic_rows, "mcp.reset_dex_score_policy|failure") == 1);
         CHECK(t.car_calls == 0);
         CHECK(t.stored.has_value());
     }

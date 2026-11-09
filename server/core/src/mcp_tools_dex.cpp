@@ -21,7 +21,9 @@
 //     delete_result_set mechanism); MCP is therefore stricter than REST DELETE, which needs
 //     Infrastructure:Write only. set is NOT approval-gated (Infrastructure:Write, like
 //     set_runtime_config). The ticket is consumed BEFORE the handler runs, so any failure after
-//     that point spends it: the remediation says so and how to recover.
+//     that point spends it: the remediation says so and how to recover (the one exception is a
+//     refusal by the handler's own perm_fn gate, whose 403 body is the gate's; the tool
+//     description says that spends the ticket too).
 //   * deny_mcp_token_session is deliberately absent: the REST routes admit MCP-tier tokens and
 //     this twin exists to serve them.
 //
@@ -33,9 +35,11 @@
 // equivalent of REST's Sec-Audit-Failed header.
 //
 // ONE handler per tool, never a shared one: the A5 retry-hint gate
-// (scripts/ci/check-mcp-retry-hints.py) scans each tool's own handler body. The one shared
-// helper, writer_actor, holds only answer_unwired (non-retryable by design): no a4_error, so no
-// retry site hides outside a handler.
+// (scripts/ci/check-mcp-retry-hints.py) scans each tool's own handler body. Two shared helpers
+// answer outside a handler, and both are non-retryable by design, each marked
+// `// retry-hint-exempt:` on its a4_error line: tier_admits (the token's tier never changes) and
+// writer_actor (an unwired closure or unresolved caller is a misconfiguration, not a transient
+// fault). Every retryable answer lives inside a handle_* body.
 
 #include "mcp_tool_registry.hpp"
 
@@ -47,6 +51,7 @@
 #include "rest_audit.hpp"            // detail::try_persist_audit (the shared audit kernel)
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <optional>
 #include <span>
@@ -78,10 +83,12 @@ constexpr const char* kWriteOutputSchema =
     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when an audit row after the change failed to persist; the change stands"})j"
     R"j(},"required":["document","revision","source","previous_revision"]})j";
 
-/// Appended to every reset refusal or failure: the generic gate consumed the approval ticket
-/// before the handler ran (mcp_server.cpp), so a repeat with the same approval_id is refused.
+/// Carried by every reset refusal or failure the handler answers after the ticket is consumed:
+/// the generic gate consumed the approval ticket before the handler ran (mcp_server.cpp), so a
+/// repeat with the same approval_id is refused. The remediation of a reset error that already
+/// has one gets it after a "; ".
 constexpr std::string_view kResetTicketSpentNote =
-    "; the approval ticket this call consumed is spent: read the policy with "
+    "the approval ticket this call consumed is spent: read the policy with "
     "get_dex_score_policy, compare its revision with the one named here, then submit a new "
     "request without approval_id for a fresh ticket";
 
@@ -122,22 +129,29 @@ ToolDeps::DexScorePolicyAuditFn audit_hook(const ToolCallContext& ctx, bool& per
 /// row: the apply and audit closures must be wired (an unwired sink would be called
 /// "persisted" by the kernel, so it is refused here; stricter than REST, which treats an empty
 /// sink as audit-off: "no audit row, no mutation") and the caller's username must resolve (it
-/// would name no one). Either refusal is answered here (answer_unwired: non-retryable by
-/// design, no retry hint) and yields nullopt; otherwise the actor for the audit rows.
-std::optional<std::string> writer_actor(const ToolCallContext& ctx, std::string_view tool) {
+/// would name no one). Either refusal is answered here and yields nullopt; otherwise the actor
+/// for the audit rows. The answer is answer_unwired's shape (the generic failure row, no
+/// retry hint, no data), written here because answer_unwired carries no remediation:
+/// `remediation` is empty for set, and for reset the spent-ticket recovery, since its approval
+/// ticket was consumed before the handler ran and these refusals spend it too.
+std::optional<std::string> writer_actor(const ToolCallContext& ctx, std::string_view tool,
+                                        std::string_view remediation) {
+    const auto refuse = [&](const std::string& detail, const std::string& log) {
+        spdlog::error("{}", log);
+        const bool audited = ctx.audit("failure", detail);
+        answer(ctx, ctx.a4_error(kInternalError, "service unavailable", remediation, -1, {}, audited)); // retry-hint-exempt: an unwired closure or unresolved caller is a misconfiguration, not a transient fault
+    };
     if (ctx.deps == nullptr || !ctx.deps->dex_score_policy_apply_fn || !ctx.deps->audit_fn) {
-        answer_unwired(ctx, "service unavailable",
-                       "dex score policy provider unwired; policy not changed", {},
-                       std::string(tool) + ": apply or audit closure unwired - misconfigured call "
-                                           "site; failing closed, policy not changed");
+        refuse("dex score policy provider unwired; policy not changed",
+               std::string(tool) + ": apply or audit closure unwired - misconfigured call site; "
+                                   "failing closed, policy not changed");
         return std::nullopt;
     }
     auto resolved = ctx.deps->username_fn ? ctx.deps->username_fn(ctx.req) : std::nullopt;
     if (!resolved || resolved->empty()) {
-        answer_unwired(ctx, "service unavailable", "caller identity unresolved; policy not changed",
-                       {},
-                       std::string(tool) + ": the caller's username could not be resolved - "
-                                           "failing closed, policy not changed");
+        refuse("caller identity unresolved; policy not changed",
+               std::string(tool) + ": the caller's username could not be resolved - failing "
+                                   "closed, policy not changed");
         return std::nullopt;
     }
     return resolved;
@@ -184,12 +198,12 @@ void handle_set_dex_score_policy(const ToolCallContext& ctx) {
         return; // loud
     if (!ctx.perm_fn(ctx.req, ctx.res, "GuaranteedState", "Read"))
         return; // loud: the answer carries application names
-    auto rq = dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op::Put, ctx.args, {});
+    auto rq = dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op::Put, ctx.args);
     if (!rq) {
         refuse_params(ctx, rq.error());
         return;
     }
-    const auto actor = writer_actor(ctx, "set_dex_score_policy");
+    const auto actor = writer_actor(ctx, "set_dex_score_policy", {});
     if (!actor)
         return; // refused BEFORE any row; the answer is written
     rq->actor = *actor;
@@ -228,12 +242,12 @@ void handle_reset_dex_score_policy(const ToolCallContext& ctx) {
         return; // loud: the answer carries application names
     // approval_id was consumed by the generic approval gate before this handler; the strict
     // check accepts and ignores it.
-    auto rq = dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op::Reset, ctx.args, {});
+    auto rq = dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op::Reset, ctx.args);
     if (!rq) {
         refuse_params(ctx, rq.error());
         return;
     }
-    const auto actor = writer_actor(ctx, "reset_dex_score_policy");
+    const auto actor = writer_actor(ctx, "reset_dex_score_policy", kResetTicketSpentNote);
     if (!actor)
         return;
     rq->actor = *actor;
@@ -254,8 +268,8 @@ void handle_reset_dex_score_policy(const ToolCallContext& ctx) {
         persisted = false;
     // The approval ticket was spent before this handler ran, so every refusal or failure here
     // has burned it: say how to recover.
-    const std::string remediation =
-        dex_score_policy_mcp_remediation(r.remediation) + std::string(kResetTicketSpentNote);
+    const std::string remediation = dex_score_policy_mcp_remediation(r.remediation) + "; " +
+                                    std::string(kResetTicketSpentNote);
     if (code == kInvalidParams) {
         answer(ctx, ctx.a4_error(kInvalidParams, r.message, remediation, -1, {}, persisted)); // retry-hint-exempt: caller refusal (If-Match, stale revision); resending fails identically
         return;
@@ -283,7 +297,7 @@ constexpr ToolRecord kToolRecords[] = {
      "nothing were stored. Takes no arguments. Requires GuaranteedState:Read, held outright (a "
      "management-group-scoped grant alone does not pass); readable at every MCP tier. Mirrors "
      "GET /api/v1/dex/score-policy. Read-only.",
-     R"({"type":"object","properties":{}})",
+     R"({"type":"object","properties":{},"additionalProperties":false})",
      kGetOutputSchema,
      "GuaranteedState", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true,
      "Get the DEX score policy", &handle_get_dex_score_policy},
@@ -333,7 +347,9 @@ constexpr ToolRecord kToolRecords[] = {
      "(a busy writer, an unavailable store or audit log, a write whose outcome is unknown, a "
      "stale or missing if_match) spends it: call get_dex_score_policy, compare its revision with "
      "the one the error names, then submit a NEW request without approval_id for a fresh ticket "
-     "(a repeat with the spent approval_id answers 'approval already used'). Stricter than REST "
+     "(a repeat with the spent approval_id answers 'approval already used'). A refusal by the "
+     "handler's own permission gate (its 403 carries no such hint) spends the ticket too. "
+     "Stricter than REST "
      "DELETE, which needs only Infrastructure:Write. Non-retryable invalid-params errors name the "
      "field; busy, unavailable and unknown-outcome errors are retryable with retry_after_ms. "
      "audit_persisted:false is present only when an audit row after the change failed to "
