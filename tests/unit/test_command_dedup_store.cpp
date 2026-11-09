@@ -1057,6 +1057,27 @@ TEST_CASE("sqlite_quarantine: a filesystem without hard links fails the claim cl
         CHECK(e.path() == db);
 }
 
+TEST_CASE("sqlite_quarantine: when every quarantine name is taken the claim gives up and the file stays",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The injected link answers "exists" for every name, so the claim must stop after exactly
+    // kMaxClaimAttempts tries (no unbounded loop) and refuse rather than overwrite anything.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "main");
+    int calls = 0;
+    sq::FsOps ops;
+    ops.link = [&calls](const fs::path&, const fs::path&, std::error_code& ec) {
+        ++calls;
+        ec = std::make_error_code(std::errc::file_exists);
+    };
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(db, 5, ".corrupt-", &notes, ops).has_value());
+    CHECK(calls == sq::kMaxClaimAttempts);
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("every quarantine name") != std::string::npos);
+    CHECK(read_bytes(db) == "main"); // the original is untouched
+}
+
 #ifndef _WIN32
 TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replaced",
           "[command_dedup][corruption][quarantine_fs]") {

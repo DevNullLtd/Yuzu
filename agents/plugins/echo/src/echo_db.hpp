@@ -535,6 +535,20 @@ struct OpenSeams {
     std::function<std::expected<void, std::string>()> v10_after_drop;
 };
 
+/// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the
+/// file aside; `busy` and `unreadable` refuse to open and quarantine nothing (a quarantine plus a
+/// fresh file would re-enable every source an operator paused).
+enum class IntegrityCheck {
+    ok,        ///< the check passed
+    busy,      ///< another connection holds the file past the busy timeout (BUSY / LOCKED)
+    corrupt,   ///< a non-"ok" integrity row, or SQLITE_CORRUPT / SQLITE_NOTADB
+    unreadable ///< any other failure to read the file (IOERR, CANTOPEN, PERM, READONLY, FULL, ...)
+};
+
+/// Classify the sqlite result code that a failed `PRAGMA integrity_check` (prepare or step) ended
+/// with. Pure; `rc` may be an extended code, only its primary (low) byte counts. Never returns `ok`.
+IntegrityCheck classify_integrity_rc(int rc) noexcept;
+
 class EchoDatabase {
 public:
     /**
@@ -544,7 +558,9 @@ public:
      *
      * On failure the error text says WHY and, where there is one, the remedy: the directory
      * cannot be created, SQLite cannot open the file, a corrupt echo.db could not be moved aside
-     * (#559, refused rather than trusted), a schema transaction wedged, or -- on Windows only --
+     * (#559, refused rather than trusted), the file is busy or could not be read for a reason
+     * that is not corruption (refused, nothing quarantined, retried on the next start, #7286), a
+     * schema transaction wedged, or -- on Windows only --
      * a planted echo.db (refused) or a planted -wal, -shm or -journal that could not be replaced
      * (foreign owner or extra hard link), or -- for a database that still holds the retired raw
      * tables -- a volume with less than twice the file's size (plus its log) free, or a v10 migration that

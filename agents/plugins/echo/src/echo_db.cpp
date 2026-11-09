@@ -225,30 +225,33 @@ constexpr const char* kCreateSchema = R"(
 // for forensic preservation — defeating the #539 retention guard with no
 // telemetry.
 //
-// Three answers, not two (#7286): a database another connection holds past the busy timeout is
-// BUSY, not corrupt, and quarantining it would move a healthy file (and the paused-source state in
-// it) out from under its holder. The caller refuses to open on busy and quarantines nothing. Every
-// other failure to read the file (a prepare that fails for a non-database file, a corrupt page, an
-// I/O error) stays corrupt, the fail-closed side.
-enum class IntegrityCheck { ok, busy, corrupt };
+// Four answers (#7286). Only an EXPLICIT integrity failure quarantines: a non-"ok" integrity row,
+// or SQLITE_CORRUPT / SQLITE_NOTADB (the sibling store's rule, command_dedup_store.cpp
+// is_corruption_rc). A database another connection holds past the busy timeout is BUSY, and
+// quarantining it would move a healthy file (and the paused-source state in it) out from under its
+// holder. Every other failure to read the file (an I/O error, CANTOPEN, PERM, READONLY, FULL,
+// PROTOCOL, NOMEM) says nothing about the file's health, so it is UNREADABLE: the caller refuses to
+// open and quarantines nothing. Quarantine plus a fresh file is the fail-OPEN side here (a fresh
+// file re-enables every source an operator paused, #559); refusing to open is the fail-closed side,
+// and the next start retries. The rc classifier is `classify_integrity_rc` (echo_db.hpp).
+struct IntegrityResult {
+    IntegrityCheck verdict;
+    int rc; ///< the sqlite rc behind a non-ok verdict (SQLITE_ROW for a non-"ok" integrity row)
+};
 
-bool is_busy_rc(int rc) noexcept {
-    const int primary = rc & 0xff; // an extended code (SQLITE_BUSY_SNAPSHOT, ...) keeps it in the low byte
-    return primary == SQLITE_BUSY || primary == SQLITE_LOCKED;
-}
-
-IntegrityCheck check_integrity(sqlite3* db) noexcept {
+IntegrityResult check_integrity(sqlite3* db) noexcept {
     sqlite3_stmt* raw = nullptr;
     const int prc = sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &raw, nullptr);
     StmtPtr stmt(raw);
     if (prc != SQLITE_OK)
-        return is_busy_rc(prc) ? IntegrityCheck::busy : IntegrityCheck::corrupt;
+        return {classify_integrity_rc(prc), prc};
     const int src = sqlite3_step(stmt.get());
     if (src == SQLITE_ROW) {
         const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-        return txt && std::string_view{txt} == "ok" ? IntegrityCheck::ok : IntegrityCheck::corrupt;
+        const bool ok = txt && std::string_view{txt} == "ok";
+        return {ok ? IntegrityCheck::ok : IntegrityCheck::corrupt, src};
     }
-    return is_busy_rc(src) ? IntegrityCheck::busy : IntegrityCheck::corrupt;
+    return {classify_integrity_rc(src), src};
 }
 
 // The integer in an echo_config `schema_version` value; an unparseable one reads as 0.
@@ -649,6 +652,15 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
 
 } // namespace
 
+IntegrityCheck classify_integrity_rc(int rc) noexcept {
+    const int primary = rc & 0xff; // an extended code (SQLITE_BUSY_SNAPSHOT, ...) keeps it in the low byte
+    if (primary == SQLITE_BUSY || primary == SQLITE_LOCKED)
+        return IntegrityCheck::busy;
+    if (primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB)
+        return IntegrityCheck::corrupt;
+    return IntegrityCheck::unreadable;
+}
+
 // ── Construction / destruction ───────────────────────────────────────────────
 
 EchoDatabase::EchoDatabase(sqlite3* db) : db_{db} {}
@@ -847,9 +859,19 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // passes trivially; an existing corrupt one is quarantined aside and a clean
     // DB is re-opened in its place, so the agent never silently serves garbage
     // config (which would re-enable operator-paused sources, compounding #539).
-    switch (check_integrity(guard.get())) {
+    const auto checked = check_integrity(guard.get());
+    switch (checked.verdict) {
     case IntegrityCheck::ok:
         break;
+    case IntegrityCheck::unreadable:
+        // The file could not be read for a reason that is not corruption (an I/O error, a
+        // permission or space fault, WAL lock contention). Quarantine would replace it with a
+        // fresh database that re-enables every paused source, so refuse to open instead and let
+        // the next start retry (#7286).
+        return std::unexpected(std::format(
+            "echo.db could not be checked (sqlite rc {}): not quarantined and not opened; "
+            "retried on the next start: {}",
+            checked.rc, path.string()));
     case IntegrityCheck::busy:
         // Another connection holds the file past the busy timeout. That says nothing about its
         // health, so quarantine nothing (a quarantine would move a healthy file away from its
@@ -897,7 +919,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         // also catches the case where a -wal/-shm sidecar belonging to the
         // quarantined file could neither be moved nor removed and was adopted by
         // the new file. If even the fresh DB is not clean (or is busy), fail closed.
-        if (check_integrity(guard.get()) != IntegrityCheck::ok) {
+        if (check_integrity(guard.get()).verdict != IntegrityCheck::ok) {
             return std::unexpected(std::format(
                 "echo.db re-initialised after quarantine still fails integrity_check: {}",
                 path.string()));
@@ -1403,12 +1425,16 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // capture source. Best-effort per file (-wal/-shm/-journal may not exist yet); a chmod
     // failure never fails an otherwise-healthy open. SQLite derives later sidecar modes from
     // the db file. POSIX mode bits only; Windows applies a protected DACL in the #else arm.
+    // `nofollow`: the link check ran at the start of open(), so a link swapped in since must not
+    // have its target chmod'ed (a regular file is unaffected).
     for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
         std::error_code pec;
         std::filesystem::permissions(path.string() + suffix,
                                      std::filesystem::perms::owner_read |
                                          std::filesystem::perms::owner_write,
-                                     std::filesystem::perm_options::replace, pec);
+                                     std::filesystem::perm_options::replace |
+                                         std::filesystem::perm_options::nofollow,
+                                     pec);
     }
 #else
     // The pre-open pass created or re-secured the four files, but on a FRESH (0-page)

@@ -3863,6 +3863,31 @@ TEST_CASE("EchoDatabase: a busy echo.db is refused and never quarantined (#7286)
     CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
 }
 
+// #7286. Quarantine plus a fresh file is the fail-OPEN side (a fresh database re-enables every
+// source an operator paused), so only an explicit integrity failure may quarantine. A read error
+// such as IOERR cannot be provoked portably at the integrity stage, so the rc classifier open()
+// uses is a pure function and pinned here: the error codes that say nothing about the file's
+// health are "unreadable" and make open() refuse without moving anything.
+TEST_CASE("classify_integrity_rc: only CORRUPT and NOTADB quarantine, BUSY refuses, the rest is unreadable (#7286)",
+          "[echo][store][corruption]") {
+    // Busy: the holder's problem, not the file's -- including the extended codes.
+    CHECK(classify_integrity_rc(SQLITE_BUSY) == IntegrityCheck::busy);
+    CHECK(classify_integrity_rc(SQLITE_LOCKED) == IntegrityCheck::busy);
+    CHECK(classify_integrity_rc(SQLITE_BUSY_SNAPSHOT) == IntegrityCheck::busy);
+    CHECK(classify_integrity_rc(SQLITE_BUSY_RECOVERY) == IntegrityCheck::busy);
+    // Corrupt: the two codes the sibling store also quarantines on, extended codes included.
+    CHECK(classify_integrity_rc(SQLITE_CORRUPT) == IntegrityCheck::corrupt);
+    CHECK(classify_integrity_rc(SQLITE_CORRUPT_VTAB) == IntegrityCheck::corrupt);
+    CHECK(classify_integrity_rc(SQLITE_NOTADB) == IntegrityCheck::corrupt);
+    // Unreadable: environmental or transient faults must never move a healthy file away.
+    for (const int rc : {SQLITE_IOERR, SQLITE_IOERR_READ, SQLITE_CANTOPEN, SQLITE_PERM,
+                         SQLITE_READONLY, SQLITE_NOMEM, SQLITE_FULL, SQLITE_PROTOCOL, SQLITE_ERROR,
+                         SQLITE_DONE}) {
+        INFO("rc = " << rc << " (" << sqlite3_errstr(rc) << ")");
+        CHECK(classify_integrity_rc(rc) == IntegrityCheck::unreadable);
+    }
+}
+
 TEST_CASE("EchoDatabase: a genuinely corrupt echo.db is still quarantined, and its handle is closed (#7286, #6698)",
           "[echo][store][lifecycle][corruption]") {
     yuzu::test::TempDir dir{"yuzu_test_echo_stillcorrupt_"};

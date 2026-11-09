@@ -14,7 +14,13 @@
 /// dropped. PRECONDITION: the directory's filesystem supports hard links (NTFS, ReFS, ext4, xfs,
 /// APFS, tmpfs all do). Without hard links the claim FAILS CLOSED (nullopt plus a note naming the
 /// directory): there is deliberately no check-then-rename fallback, and callers refuse to proceed
-/// rather than risk destroying evidence.
+/// rather than risk destroying evidence. Only the main file's name is claimed this way; a
+/// sidecar's quarantine name is derived from that exclusively claimed name (`<claimed>-wal`), so
+/// the plain exists-then-rename step used for sidecars cannot collide with another recovery.
+/// An interruption between the link and the remove (a crash, or a failed undo) leaves the file
+/// under both names: a POSIX open quarantines it again under the next free name, while the
+/// Windows Echo open refuses until one of the two names is removed (the second link reads as a
+/// planted file; docs/user-manual/upgrading.md gives the remedy).
 ///
 /// Names have the exact form `<file><suffix><epoch>[-<n>]` (suffix `.corrupt-` or `.planted-`),
 /// which the dedup store's prune parser relies on.
@@ -159,9 +165,14 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
         const bool present = fs::exists(side, ec);
         if (ec) {
             // Cannot tell whether it is there: drop it rather than leave a possibly stale sidecar
-            // beside the fresh database. Best effort.
+            // beside the fresh database. Best effort, and the caller is told.
             std::error_code rm;
             fs::remove(side, rm);
+            result.notes.push_back(std::format(
+                "could not examine {} ({}); removed best effort so the fresh database cannot "
+                "replay it{}",
+                side.string(), ec.message(),
+                rm ? std::format(" (the remove failed too: {})", rm.message()) : std::string{}));
             continue;
         }
         if (!present)

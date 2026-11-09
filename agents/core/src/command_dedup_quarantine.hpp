@@ -45,8 +45,9 @@ namespace yuzu::agent::dedup_quarantine {
 /// that corrupts the file on every boot would otherwise leave one per boot, forever.
 inline constexpr std::size_t kKeepQuarantined = 3;
 
-/// The sidecars SQLite keeps beside a database.
-inline constexpr std::string_view kSidecars[] = {"-wal", "-shm", "-journal"};
+/// The sidecars SQLite keeps beside a database (one list, shared with the quarantine primitive;
+/// declared here, ahead of parse_quarantine_name, which iterates it).
+using yuzu::shared::sqlite_quarantine::kSidecars;
 
 /// All of `s` is ASCII digits and fits a long long. `from_chars` alone is NOT enough: it accepts a
 /// leading '-' (so "-0" would pass a `< 0` check).
