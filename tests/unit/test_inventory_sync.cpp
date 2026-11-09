@@ -263,7 +263,7 @@ TEST_CASE("clamp_field strips framing separators and truncates over-long fields"
     std::string longname(2000, 'x');
     auto e2 = parse_installed_apps_output("inv|" + longname + "|1|p|d\n");
     REQUIRE(e2.size() == 1);
-    CHECK(e2[0].name.size() == 1024); // truncated to kMaxFieldLen
+    CHECK(e2[0].name.size() == 1024); // truncated to kV3MaxFieldLen
 }
 
 TEST_CASE("clamp_field truncates on a UTF-8 codepoint boundary, not mid-sequence (UP-10)",
@@ -2404,8 +2404,9 @@ TEST_CASE("collector: Windows-shaped run with the real captures", "[sync][collec
     CHECK(plus_records(got->first).size() == 241 + 17 + msi_sample_mapped_rows());
 }
 
-TEST_CASE("entry cap: the splitter reads one past kMaxEntries; the collector reports oversize above it",
-          "[sync][collector][cap]") {
+TEST_CASE(
+    "entry cap: the splitter reads one past kV3MaxRows; the collector reports oversize above it",
+    "[sync][collector][cap]") {
     CHECK(parse_installed_apps_output(inv_lines(20001)).size() == 20001);
 
     reset_fakes();

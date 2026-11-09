@@ -107,7 +107,7 @@ struct AdaptedRows {
 /// entries. Rows with any other prefix (`app|`, `user_app|`, `error|`, ...) are
 /// ignored; missing trailing tokens read as empty fields (tolerant; a plugin of the previous
 /// 13-token layout reads as an empty install_location), tokens beyond the 14th are dropped
-/// (fields never shift). Bounded at kMaxEntries + 1 entries: the collector's per-action
+/// (fields never shift). Bounded at kV3MaxRows + 1 entries: the collector's per-action
 /// raw-count check, not this parser, rejects an over-cap host.
 YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& out);
 
@@ -296,10 +296,11 @@ struct CollectorTuning {
 /// Each action runs on a bounded detached worker (agents/shared/bounded_wait.hpp), one at a
 /// time, under its table time limit. `workers` is the agent-owned single-flight state above;
 /// `kv_get`/`kv_set` are the `__sync__` accessors the per-facet acknowledged sets persist
-/// through (`sync.installed_software.<facet>.acked` / `.need_full`). The source answers the
-/// scheduler's hooks: on_force_full (every facet full next), wants_blob (a section was emitted),
-/// on_ack (commit the acknowledged sections, mark nacked ones full), has_more (a first contact
-/// larger than one call).
+/// through (`sync.installed_software.<facet>.acked` / `.need_full`). All three are required: a
+/// source built without the agent's workers would hold private single-flight state. The source
+/// answers the scheduler's hooks: on_force_full (every facet full next), wants_blob (a section
+/// was emitted), on_ack (commit the acknowledged sections, mark nacked ones full), has_more (a
+/// first contact larger than one call).
 YUZU_EXPORT SyncSource make_installed_software_source(SyncPluginMap plugins,
                                                       SyncScheduler::KvGetFn kv_get,
                                                       SyncScheduler::KvSetFn kv_set,

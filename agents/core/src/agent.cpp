@@ -325,7 +325,7 @@ struct CommandContextImpl {
     // on the server (in-tree convention: same constant in two places
     // until typed proto lands and renders both moot). This is the
     // DEFAULT; a caller that needs a larger bounded payload (the
-    // installed_software sync's v2 rows, blob contract v2) overrides it
+    // installed_software sync's rows, blob contract v3) overrides it
     // per-dispatch via `capture_max_bytes` below — see dispatch_with_capture.
     static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
     std::size_t capture_max_bytes{kCaptureMaxBytes};

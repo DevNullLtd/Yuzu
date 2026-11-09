@@ -2,7 +2,7 @@
 
 // installed_apps_parsers.hpp -- pure parse helpers for the `list`/`query`/
 // `list_per_user` acquisition legs of installed_apps_plugin.cpp (the
-// `list_inventory` v2-row parsers already live in installed_apps_inventory.hpp
+// `list_inventory` row parsers already live in installed_apps_inventory.hpp
 // and are unchanged by this header).
 //
 // Header-only and OS-free so every parser here is fixture-tested on any host
@@ -414,34 +414,6 @@ constexpr long kErrorNoMoreItems = 259;
     if (status == kErrorFileNotFound && absent_ok)
         return HiveRead::absent;
     return HiveRead::failed;
-}
-
-// ── Which Uninstall roots may degrade a Windows collection ──────────────────
-// list_inventory is MACHINE-scope data. Three roots are walked (installed_apps_plugin.cpp
-// windows_roots): the native HKLM view, the WOW6432Node view and the agent identity's OWN HKCU.
-//   - a failed read of the own HKCU never degrades the collection: it holds the service
-//     account's per-user entries, which the inventory does not report;
-//   - the WOW6432Node view is absent only on a 32-bit OS: on a 64-bit OS its Uninstall key is
-//     part of a healthy hive, so "not found" there is a broken view, not an empty one;
-//   - the native HKLM view is never allowed to be absent.
-// Every other status (access denied, more data, an enumeration that does not end in
-// ERROR_NO_MORE_ITEMS) degrades regardless of root (classify_reg_status).
-enum class UninstallView { hklm_native, hklm_wow64, own_hkcu };
-
-[[nodiscard]] constexpr bool failed_root_degrades(UninstallView v) noexcept {
-    return v != UninstallView::own_hkcu;
-}
-
-[[nodiscard]] constexpr bool root_absent_ok(UninstallView v, bool os_is_64bit) noexcept {
-    switch (v) {
-    case UninstallView::hklm_native:
-        return false;
-    case UninstallView::hklm_wow64:
-        return !os_is_64bit;
-    case UninstallView::own_hkcu:
-        return true;
-    }
-    return false;
 }
 
 // ── Degraded-acquisition contract (every OS) ────────────────────────────────

@@ -1,9 +1,9 @@
 #pragma once
 
 // installed_apps_inventory.hpp -- pure parsing/formatting helpers for the
-// `list_inventory` action (software-inventory blob contract v2, ADR-0016).
+// `list_inventory` action (software-inventory blob contract v3, ADR-0016).
 //
-// The v2 contract: fields an ecosystem does not store stay EMPTY, never
+// The contract: fields an ecosystem does not store stay EMPTY, never
 // synthesised. Every function here is a pure string operation -- no popen, no
 // platform #ifdefs -- so the unit test (test_installed_apps_inventory.cpp)
 // exercises the exact code the plugin runs against per-ecosystem fixture
@@ -29,9 +29,9 @@
 namespace yuzu::installed_apps::inventory {
 
 // One `inv|` row. Member order == wire order after the prefix -- the blob
-// contract v2 field order the agent core hashes and the server re-parses:
+// contract v3 field order the agent core hashes and the server re-parses:
 //   name, version, publisher, install_date, kind, ecosystem, epoch, release,
-//   arch, signature_status, distro_id, distro_version
+//   arch, signature_status, distro_id, distro_version, install_location
 struct InvRecord {
     std::string name;
     std::string version;      // upstream version, release/revision stripped

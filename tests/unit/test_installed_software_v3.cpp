@@ -441,8 +441,10 @@ TEST_CASE("write_v3_blob: header, S field order, status-only sections first, no 
     SectionPlan full = plan_section(kApps, {row("a"), row("b")}, std::nullopt, false);
     full.duration_ms = 12;
     full.bytes_read = 3456;
-    SectionPlan degraded = status_section(kPy, V3Status::constrained, "rc=2", 7, 99);
-    SectionPlan absent = status_section(kPkgs, V3Status::not_collected, "not_loaded", 0, 0);
+    SectionPlan degraded = status_section(kPy, V3Status::constrained, "rc=2");
+    degraded.duration_ms = 7;
+    degraded.bytes_read = 99;
+    SectionPlan absent = status_section(kPkgs, V3Status::not_collected, "not_loaded");
 
     const auto out = write_v3_blob({full, degraded, absent});
     CHECK(out.blob.starts_with(std::string(kV3Header)));
@@ -461,7 +463,7 @@ TEST_CASE("write_v3_blob: header, S field order, status-only sections first, no 
     CHECK(parsed.sections[2].adds.size() == 2);
     // A token is bounded to the safe alphabet: a separator cannot re-frame the S record.
     const auto evil = write_v3_blob(
-        {status_section(kPy, V3Status::timeout, "a\x1f" "b\x1e" "c d", 0, 0)});
+        {status_section(kPy, V3Status::timeout, "a\x1f" "b\x1e" "c d")});
     CHECK(parse_like_server(evil.blob).sections[0].header[4] == "a_b_c_d");
     // An unchanged plan is not written at all.
     SectionPlan unchanged = plan_section(kApps, {row("a")}, acked_of(plan_section(kApps, {row("a")}, std::nullopt, false)), false);

@@ -765,31 +765,6 @@ TEST_CASE("emit_inventory: degraded is rc 1 with no rows and the typed status",
     CHECK(bad.provenance == "installed_apps:acquisition_degraded");
 }
 
-TEST_CASE("Uninstall roots: which failed reads degrade a machine-scope collection",
-          "[installed_apps]") {
-    using V = UninstallView;
-    // The agent identity's OWN HKCU is per-user data: its failure never degrades, and its absence
-    // is normal. The two HKLM views always degrade on a failed read.
-    CHECK_FALSE(failed_root_degrades(V::own_hkcu));
-    CHECK(failed_root_degrades(V::hklm_native));
-    CHECK(failed_root_degrades(V::hklm_wow64));
-    CHECK(root_absent_ok(V::own_hkcu, true));
-    CHECK(root_absent_ok(V::own_hkcu, false));
-    // The WOW6432Node view is absent only on a 32-bit OS; on a 64-bit OS "not found" is a broken view.
-    CHECK(root_absent_ok(V::hklm_wow64, false));
-    CHECK_FALSE(root_absent_ok(V::hklm_wow64, true));
-    // The native HKLM view is never allowed to be absent.
-    CHECK_FALSE(root_absent_ok(V::hklm_native, true));
-    CHECK_FALSE(root_absent_ok(V::hklm_native, false));
-    // With the status classifier: not-found is clean only where absent_ok, access denied never.
-    CHECK(classify_reg_status(kErrorFileNotFound, root_absent_ok(V::hklm_wow64, false)) ==
-          HiveRead::absent);
-    CHECK(classify_reg_status(kErrorFileNotFound, root_absent_ok(V::hklm_wow64, true)) ==
-          HiveRead::failed);
-    CHECK(classify_reg_status(kErrorAccessDenied, root_absent_ok(V::own_hkcu, false)) ==
-          HiveRead::failed);
-}
-
 TEST_CASE("report_hive_read_failed: zero is silent; a failure is a trailing warning plus the typed status",
           "[installed_apps]") {
     RecCtx none;

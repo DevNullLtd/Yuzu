@@ -281,21 +281,18 @@ namespace reg_walk = yuzu::installed_apps::reg_walk;
 const std::wstring kUninstallKey = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
 std::span<const reg_walk::UninstallRoot> windows_roots() {
-    // A 64-bit process runs on a 64-bit OS; the plugin ships x64 only.
-    constexpr bool kOs64 = sizeof(void*) == 8;
-    using V = parsers::UninstallView;
+    // Columns: root, subkey, extra_sam, absent_ok, degrades_walk. The plugin ships x64 only, so a
+    // 64-bit process always runs on a 64-bit OS and the WoW64 view always exists.
     static const reg_walk::UninstallRoot roots[] = {
         // 64-bit HKLM: setup always creates it, so its absence is a broken hive.
-        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, parsers::root_absent_ok(V::hklm_native, kOs64),
-         parsers::failed_root_degrades(V::hklm_native)},
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, false, true},
         // 32-bit HKLM (WoW6432Node): absent only on a 32-bit OS (a key that does not exist has no
-        // entries); on a 64-bit OS a missing view is a broken one. Every other status degrades.
-        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, parsers::root_absent_ok(V::hklm_wow64, kOs64),
-         parsers::failed_root_degrades(V::hklm_wow64)},
+        // entries), which this plugin never runs on; on a 64-bit OS a missing view is a broken
+        // one. Every other status degrades.
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, false, true},
         // The agent identity's OWN HKCU: per-user data. Its absence is normal and its failure
         // never degrades the machine-scope collection.
-        {HKEY_CURRENT_USER, kUninstallKey, 0, parsers::root_absent_ok(V::own_hkcu, kOs64),
-         parsers::failed_root_degrades(V::own_hkcu)},
+        {HKEY_CURRENT_USER, kUninstallKey, 0, true, false},
     };
     return roots;
 }
@@ -419,7 +416,7 @@ AppCollection get_installed_apps_macos() {
 }
 #endif
 
-// ── list_inventory collectors (blob contract v2) ──────────────────────────
+// ── list_inventory collectors (blob contract v3) ──────────────────────────
 
 namespace inv = yuzu::installed_apps::inventory;
 
@@ -489,8 +486,8 @@ InvCollection get_inventory_linux() {
         collect({path, "info", "-v"}, inv::parse_apk_inv_line);
     }
 
-    // Host-level distro identity, read once and stamped on every row (v2
-    // contract). Honest-empty when /etc/os-release is absent (minimal
+    // Host-level distro identity, read once and stamped on every row (blob
+    // contract v3). Honest-empty when /etc/os-release is absent (minimal
     // containers) or the keys are missing.
     std::string osrel;
     if (std::ifstream f{"/etc/os-release"}; f) {
@@ -609,7 +606,7 @@ InvCollection get_inventory_macos_uncached() {
             // #2273 native enrichment: CFBundle + SecStaticCode, in-process,
             // no subprocess (installed_apps_macos_enrich.hpp). Fills ONLY the
             // pre-existing, currently-honest-empty publisher/signature_status
-            // fields -- ADR-0016: the hashed 12-field row is NEVER
+            // fields -- ADR-0016: the hashed 13-field row is NEVER
             // added-to/reordered. bundle_id has no home in this row; see that
             // header's comment.
             if (!app.location.empty() && enriched < kMaxEnrichApps) {

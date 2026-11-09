@@ -314,14 +314,11 @@ std::string v3_component_section_hash(std::vector<SwComponent> rows) {
     return sha256_hex(canon);
 }
 
-SectionPlan status_section(std::string facet, V3Status status, std::string token,
-                           std::int64_t duration_ms, std::int64_t bytes_read) {
+SectionPlan status_section(std::string facet, V3Status status, std::string token) {
     SectionPlan p;
     p.facet = std::move(facet);
     p.status = status;
     p.token = std::move(token);
-    p.duration_ms = duration_ms;
-    p.bytes_read = bytes_read;
     return p;
 }
 
@@ -331,7 +328,6 @@ SectionPlan plan_section(std::string facet, std::vector<SwEntry> rows,
     p.facet = std::move(facet);
     // The cap is on what the server would hold after its own de-duplication.
     const std::vector<SwEntry> cur = normalise_rows(rows, true, p.facet);
-    p.rows_for_full = cur.size();
     if (cur.size() > kV3MaxRows) {
         p.status = V3Status::oversize;
         p.token = "rows=" + std::to_string(cur.size());

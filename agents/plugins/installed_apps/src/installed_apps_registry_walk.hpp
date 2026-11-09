@@ -52,11 +52,11 @@ struct UninstallRoot {
     std::wstring subkey;
     REGSAM extra_sam;
     // true for HKCU and, on a 32-bit OS only, HKLM-32: a user hive often has no Uninstall key, a
-    // host without WoW64 has no WOW6432Node one (parsers::root_absent_ok)
+    // host without WoW64 has no WOW6432Node one (the rows of windows_roots() in the plugin)
     bool absent_ok;
     // false for the agent identity's OWN HKCU: per-user data, so a failed read of it is logged
-    // (failed_roots) but never degrades the machine-scope collection
-    // (parsers::failed_root_degrades). The default keeps the per-user walks strict.
+    // (failed_roots) but never degrades the machine-scope collection. The default keeps the
+    // per-user walks strict.
     bool degrades_walk{true};
 };
 

@@ -33,8 +33,8 @@
 
 namespace yuzu::agent {
 
-/// Wire caps. MUST equal server/core/src/inventory_blob_v3.hpp (kV3Max*), which equal the v2
-/// seam's. A section the agent sends over a cap is refused whole, so the writer plans to them.
+/// Wire caps. MUST equal server/core/src/inventory_blob_v3.hpp (kV3Max*). A section the agent
+/// sends over a cap is refused whole, so the writer plans to them.
 inline constexpr std::size_t kV3MaxBlobBytes = 3u * 1024 * 1024;
 inline constexpr std::size_t kV3MaxSections = 32;
 inline constexpr std::size_t kV3MaxRows = 20000;        ///< `+` rows per call
@@ -177,7 +177,6 @@ struct SectionPlan {
     bool unchanged{false};          ///< acked set equals the current set: no section at all
     std::string section_hash;       ///< hash of the CURRENT set (the hash held after this section)
     std::vector<std::string> row_hashes; ///< sorted row hashes of the CURRENT set
-    std::size_t rows_for_full{0};   ///< rows in the current set
     std::size_t full_bytes{0};      ///< serialised size of the FULL form of the section
 };
 
@@ -197,8 +196,7 @@ struct SectionPlan {
 
 /// A status-only section (constrained, timeout, oversize, not_collected, disabled).
 [[nodiscard]] YUZU_EXPORT SectionPlan status_section(std::string facet, V3Status status,
-                                                     std::string token, std::int64_t duration_ms,
-                                                     std::int64_t bytes_read);
+                                                     std::string token);
 
 struct V3Blob {
     std::string blob;
