@@ -420,7 +420,7 @@ constexpr ToolRecord kToolRecords[] = {
      "dex.score_policy.reset (attempted first) plus the generic mcp.reset_dex_score_policy row. "
      "Mirrors DELETE /api/v1/dex/score-policy.",
      R"j({"type":"object","properties":{)j"
-     R"j("if_match":{"type":"string","maxLength":64,"pattern":"^(default|[0-9a-f]{16})$","description":"The revision get_dex_score_policy returned: 16 lower-case hex digits, or 'default' when no policy has been written. Required; a stale value is refused"},)j"
+     R"j("if_match":{"type":"string","maxLength":64,"pattern":"^(default|[0-9a-f]{16})$","description":"The revision get_dex_score_policy returned: 16 lower-case hex digits, or 'default' when no policy has been written, sent bare (no quotes; the reset schema refuses the quoted ETag form before any approval ticket is created). Required; a stale value is refused"},)j"
      R"j("approval_id":{"type":"string","maxLength":128,"description":"Approval ticket id from a prior kApprovalRequired response; repeat the same call with it once a human has approved"})j"
      R"j(},"required":["if_match"],"additionalProperties":false})j",
      kWriteOutputSchema,
