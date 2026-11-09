@@ -847,6 +847,10 @@ public:
                 if (!time_ec) {
                     std::error_code set_ec;
                     std::filesystem::last_write_time(entry.backup, mtime, set_ec);
+                    if (set_ec)
+                        spdlog::warn("OTA upload: could not carry the modification time to the "
+                                     "kept copy of {}: {}",
+                                     path.filename().string(), set_ec.message());
                 }
                 entry.state = Predecessor::kept;
                 return true;
@@ -890,14 +894,23 @@ public:
         if (settled_)
             return restore_ok_;
         settled_ = true;
-        try {
-            for (auto it = entries_.rbegin(); it != entries_.rend(); ++it)
+        // Each entry is restored on its own: one that throws is recorded as not restored
+        // and the others are still put back.
+        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+            try {
                 restore_one(*it);
-        } catch (...) {
-            restore_ok_ = false;
+            } catch (...) {
+                restore_ok_ = false;
+            }
         }
         return restore_ok_;
     }
+
+    /// Settles the guard WITHOUT touching the disk: the new files stay where they are
+    /// and every kept copy stays too. Used when it cannot be known whether the registry
+    /// row was written, so neither deleting the kept copies (a commit) nor putting them
+    /// back (a rollback) is safe. The kept copies are then left for the operator.
+    void abandon() noexcept { settled_ = true; }
 
     /// Plain text (not markup) for the answer to a request whose restore failed.
     [[nodiscard]] std::string restore_failure_text() const {
@@ -7055,12 +7068,31 @@ void SettingsRoutes::register_routes(
         bool recorded = update_registry_->upsert_package(pkg);
         if (!recorded) {
             // A connection lost after the commit looks like a failed write although the
-            // row is there. Read it back: when it carries exactly what this request
-            // wrote, the upload did happen, so the new files stay and the request goes
-            // down the success path. Any other outcome (no such row, a different row,
-            // an unreadable listing) is a failed write.
-            if (const auto listing = update_registry_->list_packages_checked();
-                listing && row_carries_upload(*listing, pkg)) {
+            // row is there, and the same fault usually makes the read-back fail too. So
+            // there are three outcomes. The row read back carries exactly what this
+            // request wrote: the upload did happen, the new files stay and the request
+            // goes down the success path. The listing was read and the row is absent or
+            // different: the write did not happen, the previous files go back. The
+            // listing could not be read: it is NOT known, and neither deleting the kept
+            // copies nor restoring them is safe, so everything is left in place for the
+            // operator and the answer says so.
+            const auto listing = update_registry_->list_packages_checked();
+            if (!listing) {
+                spdlog::error("OTA upload for {}/{}: the registry write reported failure and "
+                              "the row could not be read back; the new files and the previous "
+                              "files are both left in place",
+                              platform, arch);
+                audit_fn_(req, "ota.package.uploaded", "failure", "UpdatePackage",
+                          platform + "/" + arch + "/" + version, "outcome_unknown");
+                predecessors.abandon();
+                respond_lifecycle_store_unavailable(
+                    res, "The registry did not confirm whether the package was recorded. The "
+                         "new files were kept, and the previous files are kept as copies "
+                         "named *.yuzu_prev_*. Check the package list, then retry the same "
+                         "upload: it is safe to repeat.");
+                return;
+            }
+            if (row_carries_upload(*listing, pkg)) {
                 spdlog::warn("OTA upload for {}/{}: the registry write reported failure but "
                              "the row carries this upload; treating it as written",
                              platform, arch);

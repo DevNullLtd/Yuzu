@@ -1015,6 +1015,70 @@ TEST_CASE("OTA upload whose registry write fails restores the previous package a
     CHECK_FALSE(any_entry_contains(h.update_dir.path, "yuzu_prev_"));
 }
 
+TEST_CASE("OTA upload whose registry write and read-back both fail leaves every file in place",
+          "[ota][settings_routes][pg][validation]") {
+    // Renaming a column both the registry write and the package listing use makes the write
+    // fail AND the read-back fail, so it cannot be known whether the row was written. The
+    // upload must then neither delete the previous files (a commit) nor put them back (a
+    // rollback): it answers that the outcome is unknown and leaves everything for the
+    // operator.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    OtaWireServer wire{h};
+    httplib::Client cli("127.0.0.1", wire.port);
+    cli.set_read_timeout(10, 0);
+    const std::string url = std::string(kUploadUrl) + "?platform=linux&arch=x86_64";
+
+    auto r0 = cli.Post(url, httplib::UploadFormDataItems{
+                                {"file", "old-bytes", "yuzu-agent-1.0.0", "application/octet-stream"}});
+    REQUIRE(r0);
+    REQUIRE(r0->status == 200);
+    const auto before = h.registry->list_packages();
+    REQUIRE(before.size() == 1);
+    const std::string old_sha = before.front().sha256;
+
+    const auto exec_sql = [&](const char* sql) {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult c{PQexec(conn.get(), sql)};
+        REQUIRE(c.ok());
+    };
+    exec_sql("ALTER TABLE update_registry.update_packages "
+             "RENAME COLUMN uploaded_at TO yuzu_test_uploaded_at");
+
+    auto r1 = cli.Post(url, httplib::UploadFormDataItems{{"file", "new-bytes", "yuzu-agent-1.0.0",
+                                                          "application/octet-stream"}});
+    REQUIRE(r1);
+    CHECK(r1->status == 503);
+    CHECK(r1->body.find("did not confirm") != std::string::npos);
+    CHECK(r1->body.find("Nothing was changed") == std::string::npos);
+    wire.stop();
+
+    REQUIRE(h.audited.size() == 2);
+    CHECK(h.audited[1].action == "ota.package.uploaded");
+    CHECK(h.audited[1].result == "failure");
+    CHECK(h.audited[1].detail == "outcome_unknown");
+
+    // The new bytes are live, and the previous bytes are kept exactly once under a kept name.
+    CHECK(read_file(h.update_dir.path / "yuzu-agent-1.0.0") == "new-bytes");
+    std::size_t kept = 0;
+    for (const auto& e : fs::directory_iterator(h.update_dir.path)) {
+        const auto name = e.path().filename().string();
+        if (name.find("yuzu_prev_") != std::string::npos) {
+            ++kept;
+            CHECK(read_file(e.path()) == "old-bytes");
+        }
+    }
+    CHECK(kept == 1);
+
+    // The registry was not written: with the column back, the row is still the old one.
+    exec_sql("ALTER TABLE update_registry.update_packages "
+             "RENAME COLUMN yuzu_test_uploaded_at TO uploaded_at");
+    const auto after = h.registry->list_packages();
+    REQUIRE(after.size() == 1);
+    CHECK(after.front().sha256 == old_sha);
+}
+
 TEST_CASE("OTA re-upload over an existing filename succeeds and leaves no kept copies",
           "[ota][settings_routes][pg][validation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
