@@ -1506,7 +1506,9 @@ sync, defeating the hash-skip protocol.
   of band): the section is served `constrained` and incomplete with its `rows` empty, because the
   rows read are **not** the values the agent reported. This holds even when the agent's own level
   was already `constrained` (for example `server_cap:<n>`). Only a full device-record sync
-  repairs either; the stored rows stay in the database for an operator to inspect. A lost row
+  repairs either. A damaged stored digest alone, with intact rows, is withheld the same way. The
+  stored rows stay in the database (read them with SQL if you need to inspect them; neither REST
+  nor MCP shows them). A lost row
   reports `server:row_count_mismatch` alone. A third token, `server:content_digest_unverifiable`,
   means this **server** could not compute the digest to compare (its digest provider failed, an
   OpenSSL fault): the section is served `constrained` and incomplete with the rows that were read,

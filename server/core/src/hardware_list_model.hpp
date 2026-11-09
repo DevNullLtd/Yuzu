@@ -294,6 +294,17 @@ inline constexpr std::string_view kSectionContentDigestUnverifiableReason =
     return false;
 }
 
+/// THE row-serving decision `ci_sections_json` makes for one section, as a pure function so every
+/// input is testable without a digest provider: rows are served only for a table-backed kind whose
+/// STORED level is `ok` or `constrained` and whose fault is not a withholding one. A section at any
+/// other level (`unavailable`, `permission_denied`, an unknown or blank level) serves no rows even
+/// if some were stored; `Unverifiable` and `None` serve them.
+[[nodiscard]] constexpr bool section_serves_rows(bool table_backed, std::string_view stored_level,
+                                                 SectionFault fault) noexcept {
+    return table_backed && (stored_level == "ok" || stored_level == "constrained") &&
+           !section_rows_withheld(fault);
+}
+
 /// The reason token a downgrade of kind `fault` is served with; empty for `SectionFault::None`.
 [[nodiscard]] std::string_view section_fault_token(SectionFault fault) noexcept;
 

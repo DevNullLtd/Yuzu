@@ -1274,8 +1274,8 @@ any read surface for the ledger or the components.
 `GET /api/v1/hardware/{id}` and the MCP tool
 `get_hardware_ci` serve the expanded record behind the fail-closed `inventory.device.ci` audit.
 The chassis, board and DIMM serials and the machine-id hash (with its algorithm and source) are
-served. Section rows are served only for the `ok` and `constrained` levels; a section at any other
-level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
+served. Section rows are served only for the `ok` and `constrained` levels, except a section withheld
+for an integrity mismatch (below); a section at any other level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
 snapshot (`get_device_ci_with_sections`), so the scalars and the rows are the same replace
 generation. A failed read of the sections is a `503` on REST and a retryable error on MCP
 (`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections

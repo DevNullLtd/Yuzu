@@ -2219,6 +2219,26 @@ TEST_CASE("section_rows_withheld: only the two mismatch faults withhold rows",
     CHECK_FALSE(section_rows_withheld(SectionFault::None));
 }
 
+// The whole row-serving decision, over every input ci_sections_json feeds it. Kills: withholding
+// for Unverifiable (a server fault) or for None, serving a mismatch, serving rows of a level that
+// has none by contract, and serving rows for a status-only kind (no table).
+TEST_CASE("section_serves_rows: table, stored level and fault together decide",
+          "[hardware][model][sections][digest]") {
+    for (const char* level : {"ok", "constrained"}) {
+        INFO(level);
+        CHECK(section_serves_rows(true, level, SectionFault::None));
+        CHECK(section_serves_rows(true, level, SectionFault::Unverifiable));
+        CHECK_FALSE(section_serves_rows(true, level, SectionFault::RowCount));
+        CHECK_FALSE(section_serves_rows(true, level, SectionFault::Content));
+        CHECK_FALSE(section_serves_rows(false, level, SectionFault::None)); // status-only kind
+    }
+    for (const char* level : {"unavailable", "permission_denied", "", "somethingnew"}) {
+        INFO(level);
+        for (const auto f : {SectionFault::None, SectionFault::Unverifiable})
+            CHECK_FALSE(section_serves_rows(true, level, f));
+    }
+}
+
 // The digest binds n_fields; the INSERT and SELECT use the parsed column list. They must agree for
 // every kind (also a build-time static_assert in device_ci_kinds.hpp; this reports which kind).
 TEST_CASE("registry: n_fields equals the column count of every table-backed kind",

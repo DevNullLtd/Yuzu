@@ -40,9 +40,8 @@ void register_section_integrity_metrics(yuzu::MetricsRegistry& metrics);
 /// The verdict comes from `served_section_verdict` - the same function and the same rows the
 /// response body is built from - but it is a second CALL, so an intermittent digest-provider
 /// failure between the two could make the counted label differ from the served token, and the body
-/// then carry rows (`unverifiable`) where the counter says `content_digest_mismatch`, or the reverse
-/// (accepted;
-/// carrying a precomputed verdict would create a second serving path). Re-verifying costs two
+/// then carry rows (`unverifiable`) where the counter says `content_digest_mismatch`, or the
+/// reverse (accepted; carrying a precomputed verdict would create a second serving path). Re-verifying costs two
 /// SHA-256 passes over at most 96 KiB of section rows (the `device_ci_kinds.hpp` static_assert),
 /// sub-millisecond against a Postgres round-trip. The provider is a PARAMETER (no process-global
 /// state); nullptr means `sha256_hex`. `metrics` may be null (nothing counted, still logged).

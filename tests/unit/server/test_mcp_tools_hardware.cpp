@@ -1521,7 +1521,8 @@ TEST_CASE("mcp hardware twins: a served integrity fault is counted once per read
     CHECK(cd["ci"]["sections"][0]["rows"].empty());
     CHECK(rest_cd["ci"]["sections"][0] == cd["ci"]["sections"][0]);
     // An intact section keeps its rows (the withholding is per fault, not per read).
-    CHECK(t.call("get_hardware_ci", {{"agent_id", "ok"}})["result"]["structuredContent"]["ci"]["sections"][0]["rows"].size() == 2);
+    const json intact = t.call("get_hardware_ci", {{"agent_id", "ok"}})["result"]["structuredContent"];
+    CHECK(intact["ci"]["sections"][0]["rows"].size() == 2);
     CHECK(integrity(t, "content_digest_mismatch") == 2.0);
     CHECK(integrity(t, "row_count_mismatch") == 2.0);
     CHECK(integrity(t, "digest_unverifiable") == 0.0);
