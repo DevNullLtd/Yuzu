@@ -64,11 +64,7 @@ namespace {
 // the call and restores it from here.
 constexpr int kBusyTimeoutMs = 5000;
 
-int64_t now_epoch_seconds() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
+using yuzu::shared::sqlite_quarantine::now_epoch_seconds;
 
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
@@ -931,8 +927,6 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         return std::unexpected(std::format("failed to enable WAL mode: {}", err));
     }
     sqlite3_free(err_msg);
-
-    // (The busy timeout is already set: open_main applies it before the integrity check.)
 
     // Secure delete -- zeroes deleted content; required for security
     err_msg = nullptr;

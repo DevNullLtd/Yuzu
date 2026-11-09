@@ -19,6 +19,7 @@
 /// Names have the exact form `<file><suffix><epoch>[-<n>]` (suffix `.corrupt-` or `.planted-`),
 /// which the dedup store's prune parser relies on.
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -37,6 +38,14 @@ inline constexpr std::string_view kSidecars[] = {"-wal", "-shm", "-journal"};
 
 /// How many `-<n>` names a claim tries before it gives up (fails rather than overwrite).
 inline constexpr int kMaxClaimAttempts = 10'000;
+
+/// Wall-clock seconds since the epoch: the `epoch_seconds` every caller passes to the functions
+/// below.
+inline std::int64_t now_epoch_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 /// Test seam for the two filesystem steps whose failure is hard to provoke on a real disk. An
 /// empty member means the real `std::filesystem` call; production never sets one.
@@ -181,12 +190,11 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
         }
         // Rename failed: preserve by copy (fails rather than overwrite), then drop the original.
         std::error_code cec;
-        if (!taken)
-            fs::copy_file(side, side_dest, fs::copy_options::none, cec);
-        if (taken || cec) {
+        fs::copy_file(side, side_dest, fs::copy_options::none, cec);
+        if (cec) {
             result.notes.push_back(std::format(
                 "could not preserve {} as {} ({}); its content is not kept", side.string(),
-                side_dest.string(), taken ? "that name is taken" : cec.message()));
+                side_dest.string(), cec.message()));
         } else {
             secure(side_dest);
             result.notes.push_back(std::format("copied {} to {} because it could not be renamed "

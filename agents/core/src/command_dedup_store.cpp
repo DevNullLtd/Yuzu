@@ -16,7 +16,6 @@
 #include <spdlog/spdlog.h>
 
 #include <cctype>
-#include <chrono>
 #include <cstddef>
 #include <format>
 #include <memory>
@@ -29,11 +28,7 @@ namespace yuzu::agent {
 
 namespace {
 
-std::int64_t now_epoch_seconds() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
+using yuzu::shared::sqlite_quarantine::now_epoch_seconds;
 
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }

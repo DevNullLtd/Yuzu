@@ -95,12 +95,8 @@ inline std::optional<std::pair<long long, long long>> parse_quarantine_name(std:
 /// dir (unsupported; no instance lock covers the dedup store, and the Guardian boot-epoch lock
 /// guards only the epoch claim): process B can still drop the fresh store that process A just
 /// created, leaving A on an orphaned inode.
-using QuarantineResult = yuzu::shared::sqlite_quarantine::QuarantineResult;
-[[nodiscard]] inline QuarantineResult
-quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seconds,
-                      const yuzu::shared::sqlite_quarantine::FsOps& ops = {}) {
-    return yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(path, epoch_seconds, ops);
-}
+using yuzu::shared::sqlite_quarantine::QuarantineResult;
+using yuzu::shared::sqlite_quarantine::quarantine_corrupt_db;
 
 /// Keep only the newest kKeepQuarantined quarantined stores in the db's directory. COUNT-based,
 /// not a wall-clock cutoff. Groups are ordered by the (epoch, n) parsed from the NAME, which a

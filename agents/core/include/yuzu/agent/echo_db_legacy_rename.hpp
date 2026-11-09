@@ -60,7 +60,6 @@
 // has tar.db present, because sidecars move before the main file.
 #pragma once
 
-#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -161,9 +160,7 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db,
             }
         }
         if (echo_foreign && !unresolved) {
-            const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                                   std::chrono::system_clock::now().time_since_epoch())
-                                   .count();
+            const auto epoch = yuzu::shared::sqlite_quarantine::now_epoch_seconds();
             // One at a time. The sidecars first, the main file last, so an interruption leaves
             // "echo.db still planted" (re-detected on the next start), never a stranded sidecar.
             for (auto it = foreign.rbegin(); it != foreign.rend(); ++it) {

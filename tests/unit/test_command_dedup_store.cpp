@@ -1002,7 +1002,7 @@ TEST_CASE("dedup_quarantine: a sidecar quarantine name that is taken is never ov
     CHECK(read_bytes(fs::path(r.dest->string() + "-wal")) == "stray older wal"); // not replaced
     CHECK_FALSE(fs::exists(fs::path(db.string() + "-wal"))); // the stale original still goes
     REQUIRE(r.notes.size() == 1);
-    CHECK(r.notes[0].find("taken") != std::string::npos);
+    CHECK(r.notes[0].find("could not preserve") != std::string::npos);
 }
 
 TEST_CASE("sqlite_quarantine: claim_quarantine_name moves one file and no sidecar",

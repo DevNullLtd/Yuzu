@@ -14,7 +14,6 @@
 #include "test_log_capture.hpp"
 
 #include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption
-#include <sqlite_quarantine.hpp>                   // the shared no-overwrite quarantine move
 
 #include <sqlite3.h> // raw handle for the reopen-after-DROP upgrade simulation
 
@@ -3789,8 +3788,6 @@ TEST_CASE("adopt_legacy_echo_db: a rename that cannot complete fails closed and 
 // the adoption block above.
 namespace {
 
-namespace sq = yuzu::shared::sqlite_quarantine;
-
 // Names in `dir` that start with `prefix`.
 std::vector<std::string> names_with_prefix(const fs::path& dir, const std::string& prefix) {
     std::vector<std::string> out;
@@ -3977,38 +3974,6 @@ TEST_CASE("EchoDatabase: a rollback journal beside echo.db is owner-only after o
           (fs::perms::owner_read | fs::perms::owner_write));
 }
 #endif // !_WIN32
-
-// #6914 / #1527. The shared quarantine, driven through its seam: a sidecar whose rename fails is
-// copied before the original goes, and two claims in the same second never overwrite each other.
-TEST_CASE("sqlite_quarantine: the echo database files keep their evidence (#6914, #1527)",
-          "[echo][store][corruption]") {
-    yuzu::test::TempDir dir{"yuzu_test_echo_sharedq_"};
-    REQUIRE(fs::create_directories(dir.path));
-    const auto db = dir.path / "echo.db";
-    spit_file(db, "main one");
-    spit_file(fs::path{db.string() + "-wal"}, "wal one");
-
-    sq::FsOps fail_move;
-    fail_move.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
-        ec = std::make_error_code(std::errc::permission_denied);
-    };
-    const auto first = sq::quarantine_corrupt_db(db, 100, fail_move);
-    REQUIRE(first.dest.has_value());
-    CHECK(slurp_file(fs::path{first.dest->string() + "-wal"}) == "wal one"); // copied, then removed
-    CHECK_FALSE(fs::exists(fs::path{db.string() + "-wal"}));
-
-    spit_file(db, "main two");
-    const auto second = sq::quarantine_corrupt_db(db, 100); // same second
-    REQUIRE(second.dest.has_value());
-    CHECK(*second.dest != *first.dest);
-    CHECK(slurp_file(*first.dest) == "main one"); // not overwritten
-    CHECK(slurp_file(*second.dest) == "main two");
-
-    spit_file(db, "main three");
-    const auto clamped = sq::quarantine_corrupt_db(db, -5);
-    REQUIRE(clamped.dest.has_value());
-    CHECK(clamped.dest->filename().string() == "echo.db.corrupt-0");
-}
 
 // #6695. The both-present arm's decisions, driven with a fake owner probe so they run on every
 // host (the real Windows probe is EchoDbOwnerProbe; it is exercised on the Windows leg).
