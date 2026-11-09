@@ -1078,6 +1078,62 @@ TEST_CASE("sqlite_quarantine: when every quarantine name is taken the claim give
     CHECK(read_bytes(db) == "main"); // the original is untouched
 }
 
+TEST_CASE("sqlite_quarantine: a failed drop of the original gives the claim back",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The link succeeds but the original cannot be removed: `file` is a NON-EMPTY directory, which
+    // std::filesystem::remove refuses on every OS (and the link seam lets us claim a regular file
+    // over it). The claim must be released, so the file is at ONE name, not two.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto file = dir.path / "x.db";
+    std::error_code ec;
+    fs::create_directories(file, ec);
+    REQUIRE_FALSE(ec);
+    write_bytes(file / "child", "keeps the directory non-empty");
+    fs::path dest = file;
+    dest += ".corrupt-5";
+    sq::FsOps ops;
+    ops.link = [](const fs::path&, const fs::path& to, std::error_code& lec) {
+        write_bytes(to, "claimed");
+        lec.clear();
+    };
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(file, 5, ".corrupt-", &notes, ops).has_value());
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("could not drop") != std::string::npos);
+    CHECK_FALSE(fs::exists(dest));                  // the claim was given back
+    CHECK(fs::is_directory(file));                  // the original is untouched
+    CHECK(read_bytes(file / "child") == "keeps the directory non-empty");
+}
+
+TEST_CASE("sqlite_quarantine: a claim that cannot be given back is reported as a stray name",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // As above, but the claimed name is itself a NON-EMPTY directory, so the undo remove fails
+    // too: the caller is told which stray name is left behind.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto file = dir.path / "x.db";
+    std::error_code ec;
+    fs::create_directories(file, ec);
+    REQUIRE_FALSE(ec);
+    write_bytes(file / "child", "keeps the directory non-empty");
+    fs::path dest = file;
+    dest += ".corrupt-5";
+    sq::FsOps ops;
+    ops.link = [](const fs::path&, const fs::path& to, std::error_code& lec) {
+        std::error_code mk;
+        fs::create_directories(to, mk);
+        write_bytes(to / "child", "keeps the claim non-empty");
+        lec = mk;
+    };
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(file, 5, ".corrupt-", &notes, ops).has_value());
+    REQUIRE(notes.size() == 2);
+    CHECK(notes[0].find("could not drop") != std::string::npos);
+    CHECK(notes[1].find("could not release the claim") != std::string::npos);
+    CHECK(notes[1].find("stray name") != std::string::npos);
+    CHECK(fs::is_directory(dest));                  // the stray name is still there
+    CHECK(fs::is_directory(file));                  // the original is untouched
+}
+
 #ifndef _WIN32
 TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replaced",
           "[command_dedup][corruption][quarantine_fs]") {

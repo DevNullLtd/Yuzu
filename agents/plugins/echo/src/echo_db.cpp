@@ -413,10 +413,11 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 // do (explicit SIDs, not the Owner Rights alias "OW": execution_artifacts_win.cpp stores that one
 // literally). It runs before each sqlite3_open_v2 and once at the end of open():
 //  - a missing file is CREATED here with the protected DACL (no inheritance window; SQLite
-//    then creates nothing, and a 0-byte echo.db is a valid empty database);
+//    then creates nothing on an existing database, and a 0-byte echo.db is a valid empty
+//    database);
 //  - an existing file is re-secured in place (an upgraded echo.db on its first open);
 //  - the end pass exists because, on a FRESH (0-page) database, SQLite deletes the pre-created
-//    -wal and recreates it with the inherited ACL on the first write.
+//    -wal and -journal and recreates each with the inherited ACL on the first write.
 // -journal is on the list because SQLite replays a HOT rollback journal found beside the
 // database BEFORE it looks at the WAL, as the agent: a journal planted by a local user would
 // otherwise rewrite echo_config (the #559 class). An empty journal is inert, so the one created
@@ -443,13 +444,14 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 // no DELETE on the four protected files and no delete-child right on the directory; (ii) an
 // entry found at a free name is examined as the planter's own (refuse_linked_db_files, and the
 // owner test above through FILE_FLAG_OPEN_REPARSE_POINT) and refused or re-created; (iii) a file
-// symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode; (iv) the one free-name window
-// that nothing examines before an open is SQLite's own delete-and-recreate of echo.db-wal on a
-// 0-page database (the first open of a fresh file and the reopen after a quarantine), which only
-// the end-of-open pass catches afterwards. The POSIX opens are closed by SQLite's own O_NOFOLLOW
-// (SQLITE_OPEN_NOFOLLOW). Lock-out: a later run under a different non-admin account cannot open
-// echo.db. An account switch is not undone by `icacls /reset` (it rewrites the DACL,
-// never the owner): the open fails until the new account holds an ACE for the files (the open
+// symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode, while a hard link needs neither
+// and is caught only by (ii), so inside window (iv) it is not caught; (iv) the free-name windows
+// that nothing examines before an open are SQLite's own delete-and-recreate of echo.db-wal and
+// echo.db-journal on a 0-page database (the first open of a fresh file and the reopen after a
+// quarantine), which only the end-of-open pass catches afterwards. The POSIX opens are closed by
+// SQLite's own O_NOFOLLOW (SQLITE_OPEN_NOFOLLOW). Lock-out: a later run under a different
+// non-admin account cannot open echo.db. An account switch is not undone by `icacls /reset` (it
+// rewrites the DACL, never the owner): the open fails until the new account holds an ACE for the files (the open
 // asks FILE_READ_ATTRIBUTES, which owning a file does not grant) and, when the former owner is
 // neither SYSTEM nor Administrators, until it owns them too, since the owner test refuses them
 // first. A former owner of SYSTEM or Administrators passes the owner test, so no owner is named:
@@ -667,9 +669,11 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
 // (agents/shared/sqlite_quarantine.hpp), and a copy is created with the directory's inherited ACL,
 // which can let Users read a corrupt database's WAL (process, network and registry capture) while
 // the live files are protected. Re-apply the protected DACL to each sidecar that exists beside the
-// quarantined file, by handle and without following a link, exactly as secure_echo_db_files does
-// for the live names. A renamed sidecar keeps its DACL, so for it this repeats what it has. Not
-// secure_echo_db_files itself: its OPEN_ALWAYS would create empty sidecars beside the evidence.
+// quarantined file, by handle and without following a link, opened as secure_echo_db_files opens
+// the live names but with no owner or hard-link test first (recorded residual S1: a hard link
+// squatted at a claimed sidecar name would have its target's DACL rewritten). A renamed sidecar
+// keeps its DACL, so for it this repeats what it has. Not secure_echo_db_files itself: its
+// OPEN_ALWAYS would create empty sidecars beside the evidence.
 // Best effort and logged, the same availability-over-confidentiality posture as the live files.
 void secure_quarantined_sidecars(const std::filesystem::path& quarantined,
                                  const EchoDbDacl& dacl) {

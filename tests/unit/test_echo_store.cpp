@@ -4007,8 +4007,7 @@ TEST_CASE("EchoDatabase: a symlink at echo.db or a sidecar is refused (#1527)",
             const fs::path link{db.string() + suffix};
             std::error_code ec;
             fs::create_symlink(target, link, ec);
-            if (ec)
-                SKIP("cannot create a symlink here: " << ec.message());
+            skip_unless_symlink_capable(ec);
 
             auto refused = EchoDatabase::open(db);
             REQUIRE_FALSE(refused.has_value());
@@ -4092,8 +4091,7 @@ TEST_CASE("sqlite: SQLITE_OPEN_NOFOLLOW refuses a symlink at the database name (
     const fs::path link = resolved / "echo.db";
     std::error_code ec;
     fs::create_symlink(target, link, ec);
-    if (ec)
-        SKIP("cannot create a symlink here: " << ec.message());
+    skip_unless_symlink_capable(ec);
 
     SqliteOwner o;
     const int rc = sqlite3_open_v2(link.string().c_str(), &o.db,
@@ -4143,7 +4141,8 @@ TEST_CASE("EchoDatabase: a link swapped in at echo.db right before SQLite opens 
         CHECK(fs::is_symlink(db)); // not replaced
         if (!read_only_open) {
             REQUIRE_FALSE(opened.has_value());
-            CHECK(opened.error().find("failed to open echo.db") != std::string::npos);
+            CHECK(opened.error().find("failed to open echo.db: unable to open database file") !=
+                  std::string::npos);
             CHECK_FALSE(fs::exists(target)); // nothing was created through the link
             CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
         } else {
