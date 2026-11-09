@@ -948,7 +948,7 @@ bool GuaranteedStateStore::delete_agent(std::string_view agent_id) {
     });
     if (!committed)
         spdlog::debug("GuaranteedStateStore: delete_agent did not commit for agent={} ({})",
-                      agent_id, pool_.last_error());
+                      log_id_token(agent_id), ::yuzu::log_key_token(pool_.last_error()));
     return committed;
 }
 
