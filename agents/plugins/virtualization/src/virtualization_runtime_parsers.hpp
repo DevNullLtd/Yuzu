@@ -665,16 +665,17 @@ struct ConfigRow {
     std::string value;
 };
 
-struct InfoRows {
+/// What a config parser returns: the rows it admitted, and whether the source was malformed.
+struct ConfigRows {
     std::vector<ConfigRow> rows;
-    /// The reply was not an object, or SecurityOptions / CgroupDriver was present with the wrong type.
-    /// A key that is simply absent omits its row and is not malformed (same visibility as a key
-    /// missing from daemon.json).
     bool malformed = false;
 };
 
-inline InfoRows parse_info(const nlohmann::json& j) {
-    InfoRows out;
+/// malformed: the reply was not an object, or SecurityOptions / CgroupDriver was present with the
+/// wrong type. A key that is simply absent omits its row and is not malformed (same visibility as a
+/// key missing from daemon.json).
+inline ConfigRows parse_info(const nlohmann::json& j) {
+    ConfigRows out;
     if (!j.is_object()) {
         out.malformed = true;
         return out;
@@ -705,13 +706,8 @@ inline InfoRows parse_info(const nlohmann::json& j) {
 // daemon.json: a fixed key allow-list (section 6)
 // ---------------------------------------------------------------------------
 
-struct DaemonJson {
-    std::vector<ConfigRow> rows;
-    bool malformed = false;
-};
-
-inline DaemonJson parse_daemon_json(std::string_view text) {
-    DaemonJson out;
+inline ConfigRows parse_daemon_json(std::string_view text) {
+    ConfigRows out;
     const ParsedJson p = parse_limited(text);
     if (!p.ok || !p.value.is_object()) {
         out.malformed = true;

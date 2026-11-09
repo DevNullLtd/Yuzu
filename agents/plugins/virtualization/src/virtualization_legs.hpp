@@ -263,7 +263,7 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
                 if (r.state == ReadState::ok) {
                     d.config_field = "present";
                     d.any = true;
-                    DaemonJson dj = parse_daemon_json(r.value);
+                    ConfigRows dj = parse_daemon_json(r.value);
                     if (dj.malformed) {
                         docker_config_malformed = true;
                         acc.add_failure(rt_token("daemon_json:malformed"));
@@ -411,7 +411,7 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
 
         if (proceed) {
             if (const auto info = fetch(Verb::info, "info")) {
-                InfoRows ir = parse_info(info->value);
+                ConfigRows ir = parse_info(info->value);
                 if (ir.malformed)
                     acc.add_failure(rt_token("info:malformed"));
                 info_rows = std::move(ir.rows);

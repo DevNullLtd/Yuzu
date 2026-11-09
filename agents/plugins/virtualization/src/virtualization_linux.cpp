@@ -118,21 +118,17 @@ runtime::StatResult stat_path(const std::string& path) {
     return to_stat_result(st);
 }
 
-/// The endpoint descriptor, opened O_PATH|O_NOFOLLOW so a link at the leaf is returned as a link
-/// (and refused by the caller's fstat check) rather than followed. Held for the whole run: the
-/// transport connects through it, so the object that was checked is the object connected to.
-struct EndpointHandle {
-    yuzu::agent::ScopedFd fd;
-};
-
-runtime::StatResult open_endpoint_checked(EndpointHandle& h, const std::string& path) {
+/// Opens the endpoint O_PATH|O_NOFOLLOW so a link at the leaf is returned as a link (and refused by
+/// the caller's fstat check) rather than followed. `handle` is held by the caller for the whole run:
+/// the transport connects through it, so the object that was checked is the object connected to.
+runtime::StatResult open_endpoint_checked(yuzu::agent::ScopedFd& handle, const std::string& path) {
     const int fd = ::open(path.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
     runtime::StatResult r;
     if (fd < 0) {
         r.err = errno;
         return r;
     }
-    h.fd.reset(fd);
+    handle.reset(fd);
     struct stat st{};
     if (::fstat(fd, &st) != 0) {
         r.err = errno;
@@ -264,7 +260,7 @@ int run_linux(yuzu::CommandContext& ctx) {
 int run_linux_runtime_posture(yuzu::CommandContext& ctx) {
     report(ctx, "runtime_posture",
            runtime::single_flight(runtime::runtime_posture_flight(), [] {
-               EndpointHandle handle;
+               yuzu::agent::ScopedFd handle; // the checked endpoint descriptor, held for the whole run
                runtime::RuntimeFs fs;
                fs.stat = stat_path;
                fs.read = [](const std::string& path, size_t cap) {
@@ -289,7 +285,7 @@ int run_linux_runtime_posture(yuzu::CommandContext& ctx) {
                // section 9 item 6 decides what happens then.
                const runtime::Transport transport = [&handle](const runtime::Request& req,
                                                               std::chrono::milliseconds budget) {
-                   return one_request("/proc/self/fd/" + std::to_string(handle.fd.get()), req,
+                   return one_request("/proc/self/fd/" + std::to_string(handle.get()), req,
                                       budget);
                };
                const runtime::Clock clock = [] { return std::chrono::steady_clock::now(); };
