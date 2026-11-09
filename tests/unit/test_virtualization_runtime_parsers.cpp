@@ -386,29 +386,54 @@ TEST_CASE("runtime daemon.json: only allowlisted keys, arrays as counts, hosts_t
     CHECK(std::set<std::string>(keys.begin(), keys.end()).size() == keys.size());
 }
 
-TEST_CASE("runtime daemon.json: wrong types and bad text never throw and never render",
+TEST_CASE("runtime daemon.json: wrong types read malformed, withhold their row and never render",
           "[virtualization][runtime][config]") {
     const auto wrong = parse_daemon_json(R"({"icc":[1],"data-root":7,"live-restore":"yes",
                                              "hosts":"tcp://x","log-driver":"a b\u001b[31m",
                                              "userns-remap":["x"]})");
-    REQUIRE_FALSE(wrong.malformed);
-    // icc, data-root, live-restore, hosts and userns-remap are skipped; log-driver is `invalid`
+    CHECK(wrong.malformed);
+    // icc, data-root, live-restore, hosts and userns-remap are withheld; log-driver is `invalid`
     REQUIRE(wrong.rows.size() == 1);
     CHECK(wrong.rows[0].key == "log-driver");
     CHECK(wrong.rows[0].value == "invalid");
 
-    // a value of the wrong kind for ITS key is skipped, not rendered through another kind's path: a
-    // boolean on a string key must not read yes/no, nor a string on a boolean key
+    // a value of the wrong kind for ITS key is withheld, not rendered through another kind's path: a
+    // boolean on a string key must not read yes/no, nor a string on a boolean key; the well-typed
+    // `icc` still reports beside the malformed flag
     const auto kinds = parse_daemon_json(R"({"data-root":true,"log-driver":false,"storage-driver":true,
                                               "userns-remap":false,"icc":true,"tls":"true"})");
-    REQUIRE_FALSE(kinds.malformed);
+    CHECK(kinds.malformed);
     REQUIRE(kinds.rows.size() == 1);
     CHECK(kinds.rows[0].key == "icc");
     CHECK(kinds.rows[0].value == "yes");
 
     const auto tcp_no = parse_daemon_json(R"({"hosts":["unix:///var/run/docker.sock"]})");
+    CHECK_FALSE(tcp_no.malformed);
     REQUIRE(tcp_no.rows.size() == 2);
     CHECK(tcp_no.rows[1].value == "no");
+
+    // a `hosts` element that is not a string: `hosts_tcp no` cannot be told, so neither hosts row is
+    // emitted and the file reads malformed (a sibling key still reports)
+    for (const char* text : {R"({"hosts":[5]})", R"({"hosts":["fd://",5]})", R"({"hosts":[null,"tcp://x"]})",
+                             R"({"hosts":[["tcp://x"]]})"}) {
+        const auto bad = parse_daemon_json(text);
+        INFO(text);
+        CHECK(bad.malformed);
+        CHECK(bad.rows.empty());
+    }
+    const auto hosts_sibling = parse_daemon_json(R"({"icc":false,"hosts":[5]})");
+    CHECK(hosts_sibling.malformed);
+    REQUIRE(hosts_sibling.rows.size() == 1);
+    CHECK(hosts_sibling.rows[0].key == "icc");
+    // the registry lists are counted, never read: a non-array is malformed, an array is not
+    for (const char* text : {R"({"insecure-registries":"a:5000"})", R"({"registry-mirrors":{"a":1}})",
+                             R"({"insecure-registries":null})"}) {
+        const auto bad = parse_daemon_json(text);
+        INFO(text);
+        CHECK(bad.malformed);
+        CHECK(bad.rows.empty());
+    }
+    CHECK_FALSE(parse_daemon_json(R"({"insecure-registries":[5,null]})").malformed);
 
     for (const char* text : {"{not json", "[1,2]", "\"s\"", "", "{\"a\":"})
         CHECK(parse_daemon_json(text).malformed);
@@ -424,11 +449,11 @@ TEST_CASE("runtime daemon.json: wrong types and bad text never throw and never r
     CHECK(d.rows.empty());
 }
 
-TEST_CASE("runtime /version: the dialect comes from Components, wrong types are tolerated",
+TEST_CASE("runtime /version: the dialect comes from Components, a wrong type is malformed",
           "[virtualization][runtime][version]") {
     const auto podman = parse_version(json::parse(
         R"({"Version":"5.2.0","ApiVersion":"1.41","Components":[{"Name":"Podman Engine","Version":"5.2.0"}]})"));
-    CHECK(podman.valid);
+    CHECK_FALSE(podman.malformed);
     CHECK(podman.dialect == Dialect::podman);
     CHECK(podman.version == "5.2.0");
     CHECK(podman.api_version == "1.41");
@@ -438,22 +463,60 @@ TEST_CASE("runtime /version: the dialect comes from Components, wrong types are 
     CHECK(docker.dialect == Dialect::docker);
 
     const auto bare = parse_version(json::parse(R"({"Version":"27.3.1"})"));
-    CHECK(bare.valid);
+    CHECK_FALSE(bare.malformed);
     CHECK(bare.dialect == Dialect::docker);
     CHECK(bare.version == "27.3.1");
     CHECK(bare.api_version == "-");
 
+    // every key read is wrong-typed: malformed, no dialect (Components is not an array), `-` fields
     const auto odd = parse_version(json::parse(R"({"Version":27,"ApiVersion":null,"Components":"x"})"));
-    CHECK(odd.valid);
-    CHECK(odd.dialect == Dialect::docker);
+    CHECK(odd.malformed);
+    CHECK(odd.dialect == Dialect::none);
     CHECK(odd.version == "-");
     CHECK(odd.api_version == "-");
 
-    const auto wrong_comp = parse_version(json::parse(R"({"Components":[1,{"Name":5},{"Name":"Podman Engine"}]})"));
-    CHECK(wrong_comp.dialect == Dialect::podman);
+    // a wrong-typed Version or ApiVersion alone: malformed, the dialect from the well-typed
+    // Components still stands, the field stays `-`
+    const auto wrong_version = parse_version(json::parse(R"({"Version":27,"ApiVersion":"1.47"})"));
+    CHECK(wrong_version.malformed);
+    CHECK(wrong_version.dialect == Dialect::docker);
+    CHECK(wrong_version.version == "-");
+    CHECK(wrong_version.api_version == "1.47");
+    const auto wrong_api = parse_version(json::parse(R"({"Version":"1","ApiVersion":null})"));
+    CHECK(wrong_api.malformed);
+    CHECK(wrong_api.version == "1");
+    CHECK(wrong_api.api_version == "-");
 
-    CHECK_FALSE(parse_version(json::parse("[1]")).valid);
-    CHECK(parse_version(json::parse("[1]")).dialect == Dialect::none);
+    // a Components element that is not an object, or a Name that is not a string: malformed and no
+    // dialect, even beside a "Podman Engine" element
+    const auto wrong_comp = parse_version(json::parse(R"({"Components":[1,{"Name":5},{"Name":"Podman Engine"}]})"));
+    CHECK(wrong_comp.malformed);
+    CHECK(wrong_comp.dialect == Dialect::none);
+    for (const char* body : {R"({"Components":[1]})", R"({"Components":[{"Name":5}]})",
+                             R"({"Components":null})", R"({"Components":{"Name":"Podman Engine"}})"}) {
+        const auto bad = parse_version(json::parse(body));
+        INFO(body);
+        CHECK(bad.malformed);
+        CHECK(bad.dialect == Dialect::none);
+    }
+
+    // a MISSING key is never wrong-typed: an element without Name, or without any key, is fine
+    const auto missing = parse_version(json::parse(
+        R"({"Version":"1","Components":[{"Name":"Podman Engine"},{"x":1}]})"));
+    CHECK_FALSE(missing.malformed);
+    CHECK(missing.dialect == Dialect::podman);
+    CHECK_FALSE(parse_version(json::parse(R"({"Components":[]})")).malformed);
+    CHECK(parse_version(json::parse(R"({"Components":[]})")).dialect == Dialect::docker);
+
+    // a non-object reply
+    for (const char* body : {"[1]", "\"s\"", "7", "null"}) {
+        const auto bad = parse_version(json::parse(body));
+        INFO(body);
+        CHECK(bad.malformed);
+        CHECK(bad.dialect == Dialect::none);
+        CHECK(bad.version == "-");
+        CHECK(bad.api_version == "-");
+    }
     CHECK(parse_version(json::parse(R"({"Version":"1.0\u001b"})")).version == "invalid");
 }
 
@@ -504,6 +567,26 @@ TEST_CASE("runtime /info: at most three rows, no other key is read", "[virtualiz
     const auto wrong_options = parse_info(json::parse(R"({"SecurityOptions":5})"));
     CHECK(wrong_options.malformed);
     CHECK(wrong_options.rows.empty());
+    // a SecurityOptions element that is not a string: "rootless" cannot be told, so neither it nor the
+    // count is emitted (never `rootless no`), and the reply is malformed
+    for (const char* body : {R"({"SecurityOptions":[5]})", R"({"SecurityOptions":["name=rootless",5]})",
+                             R"({"SecurityOptions":[null]})", R"({"SecurityOptions":[["name=rootless"]]})"}) {
+        const auto bad = parse_info(json::parse(body));
+        INFO(body);
+        CHECK(bad.malformed);
+        CHECK(bad.rows.empty());
+    }
+    const auto options_bad_driver_ok =
+        parse_info(json::parse(R"({"CgroupDriver":"systemd","SecurityOptions":["a",5]})"));
+    CHECK(options_bad_driver_ok.malformed);
+    REQUIRE(options_bad_driver_ok.rows.size() == 1);
+    CHECK(options_bad_driver_ok.rows[0].key == "cgroup_driver");
+    // an empty list is well-typed: rootless no, count 0
+    const auto no_options = parse_info(json::parse(R"({"SecurityOptions":[]})"));
+    CHECK_FALSE(no_options.malformed);
+    REQUIRE(no_options.rows.size() == 2);
+    CHECK(no_options.rows[0].value == "no");
+    CHECK(no_options.rows[1].value == "0");
     // a well-typed key still reports beside a wrong-typed one
     const auto mixed =
         parse_info(json::parse(R"({"CgroupDriver":"systemd","SecurityOptions":{"a":1}})"));
@@ -580,10 +663,42 @@ TEST_CASE("runtime list: caps, skips and wrong types never throw", "[virtualizat
     const auto mixed = containers_from_list(json::parse(
         R"([{"Id":7},{"Id":"short"},"str",null,{"Id":")" + id('d') + R"(","Names":"notarray","Image":5,"State":[]}])"));
     CHECK(mixed.skipped == 4);
+    CHECK(mixed.malformed); // Names, Image and State are each present with another type
     REQUIRE(mixed.rows.size() == 1);
     CHECK(mixed.rows[0].name == "-");
     CHECK(mixed.rows[0].image == "-");
     CHECK(mixed.rows[0].state == "invalid");
+}
+
+TEST_CASE("runtime list: a wrong-typed key of a valid entry keeps the row and reads malformed",
+          "[virtualization][runtime][containers]") {
+    const std::string valid_id = id('e');
+    const auto one = [&](const std::string& rest) {
+        return containers_from_list(json::parse(R"([{"Id":")" + valid_id + R"(")" + rest + "}]"));
+    };
+    // Image / State / Names / the first Names element each present with another type
+    const auto image = one(R"(,"Names":["/web"],"Image":5,"State":"running")");
+    CHECK(image.malformed);
+    REQUIRE(image.rows.size() == 1);
+    CHECK(image.rows[0].image == "-");
+    CHECK(image.rows[0].name == "web"); // the well-typed fields still report
+    CHECK(image.rows[0].state == "running");
+    const auto state = one(R"(,"Image":"i","State":null)");
+    CHECK(state.malformed);
+    REQUIRE(state.rows.size() == 1);
+    CHECK(state.rows[0].state == "invalid");
+    CHECK(one(R"(,"Names":"web")").malformed);
+    const auto first = one(R"(,"Names":[5,"/web"])");
+    CHECK(first.malformed);
+    REQUIRE(first.rows.size() == 1);
+    CHECK(first.rows[0].name == "-");
+    // a MISSING key (or an empty Names) is not wrong-typed
+    for (const char* rest : {"", R"(,"Names":[])", R"(,"Image":"i")", R"(,"State":"running")"}) {
+        INFO(rest);
+        const auto ok = one(rest);
+        CHECK_FALSE(ok.malformed);
+        CHECK(ok.rows.size() == 1);
+    }
 }
 
 TEST_CASE("runtime fields: the charset check runs before truncation and a miss reads invalid",
@@ -663,15 +778,30 @@ TEST_CASE("runtime inspect: privileged, network mode and the host-socket mount f
     ContainerRow absent = make();
     REQUIRE(apply_inspect(absent, json::parse(R"({"HostConfig":{}})")));
     CHECK(absent.socket_mounted == Tri::unknown);
-    ContainerRow wrong = make();
-    REQUIRE(apply_inspect(wrong, json::parse(R"({"HostConfig":{"Privileged":"yes","NetworkMode":5},"Mounts":"x"})")));
-    CHECK(wrong.privileged == Tri::unknown);
-    CHECK(wrong.network_mode == "unknown");
-    CHECK(wrong.socket_mounted == Tri::unknown);
-    // a mount whose Source is not a string is skipped, not thrown on
-    ContainerRow odd = make();
-    REQUIRE(apply_inspect(odd, json::parse(R"({"HostConfig":{},"Mounts":[{"Source":3},5,{"Source":"/data"}]})")));
-    CHECK(odd.socket_mounted == Tri::no);
+    // a wrong-typed key read is a failed inspection: the row is left untouched, all three fields
+    // unknown (the caller counts `inspect:failed:<n>`), never a field read through another type
+    for (const char* body : {
+             R"({"HostConfig":{"Privileged":"yes","NetworkMode":5},"Mounts":"x"})",
+             R"({"HostConfig":{"Privileged":1,"NetworkMode":"host"},"Mounts":[]})",
+             R"({"HostConfig":{"Privileged":null},"Mounts":[]})",
+             R"({"HostConfig":{"Privileged":true,"NetworkMode":5},"Mounts":[]})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":"x"})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":{"Source":"/run"}})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":[5]})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":[{"Source":"/data"},null]})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":[{"Source":3}]})",
+             R"({"HostConfig":{"Privileged":true},"Mounts":[{"Source":"/data"},{"Source":["/run"]}]})"}) {
+        ContainerRow r = make();
+        INFO(body);
+        CHECK_FALSE(apply_inspect(r, json::parse(body)));
+        CHECK(r.privileged == Tri::unknown);
+        CHECK(r.network_mode == "unknown");
+        CHECK(r.socket_mounted == Tri::unknown);
+    }
+    // a mount object with no Source (tmpfs) mounts no host path and is well-typed
+    ContainerRow tmpfs = make();
+    REQUIRE(apply_inspect(tmpfs, json::parse(R"({"HostConfig":{},"Mounts":[{"Type":"tmpfs"},{"Source":"/data"}]})")));
+    CHECK(tmpfs.socket_mounted == Tri::no);
 
     // no HostConfig object: the row is untouched and the caller counts a failed inspection
     ContainerRow untouched = make();

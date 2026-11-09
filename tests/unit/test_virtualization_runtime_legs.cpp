@@ -507,6 +507,18 @@ TEST_CASE("runtime seam: per-response recovery keeps earlier rows and runs later
         CHECK(rows_with(p, "config|docker|cgroup_driver|systemd").size() == 1);
         CHECK(rows_with(p, "config|docker|rootless|").empty()); // unknown is never rendered as no
     }
+    SECTION("a non-string SecurityOptions element is malformed: no rootless row, never `rootless no`") {
+        Fake f;
+        f.happy_version();
+        f.reply("/info", http(200, R"({"CgroupDriver":"systemd","SecurityOptions":[5]})"));
+        f.reply("/containers/json?all=1", http(200, "[]"));
+        const Posture p = f.run(kEndpoint);
+        CHECK(has_token(p, "info:malformed"));
+        CHECK(p.status == StatusState::constrained);
+        CHECK(rows_with(p, "config|docker|cgroup_driver|systemd").size() == 1);
+        CHECK(rows_with(p, "config|docker|rootless|").empty());
+        CHECK(rows_with(p, "config|docker|security_options_count|").empty());
+    }
     SECTION("a missing /info key only omits its row") {
         Fake f;
         f.happy_version();
@@ -537,6 +549,81 @@ TEST_CASE("runtime seam: per-response recovery keeps earlier rows and runs later
         CHECK(p.status == StatusState::constrained);
         CHECK(rows_with(p, "container|").empty());
         CHECK(p.rows[0] == "endpoint|ok|-|docker");
+    }
+    SECTION("a wrong-typed list entry key keeps the row and constrains with list:malformed") {
+        Fake f;
+        f.happy_version();
+        f.reply("/info", http(200, kInfo));
+        f.reply("/containers/json?all=1",
+                http(200, R"([{"Id":")" + id('a') + R"(","Names":["/c-a"],"Image":5,"State":"running"}])"));
+        f.reply("/containers/" + id('a') + "/json", http(200, inspect_body(false)));
+        const Posture p = f.run(kEndpoint);
+        CHECK(has_token(p, "list:malformed"));
+        CHECK(p.status == StatusState::constrained);
+        CHECK(rows_with(p, "container|docker|" + id('a').substr(0, 12) + "|c-a|-|running|no|bridge|no").size() == 1);
+    }
+    SECTION("a wrong-typed inspect key is a failed inspection: fields unknown, counted") {
+        Fake f;
+        f.happy_version();
+        f.reply("/info", http(200, kInfo));
+        f.reply("/containers/json?all=1", http(200, list_of({'a', 'b'})));
+        f.reply("/containers/" + id('a') + "/json",
+                http(200, R"({"HostConfig":{"Privileged":"yes"},"Mounts":[]})"));
+        f.reply("/containers/" + id('b') + "/json",
+                http(200, R"({"HostConfig":{"Privileged":true},"Mounts":[5]})"));
+        const Posture p = f.run(kEndpoint);
+        CHECK(has_token(p, "inspect:failed:2"));
+        CHECK(p.status == StatusState::constrained);
+        CHECK(rows_with(p, "container|docker|" + id('a').substr(0, 12) +
+                               "|c-a|img:1|running|unknown|unknown|unknown")
+                  .size() == 1);
+        CHECK(rows_with(p, "container|docker|" + id('b').substr(0, 12) +
+                               "|c-b|img:1|running|unknown|unknown|unknown")
+                  .size() == 1);
+        CHECK(f.calls.size() == 5); // version, info, list and both inspections still ran
+    }
+    SECTION("a /version with a wrong-typed key is malformed, never a clean OK") {
+        Fake f;
+        f.reply("/version", http(200, R"({"Version":27,"ApiVersion":"1.47"})"));
+        f.reply("/info", http(200, kInfo));
+        f.reply("/containers/json?all=1", http(200, "[]"));
+        const Posture p = f.run(kEndpoint);
+        CHECK(has_token(p, "version:malformed"));
+        CHECK(p.status == StatusState::constrained);
+        // the dialect is from the well-typed (absent) Components; the wrong-typed field stays `-`
+        CHECK(p.rows[0] == "endpoint|ok|-|docker");
+        CHECK(rows_with(p, "runtime|docker|served|").size() == 1);
+        CHECK(rows_with(p, "runtime|docker|served|")[0].find("|-|1.47") != std::string::npos);
+        CHECK(f.calls.size() == 3); // later verbs still run
+    }
+    SECTION("a /version whose Components is malformed identifies no runtime; later verbs run with -") {
+        for (const char* body : {R"({"Version":"1","Components":"x"})",
+                                 R"({"Version":"1","Components":[1]})",
+                                 R"({"Version":"1","Components":[{"Name":5},{"Name":"Podman Engine"}]})"}) {
+            Fake f;
+            f.reply("/version", http(200, body));
+            f.reply("/info", http(200, kInfo));
+            f.reply("/containers/json?all=1", http(200, "[]"));
+            const Posture p = f.run(kEndpoint);
+            INFO(body);
+            CHECK(has_token(p, "version:malformed"));
+            CHECK(p.status == StatusState::constrained);
+            CHECK(p.rows[0] == "endpoint|ok|-|-");
+            for (const auto& r : rows_with(p, "runtime|"))
+                CHECK(r.find("|served|") == std::string::npos);
+            CHECK(rows_with(p, "config|-|cgroup_driver|systemd").size() == 1);
+            CHECK(f.calls.size() == 3);
+        }
+    }
+    SECTION("a /version missing a key (or with a Components element lacking Name) is not malformed") {
+        Fake f;
+        f.reply("/version", http(200, R"({"Version":"5.2.0","Components":[{"Name":"Podman Engine"},{"x":1}]})"));
+        f.reply("/info", http(200, kInfo));
+        f.reply("/containers/json?all=1", http(200, "[]"));
+        const Posture p = f.run(kEndpoint);
+        CHECK(p.status == StatusState::supported);
+        CHECK(p.reason.empty());
+        CHECK(p.rows[0] == "endpoint|ok|-|podman");
     }
     SECTION("a /version nested past 32 levels reads malformed, endpoint still answered") {
         Fake f;
@@ -701,6 +788,19 @@ TEST_CASE("runtime seam: daemon.json reads are typed, not guessed", "[virtualiza
         CHECK(p.status == StatusState::supported);
         CHECK(p.reason.empty());
         CHECK(p.rows[1] == "runtime|docker|not_detected|absent|absent|-|-");
+    }
+    SECTION("a wrong-typed key keeps the well-typed rows beside the malformed row and the token") {
+        Fake f;
+        f.reads["/etc/docker/daemon.json"] =
+            FieldRead{ReadState::ok, R"({"icc":true,"data-root":true,"hosts":["fd://",5]})", ""};
+        const Posture p = f.run("");
+        CHECK(p.status == StatusState::constrained);
+        CHECK(has_token(p, "daemon_json:malformed"));
+        CHECK(rows_with(p, "config|docker|icc|yes").size() == 1);
+        CHECK(rows_with(p, "config|docker|data-root|").empty());
+        CHECK(rows_with(p, "config|docker|hosts").empty()); // hosts and hosts_tcp: unknown, withheld
+        CHECK(rows_with(p, "config|docker|daemon_json|malformed").size() == 1);
+        CHECK(p.rows[1] == "runtime|docker|detected|absent|present|-|-");
     }
     SECTION("oversized and malformed files are tokens, malformed also a row") {
         Fake f;

@@ -318,7 +318,7 @@ spec:
         platforms: [linux]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:virtualization:runtime_posture:endpoint:default_socket, linux:virtualization:runtime_posture:version:timeout, linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, "-" when it did not answer. runtime: the default socket, present:<mode>:<uid>:<gid>, absent or unreadable (its stat failed). config: the setting value. container: the container name.'
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; every token is linux:virtualization:runtime_posture:<source>:<cause>, where <source> is endpoint, version, info, list, inspect, daemon_json or a runtime name; tokens look like linux:virtualization:runtime_posture:endpoint:default_socket, linux:virtualization:runtime_posture:version:timeout, linux:virtualization:runtime_posture:info:malformed, linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, "-" when it did not answer. runtime: the default socket, present:<mode>:<uid>:<gid>, absent or unreadable (its stat failed). config: the setting value. container: the container name.'
         example: present:0660:0:998
         platforms: [linux]
       - name: field_4

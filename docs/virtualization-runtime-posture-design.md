@@ -246,15 +246,17 @@ refused as in section 5, so the file reads `malformed`) and only an allow-list o
 `selinux-enabled`, `userland-proxy`. `hosts` is reduced to a count and a `hosts_tcp yes|no` flag (any
 `tcp://` listener); `insecure-registries` and `registry-mirrors` are reduced to counts. Every other key,
 including anything that looks like a credential, is dropped and never emitted. A key with a value of the
-wrong type is skipped. Malformed JSON reports `config|docker|daemon_json|malformed` and a constraint
-token.
+wrong type (or a `hosts` element that is not a string) is skipped and the file reads `malformed` (the
+well-typed keys still report). A malformed file reports `config|docker|daemon_json|malformed` beside any
+well-typed rows, and a constraint token.
 
 **binding (`/info` rows):** when an endpoint is configured, the `/info` reply is reduced to at most three
 `config` rows and nothing else: `rootless yes|no` (whether any `SecurityOptions` entry is
 `name=rootless`), `cgroup_driver <value>` (`CgroupDriver`, charset-checked), and
 `security_options_count <n>` (the length of `SecurityOptions`). A key that is missing omits its row. A
-`SecurityOptions` or `CgroupDriver` of the wrong type, or a reply that is not an object, is
-`info:malformed` (the well-typed key still reports). No other `/info` key is read; the reply is
+`SecurityOptions` or `CgroupDriver` of the wrong type, a `SecurityOptions` element that is not a string
+(neither `rootless` nor the count is emitted then: unknown is never rendered as `no`), or a reply that is
+not an object, is `info:malformed` (the well-typed key still reports). No other `/info` key is read; the reply is
 otherwise dropped. The reviewer judged these three fields safe; the reviewer could not verify how a
 runtime masks credentials elsewhere in `/info`, which is why no other key is read.
 
@@ -276,7 +278,7 @@ Attribution is split in two so every outcome has exactly one owner.
 | `permission_denied` | `connect` failed with `EACCES` or `EPERM` |
 | `unreachable` | `ENOENT` at the endpoint path, `ECONNREFUSED`, a connect timeout, or no complete `/version` reply within the budget (token `version:timeout`) |
 | `not_http` | connected, but `/version` was not a parseable HTTP reply with a JSON body within 1 MiB (token `version:not_http` or `version:response_oversized`; for example a containerd socket) |
-| `ok` | `/version` answered; `dialect` is `docker` or `podman` (from the `Components[].Name` of the reply; `Podman Engine` means podman) |
+| `ok` | `/version` answered; `dialect` is `docker` or `podman` when the reply identified one (from the `Components[].Name` of the reply; `Podman Engine` means podman), `-` when it answered non-200 or malformed (section 7, per-response recovery) |
 
 Every state other than `unset` and `ok` is also a failed read, so each adds one token to the status as
 well as being named by the endpoint row: `endpoint:<reason>` for a refusal (`endpoint:default_socket`,
@@ -310,14 +312,20 @@ emitted only when it is numeric and in 100-599, otherwise the cause is `http_oth
 
 **Per-response recovery.** A non-200, malformed or wrong-typed `/version`, `/info` or list reply yields
 unknown fields for that verb plus one token `<verb>:http_<status>` or `<verb>:malformed`, where `<verb>` is
-`version`, `info` or `list`; earlier rows are kept and later verbs still run while budget remains. A list
-entry that is not an object or carries no valid id is skipped and counted in the token
-`list:entries_skipped`. When `/version` answers non-200 or malformed the dialect is not known: the later
-verbs still run and their `config` and `container` rows carry `-` as the runtime, while the runtime rows
-are unchanged. A `/version` request that fails at the transport (refused, timed out, oversized, not HTTP)
+`version`, `info` or `list`; earlier rows are kept and later verbs still run while budget remains.
+Wrong-typed means a key the parser reads is present with a value, or an element it reads, of another type;
+a missing key is never wrong-typed. The keys read are `/version` `Version`, `ApiVersion`, `Components`, each
+`Components` element (an object) and its `Name`; `/info` as in section 6; and in a list entry `Names`, its
+first element, `Image` and `State`. A wrong-typed key withholds its own field and the reply reads
+`malformed` while the well-typed keys still report; a list entry keeps its row with `-` or `invalid` for the
+field. A list entry that is not an object or carries no valid id is skipped and counted in the token
+`list:entries_skipped`. When `/version` answers non-200, is not an object or carries a malformed
+`Components` the dialect is not known: the later verbs still run and their `config` and `container` rows
+carry `-` as the runtime, while the runtime rows are unchanged. A `/version` request that fails at the transport (refused, timed out, oversized, not HTTP)
 or answers 200 with a body that is not JSON stops the action: the endpoint row says which and the
-`version:<cause>` token says it was a failed read. A failed inspection keeps the list-derived row with
-the three inspect fields `unknown` and continues; the failures are counted in one token
+`version:<cause>` token says it was a failed read. A failed inspection (a transport or HTTP failure, a body that is not JSON, or a
+wrong-typed `HostConfig.Privileged`, `NetworkMode`, `Mounts` or `Mounts[].Source`) keeps the list-derived
+row with the three inspect fields `unknown` and continues; the failures are counted in one token
 `inspect:failed:<n>`. An HTTP 404 on inspect (the container was removed between list and inspect) is
 expected churn: fields `unknown`, no token and no constraint.
 
@@ -338,8 +346,9 @@ container|<runtime|->|<id12>|<name>|<image>|<state>|<privileged yes|no|unknown>|
 ```
 
 `unreadable` means the `stat` failed with an error other than `ENOENT` or `ENOTDIR` (never read as
-`absent`), and the status carries the token. The runtime of a `config` or `container` row is the dialect
-`/version` identified; it is `-` when `/version` did not identify one (section 7, per-response recovery).
+`absent`), and the status carries the token. The runtime of an `/info` `config` row or a `container` row is the dialect
+`/version` identified, `-` when it did not identify one (section 7, per-response recovery); `daemon.json`
+rows are always `docker`.
 
 **binding (per-field allow-lists):** the wire escaping (`wire_field`: NUL and malformed UTF-8 to `?`,
 then `\`, CR, LF and `|` handled) is the second layer, not the first. ESC and the other C0/C1 bytes and
@@ -486,7 +495,11 @@ the group-write bit (section 4) and section 9 item 4. (f) The 1 MiB cap is enfor
 check and the receiver ahead of the client's own payload cap, which sits one read buffer above it
 (section 5). (g) The shell connects only through the checked descriptor; the earlier per-request retry by
 path is gone (section 4, section 9 item 6). (h) A default-socket `stat` failure does not refuse the
-endpoint; the residual is recorded in section 4.
+endpoint; the residual is recorded in section 4. (i) The wrong-typed class was closed across every JSON
+reader in one rule (section 7, per-response recovery): a wrong-typed `/version` key, a non-string
+`SecurityOptions` element, a wrong-typed list-entry key, a wrong-typed inspect key and a wrong-typed
+`daemon.json` key each add a token and withhold their own field, so none reads as `no` or answers a clean
+`OK`; the well-typed keys still report in every reader.
 
 **Binding statements for the build (every one is marked `binding` above):** the list-reply allow-list
 (section 2); the `O_PATH|O_NOFOLLOW` open, `fstat` properties, ancestor walk, connect through

@@ -12,7 +12,11 @@
 //     socket refusal by path, by inode, socket type / owner / group / mode, ancestor walk.
 //   * The JSON readers. Every body is parsed through parse_limited (non-throwing, comments
 //     ignored, nesting over kMaxJsonDepth discarded as it starts) and read only through accessors
-//     that tolerate a wrong type. Each reader touches an allow-list of keys and nothing else:
+//     that tolerate a wrong type. ONE rule for every reader (typed_member): a key it reads that is
+//     absent omits its row or leaves the field unknown; a key present with another type, or a read
+//     element of another type, makes that reader `malformed` (the caller adds the token) and
+//     contributes nothing, while the well-typed keys still report. Each reader touches an
+//     allow-list of keys and nothing else:
 //     /version (Version, ApiVersion, Components[].Name), /info (CgroupDriver, SecurityOptions),
 //     the list reply (Id, Names, Image, State), the inspect reply (HostConfig.Privileged,
 //     HostConfig.NetworkMode, Mounts[].Source), daemon.json (a fixed key list).
@@ -559,6 +563,20 @@ inline const nlohmann::json* member_of_type(const nlohmann::json& j, const char*
     return (m && m->type() == t) ? m : nullptr;
 }
 
+/// The typed read every JSON reader below uses for a key it reads. Absent: nullptr and nothing
+/// recorded (the row is omitted or stays unknown; a missing key is never wrong-typed). Present with
+/// another type, null included: nullptr and `malformed` set, so the reader reports a token beside
+/// whatever well-typed keys it still read. `malformed` is only ever set here, never cleared.
+inline const nlohmann::json* typed_member(const nlohmann::json& j, const char* key,
+                                          nlohmann::json::value_t t, bool& malformed) {
+    const auto* m = member(j, key);
+    if (m && m->type() != t) {
+        malformed = true;
+        return nullptr;
+    }
+    return m;
+}
+
 // ---------------------------------------------------------------------------
 // Per-field allow-lists (section 8)
 // ---------------------------------------------------------------------------
@@ -629,29 +647,44 @@ inline std::string_view dialect_token(Dialect d) {
 }
 
 struct VersionInfo {
-    bool valid = false; ///< the reply was a JSON object
+    /// The reply was not a JSON object, or a key read below was present with another type
+    /// (Version, ApiVersion, Components, a Components element, an element's Name).
+    bool malformed = false;
     Dialect dialect = Dialect::none;
     std::string version = "-";
     std::string api_version = "-";
 };
 
 /// `Components[].Name == "Podman Engine"` means podman; a docker-shaped or component-less object
-/// means docker. A non-object reply is not valid (dialect none).
+/// means docker. The dialect comes from a well-typed Components only: a malformed Components, and a
+/// non-object reply, give Dialect::none. A wrong-typed Version or ApiVersion stays `-` and the
+/// reply is malformed; the dialect is unaffected by them.
 inline VersionInfo parse_version(const nlohmann::json& j) {
     VersionInfo v;
-    if (!j.is_object())
+    if (!j.is_object()) {
+        v.malformed = true;
         return v;
-    v.valid = true;
-    v.dialect = Dialect::docker;
-    if (const auto* comps = member_of_type(j, "Components", nlohmann::json::value_t::array)) {
-        for (const auto& c : *comps)
-            if (const auto* n = member_of_type(c, "Name", nlohmann::json::value_t::string))
-                if (n->get_ref<const std::string&>() == "Podman Engine")
-                    v.dialect = Dialect::podman;
     }
-    if (const auto* s = member_of_type(j, "Version", nlohmann::json::value_t::string))
+    bool comps_malformed = false;
+    bool podman = false;
+    if (const auto* comps =
+            typed_member(j, "Components", nlohmann::json::value_t::array, comps_malformed)) {
+        for (const auto& c : *comps) {
+            if (!c.is_object()) {
+                comps_malformed = true;
+                continue;
+            }
+            if (const auto* n =
+                    typed_member(c, "Name", nlohmann::json::value_t::string, comps_malformed))
+                podman = podman || n->get_ref<const std::string&>() == "Podman Engine";
+        }
+    }
+    v.malformed = comps_malformed;
+    v.dialect = comps_malformed ? Dialect::none : (podman ? Dialect::podman : Dialect::docker);
+    if (const auto* s = typed_member(j, "Version", nlohmann::json::value_t::string, v.malformed))
         v.version = checked_version(s->get_ref<const std::string&>());
-    if (const auto* s = member_of_type(j, "ApiVersion", nlohmann::json::value_t::string))
+    if (const auto* s =
+            typed_member(j, "ApiVersion", nlohmann::json::value_t::string, v.malformed))
         v.api_version = checked_version(s->get_ref<const std::string&>());
     return v;
 }
@@ -671,32 +704,36 @@ struct ConfigRows {
     bool malformed = false;
 };
 
-/// malformed: the reply was not an object, or SecurityOptions / CgroupDriver was present with the
-/// wrong type. A key that is simply absent omits its row and is not malformed (same visibility as a
-/// key missing from daemon.json).
+/// malformed: the reply was not an object, or SecurityOptions (or one of its elements) or
+/// CgroupDriver was present with the wrong type. A wrong-typed SecurityOptions contributes no row
+/// at all (a non-string element means "rootless" cannot be told, never `no`); a key that is simply
+/// absent omits its row and is not malformed (same visibility as a key missing from daemon.json).
 inline ConfigRows parse_info(const nlohmann::json& j) {
     ConfigRows out;
     if (!j.is_object()) {
         out.malformed = true;
         return out;
     }
-    const auto* so = member_of_type(j, "SecurityOptions", nlohmann::json::value_t::array);
+    const auto* so =
+        typed_member(j, "SecurityOptions", nlohmann::json::value_t::array, out.malformed);
+    bool rootless = false;
     if (so) {
-        bool rootless = false;
-        for (const auto& e : *so)
-            if (e.is_string()) {
-                const auto& s = e.get_ref<const std::string&>();
-                if (s == "name=rootless" || s.rfind("name=rootless,", 0) == 0)
-                    rootless = true;
+        for (const auto& e : *so) {
+            if (!e.is_string()) {
+                out.malformed = true;
+                so = nullptr;
+                break;
             }
-        out.rows.push_back({"rootless", rootless ? "yes" : "no"});
-    } else if (member(j, "SecurityOptions")) {
-        out.malformed = true;
+            const auto& s = e.get_ref<const std::string&>();
+            if (s == "name=rootless" || s.rfind("name=rootless,", 0) == 0)
+                rootless = true;
+        }
     }
-    if (const auto* cg = member_of_type(j, "CgroupDriver", nlohmann::json::value_t::string))
+    if (so)
+        out.rows.push_back({"rootless", rootless ? "yes" : "no"});
+    if (const auto* cg =
+            typed_member(j, "CgroupDriver", nlohmann::json::value_t::string, out.malformed))
         out.rows.push_back({"cgroup_driver", checked_config_string(cg->get_ref<const std::string&>())});
-    else if (member(j, "CgroupDriver"))
-        out.malformed = true;
     if (so)
         out.rows.push_back({"security_options_count", std::to_string(so->size())});
     return out;
@@ -706,6 +743,9 @@ inline ConfigRows parse_info(const nlohmann::json& j) {
 // daemon.json: a fixed key allow-list (section 6)
 // ---------------------------------------------------------------------------
 
+/// malformed: the text is not a JSON object, or an allow-listed key is present with the wrong type
+/// (or a `hosts` element is not a string). The well-typed keys still report; the wrong-typed one
+/// contributes no row, never a row read through another type's path.
 inline ConfigRows parse_daemon_json(std::string_view text) {
     ConfigRows out;
     const ParsedJson p = parse_limited(text);
@@ -715,7 +755,7 @@ inline ConfigRows parse_daemon_json(std::string_view text) {
     }
     const auto& j = p.value;
     // One list, each key admitted only through its own type: a boolean on a string key (or a string
-    // on a boolean one) is skipped, never rendered. Row order follows this list.
+    // on a boolean one) is withheld and the file reads malformed. Row order follows this list.
     struct Key {
         const char* name;
         nlohmann::json::value_t type;
@@ -728,24 +768,35 @@ inline ConfigRows parse_daemon_json(std::string_view text) {
                          Key{"data-root", kString}, Key{"log-driver", kString},
                          Key{"storage-driver", kString}, Key{"selinux-enabled", kBool},
                          Key{"userland-proxy", kBool}}) {
-        const auto* m = member_of_type(j, k.name, k.type);
+        const auto* m = typed_member(j, k.name, k.type, out.malformed);
         if (!m)
-            continue; // absent, or of another type: skipped, never rendered
+            continue; // absent: omitted; of another type: omitted and malformed
         if (k.type == kBool)
             out.rows.push_back({k.name, m->get<bool>() ? "yes" : "no"});
         else
             out.rows.push_back({k.name, checked_config_string(m->get_ref<const std::string&>())});
     }
-    if (const auto* hosts = member_of_type(j, "hosts", nlohmann::json::value_t::array)) {
+    if (const auto* hosts =
+            typed_member(j, "hosts", nlohmann::json::value_t::array, out.malformed)) {
         bool tcp = false;
-        for (const auto& h : *hosts)
-            if (h.is_string() && h.get_ref<const std::string&>().rfind("tcp://", 0) == 0)
+        bool all_strings = true;
+        for (const auto& h : *hosts) {
+            if (!h.is_string()) {
+                all_strings = false;
+                break;
+            }
+            if (h.get_ref<const std::string&>().rfind("tcp://", 0) == 0)
                 tcp = true;
-        out.rows.push_back({"hosts", std::to_string(hosts->size())});
-        out.rows.push_back({"hosts_tcp", tcp ? "yes" : "no"});
+        }
+        if (all_strings) {
+            out.rows.push_back({"hosts", std::to_string(hosts->size())});
+            out.rows.push_back({"hosts_tcp", tcp ? "yes" : "no"});
+        } else {
+            out.malformed = true; // `hosts_tcp no` over an unreadable element would be a guess
+        }
     }
     for (const char* key : {"insecure-registries", "registry-mirrors"})
-        if (const auto* a = member_of_type(j, key, nlohmann::json::value_t::array))
+        if (const auto* a = typed_member(j, key, nlohmann::json::value_t::array, out.malformed))
             out.rows.push_back({key, std::to_string(a->size())});
     return out;
 }
@@ -767,7 +818,10 @@ struct ContainerRow {
 
 struct ContainerList {
     std::vector<ContainerRow> rows;
-    bool malformed = false;       ///< the reply was not a JSON array
+    /// The reply was not a JSON array, or a key read from an entry (Names, its first element,
+    /// Image, State) was present with another type. The rows are kept; the field reads `-` /
+    /// `invalid`.
+    bool malformed = false;
     bool rows_capped = false;     ///< more than kMaxContainerRows entries
     std::size_t skipped = 0;      ///< entries that were not objects or carried no valid Id
 };
@@ -793,23 +847,30 @@ inline ContainerList containers_from_list(const nlohmann::json& j) {
         ContainerRow r;
         r.id = id->get_ref<const std::string&>();
         r.id12 = r.id.substr(0, 12);
-        if (const auto* names = member_of_type(e, "Names", nlohmann::json::value_t::array);
-            names && !names->empty() && names->front().is_string()) {
-            std::string_view n = names->front().get_ref<const std::string&>();
-            if (!n.empty() && n.front() == '/')
-                n.remove_prefix(1);
-            r.name = checked_name(n);
+        if (const auto* names =
+                typed_member(e, "Names", nlohmann::json::value_t::array, out.malformed);
+            names && !names->empty()) {
+            if (names->front().is_string()) {
+                std::string_view n = names->front().get_ref<const std::string&>();
+                if (!n.empty() && n.front() == '/')
+                    n.remove_prefix(1);
+                r.name = checked_name(n);
+            } else {
+                out.malformed = true;
+            }
         }
-        if (const auto* img = member_of_type(e, "Image", nlohmann::json::value_t::string))
+        if (const auto* img =
+                typed_member(e, "Image", nlohmann::json::value_t::string, out.malformed))
             r.image = checked_image(img->get_ref<const std::string&>());
-        if (const auto* st = member_of_type(e, "State", nlohmann::json::value_t::string))
+        if (const auto* st =
+                typed_member(e, "State", nlohmann::json::value_t::string, out.malformed))
             r.state = checked_state(st->get_ref<const std::string&>());
         out.rows.push_back(std::move(r));
     }
     return out;
 }
 
-/// `s` (normalised) is one of the default sockets or a directory that contains one.
+/// `source` (normalised) is one of the default sockets or a directory that contains one.
 inline bool mount_exposes_runtime_socket(std::string_view source) {
     const std::string s = normalise_path(source);
     if (s.empty() || s.front() != '/')
@@ -820,28 +881,50 @@ inline bool mount_exposes_runtime_socket(std::string_view source) {
     return false;
 }
 
-/// Applies one inspect reply. Returns false (the row is left untouched) when the reply has no
-/// object HostConfig, which is how a failed or wrong-typed inspect reads.
+/// Applies one inspect reply, all or nothing. Returns false (the row is left untouched, so its
+/// three inspect fields stay unknown) when the reply has no object HostConfig or any key read is
+/// wrong-typed: HostConfig.Privileged, HostConfig.NetworkMode, Mounts (neither null nor an array),
+/// a Mounts element that is not an object, or a Mounts[].Source that is present and not a string.
+/// A missing key leaves its field unknown, never `no`; a mount object without Source (tmpfs)
+/// mounts no host path.
 inline bool apply_inspect(ContainerRow& row, const nlohmann::json& j) {
     const auto* hc = member_of_type(j, "HostConfig", nlohmann::json::value_t::object);
     if (!hc)
         return false;
-    if (const auto* p = member_of_type(*hc, "Privileged", nlohmann::json::value_t::boolean))
-        row.privileged = p->get<bool>() ? Tri::yes : Tri::no;
-    if (const auto* nm = member_of_type(*hc, "NetworkMode", nlohmann::json::value_t::string))
-        row.network_mode = checked_network_mode(nm->get_ref<const std::string&>());
-    const auto* mounts = member(j, "Mounts");
-    if (mounts && mounts->is_null()) {
-        row.socket_mounted = Tri::no;
-    } else if (mounts && mounts->is_array()) {
-        bool exposed = false;
-        for (const auto& m : *mounts)
-            if (const auto* src = member_of_type(m, "Source", nlohmann::json::value_t::string))
-                if (mount_exposes_runtime_socket(src->get_ref<const std::string&>()))
-                    exposed = true;
-        row.socket_mounted = exposed ? Tri::yes : Tri::no;
+    bool bad = false;
+    Tri privileged = row.privileged;
+    std::string network_mode = row.network_mode;
+    Tri socket_mounted = row.socket_mounted;
+    if (const auto* p = typed_member(*hc, "Privileged", nlohmann::json::value_t::boolean, bad))
+        privileged = p->get<bool>() ? Tri::yes : Tri::no;
+    if (const auto* nm = typed_member(*hc, "NetworkMode", nlohmann::json::value_t::string, bad))
+        network_mode = checked_network_mode(nm->get_ref<const std::string&>());
+    if (const auto* mounts = member(j, "Mounts")) {
+        if (mounts->is_null()) {
+            socket_mounted = Tri::no;
+        } else if (mounts->is_array()) {
+            bool exposed = false;
+            for (const auto& m : *mounts) {
+                if (!m.is_object()) {
+                    bad = true;
+                    break;
+                }
+                if (const auto* src =
+                        typed_member(m, "Source", nlohmann::json::value_t::string, bad))
+                    exposed = exposed ||
+                              mount_exposes_runtime_socket(src->get_ref<const std::string&>());
+            }
+            socket_mounted = exposed ? Tri::yes : Tri::no;
+        } else {
+            bad = true;
+        }
     }
-    // no Mounts key, or one of another type, leaves socket_mounted unknown: never rendered as no
+    // no Mounts key leaves socket_mounted unknown: never rendered as no
+    if (bad)
+        return false;
+    row.privileged = privileged;
+    row.network_mode = std::move(network_mode);
+    row.socket_mounted = socket_mounted;
     return true;
 }
 

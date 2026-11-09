@@ -267,9 +267,8 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
                     if (dj.malformed) {
                         docker_config_malformed = true;
                         acc.add_failure(rt_token("daemon_json:malformed"));
-                    } else {
-                        docker_config = std::move(dj.rows);
                     }
+                    docker_config = std::move(dj.rows); // the well-typed keys still report
                 } else if (r.state == ReadState::unreadable) {
                     config_unreadable = true;
                     acc.add_failure(rt_token("daemon_json:" + r.cause));
@@ -376,8 +375,11 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
                     acc.add_failure(rt_token("version:not_http"));
                     proceed = false;
                 } else {
-                    version = pj.ok ? parse_version(pj.value) : VersionInfo{};
-                    if (!version.valid)
+                    if (pj.ok)
+                        version = parse_version(pj.value);
+                    else
+                        version.malformed = true; // nested past the limit
+                    if (version.malformed)
                         acc.add_failure(rt_token("version:malformed"));
                     dialect = version.dialect;
                 }
