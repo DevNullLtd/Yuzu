@@ -2077,6 +2077,7 @@ struct RouteRig {
     bool perm_grant{true};
     DispatchCaller caller = make_caller("alice", true);
     bool caller_wired{true};
+    int caller_derivations{0};
     int audit_calls{0};
     std::vector<std::string> target_ids; // the `target_id` column value of every audit row
     struct Emitted {
@@ -2116,7 +2117,10 @@ struct RouteRig {
             };
         }
         if (caller_wired)
-            deps.caller_fn = [this](const httplib::Request&) { return caller; };
+            deps.caller_fn = [this](const httplib::Request&) {
+                ++caller_derivations;
+                return caller;
+            };
         deps.emit_event_fn = [this](const std::string& type, const httplib::Request&,
                                     const json& attrs, const json& payload) {
             emitted.push_back({type, attrs, payload});
@@ -3186,4 +3190,26 @@ TEST_CASE("REST execute: the caller is re-derived after the row", "[instruction_
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(r.core.drain() == std::vector<std::pair<std::string, std::string>>{{kB, "testplug.ping"}});
+}
+
+TEST_CASE("REST execute: a different principal re-derived after the row is permission_revoked "
+          "(the same principal is required, as commands and MCP)",
+          "[instruction_execute][rest][security]") {
+    RouteRig r;
+    r.core.defs["d"] = make_def("d");
+    r.caller = make_caller("alice", true);
+    // The credentials resolve to another principal while the execution row is written.
+    r.core.on_create = [&] { r.caller = make_caller("someone-else", true); };
+    auto res = r.post("d", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    const auto j = json::parse(res->body);
+    CHECK(j["error"]["reason"] == "permission_revoked");
+    CHECK(r.caller_derivations == 2); // the entry derivation and the recheck's
+    CHECK(r.core.calls.empty());
+    CHECK(r.core.cancelled == std::vector<std::string>{"exec-1"}); // the row it created is closed
+    REQUIRE(r.core.audits.size() == 2);
+    CHECK(r.core.audits[0].result == "requested");
+    CHECK(r.core.audits[1].result == "failure");
+    CHECK(r.core.audits[1].detail.find("reason=permission_revoked") != std::string::npos);
 }

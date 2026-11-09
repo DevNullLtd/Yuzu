@@ -47591,33 +47591,46 @@ TEST_CASE("MCP execute_instruction_definition: the audit row is written BEFORE d
     CHECK(rig.rows.empty());
 }
 
-TEST_CASE("MCP execute_instruction_definition: Execution:Execute withdrawn inside the execution-row "
-          "write dispatches nothing, cancels the row and is kPermissionDenied permission_revoked "
-          "(#7110)",
+TEST_CASE("MCP execute_instruction_definition: a withdrawn grant, an expired session or a changed "
+          "principal inside the execution-row write dispatches nothing, cancels the row and is "
+          "HTTP 200 kPermissionDenied permission_revoked (#7110)",
           "[mcp][integration][execute][idef][audit][security][7110]") {
-    McpTestServer ts;
-    Rig rig;
-    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
-    // The tool-level gate admitted the call; the grant moves while the execution row is written
+    // The tool-level gate admitted the call; the world moves while the execution row is written
     // (the core's last own write), so only the handler's own recheck (its `readmit` wiring) can
-    // catch it.
-    rig.on_create = [&] {
-        ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
-            return !(sec == "Execution" && op == "Execute");
-        };
-    };
-    idef_start(ts, rig, "operator");
-    auto res = ts.call(idef_call({{"definition_id", "d"}}));
-    REQUIRE(res);
-    const auto body = nlohmann::json::parse(res->body);
-    REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
-    CHECK(body["error"]["data"]["reason"] == "permission_revoked");
-    CHECK(rig.calls.empty());
-    CHECK(rig.rows.size() == 1); // the row exists ...
-    CHECK(rig.cancelled == std::vector<std::string>{"exec-1"}); // ... and is closed, not left running
-    CHECK(idef_audited(ts, "requested"));
-    CHECK(idef_audited(ts, "failure"));
+    // catch it. `auth_fn` / `perm_fn` write 401 / 403 into the response on refusal; the rendered
+    // JSON-RPC envelope must replace that status, so all three refusals read alike on the wire.
+    for (const int k : {0, 1, 2}) {
+        DYNAMIC_SECTION((k == 0   ? "grant withdrawn"
+                         : k == 1 ? "session expired"
+                                  : "principal changed")) {
+            McpTestServer ts;
+            Rig rig;
+            rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+            rig.on_create = [&] {
+                if (k == 0)
+                    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+                        return !(sec == "Execution" && op == "Execute");
+                    };
+                else if (k == 1)
+                    ts.mock_auth_enabled = false;
+                else
+                    ts.mock_username = "someone-else";
+            };
+            idef_start(ts, rig, "operator");
+            auto res = ts.call(idef_call({{"definition_id", "d"}}));
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            const auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+            CHECK(body["error"]["data"]["reason"] == "permission_revoked");
+            CHECK(rig.calls.empty());
+            CHECK(rig.rows.size() == 1); // the row exists ...
+            CHECK(rig.cancelled == std::vector<std::string>{"exec-1"}); // ... and is closed
+            CHECK(idef_audited(ts, "requested"));
+            CHECK(idef_audited(ts, "failure"));
+        }
+    }
 }
 
 TEST_CASE("MCP execute_instruction_definition: the caller dispatched is the one re-derived after "

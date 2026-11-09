@@ -254,10 +254,15 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         // `perm_fn` writes its own 403 into `res` on refusal; the refusal render below overwrites
         // it with the same status. A copy: `deps.ports` is const and shared across requests.
         Ports ports = deps.ports;
+        const std::string entry_principal = rq.caller.principal;
         ports.readmit = [&]() -> std::optional<DispatchCaller> {
             if (!deps.perm_fn || !deps.perm_fn(req, res, "Execution", "Execute") || !deps.caller_fn)
                 return std::nullopt;
-            return deps.caller_fn(req);
+            auto again = deps.caller_fn(req);
+            // The same principal is required, as `POST /api/v1/commands` and MCP do.
+            if (again.principal != entry_principal)
+                return std::nullopt;
+            return again;
         };
         const Outcome out =
             run(rq, ports, audit, bind_event_emit(deps.emit_event_fn, req, ports.metrics));

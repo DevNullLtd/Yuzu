@@ -21203,7 +21203,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #7110: the post-write recheck re-authenticates: the admin bit is a session
                 // snapshot (the REST twins do the same). The re-derived caller gets
                 // approval_provenance None again, as above. `auth_fn` / `perm_fn` write a 401 /
-                // 403 into `res` on refusal, which the rendered JSON-RPC answer below replaces.
+                // 403 into `res` on refusal; the rendered JSON-RPC answer below replaces the
+                // body AND the status (a handler-rendered envelope rides HTTP 200, so the
+                // status never reveals which internal branch refused).
                 auto exec_ports = instr_exec_ports_;
                 exec_ports.readmit = [&]() -> std::optional<DispatchCaller> {
                     const auto fresh = auth_fn(req, res);
@@ -21222,6 +21224,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     },
                     bind_event_emit(emit_event_fn_, req, metrics));
                 const auto rendered = idef::render_outcome(out, out.correlation_id);
+                res.status = 200;
                 res.set_content(
                     rendered.is_error
                         ? error_response(id, rendered.code, rendered.message, rendered.data_json)
