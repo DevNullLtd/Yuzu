@@ -157,15 +157,21 @@ void log_drift(const std::string& store, int version, const std::string& recorde
                   kDriftDocHeading);
 }
 
-/// Writes one hash row. `first_sight == false` is the apply path: an UPSERT, never
-/// a plain INSERT, because a rewound schema_meta re-applies a version over its old
-/// row and the text that just ran is the authority (`recorded_by = 'apply'`).
-/// `first_sight == true` is trust on first use for a version applied before the
-/// table existed (`'tofu'`): DO NOTHING, so a row another process recorded first
-/// is never overwritten by this one.
+/// Which of the two hash-row writes `record_hash` performs.
+enum class HashRecord {
+    /// The apply path: an UPSERT, never a plain INSERT, because a rewound schema_meta
+    /// re-applies a version over its old row and the text that just ran is the
+    /// authority (`recorded_by = 'apply'`).
+    Apply,
+    /// Trust on first use for a version applied before the table existed (`'tofu'`):
+    /// DO NOTHING, so a row another process recorded first is never overwritten.
+    FirstSight,
+};
+
+/// Writes one hash row, in the manner `how` names.
 bool record_hash(PGconn* conn, const std::string& store, int version, const std::string& sha,
-                 bool first_sight) {
-    const char* sql = first_sight
+                 HashRecord how) {
+    const char* sql = how == HashRecord::FirstSight
                           ? "INSERT INTO public.yuzu_schema_migrations "
                             "(store, version, sha256, recorded_by, recorded_at) "
                             "VALUES ($1, $2::int, $3, 'tofu', extract(epoch FROM now())::bigint) "
@@ -230,7 +236,7 @@ bool verify_recorded_hashes(PGconn* conn, const std::string& store, int current,
         return true; // another process recorded them first; nothing to write or log
     for (int version : verdict.missing) {
         const std::string* e = find_hash(expected, version);
-        if (!record_hash(conn, store, version, *e, /*first_sight=*/true))
+        if (!record_hash(conn, store, version, *e, HashRecord::FirstSight))
             return false;
     }
     if (!txn.commit()) {
@@ -562,7 +568,7 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
         }
 
         if (const std::string* h = find_hash(expected, m.version);
-            !h || !record_hash(conn, store, m.version, *h, /*first_sight=*/false))
+            !h || !record_hash(conn, store, m.version, *h, HashRecord::Apply))
             return false;
 
         if (!txn.commit()) {

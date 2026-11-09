@@ -581,8 +581,10 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
     }
 
     SECTION("the hashes are verified BEFORE a pending higher migration is applied") {
-        // If the verify moved after the apply loop, v3 would be applied and only then
-        // refused: the schema would move under a build that is about to be rejected.
+        // Pins "no schema movement before the refusal": were the verify to run after the
+        // apply loop, v3 would be applied and only then refused, so the schema would move
+        // under a build that is about to be rejected. (It does not distinguish the
+        // lock-free verify from any other ordering that refuses before applying.)
         const std::vector<PgMigration> two = {{1, t1}, {2, t2}};
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", two));
         const std::vector<PgMigration> edited_plus_new = {
@@ -595,9 +597,10 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
                      "'store_h' AND table_name = 'items' AND column_name = 'note'") == 0);
     }
 
-    SECTION("a hash write that fails rolls the whole migration back (apply path)") {
-        // Another store creates the table first, so the constraint has something to attach to.
-        REQUIRE(PgMigrationRunner::run(conn.get(), "store_seed", {{1, "CREATE TABLE s (id INT)"}}));
+    // Runs v3 for store_h with a CHECK constraint that refuses every hash-row write for it,
+    // returning {run() result, captured error log}; the constraint is dropped again before
+    // returning so the caller's later assertions see a normal table.
+    const auto run_with_hash_writes_refused = [&]() -> std::pair<bool, std::string> {
         exec_ok_or_fail(
             conn.get(),
             "ALTER TABLE public.yuzu_schema_migrations ADD CONSTRAINT yuzu_test_nowrite "
@@ -612,6 +615,13 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
         }
         exec_ok_or_fail(conn.get(), "ALTER TABLE public.yuzu_schema_migrations DROP CONSTRAINT "
                                     "yuzu_test_nowrite");
+        return {ok, logs};
+    };
+
+    SECTION("a hash write that fails rolls the whole migration back (apply path)") {
+        // Another store creates the table first, so the constraint has something to attach to.
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_seed", {{1, "CREATE TABLE s (id INT)"}}));
+        const auto [ok, logs] = run_with_hash_writes_refused();
         CHECK_FALSE(ok);
         CHECK(logs.find("failed to record the hash of v1 for store_h") != std::string::npos);
         // Same transaction as the schema_meta bump: nothing applied, nothing recorded.
@@ -624,20 +634,7 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
         exec_ok_or_fail(conn.get(),
                         "DELETE FROM public.yuzu_schema_migrations WHERE store = 'store_h'");
-        exec_ok_or_fail(
-            conn.get(),
-            "ALTER TABLE public.yuzu_schema_migrations ADD CONSTRAINT yuzu_test_nowrite "
-            "CHECK (store <> 'store_h')");
-        std::string logs;
-        bool ok = true;
-        {
-            yuzu::test::LogCapture capture{spdlog::level::err};
-            ok = PgMigrationRunner::run(conn.get(), "store_h", v3);
-            capture.stop();
-            logs = capture.text();
-        }
-        exec_ok_or_fail(conn.get(), "ALTER TABLE public.yuzu_schema_migrations DROP CONSTRAINT "
-                                    "yuzu_test_nowrite");
+        const auto [ok, logs] = run_with_hash_writes_refused();
         CHECK_FALSE(ok);
         CHECK(logs.find("failed to record the hash of v1 for store_h") != std::string::npos);
         CHECK(row_count() == 0);
@@ -812,6 +809,23 @@ struct HeldStoreLock {
     }
 };
 
+/// Releases the lock-holder and joins the runner thread on EVERY exit path, including the
+/// exception a failed REQUIRE throws: a std::thread destroyed while joinable calls
+/// std::terminate, which would abort the whole test binary and hide every other result.
+/// ROLLBACK is a harmless no-op warning when the holder already committed. Declare it
+/// immediately after the thread, before any call that can throw. (std::jthread is not
+/// available in every supported libc++; see test_command_dedup_store.cpp.)
+struct ReleaseAndJoin {
+    PGconn* holder;
+    std::thread& thread;
+    ~ReleaseAndJoin() {
+        if (thread.joinable()) {
+            PgResult rb{PQexec(holder, "ROLLBACK")};
+            thread.join();
+        }
+    }
+};
+
 } // namespace
 
 TEST_CASE("PgMigrationRunner concurrent-winner branch compares every adopted version (#7158)",
@@ -842,6 +856,7 @@ TEST_CASE("PgMigrationRunner concurrent-winner branch compares every adopted ver
                 y_ok =
                     PQstatus(c.get()) == CONNECTION_OK && PgMigrationRunner::run(c.get(), store, y);
             }};
+            ReleaseAndJoin release{holder.get(), t};
             const bool waiting = lock.wait_for_waiter(conn.get());
             if (waiting) {
                 exec_ok_or_fail(holder.get(), "SET LOCAL search_path TO \"" + store + "\", public");
@@ -887,6 +902,7 @@ TEST_CASE("PgMigrationRunner concurrent-winner branch compares every adopted ver
             PgConn c{PQconnectdb(db.dsn().c_str())};
             y_ok = PQstatus(c.get()) == CONNECTION_OK && PgMigrationRunner::run(c.get(), store, y);
         }};
+        ReleaseAndJoin release{holder.get(), t};
         const bool waiting = lock.wait_for_waiter(conn.get());
         if (waiting)
             exec_ok_or_fail(holder.get(),
