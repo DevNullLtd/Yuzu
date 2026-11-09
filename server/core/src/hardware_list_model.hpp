@@ -360,6 +360,12 @@ enum class HardwareCiRead {
     return !detail.ci_sections.has_value();
 }
 
+/// The scalar fields of one stored CI record exactly as `hardware_ci_json` renders its `ci` object
+/// (a blank or "unknown" value is null; a v2 scalar the agent could not read is null), WITHOUT
+/// `sections`. `hardware_ci_json` builds `ci` from this plus `sections`, and the bulk CI page
+/// (`hardware_ci_page_model.hpp`) uses it alone, so the two cannot disagree on a field.
+[[nodiscard]] nlohmann::json hardware_ci_scalars_json(const DeviceCiRecord& ci);
+
 /// `ci_state`, `sections_state` and `identity_state` in the output are each one of "found" |
 /// "absent" | "degraded" — never inferred by the reader from a blank field. `sections_state` is
 /// "degraded" when the sections read failed OR `ci` could not be read (so none was attempted),
@@ -370,12 +376,6 @@ enum class HardwareCiRead {
 /// A default (empty) `ci_sections` means NOT READ and renders as `sections_state` "absent":
 /// callers that did not read the sections (`with_sections` false) must NOT feed their detail
 /// here for a record-serving surface (see `HardwareCiDetail::ci_sections`).
-/// The scalar fields of one stored CI record exactly as `hardware_ci_json` renders its `ci` object
-/// (a blank or "unknown" value is null; a v2 scalar the agent could not read is null), WITHOUT
-/// `sections`. `hardware_ci_json` builds `ci` from this plus `sections`, and the bulk CI page
-/// (`hardware_ci_page_model.hpp`) uses it alone, so the two cannot disagree on a field.
-[[nodiscard]] nlohmann::json hardware_ci_scalars_json(const DeviceCiRecord& ci);
-
 [[nodiscard]] nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t now_secs);
 
 } // namespace yuzu::server

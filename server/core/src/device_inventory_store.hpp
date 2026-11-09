@@ -100,10 +100,12 @@ public:
     [[nodiscard]] std::optional<std::vector<DeviceCiRecord>> list_device_ci(int limit);
 
     /// One KEYSET page of the stored CI rows (scalar columns plus the stored `content_hash`, no
-    /// sections), ordered by `agent_id` ascending: `agent_id > after`, then `skip` rows passed
-    /// over, then up to `limit` rows (clamped to the same ceiling as `list_device_ci`). `agent_id`
-    /// and `agent_ids` narrow the read in SQL; a present-empty `agent_ids` is an empty page with no
-    /// SQL. Reads the CI table directly, so a device is returned for as long as its row exists,
+    /// sections), ordered by `agent_id` ascending: `agent_id > after`, then up to `limit` rows
+    /// (clamped to the same ceiling as `list_device_ci`). `agent_id` and `agent_ids` narrow the
+    /// read in SQL; a present-empty `agent_ids` is an empty page with no SQL. The query runs in a
+    /// transaction under `SET LOCAL statement_timeout = '5s'`: a SELECT that runs past 5 s is
+    /// cancelled and that is a `std::nullopt` (the cap is per statement, not a bound on the whole
+    /// call). Reads the CI table directly, so a device is returned for as long as its row exists,
     /// whatever its last contact. Authoritative: `std::nullopt` on a closed store, a lease timeout
     /// or a query error, NEVER an empty page. Reads serial / UUID / MAC: any caller must sit behind
     /// the fail-closed `inventory.devices.ci` audit and the Inventory:Read scope gate.

@@ -2862,22 +2862,38 @@ TEST_CASE("list_device_ci_after pages the stored rows by agent_id and narrows in
         CHECK((**one).last_seen == v2.last_seen);
     }
 
-    SECTION("skip passes over rows after the anchor") {
+    SECTION("after is exclusive, and a limit bounds the page") {
         yuzu::server::DeviceCiKeysetQuery q;
-        q.skip = 2;
+        q.after = "agent-b";
         q.limit = 2;
         auto page = store.list_device_ci_after(q);
         REQUIRE(page.has_value());
         CHECK(ids_of(*page) == std::vector<std::string>{"agent-c", "agent-d"});
-        q.after = "agent-b";
-        q.skip = 1;
+        q.after = "agent-e"; // the last key: nothing follows
         page = store.list_device_ci_after(q);
         REQUIRE(page.has_value());
-        CHECK(ids_of(*page) == std::vector<std::string>{"agent-d", "agent-e"});
-        q.skip = -5; // a negative skip is no skip, never an SQL error
+        CHECK(page->empty());
+        q.after = "agent-bz"; // between two keys: the next key above it
+        q.limit = 1;
         page = store.list_device_ci_after(q);
         REQUIRE(page.has_value());
-        CHECK(ids_of(*page) == std::vector<std::string>{"agent-c", "agent-d"});
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-c"});
+    }
+
+    // Kills: dropping `agent_id > after` when an agent_id filter is also set (the combined WHERE
+    // is built from independent clauses, so each must survive the other).
+    SECTION("agent_id and after combine: the named device is served only beyond the bound") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        q.agent_id = "agent-d";
+        q.after = "agent-c";
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-d"});
+        q.after = "agent-d";
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
     }
 
     SECTION("agent_id and agent_ids narrow the read") {
@@ -2953,6 +2969,68 @@ TEST_CASE("list_device_ci_after pages the stored rows by agent_id and narrows in
         page = store.list_device_ci_after(q);
         REQUIRE(page.has_value()); // a bound parameter, not SQL text
     }
+}
+
+// Kills: setting the timeout with a session-level SET (it would leak onto the pooled connection
+// every other store shares).
+TEST_CASE("list_device_ci_after's statement timeout is transaction-local",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto show_timeout = [&]() -> std::string {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), "SHOW statement_timeout",
+                                                 std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        return PQgetvalue(res.get(), 0, 0);
+    };
+    const std::string before = show_timeout();
+    REQUIRE(store.list_device_ci_after({}).has_value()); // the one connection runs the read
+    CHECK(show_timeout() == before);
+}
+
+// Kills: removing the SET LOCAL statement_timeout, which would let a stalled read hold one of the
+// shared pool's connections for the pool's own (longer) default. The stall is a table lock held by
+// another connection; the read gives up at the store's cap (5 s), which costs this test about 5 s.
+TEST_CASE("list_device_ci_after gives up at its statement timeout and reads again afterwards",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    // The pool's own lock_timeout (10 s by default) is switched off so only a statement timeout can
+    // end the stall: with it on, the lock wait would end the read at 10 s whatever the store sets.
+    PgPool pool{{.conninfo = db.dsn(), .size = 3, .lock_timeout_ms = 0}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    DeviceCiRecord r = distinct_v2_record("A");
+    r.content_hash = "hash-t";
+    REQUIRE(store.apply_device_ci("agent-t", DeviceInventoryStore::canonical_hash(r),
+                                  std::optional<DeviceCiRecord>{r}, 1) == InventoryIngestOutcome::kStored);
+
+    auto holder = pool.acquire();
+    REQUIRE(holder);
+    const auto run = [&](const char* sql) {
+        auto res = yuzu::server::pg::exec_params(holder.get(), sql, std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    };
+    run("BEGIN");
+    run("LOCK TABLE device_inventory_store.device_ci IN ACCESS EXCLUSIVE MODE");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto stalled = store.list_device_ci_after({});
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    CHECK_FALSE(stalled.has_value()); // a timeout is a degrade, never an empty page
+    CHECK(waited >= std::chrono::seconds(4));
+    CHECK(waited < std::chrono::seconds(15)); // the pool's own statement timeout is 30 s
+
+    run("ROLLBACK");
+    const auto after = store.list_device_ci_after({});
+    REQUIRE(after.has_value());
+    CHECK(after->size() == 1);
 }
 
 TEST_CASE("list_device_ci_after degrades (not empty) on a closed store", "[device_ci][keyset]") {

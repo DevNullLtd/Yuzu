@@ -43,6 +43,8 @@ constexpr const char* kStoreName = "device_inventory_store";
 // reads are user-facing dashboard requests and can wait a little longer.
 constexpr std::chrono::milliseconds kIngestAcquireTimeout{500};
 constexpr std::chrono::milliseconds kQueryAcquireTimeout{3000};
+// Execution cap of the keyset SELECT (SET LOCAL statement_timeout); the pool default is 30 s.
+constexpr const char* kKeysetStatementTimeout = "5s";
 // Hard cap on roster rows materialised regardless of the caller's `limit`, so the
 // store can never allocate an unbounded result set.
 constexpr int kListRowCap = 100000;
@@ -759,14 +761,6 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
     }
     if (q.agent_ids && q.agent_ids->empty())
         return std::vector<DeviceCiRecord>{}; // a deny-all scope: nothing to read, no SQL
-    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
-    if (!lease) {
-        static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
-            spdlog::warn("DeviceInventoryStore: keyset list skipped, no connection in time ({})",
-                         pool_.last_error());
-        return std::nullopt;
-    }
     const int eff = q.limit > 0 && q.limit < kListRowCap ? q.limit : kListRowCap;
     // The bound parameters are built alongside the placeholders, in order.
     std::vector<std::string> params;
@@ -785,28 +779,52 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
         params.push_back(pg::to_text_array(ids));
         sql += " AND agent_id = ANY($" + std::to_string(params.size()) + "::text[])";
     }
-    params.push_back(std::to_string(std::max<std::int64_t>(q.skip, 0)));
-    const std::string skip_ph = "$" + std::to_string(params.size());
     params.push_back(std::to_string(eff));
-    sql += " ORDER BY agent_id ASC OFFSET " + skip_ph + "::bigint LIMIT $" +
-           std::to_string(params.size()) + "::bigint";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK) {
-        static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
-            spdlog::warn("DeviceInventoryStore: keyset list failed: {}", PQerrorMessage(lease.get()));
-        return std::nullopt;
-    }
-    const int rows = PQntuples(res.get());
-    std::vector<DeviceCiRecord> out;
-    out.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i) {
-        DeviceCiRecord r;
-        const int next = fill_record(res.get(), i, r);
-        r.content_hash = PQgetvalue(res.get(), i, next);
-        out.push_back(std::move(r));
-    }
-    return out;
+    sql += " ORDER BY agent_id ASC LIMIT $" + std::to_string(params.size()) + "::bigint";
+
+    // Run in a transaction whose SELECT is capped by SET LOCAL statement_timeout (the
+    // count_stale_agents idiom): this page holds one connection of the pool the RBAC and audit
+    // stores share, so a slow SELECT is cancelled at 5 s rather than at the pool's 30 s default.
+    // A timeout errors the SELECT, rolls back and is a nullopt like any other query error.
+    std::optional<std::vector<DeviceCiRecord>> out;
+    bool entered = false;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
+        entered = true;
+        pg::PgResult t = pg::exec_params(
+            c, (std::string("SET LOCAL statement_timeout = '") + kKeysetStatementTimeout + "'").c_str(),
+            std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(c, sql.c_str(), params);
+        if (res.status() != PGRES_TUPLES_OK) {
+            err = PQerrorMessage(c);
+            return false;
+        }
+        const int rows = PQntuples(res.get());
+        std::vector<DeviceCiRecord> page;
+        page.reserve(static_cast<std::size_t>(rows));
+        for (int i = 0; i < rows; ++i) {
+            DeviceCiRecord r;
+            const int next = fill_record(res.get(), i, r);
+            r.content_hash = PQgetvalue(res.get(), i, next);
+            page.push_back(std::move(r));
+        }
+        out = std::move(page);
+        return true;
+    });
+    if (ok)
+        return out;
+    static DegradeSampler pool_sampler;
+    static DegradeSampler query_sampler;
+    if (note_read_degrade(metrics_, entered ? kReasonQueryError : kReasonPoolTimeout,
+                          entered ? query_sampler : pool_sampler)
+            .should_log)
+        spdlog::warn("DeviceInventoryStore: keyset list degraded: {}",
+                     entered ? ::yuzu::log_key_token(err) : pool_.last_error());
+    return std::nullopt;
 }
 
 namespace {

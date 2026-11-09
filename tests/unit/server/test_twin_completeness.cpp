@@ -48,16 +48,17 @@ using yuzu::server::twin_table::kExpectedTwins;
 
 namespace {
 
-// Registry tools that no ledger row names as its mcp_twin yet. Shrink-only: never add a name,
-// ledger the tool. ONE recorded exception (owner ruling on #6558 PR 2, tracked by #6700): these
-// three /crypto tools have a REST twin that exists only under /api/v1, and the ledger keys rows on
-// fragment/legacy routes (a v1-keyed row is legal only with an `exception:` status, which would
-// be false for a tool that HAS a twin), so no legal row exists yet. #6700 decides the row shape;
-// the change that lands it deletes these three names and lowers the cap back to 0.
-// A fourth name, `list_hardware_ci_records`, was added by the bulk device-CI read
-// (GET /api/v1/hardware/ci): same situation (a REST twin only under /api/v1, no fragment or legacy
-// route to key a row on), and the user approved adding it while #6700 is open. The change that
-// lands #6700's row shape deletes it with the other three.
+// Registry tools that no ledger row names as its mcp_twin yet. Shrink-only: ledger a tool rather
+// than adding a name here. The set holds four names, for one reason: each has a REST twin that
+// exists only under /api/v1, and the ledger keys rows on fragment/legacy routes (a v1-keyed row is
+// legal only with an `exception:` status, which would be false for a tool that HAS a twin), so no
+// legal row exists yet. #6700 decides the row shape.
+//  - three /crypto tools (`export_crypto_cbom`, `list_crypto_widgets`,
+//    `set_crypto_dashboard_layout`): the recorded owner ruling on #6558 PR 2, tracked by #6700.
+//  - `list_hardware_ci_records` (REST twin GET /api/v1/hardware/ci): added by commit e362c2e4f4
+//    for the same reason. The owner's approval is stated in that commit message and is still to be
+//    recorded on #6700.
+// The change that lands #6700's row shape deletes all four names and lowers the cap back to 0.
 const std::set<std::string> kLedgerBackfill{"export_crypto_cbom", "list_crypto_widgets",
                                             "set_crypto_dashboard_layout",
                                             "list_hardware_ci_records"};

@@ -3,8 +3,7 @@
 /// @file test_fake_ci_keyset_store.hpp
 /// An in-memory stand-in for `DeviceInventoryStore::list_device_ci_after`, shared by the model,
 /// route and MCP tests of the bulk CI page. Same keyset semantics as the SQL: `agent_id > after`,
-/// the optional `agent_id` / `agent_ids` narrowing, `skip` rows passed over, then up to `limit`
-/// rows, ordered by `agent_id`. A present-empty `agent_ids` reads nothing. `degraded` makes every
+/// the optional `agent_id` / `agent_ids` narrowing, then up to `limit` rows, ordered by `agent_id`. A present-empty `agent_ids` reads nothing. `degraded` makes every
 /// read fail (nullopt), as a closed store or a query error does.
 ///
 /// It exists so a confinement test can assert the EXACT set of devices that came back: a fake
@@ -63,7 +62,6 @@ struct FakeCiKeysetStore {
         std::set<std::string> ids;
         if (q.agent_ids)
             ids.insert(q.agent_ids->begin(), q.agent_ids->end());
-        std::int64_t to_skip = q.skip;
         for (const auto& r : rows) {
             if (!q.after.empty() && !(r.agent_id > q.after))
                 continue;
@@ -71,10 +69,6 @@ struct FakeCiKeysetStore {
                 continue;
             if (q.agent_ids && !ids.contains(r.agent_id))
                 continue;
-            if (to_skip > 0) {
-                --to_skip;
-                continue;
-            }
             if (static_cast<int>(out.size()) >= q.limit)
                 break;
             out.push_back(r);

@@ -128,8 +128,6 @@ struct DeviceCiWithSections {
 struct DeviceCiKeysetQuery {
     /// Exclusive lower bound on `agent_id`; empty = from the first row.
     std::string after;
-    /// Rows to pass over after `after` (the wide-scope continuation; 0 otherwise).
-    std::int64_t skip{0};
     /// Rows wanted; the store clamps it to its own row ceiling.
     int limit{100};
     /// Only this agent's row, when set.

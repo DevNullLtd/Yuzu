@@ -1,0 +1,1 @@
+- **Breaking:** `GET /api/v1/hardware/ci` now returns the bulk CI page. A device whose agent id is literally `ci` is no longer readable as a record at that URL: read its CI row with `GET /api/v1/hardware/ci?agent_id=ci` (its sections and installed software stay on the MCP tool `get_hardware_ci`).

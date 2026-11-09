@@ -2,6 +2,14 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: `GET /api/v1/hardware/ci` is now the bulk CI page (a device whose agent id is `ci` is read with `?agent_id=ci`)
+
+**What changed.** `GET /api/v1/hardware/ci` now names the bulk device-CI read: one keyset page of the stored CI records of every device (the scalar CI block, the stored `content_hash` and the `blob_version`, no sections), with the MCP twin `list_hardware_ci_records`. Before this release the same URL was the per-device route `GET /api/v1/hardware/{id}` for a device whose agent id is literally `ci`.
+
+**Who is affected.** Only a deployment that has a device whose agent id is exactly `ci`. Read that device's CI row with `GET /api/v1/hardware/ci?agent_id=ci`. Its sections and installed software are then reachable only through the MCP tool `get_hardware_ci`. Every other agent id is unaffected.
+
+**Cursors and rolling upgrades.** A pagination cursor issued by this route does not survive an upgrade: start the walk again from the first page. During a rolling upgrade a replica that is still on the earlier build answers `404` for the route, so a client that gets a `404` mid-walk restarts the walk rather than retrying the cursor.
+
 ## ⚠️ Breaking: Echo reads roll-up tables on the server (a stored result set over a raw capture table is refused)
 
 **What changed.** The server reads Echo as roll-up only. The canned Echo queries (`crossplatform.echo.*`, from `content/definitions/echo_warehouse.yaml`) read the hourly tier and return counts per hour with no pid; `GET /api/v1/settings/data-retention` lists no `live` tier and adds `budget_dependent` per tier and `echo.db_budget_bytes`; the Device page's Capture sources panel and the Echo retention-paused list show a source's hourly row count. Creating a result set from a query over a `$<Source>_Live` name or a `<source>_live` table (`POST /api/v1/result-sets/from-echo-query`, `from-instruction-result` with an `echo.sql` definition, and the MCP twins), and re-evaluating such a set, formerly answered 201 or 202 and now answers 400 (MCP `-32602`) with `RESULT_SET_REEVAL_STALE_SOURCE`; nothing is dispatched, and no audit row is written for the refusal. Result sets filled from agent answers now report `agents_failed` and `partial` (`result_set_store` schema v4 adds the `agents_failed` column).
@@ -1485,7 +1493,7 @@ bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
 | Source | REST | MCP |
 |---|---|---|
 | `installed_software` | `GET /api/v1/inventory/software` | `query_installed_software` |
-| `device_ci` | `GET /api/v1/hardware/{id}` | `get_hardware_ci`, `list_hardware_ci` |
+| `device_ci` | `GET /api/v1/hardware/{id}`, `GET /api/v1/hardware/ci` (bulk) | `get_hardware_ci`, `list_hardware_ci`, `list_hardware_ci_records` (bulk) |
 | `app_perf` | `GET /api/v1/dex/perf/apps` and the other `/api/v1/dex/perf/app*` routes | `list_dex_perf_apps`, `get_dex_app_perf` |
 | `software_licensing` | `GET /api/v1/sle/agents/{agent_id}` | `query_software_licenses` |
 | `app_usage` | `GET /api/v1/forensics/agents/{agent_id}/app-usage` | `get_agent_app_usage` |

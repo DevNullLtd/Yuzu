@@ -1,7 +1,7 @@
 /// @file test_bulk_ci_page_model.cpp
 /// The pure model behind GET /api/v1/hardware/ci and the MCP list_hardware_ci_records tool:
 /// parameter parsing (REST clamps, MCP refuses), the cursor codec (tamper, filter binding), the
-/// keyset walk under every scope shape (TOP, engaged-empty, pushed-down, wide post-filter) with
+/// keyset walk under every scope shape (TOP, engaged-empty, pushed-down, over the ceiling) with
 /// the EXACT returned set asserted against an in-memory fake store, and the JSON row shape.
 /// No Postgres: the store is reached through the Reader closure.
 
@@ -9,6 +9,7 @@
 
 #include "hardware_list_model.hpp"
 #include "list_keyset.hpp"
+#include "model_param_helpers.hpp"
 #include "test_fake_ci_keyset_store.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -46,7 +47,7 @@ std::vector<std::string> ids_of(const hcp::Page& p) {
 
 // Walks every page by following next_cursor; returns the concatenated ids.
 std::vector<std::string> walk(FakeStore& store, hcp::Request rq, const authz::VisibleSet& scope,
-                              int* pages = nullptr, std::int64_t* omitted = nullptr) {
+                              int* pages = nullptr) {
     std::vector<std::string> all;
     int n = 0;
     for (;;) {
@@ -56,8 +57,6 @@ std::vector<std::string> walk(FakeStore& store, hcp::Request rq, const authz::Vi
         REQUIRE(n < 1000); // a runaway walk is a defect, not a long test
         for (const auto& id : ids_of(*page))
             all.push_back(id);
-        if (omitted)
-            *omitted += page->devices_omitted;
         if (page->next_cursor.empty())
             break;
         rq.cursor = page->next_cursor;
@@ -90,8 +89,26 @@ TEST_CASE("hardware ci page: REST parameters default, clamp and refuse", "[hardw
         CHECK(hcp::parse_params(params({{"limit", "1001"}}))->limit == 1000);
         CHECK(hcp::parse_params(params({{"limit", "99999999999"}}))->limit == 1000);
     }
+    // Kills: returning a 400 for an integer that overflows int64 (the documented rule is that an
+    // out-of-range integer clamps), and clamping the wrong way for the sign.
+    SECTION("an integer too large for 64 bits clamps by its sign") {
+        struct Row {
+            const char* text;
+            int expect;
+        };
+        for (const Row& row : {Row{"9223372036854775807", 1000}, Row{"9223372036854775808", 1000},
+                               Row{"-9223372036854775808", 1}, Row{"-9223372036854775809", 1},
+                               Row{"-99999999999999999999", 1}, Row{"99999999999999999999999", 1000},
+                               Row{"0", 1}, Row{"-0", 1}, Row{"007", 7}}) {
+            INFO(row.text);
+            const auto r = hcp::parse_params(params({{"limit", row.text}}));
+            REQUIRE(r.has_value());
+            CHECK(r->limit == row.expect);
+        }
+    }
     SECTION("a limit that is not one decimal integer is refused") {
-        for (const char* bad : {"abc", "1.5", "10x", "+5", " 5", "99999999999999999999"})
+        for (const char* bad : {"abc", "1.5", "10x", "+5", " 5", "5 ", "-", "--5", "1e3", "0x10",
+                                "-abc", "99999999999999999999x"})
             CHECK_FALSE(hcp::parse_params(params({{"limit", bad}})).has_value());
     }
     SECTION("a repeated key keeps its first value; an unknown key is ignored") {
@@ -126,6 +143,9 @@ TEST_CASE("hardware ci page: MCP arguments are refused, not clamped", "[hardware
     CHECK_FALSE(hcp::request_from_args(json{{"limit", 1.5}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"limit", "5"}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"limit", UINT64_MAX}}).has_value());
+    CHECK_FALSE(hcp::request_from_args(json{{"limit", static_cast<std::uint64_t>(INT64_MAX)}}).has_value());
+    CHECK_FALSE(hcp::request_from_args(json{{"limit", static_cast<std::uint64_t>(INT64_MAX) + 1}}).has_value());
+    CHECK_FALSE(hcp::request_from_args(json{{"limit", INT64_MIN}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"agent_id", 5}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"agent_id", ""}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"agent_id", "a\tb"}}).has_value());
@@ -136,58 +156,153 @@ TEST_CASE("hardware ci page: MCP arguments are refused, not clamped", "[hardware
 
 // ── cursors ──────────────────────────────────────────────────────────────────
 
+namespace {
+
+const char kSepChar = '\x1f';
+
+// A token built from a raw payload, as a hostile client would.
+std::string forge_token(const std::string& fp, const std::string& payload) {
+    return "h1:" + fp + ":" + yuzu::server::keyset::b64url_encode(payload);
+}
+
+} // namespace
+
 TEST_CASE("hardware ci page: cursor round-trips and refuses tampering", "[hardware_ci_page][cursor]") {
     const hcp::Request rq;
     const std::string fp = hcp::filter_fingerprint(rq);
-    const hcp::Position at{"agent-42", 0};
+    const hcp::Position at{"agent-42"};
     const std::string tok = hcp::encode_cursor(at, fp);
 
     const auto back = hcp::decode_cursor(tok, fp);
     REQUIRE(back.has_value());
     CHECK(back->after == "agent-42");
-    CHECK(back->skip == 0);
 
-    const auto wide = hcp::decode_cursor(hcp::encode_cursor({"", 7}, fp), fp);
-    REQUIRE(wide.has_value());
-    CHECK(wide->after.empty());
-    CHECK(wide->skip == 7);
-
+    SECTION("the filter fingerprint is the agent_id filter alone, byte for byte") {
+        // Pinned: a later change that adds a filter must not invalidate cursors already issued, so
+        // the fingerprint of today's only filter must not move.
+        CHECK(fp == yuzu::server::model_detail::fnv1a_hex16("agent_id="));
+        hcp::Request named;
+        named.agent_id = "dev-9";
+        CHECK(hcp::filter_fingerprint(named) == yuzu::server::model_detail::fnv1a_hex16("agent_id=dev-9"));
+    }
     SECTION("malformed tokens") {
-        for (const std::string bad :
+        for (const std::string& bad :
              {std::string("garbage"), std::string(""), std::string("h1:"), std::string("h1::"),
               std::string("h2:") + tok.substr(3), std::string("d2:") + tok.substr(3),
-              tok + "A", tok + "=", tok.substr(0, tok.size() - 1), tok + ":x",
-              std::string("h1:ZZZZZZZZZZZZZZZZ:") + tok.substr(20), tok.substr(0, 20) + "!" + tok.substr(21)}) {
+              std::string("H1:") + tok.substr(3), tok + "A", tok + "=", tok.substr(0, tok.size() - 1),
+              tok + ":x", std::string("h1:ZZZZZZZZZZZZZZZZ:") + tok.substr(20),
+              tok.substr(0, 20) + "!" + tok.substr(21)}) {
+            INFO(bad);
             const auto r = hcp::decode_cursor(bad, fp);
             REQUIRE_FALSE(r.has_value());
             CHECK(r.error() == hcp::CursorError::kMalformed);
         }
     }
-    SECTION("a payload that lies about a field length, or carries a bad skip or id") {
-        const auto forge = [&](const std::string& payload) {
-            return "h1:" + fp + ":" + yuzu::server::keyset::b64url_encode(payload);
+    // Each payload below is one hostile spelling of a position. Every one must come back as an
+    // error and none may crash or read past the payload.
+    SECTION("a payload that lies about a field length, or carries a bad id") {
+        const std::string sep(1, kSepChar);
+        const auto refused = [&](const std::string& payload) {
+            const auto r = hcp::decode_cursor(forge_token(fp, payload), fp);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == hcp::CursorError::kMalformed);
         };
-        const char sep = '\x1f';
-        const std::string ok_id = "5:agent";
-        // length longer than what remains
-        CHECK(hcp::decode_cursor(forge("99:agent" + std::string(1, sep) + "1:0" + sep), fp).error() ==
+        // the well-formed spelling of the same shape IS accepted (so the cases below fail for the
+        // defect they name, not for the harness)
+        REQUIRE(hcp::decode_cursor(forge_token(fp, "5:agent" + sep), fp).has_value());
+
+        refused("");                           // empty payload
+        refused("0:" + sep);                   // zero-length after: never minted
+        refused("5:agent");                    // missing trailing separator
+        refused("6:agent" + sep);              // length exactly equal to what remains
+        refused("7:agent" + sep);              // length past what remains
+        refused("4:agent" + sep);              // length one short: the separator is not where it says
+        refused("5:agent" + sep + "X");        // a byte after the separator
+        refused("99:agent" + sep);
+        refused("9223372036854775807:a" + sep); // INT64_MAX
+        refused("9223372036854775808:a" + sep); // INT64_MAX + 1
+        refused("18446744073709551616:a" + sep); // 2^64
+        refused("99999999999999999999999:a" + sep);
+        refused("-1:a" + sep);
+        refused("+1:a" + sep);
+        refused("05:agent" + sep);             // leading zero: a second spelling of the position
+        refused("x:agent" + sep);
+        refused(":" + sep);
+        refused("3:a" + std::string(1, '\0') + "b" + sep); // NUL inside after
+        refused("3:a\nb" + sep);               // control byte
+        refused("3:a\x1f" "b" + sep);          // the separator byte inside after
+    }
+    SECTION("DEL is not a control byte below 0x20, so an id carrying it is accepted like any other") {
+        // id_is_audit_safe is the audit-trail floor (no byte below 0x20), not a charset rule.
+        const std::string sep(1, kSepChar);
+        CHECK(hcp::decode_cursor(forge_token(fp, "3:a\x7f" "b" + sep), fp).has_value());
+    }
+    SECTION("invalid UTF-8 in the id") {
+        const std::string sep(1, kSepChar);
+        for (const std::string& bad : {std::string("3:a\xFF" "b"), std::string("2:\xC3("),
+                                      std::string("3:\xE2\x82" "x"), std::string("2:\xC0\x80")}) {
+            INFO(bad);
+            CHECK(hcp::decode_cursor(forge_token(fp, bad + sep), fp).error() == hcp::CursorError::kMalformed);
+        }
+    }
+    // Kills: re-adding the retired `skip` field (or any second field) to the payload.
+    SECTION("a second field, the retired skip form, is refused") {
+        const std::string sep(1, kSepChar);
+        CHECK(hcp::decode_cursor(forge_token(fp, "5:agent" + sep + "1:0" + sep), fp).error() ==
               hcp::CursorError::kMalformed);
-        // skip not a number
-        CHECK(hcp::decode_cursor(forge(ok_id + sep + "1:x" + sep), fp).error() == hcp::CursorError::kMalformed);
-        // negative skip
-        CHECK(hcp::decode_cursor(forge(ok_id + sep + "2:-1" + sep), fp).error() == hcp::CursorError::kMalformed);
-        // control byte in the id
-        CHECK(hcp::decode_cursor(forge("3:a\nb" + std::string(1, sep) + "1:0" + sep), fp).error() ==
+        CHECK(hcp::decode_cursor(forge_token(fp, "5:agent" + sep + "1:7" + sep), fp).error() ==
               hcp::CursorError::kMalformed);
-        // invalid UTF-8 in the id
-        CHECK(hcp::decode_cursor(forge("3:a\xFF" "b" + std::string(1, sep) + "1:0" + sep), fp).error() ==
+        CHECK(hcp::decode_cursor(forge_token(fp, "5:agent" + sep + "1:0" + sep + "1:0" + sep), fp).error() ==
               hcp::CursorError::kMalformed);
-        // a third field
-        CHECK(hcp::decode_cursor(forge(ok_id + sep + "1:0" + sep + "1:0" + sep), fp).error() ==
+    }
+    SECTION("the id length bound: 256 bytes accepted, 257 refused") {
+        const std::string sep(1, kSepChar);
+        const std::string ok(256, 'x');
+        const auto good = hcp::decode_cursor(forge_token(fp, "256:" + ok + sep), fp);
+        REQUIRE(good.has_value());
+        CHECK(good->after == ok);
+        CHECK(forge_token(fp, "256:" + ok + sep).size() <= hcp::kCursorMaxBytes);
+        CHECK(hcp::decode_cursor(forge_token(fp, "257:" + ok + "x" + sep), fp).error() ==
               hcp::CursorError::kMalformed);
-        // non-canonical (leading-zero) length is a second spelling of the same position
-        CHECK(hcp::decode_cursor(forge("05:agent" + std::string(1, sep) + "1:0" + sep), fp).error() ==
-              hcp::CursorError::kMalformed);
+    }
+    SECTION("a token over the cursor cap is refused by the decoder too") {
+        const std::string at_cap = std::string(hcp::kCursorMaxBytes, 'A');
+        const std::string over_cap = std::string(hcp::kCursorMaxBytes + 1, 'A');
+        CHECK(hcp::decode_cursor(at_cap, fp).error() == hcp::CursorError::kMalformed);
+        CHECK(hcp::decode_cursor(over_cap, fp).error() == hcp::CursorError::kMalformed);
+        // and the REST/MCP parsers: 2048 passes the parse, 2049 does not
+        CHECK(hcp::parse_params(params({{"cursor", at_cap}})).has_value());
+        CHECK_FALSE(hcp::parse_params(params({{"cursor", over_cap}})).has_value());
+        json args{{"cursor", at_cap}};
+        CHECK(hcp::request_from_args(args).has_value());
+        args["cursor"] = over_cap;
+        CHECK_FALSE(hcp::request_from_args(args).has_value());
+    }
+    // Kills: dropping the re-encode comparison, which would accept a second spelling of a position.
+    SECTION("a non-canonical base64url tail is a second spelling and is refused") {
+        const std::string sep(1, kSepChar);
+        const std::string base = forge_token(fp, "5:agent" + sep); // 8 bytes: 2 spare bits in the last char
+        REQUIRE(hcp::decode_cursor(base, fp).has_value());
+        const std::string alphabet =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        int variants = 0;
+        for (const char c : alphabet) {
+            if (c == base.back())
+                continue;
+            std::string t = base;
+            t.back() = c;
+            const auto r = hcp::decode_cursor(t, fp);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == hcp::CursorError::kMalformed);
+            ++variants;
+        }
+        CHECK(variants == 63);
+    }
+    SECTION("malformed is reported before a filter mismatch") {
+        hcp::Request other;
+        other.agent_id = "agent-42";
+        const std::string other_fp = hcp::filter_fingerprint(other);
+        CHECK(hcp::decode_cursor(tok + "A", other_fp).error() == hcp::CursorError::kMalformed);
     }
     SECTION("a cursor is bound to the agent_id filter") {
         hcp::Request other;
@@ -286,10 +401,8 @@ TEST_CASE("hardware ci page: scope confines the exact set returned", "[hardware_
         const authz::VisibleSet scope = std::unordered_set<std::string>{"a", "c", "e", "ghost"};
         hcp::Request rq;
         rq.limit = 2;
-        std::int64_t omitted = 0;
-        const auto all = walk(store, rq, scope, nullptr, &omitted);
+        const auto all = walk(store, rq, scope);
         CHECK(all == std::vector<std::string>{"a", "c", "e"});
-        CHECK(omitted == 0); // push-down hides nothing
         // the scope reached SQL as agent_ids on every read
         for (const auto& q : store.queries) {
             REQUIRE(q.agent_ids.has_value());
@@ -327,10 +440,18 @@ TEST_CASE("hardware ci page: scope confines the exact set returned", "[hardware_
     }
 }
 
-TEST_CASE("hardware ci page: a scope wider than the push-down ceiling is post-filtered with no leak",
-          "[hardware_ci_page][scope][wide]") {
+namespace {
+
+// A scope of exactly `n` ids: the real ids first, then padding that matches no stored device.
+authz::VisibleSet scope_of_size(const std::set<std::string>& real, std::size_t n) {
+    std::unordered_set<std::string> ids(real.begin(), real.end());
+    for (int i = 0; ids.size() < n; ++i)
+        ids.insert("pad-" + std::to_string(i));
+    return ids;
+}
+
+FakeStore forty_devices(std::set<std::string>& in_scope_real) {
     FakeStore store;
-    std::set<std::string> in_scope_real;
     for (int i = 0; i < 40; ++i) {
         char buf[16];
         std::snprintf(buf, sizeof buf, "dev-%03d", i);
@@ -338,42 +459,117 @@ TEST_CASE("hardware ci page: a scope wider than the push-down ceiling is post-fi
         if (i % 3 == 0)
             in_scope_real.insert(buf);
     }
-    // 10001 ids: just over software_catalogue::kScopePushdownMaxIds.
-    std::unordered_set<std::string> ids(in_scope_real.begin(), in_scope_real.end());
-    for (int i = 0; ids.size() <= 10000; ++i)
-        ids.insert("pad-" + std::to_string(i));
-    const authz::VisibleSet scope = ids;
+    return store;
+}
+
+} // namespace
+
+static_assert(hcp::kMaxPushdownScopeIds == 10000);
+
+// Kills: raising or dropping the ceiling, using `>=` for `>`, and pushing a set at the ceiling
+// into SQL as anything but the full id list. Pages are exact at the ceiling.
+TEST_CASE("hardware ci page: a scope of exactly the ceiling is pushed into SQL, pages exact",
+          "[hardware_ci_page][scope][ceiling]") {
+    std::set<std::string> real;
+    FakeStore store = forty_devices(real);
+    const authz::VisibleSet scope = scope_of_size(real, hcp::kMaxPushdownScopeIds);
+    REQUIRE(scope->size() == 10000);
 
     hcp::Request rq;
     rq.limit = 4;
-    const std::string fp = hcp::filter_fingerprint(rq);
-
-    std::vector<std::string> all;
-    std::int64_t omitted = 0;
     int pages = 0;
-    for (;;) {
+    const auto all = walk(store, rq, scope, &pages);
+    CHECK(all == std::vector<std::string>(real.begin(), real.end()));
+    CHECK(pages == 4); // 14 devices in scope, 4 per page: 4+4+4+2
+    REQUIRE_FALSE(store.queries.empty());
+    for (const auto& q : store.queries) {
+        REQUIRE(q.agent_ids.has_value());
+        CHECK(q.agent_ids->size() == 10000);
+        CHECK(q.limit == 5); // limit + 1: the look-ahead row
+    }
+}
+
+// Kills: reading (or post-filtering) a scope above the ceiling, and returning anything but the
+// distinct terminal error. ZERO store reads is the point: nothing is scanned, so nothing can be
+// counted.
+TEST_CASE("hardware ci page: a scope over the ceiling with no agent_id is refused with zero reads",
+          "[hardware_ci_page][scope][ceiling]") {
+    std::set<std::string> real;
+    FakeStore store = forty_devices(real);
+    const authz::VisibleSet scope = scope_of_size(real, hcp::kMaxPushdownScopeIds + 1);
+    REQUIRE(scope->size() == 10001);
+
+    const auto page = hcp::read_page(store.reader(), {}, scope);
+    REQUIRE_FALSE(page.has_value());
+    CHECK(page.error() == hcp::ReadError::kScopeTooWide);
+    CHECK(store.reads == 0);
+
+    // a continuation is refused the same way (the cursor is decoded first, then the scope)
+    hcp::Request first;
+    first.limit = 3;
+    FakeStore small;
+    small.add("a");
+    small.add("b");
+    small.add("c");
+    small.add("d");
+    const auto head = hcp::read_page(small.reader(), first, std::nullopt);
+    REQUIRE(head.has_value());
+    REQUIRE_FALSE(head->next_cursor.empty());
+    hcp::Request next = first;
+    next.cursor = head->next_cursor;
+    small.reads = 0;
+    const auto again = hcp::read_page(small.reader(), next, scope);
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == hcp::ReadError::kScopeTooWide);
+    CHECK(small.reads == 0);
+
+    // the text carries no count and names the remedy
+    const std::string msg(hcp::read_error_message(hcp::ReadError::kScopeTooWide));
+    CHECK(msg.find("agent_id") != std::string::npos);
+    CHECK(msg.find("10001") == std::string::npos);
+    CHECK(hcp::audit_detail_scope_too_wide("REST") == "hardware CI records (REST): state=scope too wide");
+}
+
+// Kills: sending the id array with a named device (a 10001-element ANY for one row), and serving a
+// named device without the in_scope check.
+TEST_CASE("hardware ci page: a scope over the ceiling with an agent_id reads that one device by key",
+          "[hardware_ci_page][scope][ceiling]") {
+    std::set<std::string> real;
+    FakeStore store = forty_devices(real);
+    const authz::VisibleSet scope = scope_of_size(real, hcp::kMaxPushdownScopeIds + 1);
+
+    SECTION("an in-scope device is served") {
+        hcp::Request rq;
+        rq.agent_id = "dev-003"; // 3 % 3 == 0: in scope
         const auto page = hcp::read_page(store.reader(), rq, scope);
         REQUIRE(page.has_value());
-        REQUIRE(++pages < 100);
-        omitted += page->devices_omitted;
-        for (const auto& id : ids_of(*page)) {
-            CHECK(in_scope_real.contains(id));
-            all.push_back(id);
-        }
-        if (page->next_cursor.empty())
-            break;
-        // The token names only an in-scope device (or the head), never a dropped one.
-        const auto pos = hcp::decode_cursor(page->next_cursor, fp);
-        REQUIRE(pos.has_value());
-        CHECK((pos->after.empty() || in_scope_real.contains(pos->after)));
-        rq.cursor = page->next_cursor;
+        CHECK(ids_of(*page) == std::vector<std::string>{"dev-003"});
+        CHECK_FALSE(page->target_denied);
+        CHECK(page->next_cursor.empty());
+        REQUIRE(store.queries.size() == 1);
+        CHECK(store.queries[0].agent_id == std::optional<std::string>("dev-003"));
+        CHECK_FALSE(store.queries[0].agent_ids.has_value());
     }
-    // every in-scope device exactly once, in order; nothing else
-    CHECK(all == std::vector<std::string>(in_scope_real.begin(), in_scope_real.end()));
-    CHECK(omitted > 0);
-    // the wide path never sends an id set to the store
-    for (const auto& q : store.queries)
-        CHECK_FALSE(q.agent_ids.has_value());
+    SECTION("an out-of-scope device that exists is the empty page of a device with no record") {
+        hcp::Request hidden;
+        hidden.agent_id = "dev-001"; // exists, not in scope
+        const auto denied = hcp::read_page(store.reader(), hidden, scope);
+        hcp::Request ghost;
+        ghost.agent_id = "pad-5"; // in scope, no record
+        const auto none = hcp::read_page(store.reader(), ghost, scope);
+        REQUIRE(denied.has_value());
+        REQUIRE(none.has_value());
+        CHECK(denied->rows.empty());
+        CHECK(none->rows.empty());
+        CHECK(denied->next_cursor.empty());
+        CHECK(none->next_cursor.empty());
+        CHECK(denied->target_denied);
+        CHECK_FALSE(none->target_denied);
+        CHECK(hcp::page_json(*denied) == hcp::page_json(*none));
+        // the hidden device was never read
+        for (const auto& q : store.queries)
+            CHECK(q.agent_id != std::optional<std::string>("dev-001"));
+    }
 }
 
 TEST_CASE("hardware ci page: a degraded store read is an error, never an empty page",
@@ -383,7 +579,7 @@ TEST_CASE("hardware ci page: a degraded store read is an error, never an empty p
     store.degraded = true;
     const auto page = hcp::read_page(store.reader(), {}, std::nullopt);
     REQUIRE_FALSE(page.has_value());
-    CHECK_FALSE(page.error().has_value()); // not a cursor error
+    CHECK(page.error() == hcp::ReadError::kDegraded); // not a cursor or scope error
 
     const authz::VisibleSet scope = std::unordered_set<std::string>{"a"};
     CHECK_FALSE(hcp::read_page(store.reader(), {}, scope).has_value());
@@ -396,8 +592,17 @@ TEST_CASE("hardware ci page: a refused cursor surfaces its reason", "[hardware_c
     rq.cursor = "nonsense";
     const auto bad = hcp::read_page(store.reader(), rq, std::nullopt);
     REQUIRE_FALSE(bad.has_value());
-    REQUIRE(bad.error().has_value());
-    CHECK(*bad.error() == hcp::CursorError::kMalformed);
+    CHECK(bad.error() == hcp::ReadError::kCursorMalformed);
+    CHECK(store.reads == 0);
+
+    // a well-formed cursor issued for another filter is the other refusal
+    hcp::Request named;
+    named.agent_id = "a";
+    hcp::Request unnamed;
+    unnamed.cursor = hcp::encode_cursor({"a"}, hcp::filter_fingerprint(named));
+    const auto mismatch = hcp::read_page(store.reader(), unnamed, std::nullopt);
+    REQUIRE_FALSE(mismatch.has_value());
+    CHECK(mismatch.error() == hcp::ReadError::kCursorFilterMismatch);
     CHECK(store.reads == 0);
 }
 
@@ -451,12 +656,11 @@ TEST_CASE("hardware ci page: page JSON shape and audit text", "[hardware_ci_page
     hcp::Page page;
     page.rows.push_back(make_record("a"));
     page.next_cursor = "tok";
-    page.devices_omitted = 3;
     const json j = hcp::page_json(page);
-    CHECK(j.size() == 3);
+    CHECK(j.size() == 2);
     CHECK(j["devices"].size() == 1);
     CHECK(j["next_cursor"] == "tok");
-    CHECK(j["devices_omitted"] == 3);
+    CHECK_FALSE(j.contains("devices_omitted"));
 
     hcp::Page last;
     CHECK(hcp::page_json(last)["next_cursor"] == "");
@@ -464,27 +668,31 @@ TEST_CASE("hardware ci page: page JSON shape and audit text", "[hardware_ci_page
     hcp::Request rq;
     CHECK(hcp::audit_target_type(rq) == "Inventory");
     CHECK(hcp::audit_target_id(rq) == "fleet");
-    CHECK(hcp::audit_detail(page, rq, "REST", false) ==
-          "hardware CI records (REST): rows=1 omitted=3 scope=fleet");
+    // exact strings, not substrings: the grammar is a contract with the audit-log docs
+    CHECK(hcp::audit_detail(page, rq, "REST", false) == "hardware CI records (REST): rows=1 scope=fleet");
     CHECK(hcp::audit_detail(page, rq, "MCP", true) ==
-          "hardware CI records (MCP): rows=1 scope=confined");
-    rq.agent_id = "dev-9";
+          "hardware CI records (MCP): rows=1 scope=authority_scoped");
     rq.cursor = "c";
+    CHECK(hcp::audit_detail(page, rq, "REST", false) ==
+          "hardware CI records (REST): rows=1 page=continuation scope=fleet");
+    CHECK(hcp::audit_detail(page, rq, "MCP", true) ==
+          "hardware CI records (MCP): rows=1 page=continuation scope=authority_scoped");
+    rq.agent_id = "dev-9";
     CHECK(hcp::audit_target_type(rq) == "Agent");
     CHECK(hcp::audit_target_id(rq) == "dev-9");
-    CHECK(hcp::audit_detail(page, rq, "REST", false).find("page=continuation") != std::string::npos);
+    // the detail never names the device: the target does
+    CHECK(hcp::audit_detail(page, rq, "REST", false).find("dev-9") == std::string::npos);
+    CHECK(hcp::audit_detail_target_denied("MCP") == "hardware CI records (MCP): state=agent_id outside the caller's scope");
 }
 
-TEST_CASE("hardware ci page: a confined caller's body carries scope_basis and never the omitted count",
+TEST_CASE("hardware ci page: a confined caller's body carries scope_basis and nothing about hidden devices",
           "[hardware_ci_page][json][security]") {
     hcp::Page page;
     page.rows.push_back(make_record("a"));
-    page.devices_omitted = 7;
 
     json confined = hcp::page_json(page);
     hcp::apply_scope_disclosure(confined, /*confined=*/true);
     CHECK(confined.size() == 3);
-    CHECK_FALSE(confined.contains("devices_omitted"));
     CHECK(confined["scope_basis"] == "authority_scoped");
     CHECK(confined["devices"].size() == 1);
     CHECK(confined["next_cursor"] == "");
@@ -492,11 +700,21 @@ TEST_CASE("hardware ci page: a confined caller's body carries scope_basis and ne
     json global = hcp::page_json(page);
     hcp::apply_scope_disclosure(global, /*confined=*/false);
     CHECK(global == hcp::page_json(page)); // untouched
-    CHECK(global["devices_omitted"] == 7);
     CHECK_FALSE(global.contains("scope_basis"));
+    CHECK(global.size() == 2);
+}
 
-    // and neither does the confined audit detail
-    const hcp::Request rq;
-    CHECK(hcp::audit_detail(page, rq, "REST", true).find("omitted") == std::string::npos);
-    CHECK(hcp::audit_detail(page, rq, "REST", false).find("omitted=7") != std::string::npos);
+// Kills: reading `rec.hostname` verbatim (an empty or "unknown" CI hostname must be null so a
+// CMDB never imports a literal "unknown" as a device name).
+TEST_CASE("hardware ci page: hostname is null when empty or the literal unknown, and passes a real name",
+          "[hardware_ci_page][json]") {
+    DeviceCiRecord rec = make_record("h-1");
+    rec.hostname = "unknown";
+    CHECK(hcp::row_json(rec)["hostname"].is_null());
+    rec.hostname.clear();
+    CHECK(hcp::row_json(rec)["hostname"].is_null());
+    rec.hostname = "build-07";
+    CHECK(hcp::row_json(rec)["hostname"] == "build-07");
+    rec.hostname = "Unknown"; // only the exact stored sentinel is a sentinel
+    CHECK(hcp::row_json(rec)["hostname"] == "Unknown");
 }

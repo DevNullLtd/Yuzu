@@ -3,13 +3,13 @@
 #include "hardware_list_model.hpp"       // hardware_ci_scalars_json, id_is_audit_safe
 #include "list_keyset.hpp"               // the strict base64url codec shared by every cursor
 #include "model_param_helpers.hpp"       // shared param/cursor helpers (one copy across models)
-#include "software_catalogue_model.hpp"  // kScopePushdownMaxIds, kWideScopeMaxReads
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <format>
 #include <iterator>
-#include <unordered_set>
+#include <system_error>
 #include <utility>
 
 namespace yuzu::server::hardware_ci_page {
@@ -19,12 +19,8 @@ namespace {
 using model_detail::fnv1a_hex16;
 using model_detail::is_lower_hex16;
 using model_detail::length_prefixed;
-using model_detail::parse_i64;
-using model_detail::parse_nonneg;
 using model_detail::read_length_prefixed;
 using model_detail::valid_text;
-
-namespace sc = software_catalogue;
 
 constexpr std::string_view kCursorPrefix = "h1";
 
@@ -40,6 +36,24 @@ std::vector<std::string_view> split_colon(std::string_view s) {
         out.push_back(s.substr(start, pos - start));
         start = pos + 1;
     }
+}
+
+// REST `limit`: an optional leading '-' and decimal digits only, nothing else. A value that is
+// that shape but too large for 64 bits clamps by its sign (the documented rule for an
+// out-of-range integer); anything of another shape is nullopt (a 400).
+std::optional<int> parse_rest_limit(std::string_view s) {
+    const bool negative = !s.empty() && s.front() == '-';
+    const std::string_view digits = negative ? s.substr(1) : s;
+    if (digits.empty() ||
+        !std::ranges::all_of(digits, [](char c) { return c >= '0' && c <= '9'; }))
+        return std::nullopt;
+    std::int64_t v = 0;
+    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec == std::errc::result_out_of_range)
+        return static_cast<int>(negative ? 1 : kPageMax);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::nullopt;
+    return static_cast<int>(std::clamp<std::int64_t>(v, 1, kPageMax));
 }
 
 // The text checks every channel applies to the two string inputs. nullopt = acceptable.
@@ -68,10 +82,10 @@ std::expected<Request, std::string> parse_params(const Params& p) {
     if (const auto bad = text_error(r.agent_id, r.cursor))
         return std::unexpected(*bad);
     if (const std::string limit = first("limit"); !limit.empty()) {
-        const auto n = parse_i64(limit);
+        const auto n = parse_rest_limit(limit);
         if (!n)
             return std::unexpected("invalid limit (expected integer)");
-        r.limit = static_cast<int>(std::clamp<std::int64_t>(*n, 1, kPageMax));
+        r.limit = *n;
     }
     return r;
 }
@@ -125,34 +139,37 @@ std::string filter_fingerprint(const Request& rq) {
 }
 
 std::string encode_cursor(const Position& at, std::string_view fp) {
-    const std::string skip = std::to_string(at.skip);
     std::string out(kCursorPrefix);
     out += ':';
     out += fp;
     out += ':';
-    out += keyset::b64url_encode(length_prefixed({&at.after, &skip}));
+    out += keyset::b64url_encode(length_prefixed({&at.after}));
     return out;
 }
 
 std::expected<Position, CursorError> decode_cursor(std::string_view token, std::string_view fp) {
+    if (token.size() > kCursorMaxBytes)
+        return std::unexpected(CursorError::kMalformed);
     const auto parts = split_colon(token);
     if (parts.size() != 3 || parts[0] != kCursorPrefix || !is_lower_hex16(parts[1]))
         return std::unexpected(CursorError::kMalformed);
     const auto payload = keyset::b64url_decode(parts[2]);
     if (!payload)
         return std::unexpected(CursorError::kMalformed);
-    const auto fields = read_length_prefixed(*payload, 2);
+    // Exactly one field. A second field (the retired `skip` form) is a different position kind
+    // this server no longer issues, so it is refused rather than ignored.
+    const auto fields = read_length_prefixed(*payload, 1);
     if (!fields)
         return std::unexpected(CursorError::kMalformed);
-    const auto skip = parse_nonneg((*fields)[1]);
     const std::string after((*fields)[0]);
-    // The decoded id is bound as a SQL parameter: strict UTF-8, no NUL, and the audit-safe floor
-    // every id on this surface meets.
-    if (!skip || !valid_text(after) || (!after.empty() && !id_is_audit_safe(after)))
+    // A token is only ever minted after a served row, so `after` is never empty: an empty one
+    // would be a second spelling of the first page. The decoded id is bound as a SQL parameter:
+    // strict UTF-8, no NUL, and the audit-safe floor every id on this surface meets.
+    if (after.empty() || !valid_text(after) || !id_is_audit_safe(after))
         return std::unexpected(CursorError::kMalformed);
-    const Position pos{after, *skip};
+    const Position pos{after};
     // One spelling per position: a token that does not re-encode to itself (non-canonical
-    // base64url tail bits, a leading-zero length or skip) is malformed.
+    // base64url tail bits, a leading-zero length) is malformed.
     if (encode_cursor(pos, parts[1]) != token)
         return std::unexpected(CursorError::kMalformed);
     if (parts[1] != fp)
@@ -162,14 +179,31 @@ std::expected<Position, CursorError> decode_cursor(std::string_view token, std::
 
 // ── One page ─────────────────────────────────────────────────────────────────
 
-std::expected<Page, std::optional<CursorError>>
+std::string_view read_error_message(ReadError e) {
+    switch (e) {
+    case ReadError::kDegraded:
+        return "hardware CI records unavailable";
+    case ReadError::kCursorMalformed:
+        return cursor_error_message(CursorError::kMalformed);
+    case ReadError::kCursorFilterMismatch:
+        return cursor_error_message(CursorError::kFilterMismatch);
+    case ReadError::kScopeTooWide:
+        return "the caller's scope covers more than 10000 devices; pass agent_id or ask an "
+               "administrator to narrow the scope";
+    }
+    return "invalid request";
+}
+
+std::expected<Page, ReadError>
 read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope) {
     const std::string fp = filter_fingerprint(rq);
     Position incoming; // the head: nothing served yet
     if (!rq.cursor.empty()) {
         auto cur = decode_cursor(rq.cursor, fp);
         if (!cur)
-            return std::unexpected(cur.error());
+            return std::unexpected(cur.error() == CursorError::kMalformed
+                                       ? ReadError::kCursorMalformed
+                                       : ReadError::kCursorFilterMismatch);
         incoming = std::move(*cur);
     }
     Page out;
@@ -179,81 +213,36 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope)
         out.target_denied = true;
         return out;
     }
+    // A scope above the push-down ceiling cannot be applied in SQL, and filtering its rows after
+    // the read would let a short page or a skipping cursor count the hidden ones. Without an
+    // `agent_id` it is refused before any read; with one the device is read by key and the
+    // `in_scope` check above is the whole filter.
+    const bool wide = scope && scope->size() > kMaxPushdownScopeIds;
+    if (wide && rq.agent_id.empty())
+        return std::unexpected(ReadError::kScopeTooWide);
+
     DeviceCiKeysetQuery q;
     q.after = incoming.after;
-    q.limit = rq.limit;
     if (!rq.agent_id.empty())
         q.agent_id = rq.agent_id;
     // TOP leaves the query alone; an engaged-empty scope is agent_ids = {} (the store answers
-    // empty without SQL); a bounded set is pushed into SQL; a wider one is post-filtered below.
-    const bool wide = scope && scope->size() > sc::kScopePushdownMaxIds;
+    // empty without SQL); a bounded set is pushed into SQL. A wide scope with an agent_id sends
+    // no id array: the one device is the whole read.
     if (scope && !wide)
         q.agent_ids.emplace(scope->begin(), scope->end());
 
-    if (!wide) {
-        // Every returned row is in scope. One extra row is read to know whether the page is the
-        // last, so a final page carries no cursor. A skip is only ever minted by the wide path
-        // below and has no meaning here.
-        q.limit = rq.limit + 1;
-        auto rows = read(q);
-        if (!rows)
-            return std::unexpected(std::nullopt);
-        const auto limit = static_cast<std::size_t>(rq.limit);
-        if (rows->size() > limit) {
-            rows->resize(limit);
-            out.next_cursor = encode_cursor({rows->back().agent_id, 0}, fp);
-        }
-        out.rows = std::move(*rows);
-        return out;
-    }
-
-    // Wide scope: post-filter, refilling the page with at most kWideScopeMaxReads bounded reads.
-    // The cursor must never carry a dropped row's key, so it is the last IN-SCOPE row served (the
-    // incoming anchor if there is none) plus the number of rows scanned after it, which the next
-    // request passes over in SQL. Each refill read continues after the last row SCANNED, kept
-    // in-process only.
+    // Every returned row is in scope. One extra row is read to know whether the page is the last,
+    // so a final page carries no cursor.
+    q.limit = rq.limit + 1;
+    auto rows = read(q);
+    if (!rows)
+        return std::unexpected(ReadError::kDegraded);
     const auto limit = static_cast<std::size_t>(rq.limit);
-    q.skip = incoming.skip;
-    std::int64_t since_anchor = incoming.skip;
-    std::unordered_set<std::string> dropped;
-    bool more = false;
-    out.rows.reserve(limit);
-    for (int reads = 1;; ++reads) {
-        auto rows = read(q);
-        if (!rows)
-            return std::unexpected(std::nullopt);
-        const bool full = !rows->empty() && rows->size() == limit;
-        std::string last_scanned;
-        if (full && reads < sc::kWideScopeMaxReads)
-            last_scanned = rows->back().agent_id;
-        std::size_t i = 0;
-        for (; i < rows->size() && out.rows.size() < limit; ++i) {
-            auto& r = (*rows)[i];
-            if (authz::in_scope(scope, r.agent_id)) {
-                out.rows.push_back(std::move(r));
-                since_anchor = 0;
-            } else {
-                dropped.insert(r.agent_id); // each DISTINCT device counts once
-                ++since_anchor;
-            }
-        }
-        if (out.rows.size() >= limit) { // page filled: rows may remain here or beyond
-            more = i < rows->size() || full;
-            break;
-        }
-        if (!full) // a short read is the end of the data
-            break;
-        if (reads >= sc::kWideScopeMaxReads) { // bound reached: say there may be more
-            more = true;
-            break;
-        }
-        q.after = std::move(last_scanned);
-        q.skip = 0;
+    if (rows->size() > limit) {
+        rows->resize(limit);
+        out.next_cursor = encode_cursor({rows->back().agent_id}, fp);
     }
-    out.devices_omitted = static_cast<std::int64_t>(dropped.size());
-    if (more)
-        out.next_cursor = encode_cursor(
-            {out.rows.empty() ? incoming.after : out.rows.back().agent_id, since_anchor}, fp);
+    out.rows = std::move(*rows);
     return out;
 }
 
@@ -278,15 +267,12 @@ nlohmann::json page_json(const Page& page) {
     return nlohmann::json{
         {"devices", std::move(devices)},
         {"next_cursor", page.next_cursor},
-        {"devices_omitted", page.devices_omitted},
     };
 }
 
 void apply_scope_disclosure(nlohmann::json& body, bool confined) {
-    if (!confined)
-        return;
-    body.erase("devices_omitted");
-    body["scope_basis"] = "authority_scoped";
+    if (confined)
+        body["scope_basis"] = "authority_scoped";
 }
 
 // ── Audit text ───────────────────────────────────────────────────────────────
@@ -302,12 +288,18 @@ std::string audit_target_id(const Request& rq) {
 std::string audit_detail(const Page& page, const Request& rq, std::string_view surface,
                          bool confined) {
     std::string out = std::format("hardware CI records ({}): rows={}", surface, page.rows.size());
-    if (!confined)
-        out += " omitted=" + std::to_string(page.devices_omitted);
     if (!rq.cursor.empty())
         out += " page=continuation";
-    out += confined ? " scope=confined" : " scope=fleet";
+    out += confined ? " scope=authority_scoped" : " scope=fleet";
     return out;
+}
+
+std::string audit_detail_scope_too_wide(std::string_view surface) {
+    return std::format("hardware CI records ({}): state=scope too wide", surface);
+}
+
+std::string audit_detail_target_denied(std::string_view surface) {
+    return std::format("hardware CI records ({}): state=agent_id outside the caller's scope", surface);
 }
 
 } // namespace yuzu::server::hardware_ci_page
