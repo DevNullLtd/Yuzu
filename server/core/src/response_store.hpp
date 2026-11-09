@@ -47,6 +47,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "bounded_audit_budget.hpp"
@@ -183,6 +184,12 @@ struct ResponseQuery {
     std::optional<int64_t> until;
     int limit{100};
     int offset{0};
+    /// `query_by_execution` only: continue a newest-first read past the row with this
+    /// (`timestamp`, `id`), the last row of the previous page. Only rows that sort after it in
+    /// that read's order (`timestamp DESC, id DESC`) are returned, so a page boundary inside a
+    /// tied timestamp, or a row reaped between two pages, never skips or repeats a row (an
+    /// `offset` walk can do both). The other reads do not honour it.
+    std::optional<std::pair<int64_t, int64_t>> continue_after;
 };
 
 /// Management-group scope filter for `aggregate()`, `query()`, and
@@ -400,6 +407,7 @@ public:
     /// `execution_id` is rejected (returns an engaged empty vector, NOT
     /// nullopt) — that sentinel is the legacy path; callers must fall back
     /// to `query()` if they support pre-PR-2 data. `scope`: see `query()`.
+    /// Order is `timestamp DESC, id DESC` (total); `q.continue_after` pages it by keyset.
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
     query_by_execution(const std::string& execution_id, const ResponseTierFilter& tier,
                        const ResponseQuery& q = {},

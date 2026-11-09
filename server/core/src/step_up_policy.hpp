@@ -100,6 +100,11 @@ inline constexpr std::string_view kReferenceDataReplace =
     "fleet-wide software reference data (pack replace, curated aliases): not credentials, "
     "identity or authority, but it steers cpe_product and CVE matching and fleet-wide title "
     "resolution; audited before the write; whether it needs MFA step-up awaits an owner ruling";
+inline constexpr std::string_view kCollectionSettings =
+    "per-group software collection settings (interval, window, zone, collector switches): not "
+    "credentials, identity or authority, but a root document can switch collectors off "
+    "fleet-wide; audited ahead of the write; exempt by the project owner's SAM-34 decision while "
+    "the owner ruling on the plugin kill-switch route is pending";
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";
@@ -165,6 +170,13 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     {"DELETE", R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",          StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/guaranteed-state/rules/{id}"},
     {"POST",   R"(/api/v1/guaranteed-state/push)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/push"},
     {"POST",   R"(/api/v1/guaranteed-state/policy-generation/raise)",           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/policy-generation/raise"},
+    // ADR-0070 R1 (slice 2b-1a): registered CRL sources. Registering adds an egress target the server
+    // will fetch from, a replace/remove changes what is fetched, and a reset reopens the CRL replay
+    // window - all admin-only and none of them reversible by the caller alone, so each is kRequired.
+    {"POST",   R"(/api/v1/crypto/revocation-sources)",                          StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/crypto/revocation-sources"},
+    {"PUT",    R"(/api/v1/crypto/revocation-sources/([0-9]+))",                 StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/crypto/revocation-sources/{id}"},
+    {"DELETE", R"(/api/v1/crypto/revocation-sources/([0-9]+))",                 StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/crypto/revocation-sources/{id}"},
+    {"POST",   R"(/api/v1/crypto/revocation-sources/([0-9]+)/reset-high-water)", StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/crypto/revocation-sources/{id}/reset-high-water"},
     // Approvals (approval_routes.cpp; the label is the handler's verb-based one)
     {"POST",   R"(/api/approvals/([^/]+)/approve)",                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/approvals/{id}/approve"},
     {"POST",   R"(/api/approvals/([^/]+)/reject)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/approvals/{id}/reject"},
@@ -263,6 +275,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/aliases)",                        step_up_detail::kReferenceDataReplace),
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)",  step_up_detail::kOperationalData),
     step_up_detail::exempt("POST",  R"(/api/v1/inventory/software/normalization/pack)",                           step_up_detail::kReferenceDataReplace),
+    // software_collection_settings_routes.cpp
+    step_up_detail::exempt("PUT",   R"(/api/v1/inventory/software/collection-settings/([a-f0-9]+))",              step_up_detail::kCollectionSettings),
     // instruction_fragment_routes.cpp
     step_up_detail::exempt("POST",  R"(/fragments/instructions/yaml-preview)",                                    step_up_detail::kReadShaped),
     // instruction_routes.cpp

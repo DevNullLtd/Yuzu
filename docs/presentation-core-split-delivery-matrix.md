@@ -125,13 +125,15 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   route was found and is intentionally kept byte-identical rather than fixed in this seam PR (tracked
   #4333, out of scope for a behaviour-preserving refactor).
 - **`device` is the FOURTH family (PR #4484, MERGED to dev)** — the narrowest method set yet
-  (`list_devices`/`lookup_device`, 1:1 with `GET /api/v1/devices[/{id}]`, INV-31-4), unifying the
+  (`list_devices`/`lookup_device`, 1:1 with `GET /api/v1/devices[/{id}]`, INV-31-4; #2240 later added
+  two in-process read shapes with no REST/MCP twin, `list_devices_basic` and `connected_count`, see
+  `device_api.hpp`), unifying the
   THREE live consumers (dashboard `device_routes.cpp`, REST v1, MCP `list_agents`/`get_agent_details`)
   behind one store-free `DeviceApi` (`device_api.hpp` + core-only `device_api_local.hpp`, the same
   two-header template). Authorization is BYTE-IDENTICAL per consumer, not merely "equivalent" —
   REST keeps `fleet_read_fn`+`authz::in_scope`, MCP `list_agents` stays deliberately unconfined
   (true at #4484; `list_agents` moved onto `fleet_read_fn` on 2026-11-02, #4041), and the dashboard keeps its service-scoped
-  hand-403 + `device.list.view` denial audit, now filtering `api_->list_devices()`'s unscoped rows
+  hand-403 + `device.list.view` denial audit, now filtering `api_->list_devices_basic()`'s unscoped rows
   through the SAME `visible_set_fn` `get_visible_agents_json` already applied. `lookup_device` is an
   O(1) registry point lookup (mirrors `network`/`verify`/`compliance`'s posture): the #3564
   timing-oracle fix — a miss and an out-of-scope hit must take the identical not-found path, including

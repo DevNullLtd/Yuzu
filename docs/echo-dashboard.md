@@ -87,7 +87,7 @@ URL structure:
 
 The source of truth is the agent's `echo_config` table — the `<source>_enabled` keys, set by the `echo.configure` action. The server does not currently maintain a centralised "Echo config" mirror; the data path is **request-driven**:
 
-1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_live_rows` count + `<source>_oldest_ts` per source) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
+1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_rows` count + `<source>_oldest_ts` per source; the server reads `<source>_rows`; an agent that sends only `<source>_live_rows`, from before the roll-up-only release, is shown with a dash and an upgrade note, never with that figure as the count) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
 2. Responses stream back via the standard agent-streaming pipeline.
 3. Server collates into a transient in-memory table; renders as HTMX OOB swaps.
 4. Empty rows (`enabled=true` for all four sources) are dropped — the table only shows the *paused* state, not the entire fleet.

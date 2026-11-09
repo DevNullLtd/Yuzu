@@ -220,10 +220,12 @@ class EnablementStore;
 class AppUsageStore;
 class CertificateInventoryStore;
 class ProductRegistryStore;
+class SoftwareCollectionSettingsStore;
 class ProductPackStore;
 class ScimStore;
 class AnalyticsEventStore;
 class CryptoDashboardLayoutStore; // /readyz "degraded" notice only (ADR-0071 degrade posture)
+class RevocationSourceStore;      // /readyz GATING check (ADR-0070 R1: fail-closed registered CRL sources)
 
 // /metrics ONLY.
 class NvdDatabase;
@@ -464,6 +466,7 @@ struct Deps {
     AppUsageStore* app_usage_store{nullptr}; // Wave 7 PR7.2 (gov Gate 3 sre HIGH finding)
     CertificateInventoryStore* certificate_inventory_store{nullptr}; // slice-2 PR 2a-2a
     ProductRegistryStore* product_registry_store{nullptr};
+    SoftwareCollectionSettingsStore* software_collection_settings_store{nullptr}; // SAM-34
     ProductPackStore* product_pack_store{nullptr};
     ScimStore* scim_store{nullptr};
     AnalyticsEventStore* analytics_store{nullptr};
@@ -471,6 +474,9 @@ struct Deps {
     /// server boots without saved layouts), so null here means "did not open" - reported under
     /// /readyz's "degraded", never in failed_stores.
     CryptoDashboardLayoutStore* crypto_dashboard_layout_store{nullptr};
+    /// Gating (ADR-0070 R1): registered CRL sources are operator-authored security configuration,
+    /// so construction is fail-closed and this store IS in the /readyz conjunction.
+    RevocationSourceStore* revocation_source_store{nullptr};
 
     // ---- /metrics ONLY ----
     NvdDatabase* nvd_db{nullptr};

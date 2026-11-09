@@ -390,6 +390,61 @@ TEST_CASE("access-review fragments: a human holding the same custom role is stil
     CHECK(r.fragment_audits.empty()); // the belt writes only on a refusal
 }
 
+TEST_CASE(
+    "access-review campaign fragment: the signed-in reviewer's own user grant shows no Attest "
+    "or Flag, another reviewer's grant does",
+    "[pg][settings][access_review][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, ar_engine_tpl);
+    Rig r{db_.dsn(), /*rbac_enabled=*/false}; // the default: AccessReview:Attest is admin-only
+    auto id = r.reviews.open_campaign("Own grant", "root",
+                                      {GrantRef{"user", "root", "Administrator", "{}"},
+                                       GrantRef{"user", "alice", "Operator", "{}"},
+                                       // A GROUP sharing the viewer's name is not the viewer's
+                                       // own grant (the rule is user-typed): it keeps controls.
+                                       GrantRef{"group", "root", "Reader", "{}"}},
+                                      "disabled");
+    REQUIRE(id.has_value());
+    const auto root = r.cookie("root", auth::Role::admin);
+
+    const auto res = r.cookie_get(std::string(kGetFragment) + "?id=" + *id, root);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // The server refuses the self-decision either way; the page does not offer it (a courtesy,
+    // like the Access page), and says why.
+    CHECK_THAT(res->body, ContainsSubstring("Another reviewer must decide"));
+    std::size_t attest_buttons = 0;
+    for (std::size_t at = res->body.find(">Attest</button>"); at != std::string::npos;
+         at = res->body.find(">Attest</button>", at + 1))
+        ++attest_buttons;
+    CHECK(attest_buttons == 2); // alice's user row and the group row, never root's own user row
+    std::size_t inputs = 0;
+    for (std::size_t at = res->body.find("data-ar-justification"); at != std::string::npos;
+         at = res->body.find("data-ar-justification", at + 1))
+        ++inputs;
+    CHECK(inputs == 2); // the justification box is withheld from the own row too
+}
+
+TEST_CASE("access-review campaign fragment: a malformed or unknown id shows a plain notice, never "
+          "the store's classification prefix",
+          "[pg][settings][access_review][4752]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, ar_engine_tpl);
+    Rig r{db_.dsn()};
+    const auto bob = r.cookie("bob", auth::Role::user);
+    const std::string base = std::string(kGetFragment) + "?id=";
+
+    // "has space" and "a%00b" fail the shared validator; "nosuchcampaign" passes it and is unknown.
+    for (const char* id : {"has%20space", "a%00b", "nosuchcampaign"}) {
+        INFO("id=" << id);
+        const auto res = r.cookie_get(base + id, bob);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("No campaign with that id."));
+        CHECK_THAT(res->body, !ContainsSubstring("bad_request"));
+        CHECK_THAT(res->body, !ContainsSubstring("not_found"));
+        CHECK_THAT(res->body, !ContainsSubstring(kCampaignTitle));
+    }
+}
+
 TEST_CASE("access-review fragments: a caller without the grant and an unauthenticated caller are "
           "still refused at the gate, before the belt",
           "[pg][settings][engine_principal][access_review][authz][security]") {

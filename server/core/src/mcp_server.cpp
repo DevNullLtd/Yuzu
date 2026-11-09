@@ -49,6 +49,7 @@
 #include "result_set_matcher.hpp"        // validate_matcher: admission check of a caller matcher (#4644)
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
+#include "revocation_source_admin_gate.hpp" // ADR-0070 R1: decide_admin + RevocationSourceService (shared REST+MCP)
 #include "guardian_generation_raise.hpp"   // raise_guardian_policy_generation: shared REST+MCP parse/audit-detail/result builders
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
@@ -98,6 +99,7 @@
 #include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
+#include "access_review_attest_gate.hpp" // reviewer != subject of the grant, shared with REST
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
 #include "enrollment_directory_model.hpp" // #4031: shared row builders — REST/MCP parity (Rule 1)
@@ -702,13 +704,27 @@ std::string lower_copy(std::string v) {
 // constant).
 static_assert(kMaxFacetValueBytes == 2048,
               "update the preview tool text, the OpenAPI text and the docs");
+// The ResultSet row's `properties` / `required` fragments are spelled once here and spliced into the
+// nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
+// array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
+// #undef'd right after it.
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica, and false for a failed set"})j"
+#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents",
-     "List the connected agents the caller may read, with hostname, OS, architecture, and "
-     "version. Read-only. Requires Infrastructure:Read. A live snapshot of the agents connected "
+     "List the connected agents the caller may read, with hostname, OS, architecture, "
+     "version and guardian_backend. Read-only. Requires Infrastructure:Read. A live snapshot of "
+     "the agents connected "
      "to this server: an enrolled device that is offline is not listed, so use list_hardware_ci "
      "for enrolled devices. Use get_agent_details for one device's tags and detail; each row's "
-     "agent_id feeds the per-agent tools. Confined: when the read is scoped to the devices the "
+     "agent_id feeds the per-agent tools. guardian_backend is the detection backend the device "
+     "reports on its latest heartbeat: legacy, spark, spark_failed or unwired, or null when it "
+     "has not reported one (an older agent, no Guardian, a faulted heartbeat tag group, a "
+     "forged value, or no heartbeat in the last 90 seconds); null is never legacy, and until "
+     "prefer_spark is enabled every device that reports reads legacy. The value is the "
+     "device's own report, not independent verification, and null on a connected device is "
+     "routine (for example before its first heartbeat), not evidence that it is unprotected. "
+     "Confined: when the read is scoped to the devices the "
      "caller may read, the result carries scope_basis authority_scoped, and the text content is "
      "the object {agents, scope_basis} instead of the bare array of an unscoped read. It is a "
      "status, set whether or not anything was hidden; the number of hidden devices is never "
@@ -718,7 +734,7 @@ static const ToolDef kTools[] = {
      "permission denial is terminal; an authorization-store failure is a retryable 503 with "
      "retry_after_ms, never an empty list; an unwired server is a non-retryable internal error.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
+     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Until prefer_spark is enabled every device that reports reads legacy. The value is the device's own report, not independent verification, and null is routine (for example before the first heartbeat) and is not evidence that the device is unprotected. The set is closed: adding a value is a breaking change under docs/api-versioning-policy.md. During a rolling upgrade a response from a replica older than this change omits the key."}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend"]}},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the list holds only devices within that scope. A status, set whether or not any device was hidden; never a count."}},"required":["agents"]})j"},
 
     // ── #4027 API-parity read twins: Echo process-tree / capture-sources device
     // pickers + retention-paused source list. Requires Infrastructure:Read,
@@ -766,17 +782,37 @@ static const ToolDef kTools[] = {
      "result_truncated_by_cap=true means the scan's response read reached its "
      "10,000-row / 50 MiB cap, so rows and the counters are PARTIAL (a dropped "
      "response reads as an agent that never answered); store_degraded is then "
-     "also true, and result_truncated_by_cap tells a cut apart from a failed read.",
+     "also true, and result_truncated_by_cap tells a cut apart from a failed read. "
+     "Each row's live_rows is the count of raw capture rows held for the source (the "
+     "name is kept for compatibility; -1 when unknown).",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"result_truncated_by_cap":{"type":"boolean","description":"true when the scan's response read hit the 10,000-row or 50 MiB payload cap: rows and counts are partial"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows"]})j"},
 
     {"get_agent_details",
-     "Get detailed info for a single agent including tags and inventory. "
-     "An \"Agent not found\" error means either the agent does not exist or "
-     "it exists outside your management-group scope -- deliberately "
-     "indistinguishable to prevent scope-probing.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","tags"]})j"},
+     "Get one connected agent's identity (hostname, OS, architecture, agent version), its "
+     "guardian_backend and its tags (key, value, source). Read-only. Requires "
+     "Infrastructure:Read. Use list_agents first: each row's agent_id is the input here, and "
+     "list_agents is the right tool to enumerate or find devices. This is not an inventory "
+     "read; installed software and hardware are separate tools. The identity fields are a live "
+     "snapshot of the agent's session on this server, so a device that is not currently "
+     "connected is not found; the tags are read live from the tag store. guardian_backend is "
+     "the detection backend the device reports on its latest heartbeat: legacy, spark, "
+     "spark_failed or unwired, or null when it has not reported one (an older agent, no "
+     "Guardian, a faulted heartbeat tag group, a forged value, or no heartbeat in the last 90 "
+     "seconds); null is never legacy, and until prefer_spark is enabled every device that "
+     "reports reads legacy. The value is the device's own report, not independent "
+     "verification, and null on a connected device is routine (for example before its first "
+     "heartbeat), not evidence that it is unprotected. The tags array is always present, empty "
+     "when the device has none. An \"Agent "
+     "not found\" error means the agent is not connected, does not exist, or exists outside "
+     "your management-group scope, deliberately indistinguishable to prevent scope-probing, "
+     "so an unreadable id is not proof the device is absent from the fleet. Not found and "
+     "permission denial are terminal; a tag-store failure (\"Tag store unavailable\") is "
+     "retryable with retry_after_ms 5000, never a device with empty tags; an authorization-store "
+     "failure is also a retryable 503 with retry_after_ms; an unwired server or device registry "
+     "is a non-retryable internal error.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Agent ID"}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"guardian_backend":{"type":["string","null"],"enum":["legacy","spark","spark_failed","unwired",null],"description":"Guardian detection backend the device reports on its heartbeat (the yuzu.guardian_backend tag), read live. null when not reported: an agent older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a forged or unrecognised value, or no heartbeat within the last 90 seconds. null is never legacy. Until prefer_spark is enabled every device that reports reads legacy. The value is the device's own report, not independent verification, and null is routine (for example before the first heartbeat) and is not evidence that the device is unprotected. The set is closed: adding a value is a breaking change under docs/api-versioning-policy.md. During a rolling upgrade a response from a replica older than this change omits the key."},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version","guardian_backend","tags"]})j"},
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries (newest first, rows with "
@@ -1524,7 +1560,7 @@ static const ToolDef kTools[] = {
     // v1 had a full 12-operation API with zero MCP tools before this batch.
     // Every tool below shares the SAME `ResultSet` row shape (id/name/
     // owner_principal/created_at/ttl_at/last_used_at/pinned/parent_id/
-    // source_kind/status/source_execution_id/device_count) as its REST v1
+    // source_kind/status/source_execution_id/device_count/agents_failed/partial) as its REST v1
     // twin — both surfaces call the SAME result_set_json() builder
     // (result_set_model.hpp), so the shape cannot drift.
 
@@ -1536,8 +1572,8 @@ static const ToolDef kTools[] = {
      "share.",
      R"j({"type":"object","properties":{"cursor":{"type":"string","maxLength":2048,"description":"Opaque pagination cursor from a prior response's next_cursor"},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50}}})j",
      R"j({"type":"object","properties":{"result_sets":{"type":"array","items":{"type":"object","properties":{)j"
-     R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]}},"next_cursor":{"type":"string"}},"required":["result_sets","next_cursor"]})j"},
+     YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]}},"next_cursor":{"type":"string"}},"required":["result_sets","next_cursor"]})j"},
 
     {"create_result_set",
      "Create a result set directly from pre-computed device ids. Synchronous — lands "
@@ -1548,8 +1584,8 @@ static const ToolDef kTools[] = {
      "request (RESULT_SET_UNKNOWN_DEVICE_ID). REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"create_result_set_from_inventory_query",
      "Create an owner-scoped result set from a SYNCHRONOUS inventory query — evaluates "
@@ -1567,8 +1603,8 @@ static const ToolDef kTools[] = {
      "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. JSON integers are exact; every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is -32602: send an integer, or send the decimal as a string under > >= < <= (at most 15 significant digits, a magnitude below 2^53, not subnormal, within the range of a double), where == and != stay a text compare; write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as 1e16 (read exactly). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"create_result_set_from_echo_query",
      "Create a result set by DISPATCHING a read-only Echo SQL query to the fleet. ASYNC: "
@@ -1578,7 +1614,14 @@ static const ToolDef kTools[] = {
      "derived visible device set — the ONLY per-device authorization on this dispatch "
      "surface (not defense-in-depth). SQL is sandboxed AGENT-side by a read-only authorizer; "
      "the server only length-checks (max 100000 bytes). Membership is every agent that "
-     "returned >=1 row (include_empty=true widens to every responder). Dispatches to "
+     "returned >=1 row (include_empty=true widens to every responder); an agent whose "
+     "query failed is not a member, and the filled set reports how many in agents_failed "
+     "with partial=true (an execution with more than 100000 stored answers marks the set "
+     "failed instead, with agents_failed 0 and the reason in the server log). SQL that "
+     "reads a raw capture table ($<Source>_Live or a "
+     "<source>_live table, which Echo no longer keeps) is refused with "
+     "RESULT_SET_REEVAL_STALE_SOURCE: query the hourly roll-up instead, for example "
+     "$Process_Hourly. Dispatches to "
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
@@ -1591,8 +1634,8 @@ static const ToolDef kTools[] = {
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"create_result_set_from_instruction_result",
      "Create a result set by DISPATCHING an existing InstructionDefinition to the fleet. "
@@ -1604,7 +1647,11 @@ static const ToolDef kTools[] = {
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
      "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
-     "or discover_instructions — do not guess. If the definition runs a Forensics-tier "
+     "or discover_instructions — do not guess. An echo.sql definition whose SQL (params.sql, "
+     "else the definition's own default) reads a raw capture table ($<Source>_Live or a "
+     "<source>_live table, which Echo no longer keeps) is refused with "
+     "RESULT_SET_REEVAL_STALE_SOURCE and nothing is dispatched, the same as "
+     "create_result_set_from_echo_query. If the definition runs a Forensics-tier "
      "plugin (an action on the Forensics securable) the set materializes with no members "
      "for every creator, because the materializer never reads Forensics-tier output; an "
      "empty set from such a definition says nothing about the fleet. A definition whose "
@@ -1633,8 +1680,8 @@ static const ToolDef kTools[] = {
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
      R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"reevaluate_result_set",
      "Re-run an existing result set's OWN source query, creating a NEW SIBLING set (same "
@@ -1665,6 +1712,9 @@ static const ToolDef kTools[] = {
      "retry_after_ms 5000; effect_unresolvable_store_unwired null). A missing instruction, or "
      "an absent or not-owned set, still mints a ticket bound to effect=unresolved, which the "
      "approved recall then refuses and spends. "
+     "A set whose stored SQL reads a raw capture table ($<Source>_Live or a <source>_live "
+     "table, which Echo no longer keeps) is refused with RESULT_SET_REEVAL_STALE_SOURCE and "
+     "nothing is dispatched: create a new set over the hourly roll-up instead. "
      "REST v1 twin: POST "
      "/api/v1/result-sets/{id}/re-eval. "
      "NEVER re-send this call on a timeout or an ambiguous/post-dispatch error - it "
@@ -1675,16 +1725,16 @@ static const ToolDef kTools[] = {
      "faulted after a real command already reached the fleet) carries no retry_after_ms "
      "and must NEVER be retried - poll executions for the outcome instead.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"get_result_set",
      "Get one result set's metadata by id. Owner-scoped — a non-owner gets the same "
      "not-found error as a nonexistent id (existence-oracle-safe). REST v1 twin: GET "
      "/api/v1/result-sets/{id}.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"get_result_set_members",
      "List a result set's member device ids. Owner-scoped. REST v1 twin: GET "
@@ -1705,15 +1755,15 @@ static const ToolDef kTools[] = {
      "set is a no-op success, same end state. Owner-scoped; capped at 50 pinned sets per "
      "owner. REST v1 twin: POST /api/v1/result-sets/{id}/pin.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"unpin_result_set",
      "Unpin a result set, restoring its normal TTL. Idempotent — unpinning an already-unpinned "
      "set is a no-op success. Owner-scoped. REST v1 twin: POST /api/v1/result-sets/{id}/unpin.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
-     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
-     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+     R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
+     R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
     {"delete_result_set",
      "Delete a result set. Owner-scoped. A pinned set must be unpinned first. REST v1 twin: "
@@ -3853,9 +3903,10 @@ static const ToolDef kTools[] = {
      "(enabled|disabled|degraded) stamps whether RBAC actually governs this grant population "
      "right now — degraded means the read could not confirm state, so gates deny "
      "defensively, NOT that an admin turned RBAC off. Self-audited as "
-     "access_review.exported. Requires AccessReview:Read.",
+     "access_review.exported; if that audit write fails the export still stands and the "
+     "result carries audit_persisted:false. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]}},"required":["count","rows","rbac_enforcement"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"rows":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string"},"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_or_email":{"type":"string"},"roles":{"type":"array","items":{"type":"string"}},"effective_permission_count":{"type":"integer"},"last_activity_ms":{"type":"integer"},"last_activity_kind":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"source":{"type":"string"}}}},"rbac_enforcement":{"type":"string","enum":["enabled","disabled","degraded"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","rows","rbac_enforcement"]})j"},
 
     {"open_access_review",
      "Open a review campaign — freeze the CURRENT cross-principal grant population "
@@ -3865,78 +3916,116 @@ static const ToolDef kTools[] = {
      "stays reviewable (frozen, not re-derived from live state). The fleet's current RBAC "
      "enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same "
      "moment — see get_access_review. Mirrors POST "
-     "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. This records "
+     "/api/v1/access-reviews. Self-audited as access_review.campaign_opened. If the audit "
+     "row cannot be saved the campaign is still open and the result carries "
+     "audit_persisted:false. This records "
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("title":{"type":"string","minLength":1,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
+     R"j("title":{"type":"string","minLength":1,"maxLength":256,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'. At most 256 bytes and no NUL (a longer one is refused with invalid-params)"})j"
      R"j(},"required":["title"]})j",
-     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j"},
+     R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["campaign_id","grant_count"]})j"},
 
+    // campaign_id on the three id tools below carries maxLength/pattern as DISCOVERY METADATA
+    // only: the schema validator runs just for approval-gated calls, so each handler's own
+    // valid_campaign_id check is the enforcement.
     {"record_attestation",
      "Record one reviewer decision against a grant frozen into an open campaign — "
      "'attested' (the reviewer confirms this grant is still appropriate) or "
      "'flagged_revoke' (the reviewer believes it should be revoked). flag != revoke: this "
      "tool ONLY records evidence — it never itself mutates any RBAC/EnginePrincipal grant. "
      "Acting on a flagged_revoke decision is a separate, explicit role-unassignment or "
-     "engine-principal-revoke call an operator makes after reading this evidence. This is "
-     "FINAL and irreversible, so destructiveHint:true: the first decision on a "
-     "(campaign_id, principal_type, principal_id, role_name) grant sticks and cannot be "
-     "changed while the campaign is open (a second call is refused as already_decided; open "
-     "a new campaign to re-review). Separation of duties: the reviewer may NOT decide their "
-     "own grant (principal_type 'user' whose principal_id is the caller) nor an engine "
-     "principal they own — refused as self_attestation, and another reviewer must decide it. "
-     "Group grants are not covered by the owner check. Both refusals are audited with "
-     "result=denied. An identifier with a NUL byte or over 512 bytes, or a justification with "
-     "a NUL byte or over 8192 bytes, is refused as invalid-params (nothing is truncated). "
-     "Mirrors POST /api/v1/access-reviews/{id}/attestations. Self-audited as "
-     "access_review.attested or access_review.flagged (by decision). Requires "
-     "AccessReview:Attest.",
+     "engine-principal-revoke call an operator makes after reading this evidence. Calling it "
+     "again for the same (campaign_id, principal_type, principal_id, role_name) makes the new "
+     "decision the CURRENT one and it can never return the grant to pending, so "
+     "destructiveHint:true; the earlier decision is NOT lost, every decision is kept in the "
+     "grant's history (get_access_review returns the latest 100 entries per grant, with an "
+     "earlier justification cut to its first 64 characters, and a decision_seq). The "
+     "reviewer must differ from the subject of the grant: a user grant naming the caller, an "
+     "engine principal the caller owns now or owned when the campaign opened, or a group the caller "
+     "belongs to is refused with a "
+     "permission-denied result, 'the reviewer must differ from the subject of this grant; ask "
+     "another reviewer to record this decision', and records nothing. principal_id and "
+     "role_name are at most 1024 bytes each and justification at most 4096 bytes (a "
+     "justification that is present and not a string is refused with invalid params). Each grant "
+     "keeps at most 100 recorded decisions, the 100th is final: a further one is refused with "
+     "invalid params and records nothing, and the way to review that grant again is to open a "
+     "new campaign. A successful call returns decision_seq (this "
+     "decision's position in the grant's history, 1 for the first) and previous_decision "
+     "(the decision it superseded, 'pending' for the first), so you can see when you replaced "
+     "another reviewer's decision. "
+     "An internal error that carries retry_after_ms can mean the decision was recorded anyway "
+     "(a lost commit acknowledgement): before retrying, call get_access_review, compare "
+     "decision_seq with the value you last saw and look for your own entry (match reviewer, "
+     "justification and decided_at_ms; an earlier entry shows at most its first 64 "
+     "characters), because a blind retry appends another identical "
+     "decision, which is kept and visible, not an error, until the grant reaches its limit of "
+     "100 decisions, after which the request is refused. Mirrors POST "
+     "/api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested or "
+     "access_review.flagged (by decision). If the audit row cannot be saved the decision "
+     "still stands and the result carries audit_persisted:false. Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":512},)j"
-     R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string","minLength":1,"maxLength":512},)j"
-     R"j("role_name":{"type":"string","minLength":1,"maxLength":512},)j"
-     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
-     R"j("justification":{"type":"string","maxLength":8192})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"},)j"
+     R"j("principal_type":{"type":"string","enum":["user","group","engine"],"description":"Type of the principal that holds the grant"},)j"
+     R"j("principal_id":{"type":"string","minLength":1,"maxLength":1024,"description":"Id of the principal that holds the grant, as listed in get_access_review (at most 1024 bytes)"},)j"
+     R"j("role_name":{"type":"string","minLength":1,"maxLength":1024,"description":"Role of the grant being decided (at most 1024 bytes)"},)j"
+     R"j("decision":{"type":"string","enum":["attested","flagged_revoke"],"description":"attested records that the grant is still appropriate; flagged_revoke records evidence that it should be revoked. Neither changes any grant"},)j"
+     R"j("justification":{"type":"string","maxLength":4096,"description":"Reviewer's reason (at most 4096 bytes). Only the latest entry of a grant's history is returned whole"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
-     R"j({"type":"object","properties":{"recorded":{"type":"boolean"}},"required":["recorded"]})j"},
+     R"j({"type":"object","properties":{"recorded":{"type":"boolean"},"decision_seq":{"type":"integer"},"previous_decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["recorded","decision_seq","previous_decision"]})j"},
 
     {"get_access_review",
      "Full evidentiary state of one review campaign: metadata plus every frozen "
-     "attestation row (pending/attested/flagged_revoke) plus pending_count. "
+     "attestation row (pending/attested/flagged_revoke) plus pending_count. Each attestation "
+     "carries its current decision, a decision_seq (0 while pending) and history, the latest "
+     "decisions recorded for that grant (at most 100) oldest first as {seq, decision, "
+     "previous_decision, reviewer, justification, justification_truncated, decided_at_ms}; "
+     "previous_decision \"\" means not recorded (the decision predates the history), never "
+     "pending. The response grows with every re-recorded decision, up to 100 decisions per "
+     "grant; a history lists at most the latest 100, so decision_seq greater than the number "
+     "of history entries means earlier ones are not shown. Only the latest history entry "
+     "carries its whole justification; an earlier entry carries at most its first 64 "
+     "characters, with justification_truncated true when text was cut (the full text stays "
+     "in the database). "
      "campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen "
      "AT OPEN (empty string for a campaign opened before this field existed). Mirrors GET "
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
+     R"j({"type":"object","properties":{"campaign":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}},"attestations":{"type":"array","items":{"type":"object","properties":{"principal_type":{"type":"string","enum":["user","group","engine"]},"principal_id":{"type":"string"},"role_name":{"type":"string"},"decision":{"type":"string","enum":["pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"decided_at_ms":{"type":"integer"},"justification":{"type":"string"},"grant_snapshot":{"type":["object","null"]},"decision_seq":{"type":"integer"},"history":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"decision":{"type":"string","enum":["attested","flagged_revoke"]},"previous_decision":{"type":"string","enum":["","pending","attested","flagged_revoke"]},"reviewer":{"type":"string"},"justification":{"type":"string"},"justification_truncated":{"type":"boolean"},"decided_at_ms":{"type":"integer"}},"required":["seq","decision","previous_decision","reviewer","justification","justification_truncated","decided_at_ms"]}}},"required":["principal_type","principal_id","role_name","decision","reviewer","decided_at_ms","justification","grant_snapshot","decision_seq","history"]}},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
     {"list_access_reviews",
      "List every review campaign's metadata (NOT its attestations — use get_access_review "
-     "for those), newest-first, capped at the most recent 500. The surface an auditor "
-     "needs to prove reviews ran on cadence. Each campaign's rbac_enforcement "
+     "for those), newest-first, capped at the most recent 500. Metadata only, with no "
+     "decided or pending counts: use get_access_review (pending_count and the attestation rows) "
+     "to see how complete a campaign is. Each campaign's rbac_enforcement "
      "(enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN (empty string for "
      "a campaign opened before this field existed). Mirrors GET /api/v1/access-reviews. "
-     "Self-audited as access_review.list. Requires AccessReview:Read.",
+     "Self-audited as access_review.list; if that audit write fails the list still stands and "
+     "the result carries audit_persisted:false. Requires AccessReview:Read.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}}},"required":["count","campaigns"]})j"},
+     R"j({"type":"object","properties":{"count":{"type":"integer"},"campaigns":{"type":"array","items":{"type":"object","properties":{"campaign_id":{"type":"string"},"title":{"type":"string"},"status":{"type":"string","enum":["open","closed"]},"created_by":{"type":"string"},"created_at_ms":{"type":"integer","description":"Database clock, epoch ms, at the start of the transaction that opened the campaign"},"closed_by":{"type":"string"},"closed_at_ms":{"type":"integer","description":"0 while open; otherwise the database clock, epoch ms, at the start of the closing transaction. A decision that overlapped the close can carry a later decided_at_ms: order decisions by seq"},"rbac_enforcement":{"type":"string","enum":["","enabled","disabled","degraded"]}}}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["count","campaigns"]})j"},
 
     {"close_access_review",
      "Close an open review campaign. Does NOT require every attestation to be decided "
      "first — a campaign closed with pending rows still outstanding is itself evidence, "
      "not something this tool silently forces to completion. Mirrors POST "
-     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. Closing is a "
+     "/api/v1/access-reviews/{id}/close. Self-audited as access_review.closed. If the audit "
+     "row cannot be saved the campaign is still closed and the result carries "
+     "audit_persisted:false. Closing is a "
      "one-way lifecycle transition (no reopen path) that permanently freezes every still-pending "
      "attestation, so destructiveHint:true; it deletes no evidence (attestation rows are "
      "untouched), but the campaign's own open->closed state is irreversibly transitioned. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string","minLength":1})j"
+     R"j("campaign_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]{1,64}$","description":"Campaign id as returned by open_access_review: 1 to 64 characters from A-Z, a-z, 0-9, underscore and hyphen"})j"
      R"j(},"required":["campaign_id"]})j",
-     R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
+     R"j({"type":"object","properties":{"closed":{"type":"boolean"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present, and false, only when the operation succeeded but its audit row was not saved"}},"required":["closed"]})j"},
 
     // ── KEK (key-encryption-key) rotation tools (#2395 track C) — MCP twins
     // of POST/GET /api/v1/secrets/kek/* (kek_routes.hpp/.cpp), sharing the
@@ -4736,7 +4825,151 @@ static const ToolDef kTools[] = {
      R"j("administrator":{"type":"string","enum":["may","may_not","unconfirmed"],"description":"Advisory. may: the RBAC administration routes would admit this credential's durable authority now (excludes the MCP tier and approval ladder, REST MFA step-up and the enforcement change's destination-regime refusal). may_not: they would refuse it. unconfirmed: a required store could not answer; retry later and do not read it as may_not. Advisory only, never a go signal for a mutation. Treat an unrecognised value as unconfirmed"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"False when either audit row (rbac.enforcement.read or mcp.get_rbac_enforcement) failed to persist; the data is still returned. True when both persisted, or when no audit sink is wired"})j"
      R"j(},"required":["enabled","unconfirmed","administrator","audit_persisted"],"additionalProperties":false})j"},
+
+    // ── Revocation sources (ADR-0070 R1, slice 2b-1a) ─────────────────────────────────────────
+    // Registered CRL sources: a CA plus the CRL URLs the server may fetch for it. Admin-only in
+    // both RBAC states (the RevocationSource securable AND the durable-administrator predicate),
+    // so not grantable; removal is a Write. REST twins: /api/v1/crypto/revocation-sources.
+    {"list_revocation_sources",
+     "List the registered CRL sources: each is one CA (its certificate keys, by sha256 / SKI / "
+     "SPKI hash) and the CRL URLs the server may fetch for it, with the address classes the "
+     "administrator confirmed, a per-URL fetch status and the source's crl_status. This release "
+     "registers sources only: crl_status reads no_crl_fetched and every fetch_status reads "
+     "never_fetched until the fetcher ships, so a source here is NOT evidence that any "
+     "certificate was checked. The result carries crl_past_next_update, the count of registered "
+     "CRL scopes whose held CRL (base or delta) is past its nextUpdate (always 0 until CRLs are held). Scope: facts only; the only "
+     "built-in checks are D13's named rules and windows, each shown with its criterion. Requires "
+     "the RevocationSource:Read grant AND a durable Administrator role (not grantable: a custom "
+     "role holding the pair is still refused); denied outright to a service-scoped token. "
+     "Audited as crypto.revocation_source.list; if that row cannot be written the list is still "
+     "returned with audit_persisted false. A degraded store is a retryable error, never an empty "
+     "list. Mirrors GET /api/v1/crypto/revocation-sources.",
+     R"({"type":"object","properties":{},"additionalProperties":false})",
+     R"j({"type":"object","properties":{"sources":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"ca_subject_name_sha256":{"type":"string","description":"SHA-256 of the CA subject Name DER, hex: one source per CA"},"config_version":{"type":"integer","description":"Pass back as expected_config_version on update_revocation_source"},"created_by":{"type":"string"},"created_at":{"type":"string","description":"RFC 3339 UTC time"},"updated_at":{"type":"string","description":"RFC 3339 UTC time"},"held_crl_count":{"type":"integer","minimum":0},"crl_status":{"type":"string","enum":["no_crl_fetched","crl_held"]},"high_water":{"type":"object","properties":{"reset_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null until the first reset, never cleared"},"pinned_crl_sha256":{"type":["string","null"]}},"required":["reset_at","pinned_crl_sha256"]},"ca_certificates":{"type":"array","items":{"type":"object","properties":{"cert_sha256":{"type":"string","description":"SHA-256 of the certificate DER, hex"},"ski":{"type":["string","null"],"description":"Subject key identifier, hex; null when the certificate has none"},"spki_sha256":{"type":"string","description":"SHA-256 of the SubjectPublicKeyInfo DER, hex"}},"required":["cert_sha256","ski","spki_sha256"]}},"crl_urls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"confirmed_address_classes":{"type":"array","items":{"type":"string"},"description":"The address classes the administrator confirmed at registration"},"fetch_status":{"type":"object","properties":{"state":{"type":"string","enum":["never_fetched","ok","failing"],"description":"never_fetched until the CRL fetcher (a later release) has made an attempt"},"last_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first attempt"},"last_success_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first success"},"last_failure_cause":{"type":["string","null"],"description":"The cause of the last failed attempt; null when the last attempt succeeded or none was made"},"consecutive_failures":{"type":"integer","minimum":0},"next_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null when no attempt is scheduled"}},"required":["state","last_attempt_at","last_success_at","last_failure_cause","consecutive_failures","next_attempt_at"]}},"required":["id","url","host","confirmed_address_classes","fetch_status"]}}},"required":["id","name","ca_subject_name_sha256","config_version","created_by","created_at","updated_at","held_crl_count","crl_status","high_water","ca_certificates","crl_urls"]}},"total":{"type":"integer","minimum":0},"max_sources":{"type":"integer"},"crl_past_next_update":{"type":"integer","minimum":0,"description":"Registered CRL scopes whose held CRL (base or delta) is past its nextUpdate (a count of scopes, not of sources)"},"audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"}},"required":["sources","total","max_sources","crl_past_next_update"]})j"},
+
+    {"get_revocation_source",
+     "Show one registered CRL source by id: its name, the CA subject hash, each CA certificate "
+     "(cert_sha256, ski, spki_sha256), each CRL URL with the address classes the administrator "
+     "confirmed and its fetch status, config_version, who registered it and when. Fetch status "
+     "reads never_fetched until the fetcher ships. Scope: facts only; the only built-in checks are D13's "
+     "named rules and windows, each shown with its criterion. Requires RevocationSource:Read AND "
+     "a durable Administrator role; denied outright to a service-scoped token. Audited as "
+     "crypto.revocation_source.view; if that row cannot be written the source is still returned "
+     "with audit_persisted false. An unknown id is a non-retryable invalid_params error (MCP has no 404 code); a degraded store is "
+     "a retryable error. Mirrors GET /api/v1/crypto/revocation-sources/{id}.",
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id from list_revocation_sources"}},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"ca_subject_name_sha256":{"type":"string","description":"SHA-256 of the CA subject Name DER, hex: one source per CA"},"config_version":{"type":"integer","description":"Pass back as expected_config_version on update_revocation_source"},"created_by":{"type":"string"},"created_at":{"type":"string","description":"RFC 3339 UTC time"},"updated_at":{"type":"string","description":"RFC 3339 UTC time"},"held_crl_count":{"type":"integer","minimum":0},"crl_status":{"type":"string","enum":["no_crl_fetched","crl_held"]},"high_water":{"type":"object","properties":{"reset_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null until the first reset, never cleared"},"pinned_crl_sha256":{"type":["string","null"]}},"required":["reset_at","pinned_crl_sha256"]},"ca_certificates":{"type":"array","items":{"type":"object","properties":{"cert_sha256":{"type":"string","description":"SHA-256 of the certificate DER, hex"},"ski":{"type":["string","null"],"description":"Subject key identifier, hex; null when the certificate has none"},"spki_sha256":{"type":"string","description":"SHA-256 of the SubjectPublicKeyInfo DER, hex"}},"required":["cert_sha256","ski","spki_sha256"]}},"crl_urls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"confirmed_address_classes":{"type":"array","items":{"type":"string"},"description":"The address classes the administrator confirmed at registration"},"fetch_status":{"type":"object","properties":{"state":{"type":"string","enum":["never_fetched","ok","failing"],"description":"never_fetched until the CRL fetcher (a later release) has made an attempt"},"last_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first attempt"},"last_success_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first success"},"last_failure_cause":{"type":["string","null"],"description":"The cause of the last failed attempt; null when the last attempt succeeded or none was made"},"consecutive_failures":{"type":"integer","minimum":0},"next_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null when no attempt is scheduled"}},"required":["state","last_attempt_at","last_success_at","last_failure_cause","consecutive_failures","next_attempt_at"]}},"required":["id","url","host","confirmed_address_classes","fetch_status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"}},"required":["id","name","ca_subject_name_sha256","config_version","created_by","created_at","updated_at","held_crl_count","crl_status","high_water","ca_certificates","crl_urls"]})j"},
+
+    {"register_revocation_source",
+     "Register a CA and the CRL URLs the server may fetch for it. This adds an outbound fetch "
+     "target: the server will request exactly these URLs, and an address the administrator did "
+     "not confirm is never fetched. ca_certificates are 1..8 PEM CERTIFICATE blocks (one CA: "
+     "every certificate must share one subject Name, each must be a CA with basicConstraints "
+     "cA=TRUE and cRLSign when it has a key usage extension; several keys let a CA renewal keep "
+     "verifying). crl_urls are 1..8 objects {url, confirmed_address_classes}: http or https, a "
+     "host, no userinfo, no fragment, at most 2048 bytes, ASCII only (give an internationalised "
+     "host as punycode). The host is resolved at registration. Loopback, link-local, cloud "
+     "metadata, unspecified, multicast, reserved addresses and every address this server is "
+     "bound to are refused with no override. Any other class (public, private, "
+     "carrier-grade-nat, unique-local, non-global) must be named in confirmed_address_classes: "
+     "if you omit it the call is refused with invalid_params naming the classes the host "
+     "resolves to; read them and call again with that list. At most 64 sources; one source per "
+     "CA (a second registration of the same CA is a non-retryable invalid_params error naming the existing "
+     "id in its remediation: use update_revocation_source). Not idempotent. This release stores registrations only: "
+     "no CRL is fetched and no certificate is judged. Requires RevocationSource:Write AND a "
+     "durable Administrator role (not grantable), the supervised MCP tier (approval-gated: the "
+     "first call returns an approval ticket, re-call with the returned approval_id) and is "
+     "denied outright to a service-scoped token and to an MCP-tier-less caller. Resolves the "
+     "registered host, the only outbound reach any tool has. The refusals are exact: the NAT64 "
+     "forms (the well-known 64:ff9b::/96 and any prefix the operator declared with "
+     "--oidc-nat64-prefix) and 6to4 and IPv4-mapped forms are judged by the IPv4 address they "
+     "embed. Declared prefixes only at registration: no RFC 7050 discovery is done, so an address "
+     "behind an undeclared prefix the network advertises is judged as plain IPv6 here and "
+     "re-judged when the source is fetched. If this server's own addresses cannot be determined "
+     "or a name lookup times out, the call fails closed with a retryable error (retry_after_ms "
+     "5000) and registers nothing. Audited as "
+     "crypto.revocation_source.register: an attempted row is written first and if it cannot be "
+     "stored nothing is changed. Scope: facts only; the only built-in checks are D13's named rules and "
+     "windows, each shown with its criterion. Mirrors POST /api/v1/crypto/revocation-sources.",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"A label for the source (free text, escaped on render)"},)j"
+     R"j("ca_certificates":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":16384},"description":"1..8 PEM CERTIFICATE blocks of one CA"},)j"
+     R"j("crl_urls":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"type":"string","maxLength":2048,"description":"An http or https CRL URL: a host, no userinfo, no fragment, ASCII only (an internationalised host as punycode)"},"confirmed_address_classes":{"type":"array","maxItems":5,"items":{"type":"string","enum":["public","private","carrier-grade-nat","unique-local","non-global"]},"description":"The address classes the host resolves to, which you confirm the server may fetch from"}},"required":["url"],"additionalProperties":false},"description":"1..8 CRL URLs, each with the address classes you confirm"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
+     R"j(},"required":["name","ca_certificates","crl_urls"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"ca_subject_name_sha256":{"type":"string","description":"SHA-256 of the CA subject Name DER, hex: one source per CA"},"config_version":{"type":"integer","description":"Pass back as expected_config_version on update_revocation_source"},"created_by":{"type":"string"},"created_at":{"type":"string","description":"RFC 3339 UTC time"},"updated_at":{"type":"string","description":"RFC 3339 UTC time"},"held_crl_count":{"type":"integer","minimum":0},"crl_status":{"type":"string","enum":["no_crl_fetched","crl_held"]},"high_water":{"type":"object","properties":{"reset_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null until the first reset, never cleared"},"pinned_crl_sha256":{"type":["string","null"]}},"required":["reset_at","pinned_crl_sha256"]},"ca_certificates":{"type":"array","items":{"type":"object","properties":{"cert_sha256":{"type":"string","description":"SHA-256 of the certificate DER, hex"},"ski":{"type":["string","null"],"description":"Subject key identifier, hex; null when the certificate has none"},"spki_sha256":{"type":"string","description":"SHA-256 of the SubjectPublicKeyInfo DER, hex"}},"required":["cert_sha256","ski","spki_sha256"]}},"crl_urls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"confirmed_address_classes":{"type":"array","items":{"type":"string"},"description":"The address classes the administrator confirmed at registration"},"fetch_status":{"type":"object","properties":{"state":{"type":"string","enum":["never_fetched","ok","failing"],"description":"never_fetched until the CRL fetcher (a later release) has made an attempt"},"last_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first attempt"},"last_success_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first success"},"last_failure_cause":{"type":["string","null"],"description":"The cause of the last failed attempt; null when the last attempt succeeded or none was made"},"consecutive_failures":{"type":"integer","minimum":0},"next_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null when no attempt is scheduled"}},"required":["state","last_attempt_at","last_success_at","last_failure_cause","consecutive_failures","next_attempt_at"]}},"required":["id","url","host","confirmed_address_classes","fetch_status"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["id","name","ca_subject_name_sha256","config_version","created_by","created_at","updated_at","held_crl_count","crl_status","high_water","ca_certificates","crl_urls"]})j"},
+
+    {"update_revocation_source",
+     "Replace a registered CRL source's name, CA certificates and CRL URLs (a full replace, the "
+     "same body as register_revocation_source plus the source id). This is how a renewed CA key "
+     "is added. The CA certificates must name the same subject as the registered source. "
+     "Dropping a URL deletes that URL's fetch status and every held CRL fetched from it; "
+     "dropping a key deletes every held CRL that verified only under it (destructive to that "
+     "held data; nothing is held in this release). The CA's anti-rollback marks are never "
+     "touched. expected_config_version is REQUIRED: pass the config_version you read with "
+     "get_revocation_source; if the source has changed since, the call is refused as a "
+     "non-retryable conflict (invalid_params, naming the current version) and nothing is "
+     "replaced, so an approved call cannot silently revert a newer configuration. Idempotent: a "
+     "body equal to the current configuration changes nothing and does "
+     "not bump config_version (changed false). The host of every URL is resolved again and the "
+     "same address rules and confirmations apply. Requires RevocationSource:Write AND a durable "
+     "Administrator role, the supervised MCP tier (approval-gated) and is denied outright to a "
+     "service-scoped token and to an MCP-tier-less caller. Resolves the registered hosts. "
+     "Audited as crypto.revocation_source.update (an attempted row first). Scope: facts only; the only "
+     "built-in checks are D13's named rules and windows, each shown with its criterion. Mirrors "
+     "PUT /api/v1/crypto/revocation-sources/{id}.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"integer","minimum":1,"description":"The source id"},)j"
+     R"j("expected_config_version":{"type":"integer","minimum":1,"description":"The source's config_version as you last read it (get_revocation_source). Refused with a conflict if the source has changed since, so an approved call cannot revert a newer configuration"},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"A label for the source (free text, escaped on render)"},)j"
+     R"j("ca_certificates":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":16384},"description":"1..8 PEM CERTIFICATE blocks of one CA, naming the same subject as the registered source"},)j"
+     R"j("crl_urls":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"type":"string","maxLength":2048,"description":"An http or https CRL URL: a host, no userinfo, no fragment, ASCII only (an internationalised host as punycode)"},"confirmed_address_classes":{"type":"array","maxItems":5,"items":{"type":"string","enum":["public","private","carrier-grade-nat","unique-local","non-global"]},"description":"The address classes the host resolves to, which you confirm the server may fetch from"}},"required":["url"],"additionalProperties":false},"description":"1..8 CRL URLs, each with the address classes you confirm"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
+     R"j(},"required":["id","expected_config_version","name","ca_certificates","crl_urls"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"ca_subject_name_sha256":{"type":"string","description":"SHA-256 of the CA subject Name DER, hex: one source per CA"},"config_version":{"type":"integer","description":"Pass back as expected_config_version on update_revocation_source"},"created_by":{"type":"string"},"created_at":{"type":"string","description":"RFC 3339 UTC time"},"updated_at":{"type":"string","description":"RFC 3339 UTC time"},"held_crl_count":{"type":"integer","minimum":0},"crl_status":{"type":"string","enum":["no_crl_fetched","crl_held"]},"high_water":{"type":"object","properties":{"reset_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null until the first reset, never cleared"},"pinned_crl_sha256":{"type":["string","null"]}},"required":["reset_at","pinned_crl_sha256"]},"ca_certificates":{"type":"array","items":{"type":"object","properties":{"cert_sha256":{"type":"string","description":"SHA-256 of the certificate DER, hex"},"ski":{"type":["string","null"],"description":"Subject key identifier, hex; null when the certificate has none"},"spki_sha256":{"type":"string","description":"SHA-256 of the SubjectPublicKeyInfo DER, hex"}},"required":["cert_sha256","ski","spki_sha256"]}},"crl_urls":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"url":{"type":"string"},"host":{"type":"string"},"confirmed_address_classes":{"type":"array","items":{"type":"string"},"description":"The address classes the administrator confirmed at registration"},"fetch_status":{"type":"object","properties":{"state":{"type":"string","enum":["never_fetched","ok","failing"],"description":"never_fetched until the CRL fetcher (a later release) has made an attempt"},"last_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first attempt"},"last_success_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null before the first success"},"last_failure_cause":{"type":["string","null"],"description":"The cause of the last failed attempt; null when the last attempt succeeded or none was made"},"consecutive_failures":{"type":"integer","minimum":0},"next_attempt_at":{"type":["string","null"],"description":"RFC 3339 UTC time; null when no attempt is scheduled"}},"required":["state","last_attempt_at","last_success_at","last_failure_cause","consecutive_failures","next_attempt_at"]}},"required":["id","url","host","confirmed_address_classes","fetch_status"]}},"changed":{"type":"boolean","description":"False when the body equalled the stored source (config_version unchanged)"},"dropped_urls":{"type":"integer","minimum":0},"dropped_ca_certificates":{"type":"integer","minimum":0},"crls_deleted":{"type":"integer","minimum":0},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["id","name","ca_subject_name_sha256","config_version","created_by","created_at","updated_at","held_crl_count","crl_status","high_water","ca_certificates","crl_urls","changed","dropped_urls","dropped_ca_certificates","crls_deleted"]})j"},
+
+    {"remove_revocation_source",
+     "Remove a registered CRL source with its URLs, held CRLs, entries and signature checks. "
+     "Certificates the source covered then read 'issuer not registered'. The CA's anti-rollback "
+     "marks SURVIVE, so removing and re-registering the CA cannot accept an older CRL. Removal "
+     "is a Write (there is no separate Delete). Idempotent: a repeat has no further effect and "
+     "answers a non-retryable invalid_params error (no such revocation source). Requires RevocationSource:Write AND a durable "
+     "Administrator role, the supervised MCP tier (approval-gated) and is denied outright to a "
+     "service-scoped token and to an MCP-tier-less caller. Audited as "
+     "crypto.revocation_source.remove (an attempted row first). Scope: facts only; the only built-in "
+     "checks are D13's named rules and windows, each shown with its criterion. Mirrors DELETE "
+     "/api/v1/crypto/revocation-sources/{id}.",
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer","description":"The removed source id"},"removed":{"type":"boolean","const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["id","removed"]})j"},
+
+    {"reset_revocation_source_high_water",
+     "Reset a registered CA's CRL anti-rollback marks and discard its held CRLs. Use it ONLY "
+     "after confirming the CA's clock or CRL numbering moved backwards on purpose: until the next "
+     "CRL is accepted the CA's certificates read 'revocation not checked', and the reset opens a "
+     "replay window, because a CRL that verifies and is dated at or after the reset is accepted "
+     "whatever its number. reset_at (RFC 3339 UTC, optional, no later than the server clock; "
+     "default now) sets the floor: a value below the CA's current thisUpdate widens that window "
+     "to everything since it. The response echoes the window opened. NOT idempotent: each call "
+     "sets a new reset_at and deletes the held CRLs again, so a repeat after a CRL was accepted "
+     "discards it. After a reset whose outcome is unknown, read get_revocation_source: "
+     "high_water.reset_at shows the floor in force. Optional pin_crl_sha256 (64 hex) names the "
+     "only first CRL to accept afterwards; the reset also clears each scope's CRL number and "
+     "thisUpdate and bumps config_version. Requires RevocationSource:Write AND a durable Administrator role, the "
+     "supervised MCP tier (approval-gated) and is denied outright to a service-scoped token and "
+     "to an MCP-tier-less caller. Audited as crypto.revocation_source.reset_high_water (an "
+     "attempted row first, carrying the reset_at you supplied). Scope: facts only; the only built-in "
+     "checks are D13's named rules and windows, each shown with its criterion. Mirrors POST "
+     "/api/v1/crypto/revocation-sources/{id}/reset-high-water.",
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},"reset_at":{"type":"string","maxLength":40,"description":"Optional RFC 3339 UTC time from 1970 on, no later than the server clock"},)j"
+     R"j("pin_crl_sha256":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$","description":"Optional SHA-256 of the one CRL to accept first afterwards"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"reset_at":{"type":"string","description":"The floor now in force, RFC 3339 UTC time"},"crls_deleted":{"type":"integer","minimum":0},"replay_window_opens_at":{"type":"string","description":"RFC 3339 UTC time: a CRL that verifies and is dated at or after it is accepted again, whatever its number"},"pinned":{"type":"boolean","description":"A first-CRL pin was recorded"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["reset_at","crls_deleted","replay_window_opens_at","pinned"]})j"},
 };
+#undef YUZU_MCP_RESULT_SET_ROW_PROPS
+#undef YUZU_MCP_RESULT_SET_ROW_REQUIRED
 
 static_assert(software_catalogue::kCursorMaxBytes == mcp::kMcpCursorMaxLen,
               "the catalogue cursor bound must equal the MCP cursor input bound");
@@ -4836,6 +5069,9 @@ static const char* const kWriteToolsRaw[] = {
     // #2146 batch B - execution cancel/rerun records (Execution:Execute). Neither sends anything
     // to a device.
     "cancel_execution", "record_execution_rerun",
+    // ADR-0070 R1 (slice 2b-1a) — RevocationSource:Write (register, replace, remove, reset).
+    "register_revocation_source", "update_revocation_source", "remove_revocation_source",
+    "reset_revocation_source_high_water",
 };
 
 // The lookup set is DERIVED by catalogue() (merged with the registry records'
@@ -5383,6 +5619,20 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"create_software_deployment", {"SoftwareDeployment", "Execute"}},
     {"rollback_software_deployment", {"SoftwareDeployment", "Execute"}},
     {"cancel_software_deployment", {"SoftwareDeployment", "Execute"}},
+
+    // ADR-0070 R1: registered CRL sources. The pair drives the generic C8 tier / approval gate
+    // (`requires_approval` carries RevocationSource:Write, so a supervised token needs a
+    // ticket); the handler then requires the RevocationSource grant (perm_fn) AND the
+    // durable-administrator predicate, because the surface is admin-only in BOTH RBAC states
+    // and so not grantable, and a DENY on the grant must hold on MCP as it does on REST.
+    // No ServiceScopeClass: a service-scoped token is denied outright (the default) - the
+    // registry is fleet-wide with no per-service slice.
+    {"list_revocation_sources", {"RevocationSource", "Read"}},
+    {"get_revocation_source", {"RevocationSource", "Read"}},
+    {"register_revocation_source", {"RevocationSource", "Write"}},
+    {"update_revocation_source", {"RevocationSource", "Write"}},
+    {"remove_revocation_source", {"RevocationSource", "Write"}},
+    {"reset_revocation_source_high_water", {"RevocationSource", "Write"}},
 };
 
 // The lookup map is DERIVED by catalogue() (merged with the registry records);
@@ -5496,7 +5746,10 @@ constexpr std::string_view kRbacSecurables[] = {
     // REST-only (ADR-1005 twin-existence exception #2102). It is listed so
     // the seeded-catalogues binding test in test_rbac_store.cpp keeps the
     // two mirrors equal.
-    "Decommission"};
+    "Decommission",
+    // ADR-0070 R1: registered CRL sources; mirrors rbac_store.cpp's types[] addition. Seeded to
+    // Administrator only and ALSO behind the administrator predicate.
+    "RevocationSource"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -5728,7 +5981,8 @@ void validate_tool_security_registration(
 // approval-gated; assign_engine_role is approval-gated yet additive). Derive:
 //   readOnlyHint    = (effect == ReadOnly)
 //   destructiveHint = (effect == Destructive)   // meaningful only when !readOnly
-//   openWorldHint   = false                     // closed managed fleet, always
+//   openWorldHint   = ToolAnnotation::open_world // false (closed managed fleet) unless the entry says
+//                                                // it resolves an administrator-registered host
 // `idempotent` is ORTHOGONAL to effect (all four quadrants exist) and is a
 // hand-authored, safe-direction value (when in doubt, false — a false
 // idempotentHint:true invites an unsafe blind retry, a BLOCKING A5 defect).
@@ -5745,6 +5999,9 @@ struct ToolAnnotation {
     ToolEffect effect;
     bool idempotent;
     const char* title;
+    // True only for a tool that itself reaches outside Yuzu's own stores. The default stays
+    // false (closed managed fleet); the cross-check test allows exactly the tools it names.
+    bool open_world = false;
 };
 
 static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
@@ -6044,9 +6301,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"raise_guardian_policy_generation",
      {ToolEffect::Destructive, true, "Raise Guardian policy generation"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
-    // record_attestation: writes a FINAL, irreversible reviewer decision (#4752 — once-only,
-    // no overwrite) → stays Destructive. Do NOT lower it: that would loosen tier gating, a
-    // security decision rather than a side effect of making the write once-only.
+    // record_attestation: the current decision is replaced and a grant can never return to
+    // pending → Destructive. The earlier decision is kept in the grant's history (the read
+    // returns the latest 100 per grant, earlier justifications cut), so this is not a loss of
+    // evidence; the hint stays true because the current state is replaced.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
     // close_access_review: one-way open→closed lifecycle (no reopen path) → Destructive.
     {"close_access_review", {ToolEffect::Destructive, false, "Close access review campaign"}},
@@ -6157,6 +6415,23 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"cancel_execution", {ToolEffect::Destructive, false, "Cancel execution record"}},
     {"record_execution_rerun",
      {ToolEffect::Destructive, false, "Record execution rerun (sends nothing to devices)"}},
+
+    // ADR-0070 R1 (slice 2b-1a). register: Additive, NOT idempotent (a second registration of the
+    // same CA is a 409). update: a full replace - Destructive (dropping a URL or key deletes its
+    // held CRLs) and idempotent (an equal body changes nothing). remove: Destructive, idempotent
+    // (a repeat is a 404 and changes nothing). reset: Destructive and NOT idempotent (each call
+    // sets a new reset_at and discards the held CRLs again). openWorldHint is true ONLY for
+    // register and update: they resolve the administrator-registered host, the only outbound
+    // reach any tool has (no tool fetches a CRL; the refresh job does).
+    {"list_revocation_sources", {ToolEffect::ReadOnly, true, "List registered CRL sources"}},
+    {"get_revocation_source", {ToolEffect::ReadOnly, true, "Show one registered CRL source"}},
+    {"register_revocation_source",
+     {ToolEffect::Additive, false, "Register a CA and its CRL URLs", /*open_world=*/true}},
+    {"update_revocation_source",
+     {ToolEffect::Destructive, true, "Replace a CRL source's keys and URLs", /*open_world=*/true}},
+    {"remove_revocation_source", {ToolEffect::Destructive, true, "Remove a CRL source"}},
+    {"reset_revocation_source_high_water",
+     {ToolEffect::Destructive, false, "Reset a CA's CRL anti-rollback marks"}},
 };
 
 // The registry header spells the PermFn signature out (it must not include the
@@ -6455,7 +6730,7 @@ std::string build_tool_annotations(const char* name) {
         .add("readOnlyHint", a.effect == ToolEffect::ReadOnly)
         .add("destructiveHint", a.effect == ToolEffect::Destructive)
         .add("idempotentHint", a.idempotent)
-        .add("openWorldHint", false)
+        .add("openWorldHint", a.open_world)
         .str();
 }
 
@@ -6615,40 +6890,28 @@ int mcp_error_for_store_msg(const std::string& msg) {
 
 // AccessReviewStore error → JSON-RPC code (mirrors rest_api_v1.cpp's
 // access_review_error_status(), translated into the JSON-RPC vocabulary).
-// The store's documented "not_found: " prefix (access_review_store.hpp —
+// The store's documented "not_found: " prefix (access_review_store.hpp,
 // machine-checkable) means a bad campaign_id, a grant never in the frozen
 // population, or an already-closed campaign: client input, not a server
-// fault, so it maps to kInvalidParams like the REST twin's 404. Any other
-// message is a genuine read/write failure → kInternalError (retryable).
+// fault, so it maps to kInvalidParams like the REST twin's 404. The
+// "bad_request: " prefix (campaign_id shape, an embedded NUL, an oversized
+// justification) is client input the store refused before touching the pool,
+// so it is kInvalidParams too, like the REST twin's 400. The "forbidden: "
+// prefix (the reviewer is the subject of the grant) is kPermissionDenied, like
+// the REST twin's 403. Any other message is a genuine read/write failure ->
+// kInternalError (retryable).
 //
-// Contract pin: same classes as rest_api_v1.cpp's access_review_error_status —
-// self_attestation: -> kPermissionDenied, already_decided: and bad_request: ->
-// kInvalidParams (#4752), not_found: -> kInvalidParams, else kInternalError.
-// Every tool handler above also pre-validates its own required fields
-// (title/decision/campaign_id/principal_type/principal_id/role_name) BEFORE
-// calling into AccessReviewStore, so the store's remaining bare validation
-// strings never actually reach this function today; they would otherwise land
-// in the `else -> kInternalError` arm, which is wrong (client error, not
-// retryable). Callers MUST keep pre-validating; a store error a handler cannot
-// pre-validate gets a `bad_request:` prefix (see
-// AccessReviewStore::record_attestation) and is mapped here and in the matching
-// 400 arm in rest_api_v1.cpp rather than falling through to kInternalError.
+// Contract pin: every tool handler above pre-validates its own required
+// fields (title/decision/campaign_id/principal_type/principal_id/role_name)
+// BEFORE calling into AccessReviewStore, so the store's other
+// input-validation strings never actually reach this function today; an
+// unprefixed one would land in the `else -> kInternalError` arm, which is
+// wrong (client error, not retryable). Callers MUST keep pre-validating, and
+// any new store-side validation error gets the `bad_request:` prefix (the
+// arm below and the matching 400 arm in rest_api_v1.cpp's
+// access_review_error_status already map it).
 int mcp_error_for_access_review_msg(const std::string& msg) {
-    // #4752: a deliberate refusal of an attestation. self_attestation is a
-    // permission problem (the reviewer may not decide their own grant);
-    // already_decided is bad input against the row's current state. Neither is
-    // retryable, so neither may fall into kInternalError.
-    switch (classify_attestation_refusal(msg)) {
-    case AttestationRefusal::SelfAttestation:
-        return kPermissionDenied;
-    case AttestationRefusal::AlreadyDecided:
-        return kInvalidParams;
-    case AttestationRefusal::None:
-        break;
-    }
-    if (is_bad_request_error(msg))
-        return kInvalidParams;
-    return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
+    return access_review_sod::store_error_jsonrpc_code(access_review_sod::classify_store_error(msg));
 }
 
 // B4 (#2146 API-parity) — ManagementGroupStore error → JSON-RPC code + retry
@@ -10588,12 +10851,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 for (const auto& d : device_api->list_devices()) {
                     if (!authz::in_scope(gate.scope, d.agent_id))
                         continue;
-                    arr.add(JObj()
-                                .add("agent_id", d.agent_id)
-                                .add("hostname", d.hostname)
-                                .add("os", d.os)
-                                .add("arch", d.arch)
-                                .add("agent_version", d.agent_version));
+                    JObj row;
+                    row.add("agent_id", d.agent_id)
+                        .add("hostname", d.hostname)
+                        .add("os", d.os)
+                        .add("arch", d.arch)
+                        .add("agent_version", d.agent_version);
+                    // #2240: always present; null = not reported, never "legacy".
+                    if (d.guardian_backend)
+                        row.add("guardian_backend", *d.guardian_backend);
+                    else
+                        row.raw("guardian_backend", "null");
+                    arr.add(row);
                 }
                 // Confinement is reported as a STATUS, never a count of hidden devices
                 // (mcp_tools_hardware.cpp), in both channels so a client reading only
@@ -10811,7 +11080,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
                                 // (in-scope only reaches here)
                     mcp_audit("failure", audit_caller_id(agent_id));
-                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                    // A genuine retryable store fault: carry the hint (A5 item 5) rather
+                    // than an inline exemption. The REST twin carries the same 5 s hint.
+                    res.set_content(a4_error(kInternalError, "Tag store unavailable",
+                                             "retry once the tag store recovers",
+                                             mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -10831,6 +11104,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("os", detail.row.os)
                     .add("arch", detail.row.arch)
                     .add("agent_version", detail.row.agent_version);
+                // #2240: always present; null = not reported, never "legacy".
+                if (detail.row.guardian_backend)
+                    agent_obj.add("guardian_backend", *detail.row.guardian_backend);
+                else
+                    agent_obj.raw("guardian_backend", "null");
                 // ADR-0031 WS-A4 wave 2: DeviceApi always returns a (possibly
                 // empty) tags vector — a null/unwired TagStore at the seam
                 // degrades to empty, not an omitted key (device_api_local.hpp's
@@ -11816,6 +12094,402 @@ McpServer::HandlerFn McpServer::build_handler(
                 reply(swc::catalogue_response_json(page.rows, page.totals, page.kpis, page.next_cursor,
                                                    omit_newest, 0),
                       audit_ok);
+                return;
+            }
+
+            // ── Revocation sources (ADR-0070 R1, slice 2b-1a) ─────────────────────────────
+            // Twins of /api/v1/crypto/revocation-sources, calling the SAME
+            // RevocationSourceService as the REST routes so both transports accept and refuse
+            // the same bodies. Admin-only in BOTH RBAC states and not grantable: the generic
+            // C8 gate has already applied the tier / approval ({"RevocationSource","Write"} is
+            // in requires_approval's supervised list) and refused a service-scoped token, and
+            // rs_admit below is the authorization: the RevocationSource grant (perm_fn) AND the
+            // durable-administrator predicate, the same pair the REST routes require. (The
+            // assign_rbac_role family gates on the predicate INSTEAD OF perm_fn; this surface
+            // does not.) The shared helpers are declared once here; every tool branch below keeps its
+            // own block (the retry-hint gate scans each tool's block).
+            auto rs_fail = [&](const yuzu::server::revocation_source::ServiceError& e) {
+                using RsKind = yuzu::server::revocation_source::ServiceError::Kind;
+                switch (e.kind) {
+                case RsKind::kInvalidParams:
+                    res.set_content(a4_error(kInvalidParams, e.message,
+                                             e.param.empty() ? std::string{}
+                                                             : "fix the parameter " + e.param),
+                                    "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                case RsKind::kNotFound:
+                    res.set_content(a4_error(kInvalidParams, e.message,
+                                             "list the sources with list_revocation_sources"),
+                                    "application/json"); // retry-hint-exempt: unknown id, a retry fails identically
+                    return;
+                case RsKind::kVersionConflict:
+                    res.set_content(a4_error(kInvalidParams, e.message,
+                                             "read the source with get_revocation_source and resend "
+                                             "update_revocation_source with expected_config_version=" +
+                                                 std::to_string(e.existing_id)),
+                                    "application/json"); // retry-hint-exempt: stale version, resending it fails identically
+                    return;
+                case RsKind::kConflict:
+                    res.set_content(a4_error(kInvalidParams, e.message,
+                                             e.existing_id > 0
+                                                 ? "update the existing source with "
+                                                   "update_revocation_source id=" +
+                                                       std::to_string(e.existing_id)
+                                                 : std::string("remove a source first with "
+                                                               "remove_revocation_source")),
+                                    "application/json"); // retry-hint-exempt: conflict, a retry fails identically
+                    return;
+                case RsKind::kOutcomeUnknown:
+                    res.set_content(a4_error(kInternalError, e.message,
+                                             "read the source with get_revocation_source or "
+                                             "list_revocation_sources to see whether the change "
+                                             "was applied",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                case RsKind::kUnavailable:
+                    break;
+                }
+                res.set_content(a4_error(kInternalError, e.message, "retry the request",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+            };
+            // Gate: tier, wiring, the empty-tier refusal for a write (#4309 - such a caller has
+            // neither the REST twin's step-up nor an approval ticket), then the administrator
+            // decision. On refusal the answer is written and the denial audited.
+            auto rs_admit = [&](bool is_write, const std::string& verb,
+                                const std::string& target, bool check_grant = true) -> bool {
+                namespace rs = yuzu::server::revocation_source;
+                if (!tier_allows(tier, "RevocationSource", is_write ? "Write" : "Read")) {
+                    res.set_content(a4_error(kTierDenied, "MCP tier does not allow this operation",
+                                             kTierRemediation),
+                                    "application/json"); // retry-hint-exempt: tier denial
+                    return false;
+                }
+                if (!revocation_source_service_) {
+                    spdlog::error("{}: RevocationSourceService unwired - misconfigured call site; "
+                                  "failing closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json"); // retry-hint-exempt: unwired dependency, lasts until a restart
+                    return false;
+                }
+                if (is_write && session->mcp_tier.empty()) {
+                    (void)audit_fn(req, verb, "denied", rs::kAuditTargetType, target,
+                                   "empty mcp_tier, denied outright (auth_source=" +
+                                       session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 tool_name + " requires an MCP-tier bearer token - an MCP-tier-less "
+                                             "caller has neither the step-up nor an approval "
+                                             "ticket; use the REST twin from an authenticated "
+                                             "browser session",
+                                 "use the equivalent REST v1 route, or mint an MCP bearer token "
+                                 "with an appropriate tier"),
+                        "application/json"); // retry-hint-exempt: permission denial
+                    return false;
+                }
+                // The securable AND the predicate, exactly as the REST routes (a DENY on the
+                // Administrator role's RevocationSource grant is honoured on both transports).
+                // perm_fn writes its own 403 and denial row. Skipped on the post-validation
+                // re-check, which asks only whether the caller is STILL an administrator.
+                if (check_grant && !perm_fn(req, res, "RevocationSource", is_write ? "Write" : "Read"))
+                    return false;
+                const auto decision = rs::decide_admin(*session, auth_db, rbac_store,
+                                                       RbacAdminSurface::kMcp, is_write);
+                if (decision.outcome == rs::AdminDecision::Outcome::kAdmin)
+                    return true;
+                (void)audit_fn(req, verb, "denied", rs::kAuditTargetType, target,
+                               decision.audit_reason);
+                if (decision.outcome == rs::AdminDecision::Outcome::kUnavailable) {
+                    spdlog::warn("{}: {} (user={})", tool_name, decision.audit_reason,
+                                 session->username);
+                    res.set_content(a4_error(kInternalError, decision.message, "retry shortly",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                } else {
+                    res.set_content(a4_error(kPermissionDenied, decision.message),
+                                    "application/json"); // retry-hint-exempt: permission denial
+                }
+                return false;
+            };
+            // The `id` argument: an integer >= 1, removed from `body`. Leaves every other key for
+            // the caller (the service rejects an unknown one). nullopt = the answer is written.
+            auto rs_take_id = [&](nlohmann::json& body) -> std::optional<std::int64_t> {
+                body.erase("approval_id"); // the gate's ticket id, not an argument of the tool
+                const auto it = body.find("id");
+                if (it == body.end() || !it->is_number_integer() ||
+                    (it->is_number_unsigned() ? it->get<std::uint64_t>() > 999999999999999999ULL
+                                              : it->get<std::int64_t>() < 1) ||
+                    it->get<std::int64_t>() < 1) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   "id is required and must be an integer >= 1"),
+                                    "application/json"); // retry-hint-exempt: caller-input rejection
+                    return std::nullopt;
+                }
+                const std::int64_t v = it->get<std::int64_t>();
+                body.erase("id");
+                return v;
+            };
+
+            if (tool_name == "list_revocation_sources") {
+                namespace rs = yuzu::server::revocation_source;
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "list_revocation_sources takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string verb(rs::kAuditList);
+                if (!rs_admit(false, verb, "all"))
+                    return;
+                auto list = revocation_source_service_->list();
+                if (!list) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(list.error()), rs::kAuditTargetType, "all",
+                                   rs::audit_detail_error("", list.error()));
+                    mcp_audit(rs::audit_result_for(list.error()), list.error().message);
+                    rs_fail(list.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, "all",
+                                               rs::audit_detail_list("", list->sources.size()));
+                mcp_audit("success");
+                auto payload = rs::list_json(*list);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_revocation_source") {
+                namespace rs = yuzu::server::revocation_source;
+                nlohmann::json body = args.is_object() ? args : nlohmann::json::object();
+                const auto sid = rs_take_id(body);
+                if (!sid)
+                    return;
+                if (!body.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "get_revocation_source takes only id"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string verb(rs::kAuditView);
+                const std::string target = std::to_string(*sid);
+                if (!rs_admit(false, verb, target))
+                    return;
+                auto src = revocation_source_service_->get(*sid);
+                if (!src) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(src.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", src.error()));
+                    mcp_audit(rs::audit_result_for(src.error()), src.error().message);
+                    rs_fail(src.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,
+                                               rs::audit_detail_view(""));
+                mcp_audit("success");
+                auto payload = rs::source_json(*src);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "register_revocation_source") {
+                namespace rs = yuzu::server::revocation_source;
+                const std::string verb(rs::kAuditRegister);
+                if (!rs_admit(true, verb, "new"))
+                    return;
+                // The approval ticket id is the gate's, not part of the registration body.
+                nlohmann::json reg_body = args;
+                reg_body.erase("approval_id");
+                // Judged before the attempted row: a refused body is never a mutation attempt.
+                auto valid = revocation_source_service_->validate_registration(reg_body);
+                if (!valid) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(valid.error()), rs::kAuditTargetType, "new",
+                                   rs::audit_detail_error("", valid.error()));
+                    mcp_audit(rs::audit_result_for(valid.error()), valid.error().message);
+                    rs_fail(valid.error());
+                    return;
+                }
+                // Validation resolved names (seconds): re-confirm the caller is STILL an
+                // administrator before anything is recorded or committed.
+                if (!rs_admit(true, verb, "new", /*check_grant=*/false))
+                    return;
+                // "No audit row, no mutation" (ADR-0033 section 9), as the REST twin.
+                if (!audit_fn(req, verb, "attempted", rs::kAuditTargetType, "new",
+                              rs::audit_detail_config("", *valid))) {
+                    mcp_audit("failure", "audit unavailable; source not registered");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto made = revocation_source_service_->register_validated(*valid, session->username);
+                if (!made) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(made.error()), rs::kAuditTargetType, "new",
+                                   rs::audit_detail_error("", made.error()));
+                    mcp_audit(rs::audit_result_for(made.error()), made.error().message);
+                    rs_fail(made.error());
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, verb, "success", rs::kAuditTargetType, std::to_string(made->id),
+                             rs::audit_detail_source("", *made));
+                mcp_audit("success");
+                auto payload = rs::source_json(*made);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "update_revocation_source") {
+                namespace rs = yuzu::server::revocation_source;
+                nlohmann::json body = args.is_object() ? args : nlohmann::json::object();
+                const auto sid = rs_take_id(body);
+                if (!sid)
+                    return;
+                const std::string verb(rs::kAuditUpdate);
+                const std::string target = std::to_string(*sid);
+                if (!rs_admit(true, verb, target))
+                    return;
+                auto valid = revocation_source_service_->validate_registration(
+                    body, rs::RevocationSourceService::BodyMode::kUpdate);
+                if (!valid) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(valid.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", valid.error()));
+                    mcp_audit(rs::audit_result_for(valid.error()), valid.error().message);
+                    rs_fail(valid.error());
+                    return;
+                }
+                if (!rs_admit(true, verb, target, /*check_grant=*/false))
+                    return;
+                if (!audit_fn(req, verb, "attempted", rs::kAuditTargetType, target,
+                              rs::audit_detail_config("", *valid))) {
+                    mcp_audit("failure", "audit unavailable; source not changed");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto done = revocation_source_service_->update_validated(*sid, *valid);
+                if (!done) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(done.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", done.error()));
+                    mcp_audit(rs::audit_result_for(done.error()), done.error().message);
+                    rs_fail(done.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,
+                                               rs::audit_detail_update("", *done));
+                mcp_audit("success");
+                auto payload = rs::update_json(*done);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "remove_revocation_source") {
+                namespace rs = yuzu::server::revocation_source;
+                nlohmann::json body = args.is_object() ? args : nlohmann::json::object();
+                const auto sid = rs_take_id(body);
+                if (!sid)
+                    return;
+                if (!body.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "remove_revocation_source takes only id"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string verb(rs::kAuditRemove);
+                const std::string target = std::to_string(*sid);
+                if (!rs_admit(true, verb, target))
+                    return;
+                if (!audit_fn(req, verb, "attempted", rs::kAuditTargetType, target, "cid=none")) {
+                    mcp_audit("failure", "audit unavailable; source not removed");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto removed = revocation_source_service_->remove(*sid);
+                if (!removed) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(removed.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", removed.error()));
+                    mcp_audit(rs::audit_result_for(removed.error()), removed.error().message);
+                    rs_fail(removed.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,
+                                               "cid=none removed=true");
+                mcp_audit("success");
+                nlohmann::json payload{{"id", *sid}, {"removed", true}};
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "reset_revocation_source_high_water") {
+                namespace rs = yuzu::server::revocation_source;
+                nlohmann::json body = args.is_object() ? args : nlohmann::json::object();
+                const auto sid = rs_take_id(body);
+                if (!sid)
+                    return;
+                const std::string verb(rs::kAuditResetHighWater);
+                const std::string target = std::to_string(*sid);
+                if (!rs_admit(true, verb, target))
+                    return;
+                // Judged before the attempted row, like register and update.
+                if (const auto bad = revocation_source_service_->validate_reset(body); !bad) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(bad.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", bad.error()));
+                    mcp_audit(rs::audit_result_for(bad.error()), bad.error().message);
+                    rs_fail(bad.error());
+                    return;
+                }
+                // Re-admitted after validation, like register and update (and the REST twin).
+                if (!rs_admit(true, verb, target, /*check_grant=*/false))
+                    return;
+                if (!audit_fn(req, verb, "attempted", rs::kAuditTargetType, target,
+                              rs::audit_detail_reset("", body))) {
+                    mcp_audit("failure", "audit unavailable; marks not reset");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto done = revocation_source_service_->reset_high_water(*sid, body);
+                if (!done) {
+                    (void)audit_fn(req, verb, rs::audit_result_for(done.error()), rs::kAuditTargetType, target,
+                                   rs::audit_detail_error("", done.error()));
+                    mcp_audit(rs::audit_result_for(done.error()), done.error().message);
+                    rs_fail(done.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,
+                                               rs::audit_detail_reset_result("", *done));
+                mcp_audit("success");
+                auto payload = rs::reset_json(*done);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -15778,6 +16452,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Roll-up is the only Echo store: a query over a raw capture table answers
+                // with no rows, so the set would silently be empty (REST twin refuses too).
+                if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                        "application/json");
+                    return;
+                }
                 // #4353 follow-up (Gate 2 finding on #4364): this tool IS
                 // approval-gated at supervised tier (Execution:Execute is in
                 // requires_approval()'s list), but an operator-tier call
@@ -15966,6 +16649,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const auto& def = **def_result;
+                // Same refusal as create_result_set_from_echo_query, on the caller's params.sql,
+                // else the definition's declared default (the text the dashboard submits for a
+                // canned query; a default is never injected at dispatch, so a dispatch without
+                // sql is answered with an error by the agent and counted in agents_failed): a
+                // set that reevaluate_result_set would refuse is not created either.
+                if (def.plugin == "echo" && def.action == "sql" &&
+                    yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
+                        args.value("params", nlohmann::json::object()), def.parameter_schema)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                        "application/json");
+                    return;
+                }
                 std::unordered_map<std::string, std::string> params;
                 if (args.contains("params") && args["params"].is_object())
                     for (auto& [k, v] : args["params"].items())
@@ -16171,6 +16868,16 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
+                    // A set stored over a raw capture table would re-run to an empty
+                    // membership with no error: refuse it, nothing is dispatched.
+                    if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
+                        res.set_content(
+                            error_response(
+                                id, kInvalidParams,
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
+                            "application/json");
+                        return;
+                    }
                     std::unordered_map<std::string, std::string> params{{"sql", sql}};
                     rs_run_async("echo", "sql", params, source_kind::kEchoQuery, orig->source_payload,
                                 orig->matcher, synth, reeval_name);
@@ -16259,6 +16966,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(id, kInvalidParams,
                                            "RESULT_SET_BAD_REQUEST: original instruction unavailable"),
+                            "application/json");
+                        return;
+                    }
+                    // Same refusal as the echo_query branch, on the stored params.sql, else the
+                    // definition's declared default (never injected at dispatch; see the
+                    // create tool).
+                    if (def->plugin == "echo" && def->action == "sql" &&
+                        yuzu::server::rs_matcher::instruction_reads_raw_capture_table(
+                            sp.value("params", nlohmann::json::object()),
+                            def->parameter_schema)) {
+                        res.set_content(
+                            error_response(
+                                id, kInvalidParams,
+                                std::string(yuzu::server::rs_matcher::kStaleSourceMessage)),
                             "application/json");
                         return;
                     }
@@ -30196,6 +30917,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Enforced here, not by the input schema: its maxLength is discovery metadata only
+                // (the schema validator runs just for approval-gated tools).
+                if (title.size() > kCampaignTitleMaxLen) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignTitleTooLongMessage),
+                                    "application/json");
+                    return;
+                }
+                if (title.find('\0') != std::string::npos) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignTitleNulMessage),
+                                    "application/json");
+                    return;
+                }
                 auto rows_res = build_access_review(auth_db, rbac_store, engine_principal_store_,
                                                     engine_credential_store_, directory_sync);
                 if (!rows_res) {
@@ -30225,7 +30958,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::string snapshot =
                         JObj()
                             .add("display_name", r.display_name)
-                            .add("owner_or_email", r.owner_or_email)
+                            .add(kSnapshotOwnerKey, r.owner_or_email)
                             .add("effective_permission_count", r.effective_permission_count)
                             .add("last_activity_ms", r.last_activity_ms)
                             .add("last_activity_kind", r.last_activity_kind)
@@ -30301,44 +31034,114 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
+                                    "application/json");
+                    return;
+                }
                 if (decision != "attested" && decision != "flagged_revoke") {
                     res.set_content(
                         a4_error(kInvalidParams, "decision must be attested or flagged_revoke"),
                         "application/json");
                     return;
                 }
+                // A present justification that is not a string is refused, not read as "" (the
+                // REST twin does the same): the entry is append-only. Absent and null both mean
+                // no justification.
+                if (args.is_object() && args.contains("justification") &&
+                    !args["justification"].is_null() && !args["justification"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, kJustificationTypeMessage),
+                                    "application/json");
+                    return;
+                }
+                // Bound the grant tuple BEFORE the gate (the REST twin does the same): the gate's
+                // refusal rows and the failure row embed it, so an unbounded or NUL-bearing id
+                // would write a forged, oversized audit row per call. The schema's maxLength is
+                // discovery metadata only; this is the enforcement.
+                if (!attest_grant_fields_within_bounds(principal_type, principal_id, role_name)) {
+                    res.set_content(a4_error(kInvalidParams, kGrantFieldInvalidMessage),
+                                    "application/json");
+                    return;
+                }
+                // decision selects the audit verb so the two outcomes are
+                // separately countable evidence, matching the REST twin exactly. Every
+                // row of this verb has one shape: target_id = the campaign alone, the
+                // grant tuple in the detail (access_review_attest_gate.hpp).
+                const std::string audit_action =
+                    access_review_sod::attest_audit_action(decision);
+                const std::string tuple_detail =
+                    access_review_sod::attest_tuple_detail(principal_type, principal_id,
+                                                           role_name);
+                // One refusal path for the gate's verdict and for the store's in-write
+                // `forbidden:` backstop. The domain row is written first, then the
+                // `mcp.<tool>` wrapper row; either failing to persist is surfaced as
+                // audit_persisted:false (MCP has no response-header channel) and the
+                // refusal stands.
+                auto refuse = [&](const access_review_sod::SodVerdict& verdict) {
+                    const auto refusal = access_review_sod::sod_refusal_for(verdict.outcome);
+                    const bool domain_ok = access_review_sod::audit_and_count_refusal(
+                        audit_fn, req, metrics, access_review_sod::AttestSurface::kMcp, verdict,
+                        audit_action, campaign_id, tuple_detail);
+                    const bool wrapper_ok = mcp_audit(
+                        std::string(refusal.audit_result),
+                        access_review_sod::sod_refusal_detail(verdict, refusal, {}));
+                    res.set_content(
+                        a4_error(refusal.jsonrpc_code, refusal.message, refusal.remediation,
+                                 static_cast<long>(refusal.retry_after_ms.value_or(-1)), {},
+                                 domain_ok && wrapper_ok),
+                        "application/json");
+                };
+                // The LAST call before the store (see the REST twin): the reviewer must
+                // differ from the subject of the grant; engine-owner and group-member are a
+                // pre-read outside the store's transaction (documented window).
+                const auto verdict = access_review_sod::evaluate_attestation_sod(
+                    session->username, principal_type, principal_id, engine_principal_store_,
+                    rbac_store);
+                if (verdict.outcome != access_review_sod::SodOutcome::kPass) {
+                    refuse(verdict);
+                    return;
+                }
                 auto rec_res = access_review_store->record_attestation(
                     campaign_id, principal_type, principal_id, role_name, decision,
                     session->username, justification);
-                // decision selects the audit verb so the two outcomes are
-                // separately countable evidence, matching the REST twin exactly.
-                const std::string audit_action = decision == "flagged_revoke"
-                                                     ? "access_review.flagged"
-                                                     : "access_review.attested";
                 if (!rec_res) {
-                    // #4752: a deliberate refusal is audited `denied` with a
-                    // stable token (matches the REST twin); other errors keep
-                    // `failure`.
-                    const auto refusal = classify_attestation_refusal(rec_res.error());
-                    const bool refused = refusal != AttestationRefusal::None;
-                    const bool denied_audit_ok =
-                        refused ? audit_fn(req, audit_action, "denied", "AccessReview",
-                                           campaign_id + ":" + principal_type + ":" +
-                                               principal_id + ":" + role_name,
-                                           attestation_refusal_token(refusal))
-                                : audit_fn(req, audit_action, "failure", "AccessReview",
-                                           // bad_request: an identifier (possibly this very
-                                           // campaign_id) was NUL-bearing or over-long, so the
-                                           // row carries a fixed empty target, not the bytes.
-                                           is_bad_request_error(rec_res.error()) ? std::string{}
-                                                                                 : campaign_id,
-                                           rec_res.error());
-                    mcp_audit(refused ? "denied" : "failure",
-                              refused ? std::string(attestation_refusal_token(refusal))
-                                      : rec_res.error());
+                    if (const auto sod =
+                            access_review_sod::sod_from_store_error(rec_res.error())) {
+                        refuse({*sod, {}});
+                        return;
+                    }
+                    if (access_review_sod::classify_store_error(rec_res.error()) ==
+                        access_review_sod::StoreErrorClass::kTransient) {
+                        // A fault that is not the caller's (see the REST twin): the raw text goes
+                        // to the log, the caller gets a fixed message and a retry hint, and both
+                        // audit rows carry the fixed message, never the raw error.
+                        access_review_sod::log_store_failure(campaign_id, "mcp", rec_res.error());
+                        const bool failure_audit_ok = yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, audit_action, "failure", "AccessReview", campaign_id,
+                            access_review_sod::store_failure_audit_detail(tuple_detail));
+                        const bool wrapper_ok = mcp_audit(
+                            "failure", std::string(access_review_sod::kStoreFailureMessage));
+                        res.set_content(
+                            a4_error(kInternalError, access_review_sod::kStoreFailureMessage,
+                                     access_review_sod::kStoreFailureRemediation,
+                                     static_cast<long>(access_review_sod::kStoreFailureRetryMs),
+                                     {}, failure_audit_ok && wrapper_ok),
+                            "application/json");
+                        return;
+                    }
+                    const bool denied_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, audit_action, "failure", "AccessReview", campaign_id,
+                        flatten_audit_text(rec_res.error()) + tuple_detail);
+                    mcp_audit("failure", rec_res.error());
+                    // The cap refusal goes out without the store's `bad_request: ` classification
+                    // prefix; every other store refusal keeps the text it has always had.
+                    const std::string wire_text{
+                        decision_cap_wire_message(rec_res.error()).value_or(rec_res.error())};
                     res.set_content(
                         error_response(id, mcp_error_for_access_review_msg(rec_res.error()),
-                                       rec_res.error(),
+                                       wire_text,
                                        denied_audit_ok
                                            ? std::string_view{}
                                            : std::string_view{R"({"audit_persisted":false})"}),
@@ -30351,12 +31154,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 // on this path (flag != revoke). Acting on the flag is a separate,
                 // explicit RBAC/EnginePrincipal write an operator performs after
                 // reading this evidence.
-                const bool audit_ok = audit_fn(
-                    req, audit_action, "success", "AccessReview",
-                    campaign_id + ":" + principal_type + ":" + principal_id + ":" + role_name,
-                    "decision=" + decision);
+                //
+                // Set-and-proceed: the decision and its history row are already
+                // committed, so the audit row is secondary evidence and never a gate. A
+                // throwing audit callback is caught inside try_persist_audit.
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, audit_action, "success", "AccessReview", campaign_id,
+                    access_review_sod::attest_success_detail(decision, rec_res->previous_decision,
+                                                             rec_res->seq, tuple_detail));
                 JObj payload;
-                payload.add("recorded", true);
+                payload.add("recorded", true)
+                    .add("decision_seq", static_cast<int64_t>(rec_res->seq))
+                    .add("previous_decision", rec_res->previous_decision);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success", campaign_id);
@@ -30389,7 +31198,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto view_res = access_review_store->get_campaign(campaign_id);
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
+                                    "application/json");
+                    return;
+                }
+                // Same read as GET /api/v1/access-reviews/{id}: the grant's history.
+                auto view_res = access_review_store->get_campaign(campaign_id, /*include_history=*/true);
                 if (!view_res) {
                     mcp_audit("failure", view_res.error());
                     const int code = mcp_error_for_access_review_msg(view_res.error());
@@ -30416,6 +31233,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // grant_snapshot is raw-embedded, not escaped: this store's only
                     // writer (open_access_review/POST /api/v1/access-reviews) always
                     // freezes it as a JObj().str() JSON object.
+                    // Oldest first; previous_decision "" is "not recorded", never "pending".
+                    JArr history;
+                    for (const auto& h : a.history)
+                        history.add(JObj()
+                                        .add("seq", h.seq)
+                                        .add("decision", h.decision)
+                                        .add("previous_decision", h.previous_decision)
+                                        .add("reviewer", h.reviewer)
+                                        .add("justification", h.justification)
+                                        .add("justification_truncated", h.justification_truncated)
+                                        .add("decided_at_ms", h.decided_at_ms));
                     attestations.add(
                         JObj()
                             .add("principal_type", a.principal_type)
@@ -30426,7 +31254,9 @@ McpServer::HandlerFn McpServer::build_handler(
                             .add("decided_at_ms", a.decided_at_ms)
                             .add("justification", a.justification)
                             .raw("grant_snapshot",
-                                 a.grant_snapshot.empty() ? "null" : a.grant_snapshot));
+                                 a.grant_snapshot.empty() ? "null" : a.grant_snapshot)
+                            .add("decision_seq", a.decision_seq)
+                            .raw("history", history.str()));
                 }
                 (void)audit_fn(req, "access_review.get", "success", "AccessReview", campaign_id, "");
                 JObj payload;
@@ -30560,6 +31390,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto campaign_id = param_str(args, "campaign_id");
                 if (campaign_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "campaign_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // The id is checked here, not by the input schema: the schema's pattern is
+                // discovery metadata (the schema validator only runs for approval-gated tools).
+                if (!valid_campaign_id(campaign_id)) {
+                    res.set_content(a4_error(kInvalidParams, kCampaignIdInvalidMessage),
                                     "application/json");
                     return;
                 }
