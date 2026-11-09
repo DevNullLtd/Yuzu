@@ -150,7 +150,8 @@ inline constexpr std::size_t kMaxDigestLayoutDigits = 6;
 /// kind - the one entry point the writer and the read mapping both call, so the kind name and
 /// column count always come from the registry. nullopt when the digest provider fails. Callers
 /// treat nullopt as "cannot verify": the writer aborts the ingest (never stores a section without
-/// its digest by accident), the reader serves the section as a mismatch.
+/// its digest by accident), the reader serves the section `constrained` with
+/// `server:content_digest_unverifiable` (a server-side fault, not a mismatch).
 /// `digest` is the provider (#7163): production callers take the default (`sha256_hex`); a test
 /// passes a failing one to reach the provider-failure branches.
 [[nodiscard]] inline std::optional<std::string>

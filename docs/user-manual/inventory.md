@@ -1509,11 +1509,14 @@ sync, defeating the hash-skip protocol.
   means this **server** could not compute the digest to compare (its digest provider failed, an
   OpenSSL fault): the section is served `constrained` and incomplete with the rows that were read,
   which are not known to be wrong. It is a fault of the server, not of the device or the stored
-  rows, so no device sync clears it: check the server's OpenSSL and FIPS configuration. None of
-  the tokens is stored: all are worked out each time the record is read, so they never appear in
+  rows, so no device sync clears it. The verdict is recomputed on every read, so a transient
+  provider fault may clear on a later read; a persistent one needs an operator to fix the server's
+  OpenSSL provider or FIPS configuration (for example `openssl list -providers` in the server's
+  environment). None of the tokens is stored: all are worked out each time the record is read, so they never appear in
   the `device_ci_section` query further down. Each served fault is also counted in
   `yuzu_hardware_section_integrity_total` ([Metrics](metrics.md#hardware-record-section-integrity-metric-7159)).
-  Reading the record again does not clear either mismatch token. **Only a full device-record sync
+  Reading the record again does not clear either mismatch token (it may clear
+  `server:content_digest_unverifiable`, see above). **Only a full device-record sync
   repairs either mismatch** (a device whose hardware has not changed sends only a hash on its daily sync,
   which leaves the rows alone): use **Sync now** on the device's Hardware page, or
   `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`. The fleet-wide
@@ -1529,13 +1532,14 @@ sync, defeating the hash-skip protocol.
   non-malicious drift, not tamper resistance: someone who can write the table can rewrite the
   digest. It covers the rows only, not the section's `status` or `reason`. Stored, it carries a
   layout version prefix (`v1:` then the SHA-256). A well-formed digest of a different layout
-  version (for example `v2:` followed by a digest) is treated as unverified, because this server
-  cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
+  version (for example `v2:` followed by a digest) is not compared (left unchecked, no token),
+  because this server cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
   by a colon and a non-empty remainder). Any other stored value that is not the current form (an
   empty or damaged value, `V1:`, a bare hex string, a malformed version) is compared as a
   mismatch and reported as `server:content_digest_mismatch`, so a damaged column cannot let an
   edited section read as complete. Only an absent value (a section stored before migration 3, or
-  a status-only kind) or a well-formed digest of another layout version is unverified. A section
+  a status-only kind) or a well-formed digest of another layout version is left unchecked (no
+  token). A section
   whose row count already disagrees reports the count token alone, and an `unavailable` or
   `permission_denied` section is never compared.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the

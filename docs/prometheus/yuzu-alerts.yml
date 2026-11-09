@@ -6006,8 +6006,7 @@ groups:
         # moves but nothing inventory-specific does (#1675).
         # reason = store_not_open | pool_acquire_timeout | query_error, plus
         # sections_query_error (source=device_ci: the hardware record read answered but its
-        # sections did not), plus
-        # admission_full (source=installed_software or ca_issued): a /crypto read
+        # sections did not) and admission_full (source=installed_software or ca_issued): a /crypto read
         # refused by its per-process in-flight bound BEFORE any store call. The
         # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)
         # reads count here too; ca_issued has its own longer-held alert below. Sustained for 5m
@@ -6035,7 +6034,10 @@ groups:
             fleet vulnerability query ("which devices run <CVE>") reads as degraded,
             NOT "installed nowhere" - do not trust a zero-result inventory answer while
             one of those fires. admission_full is a shed: a refused /crypto read is an
-            error response, never a zero-result answer. A source=installed_software
+            error response, never a zero-result answer. sections_query_error
+            (source=device_ci) means the hardware record read answered but its v2
+            sections did not, so the record route answered 503: check yuzu_pg_* and
+            the DeviceInventoryStore warning in the server log. A source=installed_software
             query_error that fires together with YuzuInventoryCatalogRollupStale or
             YuzuInventoryCatalogRollupFailing is the /crypto live name scan exceeding
             its 5s bound (too many distinct package names): retrying will not help, fix
