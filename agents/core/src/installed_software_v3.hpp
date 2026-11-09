@@ -3,8 +3,8 @@
 /// @file installed_software_v3.hpp
 /// The pure writer for the `installed_software` blob contract v3 (ADR-0016 Updates 2026-11-04
 /// and 2026-11-09): sectioned, one section per source (a plugin action), rows plus a row-hash
-/// delta when the source is FULL, status only when it is degraded. No plugin, no KV, no clock and no I/O, so the
-/// whole writer is unit-tested against the server's golden vectors
+/// delta when the source is FULL, status only when it is degraded. No plugin, no KV, no clock and
+/// no I/O, so the whole writer is unit-tested against the server's golden vectors
 /// (tests/unit/server/test_software_inventory_store.cpp) without a build of the collector.
 ///
 /// The server parser is server/core/src/inventory_blob_v3.hpp and its hash recipes are

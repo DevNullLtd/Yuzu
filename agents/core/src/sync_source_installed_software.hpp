@@ -29,8 +29,9 @@
 /// Every row carries `source` = "<plugin>.<action>" and a non-empty publisher: the declared vendor
 /// when the source has one, else the origin label `via:<ecosystem>` (pkg_inventory is
 /// zero-subprocess, so brew/snap/flatpak rows are `via:brew` etc.). NO per-user data (machine
-/// scope only, a per-user install_location is blanked) and no end-user PII; a package maintainer's
-/// name in a vendor or Maintainer field is third-party metadata (ADR-0016 "PII scope note").
+/// scope only: an install_location is kept only under a known machine root, any other value is
+/// blanked) and no end-user PII; a package maintainer's name in a vendor or Maintainer field is
+/// third-party metadata (ADR-0016 "PII scope note").
 
 #include "sync_scheduler.hpp"
 
