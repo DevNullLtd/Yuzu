@@ -190,9 +190,22 @@ public:
 
     // ── Sync operations ─────────────────────────────────────────────────
 
+    /// What one snapshot apply stored: the user and group counts left after skipped records
+    /// were removed, how many records (or member ids) were skipped, and how many display
+    /// fields had an embedded NUL replaced. These are the figures of THAT apply alone, so a
+    /// caller reporting a sync reports them rather than re-reading the status row or the
+    /// cumulative accessors below.
+    struct ApplyCounts {
+        int users{0};
+        int groups{0};
+        std::uint64_t skipped{0};
+        std::uint64_t sanitized{0};
+    };
+
     /// Sync users and groups from Microsoft Entra ID (Azure AD) via Graph API.
     /// Uses OAuth2 client credentials flow to obtain an access token, then
-    /// fetches /users and /groups from Microsoft Graph.
+    /// fetches /users and /groups from Microsoft Graph. On success returns the counts that
+    /// this sync stored (see `ApplyCounts`).
     ///
     /// ADR-1007: re-entrancy guarded — two concurrent callers racing this
     /// method previously both proceeded (the deleted `mtx_`, see the file
@@ -201,7 +214,17 @@ public:
     /// port). A busy call returns `std::unexpected("sync already in
     /// progress")` immediately rather than queuing or blocking — callers
     /// map this to HTTP 409, not 500 (see `discovery_routes.cpp`).
-    std::expected<void, std::string> sync_entra(const EntraConfig& config);
+    std::expected<ApplyCounts, std::string> sync_entra(const EntraConfig& config);
+
+    /// TEST ONLY: when non-empty, replaces `https://graph.microsoft.com/v1.0` as the base of
+    /// every Graph request `sync_entra` makes, so a local server can stand in for Graph.
+    /// Empty (default) in production.
+    std::string test_hook_graph_base_url_;
+
+    /// TEST ONLY: when set, `sync_entra` takes its access token from this callable instead of
+    /// the OAuth2 token endpoint. Unset (default) in production.
+    std::function<std::expected<std::string, std::string>(const EntraConfig&)>
+        test_hook_acquire_token_;
 
     /// Fires once, synchronously, immediately after `sync_entra` wins the
     /// re-entrancy guard and before any network/store work — TEST ONLY, a
@@ -244,23 +267,26 @@ public:
     /// Get all synced groups.
     std::vector<DirectoryGroup> get_synced_groups() const;
 
-    /// Number of directory records skipped since this object was constructed: a user, or a
-    /// group, with an embedded NUL byte in a key field (id, upn, email), plus each group member
-    /// id carrying one. Postgres text cannot hold a NUL, so such a record is skipped and counted
-    /// instead of aborting the whole snapshot.
+    /// Cumulative metric: number of directory records skipped since this object was constructed,
+    /// across every snapshot apply: a user, or a group, with an embedded NUL byte in a key field
+    /// (id, upn, email), plus each group member id carrying one. Postgres text cannot hold a
+    /// NUL, so such a record is skipped and counted instead of aborting the whole snapshot. Not
+    /// a per-sync figure: the result of `sync_entra` carries those.
     [[nodiscard]] std::uint64_t skipped_records() const noexcept {
         return skipped_records_.load(std::memory_order_relaxed);
     }
 
-    /// Number of display-only fields (user display name, group display name, group description)
-    /// whose embedded NUL bytes were replaced with U+FFFD since this object was constructed. The
-    /// record is kept; only the field text changes.
+    /// Cumulative metric: number of display-only fields (user display name, group display name,
+    /// group description) whose embedded NUL bytes were replaced with U+FFFD since this object
+    /// was constructed. The record is kept; only the field text changes.
     [[nodiscard]] std::uint64_t sanitized_fields() const noexcept {
         return sanitized_fields_.load(std::memory_order_relaxed);
     }
 
-    /// Records skipped by the most recent snapshot apply alone (same definition as
-    /// `skipped_records()`); 0 when that snapshot skipped nothing.
+    /// Records skipped by the most recent snapshot apply on this object (same definition as
+    /// `skipped_records()`); 0 when that snapshot skipped nothing. A process-wide last value:
+    /// overlapping applies overwrite each other, so a report about one sync uses the result
+    /// `sync_entra` returned instead.
     [[nodiscard]] std::uint64_t last_sync_skipped_records() const noexcept {
         return last_sync_skipped_.load(std::memory_order_relaxed);
     }
@@ -323,15 +349,6 @@ private:
         std::unordered_map<std::string, std::vector<std::string>> memberships;
     };
 
-    /// What `apply_entra_sync` actually stored: the user and group counts left after skipped
-    /// records were removed, and how many records were skipped / display fields sanitized.
-    struct ApplyCounts {
-        int users{0};
-        int groups{0};
-        std::uint64_t skipped{0};
-        std::uint64_t sanitized{0};
-    };
-
     /// Applies a fetched `EntraSyncData` snapshot in one short transaction:
     /// deletes any user/group absent from the snapshot, upserts every
     /// user/group the snapshot names (role mapping is NOT stored here — see
@@ -351,8 +368,9 @@ private:
     // Internal: update sync status. Self-contained (acquires its own lease) —
     // called independently of apply_entra_sync at several points in
     // sync_entra (running/failed/completed), never from inside its
-    // transaction.
-    void update_status(const std::string& provider, const std::string& status,
+    // transaction. Returns false when the status row could not be written (closed store, no
+    // connection in time, or a failed statement); the cause is logged here.
+    bool update_status(const std::string& provider, const std::string& status,
                        int user_count = 0, int group_count = 0,
                        const std::string& error = {});
 

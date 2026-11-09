@@ -146,20 +146,20 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                      // The principal comes from the request inside audit_fn; a second auth_fn
                      // call (which can answer 401 after a multi-minute sync) is not needed.
-                     // The counts are what the sync stored (the status row), and `skipped` is
-                     // what that sync left out.
-                     auto status = directory_sync->get_status();
+                     // The counts are the ones this sync applied (carried in its own result),
+                     // and `skipped` is what that sync left out; neither is read back from the
+                     // status row or a process-wide counter.
+                     const auto& applied = *result;
                      (void)detail::emit_behavioral_audit(
                          audit_fn, req, res, "directory.sync", "success", "Directory", "entra",
                          std::format("Entra ID sync completed applied_users={} applied_groups={} "
                                      "skipped={}",
-                                     status.user_count, status.group_count,
-                                     directory_sync->last_sync_skipped_records()));
+                                     applied.users, applied.groups, applied.skipped));
 
                      res.set_content(nlohmann::json({{"status", "completed"},
                                                      {"provider", "entra"},
-                                                     {"user_count", status.user_count},
-                                                     {"group_count", status.group_count}})
+                                                     {"user_count", applied.users},
+                                                     {"group_count", applied.groups}})
                                         .dump(),
                                     "application/json");
                  } else if (provider == "ldap") {

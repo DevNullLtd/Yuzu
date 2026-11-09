@@ -57,6 +57,11 @@ constexpr int kMaxGraphPages = 500;
 // OOM-kill of the shared control-plane process.
 constexpr size_t kMaxTotalMemberships = 5'000'000;
 
+// Start of the error text for a snapshot refused because skipping emptied it; the ending names
+// the kind ("user record was skipped" / "group record was skipped").
+constexpr std::string_view kSnapshotRefusedPrefix =
+    "refusing to apply a snapshot in which every ";
+
 // U+FFFD REPLACEMENT CHARACTER, UTF-8 encoded.
 constexpr std::string_view kReplacementChar = "\xEF\xBF\xBD";
 
@@ -758,7 +763,8 @@ std::expected<void, std::string> DirectorySync::fetch_paginated(
 // see the file header's transaction-shape note (ADR-0012 §2: never hold a
 // lease across external work).
 
-std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& config) {
+std::expected<DirectorySync::ApplyCounts, std::string>
+DirectorySync::sync_entra(const EntraConfig& config) {
     if (config.tenant_id.empty() || config.client_id.empty() || config.client_secret.empty()) {
         return std::unexpected("Entra config incomplete: tenant_id, client_id, and client_secret required");
     }
@@ -784,8 +790,14 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
     update_status("entra", "running");
     spdlog::info("DirectorySync: starting Entra ID sync for tenant {}", config.tenant_id);
 
+    // Base of every Graph request this sync makes; a test points it at a local server.
+    const std::string graph_base =
+        test_hook_graph_base_url_.empty() ? std::string("https://graph.microsoft.com/v1.0")
+                                          : test_hook_graph_base_url_;
+
     // 1. Acquire access token via client credentials flow
-    auto token_result = acquire_token(config);
+    auto token_result = test_hook_acquire_token_ ? test_hook_acquire_token_(config)
+                                                 : acquire_token(config);
     if (!token_result) {
         auto err = "token acquisition failed: " + token_result.error();
         update_status("entra", "failed", 0, 0, err);
@@ -801,7 +813,8 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
     // (see its own doc comment) — a tenant with more than one page of users
     // must never be silently treated as "that's everyone".
     {
-        std::string users_url = "https://graph.microsoft.com/v1.0/users"
+        std::string users_url = graph_base +
+                                "/users"
                                 "?$select=id,displayName,mail,userPrincipalName,accountEnabled"
                                 "&$top=999";
 
@@ -837,7 +850,8 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
     // nextLink (a fetch problem this sync should abort on, leaving the store
     // untouched).
     {
-        std::string groups_url = "https://graph.microsoft.com/v1.0/groups"
+        std::string groups_url = graph_base +
+                                 "/groups"
                                  "?$select=id,displayName,description"
                                  "&$top=999";
 
@@ -876,8 +890,7 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
         // usable id to request its members with.
         if (g.id.find('\0') != std::string::npos)
             continue;
-        std::string members_url = "https://graph.microsoft.com/v1.0/groups/" +
-                                  g.id + "/members?$select=id&$top=999";
+        std::string members_url = graph_base + "/groups/" + g.id + "/members?$select=id&$top=999";
 
         auto& bucket = data.memberships[g.id];
         auto result = fetch_paginated(members_url, access_token,
@@ -915,24 +928,35 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
     const int fetched_groups = static_cast<int>(data.groups.size());
     auto apply_result = apply_entra_sync(std::move(data));
     if (!apply_result) {
-        auto err = "applying sync result failed: " + apply_result.error();
-        update_status("entra", "failed", fetched_users, fetched_groups, err);
+        // A refusal (a snapshot that skipping emptied) is recorded as its own text; any other
+        // failure names the step.
+        auto err = apply_result.error().starts_with(kSnapshotRefusedPrefix)
+                       ? apply_result.error()
+                       : "applying sync result failed: " + apply_result.error();
+        (void)update_status("entra", "failed", fetched_users, fetched_groups, err);
         spdlog::error("DirectorySync: {}", err);
         return std::unexpected(err);
     }
 
     // The status row reports what was stored. A sync that skipped records or sanitized fields
-    // still completes; the note says so on the row.
-    const auto& applied = *apply_result;
+    // still completes; the note says so on the row. The counts come from this apply's own
+    // result, never from a cumulative counter, so overlapping syncs cannot mix them.
+    const ApplyCounts applied = *apply_result;
     std::string note;
     if (applied.skipped != 0 || applied.sanitized != 0) {
         note = std::format("{} record(s) skipped, {} field(s) sanitized (embedded NUL)",
                            applied.skipped, applied.sanitized);
     }
-    update_status("entra", "completed", applied.users, applied.groups, note);
+    if (!update_status("entra", "completed", applied.users, applied.groups, note)) {
+        // The snapshot is stored; only its status row is stale. The caller still receives the
+        // counts this sync applied.
+        spdlog::warn("DirectorySync: Entra sync stored {} users and {} groups but the status row "
+                     "could not be updated",
+                     applied.users, applied.groups);
+    }
     spdlog::info("DirectorySync: Entra sync completed: {} users, {} groups", applied.users,
                  applied.groups);
-    return {};
+    return applied;
 }
 
 std::expected<DirectorySync::ApplyCounts, std::string>
@@ -985,19 +1009,27 @@ DirectorySync::apply_entra_sync(EntraSyncData data) {
         skipped_records_.fetch_add(skipped, std::memory_order_relaxed);
     if (sanitized != 0)
         sanitized_fields_.fetch_add(sanitized, std::memory_order_relaxed);
+
+    // Refuse a snapshot that skipping emptied: applying it would delete every stored row of
+    // that kind. A tenant that really has zero users (or groups) arrives with none, which is
+    // applied; only a non-empty snapshot reduced to nothing is refused, before any write.
+    if (incoming_users > 0 && data.users.empty()) {
+        spdlog::warn("DirectorySync: refusing a snapshot: all {} user record(s) were skipped "
+                     "for an embedded NUL byte",
+                     incoming_users);
+        return std::unexpected(std::string(kSnapshotRefusedPrefix) + "user record was skipped");
+    }
+    if (incoming_groups > 0 && data.groups.empty()) {
+        spdlog::warn("DirectorySync: refusing a snapshot: all {} group record(s) were skipped "
+                     "for an embedded NUL byte",
+                     incoming_groups);
+        return std::unexpected(std::string(kSnapshotRefusedPrefix) + "group record was skipped");
+    }
     if (skipped != 0 || sanitized != 0) {
         spdlog::warn("DirectorySync: skipped {} directory record(s) and sanitized {} field(s) "
                      "with an embedded NUL byte; the rest of the snapshot is applied",
                      skipped, sanitized);
     }
-
-    // Refuse a snapshot that skipping emptied: applying it would delete every stored row of
-    // that kind. A tenant that really has zero users (or groups) arrives with none, which is
-    // applied; only a non-empty snapshot reduced to nothing is refused, before any write.
-    if (incoming_users > 0 && data.users.empty())
-        return std::unexpected("refusing to apply a snapshot in which every users record was skipped");
-    if (incoming_groups > 0 && data.groups.empty())
-        return std::unexpected("refusing to apply a snapshot in which every groups record was skipped");
 
     // Filter membership pairs to users present in THIS snapshot. Graph's
     // /groups/{id}/members can return non-user directoryObjects (devices,
@@ -1315,15 +1347,15 @@ std::expected<SyncStatus, DirectoryReadError> DirectorySync::get_status_checked(
 
 // ── Sync status (internal) ──────────────────────────────────────────────────
 
-void DirectorySync::update_status(const std::string& provider, const std::string& status,
+bool DirectorySync::update_status(const std::string& provider, const std::string& status,
                                   int user_count, int group_count,
                                   const std::string& error) {
     if (!open_)
-        return;
+        return false;
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease) {
         spdlog::error("DirectorySync::update_status: could not acquire a connection");
-        return;
+        return false;
     }
 
     // The error text can embed identity-provider strings; a NUL in it must not stop the status
@@ -1345,7 +1377,9 @@ void DirectorySync::update_status(const std::string& provider, const std::string
     if (!r.ok()) {
         spdlog::error("DirectorySync::update_status: query failed: {}",
                       PQresultErrorMessage(r.get()));
+        return false;
     }
+    return true;
 }
 
 // ── Group-to-role mapping ────────────────────────────────────────────────────
