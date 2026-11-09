@@ -482,7 +482,7 @@ Decision numbers are stable, since other documents cite them.
     transaction, so a decommissioned agent stops counting in `errored_rules` and `uncertain_rules`. Its
     read securable is `GuaranteedState:Read`, which makes it the second `GuaranteedState`-governed member
     after `AppPerfDailyStore`. The Guardian event log and DEX observations are NOT erased by this
-    decommission and expire by retention; widening the erasure to them is a separate follow-up that needs an
+    decommission; they are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire). Widening the erasure to them is a separate follow-up, not yet filed, that needs an
     ADR-0038 Update. The "five per-agent stores" list in Decisions 9 and 11 is left as written; it is history.
     A still-running agent re-creates its census row on its next census-bearing event, so stop the agent first.)*
     There is **no row-level erasure API**, a stated gap. The cascade's

@@ -261,25 +261,28 @@ a decommissioned agent's, is now retired by the agent decommission cascade, whic
 `GuaranteedStateStore::delete_agent` as its ninth store (public key `guaranteed_state`). In one
 transaction it locks the agent's pending events in `ingest_seq` order, sets `projection_pending` false on exactly those
 rows (the step `delete_rule` takes for a rule), then deletes the agent's `guardian_agent_rule_status`
-rows. That is the census writers' own lock order (pending events, then the census row), so it adds no
-lock and no cycle. The method is not a rule mutation: no policy-generation bump, no hook and no push.
+rows. That is the census writers' own lock order for the event rows (pending events, then the census
+row), so it adds no new lock and event-row waits are acyclic. The census-row deletes of two overlapping
+transactions can in principle deadlock; Postgres then aborts one, the caller sees a failure and the
+re-issue is idempotent. The method is not a rule mutation: no policy-generation bump, no hook and no push.
 The second class, a first delivery whose projection failed while its rule was being deleted, is
 unchanged.
 
 Owner ruling D1, 2026-11-08: the decommission does NOT erase `guaranteed_state_events` or
 `guardian_observations`. The event log stays an immutable audit-style log and time-based expiry stays
 its single retention mechanism; the retired pending rows expire on that clock like any other event
-(and with `guardian_event_retention_days` at 0 or below nothing expires, so those rows are kept for
-good). The DEX observations are behavioural data, so retention expiry, not the decommission, is the
+(30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire, so
+those rows are kept for good). The DEX observations are behavioural data, so retention expiry, not the decommission, is the
 erasure position for them. Widening the decommission to erase the events or the DEX observations is a
 follow-up that needs its own Update to this ADR and the store header; it is not made here and the
 follow-up issue is not yet filed.
 
-Known gap, shared with `delete_rule` (#6829): a pending event committed after `delete_agent` read the
+Known gap (tracker #7147; `delete_rule` documents the same list-read gap, #6829): a pending event committed after `delete_agent` read the
 agent's pending list but before it deleted the census rows is not retired by that transaction. A later
 pending event for a decommissioned agent likewise stays pending and is exempt from the events reaper
-until a rule delete or a later decommission retires it. A still-running agent re-creates its census
-row on its next census-bearing event, and a journal replay cannot rebuild the census from retired
+until something retires it (a rule delete, a later decommission, a redelivery repair, or a later
+verdict that out-ranks it). A still-running agent re-creates its census row only at its next
+census-bearing state change (not on a schedule), and a journal replay cannot rebuild the census from retired
 evidence (the retained events are redelivered with no repair), so the agent is stopped first.
 
 ## Follow-ups

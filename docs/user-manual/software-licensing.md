@@ -195,7 +195,7 @@ enabling the SLE sources — deny-override wins).
   detected-licence, app-usage, presence, fleet-certificate and Guardian compliance-census rows).
   For the Guardian store, `deleted` means the device's census rows were erased and its pending
   census evidence retired; the Guardian event log and DEX observations are not erased by the
-  decommission and expire by retention. Because it erases well beyond licences, it is gated on a
+  decommission. They are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire). Because it erases well beyond licences, it is gated on a
   single dedicated securable, **`Decommission:Delete`**, scoped to the device (ADR-0024 Decision 9,
   amended Wave 7 PR7.2; see [RBAC](rbac.md)). Administrator and ITServiceOwner hold it by default; a custom
   role that only holds the old per-store `Delete` grants is refused. It is

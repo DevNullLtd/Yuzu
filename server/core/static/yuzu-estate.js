@@ -200,9 +200,10 @@
           'This erases the device from nine stores: inventory, installed software, device ' +
             'configuration, application performance, detected licences, application usage, the ' +
             'endpoint presence row, fleet certificates and Guardian compliance results. ' +
-            'Guardian event history and DEX observations are kept until they expire. It ' +
-            'cannot be undone.',
-          'It does not unenrol the device; a connected agent will report again. Tags, custom ' +
+            'Guardian event history and DEX observations are kept until retention expires (30 ' +
+            'days by default). It cannot be undone.',
+          'It does not unenrol the device; a connected agent will report again, but Guardian ' +
+            'compliance results return only when the device next changes state. Tags, custom ' +
             'properties, quarantine records and property schemas are not removed.'
         ],
         fields: [],
