@@ -3824,6 +3824,19 @@ fs::path make_healthy_echo_db(const fs::path& dir) {
     return db;
 }
 
+// True only when `ec` says this account may not create a symbolic link (POSIX: EPERM/EACCES;
+// Windows: ERROR_PRIVILEGE_NOT_HELD, which MSVC's std::filesystem reports as the raw Win32 code in
+// the system category, so the value is compared and no errc mapping is relied on). Any other
+// failure, `file_exists` above all, is a defect in the test's set-up and must fail the case, not
+// skip it.
+bool symlink_unavailable(const std::error_code& ec) {
+#ifdef _WIN32
+    return ec.value() == ERROR_PRIVILEGE_NOT_HELD;
+#else
+    return ec == std::errc::operation_not_permitted || ec == std::errc::permission_denied;
+#endif
+}
+
 } // namespace
 
 // #7286. echo.db is WAL-mode, so a plain BEGIN IMMEDIATE writer would NOT block a reader and this
@@ -4012,18 +4025,51 @@ TEST_CASE("EchoDatabase: a link planted after a quarantine is refused before the
         spit_file(target, "target bytes");
         const fs::path link{db.string() + suffix};
         std::error_code planted;
+        bool fired = false;
         OpenSeams seams;
-        seams.after_quarantine = [&] { fs::create_symlink(target, link, planted); };
+        seams.after_quarantine = [&] {
+            fired = true;
+            fs::create_symlink(target, link, planted);
+        };
 
         auto refused = EchoDatabase::open(db, seams);
-        if (planted)
-            SKIP("cannot create a symlink here: " << planted.message());
+        REQUIRE(fired); // a seam that never ran would leave every check below vacuous
+        if (planted) {
+            // Only a missing privilege skips. `file_exists` is what a seam moved before the
+            // quarantine would hit (the name still exists), and it must fail the case.
+            if (symlink_unavailable(planted))
+                SKIP("cannot create a symlink here: " << planted.message());
+            FAIL("create_symlink failed for another reason: " << planted.message());
+        }
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().find("symbolic link or reparse point") != std::string::npos);
         CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").size() == 1); // the quarantine stood
         CHECK(fs::is_symlink(link));                                        // not replaced
         CHECK(slurp_file(target) == "target bytes");                        // never opened through
     }
+}
+
+// The recheck after a quarantine names the sqlite rc that ended it, so an operator can tell a file
+// that is corrupt again (26, SQLITE_NOTADB) from a busy or unreadable one. A non-database written
+// into the freed name by the seam makes the reopened file fail the check with a known rc.
+TEST_CASE("EchoDatabase: a file that still fails integrity_check after a quarantine is refused with its rc (#1527)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_recheck_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    spit_file(db, "this is not a SQLite database");
+    bool fired = false;
+    OpenSeams seams;
+    seams.after_quarantine = [&] {
+        fired = true;
+        spit_file(db, "still not a database");
+    };
+
+    auto refused = EchoDatabase::open(db, seams);
+    REQUIRE(fired);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("still fails integrity_check (sqlite rc 26)") != std::string::npos);
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").size() == 1);
 }
 
 #ifndef _WIN32
@@ -4050,6 +4096,93 @@ TEST_CASE("sqlite: SQLITE_OPEN_NOFOLLOW refuses a symlink at the database name (
                                    nullptr);
     CHECK(rc == SQLITE_CANTOPEN);
     CHECK_FALSE(fs::exists(target)); // nothing was created through the link
+}
+
+// #1527. What the case above does not reach: that open() itself passes SQLITE_OPEN_NOFOLLOW on its
+// own sqlite3_open_v2 calls. The name check fires first, so a link planted before it is refused by
+// the check, not by the flag. `before_sqlite_open` runs after the last check and right before the
+// open, which is the window the flag closes; each case swaps echo.db for a link there. Drop the
+// flag from the main open and the first one creates the link's target through it; drop it from
+// the read-only query connection and the second one opens a non-database through the link.
+TEST_CASE("EchoDatabase: a link swapped in at echo.db right before SQLite opens it is refused (#1527)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    for (const bool read_only_open : {false, true}) {
+        INFO("read_only_open=" << read_only_open);
+        yuzu::test::TempDir dir{"yuzu_test_echo_swap_"};
+        const auto db = make_healthy_echo_db(dir.path);
+        const fs::path target = dir.path / "elsewhere.db";
+        // A dangling target is enough for the main open (SQLite would CREATE it through a followed
+        // link). The read-only open needs a real file: a dangling one fails READONLY with or
+        // without the flag and would not tell the two apart.
+        if (read_only_open)
+            spit_file(target, "target bytes");
+        // Call 1 is the main open; with no quarantine, call 2 is the read-only query connection.
+        const int swap_at = read_only_open ? 2 : 1;
+        int calls = 0;
+        bool fired = false;
+        std::error_code planted;
+        OpenSeams seams;
+        seams.before_sqlite_open = [&] {
+            if (++calls != swap_at)
+                return;
+            fired = true;
+            std::error_code removed;
+            fs::remove(db, removed);
+            fs::create_symlink(target, db, planted);
+        };
+
+        auto opened = EchoDatabase::open(db, seams);
+        REQUIRE(fired);
+        if (planted) {
+            if (symlink_unavailable(planted))
+                SKIP("cannot create a symlink here: " << planted.message());
+            FAIL("create_symlink failed for another reason: " << planted.message());
+        }
+        CHECK(fs::is_symlink(db)); // not replaced
+        if (!read_only_open) {
+            REQUIRE_FALSE(opened.has_value());
+            CHECK(opened.error().find("failed to open echo.db") != std::string::npos);
+            CHECK_FALSE(fs::exists(target)); // nothing was created through the link
+            CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+        } else {
+            // The main connection is already open, so the agent runs; only the sandboxed query
+            // connection is refused (fail closed), and the link's target is never read.
+            REQUIRE(opened.has_value());
+            auto query = opened->execute_user_query("SELECT 1", 1);
+            REQUIRE_FALSE(query.has_value());
+            CHECK(query.error() == "query engine unavailable");
+            CHECK(slurp_file(target) == "target bytes");
+        }
+    }
+}
+
+// #1527. A data directory that itself sits behind a link is legitimate (macOS's /var is one, and so
+// is a symlinked /var/lib): open() resolves the directory once, so only a link at the database name
+// trips the no-follow flag. macOS pins this incidentally through its temp directory; on Linux /tmp
+// is not a link, so this case is what keeps the canonicalisation from being reverted unnoticed.
+TEST_CASE("EchoDatabase: a data directory behind a symlink opens and reopens (#1527)",
+          "[echo][store][lifecycle][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_linkeddir_"};
+    const fs::path real = dir.path / "real";
+    const fs::path linked = dir.path / "linked";
+    REQUIRE(fs::create_directories(real));
+    std::error_code ec;
+    fs::create_directory_symlink(real, linked, ec);
+    if (ec) {
+        if (symlink_unavailable(ec))
+            SKIP("cannot create a symlink here: " << ec.message());
+        FAIL("create_directory_symlink failed for another reason: " << ec.message());
+    }
+
+    {
+        auto first = EchoDatabase::open(linked / "echo.db");
+        REQUIRE(first.has_value());
+        REQUIRE(first->set_config("via_link", "1"));
+    }
+    CHECK(fs::exists(real / "echo.db"));
+    auto second = EchoDatabase::open(linked / "echo.db");
+    REQUIRE(second.has_value());
+    CHECK(second->get_config("via_link", "") == "1");
 }
 
 // #6366. A non-empty -wal beside a corrupt echo.db is evidence. A second connection keeps the WAL
@@ -4350,6 +4483,61 @@ TEST_CASE("adopt_legacy_echo_db: an owner-verified echo.db with a foreign sideca
 }
 
 #ifdef _WIN32
+// adv-S2. A sidecar that cannot be renamed is COPIED into the quarantine set, and a copy takes the
+// directory's inherited ACL (here an inheritable BUILTIN\Users read ACE, as C:\ProgramData has),
+// which would leave a corrupt database's WAL readable by every local user while the live files are
+// protected. open() protects the copy again. Each sidecar is held open without FILE_SHARE_DELETE,
+// as a scanner or a backup agent holds one, so the rename and the removal of the original both
+// fail and the copy fallback runs: the seam shows it, because the originals are still there once
+// the quarantine is done. The holders share READ and WRITE, so SQLite's own opens are unaffected,
+// and the seam releases them so the stale originals can go with the fresh database. The journal's
+// first byte is zero (not hot, so SQLite leaves it for the quarantine to deal with).
+TEST_CASE("EchoDatabase (Windows): a quarantined sidecar that had to be copied is protected again",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    AclDir d;
+    spit_file(d.db, "this is not a SQLite database");
+    const std::string wal_bytes = "a wal with content";
+    const std::string journal_bytes = std::string(1, '\0') + "journal bytes";
+    spit_file(d.file("-wal"), wal_bytes);
+    spit_file(d.file("-journal"), journal_bytes);
+
+    std::vector<std::unique_ptr<void, decltype(&::CloseHandle)>> holders;
+    for (const char* sfx : {"-wal", "-journal"}) {
+        HANDLE raw = ::CreateFileW(d.file(sfx).c_str(), GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL, nullptr);
+        REQUIRE(raw != INVALID_HANDLE_VALUE);
+        holders.emplace_back(raw, ::CloseHandle);
+    }
+
+    bool fired = false;
+    OpenSeams seams;
+    seams.after_quarantine = [&] {
+        fired = true;
+        CHECK(fs::exists(d.file("-wal")));     // not renamed, not removed: copied
+        CHECK(fs::exists(d.file("-journal")));
+        holders.clear();
+    };
+    auto opened = EchoDatabase::open(d.db, seams);
+    REQUIRE(fired);
+    CHECK(opened.has_value());
+
+    const auto names = names_with_prefix(d.dir.path, "echo.db.corrupt-");
+    struct Sidecar {
+        std::string suffix;
+        std::string bytes;
+    };
+    for (const Sidecar& sc : {Sidecar{"-wal", wal_bytes}, Sidecar{"-journal", journal_bytes}}) {
+        INFO("sidecar " << sc.suffix);
+        const auto it = std::ranges::find_if(
+            names, [&](const std::string& n) { return n.ends_with(sc.suffix); });
+        REQUIRE(it != names.end());
+        const fs::path copied = d.dir.path / *it;
+        CHECK(slurp_file(copied) == sc.bytes);
+        assert_owner_only(copied); // protected, and no Users ACE inherited from the directory
+    }
+}
+
 // The real probe (default_echo_owner_probe, the owner test open() applies), not a fake: a file
 // owned by Users is foreign and moves; a file we created is ours and stays. SeRestorePrivilege is
 // needed to hand the plant to another owner, so the case SKIPs without it (as the open() cases do).

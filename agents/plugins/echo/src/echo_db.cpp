@@ -437,13 +437,18 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 // judge the directory ENTRY, and SQLite's Windows VFS ignores SQLITE_OPEN_NOFOLLOW (CreateFileW
 // follows a reparse point), so a link swapped into the entry between the last check and SQLite's
 // own CreateFileW is followed. SQLite opens by path, so binding the check to the handle is a VFS
-// redesign, not taken here. What bounds it: the swap needs write access to the state directory,
-// which the packaged install grants to SYSTEM, Administrators and the agent account only
-// (scripts/install-agent-user.ps1), and a file symlink needs SeCreateSymbolicLinkPrivilege or
-// Developer Mode; an account with that access can already write echo.db itself. The POSIX
-// opens are closed by SQLite's own O_NOFOLLOW (SQLITE_OPEN_NOFOLLOW). Lock-out: a later run under
-// a different non-admin account
-// cannot open echo.db. An account switch is not undone by `icacls /reset` (it rewrites the DACL,
+// redesign, not taken here. What bounds it, from this code (the DIRECTORY is not restricted
+// here, or by the packaged install, beyond what ProgramData grants by inheritance; see
+// docs/agent-privilege-model.md): (i) a planter can only use a FREE name, since a local user holds
+// no DELETE on the four protected files and no delete-child right on the directory; (ii) an
+// entry found at a free name is examined as the planter's own (refuse_linked_db_files, and the
+// owner test above through FILE_FLAG_OPEN_REPARSE_POINT) and refused or re-created; (iii) a file
+// symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode; (iv) the one free-name window
+// that nothing examines before an open is SQLite's own delete-and-recreate of echo.db-wal on a
+// 0-page database (the first open of a fresh file and the reopen after a quarantine), which only
+// the end-of-open pass catches afterwards. The POSIX opens are closed by SQLite's own O_NOFOLLOW
+// (SQLITE_OPEN_NOFOLLOW). Lock-out: a later run under a different non-admin account cannot open
+// echo.db. An account switch is not undone by `icacls /reset` (it rewrites the DACL,
 // never the owner): the open fails until the new account holds an ACE for the files (the open
 // asks FILE_READ_ATTRIBUTES, which owning a file does not grant) and, when the former owner is
 // neither SYSTEM nor Administrators, until it owns them too, since the owner test refuses them
@@ -656,6 +661,47 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
         }
     }
     return std::nullopt;
+}
+
+// A sidecar that quarantine_corrupt_db could not rename was COPIED into the quarantine set
+// (agents/shared/sqlite_quarantine.hpp), and a copy is created with the directory's inherited ACL,
+// which can let Users read a corrupt database's WAL (process, network and registry capture) while
+// the live files are protected. Re-apply the protected DACL to each sidecar that exists beside the
+// quarantined file, by handle and without following a link, exactly as secure_echo_db_files does
+// for the live names. A renamed sidecar keeps its DACL, so for it this repeats what it has. Not
+// secure_echo_db_files itself: its OPEN_ALWAYS would create empty sidecars beside the evidence.
+// Best effort and logged, the same availability-over-confidentiality posture as the live files.
+void secure_quarantined_sidecars(const std::filesystem::path& quarantined,
+                                 const EchoDbDacl& dacl) {
+    if (!dacl.ok())
+        return; // open() warned once, when it built the DACL
+    constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    constexpr SECURITY_INFORMATION kDaclInfo =
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
+        std::filesystem::path file = quarantined;
+        file += suffix;
+        HANDLE raw = ::CreateFileW(file.c_str(), READ_CONTROL | WRITE_DAC, kShareAll, nullptr,
+                                   OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (raw == INVALID_HANDLE_VALUE) {
+            const DWORD err = ::GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+                spdlog::warn("EchoDatabase: could not open quarantined {} to secure it (error {}); "
+                             "it keeps its current ACL",
+                             yuzu::win::from_wide(file.c_str()), err);
+            }
+            continue; // no such sidecar in this quarantine set
+        }
+        const HandlePtr h{raw, ::CloseHandle};
+        if (const DWORD rc = ::SetSecurityInfo(h.get(), SE_FILE_OBJECT, kDaclInfo, nullptr, nullptr,
+                                               dacl.acl(), nullptr);
+            rc != ERROR_SUCCESS) {
+            spdlog::warn("EchoDatabase: could not apply the owner-only DACL to quarantined {} "
+                         "(error {}); it keeps its current ACL",
+                         yuzu::win::from_wide(file.c_str()), rc);
+        }
+    }
 }
 #endif // _WIN32
 
@@ -871,6 +917,8 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // SQLite returns a handle even when the open fails; the guard closes it either way.
     DbGuard guard;
     const auto open_main = [&]() -> std::expected<void, std::string> {
+        if (seams.before_sqlite_open)
+            seams.before_sqlite_open(); // the link-swap test's fault point
         sqlite3* opened = nullptr;
         const int orc = sqlite3_open_v2(open_name.c_str(), &opened,
                                         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
@@ -934,6 +982,10 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         spdlog::error("ECHO: echo.db failed PRAGMA integrity_check (echo.db.corruption_detected) — "
                       "quarantined to {} and re-initialising a fresh database",
                       quarantined->string());
+#ifdef _WIN32
+        // A sidecar that had to be copied (not renamed) took the directory's ACL: protect it again.
+        secure_quarantined_sidecars(*quarantined, dacl);
+#endif
         if (seams.after_quarantine)
             seams.after_quarantine(); // the link-swap test's fault point
         // The quarantine left the names free for a moment: a link planted at one of them now
@@ -1488,6 +1540,8 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // can't be opened we continue without it; execute_user_query then fails
     // closed.
     {
+        if (seams.before_sqlite_open)
+            seams.before_sqlite_open(); // the link-swap test's fault point
         sqlite3* ro = nullptr;
         int rrc = sqlite3_open_v2(open_name.c_str(), &ro,
                                   SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |

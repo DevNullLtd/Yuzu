@@ -536,6 +536,11 @@ struct OpenSeams {
     /// Called after a corrupt database was quarantined and before the names are checked for a
     /// link again and reopened (the link-swap test's fault point, #1527).
     std::function<void()> after_quarantine;
+    /// Called right before every sqlite3_open_v2 on the database name: the main open, the reopen
+    /// after a quarantine and the read-only query connection. It stands in for a swap made after
+    /// the last name check, which is what SQLITE_OPEN_NOFOLLOW closes (#1527). Production never
+    /// sets it.
+    std::function<void()> before_sqlite_open;
 };
 
 /// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the
