@@ -47653,6 +47653,48 @@ TEST_CASE("MCP execute_instruction_definition: the caller dispatched is the one 
     CHECK(rig.cancelled.empty());
 }
 
+TEST_CASE("MCP execute_instruction_definition: a role demoted inside the execution-row write is seen "
+          "by the re-derived caller: the AdminOrApproval pair is refused, the row cancelled (#7110)",
+          "[mcp][integration][execute][idef][audit][security][7110]") {
+    // The control (no demotion) proves the pair dispatches for an admin; only the demotion differs.
+    for (const bool demote : {false, true}) {
+        DYNAMIC_SECTION((demote ? "demoted inside the write" : "control: still admin")) {
+            McpTestServer ts;
+            Rig rig;
+            rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "gated"); // AdminOrApproval pair
+            // Not idef_start: its `admin` parameter manufactures the bit. This deriver is the
+            // production shape (derive_dispatch_caller): the admin bit is read from the Session it
+            // is handed, so only a handler that re-authenticates after the writes sees a demotion.
+            ts.instr_exec_ports_for_test = rig.ports();
+            ts.caller_fn_for_test = [](const yuzu::server::auth::Session& s) {
+                return yuzu::test::instr_exec::make_caller(
+                    s.username, s.role == yuzu::server::auth::Role::admin);
+            };
+            ts.mock_role = yuzu::server::auth::Role::admin;
+            if (demote)
+                rig.on_create = [&] { ts.mock_role = yuzu::server::auth::Role::user; };
+            ts.start("operator");
+            auto res = ts.call(idef_call({{"definition_id", "d"}}));
+            REQUIRE(res);
+            const auto body = nlohmann::json::parse(res->body);
+            if (!demote) {
+                CHECK_FALSE(body.contains("error"));
+                CHECK(rig.calls.size() == 1);
+                CHECK(rig.cancelled.empty());
+            } else {
+                REQUIRE(body.contains("error"));
+                CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+                CHECK(body["error"]["data"]["reason"] == "approval_required");
+                CHECK(rig.calls.empty());
+                CHECK(rig.rows.size() == 1); // the row exists ...
+                CHECK(rig.cancelled == std::vector<std::string>{"exec-1"}); // ... and is closed
+                CHECK(idef_audited(ts, "requested"));
+                CHECK(idef_audited(ts, "failure"));
+            }
+        }
+    }
+}
+
 TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-std) is -32603 "
           "with NO retry hint and a failure audit row",
           "[mcp][integration][execute][idef][audit][security]") {

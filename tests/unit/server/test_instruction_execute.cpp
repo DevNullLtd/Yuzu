@@ -3045,6 +3045,9 @@ TEST_CASE("instruction execute: a readmit that withdraws (nullopt, or throws = f
     const std::vector<std::pair<const char*, bool Rig::*>> withdrawals = {
         {"readmit nullopt", &Rig::readmit_withdrawn},
         {"readmit throws reads as withdrawn (fail closed)", &Rig::readmit_throws},
+        // The authorizer re-runs for the fresh caller after the rows: a throw there must close them
+        // too, not unwind past a `requested` row and a running execution with no outcome.
+        {"the post-write authorizer throws reads as withdrawn (fail closed)", &Rig::authorize_throws},
     };
     for (const auto& [name, flag] : withdrawals) {
         DYNAMIC_SECTION(name) {

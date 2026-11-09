@@ -715,10 +715,15 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     //     again here. Not re-decided: the chokepoint's own provenance-record write, see
     //     docs/user-manual/rest-api.md 'Refused after the audit row'.
     std::optional<DispatchCaller> readmitted;
+    std::optional<detail::DispatchDenial> denial;
     try {
         readmitted = p.readmit();
-    } catch (...) { // fail closed: a throwing recheck is a withdrawn permission
+        if (readmitted)
+            if (auto decision = p.authorize(*readmitted, def.plugin, def.action); !decision)
+                denial = decision.error();
+    } catch (...) { // fail closed: a throwing recheck (or authorizer) is a withdrawn permission
         readmitted = std::nullopt;
+        denial.reset();
     }
     // Both refusals close the rows alike: a `failure` outcome, the execution cancelled.
     const auto refuse_after_rows = [&](Refusal r, const std::string& detail) {
@@ -735,8 +740,8 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                          "granted again"),
             "reason=permission_revoked definition=" + def_token);
     const DispatchCaller& caller = *readmitted; // the fresh caller is the one dispatched
-    if (auto decision = p.authorize(caller, def.plugin, def.action); !decision) {
-        Refusal r = dispatch_denied_refusal(p, def, decision.error());
+    if (denial) {
+        Refusal r = dispatch_denied_refusal(p, def, *denial);
         const std::string detail = "reason=" + r.reason + " definition=" + def_token;
         return refuse_after_rows(std::move(r), detail);
     }

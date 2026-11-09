@@ -179,6 +179,7 @@ struct Rig {
     std::function<void()> on_create;
     std::set<std::string> denied_securables; // has_permission() answers false for these
     bool authorize_unwired{false};
+    bool authorize_throws{false}; ///< the chokepoint dry run throws (a store fault): a test sets it inside on_create
     bool classify_unwired{false};
 
     struct AuditRow {
@@ -277,6 +278,8 @@ struct Rig {
             p.authorize = [this](const DispatchCaller& caller, std::string_view pl,
                                  std::string_view ac)
                 -> std::expected<CommandCapability, DispatchDenial> {
+                if (authorize_throws)
+                    throw std::runtime_error("authorize: rbac store unavailable");
                 if (force_denial)
                     return std::unexpected(*force_denial);
                 return yuzu::server::detail::classify_and_authorize_dispatch(

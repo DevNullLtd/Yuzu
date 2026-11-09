@@ -21201,17 +21201,23 @@ McpServer::HandlerFn McpServer::build_handler(
                 // core re-reads the definition, and holds that read to it (definition_changed).
                 rq.expected_effect = ticket_bound_effect;
                 // #7110: the post-write recheck (after the `requested` row and the execution row)
-                // re-decides this tool's gate and re-derives the
-                // caller (approval_provenance forced to None, as above). A per-call copy of the
-                // shared ports; `perm_fn` writes a 403 into `res` on refusal, which the rendered
-                // JSON-RPC answer below replaces.
+                // re-decides this tool's gate and re-derives the caller (approval_provenance
+                // forced to None, as above). The credentials resolve again to the same principal
+                // and the caller is derived from THAT resolution: the role and the admin bit are
+                // session snapshots, so deriving from `session` would keep an admin bit a demotion
+                // during the writes has removed (the REST twins re-authenticate the same way). A
+                // per-call copy of the shared ports; `auth_fn` / `perm_fn` write a 401 / 403 into
+                // `res` on refusal, which the rendered JSON-RPC answer below replaces.
                 auto exec_ports = instr_exec_ports_;
                 exec_ports.readmit = [&]() -> std::optional<DispatchCaller> {
+                    const auto fresh = auth_fn(req, res);
+                    if (!fresh || fresh->username != session->username)
+                        return std::nullopt;
                     if (!perm_fn(req, res, "Execution", "Execute") || !caller_fn)
                         return std::nullopt;
-                    auto fresh = caller_fn(*session);
-                    fresh.approval_provenance = yuzu::server::ApprovalProvenance::None;
-                    return fresh;
+                    auto again = caller_fn(*fresh);
+                    again.approval_provenance = yuzu::server::ApprovalProvenance::None;
+                    return again;
                 };
                 const auto out = yuzu::server::instruction_execute::run(
                     rq, exec_ports,

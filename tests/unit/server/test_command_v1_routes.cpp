@@ -109,6 +109,7 @@ struct Rig {
     /// When set, the chokepoint dry run (`authorize_dispatch_fn`) refuses with this denial; a
     /// test sets it inside `on_create` to move the gate between the two runs (#7110).
     std::optional<detail::DispatchDenial> authorize_denial;
+    bool authorize_throws = false; ///< the dry run throws (a store fault); set inside `on_create`
     bool dispatch_throws = false;
     bool dispatch_throws_nonstd = false;
     /// >0: the dispatch runs the REAL arms and the REAL instrumented sink, and send number N
@@ -216,6 +217,8 @@ struct Rig {
         d.authorize_dispatch_fn = [this](const DispatchCaller& caller, std::string_view plugin,
                                          std::string_view action)
             -> std::expected<CommandCapability, detail::DispatchDenial> {
+            if (authorize_throws)
+                throw std::runtime_error("authorize boom");
             if (authorize_denial)
                 return std::unexpected(*authorize_denial);
             return detail::classify_and_authorize_dispatch(
@@ -1398,6 +1401,7 @@ TEST_CASE("command_v1: zero_reach_reply pins the whole status table",
         {ZeroReachCause::RouteUnreadable, 503},       {ZeroReachCause::OsGateUnreadable, 503},
         {ZeroReachCause::Quarantined, 409},           {ZeroReachCause::PluginNotFound, 422},
         {ZeroReachCause::KillSwitchedOs, 403},        {ZeroReachCause::Generic, 503},
+        {ZeroReachCause::Denied, 403},
     };
     for (const auto& e : table) {
         const auto r = cv1::zero_reach_reply(e.cause, "x");
@@ -1487,6 +1491,11 @@ TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the execution-ro
                                                          "Infrastructure", authz::Operation::Write};
          },
          "gate=dispatch dispatch_reason=approval_required", true, {{"Execution:Execute", 2}}},
+        // A recheck that throws (a store fault) is a withdrawn permission, not an escape: the rows the
+        // route wrote are closed and the answer is the typed 403, never an unhandled 500.
+        {"gate=exception: the chokepoint dry run throws after the writes (fail closed)",
+         [](Rig& r) { r.authorize_throws = true; }, "reason=permission_revoked gate=exception", false,
+         {{"Execution:Execute", 2}}},
         // The pair's own securable, decided before and after the writes (a Destructive pair).
         {"gate=securable: the destructive pair's own securable withdrawn inside the write",
          [](Rig& r) { r.perm_denied.insert("Infrastructure:Delete"); },

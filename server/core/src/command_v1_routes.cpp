@@ -402,29 +402,45 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
         // The credentials resolve again to the same principal, and the caller is derived from THAT
         // resolution: the role and the admin bit are session snapshots (a JIT elevation that lapsed
         // during the writes is gone from the fresh one).
-        const auto fresh = d.auth_fn(req, res);
-        if (!fresh || fresh->username != session.username) {
-            revoked("gate=session");
-            return;
+        //
+        // `withdrawn` names the gate that refused; empty = admitted. The rechecks read stores (the
+        // session, the RBAC and management-group views), so one can throw: that is a withdrawn
+        // permission too (the deny-on-degrade mapping of `require_permission`, ADR-0041), refused
+        // here with the failure row and the cancel, never an escape that leaves the `requested`
+        // row and the execution row without an outcome.
+        std::string withdrawn;
+        try {
+            const auto fresh = d.auth_fn(req, res);
+            if (!fresh || fresh->username != session.username) {
+                withdrawn = "gate=session";
+            } else if (!d.perm_fn(req, res, "Execution", "Execute")) {
+                // With RBAC off the dry run admits every human principal, so a JIT elevation
+                // that lapsed during the writes is caught only by the route's own gate.
+                withdrawn = "gate=route";
+            } else if (gate.verdict == DestructiveTargetingVerdict::Targeted && gate.capability &&
+                       !d.perm_fn(req, res, std::string(gate.capability->securable),
+                                  std::string(authz::to_string(gate.capability->operation)))) {
+                withdrawn = "gate=securable";
+            } else {
+                caller = d.derive_caller_fn(*fresh);
+                if (const auto again = d.authorize_dispatch_fn(caller, plugin, action); !again) {
+                    const std::string_view reason = detail::to_string(again.error().reason);
+                    // A chokepoint refusal is counted as the admission dry run counts it.
+                    count_dispatch_denied(d.metrics, reason);
+                    withdrawn = std::string("gate=dispatch dispatch_reason=") + std::string(reason);
+                }
+            }
+        } catch (const std::exception& e) {
+            spdlog::error("POST /api/v1/commands: post-write admission recheck failed: {}",
+                          e.what());
+            withdrawn = "gate=exception";
+        } catch (...) {
+            spdlog::error("POST /api/v1/commands: post-write admission recheck failed: unknown "
+                          "exception");
+            withdrawn = "gate=exception";
         }
-        // With RBAC off the dry run admits every human principal, so a JIT elevation that lapsed
-        // during the writes is caught only by the route's own gate.
-        if (!d.perm_fn(req, res, "Execution", "Execute")) {
-            revoked("gate=route");
-            return;
-        }
-        if (gate.verdict == DestructiveTargetingVerdict::Targeted && gate.capability &&
-            !d.perm_fn(req, res, std::string(gate.capability->securable),
-                       std::string(authz::to_string(gate.capability->operation)))) {
-            revoked("gate=securable");
-            return;
-        }
-        caller = d.derive_caller_fn(*fresh);
-        if (const auto again = d.authorize_dispatch_fn(caller, plugin, action); !again) {
-            const std::string_view reason = detail::to_string(again.error().reason);
-            // A chokepoint refusal is counted as the admission dry run counts it.
-            count_dispatch_denied(d.metrics, reason);
-            revoked(std::string("gate=dispatch dispatch_reason=") + std::string(reason));
+        if (!withdrawn.empty()) {
+            revoked(withdrawn);
             return;
         }
     }

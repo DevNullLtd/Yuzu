@@ -22,6 +22,7 @@
 #include "auth_routes.hpp"
 #include "baseline_store.hpp"
 #include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
+#include "dispatch_denial.hpp"    // #7114: the chokepoint refusal the live stub can return
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
@@ -149,6 +150,10 @@ struct RestGsHarness {
     // response row. live_sent toggles the offline path.
     std::unique_ptr<ResponseStore> resp_store;
     int live_sent{1};
+    /// #7114: when set, the dispatch stub answers as the chokepoint does for a refused pair (sent 0,
+    /// the denial on the outcome); `live_dispatches` counts the dispatches the route made.
+    std::optional<yuzu::server::detail::DispatchDenial> live_denied;
+    int live_dispatches{0};
     std::string last_live_plugin, last_live_action;
     /// #1788: the confinement set the /live handler derived and threaded into
     /// dispatch. The per-device scoped_perm_fn gate remains this route's
@@ -461,9 +466,12 @@ struct RestGsHarness {
                    const std::unordered_map<std::string, std::string>&, const std::string&,
                    const yuzu::server::DispatchCaller& caller)
             -> yuzu::server::ConfinedDispatchOutcome {
+            ++live_dispatches;
             last_live_plugin = plugin;
             last_live_action = action;
             last_live_exec_visible = caller.exec_visible;
+            if (live_denied)
+                return {.command_id = plugin + "-live", .denied = live_denied};
             // Model what the production seam does to the Ids arm rather than
             // ignoring the set the route just derived — otherwise this fake
             // reports a successful dispatch whatever confinement decided, which
@@ -4558,6 +4566,49 @@ TEST_CASE("REST dex/devices/{id}/live: a scoped gate or the caller withdrawn ins
             CHECK(h.audit_log[1].result == "failure");
             CHECK(h.audit_log[1].target_id == "WS-1");
             CHECK(h.audit_log[1].detail.find(w.detail) == 0);
+        }
+    }
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a chokepoint refusal is a dispatch_denied answer, never a "
+          "retryable 'device offline' (#7114)",
+          "[pg][rest][dex][device][live][7114]") {
+    struct Case {
+        const char* name;
+        yuzu::server::detail::DispatchDenialReason reason;
+        int status;
+        const char* token;
+    };
+    using R = yuzu::server::detail::DispatchDenialReason;
+    // The pair comes from the server's own kind table: a permission-class refusal is the caller's
+    // 403, an Unclassified one is a server catalogue fault (500), unlike the 400 a caller-named
+    // pair would get.
+    const Case cases[] = {
+        {"approval_required is a 403", R::ApprovalRequired, 403, "approval_required"},
+        {"forbidden is a 403", R::Forbidden, 403, "forbidden"},
+        {"unclassified is a 500 (server-named pair)", R::Unclassified, 500, "unclassified"},
+    };
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            RestGsHarness h(true, true, true, true, &pool);
+            h.live_denied = yuzu::server::detail::DispatchDenial{c.reason, "Inventory",
+                                                                 yuzu::server::authz::Operation::Read};
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            CHECK(res->status == c.status);
+            const auto j = nlohmann::json::parse(res->body);
+            CHECK(j["error"]["message"].get<std::string>() ==
+                  std::string("dispatch denied: reason=") + c.token);
+            CHECK(res->body.find("offline") == std::string::npos);
+            CHECK(h.live_dispatches == 1); // refused once, never retried or re-sent
+            REQUIRE(h.audit_log.size() == 2);
+            CHECK(h.audit_log[0].result == "requested");
+            CHECK(h.audit_log[1].action == "device.live.uptime");
+            CHECK(h.audit_log[1].result == "failure");
+            CHECK(h.audit_log[1].target_id == "WS-1");
+            CHECK(h.audit_log[1].detail.find(std::string("dispatch_denied reason=") + c.token) == 0);
         }
     }
 }
