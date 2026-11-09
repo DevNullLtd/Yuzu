@@ -320,7 +320,8 @@ const std::vector<pg::PgMigration>& migrations() {
         // Gate 4 UP-3: the original v1 briefly included a sqlite_backfill_source table
         // (for the backfill mechanism retired in full before this store shipped, see
         // ADR-0058's "Backfill — none" section) and had it edited out of v1 in place —
-        // PgMigrationRunner tracks by version number only, so any dev/UAT database that
+        // PgMigrationRunner decided by version number only then (it has recorded a hash
+        // of each applied migration since #7158), so any dev/UAT database that
         // ran a migration during that narrow window keeps the orphan table forever.
         // Harmless (nothing references it) but permanent schema drift; drop it
         // idempotently for the databases that have it, no-op for the ones that don't.
