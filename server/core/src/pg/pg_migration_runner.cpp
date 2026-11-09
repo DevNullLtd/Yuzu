@@ -157,18 +157,27 @@ void log_drift(const std::string& store, int version, const std::string& recorde
                   kDriftDocHeading);
 }
 
-/// UPSERT, never INSERT: a rewound schema_meta re-applies a version over its
-/// old row, and the text that just ran is the authority.
-bool upsert_applied_hash(PGconn* conn, const std::string& store, int version,
-                         const std::string& sha) {
-    PgResult res = exec_params(
-        conn,
-        "INSERT INTO public.yuzu_schema_migrations "
-        "(store, version, sha256, recorded_by, recorded_at) "
-        "VALUES ($1, $2::int, $3, 'apply', extract(epoch FROM now())::bigint) "
-        "ON CONFLICT (store, version) DO UPDATE "
-        "SET sha256 = EXCLUDED.sha256, recorded_by = 'apply', recorded_at = EXCLUDED.recorded_at",
-        std::vector<std::string>{store, std::to_string(version), sha});
+/// Writes one hash row. `first_sight == false` is the apply path: an UPSERT, never
+/// a plain INSERT, because a rewound schema_meta re-applies a version over its old
+/// row and the text that just ran is the authority (`recorded_by = 'apply'`).
+/// `first_sight == true` is trust on first use for a version applied before the
+/// table existed (`'tofu'`): DO NOTHING, so a row another process recorded first
+/// is never overwritten by this one.
+bool record_hash(PGconn* conn, const std::string& store, int version, const std::string& sha,
+                 bool first_sight) {
+    const char* sql = first_sight
+                          ? "INSERT INTO public.yuzu_schema_migrations "
+                            "(store, version, sha256, recorded_by, recorded_at) "
+                            "VALUES ($1, $2::int, $3, 'tofu', extract(epoch FROM now())::bigint) "
+                            "ON CONFLICT (store, version) DO NOTHING"
+                          : "INSERT INTO public.yuzu_schema_migrations "
+                            "(store, version, sha256, recorded_by, recorded_at) "
+                            "VALUES ($1, $2::int, $3, 'apply', extract(epoch FROM now())::bigint) "
+                            "ON CONFLICT (store, version) DO UPDATE "
+                            "SET sha256 = EXCLUDED.sha256, recorded_by = 'apply', "
+                            "recorded_at = EXCLUDED.recorded_at";
+    PgResult res =
+        exec_params(conn, sql, std::vector<std::string>{store, std::to_string(version), sha});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::error("PgMigrationRunner: failed to record the hash of v{} for {}: {}", version,
                       store, PQerrorMessage(conn));
@@ -221,17 +230,8 @@ bool verify_recorded_hashes(PGconn* conn, const std::string& store, int current,
         return true; // another process recorded them first; nothing to write or log
     for (int version : verdict.missing) {
         const std::string* e = find_hash(expected, version);
-        PgResult res = exec_params(
-            conn,
-            "INSERT INTO public.yuzu_schema_migrations (store, version, sha256, recorded_by, "
-            "recorded_at) VALUES ($1, $2::int, $3, 'tofu', extract(epoch FROM now())::bigint) "
-            "ON CONFLICT (store, version) DO NOTHING",
-            std::vector<std::string>{store, std::to_string(version), *e});
-        if (res.status() != PGRES_COMMAND_OK) {
-            spdlog::error("PgMigrationRunner: failed to record the hash of v{} for {}: {}", version,
-                          store, PQerrorMessage(conn));
+        if (!record_hash(conn, store, version, *e, /*first_sight=*/true))
             return false;
-        }
     }
     if (!txn.commit()) {
         spdlog::error("PgMigrationRunner: COMMIT failed recording migration hashes for {}: {}",
@@ -430,8 +430,8 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
             // boot's tables here and refuse spuriously. A migration's tables and its
             // schema_meta row commit in ONE transaction, so a re-read made after the
             // tables are visible cannot miss a committed version: only a version that
-            // is still 0 is the loss/poisoning this guard exists for (ADR-0012 treats a
-            // concurrent first boot as safe).
+            // is still 0 is the loss/poisoning this guard exists for (a concurrent first boot is
+            // meant to be safe: docs/postgres-store-playbook.md).
             const int reread = read_version(conn, store, /*missing_table_ok=*/false);
             if (reread < 0)
                 return false;
@@ -517,10 +517,14 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
             std::vector<VersionHash> rec;
             if (!read_recorded_hashes(conn, store, rec))
                 return false;
-            const std::string* r = find_hash(rec, m.version);
-            const std::string* e = find_hash(expected, m.version);
-            if (r && e && *r != *e) {
-                log_drift(store, m.version, *r, *e);
+            // Compare EVERY version up to the one just adopted, not only m.version: `current`
+            // now skips the later ones above, so a version the winner applied past this one
+            // would otherwise never be compared against our text (two builds sharing v1 and
+            // differing on v2). A `missing` row is left for the next run's first-sight record.
+            const auto verdict = check_recorded_hashes(locked_version, expected, rec);
+            if (!verdict.drifted.empty()) {
+                const int d = verdict.drifted.front();
+                log_drift(store, d, *find_hash(rec, d), *find_hash(expected, d));
                 return false;
             }
             continue; // txn dtor rolls back the empty transaction
@@ -558,7 +562,7 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
         }
 
         if (const std::string* h = find_hash(expected, m.version);
-            !h || !upsert_applied_hash(conn, store, m.version, *h))
+            !h || !record_hash(conn, store, m.version, *h, /*first_sight=*/false))
             return false;
 
         if (!txn.commit()) {

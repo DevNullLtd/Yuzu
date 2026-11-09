@@ -12,10 +12,12 @@
 
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <latch>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using yuzu::server::pg::PgConn;
@@ -403,16 +405,25 @@ TEST_CASE("PgMigrationRunner check_recorded_hashes decision (#7158)", "[pg][migr
     }
 }
 
-TEST_CASE("PgMigrationRunner hashes the exact migration bytes (#7158)", "[pg][migration]") {
-    // Pins the helper and the "exact bytes, no normalisation" decision: this text
-    // has newlines and a trailing newline, and a runner that trimmed or folded
-    // whitespace would hash something else.
-    const auto h = yuzu::server::sha256_hex("CREATE TABLE t (\n  id INT\n);\n");
+TEST_CASE("PgMigrationRunner records the SHA-256 of the exact migration bytes (#7158)",
+          "[pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgConn conn = connect(db.dsn());
+    // Pins the helper AND the runner's "exact bytes, no normalisation" decision: this text
+    // has newlines and a trailing newline, and a runner that trimmed or folded whitespace
+    // would record something else. The literal is the SHA-256 of these bytes.
+    const std::string sql = "CREATE TABLE t (\n  id INT\n);\n";
+    const std::string pinned = "4eab02f428e85198d82945a894e72cee24ecdc1d711ec09795a787c79fa65f03";
+    const auto h = yuzu::server::sha256_hex(sql);
     REQUIRE(h.has_value());
-    CHECK(*h == "4eab02f428e85198d82945a894e72cee24ecdc1d711ec09795a787c79fa65f03");
+    CHECK(*h == pinned);
     const auto trimmed = yuzu::server::sha256_hex("CREATE TABLE t (\n  id INT\n);");
     REQUIRE(trimmed.has_value());
     CHECK(*trimmed != *h);
+
+    REQUIRE(PgMigrationRunner::run(conn.get(), "store_bytes", {{1, sql}}));
+    CHECK(text_scalar(conn.get(), "SELECT sha256 FROM public.yuzu_schema_migrations "
+                                  "WHERE store = 'store_bytes' AND version = 1") == pinned);
 }
 
 TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
@@ -551,6 +562,87 @@ TEST_CASE("PgMigrationRunner records and checks migration hashes (#7158)",
         CHECK(row_count() == 3);
     }
 
+    SECTION("a database ahead of this binary still refuses a version it carries with edited "
+            "text (the downgrade-onto-edited-text sub-case, pinned)") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        const std::vector<PgMigration> older_edited = {
+            {1, t1}, {2, "ALTER TABLE items ADD COLUMN IF NOT EXISTS name_edited TEXT"}};
+        std::string logs;
+        bool ok = true;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::err};
+            ok = PgMigrationRunner::run(conn.get(), "store_h", older_edited);
+            capture.stop();
+            logs = capture.text();
+        }
+        CHECK_FALSE(ok);
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_h") == 3);
+        CHECK(logs.find("recorded migration v2") != std::string::npos);
+    }
+
+    SECTION("the hashes are verified BEFORE a pending higher migration is applied") {
+        // If the verify moved after the apply loop, v3 would be applied and only then
+        // refused: the schema would move under a build that is about to be rejected.
+        const std::vector<PgMigration> two = {{1, t1}, {2, t2}};
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", two));
+        const std::vector<PgMigration> edited_plus_new = {
+            {1, t1}, {2, "ALTER TABLE items ADD COLUMN IF NOT EXISTS name_edited TEXT"}, {3, t3}};
+        CHECK_FALSE(PgMigrationRunner::run(conn.get(), "store_h", edited_plus_new));
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_h") == 2);
+        CHECK(row_count() == 2);
+        CHECK(scalar(conn.get(),
+                     "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+                     "'store_h' AND table_name = 'items' AND column_name = 'note'") == 0);
+    }
+
+    SECTION("a hash write that fails rolls the whole migration back (apply path)") {
+        // Another store creates the table first, so the constraint has something to attach to.
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_seed", {{1, "CREATE TABLE s (id INT)"}}));
+        exec_ok_or_fail(
+            conn.get(),
+            "ALTER TABLE public.yuzu_schema_migrations ADD CONSTRAINT yuzu_test_nowrite "
+            "CHECK (store <> 'store_h')");
+        std::string logs;
+        bool ok = true;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::err};
+            ok = PgMigrationRunner::run(conn.get(), "store_h", v3);
+            capture.stop();
+            logs = capture.text();
+        }
+        exec_ok_or_fail(conn.get(), "ALTER TABLE public.yuzu_schema_migrations DROP CONSTRAINT "
+                                    "yuzu_test_nowrite");
+        CHECK_FALSE(ok);
+        CHECK(logs.find("failed to record the hash of v1 for store_h") != std::string::npos);
+        // Same transaction as the schema_meta bump: nothing applied, nothing recorded.
+        CHECK(PgMigrationRunner::current_version(conn.get(), "store_h") == 0);
+        CHECK(row_count() == 0);
+        CHECK_FALSE(table_exists(conn.get(), "store_h", "items"));
+    }
+
+    SECTION("a first-sight hash write that fails refuses the store and records nothing") {
+        REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
+        exec_ok_or_fail(conn.get(),
+                        "DELETE FROM public.yuzu_schema_migrations WHERE store = 'store_h'");
+        exec_ok_or_fail(
+            conn.get(),
+            "ALTER TABLE public.yuzu_schema_migrations ADD CONSTRAINT yuzu_test_nowrite "
+            "CHECK (store <> 'store_h')");
+        std::string logs;
+        bool ok = true;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::err};
+            ok = PgMigrationRunner::run(conn.get(), "store_h", v3);
+            capture.stop();
+            logs = capture.text();
+        }
+        exec_ok_or_fail(conn.get(), "ALTER TABLE public.yuzu_schema_migrations DROP CONSTRAINT "
+                                    "yuzu_test_nowrite");
+        CHECK_FALSE(ok);
+        CHECK(logs.find("failed to record the hash of v1 for store_h") != std::string::npos);
+        CHECK(row_count() == 0);
+    }
+
     SECTION("an unreadable hash record fails closed") {
         REQUIRE(PgMigrationRunner::run(conn.get(), "store_h", v3));
         exec_ok_or_fail(conn.get(),
@@ -668,5 +760,145 @@ TEST_CASE("PgMigrationRunner hash recording under concurrent runners (#7158)",
             CHECK(x == 1);
         CHECK(rows("store_p") == 3);
         CHECK(rows("store_p", "AND recorded_by = 'tofu'") == 3);
+    }
+
+    SECTION("multi-version vectors sharing v1 and differing on v2: exactly one text wins") {
+        // Probabilistic (the interleaving is not forced); the deterministic twin below pins
+        // the skip-branch race. Here the loser can die at the verify read, in the skip
+        // branch, or at the apply loop's compare, but never return true against the winner.
+        for (int round = 0; round < 5; ++round) {
+            const std::string store = "store_m" + std::to_string(round);
+            const std::string v1 = "CREATE TABLE IF NOT EXISTS items (id INT)";
+            const std::vector<PgMigration> a = {
+                {1, v1}, {2, "ALTER TABLE items ADD COLUMN IF NOT EXISTS a TEXT"}};
+            const std::vector<PgMigration> b = {
+                {1, v1}, {2, "ALTER TABLE items ADD COLUMN IF NOT EXISTS b TEXT"}};
+            const auto r = run_concurrently(db.dsn(), store, {a, b});
+            CHECK(r[0] + r[1] == 1);
+            CHECK(rows(store) == 2);
+        }
+    }
+}
+
+namespace {
+
+/// Holds the per-store advisory lock the runner takes, on a second connection, so a
+/// runner started in a thread blocks at it. Lets a test commit "the other process's"
+/// work in the exact window between the runner's lock-free verify and its locked
+/// re-read, which is otherwise a race nothing can force. No production hook: the lock
+/// key is the runner's documented one (2037545589, hashtext(store)).
+struct HeldStoreLock {
+    PGconn* holder;
+    std::string store;
+
+    HeldStoreLock(PGconn* h, std::string s) : holder(h), store(std::move(s)) {
+        exec_ok_or_fail(holder, "BEGIN");
+        exec_ok_or_fail(holder,
+                        "SELECT pg_advisory_xact_lock(2037545589, hashtext('" + store + "')) ");
+    }
+
+    /// Polls pg_locks until a runner is waiting on this store's lock (bounded: 20 s).
+    bool wait_for_waiter(PGconn* observer) const {
+        const std::string sql =
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted "
+            "AND classid = 2037545589 AND objid::bigint = (hashtext('" +
+            store + "')::bigint & 4294967295)";
+        for (int i = 0; i < 2000; ++i) {
+            if (scalar(observer, sql) >= 1)
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+};
+
+} // namespace
+
+TEST_CASE("PgMigrationRunner concurrent-winner branch compares every adopted version (#7158)",
+          "[pg][migration][drift][concurrency]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgConn conn = connect(db.dsn());
+    PgConn holder = connect(db.dsn());
+    const std::string v1 = "CREATE TABLE items (id INT)";
+    const std::string x2 = "ALTER TABLE items ADD COLUMN a TEXT";
+    const std::string y2 = "ALTER TABLE items ADD COLUMN b TEXT";
+    const auto hash_of = [](const std::string& sql) {
+        return *yuzu::server::sha256_hex(sql);
+    };
+
+    SECTION("build Y shares v1 with build X, differs on v2, and loses the race: refuses") {
+        // Y verifies at version 0 (lock-free) and blocks on the per-store lock; X then
+        // commits v1 AND v2 (schema_meta + hashes in one txn, as the runner does). Y wakes,
+        // adopts version 2, and must still compare v2 rather than skip it.
+        const std::string store = "store_r";
+        HeldStoreLock lock{holder.get(), store};
+        const std::vector<PgMigration> y = {{1, v1}, {2, y2}};
+        std::string logs;
+        bool y_ok = true;
+        {
+            yuzu::test::LogCapture capture{spdlog::level::err};
+            std::thread t{[&] {
+                PgConn c{PQconnectdb(db.dsn().c_str())};
+                y_ok =
+                    PQstatus(c.get()) == CONNECTION_OK && PgMigrationRunner::run(c.get(), store, y);
+            }};
+            const bool waiting = lock.wait_for_waiter(conn.get());
+            if (waiting) {
+                exec_ok_or_fail(holder.get(), "SET LOCAL search_path TO \"" + store + "\", public");
+                exec_ok_or_fail(holder.get(), v1);
+                exec_ok_or_fail(holder.get(), x2);
+                exec_ok_or_fail(holder.get(),
+                                "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                                "VALUES ('" +
+                                    store + "', 2, 0)");
+                exec_ok_or_fail(holder.get(),
+                                "INSERT INTO public.yuzu_schema_migrations "
+                                "(store, version, sha256, recorded_by, recorded_at) VALUES ('" +
+                                    store + "', 1, '" + hash_of(v1) + "', 'apply', 0), ('" + store +
+                                    "', 2, '" + hash_of(x2) + "', 'apply', 0)");
+            }
+            exec_ok_or_fail(holder.get(), "COMMIT");
+            t.join();
+            capture.stop();
+            logs = capture.text();
+            REQUIRE(waiting);
+        }
+        CHECK_FALSE(y_ok);
+        CHECK(logs.find("store '" + store + "' recorded migration v2") != std::string::npos);
+        CHECK(PgMigrationRunner::current_version(conn.get(), store) == 2);
+        CHECK(text_scalar(conn.get(), "SELECT sha256 FROM public.yuzu_schema_migrations WHERE "
+                                      "store = 'store_r' AND version = 2") == hash_of(x2));
+    }
+
+    SECTION("a pre-table store: the first-sight re-read under the lock catches competing text") {
+        // The store is already at v2 with build X's text and no hash rows (a database that
+        // predates the table). Y (different v2) reads no rows lock-free, blocks on the lock;
+        // X's first-sight record commits in the window; Y's re-read must see it differ. Without
+        // the re-read, Y's DO NOTHING insert silently "succeeds" against X's rows.
+        const std::string store = "store_f";
+        const std::vector<PgMigration> x = {{1, v1}, {2, x2}};
+        REQUIRE(PgMigrationRunner::run(conn.get(), store, x));
+        exec_ok_or_fail(conn.get(),
+                        "DELETE FROM public.yuzu_schema_migrations WHERE store = '" + store + "'");
+        HeldStoreLock lock{holder.get(), store};
+        const std::vector<PgMigration> y = {{1, v1}, {2, y2}};
+        bool y_ok = true;
+        std::thread t{[&] {
+            PgConn c{PQconnectdb(db.dsn().c_str())};
+            y_ok = PQstatus(c.get()) == CONNECTION_OK && PgMigrationRunner::run(c.get(), store, y);
+        }};
+        const bool waiting = lock.wait_for_waiter(conn.get());
+        if (waiting)
+            exec_ok_or_fail(holder.get(),
+                            "INSERT INTO public.yuzu_schema_migrations "
+                            "(store, version, sha256, recorded_by, recorded_at) VALUES ('" +
+                                store + "', 1, '" + hash_of(v1) + "', 'tofu', 0), ('" + store +
+                                "', 2, '" + hash_of(x2) + "', 'tofu', 0)");
+        exec_ok_or_fail(holder.get(), "COMMIT");
+        t.join();
+        REQUIRE(waiting);
+        CHECK_FALSE(y_ok);
+        CHECK(text_scalar(conn.get(), "SELECT sha256 FROM public.yuzu_schema_migrations WHERE "
+                                      "store = 'store_f' AND version = 2") == hash_of(x2));
     }
 }
