@@ -20,7 +20,10 @@
 //     supervised "Delete needs an approval ticket" rule applies (the delete_plugin_config /
 //     delete_result_set mechanism); MCP is therefore stricter than REST DELETE, which needs
 //     Infrastructure:Write only. set is NOT approval-gated (Infrastructure:Write, like
-//     set_runtime_config). The ticket is consumed BEFORE the handler runs, so any failure after
+//     set_runtime_config). The ticket gates this MCP tool, not the capability: the same
+//     supervised token can DELETE over REST with Infrastructure:Write alone and no ticket, and
+//     set stores any valid document without one (an accepted residual, ADR-1005 2026-11-09).
+//     The ticket is consumed BEFORE the handler runs, so any failure after
 //     that point spends it: the remediation says so and how to recover (the one exception is a
 //     refusal by the handler's own perm_fn gate, whose 403 body is the gate's; the tool
 //     description says that spends the ticket too).
@@ -28,18 +31,26 @@
 //     this twin exists to serve them.
 //
 // Audit. apply writes the `attempted` row itself before it touches the store and fails closed
-// when that row is refused (no audit row, no mutation); stricter than REST, an UNWIRED audit
-// sink is refused here too. apply discards the result of every later row, so the per-request
-// hook below records whether any row was dropped, and the answer reports it as
-// `audit_persisted:false` (success body) or through the A4 error's audit flag. That is the MCP
-// equivalent of REST's Sec-Audit-Failed header.
+// when that row is refused (no audit row, no mutation); stricter than REST, an UNWIRED session
+// or session-bound audit writer is refused here too. apply discards the result of every later
+// row, so the per-request hook below records whether any row was dropped, and the answer
+// reports it as `audit_persisted:false` (success body) or through the A4 error's audit flag.
+// That is the MCP equivalent of REST's Sec-Audit-Failed header.
+//
+// Attribution. A write resolves the caller's session ONCE (ToolDeps::session_fn) and stamps
+// every DOMAIN row (dex.score_policy.*) and the stored `updated_by` from it through the
+// session-bound writer (ToolDeps::audit_as_session_fn), exactly as REST PUT/DELETE bind their
+// rows (audit_as, #6065 PR-Q): a credential that lapses mid-request cannot leave a row naming
+// no one while the write proceeds. The generic `mcp.<tool>` row is the dispatcher's
+// (mcp_server.cpp), outside this file, and is resolved per row.
 //
 // ONE handler per tool, never a shared one: the A5 retry-hint gate
-// (scripts/ci/check-mcp-retry-hints.py) scans each tool's own handler body. Two shared helpers
-// answer outside a handler, and both are non-retryable by design, each marked
-// `// retry-hint-exempt:` on its a4_error line: tier_admits (the token's tier never changes) and
-// writer_actor (an unwired closure or unresolved caller is a misconfiguration, not a transient
-// fault). Every retryable answer lives inside a handle_* body.
+// (scripts/ci/check-mcp-retry-hints.py) scans each tool's own handler body. Three shared
+// helpers answer outside a handler, and all are non-retryable by design, each marked
+// `// retry-hint-exempt:` on its a4_error line: refuse_params (a caller-input rejection),
+// tier_admits (the token's tier never changes) and writer_identity (an unwired closure or
+// unresolved caller is a misconfiguration, not a transient fault). Every retryable answer
+// lives inside a handle_* body.
 
 #include "mcp_tool_registry.hpp"
 
@@ -52,7 +63,9 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/server/auth.hpp> // auth::Session, effective_role, role_to_string
 
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -89,8 +102,8 @@ constexpr const char* kWriteOutputSchema =
 /// has one gets it after a "; ".
 constexpr std::string_view kResetTicketSpentNote =
     "the approval ticket this call consumed is spent: read the policy with "
-    "get_dex_score_policy, compare its revision with the one named here, then submit a new "
-    "request without approval_id for a fresh ticket";
+    "get_dex_score_policy, compare its revision with the one named here (or with your if_match "
+    "when none is named), then submit a new request without approval_id for a fresh ticket";
 
 /// Remediation for an argument-shape refusal (get, set and reset); reset appends the
 /// spent-ticket note to it.
@@ -115,14 +128,35 @@ bool tier_admits(const ToolCallContext& ctx, const char* securable, const char* 
     return false;
 }
 
-/// One request's domain-audit hook for apply_dex_score_policy: writes through the shared
-/// ToolDeps::audit_fn kernel and records, in `persisted`, whether ANY row of this request was
-/// dropped. The returned callable borrows `ctx` and `persisted` and lives for one call only.
-ToolDeps::DexScorePolicyAuditFn audit_hook(const ToolCallContext& ctx, bool& persisted) {
-    return [&ctx, &persisted](std::string_view verb, std::string_view result,
-                              const std::string& detail_json) {
+/// The caller as a write binds it: the session resolved ONCE and its effective role read once
+/// (a JIT elevation that lapses between two rows cannot make them disagree), the same pair
+/// REST's audit_as captures.
+struct WriterIdentity {
+    auth::Session session;
+    std::string role;
+};
+
+/// One request's domain-audit hook for apply_dex_score_policy: writes every row through the
+/// session-bound writer (`who`, resolved once) and records, in `persisted`, whether ANY row of
+/// this request was dropped. The returned callable borrows `ctx`, `who` and `persisted` and
+/// lives for one call only. A throwing writer is caught by the shared kernel and counts as a
+/// dropped row.
+ToolDeps::DexScorePolicyAuditFn audit_hook(const ToolCallContext& ctx, const WriterIdentity& who,
+                                           bool& persisted) {
+    return [&ctx, &who, &persisted](std::string_view verb, std::string_view result,
+                                    const std::string& detail_json) {
+        // The kernel takes the bool(req, 5 strings) shape every route class shares; the session
+        // and role are bound here, as RestApiV1's audit_as binds them.
+        const std::function<bool(const httplib::Request&, const std::string&, const std::string&,
+                                 const std::string&, const std::string&, const std::string&)>
+            bound = [&](const httplib::Request& req, const std::string& action,
+                        const std::string& outcome, const std::string& target_type,
+                        const std::string& target_id, const std::string& detail) {
+                return ctx.deps->audit_as_session_fn(req, who.session, who.role, action, outcome,
+                                                     target_type, target_id, detail);
+            };
         const bool ok = yuzu::server::detail::try_persist_audit(
-            ctx.deps->audit_fn, ctx.req, std::string(verb), std::string(result), "RuntimeConfig",
+            bound, ctx.req, std::string(verb), std::string(result), "RuntimeConfig",
             std::string(kDexScorePolicyKey), detail_json);
         if (!ok)
             persisted = false;
@@ -131,35 +165,38 @@ ToolDeps::DexScorePolicyAuditFn audit_hook(const ToolCallContext& ctx, bool& per
 }
 
 /// The preamble the two write handlers share, run after the arguments parse and before any
-/// row: the apply and audit closures must be wired (an unwired sink would be called
-/// "persisted" by the kernel, so it is refused here; stricter than REST, which treats an empty
-/// sink as audit-off: "no audit row, no mutation") and the caller's username must resolve (it
-/// would name no one). Either refusal is answered here and yields nullopt; otherwise the actor
-/// for the audit rows. The answer is answer_unwired's shape (the generic failure row, no
-/// retry hint, no data), written here because answer_unwired carries no remediation:
-/// `remediation` is empty for set, and for reset the spent-ticket recovery, since its approval
-/// ticket was consumed before the handler ran and these refusals spend it too.
-std::optional<std::string> writer_actor(const ToolCallContext& ctx, std::string_view tool,
-                                        std::string_view remediation) {
+/// row: the apply closure, the session resolver and the session-bound audit writer must be
+/// wired (an unwired writer would be called "persisted" by the kernel, so it is refused here;
+/// stricter than REST, which treats an empty sink as audit-off: "no audit row, no mutation")
+/// and the caller's session must resolve with a username (it would name no one). Either
+/// refusal is answered here and yields nullopt; otherwise the identity every row and the
+/// stored `updated_by` are stamped from. The answer is answer_unwired's shape (the generic
+/// failure row, no retry hint, no data), written here because answer_unwired carries no
+/// remediation: `remediation` is empty for set, and for reset the spent-ticket recovery, since
+/// its approval ticket was consumed before the handler ran and these refusals spend it too.
+std::optional<WriterIdentity> writer_identity(const ToolCallContext& ctx, std::string_view tool,
+                                              std::string_view remediation) {
     const auto refuse = [&](const std::string& detail, const std::string& log) {
         spdlog::error("{}", log);
         const bool audited = ctx.audit("failure", detail);
         answer(ctx, ctx.a4_error(kInternalError, "service unavailable", remediation, -1, {}, audited)); // retry-hint-exempt: an unwired closure or unresolved caller is a misconfiguration, not a transient fault
     };
-    if (ctx.deps == nullptr || !ctx.deps->dex_score_policy_apply_fn || !ctx.deps->audit_fn) {
+    if (ctx.deps == nullptr || !ctx.deps->dex_score_policy_apply_fn ||
+        !ctx.deps->session_fn || !ctx.deps->audit_as_session_fn) {
         refuse("dex score policy provider unwired; policy not changed",
-               std::string(tool) + ": apply or audit closure unwired - misconfigured call site; "
-                                   "failing closed, policy not changed");
+               std::string(tool) + ": apply, session or session-bound audit closure unwired - "
+                                   "misconfigured call site; failing closed, policy not changed");
         return std::nullopt;
     }
-    auto resolved = ctx.deps->username_fn ? ctx.deps->username_fn(ctx.req) : std::nullopt;
-    if (!resolved || resolved->empty()) {
+    auto session = ctx.deps->session_fn(ctx.req);
+    if (!session || session->username.empty()) {
         refuse("caller identity unresolved; policy not changed",
-               std::string(tool) + ": the caller's username could not be resolved - failing "
+               std::string(tool) + ": the caller's session could not be resolved - failing "
                                    "closed, policy not changed");
         return std::nullopt;
     }
-    return resolved;
+    std::string role = auth::role_to_string(auth::effective_role(*session));
+    return WriterIdentity{std::move(*session), std::move(role)};
 }
 
 // ── get_dex_score_policy ──────────────────────────────────────────────────────────────────
@@ -208,12 +245,12 @@ void handle_set_dex_score_policy(const ToolCallContext& ctx) {
         refuse_params(ctx, rq.error(), kBadArgsRemediation);
         return;
     }
-    const auto actor = writer_actor(ctx, "set_dex_score_policy", {});
-    if (!actor)
+    const auto who = writer_identity(ctx, "set_dex_score_policy", {});
+    if (!who)
         return; // refused BEFORE any row; the answer is written
-    rq->actor = *actor;
+    rq->actor = who->session.username;
     bool persisted = true;
-    const auto r = ctx.deps->dex_score_policy_apply_fn(*rq, audit_hook(ctx, persisted));
+    const auto r = ctx.deps->dex_score_policy_apply_fn(*rq, audit_hook(ctx, *who, persisted));
     if (r.status == DexScorePolicyWriteStatus::Ok) {
         if (!ctx.audit("success", r.dry_run ? "dry_run" : ""))
             persisted = false;
@@ -227,12 +264,13 @@ void handle_set_dex_score_policy(const ToolCallContext& ctx) {
     if (!ctx.audit(code == kInvalidParams ? "denied" : "failure",
                    std::string(dex_score_policy_mcp_status_token(r.status))))
         persisted = false;
+    const std::string message = dex_score_policy_mcp_message(r.message);
     const std::string remediation = dex_score_policy_mcp_remediation(r.remediation);
     if (code == kInvalidParams) {
-        answer(ctx, ctx.a4_error(kInvalidParams, r.message, remediation, -1, {}, persisted)); // retry-hint-exempt: caller refusal (If-Match, dry_run, invalid or stale document); resending fails identically
+        answer(ctx, ctx.a4_error(kInvalidParams, message, remediation, -1, {}, persisted)); // retry-hint-exempt: caller refusal (If-Match, dry_run, invalid or stale document); resending fails identically
         return;
     }
-    answer(ctx, ctx.a4_error(kInternalError, r.message, remediation,
+    answer(ctx, ctx.a4_error(kInternalError, message, remediation,
                              /*retry_after_ms=*/r.retry_after_ms.value_or(kDexScorePolicyRetryMs),
                              {}, persisted));
 }
@@ -254,12 +292,12 @@ void handle_reset_dex_score_policy(const ToolCallContext& ctx) {
                       std::string(kBadArgsRemediation) + "; " + std::string(kResetTicketSpentNote));
         return;
     }
-    const auto actor = writer_actor(ctx, "reset_dex_score_policy", kResetTicketSpentNote);
-    if (!actor)
+    const auto who = writer_identity(ctx, "reset_dex_score_policy", kResetTicketSpentNote);
+    if (!who)
         return;
-    rq->actor = *actor;
+    rq->actor = who->session.username;
     bool persisted = true;
-    const auto r = ctx.deps->dex_score_policy_apply_fn(*rq, audit_hook(ctx, persisted));
+    const auto r = ctx.deps->dex_score_policy_apply_fn(*rq, audit_hook(ctx, *who, persisted));
     if (r.status == DexScorePolicyWriteStatus::Ok) {
         if (!ctx.audit("success", ""))
             persisted = false;
@@ -275,13 +313,14 @@ void handle_reset_dex_score_policy(const ToolCallContext& ctx) {
         persisted = false;
     // The approval ticket was spent before this handler ran, so every refusal or failure here
     // has burned it: say how to recover.
+    const std::string message = dex_score_policy_mcp_message(r.message);
     const std::string remediation = dex_score_policy_mcp_remediation(r.remediation) + "; " +
                                     std::string(kResetTicketSpentNote);
     if (code == kInvalidParams) {
-        answer(ctx, ctx.a4_error(kInvalidParams, r.message, remediation, -1, {}, persisted)); // retry-hint-exempt: caller refusal (If-Match, stale revision); resending fails identically
+        answer(ctx, ctx.a4_error(kInvalidParams, message, remediation, -1, {}, persisted)); // retry-hint-exempt: caller refusal (If-Match, stale revision); resending fails identically
         return;
     }
-    answer(ctx, ctx.a4_error(kInternalError, r.message, remediation,
+    answer(ctx, ctx.a4_error(kInternalError, message, remediation,
                              /*retry_after_ms=*/r.retry_after_ms.value_or(kDexScorePolicyRetryMs),
                              {}, persisted));
 }
@@ -296,13 +335,16 @@ constexpr ToolRecord kToolRecords[] = {
      "tiers.edges, tiers.names, weights, model, overrides), revision (the 16-digit lower-case hex "
      "revision, or 'default' when nothing has been written), source (custom, or default for the "
      "shipped defaults) and, when a stored document was refused and the shipped defaults are "
-     "being served, a fault reason. Pass revision back as if_match to set_dex_score_policy or "
-     "reset_dex_score_policy. Read from the store, not this instance's cache, so it is the "
-     "revision a write will be checked against. A fleet-wide configuration read: no per-agent "
-     "data and no domain audit row (the generic mcp.get_dex_score_policy row is written). An "
-     "unreadable store is a retryable error with retry_after_ms, never the defaults served as if "
-     "nothing were stored. Takes no arguments. Requires GuaranteedState:Read, held outright (a "
-     "management-group-scoped grant alone does not pass); readable at every MCP tier. Mirrors "
+     "being served, a fault reason: document is then the shipped defaults, NOT your stored "
+     "policy, so do not edit it and send it to set_dex_score_policy. Pass revision back as "
+     "if_match to set_dex_score_policy or reset_dex_score_policy. Read from the store, not this "
+     "instance's cache, so it is the revision a write will be checked against. A fleet-wide "
+     "configuration read: no per-agent data and no domain audit row (the generic "
+     "mcp.get_dex_score_policy row is written). The stored text is also listed by "
+     "get_runtime_config for a caller holding Infrastructure:Read. An unreadable store is a "
+     "retryable error with retry_after_ms, never the defaults served as if nothing were stored. "
+     "Takes no arguments. Requires GuaranteedState:Read, held outright (a management-group-scoped "
+     "grant alone does not pass); readable at every MCP tier. Mirrors "
      "GET /api/v1/dex/score-policy. Read-only.",
      R"({"type":"object","properties":{},"additionalProperties":false})",
      kGetOutputSchema,
@@ -312,25 +354,30 @@ constexpr ToolRecord kToolRecords[] = {
     {"set_dex_score_policy",
      "Replace the customer DEX score policy with the given document, or check one without "
      "storing it (dry_run). It overwrites the stored document (destructive to that one "
-     "fleet-wide document: every DEX score, tier and Apps view is computed under it from the "
-     "next read, and nothing else is touched). Send document in the shape get_dex_score_policy "
-     "returns, and if_match (REQUIRED: the revision get_dex_score_policy returned, or 'default' "
-     "when none has been written) so the write is refused if the policy changed meanwhile. "
-     "dry_run true validates the document and the revision and answers what WOULD be in force "
-     "(revision = what a real set would produce) without storing anything; it leaves one "
-     "dex.score_policy.validate audit row. Idempotent: the same document with the current "
+     "fleet-wide document: every DEX score, tier and Apps view is computed under it, on this "
+     "instance at once and on other instances typically within 5 seconds; nothing else is "
+     "touched). Send document in the shape get_dex_score_policy returns, and if_match (REQUIRED: "
+     "the revision get_dex_score_policy returned, or 'default' when none has been written) so the "
+     "write is refused if the policy changed meanwhile. When get_dex_score_policy returns a fault "
+     "its document is the shipped defaults, not your stored policy: do not edit it and send it "
+     "back. Do not set during a rolling upgrade or rollback: a document carrying model is stored "
+     "as version 2, which an older replica refuses and scores under the shipped defaults until "
+     "the roll ends. dry_run true validates the document and the revision and answers what WOULD "
+     "be in force (revision = what a real set would produce) without storing anything; it leaves "
+     "one dex.score_policy.validate audit row. Idempotent: the same document with the current "
      "revision twice stores the same policy. A missing, malformed or stale if_match, an invalid "
      "document, an unknown argument or a non-boolean dry_run is a non-retryable invalid-params "
      "error naming the field (resending fails identically; read the policy again, fix the "
      "document, retry). A busy writer, an unavailable store, a write whose outcome is unknown "
-     "(call get_dex_score_policy and compare revisions) or an audit store that refused the "
-     "attempted row (the policy was NOT changed) is a retryable error with retry_after_ms. "
-     "audit_persisted:false is present only when an audit row after the change failed to "
-     "persist; the change stands. Audited as dex.score_policy.update (an attempted row first: "
-     "if it cannot be written the policy is not changed) or dex.score_policy.validate, plus the "
-     "generic mcp.set_dex_score_policy row. Requires a supervised-tier token with "
-     "Infrastructure:Write and GuaranteedState:Read; no approval ticket. Mirrors PUT "
-     "/api/v1/dex/score-policy.",
+     "(after a lost response, call get_dex_score_policy and compare revisions before sending "
+     "again) or an audit store that refused the attempted row (the policy was NOT changed) is a "
+     "retryable error with retry_after_ms. audit_persisted:false appears only when an audit row "
+     "failed to persist: on a success the change stands and a row after it is missing; on an "
+     "error answer the row recording that refusal was not stored. Audited as "
+     "dex.score_policy.update (an attempted row first: if it cannot be written the policy is not "
+     "changed) or dex.score_policy.validate, plus the generic mcp.set_dex_score_policy row. "
+     "Requires a supervised-tier token with Infrastructure:Write and GuaranteedState:Read; no "
+     "approval ticket. Mirrors PUT /api/v1/dex/score-policy.",
      R"j({"type":"object","properties":{)j"
      R"j("document":{"type":"object","description":"The whole policy document in the shape get_dex_score_policy returns (version, tiers.edges, tiers.names, weights, optional model, overrides); it replaces the stored one"},)j"
      R"j("if_match":{"type":"string","maxLength":64,"description":"The revision get_dex_score_policy returned: 16 lower-case hex digits, or 'default' when no policy has been written. Required; a stale value is refused"},)j"
@@ -343,27 +390,34 @@ constexpr ToolRecord kToolRecords[] = {
     {"reset_dex_score_policy",
      "Reset the customer DEX score policy to the shipped defaults by removing the stored "
      "document (destructive to that one fleet-wide document: every DEX score, tier and Apps view "
-     "returns to the defaults from the next read). if_match is REQUIRED: the revision "
-     "get_dex_score_policy returned, so the reset is refused if the policy changed meanwhile; "
-     "resetting a policy that was never written records an attempted and a no_change row and "
-     "answers the defaults. Idempotent: a second reset with the current revision changes "
-     "nothing. Requires a supervised-tier token with Infrastructure:Delete and "
-     "GuaranteedState:Read, and an approval ticket: the first call answers kApprovalRequired "
-     "with an approval_id, and after a human approves it you repeat the SAME call with that "
-     "approval_id. The ticket is consumed before the handler runs, so ANY failure after approval "
-     "(a busy writer, an unavailable store or audit log, a write whose outcome is unknown, a "
-     "stale or missing if_match) spends it: call get_dex_score_policy, compare its revision with "
-     "the one the error names, then submit a NEW request without approval_id for a fresh ticket "
-     "(a repeat with the spent approval_id answers 'approval already used'). A refusal by the "
-     "handler's own permission gate (its 403 carries no such hint) spends the ticket too. "
-     "Stricter than REST "
-     "DELETE, which needs only Infrastructure:Write. Non-retryable invalid-params errors name the "
-     "field; busy, unavailable and unknown-outcome errors are retryable with retry_after_ms. "
-     "audit_persisted:false is present only when an audit row after the change failed to "
-     "persist; the change stands. Audited as dex.score_policy.reset (attempted first) plus the "
-     "generic mcp.reset_dex_score_policy row. Mirrors DELETE /api/v1/dex/score-policy.",
+     "returns to the defaults, on this instance at once and on other instances typically within "
+     "5 seconds). if_match is REQUIRED: the revision get_dex_score_policy returned, so the reset "
+     "is refused if the policy changed meanwhile; resetting a policy that was never written "
+     "records an attempted and a no_change row and answers the defaults. Idempotent: a second "
+     "reset with the current revision changes nothing. Requires a supervised-tier token with "
+     "Infrastructure:Delete and GuaranteedState:Read, and an approval ticket: the first call "
+     "answers kApprovalRequired with an approval_id, and after a human approves it you repeat the "
+     "SAME call with that approval_id. A missing, malformed or over-long if_match or an unknown "
+     "argument is refused by the input schema before any ticket is created or consumed. The "
+     "ticket is consumed before the handler runs, so ANY failure after approval (a busy writer, "
+     "an unavailable store or audit log, a write whose outcome is unknown, a stale if_match) "
+     "spends it: call get_dex_score_policy (also after a lost response), compare its revision "
+     "with the one the error names (or with your if_match when none is named), then submit a NEW "
+     "request without approval_id for a fresh ticket (a repeat with the spent approval_id answers "
+     "'approval already used'). A refusal by the handler's own permission gate (its 403 carries "
+     "no such hint) spends the ticket too. Busy, unavailable and unknown-outcome errors are "
+     "retryable: retry after retry_after_ms with a NEW request (no approval_id), never the spent "
+     "one; invalid-params errors name the field and are not. Under RBAC this tool needs "
+     "Infrastructure:Delete, which REST DELETE does not (it needs Infrastructure:Write only). The "
+     "ticket gates this MCP tool, not the capability: the same supervised token can DELETE "
+     "/api/v1/dex/score-policy over REST with Infrastructure:Write alone and no ticket, and "
+     "set_dex_score_policy stores any valid document without one. audit_persisted:false appears "
+     "only when an audit row failed to persist: on a success the change stands and a row after it "
+     "is missing; on an error answer the row recording that refusal was not stored. Audited as "
+     "dex.score_policy.reset (attempted first) plus the generic mcp.reset_dex_score_policy row. "
+     "Mirrors DELETE /api/v1/dex/score-policy.",
      R"j({"type":"object","properties":{)j"
-     R"j("if_match":{"type":"string","maxLength":64,"description":"The revision get_dex_score_policy returned: 16 lower-case hex digits, or 'default' when no policy has been written. Required; a stale value is refused"},)j"
+     R"j("if_match":{"type":"string","maxLength":64,"pattern":"^(default|[0-9a-f]{16})$","description":"The revision get_dex_score_policy returned: 16 lower-case hex digits, or 'default' when no policy has been written. Required; a stale value is refused"},)j"
      R"j("approval_id":{"type":"string","maxLength":128,"description":"Approval ticket id from a prior kApprovalRequired response; repeat the same call with it once a human has approved"})j"
      R"j(},"required":["if_match"],"additionalProperties":false})j",
      kWriteOutputSchema,

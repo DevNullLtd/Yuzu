@@ -363,7 +363,10 @@ constexpr std::array<ToolFamily, 43> kFamilies{{
     {"Approvals", "list pending approvals; approve_request/reject_request always refuse "
                   "(approver_assurance_required:*) -- deciding a ticket is a dashboard/REST act",
      kApprovals},
-    {"DEX signals", "digital-employee-experience reliability signals and their scope/detail",
+    {"DEX signals",
+     "digital-employee-experience reliability signals and their scope/detail, plus the customer "
+     "score policy (get_dex_score_policy; set_dex_score_policy and reset_dex_score_policy are "
+     "supervised-tier writes, reset also approval-gated)",
      kDexSignals},
     {"DEX performance", "fleet, cohort, device, and per-app performance over time", kDexPerf},
     {"Network quality", "fleet and per-device network-quality posture, and hosts found by "

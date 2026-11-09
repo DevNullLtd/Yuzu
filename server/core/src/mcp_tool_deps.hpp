@@ -12,9 +12,10 @@
 // is the failure docs/api-twin-recipe.md section 1 exists to prevent.
 //
 // ToolDeps holds provider closures and no store instance. The closures are not
-// all reads: audit_fn writes audit rows, `crypto_set_dashboard_layout_fn` writes the
-// CALLER'S OWN /crypto dashboard layout, `dex_score_policy_apply_fn` writes the
-// fleet-wide DEX score policy, and the others compose read-only views. A
+// all reads: audit_fn and audit_as_session_fn write audit rows,
+// `crypto_set_dashboard_layout_fn` writes the CALLER'S OWN /crypto dashboard layout,
+// `dex_score_policy_apply_fn` writes the fleet-wide DEX score policy, and the others
+// compose read-only views. A
 // write-capable closure is admitted only when it is a pure forward of the very same
 // code the REST twin calls (so the two cannot drift), the gate stays central (the
 // record's securable / operation / ServiceScopeClass drive the generic tier and C8
@@ -33,8 +34,8 @@
 // else here dispatches, pushes a tag or mutates a store.
 //
 // What a handler must not reach: any store, AgentRegistry, AuthDB, RbacStore, an
-// McpServer member, or any write-capable callable beyond audit_fn and a closure
-// admitted under that criterion. The
+// McpServer member, or any write-capable callable beyond audit_fn, audit_as_session_fn and
+// a closure admitted under that criterion. The
 // file-level half of that rule is a lexical test (test_mcp_dispatch_coverage.cpp):
 // an mcp_tools_*.cpp includes none of *_store.hpp, agent_registry.hpp,
 // mcp_server.hpp, auth_db* or pg/. That test checks DIRECT includes only; a
@@ -64,6 +65,7 @@
 #include "quarantine_visible.hpp" // QuarantineListFn
 
 #include <httplib.h>
+#include <yuzu/server/auth.hpp> // auth::Session (the session a session-bound audit writer stamps)
 
 #include <cstdint>
 #include <expected>
@@ -148,6 +150,18 @@ struct ToolDeps {
         const DexScorePolicyWriteRequest&, DexScorePolicyAuditFn)>;
     DexScorePolicyReadFn dex_score_policy_read_fn;
     DexScorePolicyApplyFn dex_score_policy_apply_fn;
+    // The caller's session, resolved ONCE per write, and the session-bound audit writer the
+    // domain rows go through (`AuthRoutes::audit_as_session_fn()`, the same std::function type
+    // as `RestApiV1::AuditAsSessionFn`): REST binds every row to the session its route resolved
+    // (#6065 PR-Q), so a credential that lapses mid-request cannot leave a row naming no one
+    // while the write proceeds. `audit_fn` above re-resolves the caller per row.
+    using SessionFn = std::function<std::optional<auth::Session>(const httplib::Request&)>;
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id, const std::string& detail)>;
+    SessionFn session_fn;
+    AuditAsSessionFn audit_as_session_fn;
 };
 
 } // namespace yuzu::server::mcp

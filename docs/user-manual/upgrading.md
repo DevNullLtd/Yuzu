@@ -8,6 +8,8 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **The rule.** The version 2 rule in [Behaviour change: the DEX score policy document gains model parameters and version 2](#behaviour-change-the-dex-score-policy-document-gains-model-parameters-and-version-2), below, applies to the dashboard too: do not save or reset the policy from the Scoring tab during a rolling upgrade or rollback. The tab does not exist on a server that predates it, so behind a load balancer `GET /fragments/dex/scoring` is a `404` from a replica still on the previous release.
 
+**MCP tools.** `get_dex_score_policy`, `set_dex_score_policy` and `reset_dex_score_policy` are new and additive. `set_dex_score_policy` and `reset_dex_score_policy` write the same document through the same function as `PUT` and `DELETE /api/v1/dex/score-policy`, so the same rule applies: do not set or reset the score policy over MCP, REST or the dashboard during a rolling upgrade or rollback. An older replica does not list the MCP tools. No action on upgrade.
+
 **No action on upgrade.** There is no schema change and no existing setting is reinterpreted.
 
 ## ⚠️ Breaking: Echo reads roll-up tables on the server (a stored result set over a raw capture table is refused)

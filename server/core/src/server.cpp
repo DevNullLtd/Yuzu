@@ -23363,6 +23363,11 @@ private:
             // the deployment has no runtime-config store; the tools then answer an internal
             // error.
             if (dex_score_policy_deps) {
+                // The write tools resolve the caller's session once and stamp every domain row
+                // from it, as the REST PUT/DELETE do (audit_as_session_fn, #6065 PR-Q).
+                tool_deps.session_fn = [this](const httplib::Request& req)
+                    -> std::optional<auth::Session> { return auth_routes_->resolve_session(req); };
+                tool_deps.audit_as_session_fn = auth_routes_->audit_as_session_fn();
                 tool_deps.dex_score_policy_read_fn = dex_score_policy_deps->read_stored;
                 tool_deps.dex_score_policy_apply_fn =
                     [deps = *dex_score_policy_deps](

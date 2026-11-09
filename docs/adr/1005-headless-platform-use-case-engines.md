@@ -1569,7 +1569,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        than the REST `DELETE`: a principal that holds `Infrastructure:Write`
        but not `Infrastructure:Delete` under RBAC can reset over REST but not
        over MCP. That is deliberate; it is the price of using the one core
-       approval primitive.
+       approval primitive. **The ticket gates this MCP tool, not the
+       capability:** the same supervised token can `DELETE
+       /api/v1/dex/score-policy` over REST with `Infrastructure:Write` alone
+       and no ticket, and `set_dex_score_policy` can store any valid document
+       (the shipped defaults included) without one. Fencing REST `DELETE` or
+       `set` is a REST-surface decision for a separate change; this one is
+       REST-equal on purpose. The reset tool's `if_match` is also bounded by
+       its input schema (`default` or 16 lower-case hex digits), so a missing
+       or malformed value is refused before any ticket is created or consumed,
+       and only a refusal or failure after approval (a stale revision, a writer,
+       store or audit failure, an unresolved caller, or the handler's own
+       permission gate) spends one.
      - **A failure after approval spends the ticket.** The generic gate
        consumes the ticket before the handler runs, so a retryable writer,
        store or audit failure on reset burns it, and a repeat with the same
@@ -1584,14 +1595,28 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        is refused at the generic C8 gate (`ServiceScopeClass::denied`).
      - **Audit.** `apply_dex_score_policy` writes the `attempted` row itself
        before it touches the store and fails closed when that row is refused;
-       the MCP handlers additionally refuse an unwired audit sink or an
-       unresolvable caller (stricter than REST, which treats an empty sink as
-       audit-off). `apply` discards the result of every later row, so the
-       per-request hook records whether any row was dropped and the answer
-       reports `audit_persisted:false` (success) or the A4 audit flag (error);
-       REST reaches the same signal through `Sec-Audit-Failed`. A result-level
-       flag on the write result, so both surfaces share one signal, is a core
-       follow-up on #6087, not part of this change.
+       the MCP handlers additionally refuse an unwired session resolver or
+       session-bound audit writer and an unresolvable caller (stricter than
+       REST, which treats an empty sink as audit-off). `apply` discards the
+       result of every later row, so the per-request hook records whether any
+       row was dropped and the answer reports `audit_persisted:false`
+       (success) or the A4 audit flag (error); REST reaches the same signal
+       through `Sec-Audit-Failed`. A result-level flag on the write result, so
+       both surfaces share one signal, is a core follow-up on #6087, not part
+       of this change.
+     - **Attribution is session-bound, as on REST.** A write resolves the
+       caller's session once (`ToolDeps::session_fn`) and stamps every
+       `dex.score_policy.*` row and the stored `updated_by` from it through the
+       session-bound writer (`ToolDeps::audit_as_session_fn`, the
+       `AuthRoutes::audit_as_session_fn()` the REST routes use, #6065 PR-Q), so
+       a credential that lapses mid-request cannot leave a row naming no one
+       while the write proceeds. The sibling registry write tools keep the
+       per-row pattern (`ToolDeps::audit_fn` resolves the caller for each row);
+       session-bound domain audit for every MCP write tool is a separate core
+       change (issue to be filed on the owner's word). Residual, accepted and
+       disclosed: the generic `mcp.<tool>` row is written by the MCP
+       dispatcher (`mcp_audit` in `mcp_server.cpp`), outside this tool, and
+       still resolves the caller per row; binding it is a core MCP change.
      - **`mcp_tool_deps.hpp` admission criterion amended.** The write-capable
        closure criterion admitted only a pure forward of the REST twin's `*Api`
        method with the handler writing `attempted` before the call. The score
@@ -1606,6 +1631,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (its validation half); the tier-change diff it adds has no headless twin and
        stays the exception recorded in the 2026-11-06 entry. `prior_document`
        on reset audit rows is a core audit-row change, deferred as a follow-up.
+       Revisit by 2027-01-31; the follow-up issues are to be filed on merge.
        Reader size is tracked as #6619. The REST registration lambdas hold no
        readable gate call (the `perm_fn` sits in the shared
        `score_policy_write` lambda), so gate parity (check 6) cannot compare

@@ -25,6 +25,8 @@
 #include "test_approval_manager_pg_helper.hpp"
 #include "test_json_schema_subset.hpp"
 
+#include "../test_helpers.hpp" // ScopeExit
+
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
@@ -75,6 +77,8 @@ struct Twin {
     int read_calls = 0;
     int cas_calls = 0;
     int car_calls = 0;
+    std::vector<std::string> cas_actors; // the `updated_by` each compare-and-set was handed
+    bool clock_throws = false;           // the provider's clock fails (an install after the commit)
     // The store reports an error AFTER the write: `intended` leaves the intended state in the
     // store (observed_after_store_error), `other` leaves a different document there.
     enum class AfterError { none, intended, other };
@@ -90,6 +94,17 @@ struct Twin {
     bool domain_audit_throws = false;
     std::vector<std::string> domain_rows;    // action|result|type|id
     std::vector<std::string> domain_details; // parallel
+    std::vector<std::string> domain_principals; // parallel: the session each row was stamped from
+    std::vector<std::string> domain_roles;      // parallel: the effective role captured once
+    // The session resolver counts its calls; when set it resolves NO ONE after the first call (a
+    // credential that lapsed mid-request).
+    int session_calls = 0;
+    bool session_lapses_after_first = false;
+    bool session_unresolved = false; // the caller resolves to no session at all
+    // The per-row resolvers the write tools must NOT use for domain rows: ToolDeps::audit_fn and
+    // ToolDeps::username_fn. Both are wired as traps (a row written through audit_fn lands here;
+    // username_fn names someone else).
+    std::vector<std::string> legacy_rows;
     bool generic_audit_ok = true;
     std::vector<std::string> generic_rows;   // action|result
     std::string username = "tester";
@@ -104,8 +119,8 @@ struct Twin {
     struct Opts {
         bool wire_read = true;
         bool wire_apply = true;
-        bool wire_audit = true;
-        bool wire_username = true;
+        bool wire_audit = true;   // the session-bound audit writer (audit_as_session_fn)
+        bool wire_session = true; // the session resolver (session_fn)
         yuzu::server::ApprovalManager* approval = nullptr;
     };
 
@@ -113,7 +128,12 @@ struct Twin {
     explicit Twin(Opts o) {
         provider = std::make_shared<DexScorePolicyProvider>(
             [this]() -> std::expected<std::optional<std::string>, std::string> { return stored; },
-            [] { return std::int64_t{1'000'000}; }, std::chrono::milliseconds{1});
+            [this] {
+                if (clock_throws)
+                    throw std::runtime_error("clock failed");
+                return std::int64_t{1'000'000};
+            },
+            std::chrono::milliseconds{1});
 
         DexScorePolicyWriteDeps d;
         d.read_stored = [this]() -> std::expected<std::optional<std::string>, std::string> {
@@ -124,8 +144,9 @@ struct Twin {
         };
         d.compare_and_set = [this](const std::optional<std::string>& expected,
                                    const std::string& canonical,
-                                   const std::string&) -> std::expected<bool, std::string> {
+                                   const std::string& actor) -> std::expected<bool, std::string> {
             ++cas_calls;
+            cas_actors.push_back(actor);
             if (stored != expected)
                 return false;
             switch (cas_after_error) {
@@ -161,18 +182,45 @@ struct Twin {
         d.provider = provider;
 
         mcp::ToolDeps td;
+        // The session-bound writer: the only path the domain rows may take. It records the
+        // session it was handed, so a test asserts WHO each row was stamped as.
         if (o.wire_audit)
-            td.audit_fn = [this](const httplib::Request&, const std::string& action,
-                                 const std::string& result, const std::string& target_type,
-                                 const std::string& target_id, const std::string& detail) -> bool {
+            td.audit_as_session_fn =
+                [this](const httplib::Request&, const auth::Session& session,
+                       const std::string& role, const std::string& action,
+                       const std::string& result, const std::string& target_type,
+                       const std::string& target_id, const std::string& detail) -> bool {
                 domain_rows.push_back(action + "|" + result + "|" + target_type + "|" + target_id);
                 domain_details.push_back(detail);
+                domain_principals.push_back(session.username);
+                domain_roles.push_back(role);
                 if (domain_audit_throws)
                     throw std::runtime_error("audit sink blew up");
                 if (!domain_fail_result.empty())
                     return result != domain_fail_result;
                 return domain_audit_ok;
             };
+        if (o.wire_session)
+            td.session_fn = [this](const httplib::Request&) -> std::optional<auth::Session> {
+                ++session_calls;
+                if (session_unresolved || (session_lapses_after_first && session_calls > 1))
+                    return std::nullopt;
+                auth::Session s;
+                s.username = username;
+                s.role = auth::Role::admin;
+                return s;
+            };
+        // Traps: the per-row re-resolving sink and username resolver the write tools used to
+        // call. Neither may be reached by a domain row.
+        td.audit_fn = [this](const httplib::Request&, const std::string& action,
+                             const std::string& result, const std::string&, const std::string&,
+                             const std::string&) -> bool {
+            legacy_rows.push_back(action + "|" + result);
+            return true;
+        };
+        td.username_fn = [](const httplib::Request&) -> std::optional<std::string> {
+            return std::string("intruder");
+        };
         if (o.wire_read)
             td.dex_score_policy_read_fn = d.read_stored;
         if (o.wire_apply)
@@ -183,10 +231,6 @@ struct Twin {
                     copy.audit = std::move(audit);
                     return apply_dex_score_policy(rq, copy);
                 };
-        if (o.wire_username)
-            td.username_fn = [this](const httplib::Request&) -> std::optional<std::string> {
-                return username;
-            };
         server.set_tool_deps(std::move(td));
 
         auto auth_fn = [this](const httplib::Request&,
@@ -260,7 +304,23 @@ struct Twin {
         perm_calls.clear();
         domain_rows.clear();
         domain_details.clear();
+        domain_principals.clear();
+        domain_roles.clear();
         generic_rows.clear();
+        legacy_rows.clear();
+    }
+
+    /// Every domain row was stamped from the one session this write resolved, with the role
+    /// captured once, and none went through the per-row resolving sink.
+    void check_rows_stamped_as_session() const {
+        CHECK_FALSE(domain_rows.empty());
+        for (const auto& p : domain_principals)
+            CHECK(p == username);
+        for (const auto& r : domain_roles)
+            CHECK(r == "admin");
+        CHECK(domain_principals.size() == domain_rows.size());
+        CHECK(domain_roles.size() == domain_rows.size());
+        CHECK(legacy_rows.empty());
     }
 };
 
@@ -342,6 +402,32 @@ TEST_CASE("dex score policy mcp: the request builder is strict and maps dry_run 
         CHECK_FALSE(dex_score_policy_mcp_request(Op::Reset, {{"dry_run", true}}));
         CHECK_FALSE(dex_score_policy_mcp_request(Op::Reset, {{"document", doc_json(95.0)}}));
     }
+    SECTION("the if_match cap is 64 bytes inclusive; apply judges what the builder lets through") {
+        const json doc = doc_json(95.0);
+        const auto at_cap = dex_score_policy_mcp_request(
+            Op::Put, {{"document", doc}, {"if_match", std::string(64, 'a')}});
+        REQUIRE(at_cap);
+        CHECK(at_cap->if_match == std::optional<std::string>(std::string(64, 'a')));
+        CHECK_FALSE(dex_score_policy_mcp_request(
+            Op::Put, {{"document", doc}, {"if_match", std::string(65, 'a')}}));
+    }
+    SECTION("an unknown key cut inside a multibyte character stays valid UTF-8") {
+        // 63 ASCII bytes, then a 2-byte character whose lead byte is the 64th: the cap cuts
+        // between its bytes. The message must still be valid UTF-8 (json::dump refuses a string
+        // that is not), and still the unknown-argument refusal.
+        const std::string key = std::string(63, 'k') + "\xC3\xA9" + "b";
+        const auto rq = dex_score_policy_mcp_request(Op::Reset, json::object({{key, 1}}));
+        REQUIRE_FALSE(rq);
+        CHECK(rq.error().starts_with("unknown argument '"));
+        CHECK_NOTHROW(json(rq.error()).dump());
+        // The stray lead byte is neutralised, not echoed.
+        CHECK(rq.error().find('\xC3') == std::string::npos);
+        // A whole character inside the cap passes through unchanged.
+        const auto kept =
+            dex_score_policy_mcp_request(Op::Reset, json::object({{"caf\xC3\xA9", 1}}));
+        REQUIRE_FALSE(kept);
+        CHECK(kept.error() == "unknown argument 'caf\xC3\xA9'");
+    }
     SECTION("an unknown key is named, neutralised and capped, and no value is echoed") {
         const auto rq = dex_score_policy_mcp_request(
             Op::Reset, {{std::string("evil key\n") + std::string(200, 'z'), "SECRET-VALUE"}});
@@ -393,6 +479,16 @@ TEST_CASE("dex score policy mcp: the success payload names audit_persisted only 
     CHECK(dex_score_policy_mcp_remediation("GET /api/v1/dex/score-policy and send the revision")
               .find("get_dex_score_policy") != std::string::npos);
     CHECK(dex_score_policy_mcp_remediation("retry shortly") == "retry shortly");
+
+    // apply words its If-Match refusals for the REST header; over MCP the value is an argument.
+    CHECK(dex_score_policy_mcp_message("If-Match header required: send the revision") ==
+          "If-Match (the if_match argument) required: send the revision");
+    CHECK(dex_score_policy_mcp_message("If-Match must not be empty") ==
+          "If-Match (the if_match argument) must not be empty");
+    CHECK(dex_score_policy_mcp_message("If-Match: send exactly one revision") ==
+          "If-Match (the if_match argument): send exactly one revision");
+    CHECK(dex_score_policy_mcp_message("the stored policy's revision is abc") ==
+          "the stored policy's revision is abc");
 }
 
 // ───────────────────────── registration ─────────────────────────────────────────
@@ -443,6 +539,25 @@ TEST_CASE("dex score policy mcp: the three tools are served with their security 
     CHECK(std::count(writes.begin(), writes.end(), std::string("reset_dex_score_policy")) == 1);
     CHECK(std::count(writes.begin(), writes.end(), std::string("get_dex_score_policy")) == 0);
     for (const auto& e : listed["result"]["tools"]) {
+        const std::string desc = e.value("description", "");
+        if (e["name"] == "get_dex_score_policy") {
+            // Where else the stored text is listed, and what a fault means for a read-edit-set.
+            CHECK(desc.find("get_runtime_config") != std::string::npos);
+            CHECK(desc.find("NOT your stored policy") != std::string::npos);
+        }
+        if (e["name"] == "set_dex_score_policy") {
+            CHECK(desc.find("rolling upgrade") != std::string::npos);
+        }
+        if (e["name"] == "reset_dex_score_policy") {
+            CHECK(desc.find("gates this MCP tool, not the capability") != std::string::npos);
+            CHECK(desc.find("NEW request (no approval_id)") != std::string::npos);
+            // The schema refuses a missing if_match before any ticket exists: never "spends" one.
+            CHECK(desc.find("stale or missing if_match") == std::string::npos);
+            // The if_match schema mirrors what the writer accepts, so a malformed value is
+            // refused before the approval ticket is created or consumed.
+            CHECK(e["inputSchema"]["properties"]["if_match"]["pattern"] ==
+                  "^(default|[0-9a-f]{16})$");
+        }
         if (e["name"] == "get_dex_score_policy") // the handler refuses any argument: say so
             CHECK(e["inputSchema"]["additionalProperties"] == false);
         if (e["name"] == "set_dex_score_policy") {
@@ -598,6 +713,17 @@ TEST_CASE("set_dex_score_policy: a supervised token stores the canonical text, a
     REQUIRE(t.perm_calls.size() >= 2);
     CHECK(t.perm_calls[t.perm_calls.size() - 2] == "Infrastructure:Write");
     CHECK(t.perm_calls[t.perm_calls.size() - 1] == "GuaranteedState:Read");
+    // Attribution: `updated_by` and every domain row come from the ONE session resolved for
+    // this write; the per-row resolving sink was never reached.
+    REQUIRE(t.cas_actors.size() == 1);
+    CHECK(t.cas_actors[0] == "tester");
+    CHECK(t.session_calls == 1);
+    t.check_rows_stamped_as_session();
+    // The policy is installed on this instance, not just stored.
+    const auto in_force = t.provider->current();
+    REQUIRE(in_force);
+    CHECK(in_force->source == "custom");
+    CHECK(in_force->revision == rev_of(*t.stored));
 }
 
 TEST_CASE("set_dex_score_policy: dry_run validates, audits one validate row and stores nothing",
@@ -619,6 +745,69 @@ TEST_CASE("set_dex_score_policy: dry_run validates, audits one validate row and 
     CHECK(t.domain_rows[0] == "dex.score_policy.validate|success|RuntimeConfig|dex_score_policy");
 }
 
+TEST_CASE("set and reset: every domain row and updated_by come from the session resolved once, "
+          "even when the caller no longer resolves mid-request",
+          "[mcp][dex][score_policy][security]") {
+    SECTION("a set") {
+        Twin t;
+        t.session_lapses_after_first = true; // any SECOND resolution names no one
+        const json r = t.call("set_dex_score_policy", set_args(95.0, "default"));
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(t.session_calls == 1);
+        REQUIRE(t.cas_actors.size() == 1);
+        CHECK(t.cas_actors[0] == "tester");
+        REQUIRE(t.domain_rows.size() == 2);
+        t.check_rows_stamped_as_session();
+    }
+    SECTION("a dry run and a refusal") {
+        Twin t;
+        t.session_lapses_after_first = true;
+        json args = set_args(95.0, "default");
+        args["dry_run"] = true;
+        REQUIRE_FALSE(t.call("set_dex_score_policy", args).contains("error"));
+        REQUIRE(t.domain_rows.size() == 1);
+        t.check_rows_stamped_as_session();
+        t.clear_audit();
+        t.session_calls = 0;
+        REQUIRE(t.call("set_dex_score_policy", {{"document", doc_json(95.0)}}).contains("error"));
+        REQUIRE(t.domain_rows.size() == 1); // the denied row
+        t.check_rows_stamped_as_session();
+    }
+    SECTION("a reset") {
+        Twin t;
+        t.tier = ""; // not ticket-gated: the body is under test, the round trip is below
+        t.session_lapses_after_first = true;
+        t.stored = doc_with_excellent(80.0);
+        REQUIRE_FALSE(
+            t.call("reset_dex_score_policy", {{"if_match", rev_of(*t.stored)}}).contains("error"));
+        CHECK(t.session_calls == 1);
+        REQUIRE(t.domain_rows.size() == 2);
+        t.check_rows_stamped_as_session();
+        const auto in_force = t.provider->current();
+        REQUIRE(in_force);
+        CHECK(in_force->source == "default"); // the reset is installed, not just stored
+    }
+    SECTION("a caller that resolves to no session is refused before any row, on both writes") {
+        Twin t;
+        t.tier = "";
+        t.session_unresolved = true;
+        t.stored = doc_with_excellent(80.0);
+        for (const char* tool : {"set_dex_score_policy", "reset_dex_score_policy"}) {
+            INFO(tool);
+            const json r = t.call(tool, std::string(tool) == "set_dex_score_policy"
+                                            ? set_args(95.0, rev_of(*t.stored))
+                                            : json{{"if_match", rev_of(*t.stored)}});
+            REQUIRE(r.contains("error"));
+            CHECK(r["error"]["code"] == mcp::kInternalError);
+            CHECK(r["error"]["data"]["retry_after_ms"].is_null());
+        }
+        CHECK(t.domain_rows.empty());
+        CHECK(t.cas_calls == 0);
+        CHECK(t.car_calls == 0);
+        CHECK(t.stored.has_value());
+    }
+}
+
 TEST_CASE("set_dex_score_policy: caller refusals are non-retryable invalid-params errors with a "
           "denied row and no store write",
           "[mcp][dex][score_policy]") {
@@ -627,7 +816,10 @@ TEST_CASE("set_dex_score_policy: caller refusals are non-retryable invalid-param
         const json r = t.call("set_dex_score_policy", {{"document", doc_json(95.0)}});
         REQUIRE(r.contains("error"));
         CHECK(r["error"]["code"] == mcp::kInvalidParams);
-        CHECK(r["error"]["message"].get<std::string>().starts_with("If-Match"));
+        // apply's REST wording ("If-Match header required") is rewritten for the argument.
+        CHECK(r["error"]["message"].get<std::string>().starts_with(
+            "If-Match (the if_match argument)"));
+        CHECK(r["error"]["message"].get<std::string>().find("header") == std::string::npos);
         CHECK(r["error"]["data"]["remediation"].get<std::string>().find("get_dex_score_policy") !=
               std::string::npos);
         CHECK(r["error"]["data"]["retry_after_ms"].is_null());
@@ -731,6 +923,33 @@ TEST_CASE("set_dex_score_policy: each loud RBAC gate refuses with its own body a
     }
 }
 
+TEST_CASE("reset_dex_score_policy: each loud RBAC gate refuses with its own body and removes "
+          "nothing",
+          "[mcp][dex][score_policy][security]") {
+    for (const char* denied : {"Infrastructure:Delete", "GuaranteedState:Read"}) {
+        INFO(denied);
+        Twin t;
+        t.tier = ""; // not ticket-gated: the handler's own gate pair is under test
+        t.stored = doc_with_excellent(80.0);
+        t.perm_deny = denied;
+        auto res = t.post(json{{"jsonrpc", "2.0"},
+                               {"method", "tools/call"},
+                               {"id", 7},
+                               {"params", {{"name", "reset_dex_score_policy"},
+                                           {"arguments", {{"if_match", rev_of(*t.stored)}}}}}}
+                              .dump());
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(t.domain_rows.empty());
+        CHECK(t.car_calls == 0);
+        CHECK(t.stored.has_value());
+        CHECK(t.session_calls == 0); // refused before the caller's session was resolved
+        // Delete is asked first, Read second: a refused Read means Delete was already passed.
+        REQUIRE_FALSE(t.perm_calls.empty());
+        CHECK(std::count(t.perm_calls.begin(), t.perm_calls.end(), "Infrastructure:Delete") >= 1);
+    }
+}
+
 TEST_CASE("set_dex_score_policy: no audit row, no mutation", "[mcp][dex][score_policy][security]") {
     SECTION("a sink that refuses the attempted row: retryable with the audit hint, nothing stored") {
         Twin t;
@@ -750,13 +969,14 @@ TEST_CASE("set_dex_score_policy: no audit row, no mutation", "[mcp][dex][score_p
         CHECK(r["error"]["code"] == mcp::kInternalError);
         CHECK(t.cas_calls == 0);
     }
-    SECTION("an unwired audit sink, apply closure or username resolver is refused, nothing stored") {
+    SECTION("an unwired session-bound audit writer, apply closure or session resolver is refused, "
+            "nothing stored") {
         for (int which = 0; which < 3; ++which) {
             INFO(which);
             Twin::Opts o;
             o.wire_audit = which != 0;
             o.wire_apply = which != 1;
-            o.wire_username = which != 2;
+            o.wire_session = which != 2;
             Twin t(o);
             const json r = t.call("set_dex_score_policy", set_args(95.0, "default"));
             REQUIRE(r.contains("error"));
@@ -790,6 +1010,16 @@ TEST_CASE("set_dex_score_policy: a dropped audit row after the change is reporte
         CHECK(r["error"]["code"] == mcp::kInvalidParams);
         CHECK(r["error"]["data"]["audit_persisted"] == false);
         CHECK(t.cas_calls == 0);
+    }
+    SECTION("a retryable failure whose failure row is dropped reaches the envelope's audit flag") {
+        Twin t;
+        t.cas_after_error = Twin::AfterError::other; // outcome unknown: a failure row follows
+        t.domain_fail_result = "failure";
+        const json r = t.call("set_dex_score_policy", set_args(95.0, "default"));
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == kDexScorePolicyRetryMs);
+        CHECK(r["error"]["data"]["audit_persisted"] == false);
     }
     SECTION("a sink that accepts everything leaves no audit_persisted key anywhere") {
         Twin t;
@@ -838,6 +1068,68 @@ TEST_CASE("set_dex_score_policy: store faults are retryable; the outcome after a
     }
 }
 
+TEST_CASE("set_dex_score_policy: boundaries of if_match, the document and dry_run",
+          "[mcp][dex][score_policy]") {
+    SECTION("an if_match of exactly 64 bytes reaches apply, which refuses it as malformed") {
+        Twin t;
+        const json r = t.call("set_dex_score_policy", set_args(95.0, std::string(64, 'a')));
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["message"].get<std::string>().starts_with("If-Match"));
+        REQUIRE(t.domain_rows.size() == 1);
+        CHECK(t.domain_rows[0] == "dex.score_policy.update|denied|RuntimeConfig|dex_score_policy");
+        CHECK(t.domain_details[0].find("if_match_malformed") != std::string::npos);
+        CHECK(t.cas_calls == 0);
+        t.check_rows_stamped_as_session();
+    }
+    SECTION("one byte past the cap is refused before apply: only the generic denied row") {
+        Twin t;
+        check_a4_refusal(t.call("set_dex_score_policy", set_args(95.0, std::string(65, 'a'))),
+                         "correct the arguments and call again");
+        CHECK(t.domain_rows.empty());
+        CHECK(t.cas_calls == 0);
+    }
+    SECTION("a document over the size cap is an invalid-params error and stores nothing") {
+        Twin t;
+        const json big = {{"padding", std::string(kDexScorePolicyMaxBytes + 1, 'x')}};
+        const json r = t.call("set_dex_score_policy", {{"document", big}, {"if_match", "default"}});
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(t.cas_calls == 0);
+        CHECK_FALSE(t.stored.has_value());
+        REQUIRE(t.domain_rows.size() == 1);
+        CHECK(t.domain_rows[0] == "dex.score_policy.update|denied|RuntimeConfig|dex_score_policy");
+    }
+    SECTION("dry_run false is a real write, and the answer carries no dry_run key") {
+        Twin t;
+        json args = set_args(95.0, "default");
+        args["dry_run"] = false;
+        const json r = t.call("set_dex_score_policy", args);
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(t.cas_calls == 1);
+        REQUIRE(t.stored.has_value());
+        CHECK_FALSE(r["result"]["structuredContent"].contains("dry_run"));
+        REQUIRE(t.domain_rows.size() == 2);
+        CHECK(t.domain_rows[0] == kAttemptedUpdate);
+    }
+    SECTION("a failure after the commit (the install throws) is judged by a re-read: observed") {
+        Twin t;
+        t.clock_throws = true; // the provider's install reads the clock AFTER the commit
+        const json r = t.call("set_dex_score_policy", set_args(95.0, "default"));
+        t.clock_throws = false;
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(t.cas_calls == 1);
+        REQUIRE(t.stored.has_value());
+        CHECK(*t.stored == doc_with_excellent(95.0));
+        CHECK(r["result"]["structuredContent"]["revision"] == rev_of(*t.stored));
+        bool observed = false;
+        for (const auto& d : t.domain_details)
+            observed = observed || d.find("observed_after_store_error") != std::string::npos;
+        CHECK(observed);
+    }
+}
+
 TEST_CASE("set_dex_score_policy: a second writer in this process is told to retry, through the "
           "adapter",
           "[mcp][dex][score_policy]") {
@@ -869,16 +1161,26 @@ TEST_CASE("set_dex_score_policy: a second writer in this process is told to retr
     rq1.body = doc_with_excellent(95.0);
     rq1.actor = "first";
     std::optional<DexScorePolicyWriteResult> first;
-    std::thread parked([&] { first = apply_dex_score_policy(rq1, d1); });
-    // Bounded: a first write that never reaches its commit fails the case instead of hanging it.
-    if (entered.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
-        release_p.set_value();
-        parked.join();
-        FAIL("the first write never reached its commit");
+    json r;
+    {
+        std::thread parked([&] { first = apply_dex_score_policy(rq1, d1); });
+        // The only release path: it runs on EVERY exit from this scope, a throwing REQUIRE or
+        // json::parse in t.call included (destroying a joinable std::thread would terminate the
+        // binary, and joining one still parked on the gate would hang). A second set_value
+        // throws, hence the swallow. It also publishes `first` before the checks read it.
+        yuzu::test::ScopeExit release_and_join{[&] {
+            try {
+                release_p.set_value();
+            } catch (...) { // NOLINT(bugprone-empty-catch)
+            }
+            if (parked.joinable())
+                parked.join();
+        }};
+        // Bounded: a first write that never reaches its commit fails the case instead of hanging it.
+        if (entered.wait_for(std::chrono::seconds(30)) != std::future_status::ready)
+            FAIL("the first write never reached its commit");
+        r = t.call("set_dex_score_policy", set_args(96.0, "default"));
     }
-    const json r = t.call("set_dex_score_policy", set_args(96.0, "default"));
-    release_p.set_value();
-    parked.join();
 
     REQUIRE(r.contains("error"));
     CHECK(r["error"]["code"] == mcp::kInternalError);
@@ -1006,6 +1308,9 @@ TEST_CASE("reset_dex_score_policy: removes the stored text with attempted then s
     }
 }
 
+// At the supervised tier the input schema refuses an unknown argument before the approval gate
+// (see the round trip below); the handler's own strict check is defence in depth, reached here
+// by the empty tier. A STALE revision is the refusal that IS reachable after the ticket is spent.
 TEST_CASE("reset_dex_score_policy: dry_run and any other argument are refused; refusals carry the "
           "spent-ticket recovery",
           "[mcp][dex][score_policy]") {
@@ -1065,6 +1370,42 @@ TEST_CASE("reset_dex_score_policy: a sink that refuses the attempted row removes
     CHECK(audit_count(t.generic_rows, "mcp.reset_dex_score_policy|failure") == 1);
 }
 
+TEST_CASE("reset_dex_score_policy: a dropped refusal or failure row reaches the envelope's audit "
+          "flag",
+          "[mcp][dex][score_policy]") {
+    SECTION("a stale revision whose denied row is dropped") {
+        Twin t;
+        t.tier = "";
+        t.stored = doc_with_excellent(80.0);
+        t.domain_fail_result = "denied";
+        const json r = t.call("reset_dex_score_policy", {{"if_match", "default"}});
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["data"]["audit_persisted"] == false);
+        CHECK(t.car_calls == 0);
+    }
+    SECTION("an unknown-outcome failure whose failure row is dropped") {
+        Twin t;
+        t.tier = "";
+        t.stored = doc_with_excellent(80.0);
+        t.car_after_error = Twin::AfterError::other;
+        t.domain_fail_result = "failure";
+        const json r = t.call("reset_dex_score_policy", {{"if_match", rev_of(*t.stored)}});
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"] == kDexScorePolicyRetryMs);
+        CHECK(r["error"]["data"]["audit_persisted"] == false);
+    }
+    SECTION("rows that all persist leave the flag off the envelope") {
+        Twin t;
+        t.tier = "";
+        t.stored = doc_with_excellent(80.0);
+        const json r = t.call("reset_dex_score_policy", {{"if_match", "default"}});
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r["error"]["data"].contains("audit_persisted"));
+    }
+}
+
 TEST_CASE("reset_dex_score_policy: at the supervised tier it is approval-gated, and without an "
           "approval manager the gate denies honestly before any write",
           "[mcp][dex][score_policy][security]") {
@@ -1112,6 +1453,25 @@ TEST_CASE("reset_dex_score_policy: the approval ticket round trip, and a spent t
         REQUIRE(t.domain_rows.size() == 2);
         CHECK(t.domain_rows[0] == kAttemptedReset);
         CHECK(t.domain_rows[1] == "dex.score_policy.reset|success|RuntimeConfig|dex_score_policy");
+    }
+    SECTION("a malformed, over-long or unknown argument is refused by the input schema before any "
+            "ticket is created or consumed") {
+        for (const json& bad : {json{{"if_match", "0123456789abcdeg"}}, // 16 characters, not hex
+                                json{{"if_match", "DEFAULT"}},
+                                json{{"if_match", std::string(65, 'a')}},
+                                json{{"if_match", rev_of(*t.stored)}, {"dry_run", true}},
+                                json::object()}) {
+            INFO(bad.dump());
+            const json r = t.call("reset_dex_score_policy", bad);
+            REQUIRE(r.contains("error"));
+            CHECK(r["error"]["code"] == mcp::kInvalidParams);
+            CHECK_FALSE(r["error"]["data"].contains("approval_id"));
+            CHECK(r["error"]["data"]["remediation"].get<std::string>().find(
+                      "no approval ticket was created or consumed") != std::string::npos);
+        }
+        CHECK(t.car_calls == 0);
+        CHECK(t.domain_rows.empty());
+        (void)mint(); // the gate is untouched: a valid call still mints a ticket
     }
     SECTION("a retryable failure after approval spends the ticket; a repeat is refused, a fresh "
             "request recovers") {
@@ -1179,15 +1539,15 @@ TEST_CASE("dex score policy mcp: a non-object `arguments` is refused by the disp
     CHECK(t.car_calls == 0);
 }
 
-TEST_CASE("reset_dex_score_policy: an unwired apply closure, audit sink or username resolver is "
-          "refused with nothing removed",
+TEST_CASE("reset_dex_score_policy: an unwired apply closure, session-bound audit writer or "
+          "session resolver is refused with nothing removed",
           "[mcp][dex][score_policy]") {
     for (int which = 0; which < 3; ++which) {
         INFO(which);
         Twin::Opts o;
         o.wire_audit = which != 0;
         o.wire_apply = which != 1;
-        o.wire_username = which != 2;
+        o.wire_session = which != 2;
         Twin t(o);
         t.tier = "";
         t.stored = doc_with_excellent(80.0);

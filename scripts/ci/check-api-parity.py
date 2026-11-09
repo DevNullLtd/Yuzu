@@ -2394,11 +2394,12 @@ GATE_PARITY_NO_GATE_ALLOWED = {
     ("DELETE", "/api/v1/dex/score-policy", "reset_dex_score_policy"): (
         "the REST handler's Infrastructure:Write check lives in the shared `score_policy_write` "
         "lambda (perm_fn at its top, rest_api_v1.cpp), which this script's per-route lexical read "
-        "cannot see from the registration lambda. Read in review: the tool's Infrastructure:Write "
-        "(Delete for the MCP reset: stricter than REST DELETE, which needs Infrastructure:Write "
-        "only; the approval ticket is the generic supervised Delete rule) row matches the REST "
-        "gate, and the tool ADDS a loud GuaranteedState:Read gate and the supervised tier ladder "
-        "(ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> 16 for this pair)"),
+        "cannot see from the registration lambda. Read in review: REST already applies the MCP "
+        "tier ladder to an MCP-tier token (AuthRoutes::require_tier_policy), so the tool's "
+        "Infrastructure:Delete row (stricter than REST DELETE, which needs Infrastructure:Write "
+        "only) ADDS only a loud GuaranteedState:Read gate and the generic supervised approval "
+        "ticket for a Delete (ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> 16 "
+        "for this pair)"),
     ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent, kToolSecurityRows comment)"),
@@ -2448,9 +2449,10 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "the REST handler's Infrastructure:Write check lives in the shared `score_policy_write` "
         "lambda (perm_fn at its top, rest_api_v1.cpp), which this script's per-route lexical read "
         "cannot see from the registration lambda. Read in review: the tool's Infrastructure:Write "
-        "row matches the REST gate, and the tool ADDS a loud GuaranteedState:Read gate and the "
-        "supervised tier ladder (ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> "
-        "16 for this pair)"),
+        "row matches the REST gate, REST already applies the MCP tier ladder to an MCP-tier token "
+        "(AuthRoutes::require_tier_policy), and the tool ADDS only a loud GuaranteedState:Read "
+        "gate (ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> 16 for this "
+        "pair)"),
 }
 
 # Check 7 allowlist: registry tool -> reason, for a tool whose domain test file lacks the

@@ -47,10 +47,11 @@ dex_score_policy_mcp_request(DexScorePolicyWriteRequest::Op op, const nlohmann::
         const bool known = key == "if_match" || (put ? key == "document" || key == "dry_run"
                                                      : key == "approval_id");
         if (!known) {
-            std::string shown = ::yuzu::log_token(key);
-            if (shown.size() > 64)
-                shown.resize(64);
-            return std::unexpected("unknown argument '" + shown + "'");
+            // Cap first, neutralise second: log_token turns a multibyte sequence the cap cut
+            // into '_' (one per stray byte), so the message stays valid UTF-8; the other way
+            // round would cut a passed-through sequence mid-character.
+            return std::unexpected("unknown argument '" + ::yuzu::log_token(key.substr(0, 64)) +
+                                   "'");
         }
     }
     if (const auto it = args.find("if_match"); it != args.end()) {
@@ -111,6 +112,20 @@ dex_score_policy_mcp_status_token(DexScorePolicyWriteStatus s) noexcept {
         return "audit_unavailable";
     }
     return "unknown";
+}
+
+/// apply words its If-Match refusals for the REST header ("If-Match header required: ...",
+/// "If-Match must not be empty"); over MCP the value is the `if_match` argument. Rewrites that
+/// leading phrase to "If-Match (the if_match argument)" and leaves every other message as is.
+[[nodiscard]] inline std::string dex_score_policy_mcp_message(std::string_view apply_message) {
+    constexpr std::string_view kPrefix = "If-Match";
+    constexpr std::string_view kHeader = " header";
+    if (!apply_message.starts_with(kPrefix))
+        return std::string(apply_message);
+    auto rest = apply_message.substr(kPrefix.size());
+    if (rest.starts_with(kHeader))
+        rest.remove_prefix(kHeader.size());
+    return std::string(kPrefix) + " (the if_match argument)" + std::string(rest);
 }
 
 /// apply's remediation names the REST read ("GET /api/v1/dex/score-policy ..."); over MCP the
