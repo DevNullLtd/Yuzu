@@ -1551,9 +1551,14 @@ and the outstanding-worker count live in one object owned by the agent, not by t
 rebuilt on every reconnect while a worker abandoned at its limit may still be inside a plugin). The flag is
 per **plugin**, not per action: a plugin is one object with shared state, so a worker of any of its actions
 that is still inside it means a second thread must not enter it through a sibling action either, and the
-outstanding count is the number of plugins with a worker in flight. The flag is released by a
+outstanding count is the number of plugins with a worker in flight. Dispatch is strictly sequential, so only
+abandoned workers accumulate, one per plugin: until the two-at-once pairing of the binary-evidence plugin lands
+(see "Not in this change"), the number of workers inside plugins at once is bounded by the distinct plugins in
+the action table (and by the process-wide ceiling of `bounded_wait.hpp`), not by two. The flag is released by a
 guard inside the worker when it physically returns. Every source of a plugin whose worker is still running
-is `timeout` with token `busy` (each facet still reports for itself); a bounded call that could not start (the outstanding-call ceiling or thread creation)
+is `timeout` with token `busy` (each facet still reports for itself). That is a status-only section, and a status-only
+acknowledgement erases a facet's acknowledged set, so a healthy sibling of a hung action is sent in full once the
+plugin answers again (an accepted cost). A bounded call that could not start (the outstanding-call ceiling or thread creation)
 is `timeout` with token `rejected` and the caller clears the flag. **Teardown:** after the worker threads
 are joined and before any plugin `shutdown()` or unload, on both teardown paths of the agent, the agent
 waits `kOrphanDrainGrace` (3 s) for the count to reach zero and otherwise logs and exits with code 3
@@ -1586,9 +1591,12 @@ identity's own `HKCU` Uninstall key never degrades the machine-scope collection,
 only on a 32-bit OS.
 
 **No per-user paths (ADR-0016 section 8).** The writer blanks an `install_location` under
-`<drive>:\Users\`, `<drive>:/Users/`, `/Users/`, `/home/` or `/root`, so the server's stored location
+`/Users`, `/Documents and Settings`, `/home` or `/root` on a segment boundary, read without regard to case,
+with `\` as `/` and after an optional drive letter (`C:\Users\...`, `\Users\...`), so the server's stored location
 and the change ledger's `identity_key` copy of it name machine-scope roots only; the blanking is part of the
-stored form, so it also keeps one app installed under two accounts one row. The same paths spelled with the
+stored form, so it also keeps one app installed under two accounts one row. This is the normalisation the
+mount-point redaction above uses (`mount_entry_is_personal`), with three deliberate differences: `/Volumes` is not
+a root here, a non-path is kept, and a UNC path is blanked. The same paths spelled with the
 Win32 `\\?\` or `\\.\` prefix, or on macOS under `/System/Volumes/Data`, are blanked too, and so is
 EVERY UNC path (`\\host\share\...`, `\\?\UNC\...`): the writer cannot tell a home share from an application
 share, so it fails closed and an application installed to a network share carries no location. A

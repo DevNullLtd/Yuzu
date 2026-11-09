@@ -26,6 +26,7 @@
 
 #ifdef _WIN32
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -287,12 +288,18 @@ TEST_CASE("walk: ERROR_MORE_DATA on one name skips it, degrades, and continues",
 
 TEST_CASE("list_inventory: a healthy walk emits inv rows, rc 0, one OK/FULL status",
           "[installed_apps][registry][windows]") {
-    FakeOps ops{{app("AppA")}};
+    FakeEntry a = app("AppA");
+    a.values["InstallLocation"] = "C:\\Program Files\\AppA";
+    FakeOps ops{{a}};
     FakeCtx ctx;
     const rw::UninstallRoot roots[] = {kOkRoot};
     CHECK(rw::list_inventory(ctx, roots, ops, [](std::size_t) {}) == 0);
     REQUIRE(ctx.lines.size() == 1);
     CHECK(ctx.lines[0].rfind("inv|AppA|", 0) == 0);
+    // Row 1.4: the row has 14 tokens (13 bars) and the last is the registry's InstallLocation,
+    // exactly.
+    CHECK(std::count(ctx.lines[0].begin(), ctx.lines[0].end(), '|') == 13);
+    CHECK(ctx.lines[0].substr(ctx.lines[0].rfind('|') + 1) == "C:\\Program Files\\AppA");
     // The clean pass declares itself complete (parsers::emit_inventory): the sync collector
     // reads an undeclared answer as UNKNOWN and withholds the rows.
     REQUIRE(ctx.statuses.size() == 1);

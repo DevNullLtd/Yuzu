@@ -15,7 +15,10 @@ reordering the call compiles and every behavioural test stays green while plugin
   3. `collector_workers_` is a class-scope member created once. The factory runs inside the
      per-CONNECTION sync thread, so a worker object created there would be rebuilt on every
      reconnect while a worker from the previous connection is still inside a plugin.
-It also pins the heartbeat call site of `emit_sync_completeness_unknown_tag(tags, sync_kv);`.
+It also pins the heartbeat call site of `emit_sync_completeness_unknown_tag(tags, sync_kv);` and the
+helper's own body: the unit test injects its own exit callback, so nothing else observes that the
+helper really calls `hard_exit(3)` on both its over-grace and its could-not-check paths, with the
+`kOrphanDrainGrace` grace.
 
 Lexical only: it cannot see a relocation that keeps the tokens but changes control flow
 (review-enforced). agent.cpp has non-ASCII lines, so it is read as UTF-8.
@@ -40,11 +43,30 @@ DRAIN = r"drain_detached_collectors_or_exit\( ?\);"
 STOP = r"trigger_engine_\.stop\( ?\);"
 SKIP_TAGS = r"emit_sync_skip_tags\("
 UNKNOWN_TAG = r"emit_sync_completeness_unknown_tag\( ?tags, ?sync_kv ?\);"
+HELPER = re.compile(r"void\s+drain_detached_collectors_or_exit\(\s*\)\s*noexcept\s*\{")
+# One token at a time through the helper: a // comment or a string literal is skipped whole so a
+# brace inside either never moves the depth.
+HELPER_TOKEN = re.compile(r'//[^\n]*|"(?:\\.|[^"\\\n])*"|[{}]')
 
 
 def normalise(src):
     """Strip // comments, join lines, collapse whitespace (/* */ deliberately not stripped)."""
     return re.sub(r"[ \t\n\r\f\v]+", " ", re.sub(r"//.*", "", src))
+
+
+def helper_body(src):
+    """The text of drain_detached_collectors_or_exit() between its braces, // comments removed and
+    whitespace collapsed (a brace-match on the RAW text: the helper moves within the class, so no
+    neighbouring declaration anchors it); None when the helper is absent."""
+    m = HELPER.search(src)
+    if not m:
+        return None
+    depth = 1
+    for tok in HELPER_TOKEN.finditer(src, m.end()):
+        depth += (tok.group() == "{") - (tok.group() == "}")
+        if depth == 0:
+            return normalise(src[m.end():tok.start()])
+    return None
 
 
 def problems(src):
@@ -95,6 +117,25 @@ def problems(src):
     if len(re.findall(UNKNOWN_TAG, t)) != 1 or not skip or not re.search(UNKNOWN_TAG, t[skip.end():]):
         out.append("`emit_sync_completeness_unknown_tag(tags, sync_kv);` is not called exactly once "
                    "in the heartbeat block after `emit_sync_skip_tags(`")
+
+    # 5. The helper's body: both exits, and the grace the drain waits.
+    body = helper_body(src)
+    if body is None:
+        out.append("`void drain_detached_collectors_or_exit() noexcept {` is not defined")
+        return out
+    if len(re.findall(r"yuzu::agent::hard_exit\(3\)", body)) != 2:
+        out.append("drain_detached_collectors_or_exit() does not contain exactly two "
+                   "`yuzu::agent::hard_exit(3)` calls (the over-grace callback and the catch-all)")
+    call = re.findall(r"drain_collector_workers\( ?\*collector_workers_,([^\[]*)\[", body)
+    if len(call) != 1 or "kOrphanDrainGrace" not in call[0]:
+        out.append("drain_detached_collectors_or_exit() does not call drain_collector_workers("
+                   "*collector_workers_, <grace>, ...) exactly once with `kOrphanDrainGrace` as the grace")
+    if not re.search(r"hard_exit\(3\); ?\} ?\); ?\} ?catch", body):
+        out.append("drain_detached_collectors_or_exit(): the over-grace callback no longer ends in "
+                   "`yuzu::agent::hard_exit(3);`")
+    if not re.search(r"catch ?\(\.\.\.\) ?\{ ?yuzu::agent::hard_exit\(3\);[^;]*\} ?$", body):
+        out.append("drain_detached_collectors_or_exit(): the catch-all no longer ends the helper in "
+                   "`yuzu::agent::hard_exit(3);` (fail closed)")
     return out
 
 
@@ -127,6 +168,15 @@ MUTATIONS = [
     # 8. the heartbeat tag call deleted
     (r"yuzu::agent::emit_sync_completeness_unknown_tag\(tags, sync_kv\);", "", 0, 1,
      "heartbeat block after"),
+    # 9-11. the helper's two exits and its grace, scoped to the helper so another hard_exit(3) in
+    #       agent.cpp can never stand in for one of them
+    (r"(void drain_detached_collectors_or_exit\(\) noexcept \{.*?)yuzu::agent::hard_exit\(3\);",
+     r"\g<1>(void)0;", re.S, 1, "exactly two `yuzu::agent::hard_exit(3)`"),
+    (r"(void drain_detached_collectors_or_exit\(\) noexcept \{.*?\} catch \(\.\.\.\) \{\s*)"
+     r"yuzu::agent::hard_exit\(3\);", r"\g<1>(void)0;", re.S, 1, "exactly two `yuzu::agent::hard_exit(3)`"),
+    (r"(void drain_detached_collectors_or_exit\(\) noexcept \{.*?duration_cast<std::chrono::milliseconds>\("
+     r"\s*)yuzu::agent::kOrphanDrainGrace", r"\g<1>std::chrono::seconds{0}", re.S, 1,
+     "`kOrphanDrainGrace` as the grace"),
 ]
 
 

@@ -303,8 +303,9 @@ struct CollectorTuning {
 /// the same and acknowledged. The server keeps the rows of a facet it holds through any
 /// status-only section.
 ///
-/// Each action runs on a bounded detached worker (agents/shared/bounded_wait.hpp), one at a
-/// time per plugin, under its table time limit. `workers` is the agent-owned single-flight state above;
+/// Each action runs on a bounded detached worker (agents/shared/bounded_wait.hpp), dispatched
+/// strictly in sequence, under its table time limit; a plugin whose earlier worker is still inside
+/// it is not entered again (`busy`). `workers` is the agent-owned single-flight state above;
 /// `kv_get`/`kv_set` are the `__sync__` accessors the per-facet acknowledged sets persist
 /// through (`sync.installed_software.<facet>.acked` / `.need_full`). All three are required: a
 /// source built without the agent's workers would hold private single-flight state. The source

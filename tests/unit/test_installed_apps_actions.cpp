@@ -388,6 +388,11 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     // a per-user one), so how many rows carry one depends on the host and is only reported; the
     // shape every one must have is the contract.
     INFO("apps with an install_location: " << apps_with_location);
+    // system_profiler reports a Location for the bundles it lists, so any host with an app row has
+    // at least one. Without this the check below passes when every token is empty, and dropping
+    // the assignment of the .app path (the row's primary value, row 1.4) would go unnoticed.
+    if (app_rows > 0)
+        CHECK(apps_with_location >= 1);
     CHECK(relative_locations == 0);
 
     // The #2273 enrichment actually ran and populated the previously

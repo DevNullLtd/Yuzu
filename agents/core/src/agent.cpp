@@ -4577,38 +4577,6 @@ private:
     // or the reconnect-loop teardown already gated on stop_requested_). Never
     // call it on a transient-reconnect path — doing so would euthanise a healthy
     // agent and break the across-reconnect warm-snapshot continuity (PR 10).
-    // The teardown barrier for the installed-software collector. Its actions run on bounded
-    // DETACHED workers (agents/shared/bounded_wait.hpp): a caller that gave up at the time limit
-    // leaves the worker inside a plugin's dispatcher. Call this AFTER quiesce_run_workers() (the
-    // sync thread, the only thing that starts such a worker, is joined by then) and BEFORE any
-    // plugin shutdown() or dlclose: wait the F3 orphan-drain grace for the count to reach zero,
-    // and if it does not, hard_exit(3) (hard_exit.hpp) rather than race shutdown against code the
-    // worker is executing. Same contract as main.cpp's Guardian orphan check; the supervisor
-    // restarts the agent. A plugin that never returns therefore makes that restart a hard exit.
-    void drain_detached_collectors_or_exit() noexcept {
-        try {
-            drain_collector_workers(*collector_workers_,
-                                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        yuzu::agent::kOrphanDrainGrace),
-                                    [](std::size_t n) {
-                                        try {
-                                            spdlog::critical(
-                                                "{} installed-software collector worker(s) still "
-                                                "inside a plugin {}s after shutdown began - forcing "
-                                                "process exit rather than unload a plugin under "
-                                                "them",
-                                                n, yuzu::agent::kOrphanDrainGrace.count());
-                                            yuzu::agent::drain_log_bounded(
-                                                std::chrono::milliseconds{200});
-                                        } catch (...) {
-                                        }
-                                        yuzu::agent::hard_exit(3);
-                                    });
-        } catch (...) {
-            yuzu::agent::hard_exit(3); // could not even check: fail closed
-        }
-    }
-
     void quiesce_run_workers() noexcept {
         stop_requested_.store(true, std::memory_order_release);
         yuzu::agent::request_subprocess_cancel(true);
@@ -4651,6 +4619,38 @@ private:
         if (sync_thread_.joinable())
             sync_thread_.join();
         update_thread_.join();
+    }
+
+    // The teardown barrier for the installed-software collector. Its actions run on bounded
+    // DETACHED workers (agents/shared/bounded_wait.hpp): a caller that gave up at the time limit
+    // leaves the worker inside a plugin's dispatcher. Call this AFTER quiesce_run_workers() (the
+    // sync thread, the only thing that starts such a worker, is joined by then) and BEFORE any
+    // plugin shutdown() or dlclose: wait the F3 orphan-drain grace for the count to reach zero,
+    // and if it does not, hard_exit(3) (hard_exit.hpp) rather than race shutdown against code the
+    // worker is executing. Same contract as main.cpp's Guardian orphan check; the supervisor
+    // restarts the agent. A plugin that never returns therefore makes that restart a hard exit.
+    void drain_detached_collectors_or_exit() noexcept {
+        try {
+            drain_collector_workers(*collector_workers_,
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        yuzu::agent::kOrphanDrainGrace),
+                                    [](std::size_t n) {
+                                        try {
+                                            spdlog::critical(
+                                                "{} installed-software collector worker(s) still "
+                                                "inside a plugin {}s after shutdown began - forcing "
+                                                "process exit rather than unload a plugin under "
+                                                "them",
+                                                n, yuzu::agent::kOrphanDrainGrace.count());
+                                            yuzu::agent::drain_log_bounded(
+                                                std::chrono::milliseconds{200});
+                                        } catch (...) {
+                                        }
+                                        yuzu::agent::hard_exit(3);
+                                    });
+        } catch (...) {
+            yuzu::agent::hard_exit(3); // could not even check: fail closed
+        }
     }
 
     Config cfg_;

@@ -375,8 +375,9 @@ cadences.
   `uninstall_string` reserved (see "Install type, scope and location, and the
   sectioned report" below). This build's agent sends `install_location` (the Windows
   `InstallLocation`, the macOS `.app` path) and never `uninstall_string`; since a path under a
-  user's profile names an account, the agent blanks any location under `<drive>:\Users\`,
-  `/Users/`, `/home/` or `/root` (including the `\\?\` and macOS `/System/Volumes/Data` spellings of
+  user's profile names an account, the agent blanks any location under `/Users`,
+  `/Documents and Settings`, `/home` or `/root` (whatever the letter case, with `\` or `/`, with or
+  without a drive letter, including the `\\?\` and macOS `/System/Volumes/Data` spellings of
   them) before it hashes or sends it, and every UNC path too (a home share cannot be told from an
   application share), so the stored value and the change
   history name machine-scope roots only (ADR-0016 §8, #5186). (The only `HKCU`

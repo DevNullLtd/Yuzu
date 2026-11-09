@@ -5535,6 +5535,80 @@ TEST_CASE("collector: single-flight is per plugin, so a hung action keeps its si
     CHECK(g_blocking_entered.load() == 4);
 }
 
+TEST_CASE("collector: a hung plugin leaves the other plugins' sections reporting in the same pass",
+          "[sync][collector][v3][workers]") {
+    g_blocking_entered = 0;
+    g_blocking_release_p = std::promise<void>{};
+    g_blocking_release = g_blocking_release_p.get_future().share();
+    reset_fakes();
+    g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\n";
+    g_fake[3].out["list_inventory"] = "status|list_inventory|supported|-\n";
+    CollectorTuning tuning;
+    // Real-clock wait is the contract under test (a hung worker is abandoned at its limit);
+    // bounded at 50 ms.
+    tuning.time_limit = std::chrono::milliseconds{50};
+    // pkg_inventory sits BETWEEN the two responders in the action table: a flag shared by every
+    // plugin would hold msi_packages out, one keyed by plugin does not.
+    Collector c({{"installed_apps", &kFakeIa},
+                 {"pkg_inventory", &kHungManagersPkg},
+                 {"msi_packages", &kFakeMsi}},
+                tuning);
+    bool released = false;
+    const auto release_worker = [&released] {
+        if (!released) {
+            released = true;
+            g_blocking_release_p.set_value();
+        }
+    };
+    const yuzu::test::ScopeExit guard{release_worker};
+
+    const auto first = c.collect();
+    REQUIRE(first.has_value());
+    const auto s1 = sections_of(first->first);
+    const V3Sec* managers = find_sec(s1, "pkg_inventory.managers");
+    const V3Sec* packages = find_sec(s1, kFacetPkgs);
+    const V3Sec* store = find_sec(s1, "pkg_inventory.store_packages");
+    const V3Sec* apps = find_sec(s1, kFacetApps);
+    const V3Sec* msi_sec = find_sec(s1, "msi_packages.list_inventory");
+    REQUIRE(managers != nullptr);
+    REQUIRE(packages != nullptr);
+    REQUIRE(store != nullptr);
+    REQUIRE(apps != nullptr);
+    REQUIRE(msi_sec != nullptr);
+    // The hung plugin and its siblings report for themselves (status-only, so a sibling that was
+    // healthy is sent in full once the plugin answers again) ...
+    CHECK(managers->status == "timeout");
+    CHECK(managers->token == "timeout");
+    CHECK(packages->status == "timeout");
+    CHECK(packages->token == "busy");
+    CHECK(store->status == "timeout");
+    CHECK(store->token == "busy");
+    // ... and the plugins either side of it are entered and report in full: one hung plugin never
+    // costs another its section.
+    CHECK(apps->status == "full");
+    CHECK(msi_sec->status == "full");
+    CHECK(g_fake[0].calls.load() == 1);
+    CHECK(g_fake[3].calls.load() == 1);
+    CHECK(c.workers->outstanding() == 1);
+    CHECK(g_blocking_entered.load() <= 1);
+
+    // Released: the plugin is free and every source answers in full.
+    release_worker();
+    CHECK(yuzu::agent::drain_collector_workers(*c.workers, std::chrono::seconds{10}, {}));
+    CHECK(c.workers->outstanding() == 0);
+    const auto second = c.collect();
+    REQUIRE(second.has_value());
+    const auto s2 = sections_of(second->first);
+    for (const char* facet : {kFacetApps, "pkg_inventory.managers", "pkg_inventory.packages",
+                              "pkg_inventory.store_packages", "msi_packages.list_inventory"}) {
+        CAPTURE(facet);
+        const V3Sec* sec = find_sec(s2, facet);
+        REQUIRE(sec != nullptr);
+        CHECK(sec->status == "full");
+    }
+    CHECK(c.workers->outstanding() == 0);
+}
+
 TEST_CASE("collector: a rejected bounded call is timeout:rejected and its flag is clear at once",
           "[sync][collector][v3][workers]") {
     std::atomic<int> invoked{0};

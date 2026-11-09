@@ -206,30 +206,49 @@ std::string canonical_release(std::string_view release) {
     return release == "(none)" ? std::string{} : std::string(release);
 }
 
+namespace {
+
+// Roots that name an account, compared on the normalised form (lower case, '/' for '\\', any
+// drive letter dropped) at a segment boundary.
+constexpr std::string_view kPerUserRoots[] = {"/users", "/documents and settings", "/home",
+                                               "/root"};
+
+// The macOS firmlink: the Data volume's logical path is the same path without this prefix.
+constexpr std::string_view kDataVolume = "/system/volumes/data";
+
+} // namespace
+
 bool is_per_user_path(std::string_view p) {
     if (p.size() >= 2 && is_sep(p[0]) && is_sep(p[1])) {
         // `\\?\` and `\\.\` are the Win32 extended-length and device prefixes: the path after
         // one is the same path as without it, so classify what follows. Anything else that
         // opens with two separators is a UNC path (`\\host\share\...`, `\\?\UNC\...`): the
         // writer cannot tell a home share from an application share, so every UNC path is
-        // blanked (fail closed). Same look-through idiom as redact_mount_points
-        // (sync_source_device_ci.hpp).
+        // blanked (fail closed).
         if (p.size() < 4 || !(p[2] == '?' || p[2] == '.') || !is_sep(p[3]))
             return true;
         p.remove_prefix(4);
         if (starts_with_ci(p, "unc") && p.size() > 3 && is_sep(p[3]))
             return true;
-    } else if (p.starts_with("/System/Volumes/Data/")) {
-        // macOS firmlink: the Data volume's logical path is the same path without the prefix.
-        p.remove_prefix(20);
     }
-    // <drive>:\Users\ or <drive>:/Users/ (Windows paths are case-insensitive).
-    if (p.size() >= 9 && std::isalpha(static_cast<unsigned char>(p[0])) && p[1] == ':' &&
-        is_sep(p[2]) && starts_with_ci(p.substr(3), "users") && is_sep(p[8])) {
-        return true;
+    // The same normalisation as mount_entry_is_personal (sync_source_device_ci.cpp), so the two
+    // writers classify one spelling alike. They differ on purpose: /volumes is not a root here (an
+    // install location on another volume names an application, not a person), a UNC path is
+    // blanked above (fail closed) where the mount rule passes it through, and a non-path is kept
+    // where the mount rule treats it as personal.
+    std::string n(p);
+    for (char& c : n)
+        c = c == '\\' ? '/' : ascii_lower(c);
+    std::string_view v = n;
+    if (v.size() >= 2 && v[0] >= 'a' && v[0] <= 'z' && v[1] == ':')
+        v.remove_prefix(2);
+    if (v.starts_with(kDataVolume) && v.size() > kDataVolume.size() && v[kDataVolume.size()] == '/')
+        v.remove_prefix(kDataVolume.size());
+    for (const auto root : kPerUserRoots) {
+        if (v.starts_with(root) && (v.size() == root.size() || v[root.size()] == '/'))
+            return true;
     }
-    return p.starts_with("/Users/") || p.starts_with("/home/") || p == "/root" ||
-           p.starts_with("/root/");
+    return false;
 }
 
 SwEntry v3_normal_form(const SwEntry& in) {

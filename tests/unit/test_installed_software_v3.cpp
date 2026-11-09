@@ -296,7 +296,11 @@ TEST_CASE("per-user install_location spellings are blanked on the wire", "[v3][w
         "//host/share/Tool",              "\\\\?\\UNC\\host\\share\\Tool", "\\\\?\\unc\\host\\share",
         "\\\\.\\UNC\\host\\share\\Tool",
         "/System/Volumes/Data/Users/alice/App", "/System/Volumes/Data/home/alice",
-        "/System/Volumes/Data/root/bin"};
+        "/System/Volumes/Data/root/bin",
+        // Case, separator, a missing drive letter and the legacy profile root name the same trees
+        // (mount_entry_is_personal, sync_source_device_ci.cpp, reads them all as personal).
+        "/users/alice/App", "/System/Volumes/Data/users/x", "C:\\Documents and Settings\\alice\\x",
+        "c:/documents and settings/x", "\\Users\\alice\\x", "/Documents and Settings/x"};
     for (const auto& path : blanked) {
         CAPTURE(path);
         CHECK(is_per_user_path(path));
@@ -318,7 +322,7 @@ TEST_CASE("per-user install_location spellings are blanked on the wire", "[v3][w
     const std::vector<std::string> kept = {
         "\\\\?\\C:\\Program Files\\Tool", "\\\\.\\C:\\Windows", "/System/Volumes/Data/Applications/Tool.app",
         "/System/Applications/Tool.app", "/System/Volumes/Data", "/System/Volumes/Data/opt/x",
-        "\\\\?\\", "\\x", "\\\\?\\Cx"};
+        "\\\\?\\", "\\x", "\\\\?\\Cx", "/homework", "C:\\Usersx", "/Documents and Settingsx"};
     for (const auto& path : kept) {
         CAPTURE(path);
         CHECK_FALSE(is_per_user_path(path));

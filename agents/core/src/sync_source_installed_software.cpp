@@ -674,14 +674,14 @@ void vendor_or_origin(SwEntry& e) {
             std::string(kOriginLabelPrefix) + (e.ecosystem.empty() ? "unknown" : e.ecosystem);
 }
 
-bool CollectorWorkers::try_begin(std::string_view facet) {
+bool CollectorWorkers::try_begin(std::string_view plugin) {
     std::lock_guard<std::mutex> lk(mu_);
-    return busy_.emplace(std::string(facet)).second;
+    return busy_.emplace(std::string(plugin)).second;
 }
 
-void CollectorWorkers::end(std::string_view facet) noexcept {
+void CollectorWorkers::end(std::string_view plugin) noexcept {
     std::lock_guard<std::mutex> lk(mu_);
-    if (const auto it = busy_.find(facet); it != busy_.end())
+    if (const auto it = busy_.find(plugin); it != busy_.end())
         busy_.erase(it);
 }
 
