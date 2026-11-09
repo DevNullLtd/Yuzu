@@ -392,6 +392,9 @@ std::string http_head(std::string_view url, int& status_code) {
     }
     status_code = res->status;
 
+    // Response headers come back in the order the server sent them (cpp-httplib 0.59 keeps
+    // insertion order); before the 0.59 bump the order was unspecified (hash order, differing
+    // by platform).
     std::string headers_str;
     for (const auto& [k, v] : res->headers) {
         headers_str += k + ": " + v + "\n";

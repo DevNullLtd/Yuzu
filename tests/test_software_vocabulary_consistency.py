@@ -314,6 +314,14 @@ class VocabularyConsistency(unittest.TestCase):
         self.assertEqual(extract_table_row(text, "kind"), EXPECTED_KINDS)
         self.assertEqual(extract_table_row(text, "ecosystem"), EXPECTED_ECOSYSTEMS)
 
+    def test_manual_table_rows_are_aligned(self):
+        # A merge that adds a column to some rows only must not pass: every row of the field
+        # table has the header's cell count.
+        block = next(b for b in re.findall(r"(?m)(?:^[ \t]*\|.*\n?)+", read(MANUAL))
+                     if "| `kind` |" in b)
+        counts = {len(l.strip()[1:-1].split("|")) for l in block.splitlines()}
+        self.assertEqual(len(counts), 1, f"field table rows have uneven cell counts: {counts}")
+
     def test_emitted_equals_published(self):
         self.assertEqual(self.emitted_kinds, EXPECTED_KINDS)
         self.assertEqual(self.emitted_ecos, EXPECTED_ECOSYSTEMS)

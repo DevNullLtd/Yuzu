@@ -7,6 +7,7 @@
 #include <map>
 #include <string_view>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -14,6 +15,7 @@
 #include "custom_properties_store.hpp"
 #include "dedup_fleet_tags.hpp" // agent command-dedup store fleet telemetry (#3663)
 #include "dex_perf_rules.hpp"
+#include "guardian_backend_fleet_tags.hpp" // yuzu.guardian_backend fleet rollup + device accessors (#2240)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet telemetry table (rung 9c PR-3)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
@@ -931,6 +933,18 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "through NetShareEnum (name, path, kind and flags only), macOS reads the share points "
          "recorded by sharing -l -f json plus /etc/exports as written (not live smbd/nfsd "
          "state); read-only"},
+        {"virtualization.host",
+         "Virtualization facts: whether this device is a VM (guest), a Windows host running "
+         "Hyper-V/VBS/WSL2 (host_with_hypervisor, not a guest), or bare metal; which hypervisor; "
+         "and whether the agent itself runs in a container. CPUID, DMI/SMBIOS, sysctl, cgroup and "
+         "container-marker reads only; a host-decision source (SMBIOS, CPUID, OS hint) that cannot "
+         "be read reads unknown with a reason, never bare_metal; read-only, no subprocess"},
+        {"virtualization.wsl",
+         "WSL distributions for each local user profile (Windows only): account, distribution "
+         "name, WSL version, state, default and flavor; per-user data, so it needs an "
+         "administrator or an approval. Reads the loaded user hive, else mounts the profile's "
+         "NTUSER.DAT offline (changes that hive's sequence number and hash); wsl2 is not a VM "
+         "count; install paths, SIDs and user ids are never reported; read-only, no subprocess"},
         {"remote_access_audit.list",
          "SSH inbound-access audit as configured: sshd_config values (Include followed, Match not "
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
@@ -956,14 +970,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"hardware.memory", "Installed memory modules (DIMMs) with size and type"},
         {"hardware.disks", "Physical disk drives with size and media type"},
         {"hardware.drivers", "Installed device drivers with version, date, provider, class"},
-        {"hardware.chassis", "Chassis type, serial and asset tag (planned on every OS this release; one unsupported status row)"},
-        {"hardware.baseboard", "Baseboard vendor, product and serial (planned on every OS this release; one unsupported status row)"},
-        {"hardware.swap", "Swap devices and page files with total and used size (planned on every OS this release; one unsupported status row)"},
-        {"hardware.machine_id", "Keyed hash of the OS machine identifier (planned on every OS this release; one unsupported status row)"},
+        {"hardware.chassis", "Chassis type, serial and asset tag (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.baseboard", "Baseboard vendor, product and serial (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.swap", "Swap devices and page files with total and used size (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
+        {"hardware.machine_id", "Fixed-label HMAC-SHA256 of the OS machine identifier, a stable pseudonym that is not secret from a holder of the raw id (read on Windows; planned on Linux and macOS this release: one unsupported status row)"},
         // disk_actions
         {"disk_actions.smart", "Per-physical-drive health: model, transport, media type and, where the OS exposes it, wear indicators"},
         {"disk_actions.volumes", "Mapping between physical drives and the logical volumes they back, with mount points"},
-        {"disk_actions.partitions", "Partitions of each physical disk with size, type and mount points (planned on every OS this release; one unsupported status row)"},
+        {"disk_actions.partitions", "Partitions of each physical disk with size, type and mount points (read on Windows via WMI: Win32_DiskPartition view, no Microsoft Reserved partition, drive letters only, unmeasured on dynamic disks/BitLocker/Storage Spaces; planned on Linux and macOS: one unsupported status row)"},
         {"disk_actions.topology", "LVM, md, multipath and APFS container layers above the physical disks (planned on every OS this release; one unsupported status row)"},
         // os_info
         {"os_info.os_name", "Full OS product name"},
@@ -1139,13 +1153,15 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"pkg_inventory.managers",
          "List package managers present on the host with manager-level config facts "
          "(macOS Homebrew prefixes; Linux dpkg/apt/rpm/dnf/pacman/apk/snap/flatpak presence "
-         "with apt/snap/flatpak counts; read-only, no subprocess; Windows planned)"},
+         "with apt/snap/flatpak counts; Windows Chocolatey lib presence and winget presence "
+         "from the Appx roster; read-only, no subprocess)"},
         {"pkg_inventory.packages",
-         "List macOS Homebrew formulae and casks by name, version and kind (macOS only; "
-         "Linux unsupported by design; installed_apps owns the roster)"},
+         "List macOS Homebrew formulae and casks and Windows Chocolatey packages by name, "
+         "version and kind (Linux unsupported by design; installed_apps owns the roster)"},
         {"pkg_inventory.store_packages",
-         "List installed snaps and flatpak apps/runtimes from the system store (Linux; "
-         "read-only, no subprocess; macOS unsupported by design, Windows planned)"},
+         "List installed snaps and flatpak apps/runtimes from the system store (Linux) and "
+         "the Windows Appx/MSIX all-user roster (read-only, no subprocess; macOS unsupported "
+         "by design)"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // firmware_posture
@@ -1153,10 +1169,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // runtimes
         {"runtimes.dotnet",
          "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "
-         "install path (Linux only; standard roots only, directory walk, no subprocess)"},
+         "install path (Windows registry, macOS and Linux standard-root directory walks; "
+         "no subprocess)"},
         {"runtimes.jvm",
          "List installed JVMs by image type, version, home and vendor from each home's "
-         "release file (Linux only; standard roots only, no subprocess)"},
+         "release file (Windows registry, macOS JavaVirtualMachines and Linux standard "
+         "roots; no subprocess)"},
         {"runtimes.python",
          "List installed Python interpreters by flavour, version, install path and vendor "
          "(Windows PEP 514 registry keys, macOS python.org framework, Linux python3.<minor> "
@@ -2407,6 +2425,78 @@ AgentHealthStore::net_snapshot(std::chrono::seconds staleness) const {
     return out;
 }
 
+namespace {
+/// The shared body of guardian_backend_for / guardian_backend_of: staleness filter, then the SAME
+/// closed-set parse recompute_metrics uses. nullopt for absent, empty, rejected or stale; never a
+/// default. Caller holds AgentHealthStore::mu_.
+std::optional<std::string_view>
+guardian_backend_from_snapshot(const AgentHealthSnapshot& snap,
+                               std::chrono::steady_clock::time_point now,
+                               std::chrono::seconds staleness) {
+    if ((now - snap.last_seen) > staleness)
+        return std::nullopt; // the sweep prunes only every 15 s, so the accessor filters itself
+    static const std::string kKeyGuardianBackend{kGuardianBackendTag};
+    const auto it = snap.status_tags.find(kKeyGuardianBackend);
+    if (it == snap.status_tags.end() || it->second.empty())
+        return std::nullopt; // NotReported
+    const auto idx = parse_guardian_backend_token(it->second);
+    if (!idx)
+        return std::nullopt; // rejected: counted by the gauge, null on the device
+    return guardian_backend_token_view(*idx);
+}
+} // namespace
+
+namespace {
+/// A busy-wait on steady_clock. Used only where sleep_for cannot honour a microsecond request
+/// (see kGuardianBackendPause). Compiled on every platform so the POSIX build still checks it.
+[[maybe_unused]] void spin_for(std::chrono::microseconds d) {
+    const auto until = std::chrono::steady_clock::now() + d;
+    while (std::chrono::steady_clock::now() < until) {
+    }
+}
+
+/// The pause between slices of guardian_backend_for. Called with mu_ RELEASED.
+void pause_between_slices() {
+#ifdef _WIN32
+    spin_for(kGuardianBackendPause); // MSVC sleep_for rounds up to a 1-15.6 ms tick
+#else
+    std::this_thread::sleep_for(kGuardianBackendPause);
+#endif
+}
+} // namespace
+
+std::vector<std::optional<std::string_view>>
+AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
+                                       std::chrono::seconds staleness) const {
+    std::vector<std::optional<std::string_view>> out;
+    out.reserve(agent_ids.size());
+    const auto now = std::chrono::steady_clock::now();
+    for (std::size_t base = 0; base < agent_ids.size(); base += kGuardianBackendSlice) {
+        if (base != 0)
+            pause_between_slices(); // lock NOT held; see the constant
+        const auto end = std::min(agent_ids.size(), base + kGuardianBackendSlice);
+        std::lock_guard lock(mu_);
+        for (std::size_t i = base; i < end; ++i) {
+            const auto it = snapshots_.find(agent_ids[i]);
+            out.push_back(it == snapshots_.end()
+                              ? std::nullopt
+                              : guardian_backend_from_snapshot(it->second, now, staleness));
+        }
+    }
+    return out;
+}
+
+std::optional<std::string_view>
+AgentHealthStore::guardian_backend_of(const std::string& agent_id,
+                                      std::chrono::seconds staleness) const {
+    std::lock_guard lock(mu_);
+    const auto it = snapshots_.find(agent_id);
+    if (it == snapshots_.end())
+        return std::nullopt;
+    return guardian_backend_from_snapshot(it->second, std::chrono::steady_clock::now(),
+                                          staleness);
+}
+
 void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                                          std::chrono::seconds staleness) {
     std::lock_guard lock(mu_);
@@ -2454,6 +2544,10 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_spark_quarantined");
     metrics.clear_gauge_family("yuzu_fleet_spark_slow_op");
     metrics.clear_gauge_family("yuzu_fleet_spark_unsupported"); // F7, #2298 rung 2
+    // #2240: categorical family, rebuilt each sweep (absent-not-zero). The two meta gauges
+    // (_reporting, _tag_rejected) are NOT cleared: they are re-set unconditionally below, so a
+    // cleared-then-unpublished window can never read as "sweep did not run".
+    metrics.clear_gauge_family(kGuardianBackendGauge);
     // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Same rule, and it
     // bites hardest here: the writer is sparse (a 0 counter ships no tag), so on a
     // healthy or inert fleet NOBODY reports and every family must be ABSENT. A
@@ -2669,6 +2763,15 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             keys[i] = kGuardianIoCeilingMetrics[i].tag;
         return keys;
     }();
+    // #2240: yuzu.guardian_backend. A categorical partition count: each recognised agent is in
+    // exactly one {os,backend} bucket. gb_reporting is the valid-tag denominator, gb_tag_rejected
+    // the non-empty-but-unparseable count (never bucketed, never `legacy`).
+    std::unordered_map<std::string, std::array<int, kNGuardianBackendTokens>> guardian_backend_os;
+    int gb_reporting = 0;
+    int gb_tag_rejected = 0;
+    // Same static-destruction-safety rationale as gj_keys above: built once, get_view takes a
+    // const std::string& so the C-string constant would otherwise heap-construct a key per agent.
+    static const std::string kKeyGuardianBackend{kGuardianBackendTag};
     int gh_reporting = 0;
     int gh_tag_rejected = 0;
     // Same static-destruction-safety rationale as gj_keys above.
@@ -3052,6 +3155,22 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             }
         }
 
+        // #2240: Guardian detection backend (legacy/spark/spark_failed/unwired). A categorical
+        // partition by net_os. EMPTY (absent key or present-empty value) is NotReported: skipped,
+        // not rejected, and never read as `legacy` (guardian_backend_fleet_tags.hpp). A non-empty
+        // value outside the closed table is REJECTED: counted once, in no bucket. CLOCK: this
+        // read, like the staleness prune above, keys off last_seen because the tag rides every
+        // beat today; a status-beat split (H4a) must move it (see the header's CLOCK paragraph).
+        if (const std::string_view backend_raw = get_view(kKeyGuardianBackend);
+            !backend_raw.empty()) {
+            if (const auto idx = parse_guardian_backend_token(backend_raw)) {
+                ++guardian_backend_os[net_os][*idx];
+                ++gb_reporting;
+            } else {
+                ++gb_tag_rejected;
+            }
+        }
+
         // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Unconditional -
         // unlike spark there is no posture/denominator tag to gate on: the writer is
         // sparse, so simply having a key IS the report. Reads go through get_view() so
@@ -3399,6 +3518,21 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
     metrics.gauge(kGuardianHealthTagRejectedGauge)
         .set(static_cast<double>(gh_tag_rejected));
+
+    // #2240: one series per (os, backend) that has at least one agent; a pair nobody is in stays
+    // ABSENT (the > 0 guard), never a pre-seeded 0. Label values come from the closed token
+    // table and the normalize_os allowlist, never from agent bytes. The meta gauges publish
+    // every sweep including 0.
+    for (const auto& [os, counts] : guardian_backend_os)
+        for (std::size_t i = 0; i < kNGuardianBackendTokens; ++i)
+            if (counts[i] > 0)
+                metrics
+                    .gauge(kGuardianBackendGauge,
+                           {{kGuardianBackendLabelOs, os},
+                            {kGuardianBackendLabelBackend, kGuardianBackendTokens[i]}})
+                    .set(static_cast<double>(counts[i]));
+    metrics.gauge(kGuardianBackendReportingGauge).set(static_cast<double>(gb_reporting));
+    metrics.gauge(kGuardianBackendTagRejectedGauge).set(static_cast<double>(gb_tag_rejected));
 }
 
 void AgentHealthStore::recompute_perf_os_gauges(

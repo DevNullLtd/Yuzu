@@ -250,7 +250,12 @@ public:
     /// this same struct rather than issuing a second per-lens fetch. The MCP twin
     /// `get_hardware_ci` (mcp_tools_hardware.cpp) calls this same closure through
     /// `mcp::ToolDeps`, so the REST and MCP records cannot diverge.
-    using CiDetailFn = std::function<HardwareCiDetail(const std::string& agent_id)>;
+    /// `CiRead::WithSections` asks for the v2 per-section statuses and rows (read in the SAME
+    /// snapshot as the record: no extra lease, one more set of statements in the same single-lease
+    /// transaction): ONLY the REST record route and the MCP tool pass it. The dashboard fragment
+    /// (including the 1-2 s sync-now poll) and the actions lens pass `CiRead::RecordOnly` and get
+    /// `ci_sections` NOT READ (`std::nullopt`), so they never pay for rows they do not render.
+    using CiDetailFn = std::function<HardwareCiDetail(const std::string& agent_id, CiRead read)>;
 
     /// One connected agent's advertised plugins/actions — `nullopt` when the agent
     /// has no live session (actions are dispatch-to-a-connected-agent only, unlike

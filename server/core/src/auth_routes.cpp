@@ -24,6 +24,7 @@
 #include "http_route_sink.hpp"
 #include "legacy_self_service_allow.hpp"
 #include "mcp_policy.hpp"
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter (not a store outage)
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
 #include "step_up_gate.hpp"
@@ -62,6 +63,11 @@ constexpr std::size_t kMaxJustificationLength = 1024;
 // pre-seeded in server.cpp. Any error that is not is_store_unavailable() must
 // never reach a 503 degrade site, so the default ("query_error") is a
 // belt-and-braces fallback, not an expected path.
+//
+// #6995: `AuthDBError::EntropyUnavailable` MUST NEVER be passed here. It is inside
+// is_store_unavailable() (so it stays a fail-closed 503) but is not a store outage, and the
+// default arm would silently label it `query_error` -- the misattribution that change removed.
+// The one caller tests is_entropy_failure() first and counts the fault elsewhere.
 [[nodiscard]] const char* degrade_reason(AuthDBError e) noexcept {
     switch (e) {
     case AuthDBError::StoreBusy:
@@ -183,6 +189,34 @@ struct AuditProbeScope {
     AuditProbeScope(const AuditProbeScope&) = delete;
     AuditProbeScope& operator=(const AuditProbeScope&) = delete;
 };
+
+// The remediation for a supervised-tier token refused on a non-MCP transport. The generic text
+// names the flow; a pair with a named MCP tool also names the tool and what it needs, because
+// the contract (a required idempotency_key, the approval_id on the repeat call) cannot be
+// guessed from "ticket-then-recall". EXTEND this function when a pair gains a tool, never fork.
+std::string approval_gated_remediation(std::string_view securable_type, std::string_view operation) {
+    if (securable_type == "Workflow" && operation == "Execute")
+        return "this operation is approval-gated for the supervised MCP tier; call the MCP "
+               "execute_workflow tool (POST /mcp/v1/) with an idempotency_key: the first call "
+               "returns an approval_id, and once an administrator approves it, repeat the same "
+               "call with that approval_id. A person can also run it from the dashboard";
+    return "this operation is approval-gated for the supervised MCP tier; use the MCP "
+           "ticket-then-recall flow (POST /mcp/v1/) or the dashboard";
+}
+
+// The ONE place a CredentialReadMode is interpreted: true == read the durable row, false == a
+// cache may answer. There is deliberately NO `default:`, so a new enumerator is a -Wswitch
+// diagnostic here instead of a silent fall-through to the weaker (cached) read. A value outside
+// the enumerators (reachable only through a cast) takes the durable read, the stronger one.
+bool reads_durable_row(auth::CredentialReadMode mode) noexcept {
+    switch (mode) {
+    case auth::CredentialReadMode::kCached:
+        return false;
+    case auth::CredentialReadMode::kAuthoritative:
+        return true;
+    }
+    return true;
+}
 
 } // namespace
 
@@ -517,7 +551,8 @@ std::optional<auth::Session> AuthRoutes::resolve_session_unbound(const httplib::
     return std::nullopt;
 }
 
-auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token) const {
+auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token,
+                                                          auth::CredentialReadMode mode) const {
     using R = auth::CredentialCheck;
 
     // Mirrors the two gates synthesize_token_session applies AFTER the token row
@@ -541,11 +576,35 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
     if (!engine_principal_store_) {
         return R::kRevoked;
     }
-    // The ONE cached-lookup site (#2367). This function is only ever reached
-    // from revalidate_stream — the per-tick liveness re-check of an ALREADY
-    // authenticated stream — never from session synthesis or an on-behalf-of
-    // target check, both of which call get_for_auth and read through to
-    // Postgres every time (which is why this method is private).
+    // The ONE cached-lookup site (#2367). This function is only ever reached from
+    // revalidate_stream, which two kinds of caller ask: the held-open MCP stream's per-tick
+    // liveness re-check (kCached, below) and the workflow run's per-step boundary check
+    // (kAuthoritative, next). Session synthesis and the on-behalf-of target check never come
+    // here: they call get_for_auth and read through to Postgres every time (which is why this
+    // method is private).
+    if (reads_durable_row(mode)) {
+        // A boundary check, not a timer tick: ask Postgres, never the 15 s liveness cache. Same
+        // three-way mapping as below; nothing is reported stale because nothing was cached.
+        // This also bypasses get_for_auth_revalidate's 5-10 s failure backoff (#2367), so under a
+        // pool brownout every check pays for its own lease attempts. The bound (measured): a check makes at
+        // most three reads (two token candidates and this row). A saturated pool makes each
+        // wait at most 0.5 s, so about 4 s per boundary (the run asks twice when the first
+        // answer is indeterminate, one second apart). A database that accepts connections but
+        // does not answer costs the 10 s connect timeout on the first read of each attempt, about
+        // 21 s per boundary. A read on a connection already leased to a database that stopped
+        // answering did not return in 150 s in a test: no pool timeout bounds it and the run
+        // deadline is re-tested only after the retry wait. It fails closed (kIndeterminate)
+        // whenever a read returns.
+        switch (engine_principal_store_->get_for_auth(token.principal_id).status) {
+        case EngineLookupStatus::Active:
+            return R::kValid;
+        case EngineLookupStatus::MissingOrRevoked:
+            return R::kRevoked;
+        case EngineLookupStatus::StoreUnreachable:
+            return R::kIndeterminate;
+        }
+        return R::kRevoked; // unreachable: fail closed on a future enum value
+    }
     const auto engine = engine_principal_store_->get_for_auth_revalidate(token.principal_id);
     switch (engine.status) {
     case EngineLookupStatus::Active:
@@ -570,7 +629,8 @@ auth::CredentialCheck AuthRoutes::engine_credential_state(const ApiToken& token)
 }
 
 auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
-                                                    const std::string& expected_principal) {
+                                                    const std::string& expected_principal,
+                                                    auth::CredentialReadMode mode) {
     using R = auth::CredentialCheck;
 
     // The invariant: a stream lives iff a FRESH request carrying these same headers
@@ -581,8 +641,11 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
     // to also carry a stale cookie from a browser jar or a cookie-injecting proxy.
     // It failed closed, but it was still wrong.
 
-    // 1. Session cookie. AuthManager's session table is in-memory, so a "no" here is
-    //    always DEFINITIVE — there is no backend that could be unavailable.
+    // 1. Session cookie. `validate_session` answers from the cache of the durable session
+    //    store, whose generation it polls at most once per second (and distrusts past 30 s of
+    //    failed polls, going to the store). A "no" here is treated as DEFINITIVE even when it
+    //    came from a degraded store read: that fails closed (kRevoked), it never grants. The
+    //    mode does not change this arm: there is no per-credential cache to bypass.
     const auto cookie = extract_session_cookie(req);
     if (cookie.size() > auth::kMaxSessionTokenLength) {
         // resolve_session hard-rejects an oversized cookie rather than falling through,
@@ -617,7 +680,9 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
     for (const auto& raw : candidates) {
         if (raw.empty() || raw.size() > auth::kMaxApiTokenLength || !api_token_store_)
             continue;
-        const auto checked = api_token_store_->validate_token_checked(raw);
+        const auto checked = api_token_store_->validate_token_checked(
+            raw, reads_durable_row(mode) ? ApiTokenStore::TokenReadMode::kAuthoritative
+                                         : ApiTokenStore::TokenReadMode::kCached);
         switch (checked.status) {
         case ApiTokenStore::TokenCheck::kValid:
             if (checked.token && checked.token->principal_id == expected_principal) {
@@ -630,12 +695,14 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
                 // Returned verbatim, including kValidStale (#2367): the engine
                 // gate is the only staleness this function models today, and
                 // flattening it to kValid here would undo the whole point of
-                // the distinction. NOTE the token half above is NOT modelled —
-                // `validate_token_checked` is served from its own 60 s cache
-                // and reports a hit as plain kValid, so a token-authenticated
-                // stream still carries the additive window this closes for
-                // engine principals. Pre-existing; tracked as #2447.
-                return engine_credential_state(*checked.token);
+                // the distinction. NOTE the token half above is NOT modelled
+                // under kCached: `validate_token_checked` is served from its
+                // own 60 s cache and reports a hit as plain kValid, so a
+                // token-authenticated stream still carries the additive window
+                // this closes for engine principals. Pre-existing; tracked as
+                // #2447. Under kAuthoritative the token row was just read from
+                // Postgres, so there is no cache residency to model.
+                return engine_credential_state(*checked.token, mode);
             }
             break; // a valid token for SOMEONE ELSE is not authority for this stream
         case ApiTokenStore::TokenCheck::kUnavailable:
@@ -803,7 +870,9 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                                     const std::string& securable_type,
                                     const std::string& operation) {
     // Every route keeps ADR-0041's documented answer: an RBAC read that could not be completed
-    // is a 403 (deny-on-degrade). Only the Forensics-tier resolver opts into the 503 mapping.
+    // is a 403 (deny-on-degrade). Only the callers of probe_permission_unavailable_aware (the
+    // Forensics-tier resolver, the software collection settings per-group routes) opt into the 503
+    // mapping.
     return require_permission_impl(req, res, securable_type, operation,
                                    RbacDegradeMapping::DenyAs403);
 }
@@ -1037,8 +1106,8 @@ bool AuthRoutes::require_permission_impl(const httplib::Request& req, httplib::R
         const auto checked =
             rbac_store_->check_permission_checked(session->username, securable_type, operation);
         if (!checked && degrade == RbacDegradeMapping::UnavailableAs503) {
-            // Opt-in only (the Forensics-tier resolver): a read that could not be completed is a
-            // retryable outage, not a missing grant. Every other route takes the 403 below.
+            // Opt-in only (probe_permission_unavailable_aware): a read that could not be completed
+            // is a retryable outage, not a missing grant. Every other route takes the 403 below.
             respond_rbac_unavailable(req, res, securable_type, operation, "RBAC");
             return false;
         }
@@ -1161,13 +1230,12 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
         // false), keep `.remediation` unconditionally (it correctly steers to
         // the ticket-then-recall flow regardless of whether an RBAC grant
         // would separately admit the caller).
+        // Named local: the A4 options hold views, so the text must outlive the a4_denial call.
+        const std::string remediation = approval_gated_remediation(securable_type, operation);
         res.set_content(
             detail::a4_denial(
                 res, 403, "operation requires approval for this MCP tier on this transport",
-                detail::A4ErrorOpts{.remediation = "this operation is approval-gated "
-                                             "for the supervised MCP tier; use the MCP "
-                                             "ticket-then-recall flow (POST /mcp/v1/) or "
-                                             "the dashboard",
+                detail::A4ErrorOpts{.remediation = remediation,
                             .permission = actionable_permission ? std::string_view(perm)
                                                                 : std::string_view{}}),
             "application/json");
@@ -1294,14 +1362,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
                           securable_type + ":" + operation + " on a non-MCP transport");
             res.status = 403;
+            const std::string remediation = approval_gated_remediation(securable_type, operation);
             res.set_content(
                 detail::a4_denial(
                     res, 403,
                     "operation requires approval for this MCP tier on this transport",
-                    detail::A4ErrorOpts{.remediation = "this operation is approval-gated for the "
-                                               "supervised MCP tier; use the MCP ticket-then-recall "
-                                               "flow (POST /mcp/v1/) or the dashboard",
-                                .permission = perm}),
+                    detail::A4ErrorOpts{.remediation = remediation, .permission = perm}),
                 "application/json");
             return false;
         }
@@ -2652,6 +2718,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // never a generic 500 that could be confused with a
                 // harmless one-off. No session is minted either way.
                 const bool store_unavailable = is_store_unavailable(init.error());
+                // #6995: a CSPRNG fault is still a fail-closed 503, but no query FAILED, so it is
+                // counted in yuzu_secure_random_failure_total and NOT in the store-outage
+                // counters below. The response itself (503, Retry-After: 2, retry_after_ms) is
+                // deliberately UNCHANGED from #4763 so callers see no new status or header; the
+                // 2 s hint is store-derived and is not tuned for a possibly persistent fault.
+                const bool entropy_unavailable = is_entropy_failure(init.error());
                 res.status = store_unavailable ? 503 : 500;
                 if (store_unavailable)
                     res.set_header("Retry-After", "2"); // #2396 honest backoff hint (503 only)
@@ -2661,7 +2733,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                            {.retry_after_ms = 2000})
                         : detail::a4_error(res, "Could not initiate MFA enrollment"),
                     "application/json");
-                if (store_unavailable) {
+                if (entropy_unavailable) {
+                    mfa_entropy::count(auth_mgr_.metrics_registry(), mfa_entropy::kSiteEnroll);
+                } else if (store_unavailable) {
                     if (auto* m = auth_mgr_.metrics_registry()) {
                         m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
                             .increment();
@@ -2674,7 +2748,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 }
                 audit_log_for_principal(req, "mfa.enroll.required", "error", username,
                                         auth::role_to_string(*role_opt), "User", username,
-                                        store_unavailable
+                                        entropy_unavailable
+                                            ? "csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
+                                              "fail-closed)"
+                                        : store_unavailable
                                             ? "mfa_init_enrollment: secret/store unavailable "
                                               "(fail-closed)"
                                             : "mfa_init_enrollment failed");
@@ -3184,6 +3261,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         std::vector<std::string> recovery_codes;
         bool verified = false;
         bool store_unavailable = false;
+        bool entropy_unavailable = false; // #6995: store_unavailable, but a CSPRNG fault
         bool already_enrolled = false;
         bool credential_changed = false;
         bool enrollment_cancelled = false;
@@ -3223,6 +3301,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // this only routes to a distinct fail-closed 503 below
                 // instead of burning an attempt on a transient outage.
                 store_unavailable = true;
+                entropy_unavailable = is_entropy_failure(r.error());
             }
         }
 
@@ -3281,18 +3360,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
                             "application/json");
-            if (auto* m = auth_mgr_.metrics_registry()) {
+            if (entropy_unavailable) {
+                // #6995: the recovery-code draw faulted and the enrolment rolled back.
+                mfa_entropy::count(auth_mgr_.metrics_registry(), mfa_entropy::kSiteRecovery);
+            } else if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                     .increment();
             }
             audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
-                                    "mfa_verify_enrollment: secret/store unavailable "
-                                    "(fail-closed, no session minted)");
+                                    entropy_unavailable
+                                        ? "csprng_unavailable: mfa_recovery (mfa_verify_enrollment, "
+                                          "fail-closed, enrollment rolled back, no session minted)"
+                                        : "mfa_verify_enrollment: secret/store unavailable "
+                                          "(fail-closed, no session minted)");
             emit_event("mfa.enroll.failed", req,
                        {{"source_ip", req.remote_addr},
                         {"username", entry.username},
-                        {"reason", "store_unavailable"}},
+                        {"reason", entropy_unavailable ? "csprng_unavailable"
+                                                       : "store_unavailable"}},
                        {}, Severity::kCritical);
             return;
         }

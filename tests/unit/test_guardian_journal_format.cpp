@@ -195,6 +195,19 @@ TEST_CASE("validate_record: clock is checked before fields", "[guardian][journal
     CHECK(validate_record(r) == JournalReject::SkewedClock);
 }
 
+TEST_CASE("validate_record: empty rule_id rejected, after the clock and before the field scan",
+          "[guardian][journal][format]") {
+    auto r = good_record();
+    r.rule_id.clear();
+    CHECK(validate_record(r) == JournalReject::EmptyRuleId);
+
+    // Clock fault still reports first; the empty id outranks a bad later field.
+    r.rule_name = std::string("x\0y", 3);
+    CHECK(validate_record(r) == JournalReject::EmptyRuleId);
+    r.enqueued_ns = 0;
+    CHECK(validate_record(r) == JournalReject::SkewedClock);
+}
+
 // ── serialize / parse round-trip ─────────────────────────────────────────────
 
 TEST_CASE("journal batch round-trips byte-exact", "[guardian][journal][format]") {

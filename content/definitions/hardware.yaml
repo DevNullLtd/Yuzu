@@ -228,13 +228,13 @@ spec:
         platforms: [windows, linux, darwin]
       - name: socket_designation
         type: string
-        description: 'Socket label (e.g. "CPU 1"). Always "-" until a leg reads it. Values: "-".'
-        example: "-"
+        description: 'Socket label as the firmware names it (e.g. "U3E1", "CPU 1"); "-" when the firmware reports filler or nothing, and on Linux and macOS until their legs read it. Windows reads Win32_Processor.SocketDesignation. Values: free text, or "-".'
+        example: "FP8"
         platforms: [windows, linux, darwin]
       - name: stepping
         type: string
-        description: 'CPU stepping. Always "-" until a leg reads it. Values: "-".'
-        example: "-"
+        description: 'CPU stepping as a decimal number; "-" when it cannot be read, and on Linux and macOS until their legs read it. Windows derives it from the low nibble of CPUID EAX in Win32_Processor.ProcessorId on x86/x64, and falls back to the class Stepping value elsewhere. Values: a decimal number, or "-".'
+        example: "10"
         platforms: [windows, linux, darwin]
 
   readablePayload: "List installed processors"
@@ -307,18 +307,18 @@ spec:
         platforms: [windows, linux]
       - name: manufacturer
         type: string
-        description: 'DIMM manufacturer. Always "-" until a leg reads it. Values: "-".'
-        example: "-"
+        description: 'DIMM manufacturer string as the module reports it; "-" when it reports filler or nothing, and on Linux until its leg reads it. Windows reads Win32_PhysicalMemory.Manufacturer. Values: free text, or "-".'
+        example: "Micron Technology"
         platforms: [windows, linux]
       - name: part_number
         type: string
-        description: 'DIMM part number. Always "-" until a leg reads it. Values: "-".'
-        example: "-"
+        description: 'DIMM part number, right-trimmed; "-" when the module reports filler or nothing, and on Linux until its leg reads it. Windows reads Win32_PhysicalMemory.PartNumber. Values: free text, or "-".'
+        example: "CT32G56C46S5.C8BA"
         platforms: [windows, linux]
       - name: serial
         type: string
-        description: 'DIMM serial number. Always "-" in this release: a per-module serial is personal data, classified with the system serial, and is not read in this release. Values: "-".'
-        example: "-"
+        description: 'DIMM serial number as the module reports it; "-" when it reports filler or nothing, and on Linux until its leg reads it. Windows reads Win32_PhysicalMemory.SerialNumber. Values: free text, or "-".'
+        example: "0A1B2C3D"
         platforms: [windows, linux]
 
   readablePayload: "List installed memory modules"
@@ -502,6 +502,117 @@ apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 
 metadata:
+  id: device.hardware.drivers_inventory
+  displayName: Driver Inventory (Signed State)
+  version: 1.0.0
+  description: >
+    Lists installed drivers in a stable order (sorted by name, INF, hardware id,
+    version; exact duplicates removed) with version, date, provider, device
+    class, signer, signed state, INF name and hardware id. Always leads with one
+    status row: supported when the read was complete, constrained with reason
+    tokens when it was cut short (a row cap of 4096, a refused or failed read),
+    unsupported on macOS. A value that could not be read is "-", never a guess.
+    Windows reads Win32_PnPSignedDriver (bounded WMI, 4096 rows); a device with
+    no driver bound shows only its hardware id. Linux reads /proc/modules plus
+    /sys/module/<module>/version and taint with bounded no-follow reads: the
+    signed state is "unsigned" only when the module's taint flags contain E, and
+    "-" otherwise (no flag proves a module signed); signer, INF, hardware id and
+    date have no Linux source. Not supported on macOS (no public kext/dext
+    enumeration API). The existing "drivers" instruction is unchanged. This is
+    an on-demand question; it is not part of the daily sync.
+  tags: [hardware, inventory, drivers]
+
+spec:
+  type: question
+  platforms: [windows, linux]
+
+  execution:
+    plugin: hardware
+    action: drivers_inventory
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|drivers_inventory|<supported|constrained|unsupported>|<tokens or ->   (always first)
+    # driver_inv|<name>|<version>|<date>|<provider>|<class>|<signer>|<signed>|<inf>|<hwid>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), driver_inv (one per driver).'
+        values: [status, driver_inv]
+        example: driver_inv
+        platforms: [windows, linux]
+      - name: name
+        type: string
+        description: 'Driver or module name: the Windows DeviceName, or the Linux kernel module name. Status rows: the action name.'
+        example: "AMD Audio CoProcessor"
+        platforms: [windows, linux]
+      - name: version
+        type: string
+        description: 'Driver version (Windows DriverVersion; Linux /sys/module/<m>/version), or "-" when the host reports none. Status rows: the level (supported, constrained or unsupported).'
+        example: "6.0.0.109"
+        platforms: [windows, linux]
+      - name: date
+        type: string
+        description: 'Driver date as YYYY-MM-DD (Windows only), or "-" when empty or in a form that cannot be read unambiguously. Status rows: the reason tokens, comma-separated, or "-" when there are none.'
+        example: "2025-03-26"
+        platforms: [windows]
+      - name: provider
+        type: string
+        description: 'Driver publisher (Windows DriverProviderName; the fixed literal "kernel" on Linux), or "-" when empty.'
+        example: "AMD"
+        platforms: [windows, linux]
+      - name: device_class
+        type: string
+        description: 'Windows DeviceClass (e.g. SYSTEM, NET, MEDIA); the fixed literal "module" on Linux; "-" when empty.'
+        example: "SYSTEM"
+        platforms: [windows, linux]
+      - name: signer
+        type: string
+        description: 'Windows signer of the driver package (Signer), or "-" when empty. No Linux source.'
+        example: "Microsoft Windows Hardware Compatibility Publisher"
+        platforms: [windows]
+      - name: signed
+        type: string
+        description: 'Signature state. Windows: IsSigned True/False. Linux: "unsigned" only when the module taint flags contain E; "-" otherwise, since no flag proves a module signed. Values: signed, unsigned, or "-" when unknown.'
+        values: [signed, unsigned, '-']
+        example: "signed"
+        platforms: [windows, linux]
+      - name: inf
+        type: string
+        description: 'Windows INF name (InfName, e.g. oem18.inf), or "-" when empty. No Linux source.'
+        example: "oem18.inf"
+        platforms: [windows]
+      - name: hwid
+        type: string
+        description: 'Windows hardware id (HardWareID); a backslash is written as "/" by the row escaper. "-" when empty. No Linux source.'
+        example: "PCI/VEN_1022&DEV_15E2&SUBSYS_15E21022&REV_63"
+        platforms: [windows]
+
+  readablePayload: "List installed drivers with signer and signed state"
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [hardware]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+
+metadata:
   id: device.hardware.system
   displayName: System Identity (Serial + UUID)
   version: 1.0.0
@@ -571,13 +682,15 @@ metadata:
   displayName: Chassis
   version: 1.0.0
   description: >
-    Reports the chassis type, serial number and asset tag. Not read yet on any OS:
-    every dispatch answers one unsupported status row (windows:planned,
-    linux:planned or macos:planned) until its leg lands.
-    macOS has no public source and will move to a typed unsupported. It is
-    dispatched by the daily device-record sync: its status, the planned one
-    included, is recorded as the chassis section, and the chassis columns of the
-    record fill once the leg reads them.
+    Reports the chassis type, serial number and asset tag. Windows reads them
+    from the SMBIOS System Enclosure structure; a value the firmware leaves as
+    OEM filler is reported as "-"; a text field is capped at 256 bytes. Linux and
+    macOS do not read it yet: every
+    dispatch answers one unsupported status row (linux:planned or macos:planned)
+    until its leg lands, and macOS has no public source and will move to a typed
+    unsupported. It is dispatched by the daily device-record sync: its status is
+    recorded as the chassis section, and the chassis columns of the record fill
+    from the row.
   tags: [hardware, inventory, chassis]
 
 spec:
@@ -594,7 +707,7 @@ spec:
     properties: {}
 
   result:
-    # status|chassis|<level>|<reason>   (always first; the only row until a leg lands)
+    # status|chassis|<level>|<reason>   (always first; data rows follow it on a readable section)
     # chassis|<type>|<serial>|<asset_tag>|<source>
     columns:
       - name: row_kind
@@ -610,12 +723,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: serial
         type: string
-        description: 'Chassis serial number, or "-" when absent. Status rows: the level (unsupported).'
+        description: 'Chassis serial number, or "-" when absent. Status rows: the level (supported, constrained or unsupported).'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: asset_tag
         type: string
-        description: 'Chassis asset tag, or "-" when absent. Status rows: the reason token (<os>:planned).'
+        description: 'Chassis asset tag, or "-" when absent. Status rows: the reason token (<os>:planned until the leg lands, a failure token on a degraded read, or "-").'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: source
@@ -648,13 +761,15 @@ metadata:
   displayName: Baseboard
   version: 1.0.0
   description: >
-    Reports the baseboard (motherboard) vendor, product and serial number. Not
-    read yet on any OS: every dispatch answers one unsupported status row
-    (windows:planned, linux:planned or macos:planned) until its leg lands.
-    macOS has no public source and will move to a typed unsupported. It is
-    dispatched by the daily device-record sync: its status, the planned one
-    included, is recorded as the baseboard section, and the baseboard columns of
-    the record fill once the leg reads them.
+    Reports the baseboard (motherboard) vendor, product and serial number.
+    Windows reads them from the SMBIOS Baseboard structure; a value the firmware
+    leaves as OEM filler is reported as "-"; a text field is capped at 256 bytes.
+    Linux and macOS do not read it yet:
+    every dispatch answers one unsupported status row (linux:planned or
+    macos:planned) until its leg lands, and macOS has no public source and will
+    move to a typed unsupported. It is dispatched by the daily device-record
+    sync: its status is recorded as the baseboard section, and the baseboard
+    columns of the record fill from the row.
   tags: [hardware, inventory, baseboard]
 
 spec:
@@ -671,7 +786,7 @@ spec:
     properties: {}
 
   result:
-    # status|baseboard|<level>|<reason>   (always first; the only row until a leg lands)
+    # status|baseboard|<level>|<reason>   (always first; data rows follow it on a readable section)
     # baseboard|<vendor>|<product>|<serial>|<source>
     columns:
       - name: row_kind
@@ -687,12 +802,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: product
         type: string
-        description: 'Baseboard product name, or "-" when absent. Status rows: the level (unsupported).'
+        description: 'Baseboard product name, or "-" when absent. Status rows: the level (supported, constrained or unsupported).'
         example: "PRIME B450M-A"
         platforms: [windows, linux, darwin]
       - name: serial
         type: string
-        description: 'Baseboard serial number, or "-" when absent. Status rows: the reason token (<os>:planned).'
+        description: 'Baseboard serial number, or "-" when absent. Status rows: the reason token (<os>:planned until the leg lands, a failure token on a degraded read, or "-").'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: source
@@ -725,12 +840,15 @@ metadata:
   displayName: Swap and Page Files
   version: 1.0.0
   description: >
-    Reports swap devices and page files with total and used size in MB. Not read
-    yet on any OS: every dispatch answers one unsupported status row
-    (windows:planned, linux:planned or macos:planned) until its leg lands.
-    It is dispatched by the daily device-record sync: its status, the planned one
-    included, is recorded as the swap section, and its rows land in that section
-    once the leg reads them (used size is not recorded).
+    Reports swap devices and page files with total and used size in MB. Windows
+    reads Win32_PageFileUsage; the total is the configured maximum when the page
+    file has one (Win32_PageFileSetting), else the current allocation, which a
+    system-managed page file grows under memory pressure. No page file is a
+    definitive answer (a supported status row and no data rows). Linux and macOS
+    do not read it yet: every dispatch answers one unsupported status row
+    (linux:planned or macos:planned) until its leg lands. It is dispatched by the
+    daily device-record sync: its status is recorded as the swap section, and its
+    rows land in that section (used size is live telemetry and is not recorded).
   tags: [hardware, inventory, swap]
 
 spec:
@@ -747,7 +865,7 @@ spec:
     properties: {}
 
   result:
-    # status|swap|<level>|<reason>   (always first; the only row until a leg lands)
+    # status|swap|<level>|<reason>   (always first; data rows follow it on a readable section)
     # swap|<device>|<total_mb>|<used_mb>|<source>
     columns:
       - name: row_kind
@@ -758,17 +876,17 @@ spec:
         platforms: [windows, linux, darwin]
       - name: device
         type: string
-        description: 'Swap device or page-file path, or "-" when absent. Status rows: the action name.'
+        description: 'Swap device or page-file path, or "-" when absent. Backslashes are written as "/" (the plugin row escape), so C:\pagefile.sys reads C:/pagefile.sys. Status rows: the action name.'
         example: "/dev/sda3"
         platforms: [windows, linux, darwin]
       - name: total_mb
         type: string
-        description: 'Total size in MB, or "-" when unread. Status rows: the level (unsupported).'
+        description: 'Total size in MB, or "-" when unread. Status rows: the level (supported, constrained or unsupported).'
         example: "8192"
         platforms: [windows, linux, darwin]
       - name: used_mb
         type: string
-        description: 'Used size in MB, or "-" when unread. Status rows: the reason token (<os>:planned).'
+        description: 'Used size in MB, or "-" when unread. Status rows: the reason token (<os>:planned until the leg lands, a failure token on a degraded read, or "-").'
         example: "512"
         platforms: [windows, linux, darwin]
       - name: source
@@ -801,15 +919,17 @@ metadata:
   displayName: Machine Identifier (Keyed Hash)
   version: 1.0.0
   description: >
-    Reports a keyed hash of the operating system machine identifier. The raw
-    identifier never leaves the host. Not read yet on any OS: every dispatch
-    answers one unsupported status row (windows:planned, linux:planned or
-    macos:planned) until its leg lands; macOS has no
-    source beyond the hardware UUID that device.hardware.system reports and
-    will move to a typed unsupported. It is dispatched by the daily device-record
-    sync: its status, the planned one included, is recorded as the machine id
-    section, and the hashed machine id column of the record fills once the leg
-    reads it.
+    Reports an HMAC-SHA256 hash of the operating system machine identifier. The raw
+    identifier never leaves the host. The hash is an HMAC-SHA256 under a fixed,
+    public, versioned label, so it is stable across reinstalls of the agent and
+    is not secret from a party that already holds the raw identifier. Windows
+    reads the registry MachineGuid. Linux and macOS do not read it yet: every
+    dispatch answers one unsupported status row (linux:planned or macos:planned)
+    until its leg lands, and macOS has no source beyond the hardware UUID that
+    device.hardware.system reports and will move to a typed unsupported. It is
+    dispatched by the daily device-record sync: its status is recorded as the
+    machine id section, and the hashed machine id column of the record fills
+    from the row.
   tags: [hardware, inventory, machine-id]
 
 spec:
@@ -826,7 +946,7 @@ spec:
     properties: {}
 
   result:
-    # status|machine_id|<level>|<reason>   (always first; the only row until a leg lands)
+    # status|machine_id|<level>|<reason>   (always first; data rows follow it on a readable section)
     # machine_id|<hash_hex>|<algorithm>|<source>
     columns:
       - name: row_kind
@@ -842,12 +962,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: algorithm
         type: string
-        description: 'Name of the keyed hash used, or "-" when absent. Status rows: the level (unsupported).'
+        description: 'Name of the keyed hash used, or "-" when absent. Status rows: the level (supported, constrained or unsupported).'
         example: "-"
         platforms: [windows, linux, darwin]
       - name: source
         type: string
-        description: 'Where the identifier was read from, or "-" when absent. Status rows: the reason token (<os>:planned).'
+        description: 'Where the identifier was read from, or "-" when absent. Status rows: the reason token (<os>:planned until the leg lands, a failure token on a degraded read, or "-").'
         example: "/etc/machine-id"
         platforms: [windows, linux, darwin]
 

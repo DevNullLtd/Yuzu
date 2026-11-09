@@ -87,7 +87,7 @@ URL structure:
 
 The source of truth is the agent's `echo_config` table — the `<source>_enabled` keys, set by the `echo.configure` action. The server does not currently maintain a centralised "Echo config" mirror; the data path is **request-driven**:
 
-1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_live_rows` count + `<source>_oldest_ts` per source) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
+1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_rows` count + `<source>_oldest_ts` per source; the server reads `<source>_rows`; an agent that sends only `<source>_live_rows`, from before the roll-up-only release, is shown with a dash and an upgrade note, never with that figure as the count) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
 2. Responses stream back via the standard agent-streaming pipeline.
 3. Server collates into a transient in-memory table; renders as HTMX OOB swaps.
 4. Empty rows (`enabled=true` for all four sources) are dropped — the table only shows the *paused* state, not the entire fleet.
@@ -131,7 +131,7 @@ The "Purge data" button on a row is more dangerous than re-enable — it tells t
 
 Server dispatches a new agent action `echo.purge_source` with `{source: <name>}`. The action is gated behind a typed-hostname confirmation ("type the device hostname to confirm purge of `process` data"), per the destructive-action discipline in the project root `CLAUDE.md`. Audit row: `action: echo.source.purge, principal: <session>, result: success|failure, detail: device=<id> source=<name>` — the dispatch audit row does **not** carry `rows_deleted` (see the as-shipped note below).
 
-> **As shipped (Phase 15.A, 2026-07-01).** Route `POST /fragments/echo/retention-paused/purge`; audit verb `echo.source.purge` (matching the `echo.source.reenable` sibling); metric `yuzu_echo_source_purge_total{result}`. The typed confirmation is a native `prompt()` ("type the device hostname"), not a bespoke modal — CSP-safe (no `hx-on`/eval), consistent with the native `confirm()` used for re-enable. **The paused-guard is agent-side and authoritative:** `echo.purge_source` refuses (`source_not_paused`) if the source is currently enabled, or (`config_unreadable`) if the enable flag cannot be read so the agent cannot confirm the source is paused (nothing is purged either way), which closes the scan→purge TOCTOU. The server does **not** enforce a `SOURCE_NOT_PAUSED` check (§3.5) because the retention-paused frame is an ephemeral live scan with no persisted paused-state to check. Dispatch is fire-and-forget, so `rows_deleted` is computed agent-side and returned in the response record — it is not in the immediate dispatch audit row.
+> **As shipped (Phase 15.A, 2026-07-01).** Route `POST /fragments/echo/retention-paused/purge`; audit verb `echo.source.purge` (matching the `echo.source.reenable` sibling); metric `yuzu_echo_source_purge_total{result}`. The typed confirmation is a native `prompt()` ("type the device hostname"), not a bespoke modal — CSP-safe (no `hx-on`/eval), consistent with the native `confirm()` used for re-enable. **The paused-guard is agent-side and authoritative:** `echo.purge_source` refuses (`source_not_paused`) if the source is currently enabled, or (`config_unreadable`) if the enable flag cannot be read so the agent cannot confirm the source is paused (nothing is purged either way), which closes the scan→purge TOCTOU. The server does **not** enforce a `SOURCE_NOT_PAUSED` check (§3.5) because the retention-paused frame is an ephemeral live scan with no persisted paused-state to check. Dispatch is fire-and-forget, so `rows_deleted` is computed agent-side and returned in the response record — it is not in the immediate dispatch audit row. Since the roll-up-only change the record also carries `dictionary_pending`: `true` (with a `CONSTRAINED` result status; the completeness stays in the agent's log) means the rows are deleted but the dictionary sweep that follows ran out of its deadline or failed, so the strings those rows referenced stay on the device until the weekly sweep or a rerun of the purge — a pending result is not a complete erasure, and nothing in the dispatch audit row says which it was.
 >
 > **A1 REST parity + generic-dispatch hardening (2026-07-01).** Automation/MCP callers use the structured `POST /api/v1/echo/retention-paused/purge` (JSON body `{device_id, source}`, `Infrastructure:Delete` per-device-scoped, A4 error envelope, `202` + `command_id`; audited fail-closed — no dispatch without a durable audit row). Both the fragment and the REST route confirm the guard is agent-side authoritative. The generic `POST /api/command` escape hatch now also elevates destructive actions: `echo.purge_source` there additionally requires `Infrastructure:Delete` and is confined to the caller's visible agents with untargeted broadcast/scope fan-out refused, so it can't be a weaker path than the dedicated route. The atomic agent-side guard (check + delete under one lock) closes the agent-local check→delete race in addition to the scan→purge TOCTOU.
 
@@ -182,7 +182,7 @@ No changes to the `echo.sql` agent action; the change is purely server-side scop
   same dispatch-and-poll seam the device-page "Get live info" uses (untracked
   dispatch, `execution_id=""`, so it never enters the executions drawer). The agent
   runs them on its read-only authorizer connection (#760/#631).
-- The agent forbids recursive CTEs, so the tree is reconstructed **server-side in
+- The agent refuses common table expressions (`WITH`) before the query is prepared, so the tree is reconstructed **server-side in
   C++** from the flat event rows: per-pid alive-intervals are built from the
   `started`/`stopped` stream, incarnations whose lifetime overlaps the chosen window
   `[from, to]` are kept (PID-reuse-safe — each lifetime is its own node), and each is
@@ -459,8 +459,11 @@ Per `docs/observability-conventions.md`:
 > fragment and the REST twin write the same series with different `result` tokens:
 > the fragment distinguishes `scope_violation` from `denied`, while REST folds
 > per-device scope denial, missing wiring, and audit failure all into `denied` and
-> otherwise only ever writes `requested`. `success` and `agent_not_connected` are
-> comparable; nothing else is, and there is no `surface` label to split them.
+> otherwise only ever writes `requested`. The fragment counts an audit-store refusal
+> (the `attempted` row could not be stored, `503`, #3619) as `audit_unavailable`, a
+> value REST never writes; `yuzu_echo_source_reenable_total`
+> uses the same value. `success` and `agent_not_connected` are comparable; nothing else
+> is, and there is no `surface` label to split them.
 
 > The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).
 

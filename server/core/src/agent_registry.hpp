@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -1471,6 +1472,49 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog();
 // -- AgentHealthStore ---------------------------------------------------------
 // Aggregates per-agent heartbeat status_tags into fleet-wide Prometheus metrics.
 
+/// The ONE staleness window for every read of AgentHealthStore's per-agent heartbeat data: the
+/// 15 s sweep's prune (recompute_metrics), perf_snapshot, net_snapshot and the per-device
+/// guardian_backend accessors. An agent whose last heartbeat is older than this is not counted
+/// anywhere, so a gauge and the device field that mirrors it apply the same freshness test
+/// (#2240; the POPULATIONS still differ, see guardian_backend_for). A literal at each site is the
+/// drift this constant removes.
+inline constexpr std::chrono::seconds kAgentHealthStaleness{90};
+
+/// Bulk guardian_backend_for takes mu_ in slices of kGuardianBackendSlice ids and pauses
+/// kGuardianBackendPause between slices with the lock RELEASED, so a heartbeat upsert waits for one
+/// slice and not the whole list. That bounds the stall caused by THIS accessor only: the 15 s
+/// recompute_metrics sweep, perf_snapshot and net_snapshot still hold mu_ for a whole pass
+/// (recompute_metrics about 1.2 s at 500k).
+/// MEASURED on a prototype copy of this logic (not the committed code): 500k ids, 30 tags per
+/// agent, the two production files built -O2 on Linux, idle 32-core box, ONE closed-loop writer.
+/// Unsliced, one call held mu_ about 150-200 ms and stalled an upsert by about as long. Slices
+/// alone did NOT help (std::mutex is unfair: the releasing thread re-takes it before the woken
+/// writer runs) and neither did yield(). Slices plus a 50 us sleep took the worst upsert stall to
+/// 2-4 ms for about 15-20 ms more per call; that sleep actually lasted about 100 us (Linux timer
+/// slack). A separate model with 16-64 open-loop writers at the heartbeat rate gave a worst stall
+/// of 9-20 ms. The pause is therefore load-bearing: do not remove it as a dead sleep.
+/// PLATFORM: only Linux was measured; other non-Windows builds (macOS) sleep unmeasured. MSVC
+/// rounds sleep_for up to a scheduler tick (1-15.6 ms) and nothing in the server raises the timer
+/// resolution, which would add up to about 1.9 s per call at 500k, so _WIN32 busy-waits on
+/// steady_clock instead (about 6 ms of CPU per 500k call, a true 50 us window). On Linux the same
+/// spin measured somewhat worse than the sleep (worst stall about 9-22 ms at 16-64 writers).
+/// WINDOWS (MSVC 14.44, Windows 11, 16 hardware threads), measured on a MODEL of the store with
+/// 500k ids, not on the production store: sleep_for(50 us) lasted 15.8 ms, so a sleep-based pause
+/// added about 1.9 s per call; the spin lasted 50 us. With 4 writers at about 38k upserts/s the
+/// spin call took 63 ms (unsliced 55 ms) and the worst upsert stall fell from 55 ms to 1.3 ms;
+/// with 16 writers at about 32k/s, 162 ms and 4.7 ms. One writer in a tight loop, far above the
+/// heartbeat rate (about 17k/s at 500k agents on a 30 s interval), starves the reader (every
+/// slice waits for the lock): 1.5 s per call. The production store's unit tests pass on Windows.
+/// Slices are not a point-in-time snapshot, which list_devices never was (the registry lock is
+/// released before the health lock is taken).
+inline constexpr std::size_t kGuardianBackendSlice = 4096;
+inline constexpr std::chrono::microseconds kGuardianBackendPause{50};
+static_assert(kGuardianBackendSlice > 0, "a zero slice would never advance the bulk loop");
+static_assert(kGuardianBackendPause >= std::chrono::microseconds{1} &&
+                  kGuardianBackendPause <= std::chrono::milliseconds{1},
+              "the pause must be real (it is what lets ingest in) and must stay small (it is paid "
+              "once per slice on the request thread)");
+
 struct AgentHealthSnapshot {
     std::string agent_id;
     std::unordered_map<std::string, std::string> status_tags;
@@ -1520,6 +1564,39 @@ public:
     /// needs. Same staleness contract as recompute_metrics (pass the same value
     /// so the dashboard and the yuzu_fleet_net_* gauges see the same population).
     std::vector<AgentHealthSnapshot> net_snapshot(std::chrono::seconds staleness) const;
+
+    /// #2240: the per-device twin of the yuzu_fleet_guardian_backend gauge. Same table, same
+    /// strict parse (guardian_backend_fleet_tags.hpp) and same staleness contract as
+    /// recompute_metrics, so the gauge and the device field cannot disagree on classification or
+    /// on the freshness test; pass kAgentHealthStaleness. Two differences remain. POPULATION: the
+    /// gauge counts every health-store snapshot within the window, including an agent that has just
+    /// disconnected (remove() has no production caller, so the sweep prune is the only eviction),
+    /// while the device surfaces list only registry-connected rows. SAMPLING: the gauge is
+    /// republished every 15 s sweep, these read the live store. So after a disconnect the gauge can
+    /// still count the agent for up to about 105 s (window plus one sweep), and the two can differ in
+    /// either direction for up to one sweep (a null field does not by itself mean the gauge has
+    /// stopped counting the agent, and a non-null field can precede the gauge's first count).
+    /// CLOCK: last_seen (the tag rides every beat today; a status-beat split must move this and the
+    /// gauge together - see the header).
+    ///
+    /// `guardian_backend_for` returns one entry per input id, ALIGNED by index: the token
+    /// (a view into the header's constexpr table, static storage, safe after mu_ is released)
+    /// or nullopt for an id that is unknown to the store, stale, has no tag or an empty one, or
+    /// carries a rejected value. nullopt NEVER means `legacy`. It does one hash lookup per id with
+    /// no string copies, taking mu_ per kGuardianBackendSlice ids with a pause between slices
+    /// (kGuardianBackendPause: a sleep or a busy-wait by platform, see the constants).
+    /// Only DeviceApi::list_devices() calls it (REST /api/v1/devices and MCP list_agents); the
+    /// callers that discard the field use list_devices_basic() or connected_count().
+    /// Because mu_ is released between slices an entry can be refreshed or pruned mid-call: each
+    /// id is read consistently, the list is not one snapshot.
+    /// `guardian_backend_of` is the O(1) point lookup for lookup_device (#3564: no scan, so a miss
+    /// costs the same as a hit). Neither may be called from a hot path; both are for
+    /// Infrastructure:Read device reads.
+    [[nodiscard]] std::vector<std::optional<std::string_view>>
+    guardian_backend_for(std::span<const std::string> agent_ids,
+                         std::chrono::seconds staleness) const;
+    [[nodiscard]] std::optional<std::string_view>
+    guardian_backend_of(const std::string& agent_id, std::chrono::seconds staleness) const;
 
 private:
     mutable std::mutex mu_;

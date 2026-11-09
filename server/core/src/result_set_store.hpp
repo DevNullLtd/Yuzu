@@ -165,6 +165,11 @@ struct ResultSet {
     std::string source_execution_id;      // set for async producers; else empty
     std::string matcher;                  // JSON matcher for instruction-result; else empty
     int64_t device_count{0};
+    /// Async producers: how many agents never satisfied the matcher AND answered at least once
+    /// with a failure (status not success, or output starting `error|`). The set is partial when
+    /// this is non-zero: those agents are absent from the membership because their query failed,
+    /// not because they do not match. 0 for sync producers.
+    int64_t agents_failed{0};
 };
 
 /// One step in a lineage chain (design §6 `/lineage`).
@@ -390,9 +395,10 @@ public:
 
     // ── Async materialisation (server maintenance thread) ────────────────────
     std::vector<PendingSet> list_pending();
-    /// Populate members, flip status → materialized, set device_count.
+    /// Populate members, flip status → materialized, set device_count and agents_failed.
     std::expected<void, ResultSetError> materialize(const std::string& id,
-                                                    const std::vector<std::string>& members);
+                                                    const std::vector<std::string>& members,
+                                                    int64_t agents_failed = 0);
     void mark_failed(const std::string& id, const std::string& reason);
 
     /// #4493 heal path for a row `mark_failed` cannot reach: `mark_failed`'s

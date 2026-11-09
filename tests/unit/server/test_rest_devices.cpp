@@ -16,13 +16,13 @@
 // What's covered:
 //   - GET /api/v1/devices: gate deny (401/403/503-unwired) -> no rows; gate
 //     admit + scope filter -> only in-scope rows, correct devices_omitted
-//     count; row shape matches list_agents' 5-field contract.
+//     count; row shape matches list_agents' 6-field contract.
 //   - GET /api/v1/devices/{id}: found in-scope -> 200 w/ fields (tags key
 //     always present, possibly empty — see the PURE builder section below for
 //     why); out-of-scope match collapses to the SAME 404 as a genuinely
 //     nonexistent agent_id (#1700-style existence-oracle closure).
 //   - device_agent_row_json / device_agent_detail_json (PURE, no HTTP/store):
-//     5-field row shape; tags array populated (key/value/source per entry)
+//     6-field row shape; tags array populated (key/value/source per entry)
 //     — the DeviceApi seam (device_api.hpp) always returns an (possibly
 //     empty) tags vector, so the emitted JSON always carries the key.
 //   - GET /api/v1/management-groups/agent-count-preview: perm_fn/auth_fn gate;
@@ -228,7 +228,7 @@ TEST_CASE("GET /api/v1/devices — gate denial forwards the gate's own status, n
     CHECK(res->status == 403);
 }
 
-TEST_CASE("GET /api/v1/devices — admitted + unfiltered scope returns every agent, 5-field rows",
+TEST_CASE("GET /api/v1/devices - admitted + unfiltered scope returns every agent, 6-field rows",
           "[rest][devices]") {
     DeviceRestHarness h;
     h.fleet_scope = std::nullopt; // TOP
@@ -242,12 +242,17 @@ TEST_CASE("GET /api/v1/devices — admitted + unfiltered scope returns every age
     REQUIRE(devices.size() == 2);
     CHECK(body["data"]["count"].get<int64_t>() == 2);
     CHECK(body["data"]["devices_omitted"].get<int64_t>() == 0);
-    // Row shape: exactly the 5 list_agents fields.
+    // Row shape: the 5 original list_agents fields plus guardian_backend (#2240). The key is
+    // ALWAYS present; a device that has not reported the heartbeat tag reads JSON null, never
+    // "legacy" (the fixture's rows carry no backend).
     CHECK(devices[0]["agent_id"] == "a1");
     CHECK(devices[0]["hostname"] == "host1");
     CHECK(devices[0]["os"] == "linux");
     CHECK(devices[0]["arch"] == "x86_64");
     CHECK(devices[0]["agent_version"] == "1.0.0");
+    REQUIRE(devices[0].contains("guardian_backend"));
+    CHECK(devices[0]["guardian_backend"].is_null());
+    CHECK(devices[0].size() == 6);
     CHECK_FALSE(devices[0].contains("tags"));
     CHECK_FALSE(devices[0].contains("online"));
 }
@@ -339,6 +344,11 @@ TEST_CASE("GET /api/v1/devices/{id} — in-scope degraded tag-store read is a 50
     REQUIRE(res != nullptr);
     CHECK(res->status == 503);
     CHECK(h.device_api->lookup_calls == 1); // in-scope DOES reach the lookup (only out-of-scope skips it)
+    // #2240: a degraded tag store is a retryable store fault; the REST 503 carries the same
+    // honest retry_after_ms as the MCP twin (mcp::kMcpStoreFaultRetryMs).
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["error"].contains("retry_after_ms"));
+    CHECK(body["error"]["retry_after_ms"].get<int64_t>() == 5000);
 }
 
 // ── PURE builder coverage: device_agent_row_json / device_agent_detail_json ──
@@ -348,7 +358,8 @@ TEST_CASE("GET /api/v1/devices/{id} — in-scope degraded tag-store read is a 50
 // see device_routes.hpp's doc comment on device_agent_detail_json for why
 // this is a deliberate, already-committed (wave 1) seam decision.
 
-TEST_CASE("device_agent_row_json: exactly the 5 list_agents fields", "[devices][pure]") {
+TEST_CASE("device_agent_row_json: the 5 list_agents fields plus a nullable guardian_backend",
+          "[devices][pure]") {
     DeviceListRow agent{.agent_id = "a1", .hostname = "host1", .os = "linux", .arch = "x86_64",
                        .agent_version = "1.0.0"};
     auto row = device_agent_row_json(agent);
@@ -357,7 +368,10 @@ TEST_CASE("device_agent_row_json: exactly the 5 list_agents fields", "[devices][
     CHECK(row["os"] == "linux");
     CHECK(row["arch"] == "x86_64");
     CHECK(row["agent_version"] == "1.0.0");
-    CHECK(row.size() == 5);
+    // #2240: sixth field, key always present, null when the device has not reported the tag.
+    REQUIRE(row.contains("guardian_backend"));
+    CHECK(row["guardian_backend"].is_null());
+    CHECK(row.size() == 6);
 }
 
 TEST_CASE("device_agent_row_json: a default-constructed row degrades to empty fields",
@@ -659,4 +673,79 @@ TEST_CASE("agent-count-preview: Forensics rows are not counted for a caller with
     CHECK(count() == 3);
     h.forensics.unsupported_subset({"agent-a"}); // unsupported: fails closed like a viewer
     CHECK(count() == 1); // agent-c only
+}
+
+// ── #2240: guardian_backend carries a value, not just a key ──────────────────────────────
+// The null-only expectations above would also pass if the builder emitted a constant null, so
+// each of these sets a real token and asserts the non-null value in the SAME case.
+
+TEST_CASE("device_agent_row_json: guardian_backend is the token when set, null when not",
+          "[devices][pure][guardian_backend]") {
+    DeviceListRow set{.agent_id = "a1"};
+    set.guardian_backend = "spark_failed";
+    const auto with = device_agent_row_json(set);
+    REQUIRE(with.contains("guardian_backend"));
+    CHECK(with["guardian_backend"] == "spark_failed");
+    CHECK(with.size() == 6);
+
+    const auto without = device_agent_row_json(DeviceListRow{.agent_id = "a2"});
+    REQUIRE(without.contains("guardian_backend"));
+    CHECK(without["guardian_backend"].is_null());
+}
+
+TEST_CASE("GET /api/v1/devices: each row carries its own guardian_backend, one token one null",
+          "[rest][devices][guardian_backend]") {
+    DeviceRestHarness h;
+    h.add_agent("a1", "host1");
+    h.add_agent("a2", "host2");
+    h.device_api->rows[0].guardian_backend = "unwired";
+    auto res = h.sink.Get("/api/v1/devices");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    const auto& devices = body["data"]["devices"];
+    REQUIRE(devices.size() == 2);
+    CHECK(devices[0]["guardian_backend"] == "unwired");
+    CHECK(devices[1]["guardian_backend"].is_null());
+    CHECK(body["data"]["devices_omitted"].get<int64_t>() == 0);
+}
+
+TEST_CASE("GET /api/v1/devices/{id}: the detail carries guardian_backend alongside tags",
+          "[rest][devices][guardian_backend]") {
+    DeviceRestHarness h;
+    h.add_agent("a1", "host1");
+    h.device_api->details["a1"].row.guardian_backend = "spark";
+    auto res = h.sink.Get("/api/v1/devices/a1");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["guardian_backend"] == "spark");
+    REQUIRE(body["data"].contains("tags"));
+}
+
+TEST_CASE("GET /api/v1/devices[/{id}]: the new field opens no new read for a confined caller",
+          "[rest][devices][guardian_backend]") {
+    // Engaged scope admits only a1. a2 has a backend set, but it is neither listed nor
+    // looked up: the field rides the existing admit-then-filter read, it is not a second one.
+    DeviceRestHarness h;
+    h.fleet_scope = std::unordered_set<std::string>{"a1"};
+    h.add_agent("a1", "host1");
+    h.add_agent("a2", "host2");
+    h.device_api->rows[0].guardian_backend = "legacy";
+    h.device_api->rows[1].guardian_backend = "spark_failed";
+    h.device_api->details["a2"].row.guardian_backend = "spark_failed";
+
+    auto list = h.sink.Get("/api/v1/devices");
+    REQUIRE(list != nullptr);
+    const auto lbody = nlohmann::json::parse(list->body);
+    REQUIRE(lbody["data"]["devices"].size() == 1);
+    CHECK(lbody["data"]["devices"][0]["guardian_backend"] == "legacy");
+    CHECK(list->body.find("spark_failed") == std::string::npos);
+    CHECK(lbody["data"]["devices_omitted"].get<int64_t>() == 1);
+
+    auto detail = h.sink.Get("/api/v1/devices/a2");
+    REQUIRE(detail != nullptr);
+    CHECK(detail->status == 404);
+    CHECK(detail->body.find("spark_failed") == std::string::npos);
+    CHECK(h.device_api->lookup_calls == 0);
 }

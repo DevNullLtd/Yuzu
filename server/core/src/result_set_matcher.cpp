@@ -8,6 +8,8 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
 #include <limits>
@@ -78,6 +80,22 @@ bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann
             if (v.is_string() && cell == v.get<std::string>())
                 return true;
         return false;
+    }
+    return false;
+}
+
+// True when `output` carries an echo `__schema__` header line that does not name `column`
+// (the agent answered from a table without it). False with no header line at all (a JSON or
+// plain-row shape), and false when the header names the column, even over zero data rows.
+bool echo_schema_lacks_column(std::string_view output, const std::string& column) {
+    for (const auto& line : split_lines(output)) {
+        if (!line.starts_with("__schema__"))
+            continue;
+        auto cells = split_cells(line);
+        for (size_t i = 1; i < cells.size(); ++i)
+            if (cells[i] == column)
+                return false;
+        return true;
     }
     return false;
 }
@@ -345,6 +363,16 @@ int echo_row_count(std::string_view output) {
     return n;
 }
 
+bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output) {
+    if (matcher_json.empty())
+        return false;
+    auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+    if (m.is_discarded() || !m.is_object() || m.contains("kind") || !m.contains("column") ||
+        !m["column"].is_string())
+        return false;
+    return echo_schema_lacks_column(output, m["column"].get<std::string>());
+}
+
 bool response_matches(std::string_view matcher_json, int status, std::string_view output) {
     // A non-success response is never a hit, whatever the matcher says.
     if (status != kStatusSuccess)
@@ -395,6 +423,125 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
     // Matcher present but a recognised key is MISSING (or no recognised key at all) → fall back to
     // default so a typo can't silently empty the set; the operator still gets responders.
     return true;
+}
+
+bool references_raw_capture_table(std::string_view sql) {
+    static constexpr std::array<std::string_view, 16> kRealNames{
+        "process_live",  "tcp_live",     "service_live",   "user_live",
+        "perf_live",     "procperf_live", "netqual_live",   "module_live",
+        "software_live", "arp_live",     "dns_live",       "netconn_live",
+        "mapdrive_live", "power_live",   "removable_live", "registry_live"};
+    const auto is_word = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+    };
+    // Single pass over SQLite's tokens: a '...' literal ('' escapes), a quoted identifier
+    // ("..." and `...` double their delimiter, [...] ends at the first ']'), a -- line comment
+    // and a /* block comment are each one token, so a `'`, `--` or `/*` INSIDE a quoted
+    // identifier never opens a literal or comment that would hide the code after it. Literals
+    // and comments are blanked; a quoted identifier's content is kept and read like code. Then
+    // read maximal [A-Za-z0-9_] runs: '$' is not a word character, so `$Process_Live` reads as
+    // the run `process_live`, and every registry dollar name lowercases to its real table name.
+    // An unterminated token runs to the end of the input, as SQLite reads it.
+    // A '...' token whose whole content is a raw table name (one leading '$' allowed,
+    // case-folded) is a reference WHEREVER it stands. SQLite reads such a token as the table in
+    // more positions than a keyword list can enumerate (`FROM 'process_live'`,
+    // `JOIN 'tcp_live'`, `main.'process_live'`, `FROM ('process_live')`, `x IN 'process_live'`,
+    // `NOT IN 'tcp_live'`, each verified on sqlite3; a position rule missed the IN forms), so
+    // the rule has no look-behind and the scan stays one linear pass. The price is a documented
+    // over-refusal: a string literal that is exactly a raw table name (`WHERE name =
+    // 'process_live'`) is refused; a literal that merely contains one (`'see process_live'`)
+    // is not.
+    // The agent's scan_sql (echo_sql_executor.cpp) knows '...', -- and /* */ only and reads a
+    // double-quoted, backtick or bracket token as code, so the two scanners disagree only where
+    // this one refuses more, never less.
+    // Two more shapes are refused although SQLite would never read the shim: a name inside a
+    // double-quoted string literal (`SELECT "$Process_Live"`, read here as an identifier), and
+    // a CTE that shadows a shim name (`WITH process_live AS (...) SELECT ... FROM process_live`).
+    // Accepted: the predicate fails closed, and `"process_live"` must still be caught when it
+    // is a quoted identifier, which only a real SQL parse could tell from the literal.
+    std::string text(sql);
+    const auto is_real_name = [&](std::string_view content) {
+        if (!content.empty() && content.front() == '$')
+            content.remove_prefix(1);
+        std::string word(content);
+        for (auto& c : word)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return std::find(kRealNames.begin(), kRealNames.end(), word) != kRealNames.end();
+    };
+    const auto quoted_end = [&](std::size_t i, char close, bool doubles) {
+        std::size_t j = i + 1;
+        while (j < text.size()) {
+            if (text[j] == close) {
+                if (doubles && j + 1 < text.size() && text[j + 1] == close) {
+                    j += 2;
+                    continue;
+                }
+                return j + 1;
+            }
+            ++j;
+        }
+        return text.size();
+    };
+    for (std::size_t i = 0; i < text.size();) {
+        std::size_t end = i;
+        bool blank = true;
+        if (text[i] == '\'') {
+            end = quoted_end(i, '\'', true);
+            std::string_view content(text.data() + i + 1, end - i - 1);
+            if (!content.empty() && text[end - 1] == '\'')
+                content.remove_suffix(1); // the closing quote (absent when unterminated)
+            if (is_real_name(content))
+                return true;
+        } else if (text[i] == '"' || text[i] == '`') {
+            end = quoted_end(i, text[i], true);
+            blank = false;
+        } else if (text[i] == '[') {
+            end = quoted_end(i, ']', false);
+            blank = false;
+        } else if (text.compare(i, 2, "--") == 0) {
+            end = text.find('\n', i);
+            end = end == std::string::npos ? text.size() : end;
+        } else if (text.compare(i, 2, "/*") == 0) {
+            end = text.find("*/", i + 2);
+            end = end == std::string::npos ? text.size() : end + 2;
+        } else {
+            ++i;
+            continue;
+        }
+        if (blank)
+            text.replace(i, end - i, end - i, ' ');
+        i = end;
+    }
+    for (std::size_t i = 0; i < text.size();) {
+        if (!is_word(text[i])) {
+            ++i;
+            continue;
+        }
+        std::size_t j = i;
+        while (j < text.size() && is_word(text[j]))
+            ++j;
+        std::string word = text.substr(i, j - i);
+        for (auto& c : word)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (std::find(kRealNames.begin(), kRealNames.end(), word) != kRealNames.end())
+            return true;
+        i = j;
+    }
+    return false;
+}
+
+bool instruction_reads_raw_capture_table(const nlohmann::json& params,
+                                         std::string_view parameter_schema) {
+    if (params.is_object() && params.contains("sql") && params["sql"].is_string())
+        return references_raw_capture_table(params["sql"].get_ref<const std::string&>());
+    const auto schema = nlohmann::json::parse(parameter_schema, nullptr, false);
+    if (!schema.is_object() || !schema.contains("properties") ||
+        !schema["properties"].is_object() || !schema["properties"].contains("sql"))
+        return false;
+    const auto& prop = schema["properties"]["sql"];
+    if (!prop.is_object() || !prop.contains("default") || !prop["default"].is_string())
+        return false;
+    return references_raw_capture_table(prop["default"].get_ref<const std::string&>());
 }
 
 } // namespace yuzu::server::rs_matcher

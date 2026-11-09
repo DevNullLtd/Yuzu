@@ -98,6 +98,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_shares.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_remote_access_audit.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_middleware.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_virtualization.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
 

@@ -6,9 +6,12 @@
 //
 // ONE caller: agent core at boot (agents/core/src/agent.cpp), after the KV store opens and
 // before any plugin init or dispatch (the plugin scan only registers descriptors; no plugin
-// opens a database before init). That placement is the exclusion: no process-wide lock exists
-// across plugin dylibs, so no plugin ever adopts, and nothing can have the database open while
-// it is moved. EchoDatabase::open() refuses to create a fresh echo.db beside an unadopted
+// opens a database before init). That placement is the exclusion within the process: no
+// process-wide lock exists across plugin dylibs, so no plugin ever adopts, and nothing in this
+// process has the database open while it is moved. It does not exclude a predecessor process
+// still shutting down during a service restart (the step runs before the Guardian instance
+// lock): on Windows its open handle can fail the rename, which is logged and resumed on the
+// next start. EchoDatabase::open() refuses to create a fresh echo.db beside an unadopted
 // tar.db, so a failed adoption fails closed instead of booting with default config. The caller
 // defers adoption entirely while the plugin dir holds only the retired tar plugin (an OTA
 // replaces the agent binary alone): the next start after echo.<ext> is installed adopts.

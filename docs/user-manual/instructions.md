@@ -471,7 +471,7 @@ over a limit makes execute answer `500`):
 
 `enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
 poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
-that route does not read `enabled`.
+that route does not read `enabled`, and neither do its v1 and MCP twins.
 
 ### Replacing a stored parameter schema
 
@@ -596,7 +596,7 @@ spec:
 
 When a user (or MCP tool) executes an instruction that requires approval:
 
-1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. Nothing runs yet: the request waits as a pending approval ticket. Approving a ticket created this way records the decision but does not yet dispatch the instruction, because an instruction-origin ticket has no redemption path (tracked in #6064; see [Upgrading](upgrading.md)). An MCP client is different: it re-calls the same tool with the `approval_id` once the ticket is approved, and that call runs it.
+1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. Nothing runs yet: the request waits as a pending approval ticket. Approving a ticket created this way records the decision but does not yet dispatch the instruction, because an instruction-origin ticket has no redemption path (tracked in #6064; see [Upgrading](upgrading.md)). This is true on every surface, MCP included: a `pending_approval` answer from `execute_instruction_definition` carries the same kind of instruction-origin ticket, and no surface can redeem it, so re-calling the tool with that `approval_id` does not run the instruction. Only an MCP tier ticket is redeemable: when the supervised tier itself holds a call for approval (an `execute_instruction` or similar call answered with `approval_required` (-32006)), the client re-calls the same tool with that `approval_id` once a person has approved it, and that call runs. A definition whose `approval_mode` is not `auto` therefore cannot be run through the execute routes or tools until #6064 lands (this limit predates the v1 and MCP twins).
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
 3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab (a rejected request is never run; an approved instruction-origin ticket is recorded but not dispatched, as in step 1). On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
@@ -856,11 +856,89 @@ delivery loop then drains the outbox and performs the actual dispatch, within
 Delivery emits its own `command.outbox_delivered` audit event recording the
 real send outcome: `success` (dispatched, with the agents-reached count),
 `failure` (no agents currently in scope — recorded and skipped, not retried;
-or a malformed occurrence), or `denied` (authority was revoked between
-enqueue and delivery). The execution row's targeted-agent count fills in at
+a malformed occurrence; or a redelivery-limit dead-letter, below), or `denied`
+(authority was revoked between enqueue and delivery). The execution row's targeted-agent count fills in at
 delivery, once the real outcome is known. A systemic delivery-gate failure
 (for example, containment status unreadable) is treated as transient: the
 same occurrence is retried with back-off rather than failed outright.
+
+A retry re-sends the occurrence's original command ID, so that an agent which
+already ran it can recognise and absorb the repeat. An agent only remembers the
+most recent 20,000 completed commands, so the server bounds how long an
+occurrence may keep being retried. It records the server's dispatch counts just
+before the first delivery attempt and, once they have advanced by 10,000 (half
+the agent's memory) before a retry, it stops: the occurrence is marked failed
+with the note `redelivery_horizon_exceeded`, a `failure`
+`command.outbox_delivered` audit event is written, and it is never sent again.
+The note is `redelivery_sequence_regressed` instead if the shared dispatch count
+went backwards, which means a database restore or a failover that lost recent
+writes.
+
+A first delivery attempt that reached no agent at all (the delivery gate was
+unreadable) does not start that count: it is recorded again at the next
+attempt. If the dispatch counts cannot be read, or recording them does not
+commit, the occurrence is held (neither sent nor failed) and tried again on the
+next cycle; an unreadable count holds every pending occurrence for that cycle.
+The `yuzu_server_command_outbox_deliver_degrade_total` and
+`yuzu_server_command_outbox_deliver_hold_cause_total{cause}` counters rise while
+that lasts. The `YuzuOutboxHeld` alert fires after a hold of several minutes,
+and `YuzuOutboxStampFailing` if recording the counts keeps failing for roughly 35 to 45 minutes or more.
+An occurrence that was already being retried keeps counting dispatches during a
+hold, so it can be dead-lettered once the counts are readable again.
+
+**After a dead-letter (the run was marked failed and will not be retried).** The failed occurrence may have executed once, or may
+never have been sent at all (for example while a delivery gate stayed unreadable
+on some agents). To find it, use the `query_audit_log` tool (or the dashboard's
+audit page) with action `command.outbox_delivered`, and look for rows whose
+result is `failure` and whose detail contains `redelivery_horizon_exceeded` or
+`redelivery_sequence_regressed`. The detail starts with the scheduled run's
+source, occurrence, plugin and action, so search within it rather than for a
+prefix. Every successful scheduled run writes a row for the same action, so on a
+busy server a failure can be several pages back: give `query_audit_log` a `since`
+and `until` and page with `offset`. The row names the command ID as its target and
+carries the execution ID and the first eight characters of any approval ID. Open
+that execution in the Executions history, check which agents responded, then run
+the instruction again by hand if it did not complete. If the occurrence needed an approval, that ticket is spent (a failed
+occurrence keeps its ticket consumed), so request a new one (see
+[Who can approve](#who-can-approve)). The next scheduled occurrence is
+unaffected and fires normally. The occurrence's execution row is not cancelled by
+this step. If no agent has answered by the next stuck-execution sweep, which runs
+roughly every 15 minutes and looks at executions that are over 30 minutes old,
+the sweep may cancel it, including an execution whose agents were reached but
+have not responded yet; until then it can look in-flight.
+
+The count is an estimate, not a clock, and it can err in both directions.
+
+*It can end a run early (the safe direction).* It is fleet-wide, so any
+operator's or any push's dispatches advance it: a Guardian, asset-tag or sync
+push counts once for every target, and one push to 10,000 devices ends every
+occurrence that is waiting to be retried at that moment. Guardian control messages
+count although they take no place in the agent's memory. A long gateway-directory
+outage in which many occurrences are being retried also ages them, because each
+retry counts as a dispatch. After a change of leadership on the server, the new
+leader also charges every unrecorded dispatch it has made since it started,
+however old, so a server that once failed to record 10,000 dispatches ends every
+waiting occurrence at each later leadership change until it is restarted.
+
+*It can fail to end a run in time (the unsafe direction).* Dispatches whose
+record failed to write are counted only by the server process that made them. A
+different server replica, or an earlier run of the same server that has since
+restarted or been taken over by another replica, takes that count with it: after a
+restart the server cannot tell how many such dispatches passed, so the limit can
+trip late. Four other cases also let it trip late: a command dispatched before the
+first attempt but delivered to the agent after it is not counted; a database
+restore that leaves the dispatch count still above a waiting occurrence's recorded
+value reads as small progress; a server replica working from an out-of-date view
+can still send an occurrence that another replica has just marked failed; and the
+dispatch count cannot see an agent whose own memory was lost. Agents running
+without a working command-dedup store are not protected at all: they re-run every
+redelivery. None of this is closed by this change; the sound close, in which the
+agent refuses an ID older than its own memory, is a protocol change and is not part
+of it.
+
+It is not a time limit, so an occurrence stuck on a quiet fleet is not ended by
+it. The dispatch-count part of the retry limit is delivered under #3678; a
+time-based cap and a retry-count cap remain open under #4167.
 
 Approval-gated runs (the schedule's `requires_approval` flag, or a definition
 whose `approvalMode` is not `auto` — there is no operator session on the
@@ -1002,6 +1080,8 @@ curl -s -b cookies.txt \
 ```
 
 The `scope` field controls which agents are included. Set `"scope": "failed_only"` to target only agents that reported failure; any other value (or omitting the field) reruns all agents.
+
+**What a rerun does.** It creates a new `pending` execution record linked to the original; it does not send anything to any device. The REST v1 route `POST /api/v1/executions/{id}/rerun` and the MCP tool `record_execution_rerun` do the same, take a boolean `failed_only` instead of the `scope` string, and answer `dispatched_to_devices: false`. Likewise `POST /api/v1/executions/{id}/cancel` and `cancel_execution` only mark the execution cancelled; they do not stop a command a device already received. See `docs/user-manual/rest-api.md`.
 
 ### Cancel
 
@@ -1323,6 +1403,8 @@ curl -s -b cookies.txt \
 
 > **Approval gate:** The response varies based on the definition's `approval_mode`. Definitions with `approval_mode: auto` return HTTP 200 with an immediate execution result. Definitions with `approval_mode: role-gated` or `always` return HTTP 202 with a `pending_approval` status and an `approval_id` when the caller requires approval. See [Section 7](#7-approval-workflows) for details.
 
+**Versioned and MCP twins (#2146).** `POST /api/v1/instructions/{id}/execute` and the MCP tool `execute_instruction_definition` run the same pipeline with the same `agent_ids` / `scope` / `params` and the same `approval_mode` rules, with these differences from the route above: the v1 response is wrapped as `{"data": {...}, "meta": {"api_version": "v1"}}` and every error carries an A4 envelope with a machine-readable `reason`; a call is audited `requested` BEFORE it dispatches and refused with `503` if that row cannot be stored (the legacy route audits after the send); the `202` body adds `approval_mode`; zero agents reached is an error with a `reason` (`400` for `invalid_scope`, `503` otherwise) rather than the legacy untyped `503`; the check order puts the dispatch authorization (`403`/`400` with a `reason`) and the destructive-targeting rules (`400` `destructive_untargeted` / `forensic_untargeted`, `404` `destructive_no_visible_target`) before the definition's approval, so a call that is refused for those reasons never queues an approval. A definition id holding a control character (a byte below `0x20` or equal to `0x7F`, NUL included) or not valid UTF-8 (reachable on REST, where the HTTP layer percent-decodes the path to raw bytes) is refused before the definition is looked up (`400` / `-32602`, `reason` `invalid_definition_id`, a `denied` audit row, nothing queued or dispatched); the legacy route does not apply that check. A dispatch that throws part-way answers `500` / `-32603` `dispatch_exception` with no retry hint, and names the execution row it left running as the typed field `error.execution_id` (`error.data.execution_id` on MCP) plus, when known, the lower-bound count of agents already sent the command as `error.agents_sent` (`error.data.agents_sent`; a gateway-routed agent counts once its command is queued for forwarding, which can still fail): check that execution's results or close it with `cancel_execution` before running the definition again. Like the legacy route, neither twin reads the definition's `enabled` flag. The MCP twin does not stream progress, and a definition whose `approval_mode` is not `auto` answers `pending_approval` for an operator-tier or a supervised-tier token alike: a tier's auto-approval or consumed ticket never stands in for the definition's own approval, and a supervised token's ticket never lifts the admin-or-approval requirement of the definition's `plugin.action` either: a non-administrator is refused with `approval_required` (permanent, no ticket minted). See the [REST API reference](rest-api.md) and the [MCP guide](mcp.md).
+
 #### List definitions (v1 endpoint)
 
 ```
@@ -1621,7 +1703,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 
 The definitions table also shows each workflow's Last run and Result (the newest run you may see: "Not run" when there is none, "None visible" when runs exist only on devices outside your scope, "Unknown" when the list of newest runs was cut off before it reached that workflow). Selecting a workflow loads its latest run in the **Latest run** panel (status, start, duration, device count and one row per step) and the **Recent runs** disclosure lists its ten newest runs; selecting one loads it. A step shown as *Dispatched* means the command was sent: it says nothing about the result on a device, and for a caller confined to a device scope it reads *Dispatched (run-wide)* because the send covered the run's whole target list. A skipped step says why only for the three reasons the engine writes (condition not met, previous step failed, workflow aborted); a failed step shows its error text when the engine stored one, otherwise "No detail.". A run is visible to you only if at least one of its target devices is in your scope; a run you may not see and a run that does not exist look the same.
 
-**Workflow actions.** **New workflow** (shown when you hold `Workflow:Write`) opens a dialog for the workflow's YAML; the server's message is shown if the YAML is refused, and nothing runs until you run it. Each row's **Run now** (needs `Workflow:Execute`) opens a device checklist built from the connected devices you may see (filter box, the first 200 matches shown, at most 500 selected); without permission to list devices it falls back to a box of device ids, one per line. Each step is sent to every selected device in order; a step whose instruction needs approval is refused, and device results are not collected on this page. The server runs the whole workflow before it answers, so the page waits 8 seconds, then says the run may keep running on the server, disables that workflow's Run now and checks its newest run every 5 seconds for up to 10 minutes. Check Recent runs before running it again. **Delete** in the Steps panel (needs `Workflow:Delete`) retires the workflow after a confirmation; run history is kept and there is no undelete in the console. A control you may not use is shown disabled with the permission it needs. Instruction names appear on step rows only if you also hold `InstructionDefinition:Read`; otherwise the step's label or instruction id is shown. **Schedule actions.** Each schedule row has **Enable**/**Disable** and **Delete**, enabled only on schedules you created (a schedule with no recorded creator is nobody's, so both stay disabled). **Enable** needs `Schedule:Write` and `Execution:Execute` and asks for confirmation because the schedule then runs without anyone present; **Disable** needs `Schedule:Write` and is one click; **Delete** needs `Schedule:Delete` and confirms first. After a change the list is re-read and the stored state shown. **New schedule** (needs `Schedule:Write` and `Execution:Execute`; the instruction list needs `InstructionDefinition:Read`) takes a name, an enabled instruction, a cadence (once runs at the next scheduler tick, about now; the scheduler ignores time of day), targets, whether each run needs approval and parameters as JSON. Leaving targets empty needs an explicit acknowledgement that it reaches every device. A final summary shows the instruction's approval mode before the schedule is created enabled; a run can still be refused when it fires. Not verified by running a workflow against a live fleet: that the server keeps running a workflow after the page stops waiting.
+**Workflow actions.** **New workflow** (shown when you hold `Workflow:Write`) opens a dialog for the workflow's YAML; the server's message is shown if the YAML is refused, and nothing runs until you run it. Each row's **Run now** (needs `Workflow:Execute`) opens a device checklist built from the connected devices you may see (filter box, the first 200 matches shown, at most 500 selected); without permission to list devices it falls back to a box of device ids, one per line. Each step is sent to every selected device in order; a step whose instruction needs approval is refused, and device results are not collected on this page. The server runs the whole workflow before it answers, so the page waits 8 seconds, then says the run may keep running on the server, disables that workflow's Run now and checks its newest run every 5 seconds for up to 10 minutes. Check Recent runs before running it again. The server stops a run 60 seconds after the call, and the page's own wait ends at 8 seconds with only the timeout message, so read the run in Recent runs to see how it ended. An account may have 2 runs in progress at once, and the server as a whole has a limit shared with its other open streams; a refused click shows the server's message; an HTTP 429 adds "Try again in N seconds", and a 503 (the server is shutting down or a store is unavailable) shows the server's own advice, or "Try again shortly.", with no retry time. A run the page stopped waiting for still holds one of your two slots until it ends, which can take up to a minute, so another click can be refused for that long. **Delete** in the Steps panel (needs `Workflow:Delete`) retires the workflow after a confirmation; run history is kept and there is no undelete in the console. A control you may not use is shown disabled with the permission it needs. Instruction names appear on step rows only if you also hold `InstructionDefinition:Read`; otherwise the step's label or instruction id is shown. **Schedule actions.** Each schedule row has **Enable**/**Disable** and **Delete**, enabled only on schedules you created (a schedule with no recorded creator is nobody's, so both stay disabled). **Enable** needs `Schedule:Write` and `Execution:Execute` and asks for confirmation because the schedule then runs without anyone present; **Disable** needs `Schedule:Write` and is one click; **Delete** needs `Schedule:Delete` and confirms first. After a change the list is re-read and the stored state shown. **New schedule** (needs `Schedule:Write` and `Execution:Execute`; the instruction list needs `InstructionDefinition:Read`) takes a name, an enabled instruction, a cadence (once runs at the next scheduler tick, about now; the scheduler ignores time of day), targets, whether each run needs approval and parameters as JSON. Leaving targets empty needs an explicit acknowledgement that it reaches every device. A final summary shows the instruction's approval mode before the schedule is created enabled; a run can still be refused when it fires. Not verified by running a workflow against a live fleet: how the page behaves when the server stops a run at the 60 second bound after the page has stopped waiting.
 
 Who sees what: Administrator, Operator, PlatformEngineer, Viewer and ITServiceOwner hold `Workflow:Read` and see all definitions; runs follow the fleet-read scope of the account. A caller scoped only to management groups is refused the definitions and schedules panels (the existing global-grant rule) but sees runs that include a device in scope. ITServiceOwner can create, enable and delete its own schedules elsewhere but has no Run, New workflow or Delete workflow control, and a service-scoped token is refused the schedules panel outright.
 

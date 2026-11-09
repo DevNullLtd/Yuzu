@@ -80,6 +80,7 @@ struct GuardianHealthStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 class GuardianLegacySinkExecutor;
+struct GuardianEmitSeqSource;
 struct OutboxEntry;
 enum class SendResult;
 enum class LegacySendOutcome : std::uint8_t;
@@ -160,7 +161,15 @@ public:
     /// `false` (legacy stays the observable default); rung 12's "default
     /// flip" changes that one literal. Tests pass `true` to exercise the
     /// spark path.
-    GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark = false);
+    ///
+    /// `boot_epoch` (UP-14): the high half of the (boot_epoch, emit_seq) event-order pair,
+    /// claimed once at agent boot by claim_guardian_boot_epoch() (guardian_boot_epoch.hpp)
+    /// and passed in so this constructor stays I/O-free. 0 (the default, and what every
+    /// test using the 2- or 3-argument form gets) means "unordered": events still draw an
+    /// emit_seq internally but the wire carries 0/0 (a server that compares the pair
+    /// ignores a 0/0 pair and keeps ordering by the census ordering key).
+    GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark = false,
+                   std::uint64_t boot_epoch = 0);
     ~GuardianEngine();
 
     GuardianEngine(const GuardianEngine&) = delete;
@@ -210,15 +219,16 @@ public:
     /// part (c) — never the kick's own wall-clock `now`; a real verdict delivered
     /// between two losses is legitimately older than the SECOND loss and should
     /// still be overwritten by a repair covering that second loss, which stamping
-    /// with `now` instead of `last_lost` would otherwise let a stale repair do to
-    /// a NEWER, already-delivered real verdict, via the server's own
-    /// `updated_at >=` upsert guard — belt-and-braces alongside the executor's own
-    /// seq-guarded clearing and dequeue-time supersession check, see
+    /// with `now` instead of `last_lost` would otherwise let a stale repair overwrite
+    /// a NEWER, already-delivered real verdict through the server's own
+    /// census ordering key; the executor's own seq-guarded clearing and
+    /// dequeue-time supersession check are the agent-side stale-repair defence, see
     /// guardian_legacy_sink_executor.hpp's class doc comment). The server's
     /// census goes fail-closed (errored) for a gapped rule until either the
     /// repair is confirmed delivered or the rule's next real verdict clears it
-    /// (same-or-newer timestamp `>=` ordering — D11's "first verdict clears"
-    /// semantics, docs/spark-legacy-delta-registry.md); locally, the executor's
+    /// (today the verdict with the later census ordering key, and with the later pair once
+    /// the server compares it; D11's "first verdict clears" semantics,
+    /// docs/spark-legacy-delta-registry.md); locally, the executor's
     /// own gap ledger can ALSO be cleared by that same next real verdict, before
     /// any repair for it is ever dispatched — see
     /// guardian_legacy_sink_executor.hpp's SEQ-GUARDED CLEARING section. noexcept:
@@ -1001,6 +1011,17 @@ public:
     /// No production caller.
     void set_legacy_sink_max_events_for_test(std::size_t max_events);
 
+    /// UP-14: the boot epoch this engine was constructed with (0 = unordered; the wire pair
+    /// is then 0/0). Immutable for the engine's lifetime.
+    [[nodiscard]] std::uint64_t boot_epoch() const noexcept;
+
+    /// TEST-ONLY (UP-14): the engine-owned emit-order source the legacy sink executor and
+    /// the Spark runtime both draw from. Returned by shared_ptr so a test can take a
+    /// weak_ptr and observe the source's lifetime; a test using the complete type must
+    /// `#include "guardian_emit_seq.hpp"` itself (this header only forward-declares it).
+    /// No production caller.
+    [[nodiscard]] std::shared_ptr<GuardianEmitSeqSource> emit_seq_source_for_test() const;
+
 private:
     KvStore* kv_;
     std::string agent_id_;
@@ -1271,10 +1292,17 @@ private:
     /// `first_lost` — a real verdict delivered between two losses is legitimately
     /// older than the SECOND loss and should still be overwritten by a repair
     /// covering that second loss); every real guard callsite leaves it at
-    /// nullopt and keeps stamping `now`. This is belt-and-braces alongside the
-    /// executor's own seq-guarded clearing and dequeue-time supersession check —
-    /// it lets the server's existing `updated_at >=` upsert guard independently
-    /// reject a stale repair, even if it somehow still reached the wire.
+    /// nullopt and keeps stamping `now`. The executor's own seq-guarded clearing and
+    /// dequeue-time supersession check are the agent-side stale-repair defence; the
+    /// backdated timestamp is an input to the server's census ordering key, which
+    /// sees the repair at the time of the loss rather than the time of the repair.
+    /// UP-14: the backdated stamp is an input to that key, not an ordering authority the
+    /// agent can rely on (the key is capped at receipt plus 300 s, and a tie is decided by
+    /// arrival). A repair goes through offer() like
+    /// any event and draws a FRESH (boot_epoch, emit_seq) pair at admission; the pair and
+    /// the timestamp are both inputs, a server that compares the pair orders the repair
+    /// against other verdicts by it, and one that does not (or sees 0/0) falls back to
+    /// the census ordering key.
     ///
     /// `expected_gap_lost_seq` (adversarial-review finding, 2026-09-24): threaded
     /// straight through to offer()'s own parameter of the same name — see
@@ -1293,8 +1321,9 @@ private:
     // shape (the #1307 agent_id fold) has no cross-platform test path without
     // this. The helper drives emit_guard_event() with a synthetic GuardDrift;
     // a sink installed via set_event_sink() captures the resulting event.
-    friend YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
-                                                         const GuardDrift& drift);
+    friend YUZU_EXPORT void guardian_emit_drift_for_test(
+        GuardianEngine& engine, const GuardDrift& drift,
+        std::optional<std::chrono::system_clock::time_point> timestamp_override);
 
     // event_sink_ is guarded by its own mutex (not mtx_) so a guard worker can
     // deliver an event without contending with — or deadlocking against — the
@@ -1303,6 +1332,24 @@ private:
     mutable std::mutex sink_mtx_;
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
+    /// UP-14: the ONE emit-order source (boot_epoch fixed at construction) both emit paths
+    /// stamp the wire (boot_epoch, emit_seq) pair from: the legacy sink executor (built by
+    /// make_legacy_sink_executor, which hands it over) and, via wire_spark_engine(), the
+    /// Spark runtime. Never null. A shared_ptr, not a value member lent out by pointer: the
+    /// runtime (detached SparkEngine handler) and the executor's detached worker can outlive
+    /// this engine's frame, so each co-owns it. It lives HERE rather than in the runtime
+    /// because the runtime can be absent (SparkDisabled / SparkFailed) while the legacy path
+    /// is always live. Declared BEFORE legacy_sink_executor_ (the member-init list passes it
+    /// to the executor); distinct from event_seq_ above, which only mints event ids.
+    std::shared_ptr<GuardianEmitSeqSource> emit_seq_source_;
+    /// Build a legacy sink executor that carries emit_seq_source_. The ONE construction
+    /// path: the constructor's member-init list and set_legacy_sink_max_events_for_test()
+    /// both use it, so a rebuilt executor can never silently drop the source. Reads only
+    /// emit_seq_source_, which is initialized before legacy_sink_executor_. `max_events`
+    /// overrides GuardianLegacySinkExecutor::Config::max_events when set (the Config type is
+    /// not nameable in this header, see set_legacy_sink_max_events_for_test).
+    [[nodiscard]] std::unique_ptr<GuardianLegacySinkExecutor>
+    make_legacy_sink_executor(std::optional<std::size_t> max_events = std::nullopt) const;
     /// #4783: count of emit_guard_event() calls that bailed because no sink was wired
     /// yet (event_sink_ null - the pre-network-arm A3 drop, unchanged semantics).
     /// Previously a silent, uncounted return; now countable so "the sink was never
@@ -1557,8 +1604,12 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 /// captured by a sink installed via set_event_sink(). Intended ONLY for unit
 /// tests — production drift originates inside Windows-only guard workers. Used
 /// by the #1307 regression test to assert the event_id embeds the agent_id.
-YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
-                                              const GuardDrift& drift);
+/// `timestamp_override` (UP-14) is threaded to emit_guard_event() so a test can backdate
+/// the wire timestamp deterministically (the same parameter legacy_sink_kick() uses for a
+/// gap repair); the default leaves every existing caller unchanged.
+YUZU_EXPORT void guardian_emit_drift_for_test(
+    GuardianEngine& engine, const GuardDrift& drift,
+    std::optional<std::chrono::system_clock::time_point> timestamp_override = std::nullopt);
 
 /// Test-support helpers (#4021 adversarial-review K1/C2-1 regression net): reach
 /// the persist-side overwrite guard and the seed-side lookup directly, since the

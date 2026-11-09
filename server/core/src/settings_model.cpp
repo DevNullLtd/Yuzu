@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
 #include <optional>
 #include <string_view>
 
@@ -266,9 +267,12 @@ nlohmann::json build_data_retention_settings(
                             {"limit", t.limit},
                             {"bucket_seconds", echo_retention::bucket_seconds(t.tier)},
                             {"guaranteed_depth_seconds",
-                             depth ? nlohmann::json(*depth) : nlohmann::json(nullptr)}});
+                             depth ? nlohmann::json(*depth) : nlohmann::json(nullptr)},
+                            {"budget_dependent", echo_retention::budget_dependent(t.tier)}});
         }
-        j["echo"] = {{"tick_seconds", echo_retention::kEchoRetentionTickSeconds}, {"tiers", rows}};
+        j["echo"] = {{"tick_seconds", echo_retention::kEchoRetentionTickSeconds},
+                     {"db_budget_bytes", yuzu::kEchoDbBudgetBytesDefault},
+                     {"tiers", rows}};
     }
     return j;
 }
@@ -286,7 +290,9 @@ std::string plural(std::int64_t n, const char* unit) {
 }
 
 std::string with_thousands(std::int64_t n) {
-    std::string d = std::to_string(n < 0 ? -n : n);
+    // Unsigned magnitude: negating INT64_MIN as a signed value is undefined.
+    const std::uint64_t mag = n < 0 ? 0 - static_cast<std::uint64_t>(n) : static_cast<std::uint64_t>(n);
+    std::string d = std::to_string(mag);
     std::string out;
     for (std::size_t i = 0; i < d.size(); ++i) {
         if (i != 0 && (d.size() - i) % 3 == 0)

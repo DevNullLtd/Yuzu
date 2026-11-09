@@ -58,7 +58,8 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
       `use-after-poison` before any test runs), so it needs the `x64-linux-asan` triplet
       built first; `triplets/x64-linux-asan.cmake`'s own header documents this.
 - [ ] **3. 3-OS matrix**, written concretely: per-OS `yuzu.guardian_backend` heartbeat tag +
-      `spark_running`/`spark_disabled` posture-key evidence captured, for:
+      `spark_running`/`spark_disabled` posture-key evidence captured (the tag is also visible as
+      `yuzu_fleet_guardian_backend{os,backend}` and the per-device `guardian_backend` field, #2240), for:
       - Linux - Service mechanism on spark; File/Registry unsupported (left unregistered, per
         `agent.cpp`'s per-mechanism factory pattern).
       - Windows - all three mechanisms armed (File/Registry/Service).
@@ -1534,8 +1535,11 @@ flip, with a red-first test each:
     between "Nothing about" and "Guard detection", so a single-line grep for the whole phrase
     finds nothing; grep for "Guard detection or enforcement changes") and "No alert rule
     ships with them", plus its "dormant in steady state until the Spark path is enabled"; in
-    `guaranteed-state.md`, the `yuzu.guardian_backend` paragraph's "it reads `legacy`
-    fleet-wide, since `prefer_spark` is not yet enabled anywhere in production", the
+    `guaranteed-state.md`, the `yuzu.guardian_backend` paragraph's "every reporting device
+    reads `legacy`, since `prefer_spark` is not yet enabled anywhere in production" (and the
+    same statement in `metrics.md`'s "`legacy` is every reporting agent" bullet, the
+    `kGuardianBackendHelp` HELP constant and the `mcp.md` rows for `list_agents` and
+    `get_agent_details`), the
     "dormant until Guardian enforces through SparkEngine" labels on the wedged-rule hold note
     and the congestion-parking note, and known limit (1) of the hold note, "no current
     production route emits such a push" (retired by #5547, which rewrote limit (1) of the hold
@@ -1596,8 +1600,9 @@ flip, with a red-first test each:
     `guard.compliant` for a skipped rule, so it no longer repairs a lost recovery event by
     accident, and server-state loss (a Postgres restore, an outbox drop) no longer self-heals by
     re-push; an explicit census resync mechanism is a flip precondition, tracked in #5718 (since
-    #5674 PR1 the census write is in the event transaction under a savepoint, though a
-    Redelivered event still does not repair it; and `guard.errored` is now a census state, #5667
+    #5674 PR1 the census write is in the event transaction under a savepoint, and since #5690
+    PR2a-1 a Redelivered event repairs a census write that failed (the event is stored with
+    pending evidence), though it still does not repair a row the re-push loss left stale; and `guard.errored` is now a census state, #5667
     residual (a), so more stale census rows can exist than when this loss was first written); (2) it no longer restarts the `pending_initial` demotion clock; (3) a crash after
     the absent-row sweep and before the per-rule rewrites leaves the previous rows for carried
     rules, i.e. OLD content, including a rule the push disabled or changed, until the next push
@@ -2417,17 +2422,19 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   RESOLVED means the state mapping and its tests are done; it is not "DONE with no
   residual". Residuals to resolve or risk-accept before PR-6 sign-off (the Sign-off row's gate; the
   "pre-PR-5" tags elsewhere in this section are the original tag, kept for history): (a) on the single-event
-  ingest path a Redelivered event returns before the census write, so mixed-version redelivery never
-  repairs a census row; since #5674 PR1 the census write is in the event transaction under a
+  ingest path a Redelivered event repairs a census write that failed (#5690 PR2a-1: the event is
+  stored with pending evidence) and otherwise returns before the census write, so mixed-version
+  redelivery of an event that was projected never repairs a census row; since #5674 PR1 the census write is in the event transaction under a
   savepoint, a failed write keeps the event and is counted on
   `yuzu_server_guardian_census_proj_failures_total` (so a transient Postgres failure still leaves a detached rule showing its last verdict, now visibly), and a deleted rule's census rows are removed with it; (b)
   recovery after a spark re-arm is by code reading only, with no agent-level detach,
-  re-arm, compliant-edge test (#5676); (c) the row timestamp is agent-asserted with no
-  server clamp (`guardian_ingest.cpp:293`) and a `>=` tie rule
-  (the `ON CONFLICT ... WHERE EXCLUDED.updated_at >=` guard in `project_rule_status()`), so clock skew or a same-second tie across the
-  lifecycle and compliance lanes can leave a false compliant (#5690; live today
+  re-arm, compliant-edge test (#5676); (c) the census orders by a key limited to server receipt plus 300 s (#5690 PR2a-1;
+  the text timestamp in `guardian_ingest.cpp` (`ts_to_iso8601`) still feeds the TEXT column only) with ties broken by the
+  event INSERT's `ingest_seq`, and flags a refused, tied or unprovable ordering (`order_uncertain`), so clock skew or a same-instant tie across the
+  lifecycle and compliance lanes is shown as uncertain and no longer silently leaves a false compliant
+  (#5690; the agent now stamps milliseconds, and an agent that predates that stamps whole seconds; live today
   for guard.unhealthy; the agent-side hold, PR #5776, delays each overtake by up to
-  H = 1 s and then permits up to N = 64, but cannot close the same-second tie); (d) the census is absent from the decommission cascade, so
+  H = 1 s and then permits up to N = 64, which does not change the tie rule); (d) the census is absent from the decommission cascade, so
   REST/MCP errored_rules and the dashboard can disagree after a decommission (#5675).
 - **Journal-quarantine finding (enterprise-readiness Gate 6) - FOUND AND FIXED IN PR-2d
   ITSELF, not deferred.** `guardian_lifecycle_journal.cpp`'s replay-validation allowlist
@@ -2467,10 +2474,14 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   this doc) rests on a code-reading assertion, not an auditor-checkable per-deployment
   signal. The wire-level tag already exists (`kGuardianBackendTag`/`yuzu.guardian_backend`,
   correctly distinguishing legacy vs. spark enforcement per agent) and is ingested
-  server-side into the per-agent `status_tags` map, but **no server code reads it** - no
-  REST field, no dashboard surface. Not specific to #2818 (it's a general PR-5-readiness
-  gap), so not filed as its own #2818-scoped issue; recorded here since several of this
-  PR's own non-blocking dispositions depend on it.
+  server-side into the per-agent `status_tags` map. **Signal now visible (#2240), unattested:** the server now reads
+  it (`AgentHealthStore::recompute_metrics` rolls it up as `yuzu_fleet_guardian_backend{os,backend}`)
+  and serves it per device as the nullable `guardian_backend` field on `GET /api/v1/devices[/{id}]`,
+  `list_agents` and `get_agent_details` (the dashboard intentionally does not show it). The value is the
+  agent's own report, not independent verification. No alert rule ships; every reporting agent reading
+  `legacy` is the correct reading until `prefer_spark` is enabled. Not specific to #2818 (it was a general
+  PR-5-readiness gap), so not filed as its own #2818-scoped issue; recorded here since several of
+  this PR's own non-blocking dispositions depend on it.
 - **Baseline-persist signal emitted but unread (#4045, F14 precondition).** Same shape as the
   `yuzu.guardian_backend` gap above: `yuzu.guardian_baseline_persist_failures` is emitted on
   the heartbeat (Spark path only, cumulative, mixing retryable failures with permanent
@@ -2637,7 +2648,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 - Owner: not assigned for any item above.
 - Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + two remaining pre-PR-5 GATING items
   from the PR-2d follow-ups (the three sre observability gaps; the
-  yuzu.guardian_backend server-side-reader gap), plus two items from #4045 (the fleet-visible
+  yuzu.guardian_backend server-side-reader gap, now visible via #2240), plus two items from #4045 (the fleet-visible
   baseline-persist signal (F14 precondition, section 3a) and the missing
   remaining-deadline wall in `stop()`); the third PR-2d follow-up, guard.errored census
   recognition (C-1), is resolved by #5667 with residuals (a)-(d) carried in the C-1 bullet
@@ -2794,7 +2805,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 **#3416** (+#3415, #3485, #3486)
 - Detection signal: already shipped and live - per-OS `yuzu.guardian_backend` heartbeat tag +
   posture keys (`agent_registry.cpp:2124`/`:2296` computes `spark_failed_os`, confirmed in §2
-  criterion 3).
+  criterion 3); the tag is also rolled up as `yuzu_fleet_guardian_backend{os,backend}` (#2240).
 - Operator action: N/A - already mitigated by the above.
 - Compensating control: the shipped heartbeat/posture-key surface itself.
 - Owner / milestone: P4 lane; recheck cost at P4 start.
@@ -2810,9 +2821,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   lane was permitted to overtake an older entry in the other lane, so events may have reached
   the stream out of enqueue order (a release is counted even if that call launches nothing).
   The audit trail is complete, but the data-integrity consequence is #5690: a later-launched
-  sender overtaking an older one, combined with the server's same-second `>=` tie in
-  `project_rule_status` (`guard.errored` versus a delayed `guard.compliant`), can leave the
-  server holding a false `compliant`. #5690 is open and gates the flip. Correlate with
+  sender overtaking an older one (`guard.errored` versus a delayed `guard.compliant`) reaches
+  the server's census ordering out of stamp order, which the server now flags `order_uncertain`
+  instead of silently keeping a false `compliant`. #5690 is open and gates the flip; the flag
+  makes the outcome visible and is not a ruling that the gate is met. Correlate with
   `yuzu.guardian_send_stalls` / send exceptions on the same endpoint
   (`docs/user-manual/metrics.md`). The gauge is an unlabelled fleet sum and there is no
   operator surface for per-agent heartbeat tags yet (`docs/prometheus/yuzu-alerts.yml`
@@ -2832,13 +2844,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   `GuardianSparkRuntime::drain_bounded()`. The earlier claim here that no consumer depends on
   strict cross-lane wire ordering is withdrawn: the server maps `guard.compliant` to
   `compliant` and `guard.errored`/`guard.unhealthy` to `errored`
-  (`event_state_from_type()` in `guaranteed_state_store.cpp`) and keeps a row on
-  `EXCLUDED.updated_at >= stored` (`project_rule_status()`) at one-second timestamp resolution (`guardian_ingest.cpp:293`), with the
-  equal-timestamp case pinned by the "equal timestamps, distinct event ids" section of the "guard.errored maps to the errored census state (C-1)" case in `test_guaranteed_state_store.cpp`, so an overtaking
-  `errored` can leave a false compliant. That is #5690 (C-1 residual (c), above); the
-  agent-side hold (PR #5776) delays each overtake by up to H = 1 s and then permits up to
-  N = 64 launches, with no time bound until the lane finds no blocker or empties, so it
-  cannot close the same-second tie.
+  (`event_state_from_type()` in `guaranteed_state_store.cpp`) and, before #5690, kept a row on
+  `EXCLUDED.updated_at >= stored` at one-second timestamp resolution, so an overtaking
+  `errored` could leave a false compliant. #5690 (C-1 residual (c), above) replaced that with the
+  `(key, ingest_seq)` ordering: a same-key pair of different verdicts is ordered by arrival and flagged
+  `order_uncertain`, and the agent now stamps milliseconds. The agent-side hold (PR #5776) delays each
+  overtake by up to H = 1 s and then permits up to N = 64 launches, with no time bound until the lane
+  finds no blocker or empties; it does not change the tie rule.
 - Known behaviour of the hold (verified against `wrapped_send()` and
   `GuardianSparkRuntime::try_page_batch`'s page-time stamp, not measured on a fleet):
   (i) a large lifecycle replay is stamped at page time, so it holds live compliance entries
@@ -2857,12 +2869,77 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   mutex to a younger errored send released after H, so the errored reaches the wire first.
   UP-14: `enqueued_ns` is `system_clock`; a backward wall-clock step between an older compliant
   and a newer errored gives the errored an earlier timestamp, so the server keeps the compliant
-  whatever the wire order, and the hold cannot touch it (server side). Note on #5690's
-  acceptance options (factual, not a ruling): a same-second tie policy closes UP-13 but not
-  UP-14; receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence
+  whatever the wire order (the (agent, rule) pair is flagged `order_uncertain` when the errored arrives
+  second; in the other order the compliant applies, and the (agent, rule) pair is flagged only if one of the
+  conditions in the Guardian guide's section 'When a verdict is flagged or does not move'
+  holds), and the hold cannot touch it (server side). The agent now also
+  stamps a `(boot_epoch, emit_seq)` pair at the point queue order is decided (legacy executor
+  admission; the Spark outbox stamp). A server that compares the pair orders a retained
+  verdict against a newer one by it, and that order depends on neither the wall clock nor
+  arrival order; a server that does not compare it ignores the pair and keeps ordering by its
+  census ordering key. The census ordering key stays the key for entries that carry no pair:
+  journal-paged replays, DEX observations, and an agent whose boot epoch could not be claimed
+  are sent with the pair unset (0/0). Note on #5690's
+  acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14 (the
+  server now flags a tied or mis-ordered pair rather than keeping it silently);
+  receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence
   closes both. The test `#3972 chaos: a third sender holding the stream write mutex ...`
   (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
-- Owner: not assigned in source material.
+- Merge gate for the agent change (UP-14; conditions the UP-14 SERVER change must meet before
+  the agent change merges, in the fixed order census change, server change, agent change).
+  This agent change activates ordering against a server that may already use the pair; it stays
+  blocked until the receiving change satisfies items 1 to 5 and the integrated range is reviewed.
+  Status will be tracked on #5690 and in the agent change's pull request description (one
+  checkbox per item) once that pull request exists:
+  1. The comparator orders per (agent_id, rule_id), compares the pair only when both sides
+     carry a nonzero pair and otherwise uses the census ordering key. Tests: isolation between agents and
+     rules (one agent's pair never affects another agent's rows), ordered to unordered to
+     ordered transitions, and a test that rejects "an unset pair ranks lowest". The pair is
+     agent-asserted and unauthenticated.
+  2. A tested recovery path for a pair regression. A lost, corrupt or restored-older agent row
+     that is below the server's retained epoch recovers without waiting for the clock to catch
+     up; both the ordinary backward-clock case and the previously-fast-clock case are covered.
+     While recovery is incomplete, stale census state is not silently shown as current (an
+     observable uncertain or degraded state, or another tested mechanism). Delayed events
+     carrying the former higher epoch cannot undo the recovery. The operator procedure names
+     the affected agent, leaves other agents' state untouched, and is written in the operator
+     manual.
+  3. The pair is kept out of `stored_event_matches` (pair-independent duplicate equality is
+     retained), so a journal replay (0/0) of an event already delivered is not counted as a
+     collision (otherwise `YuzuGuardianEventsDropped` fires on benign replays), and a test
+     shows a duplicate replay does not reapply an obsolete census transition.
+  4. The rule for gap repairs (they draw a fresh pair at admission today) and for accepted
+     unordered (0/0) events is stated with correctness outcomes and tests: a failed-claim 0/0
+     event against an existing ordered verdict; rollback to a non-stamping binary; the
+     transition from unordered back to ordered; whether an accepted 0/0 clears or retains the
+     stored ordering metadata, and how that metadata stays associated with the verdict it
+     actually describes; and the timeline of a previously undelivered older replay (an error at
+     timestamp 100 replayed as 0/0 after a backward clock step, after a newer live compliant
+     verdict at timestamp 90), in both arrival orders and with subsequent live events; and two
+     live senders sharing one agent_id, a lock holder stamping a pair while a process that
+     was refused the data-directory lock (`instance_lock_not_held`) or an older build sends
+     0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
+     that is in turn ranked above it), the outcome is stated, and a test covers it. Two
+     stamping senders on separate data directories under one fixed agent id (independent
+     epochs) still order totally, but their events rank against each other by epochs that
+     are unrelated across instances, and the count below cannot see them because both send a
+     pair: for that case too the outcome is stated and a test covers it. The server also
+     counts accepted events that carry no pair, per agent, and exposes the count (a metric or
+     an API field), so an agent that runs unordered is visible fleet-wide; the agent's own
+     signal is one error-level log line.
+     For every case above, tests show that stale state is not silently presented as the current
+     verdict. When the available ordering information cannot establish freshness, the server
+     exposes that uncertainty or obtains fresh state; census-ordering-key fallback, metadata retention,
+     or documenting the selected result alone does not satisfy this criterion.
+  5. The server change's hunk for fields 24 and 25 is the authority (the agreed split: the
+     server change owns the fields); the agent change takes the server change's version of
+     the hunk when it merges origin/dev. That comment must say boot_epoch is not guaranteed
+     monotonic across restarts (lost row, clock-ahead pin, equal epoch, 2^62 ceiling) and
+     must define UP-14. This item is a compatibility and documentation criterion; it does not
+     close items 1 to 4.
+- Owner: Dave Rae (maintainer), for the UP-14 server change that must meet items 1 to 5.
+  Receiving tracking unit: #5690. No server pull request for the pair comparison exists yet;
+  when it does, its description carries one checkbox per item and links back here.
 - Milestone: PR #5776.
 - Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect
   `send_order_hold_releases`, `send_stalls` and `send_exceptions` per endpoint on the pilot
@@ -2910,10 +2987,12 @@ was raised (`governance.d/3953-3966-outbox-hardening.T6I4sf.jsonl` line 15).
 **Rollback lever for the hold and the spark path (status note; no new obligation, section 6's
 standing ruling stands).** `prefer_spark_` is `const` and fixed at construction
 (`guardian_engine.hpp`: "IMMUTABLE for object lifetime"), and `agent.cpp` constructs
-`GuardianEngine` with the default (`guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(),
-cfg_.agent_id)`, no third argument), so there is no runtime switch for it. The rollback lever is
-the boot-time deploy opt-out `--spark-disable` / `YUZU_AGENT_SPARK_DISABLE` (`agent.cpp`
-~1232-1248: the SparkEngine is not instantiated and detection stays on the legacy `IGuard` path),
+`GuardianEngine` with the literal `false` (`guardian_ = std::make_unique<GuardianEngine>(kv_store_.get(),
+cfg_.agent_id, /*prefer_spark=*/false, boot_epoch_claim.boot_epoch)`), so there is no runtime
+switch for it. The rollback lever is the boot-time deploy opt-out `--spark-disable` /
+`YUZU_AGENT_SPARK_DISABLE` (`agent.cpp`, the `if (cfg_.spark_disable)` branch ahead of the
+SparkEngine construction: the SparkEngine is not instantiated and detection stays on the
+legacy `IGuard` path),
 the sole lever per section 6: restart-required, deploy-time, not server-pushable. It persists
 across restarts only on Linux (`EnvironmentFile=`, #3851); Windows and macOS have no persistence
 mechanism yet (#3973). There is no hold-only lever: the hold's H and N are compile-time defaults.
@@ -3240,7 +3319,7 @@ mode; `/etc/yuzu-agent/` has no such collision.
    (`agent.cpp:1254`) records `SparkAvailability::SparkDisabled`, and the `SparkDisabled` case
    of the backend-derivation log switch (`:1269–1272`) reports `detection backend = legacy`
    regardless of `prefer_spark`'s compiled-in value - SparkDisabled always means legacy,
-   unconditionally. Verify via the `yuzu.guardian_backend` heartbeat tag on the next beat.
+   unconditionally. Verify via the `yuzu.guardian_backend` heartbeat tag on the next beat (or the device's `guardian_backend` field, or `yuzu_fleet_guardian_backend{backend="legacy"}` after the next sweep). All three are the agent's own report: they corroborate but do not prove that enforcement resumed, and in a one-agent drill the fleet gauge cannot name the drilled agent, so the device field is the discriminating check.
 4. Confirm no spark state leaks: both sub-checks follow directly from step 2's
    `spark_engine_` staying null - with no `SparkEngine` instance, there is nothing to hold an
    armed subscription and nothing to drain an outbox from, by construction, not by a separate

@@ -9,7 +9,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dylib`); there is no alias, and the agent rejects a leftover `tar` plugin file. See the Echo section of [Upgrading](upgrading.md).
 
 <!-- BEGIN GENERATED: plugin-doc-gen index -->
-72 of 72 plugins document themselves this way; the rest are described in the prose below until their README lands.
+73 of 73 plugins document themselves this way; the rest are described in the prose below until their README lands.
 
 | Plugin | Platforms | What it does | Docs |
 |---|---|---|---|
@@ -56,7 +56,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `network_diag` | ✅ ✅ ✅ | Network diagnostics — listening ports and established connections | [README](../../agents/plugins/network_diag/README.md) |
 | `os_info` | ✅ ✅ ✅ | Reports OS name, version, build, architecture, and system uptime | [README](../../agents/plugins/os_info/README.md) |
 | `peripherals` | ✅ ✅ ✅ | USB, PCI and Thunderbolt/USB4 device inventory | [README](../../agents/plugins/peripherals/README.md) |
-| `pkg_inventory` | 🟡 ✅ ✅ | Machine-scope package-manager inventory (managers, packages and store_packages); per-user package stores are out of scope, deferred to the user-session helper | [README](../../agents/plugins/pkg_inventory/README.md) |
+| `pkg_inventory` | ✅ ✅ ✅ | Machine-scope package-manager inventory (managers, packages and store_packages); per-user package stores are out of scope, deferred to the user-session helper | [README](../../agents/plugins/pkg_inventory/README.md) |
 | `platform_security` | ✅ ✅ ✅ | Secure Boot and code-integrity enforcement posture (read-only) | [README](../../agents/plugins/platform_security/README.md) |
 | `power_health` | ✅ ✅ 🟡 | Battery, thermal, and power-plan inventory, plus a gated power-plan switch | [README](../../agents/plugins/power_health/README.md) |
 | `printing` | ✅ ✅ ✅ | Printer/job inventory plus a single narrowly-scoped clear_queue cancellation | [README](../../agents/plugins/printing/README.md) |
@@ -79,6 +79,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `tags` | ✅ ✅ ✅ | Device tagging — set, get, delete, list tags for scope evaluation | [README](../../agents/plugins/tags/README.md) |
 | `update_source_trust` | 🟡 🟡 ✅ | Package and update-source trust posture (facts only) | [README](../../agents/plugins/update_source_trust/README.md) |
 | `users` | ✅ ✅ ✅ | Reports logged-on users, sessions, local accounts, admin group members, group membership, primary user, and session history | [README](../../agents/plugins/users/README.md) |
+| `virtualization` | 🟡 ✅ ✅ | Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions | [README](../../agents/plugins/virtualization/README.md) |
 | `vuln_scan` | ✅ ✅ ✅ | Host vulnerability scanning — CVE matching and configuration compliance checks | [README](../../agents/plugins/vuln_scan/README.md) |
 | `wifi` | ✅ 🟡 🟡 | Scans visible WiFi networks and reports current connection status | [README](../../agents/plugins/wifi/README.md) |
 | `windows_optional_features` | ✅ ⛔ ⛔ | Windows optional OS feature state (enabled/disabled/pending) via the DISM API | [README](../../agents/plugins/windows_optional_features/README.md) |

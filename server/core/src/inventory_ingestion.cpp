@@ -1,6 +1,7 @@
 #include "inventory_ingestion.hpp"
 
 #include "agent.pb.h"
+#include "inventory_blob_v3.hpp"
 #include "software_inventory_store.hpp"
 #include "utf8_sanitize.hpp"
 
@@ -24,6 +25,13 @@ namespace pb = ::yuzu::agent::v1;
 
 constexpr const char* kSourceInstalledSoftware = "installed_software";
 
+// The `facet` label of yuzu_inventory_section_ingest_total (and the facet named in the refusal
+// log line): a collector source or component_inventory, else "unknown" - never the agent's raw
+// string.
+std::string facet_label(std::string_view facet) {
+    return is_known_v3_facet(facet) ? std::string(facet) : std::string("unknown");
+}
+
 // Input caps — the report is untrusted (security-guardian). A blob over the cap
 // is rejected (dropped + nacked); entries/fields beyond the cap are
 // dropped/truncated.
@@ -42,16 +50,25 @@ constexpr std::size_t kMaxFieldLen = 1024;
 // gov fjarvis LOW.
 constexpr int kMaxSources = 64;
 
+// The blob-v3 parser (inventory_blob_v3.hpp) is a header with its own copies of these caps;
+// they are ONE number each, so a one-sided bump is a build failure here.
+static_assert(kMaxBlobBytes == kV3MaxBlobBytes && kMaxEntries == kV3MaxRows &&
+                  kMaxFieldLen == kV3MaxFieldLen,
+              "blob v2 and v3 caps must stay equal (and equal the agent source's blob cap)");
+
 // Parse the canonical wire blob into rows: entries are 0x1E-separated; each is
 // 0x1F-separated in blob contract v2 + extended tail field order (name, version,
 // publisher, install_date, kind, ecosystem, epoch, release, arch, signature_status,
 // distro_id, distro_version, install_location, uninstall_string, package_id,
 // source) — the same byte form the agent hashes (ADR-0016 §4), so the server
-// re-hash matches. Slots 13-14 (install_location, uninstall_string) are RESERVED: they
-// are consumed to keep the positions but never stored or hashed, because ADR-0016 §8
-// has not been re-opened for them (#5186). An agent that hashes real values there gets
-// need_full until the server accepts them. A shorter record (v1 4-field, v2 12-field)
-// parses fine: the token walk stops at the record's end, leaving the remaining fields default-empty
+// re-hash matches. Slots 13-14 (install_location, uninstall_string) are RESERVED on THIS
+// (v2) path: they are consumed to keep the positions but never stored or hashed, because
+// the v2 grammar was never re-classified for them (#5186). An agent that hashes real values
+// there gets need_full until the server accepts them. The blob-v3 `+` record
+// (inventory_blob_v3.hpp) is the path that stores slot 13, after ADR-0016 §8 was re-opened for
+// it in the v10 Update; slot 14 stays reserved there too. A shorter record (v1
+// 4-field, v2 12-field) parses fine: the token walk stops at the record's end, leaving the
+// remaining fields default-empty
 // (the documented mixed-version behaviour — an old agent's rows store with empty
 // trailing columns). Tokens beyond the 16th are dropped. The server hash covers
 // the tail only when package_id or source is non-empty (SoftwareInventoryStore::canonical_hash);
@@ -123,7 +140,113 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
     return out;
 }
 
+// Blob v3 (ADR-0016 Update 2026-11-04): parse the sections, apply them, and turn each
+// section's outcome into the per-section nack (`installed_software:<facet>`; the whole-source
+// `installed_software` nack is kept for a blob that cannot be attributed to sections at all)
+// and the section counter. Returns the source-level `yuzu_inventory_ingest_total` outcome.
+// A refused section never stops the others: the store applies every section that parsed, and a
+// delta or component section that does not verify is rolled back alone (`mismatch`) and nacked
+// like a refused one, so the agent resends that facet in full.
+const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& agent_id,
+                           const std::string& blob, pb::InventoryAck& ack,
+                           ::yuzu::MetricsRegistry* metrics) {
+    auto parsed = parse_v3_blob(blob);
+    if (!parsed) {
+        // Same class as an over-cap v2 blob: nacked, and the agent resends the same bytes, so
+        // it is `dropped` (the never-self-heals alert), not `need_full`.
+        spdlog::warn("inventory: unusable v3 '{}' blob from agent={} ({}), dropping + nacking",
+                     kSourceInstalledSoftware, agent_id, v3_parse_error_name(parsed.error()));
+        ack.add_need_full(kSourceInstalledSoftware);
+        return "dropped";
+    }
+    // ONE line per report, not per section (a hostile agent can refuse every one of its
+    // <= kV3MaxSections sections on every resend). The facet is logged from the closed set, never
+    // the agent's raw string.
+    {
+        std::size_t refused = 0;
+        std::string detail;
+        for (const auto& sec : parsed->sections) {
+            if (sec.refusal == V3Refusal::kNone)
+                continue;
+            ++refused;
+            if (!detail.empty())
+                detail += ", ";
+            detail += facet_label(sec.facet);
+            detail += ':';
+            detail += v3_refusal_name(sec.refusal);
+        }
+        if (refused > 0)
+            spdlog::warn("inventory: {} v3 section(s) from agent={} refused ({}), nacking them",
+                         refused, agent_id, detail);
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<V3SectionResult> results =
+        store.apply_installed_software_v3(agent_id, std::move(*parsed));
+    if (metrics) {
+        const double secs =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        // A creating site for yuzu_inventory_ingest_duration_seconds: pass seconds_buckets_60s()
+        // (see the v2 site below for why every site must).
+        metrics
+            ->histogram("yuzu_inventory_ingest_duration_seconds",
+                        {{"source", kSourceInstalledSoftware}, {"phase", "v3"}},
+                        yuzu::Histogram::seconds_buckets_60s())
+            .observe(secs);
+    }
+
+    bool any_need_full = false;
+    bool any_error = false;
+    for (const auto& r : results) {
+        if (metrics) {
+            metrics
+                ->counter("yuzu_inventory_section_ingest_total",
+                          {{"facet", facet_label(r.facet)},
+                           {"outcome", std::string(v3_section_outcome_name(r.outcome))}})
+                .increment();
+        }
+        if (!v3_section_needs_full(r.outcome))
+            continue;
+        any_need_full = true;
+        any_error = any_error || r.outcome == V3SectionOutcome::kError;
+        const std::string nack = std::string(kSourceInstalledSoftware) + ":" + r.facet;
+        bool dup = false;
+        for (const auto& have : ack.need_full())
+            dup = dup || have == nack;
+        if (!dup)
+            ack.add_need_full(nack);
+    }
+    return any_error ? "error" : any_need_full ? "need_full" : "stored";
+}
+
 } // namespace
+
+void seed_section_ingest_series(::yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_inventory_section_ingest_total",
+                     "Blob-v3 installed-software section outcomes by facet and outcome "
+                     "(facet = a collector source, component_inventory, or unknown; "
+                     "outcome = stored/status_only/need_full/mismatch/rejected/"
+                     "error; moves only once a v3 agent reports)",
+                     "counter");
+    const auto seed = [&](const std::string& facet) {
+        for (const auto outcome : kV3SectionOutcomes)
+            metrics.counter("yuzu_inventory_section_ingest_total",
+                            {{"facet", facet}, {"outcome", std::string(v3_section_outcome_name(outcome))}});
+    };
+    for (const auto& src : software_catalog::kSoftwareSources)
+        seed(std::string(src.value));
+    seed(std::string(kComponentInventoryFacet));
+    seed("unknown");
+
+    metrics.describe("yuzu_software_changes_total",
+                     "Install-history ledger rows written by applied installed-software "
+                     "sections, by kind (install/remove/upgrade); a baseline section writes "
+                     "none",
+                     "counter");
+    for (const auto kind : kSoftwareChangeKinds)
+        metrics.counter("yuzu_software_changes_total",
+                        {{"kind", std::string(software_change_kind_name(kind))}});
+}
 
 bool validate_inventory_report_source_count(const std::string& agent_id,
                                             const pb::InventoryReport& report,
@@ -173,8 +296,15 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
         if (source != kSourceInstalledSoftware)
             continue; // slice 1: only installed_software is wired
 
-        std::optional<std::vector<SoftwareEntry>> rows;
         auto it = report.plugin_data().find(source);
+        // Blob v3 is recognised by its exact header bytes and takes its own path; every other
+        // blob is v2 and falls through to the unchanged code below.
+        if (it != report.plugin_data().end() && is_v3_blob(it->second)) {
+            emit(source, ingest_v3_blob(store, agent_id, it->second, ack, metrics));
+            continue;
+        }
+
+        std::optional<std::vector<SoftwareEntry>> rows;
         if (it != report.plugin_data().end()) {
             rows = parse_software_blob(it->second);
             if (!rows.has_value()) {

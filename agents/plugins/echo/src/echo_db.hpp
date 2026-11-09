@@ -3,15 +3,19 @@
 /**
  * echo_db.hpp -- SQLite-backed Echo activity record database
  *
- * Stores timestamped events (process births/deaths, network connections,
- * service state changes, user sessions) with snapshot IDs for correlation.
+ * Stores what the capture sources observe (process births/deaths, network connections,
+ * service state changes, user sessions, ...) as ROLL-UP tiers: hourly / daily / monthly
+ * counters keyed by what happened, never as raw event rows. Roll-up is the ONLY storage model;
+ * no setting, flag or environment variable selects between it and raw rows.
  *
  * Schema:
  *   echo_state  — last-known state per collector for diff computation
  *   echo_config — key/value config (retention_days, redaction patterns, etc.)
  *   echo_cursor — last-persisted cursor JSON per cursor-model source
- *                (echo_cursor.hpp: power, removable — wave 2)
- *   plus the typed warehouse tiers generated from the schema registry.
+ *                (echo_cursor.hpp: power, removable, registry)
+ *   <src>_<tier>_r, echo_dict, echo_fold_seen — the roll-up tables, and the
+ *                <src>_<tier> views over them (echo_fold_schema.hpp)
+ *   netqual_boot, usage_live/usage_daily/usage_daily_user — the tables the roll-up does not own
  *
  * The legacy tar_events event log was retired by schema v3; it is neither
  * created nor queryable (#760 UP-8).
@@ -24,11 +28,13 @@
  * Uses WAL mode, busy_timeout=5000, secure_delete=ON.
  */
 
+#include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -38,6 +44,8 @@
 struct sqlite3; // Forward declaration
 
 namespace yuzu::echo {
+
+class EchoFold; // echo_fold.hpp: the roll-up writer every fold_* wrapper below drives
 
 /**
  * Transaction-scoped handle passed to an `EchoDatabase::checked_transaction`
@@ -128,6 +136,11 @@ struct ProcessEvent {
     std::string name;
     std::string cmdline;
     std::string user;
+    /// Exit status of a `stopped` event from a stream that carries one (ETW, Endpoint Security);
+    /// the poll cannot see it and leaves 0. A non-zero status counts as an abnormal exit.
+    int32_t exit_code{0};
+    /// Image name of the parent (resolved from the pid -> name map by the collector), "" if unknown.
+    std::string parent_name;
 };
 
 struct NetworkEvent {
@@ -375,15 +388,15 @@ struct NetConnRow {
 /// One power_live row (cursor-model seam, echo_cursor.hpp) -- a sleep/wake/
 /// AC-power transition. FROZEN by the cursor seam: wave-2 collectors and the
 /// schema registry consume this shape exactly; changing a field is a
-/// contract change, not a refactor. `record_key` is the UNIQUE replay-
-/// idempotence key (echo_cursor.hpp rule 3) -- a value-only field for every
-/// OTHER purpose, never re-derived by a query.
+/// contract change, not a refactor. `record_key` is the replay-idempotence key
+/// the fold's bounded replay ring checks (echo_cursor.hpp rule 3) -- a
+/// value-only field for every OTHER purpose, never re-derived by a query.
 struct PowerEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
     std::string action; // sleep, wake, ac_attached, ac_detached, capture_gap
     std::string detail;
-    std::string record_key; // UNIQUE — replay idempotence (INSERT OR IGNORE)
+    std::string record_key; // replay idempotence through the 4096-key replay ring
 };
 
 /// One removable_live row (cursor-model seam, echo_cursor.hpp) -- an
@@ -409,18 +422,22 @@ struct RemovableEvent {
     std::string image_path; // typed identity column (P-004); "" when n/a
     int64_t pid{0};         // typed identity column (P-004); 0 when n/a
     std::string evidence;   // forensic/value field only — NOT identity
-    std::string record_key; // UNIQUE — replay idempotence (INSERT OR IGNORE)
+    std::string record_key; // replay idempotence through the 4096-key replay ring
+    int64_t partition_count{0}; // partitions the OS reported (Windows attach record); 0 when n/a.
+                                // Appended after the frozen fields; not part of the identity digest.
 };
 
-/// One registry_live row (cursor-model seam, echo_cursor.hpp) -- a value or key
-/// change the key watch observed (echo_registry_parsers.hpp). The actor columns hold
+/// One registry event (cursor-model seam, echo_cursor.hpp) -- a value or key
+/// change the key watch observed (echo_registry_parsers.hpp). The actor fields hold
 /// the writer correlated to the change (a lead to verify, not proof): actor_pid is 0
 /// and actor_image '' when no writer is named, and `detail` says why (attr:*).
-/// `data` is the UNMASKED rendered new value; `prev_data` is empty for a row this build writes
-/// (the old value is not stored; `prev_data_type`/`prev_data_size` are).
-/// Warehouse columns are NOT NULL DEFAULT '' / 0, so "not applicable" (removals,
-/// key removals, gaps; the old value of an addition) is '' / 0, and `data_type`
-/// /`prev_data_type` == '' is what tells an absent value from an empty one.
+/// `data` is the UNMASKED rendered new value; `prev_data` is empty for an event this build
+/// makes (the old value is not carried; `prev_data_type`/`prev_data_size` are). The fold keeps
+/// only hive, key_path, value_name, action, a count, the newest data (512 bytes), its type,
+/// the actor image and ts; actor_pid, `detail`, `source` (notify | reconcile | offline),
+/// observed_at and the old-value fields are the collector's and are not stored.
+/// "Not applicable" (removals, key removals, gaps; the old value of an addition) is '' / 0,
+/// and `data_type`/`prev_data_type` == '' is what tells an absent value from an empty one.
 struct RegistryEvent {
     int64_t ts{0}; // unix seconds
     int64_t snapshot_id{0};
@@ -438,10 +455,10 @@ struct RegistryEvent {
     int prev_data_truncated{0};
     int64_t actor_pid{0}; // 0 = no writer named
     std::string actor_image;
-    std::string source;     // notify | reconcile
+    std::string source;     // notify | reconcile | offline
     int64_t observed_at{0}; // unix ms
     std::string detail;     // attr:* on a change row; the gap description on a gap
-    std::string record_key; // UNIQUE -- replay idempotence (INSERT OR IGNORE)
+    std::string record_key; // replay idempotence through the 4096-key replay ring
 };
 
 /// Row from an arbitrary SQL query (used by echo.sql action).
@@ -472,11 +489,12 @@ struct StorageBytes {
     int64_t page_count{0};
     int64_t freelist_count{0};
     int64_t page_size{0};
-    int64_t wal_bytes{0};   ///< -wal file size; 0 when absent or unreadable
+    int64_t wal_bytes{0};   ///< -wal file size; 0 only when it does not exist
     int64_t auto_vacuum{0}; ///< 0 = none, 1 = full, 2 = incremental
-    /// The page-count read succeeded. False for a closed store or a failed pragma read: the
-    /// figures above are then all zero, which must never be read as "an empty database"
-    /// (a failed measurement that reads as within-budget stops eviction and publishes a 0
+    /// The page-count read succeeded AND the -wal file's size was readable (absent is a size of
+    /// 0, an I/O or permission error is not: #6889 review B6). False for a closed store or a
+    /// failed read: the figures above are then incomplete, which must never be read as "an empty
+    /// database" (a failed measurement that reads as within-budget stops eviction and publishes a 0
     /// overage). Callers branch on this before using the sizes.
     bool ok{false};
 
@@ -489,6 +507,11 @@ struct StorageBytes {
     [[nodiscard]] int64_t file_bytes() const noexcept { return page_count * page_size; }
 };
 
+/// The size of `<main_file>-wal`: 0 when that file does not exist (a checkpointed database has
+/// none), nullopt when it cannot be read (an I/O or permission error, or something that is not a
+/// file). A failed measurement must not read as "no log".
+[[nodiscard]] std::optional<int64_t> wal_file_bytes(const std::filesystem::path& main_file);
+
 enum class CheckpointMode { kPassive, kTruncate };
 /// kBusy: a reader pins the WAL (or another writer holds it); nothing was waited for.
 enum class CheckpointResult { kOk, kBusy, kError };
@@ -497,6 +520,19 @@ enum class CheckpointResult { kOk, kBusy, kError };
 struct StateWrite {
     std::string collector;
     std::string json;
+};
+
+/// Seams for the open path's two environment reads, so a test can drive the v10 migration's
+/// refusal, rollback and deferral branches without filling a disk or crashing a process. Every
+/// member defaults to the production behaviour; production never sets one.
+struct OpenSeams {
+    /// Free bytes on the volume holding the database, or nullopt when unknown. Consulted twice by
+    /// the v10 migration: before it starts (refuse below 2 x the file size plus its write-ahead log) and again before its
+    /// one VACUUM. Empty = std::filesystem::space().available.
+    std::function<std::optional<std::uintmax_t>(const std::filesystem::path&)> free_bytes;
+    /// Called inside the v10 transaction right after the retired tables are dropped; an error it
+    /// returns rolls the whole migration back (the crash/rollback test's fault point).
+    std::function<std::expected<void, std::string>()> v10_after_drop;
 };
 
 class EchoDatabase {
@@ -510,10 +546,17 @@ public:
      * cannot be created, SQLite cannot open the file, a corrupt echo.db could not be moved aside
      * (#559, refused rather than trusted), a schema transaction wedged, or -- on Windows only --
      * a planted echo.db (refused) or a planted -wal, -shm or -journal that could not be replaced
-     * (foreign owner or extra hard link). The plugin ABI carries only an error CODE, so the
-     * caller must log this text.
+     * (foreign owner or extra hard link), or -- for a database that still holds the retired raw
+     * tables -- a volume with less than twice the file's size (plus its log) free, or a v10 migration that
+     * rolled back (the retired tables are then intact and the next open retries). The plugin ABI
+     * carries only an error CODE, so the caller must log this text.
+     *
+     * A database below schema v10 is migrated here, in ONE transaction, to the roll-up tables
+     * (echo_db_v10_migration.cpp); a fresh one gets the roll-up schema directly.
      */
     static std::expected<EchoDatabase, std::string> open(const std::filesystem::path& path);
+    static std::expected<EchoDatabase, std::string> open(const std::filesystem::path& path,
+                                                         const OpenSeams& seams);
 
     ~EchoDatabase();
 
@@ -524,10 +567,14 @@ public:
     EchoDatabase& operator=(const EchoDatabase&) = delete;
 
     /**
-     * Get database statistics.
-     * Queries typed warehouse tables (process_live, tcp_live, etc.)
+     * Get database statistics: rows and bucket range summed over each roll-up source's finest
+     * tier (a bucket is its hour's start, not an event's own time).
      */
     EchoStats stats();
+
+    /// The roll-up writer this database owns (never null on an opened database). The dictionary
+    /// GC is its one caller outside this class: `db.fold().gc_dictionary(db, deadline)`.
+    [[nodiscard]] EchoFold& fold() noexcept { return *fold_; }
 
     // ── Storage budget primitives (echo_aggregator.cpp run_budget) ───────────
 
@@ -637,19 +684,22 @@ public:
      *    caller treats it as transient the only symptom is a repeating log line.
      *    A caller MUST NOT retry a KeyCollision indefinitely — surface it.
      */
-    enum class CursorInsertError { Transient, KeyCollision };
+    ///  - `Misuse` — a programming error (not a cursor source, a column the source lacks): also
+    ///    PERMANENT, and logged at the fold. Collectors that only test for KeyCollision retry it
+    ///    like a transient fault; the repeating error line is the signal.
+    enum class CursorInsertError { Transient, KeyCollision, Misuse };
 
     /**
-     * Atomically persist a batch of power events AND the new cursor for the
-     * "power" source in ONE transaction (BEGIN IMMEDIATE..COMMIT, mu_ held
-     * for the whole batch — echo_cursor.hpp rule 6 / this header's
-     * execute_atomic_batch doc above explains why a per-call-locked helper
-     * cannot give this guarantee). Each event is inserted with INSERT OR
-     * IGNORE on the record_key UNIQUE index (echo_cursor.hpp rule 3) so a
-     * replayed event is a silent no-op, never a duplicate row. On ANY
-     * statement failure the whole transaction rolls back — events and cursor
-     * commit or fail together, never one without the other. `events` may be
-     * empty (a tick that only advances the cursor, e.g. a Baseline collect
+     * Atomically fold a batch of power events into the roll-up tiers AND persist the new
+     * cursor for the "power" source in ONE transaction (mu_ held for the whole batch --
+     * echo_cursor.hpp rule 6 / this header's execute_atomic_batch doc below explains why a
+     * per-call-locked helper cannot give this guarantee). Each event passes the digest-checked
+     * REPLAY RING of its source (EchoFold::fold_cursor_rows): a replayed event (same record_key,
+     * same digest) is a silent no-op, never a second count. The ring holds the newest 4096 keys
+     * of a source, so a record re-offered after 4096 newer ones folds again (a sum counts it
+     * twice) -- the cost of not keeping the raw rows. On ANY statement failure the whole
+     * transaction rolls back — events and cursor commit or fail together, never one without the
+     * other. `events` may be empty (a tick that only advances the cursor, e.g. a Baseline collect
      * with nothing to report); the cursor is still persisted.
      * @return {} iff the transaction committed; otherwise the discriminant
      *         above, which the caller MUST act on differently.
@@ -736,67 +786,52 @@ public:
     /** Create all typed warehouse tables from the schema registry. */
     bool create_warehouse_tables();
 
-    // ── Typed inserts ───────────────────────────────────────────────────────
+    // ── Roll-up folds ───────────────────────────────────────────────────────
     //
-    // The eight snapshot-diff inserts take an optional StateWrite: the
-    // echo_state baseline UPSERT then commits in the SAME transaction as the
-    // events, so a failed baseline save can never leave events durable with a
-    // stale baseline (which would re-diff and double-emit). Any failure rolls
-    // back both and returns false. With empty events + a StateWrite only the
-    // state is written (one autocommit statement).
+    // Each wrapper turns a batch of already-derived events into the source's tiers (the matching
+    // *_delta of echo_fold.hpp) and upserts them through the one EchoFold, in ONE transaction. The
+    // eight snapshot-diff folds take an optional StateWrite: the echo_state baseline UPSERT then
+    // commits in the SAME transaction as the tiers, so a failed baseline save can never leave
+    // counts durable with a stale baseline (which would re-diff and double-count). Any failure
+    // rolls back both and returns false. With no events and a StateWrite only the state is
+    // written; with neither, nothing happens and true is returned.
 
-    bool insert_process_events(const std::vector<ProcessEvent>& events,
-                             const std::optional<StateWrite>& state = std::nullopt);
-    bool insert_network_events(const std::vector<NetworkEvent>& events,
-                             const std::optional<StateWrite>& state = std::nullopt);
-    bool insert_service_events(const std::vector<ServiceEvent>& events,
-                             const std::optional<StateWrite>& state = std::nullopt);
-    bool insert_user_events(const std::vector<UserEvent>& events,
-                             const std::optional<StateWrite>& state = std::nullopt);
-    bool insert_software_events(const std::vector<SoftwareEvent>& events,
-                             const std::optional<StateWrite>& state = std::nullopt);
-    bool insert_arp_events(const std::vector<ArpEvent>& events,
-                             const std::optional<StateWrite>& state = std::nullopt);
-    bool insert_dns_events(const std::vector<DnsEvent>& events,
-                             const std::optional<StateWrite>& state = std::nullopt);
-    /**
-     * `skip_known_historical` (default false): when set, the insert is
-     * `INSERT ... SELECT ... WHERE NOT EXISTS` against every row already recorded with
-     * `origin='historical'` and the same mapping identity (direction, local_mount, remote_path,
-     * remote_host, username) -- the bounded per-profile retry's own call (echo_plugin.cpp), so a
-     * SID retried after already being recorded once adds no duplicate. `mapdrive_live` is
-     * append-only (the only statement touching it is the INSERT this function issues; nothing
-     * ever UPDATEs a row), so a row already recorded keeps its FIRST-recorded timestamp forever
-     * -- a later insert attempt with the same identity, whatever ts it carries, is simply
-     * skipped. The only merge of timestamps across duplicate identities is dedup_history's own
-     * earliest-sighting rule, and that applies ONLY within one enumeration's own row set, never
-     * across runs or against what is already on disk.
-     */
-    bool insert_mapdrive_events(const std::vector<MapDriveEvent>& events,
+    /// `usage_now` is the clock the joint usage fold uses (default: the wall clock). The same
+    /// transaction folds the events into the usage tables (echo_usage.hpp usage_fold_in): a
+    /// failure of either rolls back both, and the caller re-offers the same events.
+    bool fold_process_events(const std::vector<ProcessEvent>& events,
                              const std::optional<StateWrite>& state = std::nullopt,
-                             bool skip_known_historical = false);
-    bool insert_perf_sample(const PerfRow& row);
-    bool insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
-    bool insert_netqual_samples(const std::vector<NetQualRow>& rows);
+                             std::optional<int64_t> usage_now = std::nullopt);
+    bool fold_network_events(const std::vector<NetworkEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
+    bool fold_service_events(const std::vector<ServiceEvent>& events,
+                             const std::optional<StateWrite>& state = std::nullopt);
+    bool fold_user_events(const std::vector<UserEvent>& events,
+                          const std::optional<StateWrite>& state = std::nullopt);
+    bool fold_software_events(const std::vector<SoftwareEvent>& events,
+                              const std::optional<StateWrite>& state = std::nullopt);
+    bool fold_arp_events(const std::vector<ArpEvent>& events,
+                         const std::optional<StateWrite>& state = std::nullopt);
+    bool fold_dns_events(const std::vector<DnsEvent>& events,
+                         const std::optional<StateWrite>& state = std::nullopt);
+    /// A `historical` event's mapping identity (direction, local_mount, remote_path, remote_host,
+    /// username) is remembered, as a hash, in the replay ring's table (source `mapdrive_historical`)
+    /// in the SAME transaction as its count, and forgotten by purge_source("mapdrive").
+    /// `skip_known_historical` (the bounded per-profile retry's own call) skips a historical event
+    /// whose identity is already remembered, so a retried enumeration of one profile adds no second
+    /// count. The raw table this once asked ("does a historical row of this identity exist?") is
+    /// gone, and `historical_count` is additive, so without this a retry would count the mapping
+    /// twice.
+    bool fold_mapdrive_events(const std::vector<MapDriveEvent>& events,
+                              const std::optional<StateWrite>& state = std::nullopt,
+                              bool skip_known_historical = false);
+    bool fold_perf_sample(const PerfRow& row);
+    bool fold_proc_perf_samples(const std::vector<ProcPerfRow>& rows);
+    bool fold_netqual_samples(const std::vector<NetQualRow>& rows);
+    bool fold_netconn_events(const std::vector<NetConnRow>& rows);
+    bool fold_module_events(const std::vector<ModuleRow>& rows);
+    /// netqual_boot is a plain table (one row per boot), not a roll-up.
     bool insert_netqual_boot_row(const NetQualBootRow& row);
-    bool insert_netconn_events(const std::vector<NetConnRow>& rows);
-    bool insert_module_events(const std::vector<ModuleRow>& rows);
-
-    /**
-     * Return one row per unique (proto, local_addr, local_port, remote_addr,
-     * remote_port, pid) ESTABLISHED connection observed at or after
-     * `since_ts`. Each row's `ts` is set to MAX(ts) across observations of
-     * that 5-tuple — i.e. the most recent time Echo saw the connection. Used
-     * by `echo.fleet_snapshot` to widen the per-host viz from "currently
-     * established at sample time" to "established within the rolling
-     * window", so the viz draws blue tubes for connections that have
-     * existed recently even if they're closed at the moment of the call.
-     *
-     * LISTEN / TIME_WAIT / CLOSE_WAIT / etc. are filtered out — they aren't
-     * "this box talks to that box" edges.
-     */
-    std::expected<std::vector<NetworkEvent>, std::string>
-    query_recent_tcp_connections(int64_t since_ts);
 
     // ── Generic SQL execution (for warehouse queries and aggregation) ────────
 
@@ -956,18 +991,39 @@ public:
     bool execute_sql_range(const std::string& sql, int64_t from, int64_t to);
 
     /**
-     * Purge ALL rows for a capture source across every warehouse tier
-     * (`<source>_live/_hourly/_daily/_monthly`), with the tier tables resolved
-     * from the schema registry (never hardcoded). Backs the `echo.purge_source`
-     * action (retention-paused frame, Phase 15.A): it drops a deliberately
-     * paused source's accumulated forensic data WITHOUT re-enabling collection.
-     * All tiers are deleted in one transaction (all or none).
-     * @return total rows deleted, or an error string (unknown source / SQL error).
+     * Purge ALL rows for a capture source across every warehouse tier (its `<src>_<tier>_r`
+     * tables, resolved from the roll-up declaration, never hardcoded; a cursor source's replay
+     * ring; the usage tables for `usage`), then the dictionary strings only that data
+     * referenced. Backs the `echo.purge_source` action (retention-paused frame, Phase 15.A): it
+     * drops a deliberately paused source's accumulated forensic data WITHOUT re-enabling
+     * collection. The rows go in one transaction (all or none); the dictionary sweep follows
+     * it under `dictionary_deadline` (60 s: operator-initiated and rare) and, if it outruns the
+     * deadline or fails, the strings stay until the weekly GC: that is REPORTED
+     * (`dictionary_pending`, counted in `dict_gc_starved_total`), never a silent success, since
+     * the purge is promised as forensic erasure and the strings of the purged rows are forensic
+     * data too. The deadline is a parameter so a test can drive that path (gc_dictionary's
+     * deadline is the seam).
+     * @return the rows deleted and whether the dictionary sweep is pending, or an error string
+     *         (unknown source / SQL error).
      */
-    std::expected<int, std::string> purge_source(const std::string& source);
+    struct PurgeResult {
+        int rows_deleted{0};
+        bool dictionary_pending{false}; ///< strings of the purged rows remain until the weekly GC
+    };
+    std::expected<PurgeResult, std::string> purge_source(
+        const std::string& source,
+        std::chrono::steady_clock::duration dictionary_deadline = std::chrono::seconds(60));
 
 private:
     explicit EchoDatabase(sqlite3* db);
+    friend class EchoFold; // upsert_state_locked, inside the fold's transaction (echo_fold.cpp)
+
+    /// The v10 step of open(): move a database's retired raw and summary tables into the roll-up
+    /// tables in ONE transaction, or install the roll-up schema on a database that has none.
+    /// Defined in echo_db_v10_migration.cpp.
+    static std::expected<void, std::string> migrate_to_v10(EchoDatabase& db,
+                                                           const std::filesystem::path& path,
+                                                           const OpenSeams& seams);
 
     /// echo_state UPSERT on an already-locked handle; shared by set_state() and
     /// the diff-source inserts (which run it inside their transaction).
@@ -1009,6 +1065,9 @@ private:
     // so there is no concurrent writer to race with.
     sqlite3* query_db_{nullptr};
     std::optional<int64_t> quarantined_at_{};
+    /// The ONE roll-up writer for this database (echo_fold.hpp: one instance per database is a
+    /// construction rule, so it lives here). Built by open(); null only in a moved-from object.
+    std::unique_ptr<EchoFold> fold_;
     std::mutex mu_;
     std::mutex query_mu_;
 };

@@ -41,6 +41,11 @@ the Windows event log shows one of these, and they mean different things:
 | `SecretCodec::init() failed` … `kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
+A server that is **running** and `/readyz` is green but refuses MFA enrolment or recovery-code
+regeneration with a `503` "Authentication store is temporarily unavailable" is a different case: the
+host's random-number generator may have failed, not the database. See
+[MFA enrolment refused: random-number failure](#mfa-enrolment-refused-random-number-failure-503).
+
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
 within `StartLimitIntervalSec=60`, then enters `failed`:
 
@@ -629,6 +634,36 @@ Then sign in, revoke the account's old sessions
 consider enrolling a second administrator so the in-product reset is
 available next time.
 
+## SCIM / dashboard deprovision returns 500 (`sessions_db_error`)
+
+**What it means.** Deprovisioning a person (SCIM `PATCH`/`PUT` with `active:false`, SCIM `DELETE` of an active user, or the dashboard user delete) first revokes their API tokens and deletes their durable cookie-session rows, then deactivates the account. If either revoke did not persist, the call answers `500` and leaves the account active; for SCIM the resource and identity links are untouched. Credentials whose revoke did persist stay revoked (a sessions-only failure leaves the API tokens already revoked, and in a multi-principal call the other principals' sessions stay deleted). The audit row has result `partial` and a detail with `api_tokens_db_error=true` and/or `sessions_db_error=true`. The usual cause is a Postgres brownout or failover; see [Sessions are durable](#sessions-are-durable) and [Postgres substrate unreachable](#postgres-substrate-unreachable).
+
+**There is no break-glass.** While the session store is degraded a deprovision cannot complete. Do not disable the identity provider connector's retry. Wait for Postgres to recover, then let the connector retry or run the deprovision again (for the dashboard, delete the user again). Until it completes, treat the person's Yuzu sessions as live.
+
+**Finding the affected accounts.** `YuzuSessionStoreDegraded` is `increase(yuzu_auth_session_store_degrade_total[10m]) > 0` held `for: 10m`, with no `op` filter (any operation counts), so a short outage may never fire it. The audit rows are the interim signal. This query lists the last seven days of deprovisions that did not complete:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT to_timestamp(timestamp) AT TIME ZONE 'UTC' AS at_utc, principal, action, result, target_id, detail
+     FROM audit_store.audit_events
+    WHERE action IN ('scim.user.deactivated', 'scim.user.deleted', 'scim.user.provisioned', 'user.delete')
+      AND ((result = 'partial' AND (detail LIKE '%sessions_db_error=true%' OR detail LIKE '%api_tokens_db_error=true%'))
+           OR detail LIKE '%durable session wipe failed%')
+      AND timestamp >= extract(epoch FROM now() - interval '7 days')
+    ORDER BY timestamp DESC;"
+```
+
+`target_id` is the username for `user.delete` and the SCIM id for the three SCIM actions; the username is in `scim_store.scim_resources` (`SELECT username FROM scim_store.scim_resources WHERE scim_id = '<target_id>';`). A `scim.user.provisioned` row is a `POST /Users` with `active:false`: the account already exists and the IdP's retry meets `409`, so deactivate it by a `PATCH` with `active:false` (or from the dashboard) once the store has recovered. A `scim.user.provisioned` `success` row with `session_leg_backstopped=true` is not a failure: the account removal's own session wipe covered the delete. A `failure` row with `account deactivated; durable session wipe failed` means the account is down but a session may survive; end it with `DELETE /api/v1/sessions?username=<name>`. That call writes to the same session store, so it works only once PostgreSQL is healthy; it needs `UserManagement:Write` and asks for an MFA step-up only when the caller is a session whose account has an enrolled factor (see "Ending the sessions by hand" below).
+
+**Confirming it converged.** After the retry succeeds, the matching `scim.user.deactivated`, `scim.user.deleted` or `user.delete` row has result `success`, and no session row is left for the account:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT count(*) FROM session_store.sessions WHERE username = 'alice';"
+```
+
+The count must be 0. For a person who signs in through OIDC or SAML, also check the linked principal names (`oidc:...`, `saml:...`; they are listed in the success row's `revoked_principals=` detail). If the count is not 0, end the sessions with `DELETE /api/v1/sessions?username=<name>` and run the check again.
+
 ## Emergency MFA disable (break-glass)
 
 **When to use.** An operator has lost both their authenticator device *and*
@@ -1130,6 +1165,83 @@ sudo systemctl restart yuzu-server
 
 To enrol a non-admin approver deliberately (rather than recover from a lockout), see the next section.
 
+**Security note for this procedure.** While the flag is relaxed, every account that has no enrolled second
+factor, administrators included, signs in with its password alone, and an attacker holding such a password
+can enrol their own authenticator. Do it for the shortest possible window, from a restricted network, with
+the security owner's approval and a ticket recording the start and end time (no audit row covers the
+window), enrol the affected administrators first, and afterwards review the `auth.login` and
+`mfa.enroll.verified` rows from the window for accounts you did not expect. Enforcement is read per replica
+at startup, so restart every replica.
+
+If new enrolments are being refused under `--mfa-enforcement=required` and the cause is the host's
+random-number generator (not a misconfiguration), do **not** start here: see
+[MFA enrolment refused: random-number failure](#mfa-enrolment-refused-random-number-failure-503), because
+relaxing the flag does not help when the fault is host-wide.
+
+## MFA enrolment refused: random-number failure (503)
+
+The server draws random values for MFA secrets, recovery codes and their salts, and for session and
+sign-in tokens. When the host's random source fails you will see one of two shapes.
+
+**Shape 1: the MFA secret or recovery-code draws fail (audited, counted).** MFA enrolment (sign-in under
+`--mfa-enforcement`, or Settings → Security and sign-in → Two-factor sign-in) or **Regenerate recovery
+codes** is refused. The operator sees "Authentication store is temporarily unavailable — retry shortly"
+(a `503` at sign-in), but the database is fine:
+
+- `/readyz` is green, and `yuzu_auth_secret_unavailable_total` and `yuzu_auth_read_degrade_total` are flat;
+- `yuzu_secure_random_failure_total{site="mfa_enroll"}` (the TOTP secret) or `{site="mfa_recovery"}`
+  (a recovery code or its salt) is rising;
+- the audit row (`mfa.enroll.required` at sign-in enrolment, `mfa.enroll.initiated` or `mfa.enroll.failed`
+  in Settings, `mfa.enroll.failed` at the sign-in confirm step, or `mfa.recovery_codes.generated`) has a
+  `detail` starting `csprng_unavailable: `. Only the sign-in confirm step also emits the
+  `mfa.enroll.failed` event, with `reason=csprng_unavailable`; a refusal at sign-in enrol-init is audit-only;
+- the server log has a `CSPRNG failure` line.
+
+Nothing was issued or changed: no TOTP secret, no recovery codes and no partial enrolment, and stored
+enrolments and recovery codes are untouched.
+
+**Shape 2: the whole random source is dead (not audited, not counted).** The same source also mints sign-in
+pending tokens and session tokens, and those draws are not covered by the counter or the audit trail. If the
+source is wholly dead, sign-in itself, including for already-enrolled accounts, fails with a bare `500`, and
+you will see **no audit row for the failure and flat counters**. A bare `500` at sign-in with the
+`RAND_bytes failed` log line is this shape. These draws are tracked follow-ups (#6996, #7018); until then
+the signals are the sign-in 5xx rate and that log line. If `site=api_token`, `device_token` or
+`engine_principal` is moving as well, the fault is host-wide and not specific to MFA.
+
+One ordering matters: at the sign-in enrolment confirm step the session-token draw runs *after* the
+enrolment has committed and its success audit rows (`mfa.enroll.verified`, `mfa.recovery_codes.generated`)
+have been written. If that draw fails the account is enrolled, the user never saw the recovery codes, and
+the response is a bare `500`; once the host recovers, the user signs in and regenerates the codes from
+Settings (#7018). PBKDF2 hashing of a recovery code can also throw (a provider failure, not a random draw;
+#7012).
+
+**Cause.** The host's random source failed: `getrandom` or `/dev/urandom` blocked or denied in a container
+(seccomp, a read-only `/dev`), a FIPS or OpenSSL provider that did not initialise, or an entropy shortage
+in a very early boot or a freshly cloned VM. Check as the service user:
+
+```bash
+openssl rand -hex 8                      # must print 16 hex characters
+python3 -c "import os; os.getrandom(8)"  # must not raise (Linux)
+```
+
+**Fix: restore the entropy source first.** Do not restart the server until `openssl rand -hex 8` works for
+the service user: a server whose random source is dead can fail to boot as well, which turns a degraded
+server into an outage. Once the source is back, retry; no change to the auth store is needed.
+
+**Keeping sign-in working under `--mfa-enforcement=required`.** While the fault lasts no *new* account can
+enrol, and under `required` an un-enrolled account cannot sign in. `--mfa-reset` does **not** help: it clears
+an enrolment, and the blocked account has none. Relaxing `--mfa-enforcement` can help only in Shape 1, when
+sign-in itself still works. If sign-in returns `500` (Shape 2), no flag change helps: restore entropy.
+If you do use the lever, follow the security note in
+[Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration)
+(shortest possible window, approval, restricted network, enrol administrators first, restart every
+replica, review the window's `auth.login` and `mfa.enroll.verified` rows afterwards).
+
+**During a rolling upgrade.** Counters are per replica. An un-upgraded replica still reports a Shape 1
+fault as `yuzu_auth_secret_unavailable_total{route="mfa_enroll"}` (and at sign-in also
+`yuzu_auth_read_degrade_total{route="login"}`) with a `store_unavailable` audit detail. Alert on both signals
+until every replica runs the same build.
+
 ## Enrolling a non-admin approver
 
 Approving or rejecting an approval request requires the approver's own account to have an enrolled MFA factor
@@ -1481,7 +1593,7 @@ one of the two paths above.
 
 ## Step-up returns 503 while the authentication store is unavailable
 
-The 37 routes that need a fresh MFA step-up (token, session, engine-principal,
+The 41 routes that need a fresh MFA step-up (token, session, engine-principal,
 RBAC and Guardian writes, password reset and the others listed in the
 [REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
 check the caller's MFA state before the route runs. Other mutating routes and all
@@ -1700,7 +1812,7 @@ authentication store or reset the affected account. Know its limits:
   elevation still asks for a fresh proof and still fails if the store cannot be
   read.
 - **SAML sessions pass too.** The window check precedes the SAML denial, so while
-  the window is `0` or less a SAML session reaches the 37 central routes instead of
+  the window is `0` or less a SAML session reaches the 41 central routes instead of
   getting its `403`, except approve and reject (`POST /api/approvals/{id}/approve` and
   `/reject`), which keep their own gate whatever this value is (next bullet).
 - **Approval approve and reject keep a gate of their own.** The approver gate

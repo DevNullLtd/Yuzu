@@ -348,7 +348,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
-        const HardwareCiDetail detail = deps_.ci_detail_fn(id);
+        // No sections: the fragment (and its sync-now poll) never renders them.
+        const HardwareCiDetail detail = deps_.ci_detail_fn(id, CiRead::RecordOnly);
         HwCiAffordances aff = affordances_for(req, id, detail);
         if (lens == "tags")
             aff.can_delete_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Delete", id);
@@ -738,7 +739,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(detail::a4_error(res, "hardware CI record unavailable"), "application/json");
             return;
         }
-        const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id);
+        const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id, CiRead::WithSections);
         const HardwareCiRead read = classify_hardware_ci_read(detail);
         if (read == HardwareCiRead::RosterUnreadable) {
             // A failed roster read is never a 404 (#5531).
@@ -754,6 +755,21 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (read == HardwareCiRead::NotFound) {
             res.status = 404;
             res.set_content(detail::a4_error(res, "not found"), "application/json");
+            return;
+        }
+
+        if (read == HardwareCiRead::SectionsUnreadable) {
+            // The record's v2 sections (the REPEATABLE READ sections reader) could not be read:
+            // a store error is never an empty 200 (H.7). Unlike `ci` / `software` / `tags`, which
+            // degrade one part at a time, an unreadable sections read withholds the whole record -
+            // a body with `sections` blank would read as "this device reports none".
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.device.ci", "failure",
+                                                "Agent", agent_id,
+                                                "hardware CI record (REST) state=sections unreadable");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware sections unavailable",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
             return;
         }
 
@@ -777,7 +793,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             {"data", hardware_ci_json(detail, now_secs())},
             {"meta", {{"api_version", "v1"}}},
         };
-        res.set_content(out.dump(), "application/json");
+        // Section rows are agent-supplied bytes: a byte that is not valid UTF-8 must not throw
+        // out of dump() AFTER the access audit row persisted (the MCP twin's dump_replace).
+        res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                        "application/json");
     });
 
     // -- Fragment: Actions lens (the generic action runner catalogue) --
@@ -814,7 +833,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string hostname = id;
         std::string agent_os;
         if (deps_.ci_detail_fn) {
-            auto ident = deps_.ci_detail_fn(id).identity;
+            auto ident = deps_.ci_detail_fn(id, CiRead::RecordOnly).identity; // identity only
             if (ident) {
                 if (!ident->hostname.empty()) hostname = ident->hostname;
                 agent_os = ident->os;

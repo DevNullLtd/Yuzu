@@ -324,3 +324,116 @@ devices reading as a regression. A degraded read returns `std::nullopt` (the typ
 and MCP surfaces turn into a 503 / internal error), distinct from an engaged empty result. Nothing
 about the rule changes: the owner borrows the pool, issues schema-qualified SQL, and no per-store
 class gained a cross-schema method.
+
+## Update (2026-11-02) -- a sixth query owner: SoftwareTitleDimension
+
+A sixth query owner: `SoftwareTitleDimension` (`software_title_dimension.{hpp,cpp}`), the
+software-title normalisation pass. It reads `software_inventory_store.title_triples` (the distinct
+installed-software titles with exact device counts, rebuilt hourly inside the catalogue rollup) and
+writes `product_registry_store.title_dimension` and `product_registry_store.curation_queue`, and
+reads the registry's aliases and products, all on ONE lease per pass (`pool.with_txn_for`). Each
+pass sets `SET LOCAL statement_timeout` and then takes a `pg_try_advisory_xact_lock`; a loser
+skips. The alias and product reads are keyed (`source = ANY(...)` with the exact `pack:`/`curated:`
+sources of the page's ecosystems, then `raw_name = ANY(...)` and `norm_key = ANY(...)`) static
+helpers on `ProductRegistryStore` that take the owner's pinned connection, so the pass never needs
+a second pool lease. Neither store grows a cross-schema method: the registry owns its schema, the
+pack load and the alias reads; the inventory store owns `title_triples`; the owner borrows the pool
+and issues schema-qualified SQL. Each pass is one transaction (a crash leaves no partial batch),
+writes are upserts keyed on the title triple, and only unsettled titles are SELECTED (a replay is a
+no-op; selection, not every write, is what is changes-only). The hourly queue reconcile writes only
+the open rows whose device count moved or that are a day stale. Section 2(b) holds: nothing slow
+happens while the lease is held. The only work between the statements is bounded lookups over one
+page (at most 2,000 titles: normalise each, hash-map lookups into the two keyed reads), which is
+milliseconds; no product scan or fuzzy matching runs in the lease. A cooperative cancel and a 60 s
+wall budget are still polled inside the resolve loop as a guard, not as the bound, since that loop
+is covered by no SQL timeout. A degraded pass rolls back and keeps last-good.
+
+Stale-sentinel contract, binding on every registry writer (`ProductRegistryStore::upsert_product` and `upsert_alias` implement it, and the curation routes that will call them inherit it): a registry write that can change
+a title's resolution sets the affected `title_dimension.pack_version = ''` in the same transaction,
+and that write MUST first take the blocking `pg_advisory_xact_lock(hashtextextended(
+'software_normalization', 0))` that every pass tries. Without the lock a pass that selected the row
+before the mutation commits would upsert it afterwards, stamping the current pack version over the
+sentinel and losing the invalidation. The sentinel and normaliser-version rule are stated in
+`product_registry_store.hpp`.
+
+Retention (recorded decision). `title_dimension` is permanent by design and unbounded: its accepted
+bound is "the distinct (name, publisher, ecosystem) titles ever seen", and titles that embed a
+version in their raw name churn rows over time. No prune ships, because a dimension row is the
+identity later installs will join to; a later prune would be a separate clock-based retention pass
+and would route through the clock-guarded-retention rule. `yuzu_software_titles` is the size signal.
+The queue's prune is not retention: it is a derived-set reconcile against the current
+`title_triples`, regenerable from `title_dimension`, and it deliberately has no would-wipe guard (an
+empty `title_triples` empties the open queue; only each row's `first_queued_at` is lost, and
+`rejected` rows are never deleted).
+
+Input bound. A triple whose name, publisher and ecosystem together exceed 2,400 bytes is left out
+of `title_triples` at the rollup, because that table's primary key is a btree over the three text
+columns and Postgres refuses an entry beyond about 2,704 bytes, which would otherwise roll back the
+whole hourly refresh. Such a title is not normalised. The catalogue rollup's own
+`catalog_rollup_grain_key` has the same class of limit and is not changed here.
+
+## Update (2026-11-08) -- the runner records and checks each migration's hash (#7158)
+
+Decision. Option (a) of #7158: `PgMigrationRunner` records the SHA-256 of every applied
+migration's SQL in `public.yuzu_schema_migrations (store, version, sha256, recorded_by, recorded_at)`,
+written in the transaction that bumps `schema_meta` (an UPSERT, because a rewound `schema_meta`
+re-applies a version), and every `run()` compares the recorded hash of each version at or below
+the recorded schema version with this build's text. Option (b), a per-store projection smoke-read
+adopted by every store, is not mass-adopted: it needs a hand-written probe per store and detects
+only a missing column, not a changed type, constraint or index; it stays the second line of
+defence (playbook "Runner guards").
+
+A mismatch fails the store closed: `run()` returns false and the store does not open. For
+nearly every store that stops the server from starting, but three do not make a failed `run()`
+fatal: `analytics_event_store` (degraded for the run), `crypto_dashboard_layout_store` (a recorded
+exception: layouts answer 503) and `leader_elector` (the server boots with its leader-only loops
+paused; the elector re-runs `run()` every election cycle and meets the same refusal, so it does not
+recover until the database is repaired). The operator signals are the `PgMigrationRunner: store
+'<store>' recorded migration` log line and the `yuzu_server_leader_*` metrics.
+
+This is deliberately not the #3894 posture. A database ahead of the binary is off-procedure,
+and the ahead check itself does not refuse, because a refusal would be a second failure. A
+recorded version whose text differs is on-procedure (same build lineage), the build knows exactly
+what is wrong, and the alternative is the fail-open at the first query that the issue names. One
+sub-case is the exception: a database that is ahead AND carries edited text for a version this
+binary also knows does refuse (a second failure, refused on purpose, with no separate ruling
+recorded in #7158; see the `PgMigrationRunner::run` header). There is no override flag and there was
+no warn-only phase: drift can only be detected against a hash this feature wrote, so introducing
+it cannot refuse any existing database.
+
+Hash identity is the exact bytes of `PgMigration::sql`, with no normalisation, because
+normalising would hide a real change. Every migration at this change is a deterministic function
+of fixed text (52 of 58 vectors are pure literals; the other six build text from compile-time constants or,
+for `instruction_store`'s v3, generate it at first call from a fixed column list), so the bytes are
+the same in every process and deployment. A migration must stay that way: no clock, locale,
+environment, address or unordered-container iteration may reach its text.
+
+The table is named `yuzu_schema_migrations` because `public` is shared with whatever else lives in
+the database. A foreign `schema_migrations` table (golang-migrate, Rails) would make the
+`IF NOT EXISTS` skip silently and fail every store on a missing column. Flyway's default,
+`flyway_schema_history`, does not collide.
+
+Trust on first use. A version applied before the table existed has no row. It is recorded as
+first seen with `recorded_by = 'tofu'`, so an auditor can tell it from a hash verified when
+applied (`'apply'`). The write takes the per-store advisory lock and re-reads, so two processes
+cannot both believe they verified; steady state takes no lock. Not detected, and excluded by the
+hard-cutover deployment contract: drift that predates the table, and a database that two build
+lineages touched (a long-lived newer replica records whatever an older binary applied, with the
+newer text).
+
+What this is not. It detects accidental or procedural drift. It is not tamper evidence: whoever
+can write `yuzu_schema_migrations` can also rewrite `schema_meta`, a deleted row is simply recorded
+again as `'tofu'`, and `recorded_by` is not authenticated. A rewound `schema_meta` that re-applies
+an idempotent migration overwrites its recorded hash by design. A questionnaire must not cite it as
+a data-integrity control. A recorded hash that is not 64 lowercase hex digits is refused with its
+own message, never compared.
+
+A version that is at or below the recorded version and that this binary also carries is judged
+even when the database is ahead of the binary's vector (#3894), so a downgrade onto edited text now
+refuses with a diagnosed log line where it used to warn. Versions above the recorded version, and
+versions this binary does not carry, are never judged.
+
+Operator consequence: an in-place edit of an already-applied migration now refuses the boot
+(`docs/user-manual/upgrading.md`). The golden-hash CI test (#3895) is the matching author-side
+guard and should ship in the same release, so that an edit to shipped text is stopped at the
+source and not discovered at the first customer boot.

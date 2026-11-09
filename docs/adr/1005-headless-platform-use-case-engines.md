@@ -893,7 +893,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (`get.api-inventory-tables`, `post.api-inventory-query`,
        `get.api-inventory-param-param`, `get.api-agents`,
        `get.fragments-network-overview`, `get.api-tags`). `get.api-agents`
-       has since moved to a dated exception (the 2026-10-23 entry below).
+       has since moved to a dated exception (the 2026-10-23 entry below), and was
+       twinned on 2026-11-02 (the entry of that date, below).
 
    - **2026-10-23 - MCP twin completeness gates, and `list_agents` as a dated
      exception.** Two parts. First, `scripts/ci/check-api-parity.py` gains a
@@ -902,15 +903,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      test-existence tripwire (each registry tool's test file must name the tool
      and assert a schema and an audit row), and a Catch2 case checks that every
      registry tool is both a ledger `mcp_twin` and a `kExpectedTwins` row. Each
-     check carries a size-pinned, shrink-only allowlist seeded from the tree as
-     it stood. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
-     the six rows whose REST and MCP gates still differ, or whose agreement
+     check carries a size-pinned allowlist seeded from the tree as it stood. The
+     pin is an exact count that goes down when an entry is fixed; it goes up
+     only by a recorded owner ruling (see the 2026-10-31 gate-parity entry
+     below), so "shrink-only" describes the intended direction, not a
+     mechanical cap. The gate-parity table (`GATE_PARITY_KNOWN_MISMATCHES`) holds
+     the six rows (seven since the 2026-10-31 entry below) whose REST and MCP gates still differ, or whose agreement
      the check cannot prove, after it learned two shapes (a REST handler that
      refuses a service-scoped token before its gate, and an MCP handler whose
      own fleet read confines), with a
      one-line reason each in the script; a second table
      (`GATE_PARITY_NO_GATE_ALLOWED`) holds routes whose gate the script cannot
-     read. Both shrink only: a fix removes its entry and lowers the pin, and
+     read. Both are meant to shrink: a fix removes its entry and lowers the pin, and
      adding an entry or raising a pin is a reviewed deferral that needs a
      reason, a tracking issue and a ruling recorded in this ADR. These are
      tripwires, not proofs: the check compares gate labels, not effect (REST
@@ -937,6 +941,35 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `STRICT_EXCEPTION_PINS`; like the 2026-10-22 API-parity ledger reconcile entry this is a session
      statement by the ADR owner, not a signed decision.
 
+   - **2026-11-06 - DEX Scoring tab (`GET /fragments/dex/scoring`, `POST
+     /api/settings/dex-scoring/{save,preview,reset}`, AP-3.12).** Four
+     dashboard routes that edit the score policy, recorded because one
+     behaviour of the tab has no headless twin.
+     - **A UI over the REST pair.** `GET` reads, `save` writes (`PUT`),
+       `preview` is `PUT ?dry_run=true` and `reset` is `DELETE`
+       `/api/v1/dex/score-policy`. The tab calls the same write function
+       (`apply_dex_score_policy`), gates writes on the REST grant
+       `Infrastructure:Write` plus `GuaranteedState:Read` (Read is not
+       view-only: every answer carries application names), gates viewing on
+       `GuaranteedState:Read`, and writes the same audit rows, so it is a view
+       over the API and not a second authority. Each route has a
+       `planned:#6087` row in `scripts/ci/api-parity/dex.json` naming its REST
+       twin; the rows flip to twinned when the twins land.
+     - **The one capability with no headless twin: the tier-change diff.** The
+       preview lists which of the top applications would change tier. A REST
+       dry run answers only the validated document and revision, so the diff
+       exists on the dashboard alone; it is computed by scoring the Apps model
+       under the current and the proposed policy, not by a second scorer.
+       This is a recorded exception to Decision 1, not a permanent one: the
+       headless tier-change diff is to join the scope of the twins tracked as
+       **#6087**; **revisit by 2027-01-31**.
+     - **The exception relaxes no control.** The preview stores nothing and
+       writes one `dex.score_policy.validate` row; every refusal, the
+       fail-closed audit and the same-site gate are those of the REST routes.
+     - Wire reference: `docs/user-manual/dex.md`, "Scoring"; audit rows:
+       `docs/user-manual/audit-log.md`.
+     - Recorded by the change author; ADR-owner acceptance pending.
+
    - **2026-11-02 - DEX score policy model parameters on the REST route (#6087).**
      REST-only, still no MCP twin: the `GET`, `PUT` and `DELETE
      /api/v1/dex/score-policy` contract widened (a version 2 document with a
@@ -950,9 +983,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        the same document shape and the one write function
        (`apply_dex_score_policy`), so there is no second validator; both this entry
        and the 2026-10-23 one retire when the #6087 twins merge, and both are
-       then amended. No ledger row is added, as for the
+       then amended. No ledger row is added for the REST routes, as for the
        2026-10-23 entry: the parity ledger admits an `exception:` row for a
-       `/api/v1` route but does not require one.
+       `/api/v1` route but does not require one. The four dashboard routes
+       over them do carry ledger rows (`planned:#6087`; see the 2026-11-06
+       entry).
      - **The exception relaxes no control.** Same gates, `If-Match`, audit-first
        and fail-closed audit, A4 envelope, and discovery in `openapi_spec()` and
        `/api/v1/discover/routes`; the new parameters are validated by the same
@@ -1114,6 +1149,388 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
      old and new names. The ledger records the retirement because the policy
      requires it.
+   - **2026-10-31 - gate parity (check 6) pins one more known mismatch for
+     `POST /api/v1/commands` and `execute_instruction`.** Owner ruling: the
+     gate-parity table `GATE_PARITY_KNOWN_MISMATCHES` gains the entry
+     `("POST", "/api/v1/commands", "execute_instruction")` and its pin
+     `GATE_PARITY_KNOWN_MISMATCHES_MAX` is raised from 6 to 7 (the script pins the
+     count: the table size must equal it, so the pin is an exact value, not a
+     shrink-only cap; it goes down when an entry is fixed and up only by a ruling
+     like this one). The REST route is read
+     as `plain:Execution:Execute` and the tool's declared pair as
+     `confined:Execution:Execute`, so the lexical comparison cannot agree. Both
+     surfaces call the same `require_permission(Execution, Execute)`, whose
+     service-scoped branch answers 403 because `kServiceScopeGlobalSafe` is
+     empty, so a service-scoped caller is refused on both. The MCP `confined`
+     label is the C8 `ServiceScopeClass`, and is not a claim that the tool is
+     usable by a service-scoped caller. The entry is a deferral, not a proof of
+     agreement: the check compares labels and cannot see this. It is removed,
+     and the pin lowered, when the comparison can read the two gates as the same
+     kind. Tracking: programme #2146. This is the ruling the 2026-10-23 entry
+     above requires before a pin is raised. The ruling is recorded in the
+     governance ledger fragment
+     `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
+     repository owner.
+   - **2026-10-31 - `cancel_execution` at the supervised MCP tier is exempt from
+     the approval ticket.** Owner ruling. Originally given 2026-10-30 as a
+     "risk-reducing STOP"; re-confirmed by the owner 2026-10-31 after that premise
+     was corrected: `cancel_execution` marks the tracker row cancelled and sends
+     nothing to any device (step-up class `kCancelsRecord`), so it does not stop
+     anything running on a device. The exemption is the closed list
+     `kApprovalExemptTools` in `server/core/src/mcp_policy.hpp`, read through
+     `requires_approval_for_tool()` by the generic C8 gate. Asymmetry: MCP is
+     looser than REST for this one tool. The REST mirror
+     (`POST /api/v1/executions/{id}/cancel`) is still gated, and gate-parity
+     check 6 compares labels and cannot see approval tiers, so it does not
+     flag it. Residual: a supervised credential holding no ticket can irreversibly
+     mark another record cancelled while that execution's devices may still be
+     running it; the `attempted` row written before the effect and the `success`
+     row after it are the mitigation. Adding a name to `kApprovalExemptTools` is
+     a security decision, recorded where the tool is classified, never a
+     convenience. The owner ruling is recorded in the governance ledger fragment
+     `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
+     repository owner.
+   - **2026-10-30 - `Workflow:Execute` is approval-gated at the supervised MCP
+     tier.** Owner ruling 2026-10-30; the rule was cut out of this change with the
+     workflow twin on 2026-10-31, then ruled back into it on 2026-11-03 so the gap
+     closes without waiting for the twin. A workflow fans several steps out to the fleet in one
+     call with no per-step human look, so a supervised token needs an approval
+     ticket for it, like every other fleet execution at that tier. The rule is one
+     line in `requires_approval()` (`server/core/src/mcp_policy.hpp`), mirrored by
+     `AuthRoutes::require_permission` on every non-MCP transport, so
+     `POST /api/workflows/{id}/execute` refuses a supervised token with `403`.
+     Before it, a supervised token ran a workflow with no ticket. Residual: no MCP
+     tool maps to the pair yet (the `execute_workflow` tool is a separate change),
+     so until it ships a supervised token has no ticket path to run a workflow;
+     that availability loss is accepted in exchange for closing the gap. The owner
+     ruling is recorded in the governance ledger fragment
+     `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
+     repository owner.
+   - **2026-11-03 - `GET /api/v1/rbac/enforcement` and `get_rbac_enforcement`:
+     the machine twins of the enforcement fragment, session-only, and one
+     `GATE_PARITY_NO_GATE_ALLOWED` entry (#6033). Ruled by the ADR owner in the
+     authoring session; like the entries above it is a session statement, not a
+     signed decision.** Four parts.
+     First, `get.fragments-access-enforcement` flips from `twinned-rest-only`
+     to `twinned` (untwinned 206 to 205, counting the #4041 and twin batch B steps already in the baseline; the live pin is in
+     `scripts/ci/check-api-parity.py`). Both twins return
+     `{enabled, unconfirmed, administrator}` (the MCP tool adds
+     `audit_persisted`): `enabled` and `unconfirmed` are this replica's cached
+     enforcement view and whether it could be re-confirmed, and
+     `administrator` (`may`, `may_not`, `unconfirmed`) is the advisory
+     administration hint on the caller's own surface, decided from durable
+     grant rows or the local account role (the cached view only selects which
+     applies); it is neither forced nor hidden when the view is unconfirmed.
+     While the cached value is a stale off (`enabled:false` with
+     `unconfirmed:true`), an account with no Administrator grant row reads
+     `administrator:"unconfirmed"`, because the predicate cannot tell a missing
+     grant from a stale view. While it is a stale on (`enabled:true` with
+     `unconfirmed:true`), the same account reads `administrator:"may_not"`,
+     because enforcement is on and a missing grant row is a confirmed absence.
+     Second, the REST route is
+     session-only: it calls `auth_fn`, refuses a service-scoped token, and
+     holds no `perm_fn` gate. The ground is parity with its HTML fragment and
+     with `GET /api/v1/me`, both session-only; a
+     `perm_fn(Infrastructure, Read)` gate would make the machine twin stricter
+     than the fragment and invent an authority the route does not have. The
+     RBAC store is the data the route reads, not its gate. The gate-parity check
+     therefore reads it as a route with no gate call it can read, and one
+     entry, `("GET", "/api/v1/rbac/enforcement", "get_rbac_enforcement")`, is
+     added to `GATE_PARITY_NO_GATE_ALLOWED` (`GATE_PARITY_NO_GATE_MAX` rises
+     from 13 to 14). The tool's `Infrastructure:Read` row drives MCP tier
+     classification and the default-denied service-scope class only; it is
+     never classified under `kServiceScopeGlobalSafe`. Third, the rejected
+     alternative: gating the route on `perm_fn(Infrastructure, Read)`. It was
+     rejected for the reason above. Fourth, the residuals, stated plainly:
+     (a) REST and MCP differ for an MCP-tier token. On REST it gets a 200 with
+     `administrator:"may_not"` (the predicate denies it structurally on the REST
+     surface), meaning "this credential cannot administer RBAC through REST";
+     on MCP the tier ladder governs it, and a readonly-tier administrator reads
+     `may` and is still refused by `set_rbac_enforcement`.
+     (b) The view is cached per replica: a replica that never observed an enable
+     can read `enabled:false, unconfirmed:false` while another replica
+     enforces, bounded by the stale-serve window (#2703).
+     (c) The REST route is not RBAC-gated, the same class as `GET /api/v1/me`
+     and `POST /api/v1/rbac/check`. #6432 tracks only the `get_me`
+     service-scope asymmetry over MCP (`exception:#6432 revisit:2026-11-30`);
+     it does not cover retiring the two session-only `NO_GATE` entries (this
+     route and `GET /api/v1/me`). That retire-or-make-permanent decision is
+     tracked by #6984 (revisit 2026-11-30), which relates to #6432.
+     (d) "Audit every read" means every read on a deployment with a wired audit
+     sink: REST fails closed on an audit-write failure (503 with
+     `Sec-Audit-Failed`, body never sent), MCP reports `audit_persisted:false`,
+     and an empty audit callback is audit-off. The null or closed RBAC store 503
+     and a bare 401 write no audit row, matching the PUT and the fragment.
+
+   - **2026-11-02 - the `list_agents` exception (#4041) is resolved for every
+     caller except a service-scoped token.** The 2026-10-23 entry above recorded
+     `get.api-agents` and `get.fragments-devices-list` as `exception:#4041
+     revisit:2027-01-31` because MCP `list_agents` did not go through
+     `require_fleet_read`. Its handler now gates on `fleet_read_fn_` alone, with no
+     separate `tier_allows` or `perm_fn` call of its own (the generic C8 tier check
+     still runs first), and filters its rows to the caller's scope; an unwired gate
+     or device seam fails closed. `get.fragments-devices-list` returns to `twinned`
+     and `get.api-agents` moves to `twinned` for the first time (it was `planned`
+     before the exception), both with `list_agents` as the MCP twin. The two
+     `(4041, "2027-01-31")` pins leave `STRICT_EXCEPTION_PINS` and
+     `BASELINE_UNTWINNED` falls from 212 to 210. The 2026-10-23 entry is left as
+     written; this entry supersedes its second part.
+
+     What changed for a caller, because the gap was over-denial and not a leak
+     (ADR-0017): no caller that was already admitted loses a row. A global allow, an
+     engine grant and, for non-engine callers, RBAC off (the default) still read
+     every connected agent, unfiltered; this entry does not confine them. The change is an
+     admission widening: with RBAC on, a caller whose `Infrastructure:Read` comes
+     only through a management group, including one that also holds a global deny
+     (the additive rule of ADR-0017's 2026-07-24 Update), was refused 403 and now
+     gets that group's devices. An authorization-store failure moves from 403 to a
+     retryable 503, and a denial now audits as `auth.fleet_read_required` rather
+     than `auth.permission_required`. A scoped read carries `scope_basis:
+     "authority_scoped"` in both channels, a status as on `list_hardware_ci`, so
+     `content[0].text` is `{agents, scope_basis}` for such a caller and stays the
+     bare array for everyone else; every caller that gets the object was refused
+     before, so no existing text consumer changes shape. `devices_omitted` is not
+     copied from REST, because a count of hidden devices is an existence oracle
+     (ADR-0032 Decision 11, ADR-0033 section 10, ADR-0017 INV-3); REST still serves
+     it, which #6257 tracks.
+
+     `twinned` holds for every caller but one, the `get.api-me` shape (the
+     2026-10-24 entry above): a service-scoped token is refused at C8 on MCP, where
+     `list_agents` keeps its default `ServiceScopeClass::denied` row, while
+     `GET /api/v1/devices` serves it the tagged subset. The divergence fails closed.
+     Whether to reclassify the row as `confined` is open, because that is new
+     authority for a separate change. The parity gate's check for this pair is
+     lexical and does not prove the tool narrows; the unit tests do.
+
+     Not part of this resolution, and still open: the per-guard drilldown
+     `GET /fragments/guardian/guard/{id}/page`, which has no confinement and follows
+     under #4041, the legacy `GET /api/compliance/{id}`, which has no confinement and
+     no audit (#4333), and the other MCP reads on a bare global gate listed on #4041.
+     So this entry does not establish that MCP list reads are scoped as a class; the
+     tools marked Confined in `docs/user-manual/mcp.md` are. Removing the pins drops
+     the 2027-01-31 revisit date from the ledger, and that date now lives on #4041.
+
+   - **2026-11-04 - software normalisation curation (REST only; the MCP twin is
+     a recorded exception).** The five
+     `/api/v1/inventory/software/normalization/` routes (`GET status`, `GET queue`,
+     `POST aliases`, `POST queue/{key}/reject`, `POST pack`) have no MCP tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
+       as roadmap row **4.3-mcp** in the software estate roadmap (executed inside
+       delivery row SAM-29, the MCP twins of rule import, catalogue identity and
+       curation); **revisit by 2026-12-31**. The twin takes the same store methods
+       and the same field validators (`valid_cpe_product`, `known_ecosystem`,
+       `derive_curated_alias`), so there is no second validator. This entry
+       retires when the twin merges. No issue exists for that follow-up yet
+       (update this line when it is filed). No ledger row is added: the parity ledger
+       admits an `exception:` row for a `/api/v1` route but does not require one.
+     - **What an MCP-only caller can and cannot reach today.** The status, queue
+       and curated aliases are not reachable over MCP; the OpenAPI document is
+       readable as the `yuzu://openapi` resource.
+     - **The exception relaxes no control.** Every route needs a global
+       `Inventory:Read` (reads) or `Inventory:Write` (writes) grant, refuses a
+       service-scoped token, audits each write BEFORE the store is touched and
+       fails closed with `503` and `Sec-Audit-Failed`, and answers a degraded read
+       with `503`, never an empty `200`. The A4 envelope and the OpenAPI entries
+       hold for all five. Wire reference: `docs/user-manual/rest-api.md`,
+       "Software normalisation curation".
+     - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-05 - the `Workflow:Execute` residual of the 2026-10-30 entry is
+     closed.** That entry accepted that no MCP tool mapped to the pair, so a
+     supervised token had no ticket path to run a workflow. The MCP tool
+     `execute_workflow` and its REST twin `POST /api/v1/workflows/{id}/execute` now
+     exist, sharing one sequence in `server/core/src/workflow_execute.{hpp,cpp}`. A
+     supervised token calls the tool, receives an approval ticket (`-32006`), and
+     repeats the same call with the `approval_id` after an administrator approves;
+     the ticket binds the workflow id, the agent ids and the ordered step effects.
+     The tool requires an `idempotency_key` (the REST twin accepts an optional
+     `Idempotency-Key` header), because the call is synchronous and a lost response
+     must not become a second full send. The operator tier stays denied by
+     `tier_allows()`, and the legacy `POST /api/workflows/{id}/execute` still refuses
+     a supervised token with `403`. A run holds one HTTP worker, so it leases the
+     shared held-open budget (`StreamBudget`, at most 2 per principal) and has a 60
+     second deadline. The 2026-10-30 entry is left as written; this entry supersedes
+     its residual sentence only.
+     - **Known residuals of this change (recorded by the change author; ADR-owner
+       acceptance pending, except the confined-reader visibility consequence of the
+       stored agent id cap in residual 13, which the owner accepted on 2026-11-06).**
+       Each was checked against the code at the commit that wrote this paragraph.
+       The per-step credential check no longer carries the token-cache lag it once did (it
+       reads the token and engine rows from Postgres, see residual 3); #4766 (token
+       revocation and expiry without the durable-generation discipline sessions have) stays
+       open for the other callers of the token cache and for expiry on the replica's clock,
+       and `AuthRoutes::revalidate_stream` cites #2447, the separate stream grace-clock
+       point. No issue is filed for the rest yet (file each and update its line with the
+       number). The date is the latest the residual is re-read, not a promise it is fixed
+       by then.
+       1. *Write-ahead command id (revisit by 2026-12-15).* A step's command id is
+          stored after the send, by a write that can be dropped, so a step recorded
+          `pending` or `skipped` may still have been sent. The docs tell the reader
+          to check the audit and response stores. Closing it means recording the
+          intended command id before the send.
+       2. *Orphan runs (revisit by 2026-12-15).* Nothing sweeps a run left
+          `running` (a crashed process, a final write that failed twice, an
+          unconfirmed claim COMMIT); its idempotency key stays bound. The runbook is
+          `docs/user-manual/server-admin.md` "A workflow run left `running`". A sweep
+          must close the row and decide the key's fate on purpose.
+       3. *Caller authority is a snapshot (revisit by 2026-12-15).* The run
+          re-checks that the credential is live before each step but does not
+          re-derive the `DispatchCaller` (D2b): an administrator elevation that
+          expires, or a device-group narrowing, during the run is bounded only by the
+          60 s deadline. The liveness check for an API-token caller (and an engine
+          token's backing principal) reads the durable row at every step boundary, so a
+          revoke committed by any replica is seen at the next boundary; the step already
+          sent is not recalled, a cookie session is decided by the durable session
+          generation (polled at most once per second while the session store answers; a
+          replica whose poll is failing keeps trusting its cached sessions for up to
+          30 s, then fails closed), and token expiry is judged on the replica's clock.
+       4. *No per-surface ceiling (revisit by 2026-12-15).* The workflow run leases
+          from the one shared budget, 2 per principal, so 64 principals can hold all
+          128 default slots for up to 60 s and every new stream or run is refused
+          meanwhile. The caps and the `yuzu_server_workflow_runs_in_flight` gauge are
+          per server process. ADR-0034 Decision 3 prefers utilisation to per-surface
+          counters; the gauge is a diagnostic share of that utilisation, and
+          `YuzuHeldOpenUtilisationHigh` alerts on the total.
+       5. *Zero-reach is final for the key (revisit by 2027-01-15).* A run that
+          reaches no device (for example every target is quarantined) answers with
+          no retry hint, and with a key the key is bound to that failed run, so
+          running again after the cause clears needs a new key (on MCP, a new
+          approval).
+       6. *`foreach` (revisit by 2027-01-15).* A step expands over the previous
+          step's result, which is the dispatch acknowledgement (command id, agents
+          reached) and not device output, so it sends one item today.
+       7. *Unkeyed calls (revisit by 2027-01-15).* The key is required only on MCP.
+          The REST route takes it as an optional header and the legacy route takes
+          none, so a lost response retried blind sends every step again; the cap and
+          the 60 s bound still apply.
+       8. *The legacy route has fewer controls (revisit by 2027-01-15).* No approval
+          ticket or step-effect binding, no per-step credential re-check, no refusal
+          of a workflow whose retry sleeps exceed 60 s, no `requested` audit row, and
+          a run stopped at the deadline is recorded `result=success` with the stop in
+          the detail only. It answers `202` `status: running` after such a stop.
+       9. *Audit coverage (revisit by 2027-01-15).* A cap or drain refusal writes no
+          audit row (the counter is its record). Each terminal idempotent replay
+          writes one `success` row and replays are not capped, because they take no
+          slot. An unwired audit sink fails closed on REST (503 `audit_unavailable`)
+          but not on MCP, where the call proceeds and writes no row; on MCP, an
+          unknown argument and a missing or empty `workflow_id` also write no row.
+       10. *Stored attempt number (revisit by 2027-01-15).* The engine writes a
+           step's `attempt` after a failed attempt only, so a step retried to
+           success shows its last failed attempt's number.
+       11. *Shutdown (revisit by 2026-12-15).* The drain waits at most 30 s for
+           runs; a run still going then is stopped between attempts and closed
+           `failed` (the caller is told `interrupted`), and a send already in flight
+           is not interrupted. A run whose final write cannot be made before the
+           process exits stays `running` (residual 2).
+       12. *Unconfirmed claim COMMIT (revisit by 2026-12-15).* When a claim COMMIT
+           fails and Postgres cannot say whether it committed, the call fails but a
+           `running` row for a run that was never dispatched may exist, with its key
+           bound (and, on MCP, its ticket spent), until residual 2's runbook or a
+           sweep clears it.
+       13. *Run records are kept without limit (revisit by 2027-01-15).* No prune
+           exists for `workflow_executions` (see `docs/clock-guarded-retention.md`),
+           so the account name, the key and the agent list (the distinct ids, at most
+           1,000 of them and at most 131,072 bytes of JSON text per run, each id at most
+           256 bytes: a list that does not fit stores the ids that fit and a marker with
+           the count of distinct ids and a digest, `stored_agent_ids_json`) stay for the
+           life of the database, and a deleted-and-recreated username inherits the old
+           account's keys. The table now has a size gauge
+           (`yuzu_server_workflow_executions_rows`, `_bytes`) and a growth alert
+           (`YuzuWorkflowExecutionsTableLarge`, above 100,000 rows for 30 minutes); the
+           rows are still never pruned.
+
+           *Owner-accepted: confined-reader visibility (owner decision 2026-11-06,
+           "accept and record").* For a run naming more than 1,000 distinct agent ids
+           (or whose ids exceed the 131,072-byte stored budget), a CONFINED reader's
+           scoped visibility of the run depends on the stored ids. The ids in the
+           creator's own dispatch scope (`Execution:Execute` visibility) are stored first,
+           then the rest in the order named. The creator keeps seeing its run exactly
+           while at least one stored id lies in the scope its reads are checked against
+           (`Workflow:Read`). That is guaranteed when the run names at least one device
+           inside its `Execution:Execute` scope and that scope lies WITHIN its
+           `Workflow:Read` scope: the first stored id is then inside both. Overlap is not
+           enough. When the `Execution:Execute` scope reaches devices the `Workflow:Read`
+           scope does not, the creator can lose sight of its own run: a global
+           `Execution:Execute` grant with a group-scoped `Workflow:Read` makes every
+           named id "first", so the ids are stored in request order, and the creator
+           loses the run when none of its group's devices is among those stored (the two
+           scopes overlap here, and the run is still lost). Starting a run
+           needs a global `Workflow:Execute`, which of the seeded roles only
+           `Administrator` holds, so a confined creator is a custom role with that grant
+           plus a scoped one (for example an `Operator` assignment on a group). Another confined reader whose devices fall past the cap
+           does not see the run in its scoped list or detail reads. Unconfined readers
+           and the audit log still see it, and the check fails closed (a malformed or
+           empty column is invisible to a confined reader). The trigger is distinct ids
+           beyond the cap: duplicates do not consume it, and an id that names no device
+           does; an id over 256 bytes or holding a NUL byte is counted in the total and
+           never stored, so it consumes nothing. The run is still dispatched to every id
+           it named.
+       14. *Dedupe memory on the legacy execute route (revisit by 2027-01-15).*
+           `stored_agent_ids_json` holds a set of the distinct ids while it works. The
+           legacy `POST /api/workflows/{id}/execute` checks no id count, so a request
+           near its 16 MiB body cap (the reachable ceiling is about 2.5 million distinct
+           ids of at most 4 bytes) costs about 154 MiB of transient memory in that set
+           and the distinct list (the set is freed before the digest is built, the list
+           when the helper returns). The digest's JSON copy of the list, which already
+           existed, coexists with the list, so the helper's peak is about 250 MiB
+           (measured on a release build with glibc: 247 MiB above the input list at
+           2,510,443 distinct ids of 1 to 4 bytes; a list of duplicates peaks at 33 MiB
+           or less). The handler's own parse of the body peaks higher before the helper
+           runs (about 290 MiB for that list and about 450 MiB for 4.19 million one-byte
+           duplicates, measured on a copy of the parse lines). The v1 route and MCP are capped at 10,000 ids and
+           are not affected. The body cap bounds it; an id-count cap on the legacy route
+           would remove it.
+       15. *Pool brownout wait at a step boundary (revisit by 2026-12-15).* The credential
+           check reads the token and engine rows from the primary, and (unlike the
+           held-open stream's cached read) is not covered by the engine liveness cache's
+           failure backoff. The wait depends on how the database fails (measured, a test
+           harness calling the production store functions). When every pooled connection
+           is in use, a read waits at most 0.5 s (the pool's saturated fast-fail), so one
+           boundary is about 4 s (up to three reads per attempt, two attempts, 1 s
+           between). When the database accepts connections but never answers and no
+           connection is idle, the first read of each attempt waits the 10 s connect
+           timeout and the rest of that attempt fails fast, so one boundary is about 21 s.
+           A read on a connection already leased to a database that stopped answering
+           while its host still acknowledges packets (a paused or frozen server) did not
+           return within 150 s in the test: no pool timeout bounds it, and the 60 s run
+           deadline is tested only between attempts, so such a run is not stopped at
+           60 s. The run still fails closed whenever a read returns
+           (`credential_indeterminate`), and is capped at 2 per principal. A packet-drop
+           failure (no acknowledgement) was not measured; the 10 s TCP user timeout
+           should end it (inferred).
+
+   - **2026-11-05 - per-group software collection settings (REST only; the MCP
+     twin is a recorded exception).** The four routes
+     `GET /api/v1/inventory/software/collection-settings`,
+     `GET`/`PUT /api/v1/inventory/software/collection-settings/{group_id}` and
+     `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings` have
+     no MCP tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
+       as roadmap row **3.7a-mcp** in the software estate roadmap; **revisit by
+       2026-12-31**. The MCP twin and the dashboard Collection tab (roadmap row
+       **3.7c**) are separate rows, each its own change. The twin takes the same
+       store and the same pure validator and resolver
+       (`collection_settings_resolve.hpp`), so there is no second validator. This
+       entry retires when the twin merges. No parity-ledger row is added: v1
+       routes are held to the OpenAPI check (`docs/api-parity-ledger.md`).
+     - **What an MCP-only caller can and cannot reach.** The documents and the
+       per-device effective settings are not reachable over MCP; the OpenAPI
+       document is readable as the `yuzu://openapi` resource.
+     - **The exception relaxes no control.** Settings are managed by fleet
+       administrators: writes need the global `ManagementGroup:Write` grant
+       (the administrator role while RBAC enforcement is off, the default),
+       checked again immediately ahead of the write; reads take the same
+       `ManagementGroup:Read` gate as the other management-group routes,
+       which admits any signed-in session while RBAC enforcement is off; the
+       device route needs `Inventory:Read` scoped to the device. This build
+       has no group-scoped delegation. Each write is audited with a
+       `requested` row stored ahead of the write (an audit row that cannot be
+       stored is a `503` and nothing is written) and an outcome row. A degraded
+       store read answers `503`, never an empty `200`; an RBAC read that cannot
+       be completed is a `503` on the per-group read and the write, and the
+       shared deny-on-degrade `403` on the list and the device route. The A4 envelope and the OpenAPI
+       entries hold for all four. Wire reference: `docs/user-manual/rest-api.md`,
+       "Software collection settings".
+     - Recorded by the change author; ADR-owner acceptance pending.
 
 ## Interim rules (until the named follow-ups ship)
 

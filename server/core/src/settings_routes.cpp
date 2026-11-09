@@ -46,6 +46,7 @@
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
 #include "settings_security_render.hpp" // Security page: pure SSO / 2FA / HTTPS / mTLS renderers
+#include "mfa_entropy_signal.hpp" // #6995 — the MFA CSPRNG-failure counter (not a store outage)
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -1286,7 +1287,7 @@ function arFeedback(msg, isError) {
   fb.textContent = msg;
   fb.style.color = isError ? 'var(--bad)' : 'var(--ok)';
 }
-function arPost(url, body, onSuccess) {
+function arPost(url, body, onSuccess, onFailure) {
   fetch(url, {
     method: 'POST',
     credentials: 'include',
@@ -1297,8 +1298,13 @@ function arPost(url, body, onSuccess) {
       var data = {};
       try { data = JSON.parse(t); } catch (e) {}
       if (!r.ok) {
-        var msg = (data && (data.error || data.message)) || ('Action failed (' + r.status + ')');
+        // The error envelope is {error: {message, ...}}: read the message, not the object (a
+        // plain string `error` and a top-level `message` stay accepted).
+        var e = data && data.error;
+        var msg = (e && (typeof e === 'string' ? e : e.message)) || (data && data.message) ||
+                  ('Action failed (' + r.status + ')');
         arFeedback(msg, true);
+        if (onFailure) onFailure();
         return;
       }
       arFeedback('Done.', false);
@@ -1306,6 +1312,7 @@ function arPost(url, body, onSuccess) {
     });
   }).catch(function () {
     arFeedback('Network error — the action may not have applied', true);
+    if (onFailure) onFailure();
   });
 }
 function arLoadCampaign(id) {
@@ -1316,7 +1323,9 @@ function arOpenCampaign(form) {
   var title = (form.elements['title'].value || '').trim();
   if (!title) return false;
   arPost('/api/v1/access-reviews', {title: title}, function (data) {
-    if (data && data.campaign_id) arLoadCampaign(data.campaign_id);
+    // The success body is the A4 envelope {data: {campaign_id, grant_count}, meta}.
+    var d = data && data.data;
+    if (d && d.campaign_id) arLoadCampaign(d.campaign_id);
   });
   return false;
 }
@@ -1329,13 +1338,27 @@ function arAttest(btn) {
   }
   var row = btn.closest('tr');
   var justEl = row ? row.querySelector('[data-ar-justification]') : null;
+  // Every extra click would be a valid request that appends another decision, so every
+  // decision button in the campaign stays disabled until the answer arrives (re-enabled only on
+  // failure; on success the campaign is re-drawn).
+  var btns = document.querySelectorAll('#ar-campaign button');
+  function arSetBusy(busy) { for (var i = 0; i < btns.length; i++) btns[i].disabled = busy; }
+  arSetBusy(true);
   arPost('/api/v1/access-reviews/' + encodeURIComponent(d.campaignId) + '/attestations', {
     principal_type: d.principalType,
     principal_id: d.principalId,
     role_name: d.roleName,
     decision: d.decision,
     justification: justEl ? justEl.value : ''
-  }, function () { arLoadCampaign(d.campaignId); });
+  }, function (data) {
+    // The success body is the A4 envelope {data: {recorded, decision_seq, previous_decision}}.
+    // Another reviewer may have decided this grant since the page was drawn: say so.
+    var r = data && data.data;
+    if (r && typeof r.previous_decision === 'string' && r.previous_decision !== 'pending')
+      arFeedback('Done. This replaced an earlier "' + r.previous_decision + '" decision; the ' +
+                 'earlier decision stays in the history.', false);
+    arLoadCampaign(d.campaignId);
+  }, function () { arSetBusy(false); });
 }
 function arCloseCampaign(btn) {
   var id = btn.dataset.campaignId;
@@ -1465,7 +1488,7 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
                 "<div class=\"mini-field\" style=\"flex:1\">"
                 "<label>Campaign title</label>"
                 "<input type=\"text\" name=\"title\" placeholder=\"e.g. Q3 2026 access review\" "
-                "required>"
+                "maxlength=\"256\" required>"
                 "</div>"
                 "<button class=\"btn btn-primary\" type=\"submit\">Open review campaign</button>"
                 "</form>";
@@ -1492,12 +1515,26 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
         return html;
     }
 
+    // A malformed id never reaches the store; the shared validator is the one REST, MCP and the
+    // Access page use.
+    if (!valid_campaign_id(campaign_id)) {
+        html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
+        return html;
+    }
+
     auto view_res = access_review_store_->get_campaign(campaign_id);
     if (!view_res.has_value()) {
-        // Covers both the store's machine-checkable "not_found: ..." (unknown
-        // campaign id) and a genuine read failure — either way, an honest
-        // notice rather than a blank panel.
-        html += "<div class=\"feedback-error\">" + html_escape(view_res.error()) + "</div></div>";
+        // The store's machine-checkable "not_found: " prefix separates an unknown campaign id
+        // (it answered) from a genuine read failure. Neither shows the store's own text, which
+        // carries its classification prefix. A genuine read failure is logged.
+        if (view_res.error().starts_with("not_found:")) {
+            html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
+            return html;
+        }
+        spdlog::warn("settings access-review campaign: read failed: {}",
+                     ::yuzu::log_key_token(view_res.error()));
+        html += "<div class=\"feedback-error\">Access review campaign could not be read. "
+                "Please retry.</div></div>";
         return html;
     }
     const auto& view = *view_res;
@@ -1505,6 +1542,14 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     httplib::Response probe;
     bool can_attest = perm_fn_(req, probe, "AccessReview", "Attest");
     bool is_open_campaign = view.campaign.status == "open";
+    // The signed-in reviewer: the server refuses a reviewer who is the subject of a user grant,
+    // so that row shows no Attest or Flag (a courtesy, not the control), like the Access page.
+    std::string viewer;
+    if (can_attest && auth_fn_) {
+        httplib::Response who_probe;
+        if (auto who = auth_fn_(req, who_probe))
+            viewer = who->username;
+    }
 
     html += "<h4 style=\"margin:1rem 0 0.25rem\">Campaign: " + html_escape(view.campaign.title) +
             " <span class=\"role-badge " + (is_open_campaign ? "role-admin" : "role-user") +
@@ -1537,6 +1582,9 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     } else {
         for (const auto& a : view.attestations) {
             bool pending = a.decision == "pending";
+            const bool own =
+                !viewer.empty() && a.principal_type == "user" && a.principal_id == viewer;
+            const bool editable = pending && is_open_campaign && !own;
             std::string decision_cls = pending                         ? "role-user"
                                        : a.decision == "flagged_revoke" ? "role-warn"
                                                                         : "role-ok";
@@ -1556,14 +1604,16 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                     ar_fmt_epoch_ms(a.decided_at_ms) + "</td>";
             if (can_attest) {
                 html += "<td>";
-                if (pending && is_open_campaign) {
+                if (editable) {
                     html += "<input type=\"text\" data-ar-justification placeholder=\"optional\" "
                             "style=\"width:140px\">";
                 } else {
                     html += a.justification.empty() ? "—" : html_escape(a.justification);
                 }
                 html += "</td><td>";
-                if (pending && is_open_campaign) {
+                if (pending && is_open_campaign && own) {
+                    html += "<span class=\"hint\">Another reviewer must decide</span>";
+                } else if (editable) {
                     html += "<button class=\"btn btn-primary\" "
                             "data-campaign-id=\"" +
                             html_escape(campaign_id) + "\" data-principal-type=\"" +
@@ -2223,9 +2273,10 @@ std::string SettingsRoutes::render_data_retention_fragment() {
 
 namespace {
 
-// Page-local rules for the DEX Alerts form body. The sub-nav's own style block
-// (dex_fragment_style) carries the DEX shell rules; these cover only the three
-// alert panels. Tokens only; one rule per line source, joined to one line.
+// Page-local rules for the DEX settings tabs' form bodies: `.dxa*` for the three alert panels
+// and `.dxs*` for the Scoring tab's form, one style block shared by both tabs. The sub-nav's own
+// style block (dex_fragment_style) carries the DEX shell rules. Tokens only; one rule per line
+// source, joined to one line.
 const char* const kDexAlertsCss = R"CSS(
 .dxa{margin-top:16px}
 .dxa .form{gap:12px}
@@ -2239,6 +2290,16 @@ const char* const kDexAlertsCss = R"CSS(
 .dxa .chk code{color:var(--mut);font-size:12.5px}
 .dxa .pb p{margin:0 0 8px}
 .dxa .pb p:last-child{margin-bottom:0}
+.dxs{margin-top:16px}
+.dxs .grp{border:0;margin:0 0 14px;padding:0}
+.dxs legend{font-weight:500;color:var(--ink2);padding:0 0 4px}
+.dxs .fld input{max-width:14rem}
+.dxs .err{display:block;margin-top:4px;color:var(--bad);font-size:12.5px}
+.dxs input[aria-invalid=true],.dxs fieldset[data-invalid="1"]{border-color:var(--bad)}
+.dxs details.ovr{border-top:1px solid var(--line)}
+.dxs details.ovr summary{cursor:pointer;padding:8px 0;color:var(--ink2)}
+.dxs .chk{display:flex;gap:8px;align-items:baseline;padding:3px 0}
+.dxs .btns{padding:0}
 )CSS";
 
 std::string dex_alerts_style() {
@@ -2375,6 +2436,279 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
     html += "<div class=\"btns\"><button type=\"submit\" class=\"btn btn-secondary\">"
             "Save routing</button></div></form></section>";
     return html;
+}
+
+namespace {
+
+// Policy in force from the writer's own reader (the one the REST GET reads); an exception from
+// the injected reader is an unreadable store.
+std::expected<DexPolicyInForce, std::string> dex_scoring_in_force(const DexScorePolicyWriteDeps& d) {
+    try {
+        const auto stored = d.read_stored();
+        if (!stored)
+            return std::unexpected(stored.error());
+        return dex_policy_in_force_from_stored(*stored);
+    } catch (const std::exception& e) {
+        return std::unexpected(std::string("read threw: ") + e.what());
+    }
+}
+
+constexpr const char* kDexScoringUnavailable =
+    "<div class=\"note warn\"><b>Config store unavailable.</b> The score policy cannot be read or "
+    "saved until the server's runtime-config store is open. Check server /healthz.</div>";
+
+const char* dex_scoring_refusal_token(DexScorePolicyWriteStatus s) {
+    switch (s) {
+    case DexScorePolicyWriteStatus::Ok: return "";
+    case DexScorePolicyWriteStatus::IfMatchMissing: return "if_match_missing";
+    case DexScorePolicyWriteStatus::IfMatchMalformed: return "if_match_malformed";
+    case DexScorePolicyWriteStatus::Stale: return "stale";
+    case DexScorePolicyWriteStatus::Invalid: return "invalid";
+    case DexScorePolicyWriteStatus::WriterBusy: return "writer_busy";
+    case DexScorePolicyWriteStatus::StoreUnavailable: return "store_unavailable";
+    case DexScorePolicyWriteStatus::OutcomeUnknown: return "outcome_unknown";
+    case DexScorePolicyWriteStatus::AuditUnavailable: return "audit_unavailable";
+    }
+    return "invalid";
+}
+
+// Fixed text only: the toast never carries the validator's message or any submitted value.
+// Every status is listed (no default:), so a tenth one fails the build's -Wswitch rather than
+// silently reading "try again shortly". OutcomeUnknown must not say "not saved": the writer's
+// contract (dex_score_policy_writer.hpp) is that it never claims the policy was left as it was.
+const char* dex_scoring_refusal_toast(DexScorePolicyWriteStatus s) {
+    switch (s) {
+    case DexScorePolicyWriteStatus::Ok: return "";
+    case DexScorePolicyWriteStatus::Invalid: return "Score policy not saved: fix the marked field";
+    case DexScorePolicyWriteStatus::Stale: return "Score policy not saved: changed by someone else";
+    case DexScorePolicyWriteStatus::IfMatchMissing:
+    case DexScorePolicyWriteStatus::IfMatchMalformed:
+        return "Score policy not saved: reload and try again";
+    case DexScorePolicyWriteStatus::AuditUnavailable:
+        return "Score policy not saved: audit unavailable, try again shortly";
+    case DexScorePolicyWriteStatus::WriterBusy:
+    case DexScorePolicyWriteStatus::StoreUnavailable:
+        return "Score policy not saved: try again shortly";
+    case DexScorePolicyWriteStatus::OutcomeUnknown:
+        return "Save not confirmed: reload and check the policy in force";
+    }
+    return "Score policy not saved: try again shortly";
+}
+
+// The application names a Scoring render offers as image suggestions: none from a degraded model.
+std::vector<std::string> dex_scoring_subjects(const DexAppsModel& m) {
+    std::vector<std::string> out;
+    if (!m.degraded)
+        for (const auto& a : m.apps)
+            out.push_back(a.subject);
+    return out;
+}
+
+std::string dex_scoring_toast(const char* message, const char* level) {
+    return nlohmann::json{{"showToast", {{"message", message}, {"level", level}}}}.dump();
+}
+
+} // namespace
+
+std::string SettingsRoutes::render_dex_scoring_section(
+    const DexPolicyInForce& in_force, bool editable, const std::string& if_match,
+    const DexFormValues* posted, std::optional<DexFormError> error,
+    std::optional<DexTierPreview> preview, const std::string& refused,
+    const std::vector<std::string>* suggestions) {
+    DexScoringView v;
+    v.values = posted ? *posted : dex_form_values(in_force.policy);
+    v.revision = in_force.revision;
+    v.if_match = if_match;
+    v.source = in_force.source;
+    v.fault = in_force.fault;
+    v.editable = editable;
+    v.error = std::move(error);
+    v.preview = std::move(preview);
+    v.refused = refused;
+    if (suggestions)
+        v.suggestions = *suggestions;
+    else if (editable && refused != "stale" && dex_apps_fn_)
+        // Suggestions feed an input the page can use; a locked page (read-only, or a stale
+        // refusal that disables every control) has none, so it does not pay an Apps read.
+        v.suggestions = dex_scoring_subjects(dex_apps_fn_(std::nullopt));
+    return yuzu::server::render_dex_scoring_section(v);
+}
+
+// POST /api/settings/dex-scoring/{save,preview,reset}. Every outcome answers the section BODY
+// (swapped innerHTML), so no response nests a second #dex-scoring-section.
+//
+// DUAL ANSWER. The dashboard's htmx config swaps no 4xx/5xx body (static_js_bundle.cpp
+// responseHandling), so a per-field refusal could never reach the page. A request carrying
+// HX-Request therefore gets 200 with the body re-rendered, the error against its field and
+// `data-refused=<reason>`, plus an error toast; any other caller gets the real status and the A4
+// envelope, exactly as PUT/DELETE /api/v1/dex/score-policy answers it.
+void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Response& res,
+                                      DexScorePolicyWriteRequest::Op op, bool dry_run) {
+    const bool put = op == DexScorePolicyWriteRequest::Op::Put;
+    const char* leaf = dry_run ? "preview" : (put ? "save" : "reset");
+    // Authority is the REST twin's (ADR-1005 Decision 4): Infrastructure:Write first, then
+    // GuaranteedState:Read (every answer carries application names), both through the loud
+    // perm_fn_. Never admin_fn_ (it bypasses RBAC, so the REST route's refusal could be written
+    // around) and never read_perm on an action route (it is quiet for a cookie session).
+    if (!perm_fn_(req, res, "Infrastructure", "Write"))
+        return;
+    if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+        return;
+    const auto session = auth_fn_(req, res);
+    if (!session)
+        return;
+    if (dex_score_policy_writer_ && !audit_as_session_fn_) {
+        // The REST twin answers 500 for an unwired session writer (authenticate_for_session_audit):
+        // an unwired audit identity is a misconfiguration, never "audit off" on a trust-boundary
+        // write. server.cpp wires it unconditionally, so this guards a future caller or a test.
+        spdlog::error("POST /api/settings/dex-scoring/{}: audit identity writer not configured; "
+                      "refusing the request", leaf);
+        res.status = 500;
+        res.set_header("HX-Trigger", dex_scoring_toast("Score policy not saved: audit not configured",
+                                                       "error"));
+        res.set_content(detail::a4_error(res, "audit identity writer not configured"),
+                        "application/json");
+        return;
+    }
+    if (refuse_cross_site(req, res, *session, std::string("POST /api/settings/dex-scoring/") + leaf))
+        return;
+    if (!dex_score_policy_writer_ || !dex_score_policy_writer_->read_stored) {
+        res.status = 503;
+        res.set_header("HX-Trigger", dex_scoring_toast("Config store unavailable", "error"));
+        res.set_content(detail::a4_error(res, "Config store unavailable"), "application/json");
+        return;
+    }
+    const bool htmx = req.has_header("HX-Request");
+    const auto pairs = dex_form_pairs(req.body);
+    std::optional<std::string> if_match;
+    for (const auto& [name, value] : pairs)
+        if (name == "if_match")
+            if_match = value;
+
+    // The policy in force right now, for the panel; best effort (a refusal path).
+    const auto current = dex_scoring_in_force(*dex_score_policy_writer_);
+    const DexPolicyInForce shown = current ? *current : DexPolicyInForce{};
+    const DexFormValues posted = dex_form_values(pairs);
+
+    // A refusal answers per the dual answer above.
+    const auto refuse = [&](const char* token, const char* toast, int status,
+                            const std::string& field, std::string message,
+                            std::optional<std::int64_t> retry_after_ms, std::string remediation) {
+        if (htmx) {
+            res.status = 200;
+            // With the pre-apply read failed there is no policy to show: "Shipped defaults"
+            // would be a false statement about the store, so the section is the unavailable note
+            // and the toast names that, not a field the body does not mark.
+            const char* const shown_toast = current ? toast : "Config store unavailable";
+            res.set_header("HX-Trigger", dex_scoring_toast(shown_toast, "error"));
+            res.set_content(
+                current ? render_dex_scoring_section(shown, true,
+                                                     if_match.value_or(shown.revision), &posted,
+                                                     DexFormError{field, std::move(message)},
+                                                     std::nullopt, token)
+                        : std::string(kDexScoringUnavailable),
+                "text/html; charset=utf-8");
+            return;
+        }
+        res.status = status;
+        res.set_content(detail::a4_error(res, message,
+                                         {.retry_after_ms = retry_after_ms,
+                                          .remediation = std::move(remediation)}),
+                        "application/json");
+    };
+
+    DexScorePolicyWriteRequest rq;
+    rq.op = op;
+    if (dry_run)
+        rq.dry_run = "true";
+    rq.if_match = if_match;
+    rq.actor = session->username;
+    std::vector<int> row_of_override;
+    if (put) {
+        auto doc = dex_form_to_document(pairs);
+        if (!doc) {
+            refuse("invalid", dex_scoring_refusal_toast(DexScorePolicyWriteStatus::Invalid), 400,
+                   doc.error().field, doc.error().message, std::nullopt, {});
+            return;
+        }
+        rq.body = std::move(doc->text);
+        row_of_override = std::move(doc->row_of_override);
+    }
+
+    DexScorePolicyWriteDeps deps = *dex_score_policy_writer_;
+    // Stamped from the session this handler resolved, never re-resolved from the request. The
+    // bool survives: a refused 'attempted' row is the writer's AuditUnavailable 503. A row that
+    // did not persist also marks the response Sec-Audit-Failed, as the REST twin does through
+    // emit_behavioral_audit (the writer's contract leaves that signal to the handler). The writer
+    // lets at most one row fail per request (a failed 'attempted' row ends it), so the header
+    // is set at most once.
+    deps.audit = [this, &req, &res, &session,
+                  role = auth::role_to_string(auth::effective_role(*session))](
+                     std::string_view verb, std::string_view result,
+                     const std::string& detail_json) {
+        const bool persisted =
+            audit_as_session_fn_(req, *session, role, std::string(verb), std::string(result),
+                                 "RuntimeConfig", std::string(kDexScorePolicyKey), detail_json);
+        if (!persisted)
+            res.set_header("Sec-Audit-Failed", "true");
+        return persisted;
+    };
+
+    const auto r = apply_dex_score_policy(rq, deps);
+    if (r.status != DexScorePolicyWriteStatus::Ok) {
+        std::string field = "document";
+        std::string message = r.message;
+        if (r.status == DexScorePolicyWriteStatus::Invalid && put) {
+            // The writer reports the field only in its audit detail; the validator is pure and
+            // deterministic over the same text, so asking it again yields the same field.
+            if (const auto v = dex_score_policy_validate_text(rq.body); !v) {
+                field = dex_form_remap_field(v.error().field, row_of_override);
+                if (field != v.error().field && !v.error().field.empty()) {
+                    // The message names the JSON path; name the submitted row instead.
+                    for (std::size_t at = 0;
+                         (at = message.find(v.error().field, at)) != std::string::npos;
+                         at += field.size())
+                        message.replace(at, v.error().field.size(), field);
+                }
+            }
+        }
+        refuse(dex_scoring_refusal_token(r.status), dex_scoring_refusal_toast(r.status),
+               dex_score_policy_http_status(r.status), field, std::move(message), r.retry_after_ms,
+               r.remediation);
+        return;
+    }
+
+    if (dry_run) {
+        // Nothing stored: keep the user's edits and the CURRENT revision (the REST ETag rule).
+        DexTierPreview preview;
+        preview.degraded = true;
+        // The image suggestions come from the "now" model below (the same applications, whatever
+        // the policy), so the render does not read the Apps model a third time.
+        std::optional<std::vector<std::string>> subjects;
+        // "Now" is scored under the revision this handler read (the one the form edits), through
+        // the same explicit-policy path as the proposal, never under the provider's cache, which
+        // can trail another replica's write by a refresh interval. If that read and the dry run's
+        // own disagree, a write landed between them: unavailable is the honest answer.
+        if (dex_apps_fn_ && current && current->revision == r.previous_revision) {
+            const std::optional<DexPolicyInForce> now{*current};
+            const auto now_model = dex_apps_fn_(now);
+            preview = dex_tier_preview(now_model, dex_apps_fn_(r.in_force));
+            subjects = dex_scoring_subjects(now_model);
+        }
+        res.set_header("HX-Trigger", dex_scoring_toast("Preview only: nothing saved", "success"));
+        res.set_content(render_dex_scoring_section(shown, true, r.previous_revision, &posted,
+                                                   std::nullopt, std::move(preview), "",
+                                                   subjects ? &*subjects : nullptr),
+                        "text/html; charset=utf-8");
+        return;
+    }
+    res.set_header("HX-Trigger",
+                   dex_scoring_toast(put ? "Score policy saved"
+                                         : "Score policy reset to the shipped defaults",
+                                     "success"));
+    res.set_content(render_dex_scoring_section(r.in_force, true, r.in_force.revision, nullptr,
+                                               std::nullopt, std::nullopt, ""),
+                    "text/html; charset=utf-8");
 }
 
 std::string SettingsRoutes::render_mcp_fragment() {
@@ -3518,6 +3852,53 @@ void SettingsRoutes::register_routes(
             R"({"showToast":{"message":"Cohort export key saved","level":"success"}})");
         res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
     });
+
+    // -- AP-3.12: the DEX page's Scoring tab -----------------------------------------
+    // Reads gate on GuaranteedState:Read (the quiet probe server.cpp binds, else perm_fn_)
+    // BEFORE either the policy or the application names are read, exactly as GET
+    // /api/v1/dex/score-policy and /fragments/dex/apps gate. Whether the page is editable is the
+    // REST write gate (Infrastructure:Write), asked through the same quiet probe into a scratch
+    // response, so a reader without it gets the page with every control disabled and no denied
+    // row for a page view. The three POSTs gate on the loud perm_fn_ for both pairs, the write
+    // first (dex_scoring_post).
+    sink.Get("/fragments/dex/scoring", [this](const httplib::Request& req,
+                                              httplib::Response& res) {
+        if (!read_perm(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!auth_fn_(req, res))
+            return;
+        httplib::Response scratch; // the probe's refusal lands here, never on the page
+        const bool editable = read_perm(req, scratch, "Infrastructure", "Write");
+        std::string html = dex_subnav("scoring", 7) + dex_alerts_style();
+        // #dex-scoring-section is the inner swap target of every POST; the sub-nav above it is
+        // never re-rendered.
+        html += "<div id=\"dex-scoring-section\">";
+        if (!dex_score_policy_writer_ || !dex_score_policy_writer_->read_stored) {
+            html += kDexScoringUnavailable;
+        } else if (const auto in_force = dex_scoring_in_force(*dex_score_policy_writer_);
+                   !in_force) {
+            spdlog::warn("GET /fragments/dex/scoring: store read failed: {}",
+                         ::yuzu::log_key_token(in_force.error()));
+            html += kDexScoringUnavailable;
+        } else {
+            html += render_dex_scoring_section(*in_force, editable, in_force->revision, nullptr,
+                                               std::nullopt, std::nullopt, "");
+        }
+        html += "</div>";
+        res.set_content(html, "text/html; charset=utf-8");
+    });
+    sink.Post("/api/settings/dex-scoring/save",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  dex_scoring_post(req, res, DexScorePolicyWriteRequest::Op::Put, false);
+              });
+    sink.Post("/api/settings/dex-scoring/preview",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  dex_scoring_post(req, res, DexScorePolicyWriteRequest::Op::Put, true);
+              });
+    sink.Post("/api/settings/dex-scoring/reset",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  dex_scoring_post(req, res, DexScorePolicyWriteRequest::Op::Reset, false);
+              });
 
     sink.Get("/fragments/settings/plugin-signing",
              [this](const httplib::Request& req, httplib::Response& res) {
@@ -4867,22 +5248,33 @@ void SettingsRoutes::register_routes(
                 // principal strings, not just the count — mirrors the SCIM
                 // seam's `revoke_linked_credentials_or_fail`.
                 enumerate_principals_for_audit(*principals);
-            if (!revoke_result.api_tokens_persisted) {
-                revoke_detail += " api_tokens_db_error=true";
-                spdlog::error("DELETE /api/settings/users: revoke_for_principal did not "
-                             "persist for one or more principals linked to '{}' — refusing to "
-                             "report a clean delete (ADR-2001 §3 fail-closed)",
+            if (!revoke_result.all_persisted()) {
+                // #4772: the durable session DELETE is held to the same fail-closed contract
+                // as the token revoke (a surviving session row is rehydrated by another
+                // replica or after a restart).
+                if (!revoke_result.api_tokens_persisted)
+                    revoke_detail += " api_tokens_db_error=true";
+                if (!revoke_result.sessions_persisted)
+                    revoke_detail += " sessions_db_error=true";
+                spdlog::error("DELETE /api/settings/users: the credential revoke did not "
+                             "persist (api_tokens={}, sessions={}) for one or more principals "
+                             "linked to '{}' — refusing to report a clean delete (ADR-2001 §3 "
+                             "fail-closed)",
+                             revoke_result.api_tokens_persisted, revoke_result.sessions_persisted,
                              username);
                 audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
+                // A fixed literal from `failed_legs_phrase` (never user data), so it is safe
+                // inside the HX-Trigger JSON below.
+                const std::string what(failed_legs_phrase(revoke_result));
                 res.status = 500;
-                res.set_header(
-                    "HX-Trigger",
-                    R"({"showToast":{"message":"Failed to revoke API tokens for one or more )"
-                    R"(linked identities — try again","level":"error"}})");
-                res.set_content(
-                    detail::a4_error(res, "Failed to revoke API tokens for one or more linked "
-                                           "identities — try again"),
-                    "application/json");
+                res.set_header("HX-Trigger",
+                               R"({"showToast":{"message":"Failed to revoke )" + what +
+                                   R"( for one or more linked identities — try again",)"
+                                   R"("level":"error"}})");
+                res.set_content(detail::a4_error(res, "Failed to revoke " + what +
+                                                          " for one or more linked "
+                                                          "identities — try again"),
+                                "application/json");
                 return;
             }
             erase_principals = std::move(*principals);
@@ -6998,6 +7390,7 @@ void SettingsRoutes::register_routes(
         }
         if (!init) {
             const char* msg = "Enrollment failed";
+            bool csprng_detail = false; // #6995: audit detail only; the operator msg is unchanged
             if (init.error() == AuthDBError::MfaAlreadyEnrolled) {
                 msg = "MFA is already enabled — disable it first to re-enroll";
             } else if (is_store_unavailable(init.error())) {
@@ -7006,13 +7399,21 @@ void SettingsRoutes::register_routes(
                 // never mislead the operator into retrying a fundamentally
                 // broken step; no MFA state changes either way.
                 msg = "Authentication store is temporarily unavailable — retry shortly";
-                if (metrics_registry_) {
+                if (is_entropy_failure(init.error())) {
+                    // #6995: a CSPRNG fault, not a store outage — own counter, same 503-class msg.
+                    mfa_entropy::count(metrics_registry_, mfa_entropy::kSiteEnroll);
+                    csprng_detail = true;
+                } else if (metrics_registry_) {
                     metrics_registry_
                         ->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                         .increment();
                 }
             }
-            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username, msg);
+            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
+                      csprng_detail
+                          ? std::string{"csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
+                                        "fail-closed)"}
+                          : std::string{msg});
             res.set_content(render_mfa_fragment(*session, {}, {}, {}, {}, msg),
                             "text/html; charset=utf-8");
             return;
@@ -7112,15 +7513,24 @@ void SettingsRoutes::register_routes(
                           return;
                       }
                       const bool store_unavailable = is_store_unavailable(codes_res.error());
-                      if (store_unavailable && metrics_registry_) {
+                      // #6995: a recovery-code CSPRNG fault rolled the enrolment back. Still the
+                      // same 503-class operator message, but counted in
+                      // yuzu_secure_random_failure_total, not as a store outage.
+                      const bool entropy_unavailable = is_entropy_failure(codes_res.error());
+                      if (entropy_unavailable) {
+                          mfa_entropy::count(metrics_registry_, mfa_entropy::kSiteRecovery);
+                      } else if (store_unavailable && metrics_registry_) {
                           metrics_registry_
                               ->counter("yuzu_auth_secret_unavailable_total",
                                        {{"route", "mfa_enroll"}})
                               .increment();
                       }
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
-                                store_unavailable ? "secret/store unavailable (fail-closed)"
-                                                  : "code rejected");
+                                entropy_unavailable
+                                    ? "csprng_unavailable: mfa_recovery (mfa_verify_enrollment, "
+                                      "fail-closed, enrollment rolled back)"
+                                : store_unavailable ? "secret/store unavailable (fail-closed)"
+                                                    : "code rejected");
                       const char* msg =
                           store_unavailable
                               ? "Authentication store is temporarily unavailable — retry shortly."
@@ -7226,8 +7636,26 @@ void SettingsRoutes::register_routes(
                   }
                   auto codes = db->mfa_regenerate_recovery_codes(session->username);
                   if (!codes) {
+                      // #6995: a refused regeneration is counted like its siblings. A CSPRNG
+                      // fault goes to yuzu_secure_random_failure_total; any other store fault to
+                      // yuzu_auth_secret_unavailable_total{route="mfa_recovery"}. A business
+                      // outcome (e.g. UserNotFound) stays audit-only: not an alertable fault.
+                      const bool entropy_unavailable = is_entropy_failure(codes.error());
+                      if (entropy_unavailable) {
+                          mfa_entropy::count(metrics_registry_, mfa_entropy::kSiteRecovery);
+                      } else if (is_store_fault(codes.error()) && metrics_registry_) {
+                          metrics_registry_
+                              ->counter("yuzu_auth_secret_unavailable_total",
+                                        {{"route", "mfa_recovery"}})
+                              .increment();
+                      }
                       audit_fn_(req, "mfa.recovery_codes.generated", "error", "User",
-                                session->username, "regeneration failed");
+                                session->username,
+                                entropy_unavailable
+                                    ? "csprng_unavailable: mfa_recovery "
+                                      "(mfa_regenerate_recovery_codes, fail-closed, existing codes "
+                                      "unchanged)"
+                                    : "regeneration failed");
                       res.set_content(
                           render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Could not regenerate codes. Your existing "

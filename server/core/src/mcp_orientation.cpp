@@ -68,8 +68,11 @@ constexpr std::string_view kProductPacks[] = {"list_product_packs", "get_product
 constexpr std::string_view kResponses[] = {"query_responses", "aggregate_responses"};
 // #2146 A2-R1: get_execution_children joins the family - same securable
 // (Execution:Read), same domain as get_execution_status/list_executions.
+// #2146 batch B: cancel_execution and record_execution_rerun join the family - same securable
+// pair (Execution:Execute) as dispatch, but tracker-record-only: neither sends anything to a device.
 constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "get_execution_children",
-                                                 "list_executions", "query_audit_log"};
+                                                 "list_executions", "query_audit_log",
+                                                 "cancel_execution", "record_execution_rerun"};
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
                                            "query_software_licenses", "get_agent_app_usage",
@@ -113,8 +116,9 @@ constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_c
                                          "get_dex_device_app_perf"};
 constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices",
                                         "list_discovered_devices"};
-constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
-                                           "get_bundle_result", "sync_hardware_software"};
+constexpr std::string_view kExecution[] = {"execute_instruction", "execute_instruction_definition",
+                                           "execute_bundle", "get_bundle_result",
+                                           "sync_hardware_software"};
 constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
@@ -179,6 +183,11 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // views; list_guardian_events is the __observation__/enforcement event feed
 // (confined, not denied — see its kToolSecurityRows comment);
 // get_guardian_device_guards is the per-device all-guards census.
+// #5690: get_guardian_status, get_guardian_agent_status, get_guardian_rule_status and
+// get_guardian_device_guards report order_uncertain / projection_pending per row and
+// uncertain_rules per rollup; a clean value never proves freshness or completeness.
+// #7217: get_guardian_device_compliance carries the per-guard flags and uncertain_guards too, and
+// both per-device reads (it and get_guardian_device_guards) report unrepresented_pending_guards.
 // #2146 Batch B1 extends this family with the rule CRUD/push mutations
 // (create/get/update/delete_guardian_rule, push_guardian_rules) and the two
 // per-agent reads #4037 deliberately deferred (get_guardian_agent_status,
@@ -207,8 +216,11 @@ constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_dep
 // "Executions & audit" (ExecutionTracker's single-instruction fan-out): a
 // Workflow composes multiple steps, and its execution record is a different
 // data model from an Execution (see get_workflow_execution's tool doc).
+// #2146 batch B: execute_workflow joins the family - same securable (Workflow), the run side of
+// the read tools beside it.
 constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
-                                           "list_workflow_executions", "get_workflow_execution"};
+                                           "list_workflow_executions", "get_workflow_execution",
+                                           "execute_workflow"};
 // #4027 — Echo (Timeline / Activity Recorder) had zero MCP presence before this
 // read-twin batch; its own family rather than folding into an unrelated one.
 constexpr std::string_view kEcho[] = {"list_echo_process_tree_devices",
@@ -258,8 +270,10 @@ constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_h
 // whole catalog + role grid) and from Engine principals' assign/unassign/
 // list_engine_roles (grant AUTHORING, not a self-check). get_me (twin of
 // GET /api/v1/me) joins it: the same kind of read, a self-description of the
-// CALLING principal that cannot name another one.
-constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me"};
+// CALLING principal that cannot name another one. get_rbac_enforcement (twin of
+// GET /api/v1/rbac/enforcement, #6033) does too: whether enforcement is on and whether the
+// caller could administer RBAC, again about the caller alone.
+constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me", "get_rbac_enforcement"};
 // A2 (delivery plan §2) — global human role assignment/unassignment. Own
 // family, distinct from RBAC self-check above (a read, not an authoring
 // action) and from Engine principals' assign/unassign_engine_role (a
@@ -313,7 +327,13 @@ constexpr std::string_view kCryptoDashboard[] = {
     "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
     "get_crypto_ca_stats"};
 
-constexpr std::array<ToolFamily, 42> kFamilies{{
+// ADR-0070 R1 (slice 2b-1a): registered CRL sources - a CA plus the CRL URLs the server may fetch.
+// Admin-only in both RBAC states (not grantable). Registration only: nothing is fetched yet.
+constexpr std::string_view kRevocationSources[] = {
+    "list_revocation_sources", "get_revocation_source", "register_revocation_source",
+    "update_revocation_source", "remove_revocation_source", "reset_revocation_source_high_water"};
+
+constexpr std::array<ToolFamily, 43> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -321,7 +341,9 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
      kDefinitions},
     {"Product packs", "installed bundles of instruction/policy/workflow content", kProductPacks},
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
-    {"Executions & audit", "execution status/history and the who-did-what audit log",
+    {"Executions & audit",
+     "execution status/history, cancelling an execution record or recording a rerun (neither "
+     "sends anything to a device), and the who-did-what audit log",
      kExecutionsAudit},
     {"Inventory & software",
      "collected inventory tables, installed software, hardware CI records, and licenses",
@@ -401,8 +423,9 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
                             "connections, and listening sockets, fleet-wide or per-host",
      kFleetVisualization},
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
-                        "permission, and describe the calling session (identity, role, tier, "
-                        "direct RBAC role names)",
+                        "permission, describe the calling session (identity, role, tier, "
+                        "direct RBAC role names), and read whether RBAC enforcement is on and "
+                        "whether the caller could administer it",
      kRbacCheck},
     {"RBAC administration", "grant or revoke one of the 7 fleet-wide-assignable built-in RBAC "
                             "roles to a human user, and switch RBAC enforcement on/off "
@@ -424,6 +447,10 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
     {"Crypto dashboard", "the /crypto widget catalogue, your own widget layout, and counts of "
                          "certificates issued by Yuzu's own CA (fixed windows, with as_of)",
      kCryptoDashboard},
+    {"Revocation sources", "administrator-only registry of CRL sources: the CAs and the CRL URLs "
+                           "the server may fetch for them (registration only; nothing is fetched "
+                           "or judged yet)",
+     kRevocationSources},
 }};
 
 }  // namespace

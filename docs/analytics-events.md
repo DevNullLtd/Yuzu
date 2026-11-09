@@ -45,7 +45,7 @@ Every event contains:
 
 | Type | When | Key attributes/payload |
 |------|------|----------------------|
-| `command.dispatched` | `/api/command` sends to agents | `target_count`, plugin, action, scope |
+| `command.dispatched` | `POST /api/command` or `POST /api/v1/commands` sends to at least one agent (MCP `execute_instruction` does not publish it) | `target_count`, plugin, action, command_id, scope |
 | `command.response` | Each RUNNING response from agent | `output_bytes` |
 | `command.completed` | Terminal status | `status`, `exit_code`, `error_message` |
 
@@ -53,8 +53,8 @@ Every event contains:
 
 | Type | When | Key attributes/payload |
 |------|------|----------------------|
-| `execution.created` | Execution created (rerun) | execution_id, parent_id, trigger |
-| `execution.completed` | Execution cancelled | status |
+| `execution.created` | Execution created by a rerun: `POST /api/executions/{id}/rerun`, `POST /api/v1/executions/{id}/rerun` or MCP `record_execution_rerun` (once, on success only) | execution_id (the new one), parent_id, trigger |
+| `execution.completed` | Execution cancelled: `POST /api/executions/{id}/cancel`, `POST /api/v1/executions/{id}/cancel` or MCP `cancel_execution` (once, on success only) | status |
 | `schedule.fired` | ScheduleEngine triggers | definition_id, frequency_type |
 
 ### Approval
@@ -62,6 +62,7 @@ Every event contains:
 | Type | When | Key attributes/payload |
 |------|------|----------------------|
 | `approval.approved` | Approval granted | reviewer |
+| `approval.created` | An instruction execute call created a pending approval: `POST /api/instructions/{id}/execute`, `POST /api/v1/instructions/{id}/execute` or MCP `execute_instruction_definition` | none |
 | `approval.rejected` | Approval denied | reviewer, comment |
 
 ### Instruction Lifecycle
@@ -71,6 +72,13 @@ Every event contains:
 | `instruction.created` | POST /api/instructions | name, plugin, action, type |
 | `instruction.updated` | PUT /api/instructions/{id} | instruction_id |
 | `instruction.deleted` | DELETE /api/instructions/{id} | instruction_id |
+| `instruction.executed` | An instruction execute call reached at least one agent: `POST /api/instructions/{id}/execute`, `POST /api/v1/instructions/{id}/execute` or MCP `execute_instruction_definition` | none |
+
+### Workflow
+
+| Type | When | Key attributes/payload |
+|------|------|----------------------|
+| `workflow.executed` | The engine admitted and ran a workflow: `POST /api/workflows/{id}/execute`, `POST /api/v1/workflows/{id}/execute` or MCP `execute_workflow`. Published once, whatever the run's outcome; not for a refusal, an idempotent replay or a run that threw | none |
 
 ### Auth
 

@@ -80,7 +80,10 @@ A small, source-agnostic seam:
 - **Startup policy:** first-run or overdue (gone past one interval while
   offline) → one catch-up sync after a *short random startup delay* (so a
   mass-deploy or a site's Monday-morning power-on does not herd); otherwise wait
-  for the next phase fire.
+  for the next phase fire. *(Amended by the Update of 2026-11-04 below: "overdue"
+  means a `next_fire` more than 15 minutes late, not a full interval, and the
+  catch-up is spread over 30 minutes; the 10 minute startup delay stays for a first
+  run.)*
 
 > **Update (2026-10-04, #5327):** a source whose collect yields nothing records
 > `skip_streak` / `last_skip` in the same `__sync__` KV. A source that opts in
@@ -160,8 +163,11 @@ Therefore we **coexist, not replace**:
   sources that need fleet-wide queries. `installed_software` is the first;
   future high-query sources get their own typed table in this store. Built per
   the `OfflineEndpointStore` template + ADR-0012 + the postgres-store-playbook:
-  - **Current-state only** (replace on change). No history in central PG —
-    change-history stays an edge/Echo concern (ADR-0004 boundary).
+  - **Current-state only** (replace on change) for the inventory rows. One
+    exception, recorded in the 2026-11-04 Update (schema v11): a per-device
+    install history (`software_changes`, 400 days, clock-guarded prune) is kept
+    in central PG; any wider change-history is an edge/Echo concern (ADR-0004
+    boundary).
   - **Normalized relational rows**, **no JSONB/GIN** — honors the
     "migrate off Postgres easily" constraint. Generic parent
     `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` +
@@ -411,14 +417,16 @@ Motivation: the server-authoritative vulnerability-matching direction (ADR-0018)
 needs full EVR (`epoch:version-release`) + `arch` + the host's distro release for
 Lane-1 OVAL matching, and an honest `kind=app` discriminator for the Lane-3
 OS-native tail. The population contract is **honest-empty**: a field the
-ecosystem does not store is `''`, never synthesised (rpm = full NEVRA + PACKAGER
-+ stored-tag signature status; deb = NEVRA + Maintainer + arch, installed AND
+ecosystem does not store is `''`, never synthesised, except `publisher`, which carries a
+vendor or a `via:` label (the section "2026-11-04 — `installed_software`: a publisher on every
+row, and the `via:` origin label" below states the rule). Per source: rpm = full NEVRA + VENDOR, else
+PACKAGER, + stored-tag signature status; deb = NEVRA + Maintainer + arch, installed AND
 held; apk = name/version/pkgrel; pacman = name/EVR; Windows/macOS = `kind=app`
 with name/version/publisher only; `distro_id`/`distro_version` from
 `/etc/os-release` stamped on every Linux row; `homebrew` is a reserved
-ecosystem value, not collected). `version` is now the upstream version with the
-release/revision split into its own field, and rpm `publisher` switches
-VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
+ecosystem value, not collected. `version` is the upstream version with the
+release/revision split into its own field, and rpm `publisher` is the `VENDOR` tag,
+else the `PACKAGER` tag.
 
 > **Update (2026-10-04, #5328):** `homebrew` was never emitted as an ecosystem
 > value and is retired. Homebrew (ecosystem `brew`; kind `pkg` for formulae, `app`
@@ -458,6 +466,23 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > is a permission fact, where skipping the cycle would freeze every other source
 > for ever.
 
+> **Update (2026-11-04):** the `pkg_inventory` Windows legs are collected as three
+> ecosystems, all machine scope: `appx` (kind `app`; the packages registered for
+> all users in the `AppxAllUserStore` `Applications` and `InboxApplications`
+> registry keys; name is the package name, version and arch come from the package
+> full name, release empty; a package in the `Deprovisioned` key is read but never
+> collected), `chocolatey` (kind `pkg`; one row per `lib\<id>` directory holding a
+> loose nuspec, version from its `<version>`, empty if unreadable) and `winget`
+> (kind `app`; a presence row from the `managers` action, present when the App
+> Installer package is registered, version from that package). Chocolatey's own
+> presence row has an empty version. No process is spawned and nothing is hashed;
+> the `ConstrainedPolicy` of the three actions is unchanged, so a constrained
+> `packages` or `store_packages` answer still skips the cycle, which is why a
+> per-item shortfall (an unreadable nuspec, an unparsable package name) degrades its
+> own row to an empty version instead of constraining the action. The three values
+> are appended at the tail of the published ecosystem enumeration. The tail
+> `install_location` slot stays reserved and empty.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no
@@ -485,16 +510,17 @@ Mechanics:
   classification: `install_location` is
   operator-tier — an ordinary stored Response (90-day default retention, no
   per-subject erasure, not covered by `--inventory-disable`), never in this
-  blob — and can name an account's home directory
+  v2 blob — and can name an account's home directory
   (`/Users/<account>/...`, `C:/Users/<name>/...`). §8's finding — that the
   sync neither crawls a logged-in user's hive nor `~/Applications` — is about
   the sync and the Windows `HKCU` path specifically; it does not extend to
   `list`: on macOS the shared `system_profiler` scan `list`/`list_inventory`
   both run CAN list entries under `/Users/<account>/Applications` (4 of the
   323 rows in the committed macOS sample), so `list` may name a home
-  directory. Any change that puts `install_location` into a hashed or synced
-  blob (the component-inventory collection's blob v3, ADR-0028) must re-open
-  §8's classification first. `list`/`list_inventory` keep their
+  directory. §8's classification was re-opened for the server store of blob v3
+  (the 2026-11-04 Update, "Slot 13 is stored on v3 only"); the change that
+  starts SENDING slot 13 (ADR-0028) must honour its outcome before an agent
+  emits it. `list`/`list_inventory` keep their
   `Inventory:Read`/`ExecuteGate::None` tier; `list_per_user`'s AdminOrApproval
   gate exists for profile enumeration, which `list` does not do (CC6.3
   decision recorded here).
@@ -606,8 +632,9 @@ and the agent. A second `static_assert` keeps every row budget between the short
 and the clamp-bound row, and at or above the measured width recorded beside it (`row_floor`), so
 a budget cannot be cut below a width actually observed to dodge the 80% line.
 
-The `partition` and `topology` budgets are assumed widths: no captures exist yet, so they are
-re-measured when the storage legs land (`swap` has no capture either, its legs being planned, and
+The `partition` and `topology` budgets are assumed widths: no Linux or macOS captures exist yet
+(a Windows `partition` capture does: 76 to 85 wire bytes against the 95 floor, 2026-11-04), so they
+are re-measured when the storage legs land (`swap` has no capture either, its legs being planned, and
 its floor is its shortest possible row). `topology`'s cap is 96, not the 192 starting target,
 because 192 x 144 B would put the registry-derived total past the 80% line.
 
@@ -685,9 +712,8 @@ agent's next full report on the upgraded server.
 **Personal data.** `chassis_serial`, `board_serial` and the DIMM `serial` column join the
 serial/UUID/MAC behavioural-PII tier. The `volume` and `partition` mount-point column can name an
 account or a personal label as the OS reports it, so the agent redacts such entries before sending
-(2026-11-01 entry, "Mount points (personal data)"). The sections read has no REST/MCP/UI route yet;
-the later REST read-surface change must serve it behind the same fail-closed audit as the
-audited `inventory.device.ci` read.
+(2026-11-01 entry, "Mount points (personal data)"). As of the 2026-11-04 entry at the end of this
+file (H.7), the sections are served on REST and MCP behind the audited `inventory.device.ci` read.
 
 ### 2026-11-01 — `device_ci` blob v2 (agent writer)
 
@@ -754,9 +780,10 @@ calls on handles opened without a deadline (`disk_actions_win.cpp`, "BOUNDING").
 on the thread the agent joins on reconnect and on shutdown, so one wedged drive would leave the
 endpoint unable to reconnect or to stop cleanly. Until those calls have a bound, the Windows writer
 does not run the action: the `volume` section is `unavailable` with `agent:windows_volumes_unbounded`
-and carries no rows. The operator-triggered `volumes` action is unchanged, and the Windows
-`partitions` and `topology` legs are status-only (`windows:planned`), so no other section is
-affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` (plugin OS
+and carries no rows. The operator-triggered `volumes` action is unchanged. The Windows
+`partitions` leg reads `Win32_DiskPartition` and `Win32_LogicalDiskToPartition`, and cross-checks the
+drive letters against `Win32_LogicalDisk`, through the bounded WMI helper (`agents/shared/wmi_bounded.hpp`, per-call deadlines), so it runs on the sync thread; only
+Windows `topology` is status-only (`windows:planned`). No other section is affected. The Windows volume rows return when the platform gap named in `disk_actions_win.cpp` (plugin OS
 calls have no deadline, #3925) is closed. The reason is expected on every Windows host and needs no
 operator action; the operator-triggered `volumes` action still works there.
 
@@ -788,3 +815,631 @@ absorb any realistic overflow first, so `swap` is a defensive tail.
 the same build enroll, and every replica is on that build. The deployment contract (a fresh
 database, every writer on this build; `docs/user-manual/upgrading.md`, "Deployment contract (hard
 cutover)") excludes an earlier server, so this entry states no behaviour of an agent against one.
+
+### 2026-11-04 — `installed_software` blob v3 (sections) and schema v10: store and ingest
+
+This entry records the server half: the v3 wire grammar the ingest seam accepts, the store
+columns and tables it fills, and the rules the agent writer (a later change) must reproduce
+byte for byte. The v2 path is unchanged and still owns every blob that does not start with the
+v3 header. No shipped agent sends v3 yet.
+
+**Wire (same `plugin_data` and `content_hashes` key, `installed_software`).** Record 0 is the
+header `0x1F "v3" 0x1E`: an empty first field, which the v2 parser drops (it ignores a record
+with an empty name), so no v2 record can collide with it. A blob that does not start with exactly
+those four bytes is v2, including a v2 blob whose first product is named `v3`. After the header
+every record is `0x1E`-terminated with `0x1F`-separated fields, and the first field is the record
+kind:
+
+| Record | Fields after the kind | Meaning |
+|---|---|---|
+| `S` | `facet`, `status`, `base`, `token`, `duration_ms`, `bytes_read`, `expect` | opens a section; `expect` is the section hash after the agent applies it (64 lowercase hex, mandatory on `delta`, see the SAM-14 entry below) |
+| `+` | `name`, `version`, `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`, `install_location`, *slot 14 (reserved, empty)*, `package_id`, `source` | an install row |
+| `-` | `row_hash` | a deletion by row hash (64 lowercase hex); applied by the SAM-14 delta apply below |
+| `comp` | `kind`, `name`, `version`, `version_source`, `path`, `size`, `mtime`, `anchor_app` | a component row; `version_source` is one of `filename`, `pom`, `manifest`, `metadata`, `package_json`, `pe`, `elf`, `macho`, `unreadable`; stored by the SAM-14 component store below |
+
+`facet` is a `kSoftwareSources` value (the collector source) or `component_inventory`, 1 to 64
+characters of `[a-z0-9_.]`. `status` is `full`, `delta`, `constrained`, `timeout`, `oversize`,
+`not_collected` or `disabled`; only `full` and `delta` sections carry records. `duration_ms` and
+`bytes_read` are agent-reported diagnostics: anything that is not plain digits reads as 0. Every
+field passes the v2 field step: scrub to valid UTF-8 first (U+FFFD for each invalid byte), then
+clamp to 1,024 bytes on a codepoint boundary. A `+` row's `source` must equal its section's
+`facet`. Caps bound the retained records per call: 3 MiB of blob (unchanged), 32 sections, 20,000 `+` rows, 20,000 `-`
+records, 20,000 `comp` records. A refused section gives its records back, so a call can parse more than
+20,000 in total; the 3 MiB and 32-section caps still bound the work, and refused rows never reach Postgres.
+
+**Every record is terminated, the last one too.** A blob whose final record lacks its `0x1E` was
+cut off: a truncated row refuses the section it sits in (`unterminated`; the complete rows
+before it in that section are not applied alone), and a truncated `S` record or one before any
+section cannot be attributed to a facet, so it fails the whole blob. The agent writer terminates
+every record.
+
+**No NUL byte in any record.** A record that holds a `0x00` byte refuses the section it is in
+(`nul_byte`). NUL is valid UTF-8, so the field scrub would keep it, and both hashes (the section
+hash and `instance_key`) would be taken over it; but the text bound to Postgres cannot carry a
+NUL, so the stored row would read without it while its keys were computed with it. Two rows
+(`AB` and `A\0B`) would then be stored identically under different keys, and the stored section
+hash could not be reproduced from the stored rows. The refusal is a v3 grammar rule, and the
+writer contract: **the agent writer must never emit a NUL byte in any field of any record.** The
+v2 parser is unchanged.
+
+**Containment.** A grammar violation inside a section refuses that section only: a `+`, `-` or
+`comp` record in a status-only section; a `-` record in a `full` section; a `+` source other
+than the facet; `+` in `component_inventory` or `comp` anywhere else; an unknown status, facet or
+record kind; a malformed row hash; an unknown `version_source`; a repeated facet; a row over the
+per-call cap; a record holding a NUL byte; a final record with no terminator. The rest of a refused section is skipped to the next `S`, and the other sections
+still apply. A defect that cannot be attributed to a facet fails the whole blob (a record before
+any section, a header with no section after it, an `S` record whose facet is empty or outside
+the charset, more than 32 sections, over 3 MiB): the ingest seam answers the whole-source `installed_software` nack and counts
+`dropped`, like an over-cap v2 blob.
+
+**Nack form.** `InventoryAck.need_full` is a `repeated string`, so the per-section nack is
+`installed_software:<facet>` with no proto change. The whole-source `installed_software` stays
+the nack for a hash-only claim the server cannot match and for an unattributable v3 blob.
+
+**Section hash.** `canonical_section_hash(rows)` is the SHA-256 hex of the section's rows,
+sorted and de-duplicated, each written as all 16 wire slots (slot 14 empty, and no conditional
+tail: unlike the v2 hash, `package_id` and `source` are always written), `0x1F`-joined and
+`0x1E`-terminated. The sort walks the stored fields in wire order: `name`, `version`,
+`publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`,
+`signature_status`, `distro_id`, `distro_version`, `install_location`, `package_id`, `source`,
+byte-wise. An honest-empty `full` section hashes the empty string. The hash is over the
+**stored form** of each row: the field step above (scrub to UTF-8, then clamp) has already run,
+and the rows are sorted and de-duplicated, so an agent that mirrors it hashes the scrubbed and
+clamped fields, never the raw bytes it collected. The pinned vectors are the test cases
+`canonical_section_hash is order and duplicate independent, 16 slots always, pinned` and
+`v3_report_hash sorts by facet in byte order, carries the v3: prefix, pinned` in
+`tests/unit/server/test_software_inventory_store.cpp`; a writer is correct when it reproduces
+them.
+
+**Report hash.** The value stored in `inventory_state.content_hash` for a v3 agent, and the value
+a v3 agent claims in a hash-only report, is `v3:` followed by the SHA-256 hex of
+`facet 0x1F section_hash 0x1E` for every facet the server holds, sorted by facet in byte order.
+A facet is held when its `software_facet_state` row has status `full` or `delta` and a
+non-empty section hash. It is recomputed from that table after every v3 call, never from the
+call's own sections, so a first contact split over several calls converges to the hash a single
+call produces. A facet reporting a status-only status (`constrained`, `timeout`, `oversize`,
+`not_collected`, `disabled`) is not in the hash until a `full` section confirms it again, though
+its rows are kept. The `v3:` prefix means a v2 hash-only claim (plain hex) can never match a v3
+state, and the other way round; each side asks for a full report.
+
+**Apply rules** (`apply_installed_software_v3`, one transaction under the same per-agent
+advisory lock as the v2 replace):
+
+- *First v3 contact.* If the stored report hash does not start with `v3:` (or there is none),
+  every `installed_software` row and every facet state row of the agent is deleted first, so no
+  v2 leftover survives. A call that applies nothing (every section refused, or only `delta`
+  sections) does not do this.
+- *`full`.* Deletes the agent's rows of that facet, inserts the section's rows with their
+  derived keys, and upserts the facet state (status, token, recomputed section hash,
+  `last_confirmed_at`, duration, bytes). An honest-empty section deletes the facet's rows.
+- *Status-only.* Upserts status, token, duration, bytes and `enabled` (false only for
+  `disabled`). Rows, the stored section hash and `last_confirmed_at` are left alone.
+- *`delta`.* Applied by the SAM-14 rules in the entry below (row-hash `-` / `+` against the held
+  rows, verified against the agent's `expect`).
+- *`component_inventory`.* Applied by the SAM-14 rules in the entry below: the rows live in
+  `software_components`, the section hash is real and joins the report hash.
+- *Refused sections.* A refused section is skipped before any write, so its previously held
+  rows, facet state and section hash stay as they were, and the report hash still includes that
+  held section hash. A facet the agent refuses permanently therefore keeps its old rows and is
+  nacked `need_full` on every cycle until the agent is fixed (`YuzuInventorySectionIngestRefused`
+  alerts on it); this is by design, not a stuck state to repair on the server.
+- *Report state.* `inventory_state` (the report hash and `last_seen`) is written only by a call
+  that applied at least one section: a `full`, a status-only, a `component_inventory` or a `delta`
+  that verified. A call made up only of refused, need-full and mismatched sections is a nack, not
+  a received report: it leaves the hash and `last_seen` alone, and the section the agent sends on
+  the resend is what advances them.
+- *Failure.* A SQL failure rolls the whole call back and every section in it that was not
+  refused is answered `error` and nacked. A v2 full report additionally deletes the agent's
+  `software_facet_state` rows, and `delete_agent` deletes them too.
+
+**Slot 13 is stored on v3 only.** `install_location` (wire slot 13) is stored from the v3 `+`
+record. The v2 path still parses and discards it, so a v2 row's location is always empty and the
+v2 canonical hash is unchanged. Slot 14 (`uninstall_string`) stays reserved on both paths, so
+#5186 is closed for slot 13 only.
+
+*§8 outcome for slot 13 (this change re-opens §8 for the server store).* `install_location` is
+operator-tier: machine-scope roots only (ADR-0028), but a root can still name an account's home
+directory, so it is classified like the `list` column above. It is erased on decommission
+(`delete_agent` deletes the rows), and nothing in this change reads it back (no route, tool, page
+or log line carries it). The server stores it as sent after the field step, without minimisation,
+so **the agent writer must not send per-user paths**: that precondition is owned by the change
+that starts sending slot 13, which must also test that no profile path is emitted.
+The change ledger (the 2026-11-04 Update, schema v11) keeps a copy for its retention window:
+`software_changes.identity_key` carries the lower-cased location as its last segment for 400
+days, past the hard delete of the `installed_software` row (`delete_agent` removes the ledger
+rows with the device). That is accepted on the writer's requirement not to send per-user paths
+(the precondition above), which the server does not enforce, so the copy is expected to name
+machine-scope roots only; the writer's no-profile-path test covers the ledger copy as well, and
+nothing reads the ledger back.
+
+**`install_type` and `install_scope`.** Both are derived by the server at insert time and are
+never on the wire or in either hash. `install_type` is one of `msi`, `installer`, `store`,
+`package_manager`, `optional_feature`, `runtime`, `middleware`, `component`, `driver`, or `''`
+for a row not yet derived. The source decides it: `installed_apps.list_inventory` → `installer`,
+except that a row of ecosystem `deb`, `rpm`, `apk` or `pacman` (the same collector lists the Linux
+packages) is `package_manager`, so the same package reads the same with or without a source;
+`pkg_inventory.managers` and `pkg_inventory.packages` → `package_manager`;
+`pkg_inventory.store_packages` → `store`; `windows_optional_features.list` →
+`optional_feature`; `msi_packages.list_inventory` → `msi`; `runtimes.python` → `runtime`;
+`middleware.ibm_mq` → `middleware`. A row with an empty source (a pre-tail agent) falls back by
+ecosystem: `msi` → `msi`, `optional_feature` → `optional_feature`, `python` → `runtime`,
+`ibm_mq` → `middleware`, `snap` and
+`flatpak` → `store`, `brew`, `rpm`, `deb`, `apk`, `pacman` → `package_manager`, `windows`, `macos`,
+`macos_pkgutil` → `installer`, anything else `''`. `component` and `driver` are reserved for the
+component and drivers facets; no source maps to them yet. The table has a compile-time
+totality check over `kSoftwareSources`, so a new collector cannot ship without an install type.
+The `pkg_inventory.managers` presence row is stored in `installed_software` today, so it is typed
+`package_manager` like the packages it manages; it is not exempted by name. `install_scope` is
+`machine` or `user`; collection is machine-scope only, so the server writes `machine`.
+
+**`purl`.** A Package URL per row, composed by the server (`purl_compose.hpp`, `compose_purl`)
+from fields already on the `+` record and stored in `installed_software.purl`. It is not on the
+wire and in neither hash, so the agent and the v2 path are untouched. Only the v3 apply path
+sets it: a row from a v2 report carries an empty `purl` until its device's first v3 report (the
+`install_location` coexistence rule). It is built to the Package-URL specification (ECMA-427,
+Clause 5 and the `alpm`, `apk`, `brew`, `deb`, `rpm` type definitions of the purl-spec
+repository) and is `''` wherever the specification registers no type for the ecosystem: a type
+is never invented. `purl_type_for` (the title normalisation pack's ecosystem table) is the one
+source of the type. Rules common to all types: UTF-8 bytes percent-encoded except
+`A-Z a-z 0-9 . - _ ~ :`; qualifier keys sorted, empty values dropped; `''` when the name or the
+version is empty, when a required namespace has no source, and when the result would exceed 2048
+bytes (never truncated).
+
+| Ecosystem | Result | Notes |
+|---|---|---|
+| `deb` | `pkg:deb/<distro_id>/<name>@[<epoch>:]<version>[-<revision>]?arch=&distro=` | name lowercased |
+| `rpm` | `pkg:rpm/<distro_id>/<name>@<version>[-<release>]?arch=&distro=&epoch=` | name keeps its case; epoch is a qualifier |
+| `apk` | `pkg:apk/<distro_id>/<name>@<version>[-r<pkgrel>]?arch=&distro=` | the agent stores pkgrel without apk's `r` |
+| `pacman` | `pkg:alpm/<distro_id>/<name>@[<epoch>:]<pkgver>[-<pkgrel>]?arch=` | rolling: no distro qualifier |
+| `brew` formula | `pkg:brew/<name>@<version>` | default tap; `@` in a name is `%40` |
+| `brew` cask | `pkg:brew/homebrew/cask/<name>@<version>` | the Homebrew presence row gets no purl |
+| `windows`, `macos`, `macos_pkgutil`, `msi`, `snap`, `flatpak`, `optional_feature`, `python`, `ibm_mq` | `''` | no registered type; `python` rows are interpreter installs, not PyPI distributions |
+
+The namespace is the lower-cased `/etc/os-release` ID (`distro_id`). `distro` is
+`<distro_id>-<distro_version>` and only when both are known. `arch` is the stored architecture
+when non-empty, except for `brew`, whose type defines no `arch` qualifier. An index (`installed_software_purl_idx`, a partial btree `WHERE purl <> ''`) and
+`SoftwareInventoryStore::find_by_purl` serve exact lookups; no route, tool or page reads the
+column yet.
+
+**Keys, and why the uniqueness is not the identity.** Two keys are derived in one place (the
+store's `derive_install_keys`) on both insert paths:
+
+- `instance_key` is the SHA-256 hex of the row's single canonical record (the section-hash
+  serialisation of that one row). Rows are sorted and de-duplicated before insert, so it is
+  unique per agent by construction. It is the value a `-` record names. A partial unique index on
+  `(agent_id, instance_key) WHERE instance_key <> ''` enforces it.
+- `identity_key` is `norm_key(name, publisher)` (an origin label `via:<ecosystem>` in `publisher` reads
+  as no vendor), `0x1F`, `version`, `0x1F`, `arch`, `0x1F`, the
+  install location lower-cased with trailing path separators stripped (empty on v2 rows). It is
+  stored and **not** unique and not indexed; it is the key a later consolidation step will use.
+
+This deviates from the spec row, which asked for a `UNIQUE (agent_id, identity_key, removed_at)`.
+The Update of 2026-10-17 above records that one MSI product is listed by both
+`msi_packages.list_inventory` and `installed_apps.list_inventory` and that the two rows are not
+de-duplicated. They share an identity, so an identity-keyed unique constraint would reject the
+first v10 ingest of every Windows host that has an MSI product. `removed_at` belongs to the
+deletion-tracking change and is not added here.
+
+**Migration v10** (`docs/postgres-migration-ladder.md`, `SoftwareInventoryStore` row): six
+columns on `installed_software` (`install_type`, `install_scope` default `machine`,
+`install_location`, `identity_key`, `instance_key`, `purl`; constant defaults, no rewrite); two CHECK
+constraints (`install_type` in the vocabulary above or `''`, `install_scope` in `machine`,
+`user`) added `NOT VALID` (`''` is the "not derived" value of `install_type`); the partial unique index
+above and the partial btree `installed_software_purl_idx` on `(purl) WHERE purl <> ''`; and the new `software_facet_state (agent_id, facet, status, token, section_hash, enabled,
+last_confirmed_at, duration_ms, bytes_read, updated_at)` table, primary key `(agent_id, facet)`.
+The index builds are not online: they hold `ACCESS EXCLUSIVE` for their duration, under the same
+fresh-database hard-cutover ruling of 2026-10-24 (not v7's basis; see the ladder and the playbook's
+recorded-exception register). In a fresh deployment the table is empty, so the
+build returns at once; the ladder row keeps the measured build time over a populated table as a
+hazard note only.
+
+**Partitioning decision: `installed_software` stays a plain table.** No measurement exists (the
+partitioning spike was skipped). Hash-partitioning by `agent_id` needs the non-transactional
+migration kind that is not built (`app_perf_daily_store.hpp`, the ladder), would rewrite the
+table under `ACCESS EXCLUSIVE` at a size past the v7 ceiling of 2-4M rows, and would turn the one
+measured query, the `installed_software_name_idx` seek, into a scan of every partition. The
+decision is reversible and is revisited when a measurement exists.
+
+**Observability.** Each section bumps `yuzu_inventory_section_ingest_total{facet,outcome}`
+(`outcome`: `stored`, `status_only`, `need_full`, `mismatch`, `rejected`, `error`; `facet`
+is a collector source, `component_inventory`, or `unknown`, never the agent's raw string). The
+apply is timed under `yuzu_inventory_ingest_duration_seconds{source="installed_software",phase="v3"}`,
+and the source-level
+`yuzu_inventory_ingest_total` outcome is `stored`, `need_full`, `error` or `dropped`. The
+agent-reported per-section duration and bytes live in the facet state row, not in Prometheus
+labels.
+
+**Hand-off to the delta apply and the agent writer.** Two facts the next changes must carry.
+`instance_key` hashes the row's whole 16-slot record, so adding a slot to that record re-keys
+every stored row once, so the agent writer and the server move together on it. The
+delta apply and the component store are described in the SAM-14 entry below; the agent writer's golden-vector parity
+test must reproduce the section hash, the report hash and the hash membership rule above
+byte for byte, including that a facet whose status moves from `full` to a status-only status
+(for example `disabled`) leaves the report hash while its rows are kept.
+
+Three further facts belong to the agent change that sends v3. (1) The shipped
+`SyncScheduler::apply_ack` (`agents/core/src/sync_scheduler.cpp`) matches `need_full` by the
+exact source name, so the per-section token `installed_software:<facet>` reads as a clean sync:
+the scheduler must treat any `installed_software:*` token as a nack of the source, or a
+refused or delta section is never resent. (2) Sequencing is same-build only: every server
+replica of the build is up before the agents of that build enroll, and this ADR records no
+behaviour of the record against an earlier server. (3) `ConstrainedPolicy::drop_source` (the 2026-10-29 Update) removes the source's
+rows on a constrained read under v2, because the full replace omits them; under v3 the same
+read is a status-only section and the rows are kept, so the writer must send `full` (honest
+empty) to retire a facet's rows and not a status. The first v3 call of a device that applies a section also deletes
+all its v2 rows first, so it should carry `full` for every facet it holds.
+
+**Not in this change.** The agent writer; any read surface returning the new columns (the existing reads select the old columns
+only; `find_by_purl` is a store method with no caller).
+
+### 2026-11-04 — sync-now parameters, the installed-software window, and overdue catch-up
+
+This amends the trigger text of section 3 and the `__sync__.now` reserved-command contract. No
+proto field is added: both new inputs are entries in the command's existing string `parameters`
+map, and the wire, the KV keys and the heartbeat tags are unchanged.
+
+- **`__sync__.now` parameters.** `source` accepts `all`, one name, or a comma-separated list. The
+  list is all-or-nothing: any unknown name fails the command (exit 2, naming the valid set) and
+  arms nothing. `delay_max_s` is an integer from 0 to 86400; absent or 0 is the immediate path.
+  When it is above 0 the agent still forces a full report, but fires it at a stable per-agent
+  offset in `[0, delay_max_s)` from the request instead of at once; a source already armed to
+  fire sooner keeps the sooner time, so a repeated request never delays it. A malformed or
+  out-of-range value fails the command (exit 2); a present but empty value is malformed. The
+  existing `stagger_seconds` field stays ignored for `__sync__`. The server sends neither
+  `delay_max_s` nor a source list yet, so an operator's sync-now is immediate today.
+- **The sender's audit row.** The change that adds the server-side sender records `delay_max_s`
+  and the target source list in the dispatch's audit row. The sender and the agent are the same
+  build, so it needs no version or capability gate.
+- **Installed-software window.** `installed_software` is scheduled inside a nightly window of
+  01:00 to 05:00 in the machine's local time, at a stable per-agent moment
+  (`fnv1a(agent:window:source)` over the window length, to the second); a source without a window
+  fires at a phase offset of its interval. The skip backoff of #5327 is capped at that moment rather than at
+  the next phase slot. It governs the regular daily sync only: the first sync after enrolment,
+  skip-ladder and `need_full` retries, catch-up and an operator's sync-now can fall outside it.
+  The window is a compile-time default carried by the source; there is no channel to change it
+  per fleet yet, and a settings push is deferred. "Local" is the machine's own clock and time
+  zone: an agent with no zone configured (a container, a VDI image, a service with `TZ` unset)
+  runs on UTC and gets 01:00 to 05:00 UTC, which can be working hours where its users are. A
+  local time that does not exist (a spring-forward gap) resolves forward, an ambiguous one
+  (fall-back) resolves to whichever instant the C library chooses. A machine that is off or
+  asleep through its window syncs at its next wake (see catch-up) and then returns to the next
+  window. A source's full resend floor (7 days) is checked at its fire time, so across a
+  spring-forward change the seventh day's fire is an hour short of it and the full send lands on
+  the eighth: the floor is 7 to 8 days. Sources without a window keep the interval and phase-slot cadence.
+- **Capacity.** A window concentrates the day's reports. A fleet in one time zone reports
+  within four hours rather than across twenty-four: about 70 `ReportInventory` calls a second per
+  million agents at the peak, against about 12 for the uniform spread (six times), and zones
+  overlap less than a uniform spread would. Hash-skip is unchanged, so most of those calls carry
+  a hash only; the blob goes out for a changed source, at the 7 to 8 day floor and for an
+  operator-forced sync. The handler takes a per-agent lock and no fleet-wide one, and nothing
+  rate-limits it; these figures are arithmetic from the window length, not measurements, and
+  pool sizing against them has not been measured.
+- **Catch-up.** A persisted `next_fire` more than `kMaxTickSeconds` (15 minutes) in the past,
+  which a live agent never has, or more than two days ahead (a clock stepped back, a restored
+  VM, a corrupt value: no interval plus window reaches two days), is re-armed to now plus a
+  stable offset in `[0, 30 min)`. It is checked on every batch pass, so it covers both a restart
+  and a tick that runs long after the previous one (sleep and resume). It changes the schedule
+  only: `last_hash` and `force_full` are untouched, so a catch-up sync is hash-only unless the
+  source changed. An overdue source is spread rather than fired at once, which is the startup policy section 3
+  describes. First-run jitter (10 minutes) is unchanged. After a mass reboot or
+  a server outage every overdue agent reports within 30 minutes: about 550 calls a second per
+  million agents (eight times the in-window peak). The 30 minute spread is a constant and does
+  not scale with the fleet.
+- **Forced syncs and outages.** An operator-forced sync is outside catch-up only while its pass
+  is current. If the forced pass finds nothing to send or its send fails, `next_fire` stays at
+  the request time and the batch pass retries every 30 seconds, but only for 15
+  minutes; catch-up then re-arms it to a stable offset in `[0, 30 min)` and the 30 second retries
+  resume from there, with `force_full` kept so the sync is still full. The same applies to any
+  source whose send keeps failing: during a long outage an agent retries in 15 minute bursts
+  separated by a pause of up to 30 minutes.
+  A server that comes back is reached within about 30 seconds if the agent is mid-burst and
+  otherwise within 30 minutes; a sync-now that failed on first send can arrive up to about
+  45 minutes after it was requested (15 minutes to notice, up to 30 of spread).
+- **Staleness.** A windowed source's consecutive daily syncs are 24 hours apart, 23 or 25 across
+  a clock change, because the moment is fixed in local time; a machine that missed its window
+  reports at its next wake. With the 45 minutes above, both stay inside the 48 hour "two missed
+  daily cycles" staleness threshold of `docs/user-manual/inventory.md`, and the freshness gauge
+  keys on server receipt time, so no freshness expectation is weakened.
+
+### 2026-11-04 — `installed_software` blob v3: delta apply, change ledger, component store, retention (schema v11)
+
+The server applies a verified delta section, records what every applied section changed, stores
+the component section, and prunes the ledger, so an agent can be delta-only. Schema v11 adds three
+empty tables; nothing existing is rewritten.
+
+**The `expect` field (a contract revision).** The `S` record has a seventh field after
+`bytes_read`: `expect`, the section hash the agent holds AFTER applying the section (64 lowercase
+hex). A `delta` section without a valid `expect` is refused `bad_record`; a `full` or status-only
+section ignores it (the server recomputes a full section's hash from its rows). The field is
+mandatory for `delta`, and the agent writer of the same build emits it. Like every other record
+field it follows the parse rules above: a record holding a NUL byte refuses its section (`nul_byte`,
+which covers the `S` record and so `expect`), and an `S` record cut off before its terminator fails
+the whole blob. It is the only per-section check the server has that its apply produced the
+agent's row set.
+
+**Delta apply.** Each full or delta section runs inside its own `SAVEPOINT`; a section that does
+not verify is rolled back alone and the others of the call still apply.
+
+- The facet must be held with status `full` or `delta` and a section hash equal to the delta's
+  `base`; anything else is `need_full` and writes nothing (a facet last reported status-only is
+  not a valid base).
+- The `-` set is ONE statement: `DELETE ... WHERE agent_id AND source AND instance_key =
+  ANY(...) RETURNING ...`. The rows returned must equal the UNIQUE `-` count (an agent may repeat a
+  hash); fewer means the agent's base is not what the server holds.
+- The `+` rows are inserted with the same batched statement as a full section. A collision on
+  `installed_software_instance_idx` is a producer defect, not a fault.
+- The facet's rows are re-read and their section hash must equal `expect`.
+- Any of these failing is `mismatch`: the savepoint is rolled back, the facet keeps its held rows and hash, and it is
+  nacked so the agent resends it in full. A genuine SQL fault still rolls the whole call back.
+- A facet that would hold more than the per-call cap (20,000 rows or components) after the apply is
+  `mismatch` too: the cap bounds the records one call carries, and this check bounds what deltas
+  can accumulate.
+- On success the facet state is `delta` with `expect` as its section hash and the report hash is
+  recomputed.
+
+**Change ledger (`software_changes`).** Every applied installed-software section (a component
+section writes none) writes one row per install, remove
+or upgrade, in the same transaction (one `unnest()` statement per section). `observed_at` is the
+replica's own server clock in whole seconds (not the database clock) and, with `agent_id`, groups
+the rows of one apply call: calls for an agent are serialised by its advisory lock, but two calls
+inside the same second share an `observed_at`, so rows are ordered by `change_id` within a group.
+A row's identity is its `instance_key`, stored on the ledger row. The rows come from a pure
+diff: removed = held-not-new, added = new-not-held, keyed by `instance_key`. A row's version is
+the (`epoch`, `version`, `release`) tuple, so a release-only or epoch-only change (a distribution
+backport, a Flatpak commit) is an update. Within one identity stem (`identity_key` with its
+version segment blanked) both sides are sorted by (tuple, `instance_key`): a removed and an added
+row with an EQUAL tuple pair first and write no row (install_date, signature, a location
+spelling that normalises equal, or a publisher that normalises equal, which includes one origin
+label for another); the rest pair k-th to k-th in tuple order as one
+`upgrade(from, to)` each; leftovers are `remove` and `install`. `from_version` and `to_version`
+hold `[epoch:]version[-release]`, non-empty parts only (the `:` follows a non-empty epoch, the
+`-` joins a release to a non-empty version, so a Flatpak row reads as its commit), in the
+existing text columns. A version is compared as written, so a row whose version could not be read
+(an empty version, which the collector reports when a Chocolatey package's nuspec cannot be read,
+for example when the `lib` directory is a junction) moves to or from a real version as an
+`upgrade` with an empty side, provided the row has no epoch or release either. The writer must
+also keep the spelling of `arch`, the install location and the vendor stable from one sync to the
+next: a row whose `arch`, or whose location beyond ASCII case and trailing separators, or whose
+vendor beyond what the vendor normaliser reads as equal, changes is a removal and an install, not
+an update. An origin label (`via:<ecosystem>`) reads as no vendor, so one label for another is no
+event, while a source that starts or stops declaring a vendor changes the vendor.
+**There are no tombstones on `installed_software`**: a removal is a hard
+delete plus a `remove` row carrying name, publisher and that version text, so no read needs a
+`removed_at` filter.
+
+**Baseline rule.** A `full` section is a BASELINE (rows written, no ledger rows) unless the
+server HOLDS the facet's rows. A facet is held when its state has a non-empty section hash, its
+status is not `disabled`, and the stored rows hash to that section hash. A baseline is therefore a
+device's first contact for the facet (including the first v3 call that applies a section, which
+deletes the device's v2 rows), a facet that has received only status-only sections (that creates a
+facet state with no hash), a facet switched off and then on (a status-only section over a
+`disabled` facet clears its stored hash, so a timeout following the switch-off does not turn the next
+full into a diff), and a facet whose stored rows do not hash to its section hash (an out-of-band
+delete or a partial-table restore; no product path produces one), which is baselined with a
+warning so a missing row is never recorded as a phantom `install`. The warning is the only signal
+of that last case: no counter or alert counts it, because no product path produces it. Changes made
+while a facet is disabled are never recorded, by design. A held facet's rows are in the table (a
+status-only section leaves them in place), so its full section is diffed against them: a timeout
+followed by a full carrying an upgrade writes one `upgrade`, and an honest-empty full followed by
+a populated one writes the installs.
+
+**Components (`software_components`).** The component table lives in this store's schema, owned
+by `SoftwareInventoryStore`, because a component section is applied in the same transaction as
+`software_facet_state` and the report hash and ADR-0012 §3 forbids a second store writing across
+the schema. Primary key `(agent_id, kind, path_hash)`, `path_hash` = SHA-256 of
+the exact path bytes. A component canonical record is `kind US name US version US version_source
+US path US size US mtime US anchor_app RS`; a row hash is the SHA-256 of one record (the value a
+`-` names); the section hash is the SHA-256 of the records sorted by those fields (size and mtime
+numerically) and de-duplicated. A full section deletes the agent's components then inserts
+(`first_seen` = the time the row was written); a delta deletes by
+`row_hash`, inserts, and verifies `expect`, and does not touch the rows it does not name; every `-`
+must name a held row, else the section is a mismatch and rolls back. Freshness
+of a delta-maintained facet is `software_facet_state.last_confirmed_at`, not a per-row column.
+An honest-empty full
+deletes the rows. A repeated `(kind, path)` inside one section is a producer defect: `mismatch`.
+That includes two components of one kind with an empty path, and it holds for a `full` section
+too: the resend repeats the pair, so the facet is answered `mismatch` on every cycle and none of
+it is stored until the writer sends each path once. It does not repair itself.
+
+The component writer is held to the same precondition as slot 13: `path` and `anchor_app` are
+stored as sent, the server does not enforce it, so the writer must not send per-user paths.
+
+The facet now carries a real section hash and enters the report hash. A row a delta removes is
+hard-deleted with no history row: component change history is out of scope. Components are
+current-state, bounded to the per-call cap per device by the post-apply check above, and die with
+the device, so they have no prune.
+
+**Retention.** `run_retention_prune_changes` prunes `software_changes` through the shared
+clock-guarded helper (all seven parts, `docs/clock-guarded-retention.md` register): 400-day window
+in epoch seconds, a missing anchor declines, 50,000 rows per pass, ticked hourly beside the
+deployment prune. The rows are stamped by the replica's clock while the cutoff reads Postgres
+`now()`: the two clock domains are split, which the 400-day window absorbs (the register records
+why). `decommission` (`delete_agent`) removes an agent's ledger and component rows.
+
+**Observability.** `yuzu_software_changes_total{kind}` counts ledger rows by kind (a baseline
+counts none); its closed `kind` set (`install`, `remove`, `upgrade`) is created at 0 at boot beside
+the section counter's series. `YuzuInventorySectionDeltaMismatch` (warning, `for: 1h`) watches
+`outcome="mismatch"`. A device reports about once a day, so a `rate()` over a short window
+never holds for an hour; the rule reads `increase(...[1d])` and needs both at least 5 `mismatch`
+sections for a facet and more than 5% of that facet's sections. An isolated mismatch (an agent
+restored from a snapshot, a report racing a decommission) is expected and does not fire it; the
+agent resends the facet in full, which repairs a delta that went out of step; a component section
+that repeats a `(kind, path)` does not repair itself (above).
+
+**Not in this change.** The agent writer (it must emit `expect` and mirror the component hashes);
+any read surface for the ledger or the components.
+
+### 2026-11-04 — `device_ci` read surface on REST and MCP (H.7)
+
+`GET /api/v1/hardware/{id}` and the MCP tool
+`get_hardware_ci` serve the expanded record behind the fail-closed `inventory.device.ci` audit.
+The chassis, board and DIMM serials and the machine-id hash (with its algorithm and source) are
+served. Section rows are served only for the `ok` and `constrained` levels; a section at any other
+level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
+snapshot (`get_device_ci_with_sections`), so the scalars and the rows are the same replace
+generation. A failed read of the sections is a `503` on REST and a retryable error on MCP
+(`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections
+unreadable`; it is never a `200` with an empty sections list.
+
+Each table-backed section's status row also records `row_count` (migration v3, additive and
+nullable): the number of child rows the full replace actually inserted for it, taken from the insert in
+the same transaction and never from the agent. The read side compares it with the rows it reads in the
+same snapshot; if they differ (child rows lost outside the product, for example a partial single-table
+restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason
+`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the
+rows that were read are still served.
+
+The status row also records `content_digest` (the same migration v3, additive and nullable): the
+SHA-256 of a canonical, length-prefixed serialization of the section's rows (section kind, column
+count, row count, then each row's position and cells, with any NUL byte in a cell skipped because the
+store cannot keep one), computed by the server from the rows it inserts in the same transaction,
+never taken from the agent. It is stored as `v1:<64 hex>`: the prefix names the preimage layout, and a
+stored digest that is a well-formed digest of a different layout version (`v<n>:` with a non-empty
+remainder, n one to six digits, not 1, no leading zero) is treated as unverified, never as a mismatch; every other
+non-NULL value that is not the current form (empty, whitespace, `V1:`, bare hex, a malformed version,
+`v2:` with nothing after it) IS a mismatch, because treating a damaged column as unverified would let a
+same-count edit read as complete. A later layout change or a registry column change (see the warning in
+`device_ci_kinds.hpp`) can therefore be rolled out under a new prefix without raising a false integrity
+alarm on every stored row. (A column change also needs its own ALTER migration; the registry is not the schema, see
+`docs/postgres-store-playbook.md` "Registry-backed tables".) One pure function
+(`device_ci_section_digest.hpp`) serves the writer and the read mapping, so the two cannot drift. The
+read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
+row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
+and `complete: false` with reason `server:content_digest_mismatch`, appended after any existing
+reason. The rows that were read are still served, but they are not the values the agent reported. A
+lost row is reported by the count token alone, since it changes the digest too. This is an integrity
+check against accident and non-malicious drift, not tamper resistance: anyone able to write the child
+tables can also rewrite the digest column, and the digest covers the rows only, not the section's
+level or reason. It closes the same-count content drift that the count alone could not see (finding
+`up2r-up-3`). A status-only section (chassis, baseboard, machine_id) and a section written before v3
+store NULL for both, are not verified, and read exactly as before.
+Only a full replace records the count and repairs a mismatched section: a device whose hash is
+unchanged sends only a hash, which leaves the rows alone, so this happens on a hardware change, an
+operator Sync now of the device record (`POST /api/v1/hardware/{id}/sync`; the fleet-wide route and the
+MCP `sync_hardware_software` tool re-send installed software only and do not repair a section), or the
+weekly full floor (at most 7 days); the pre-v3 fleet is therefore unverified
+for up to a week after upgrade. The wire format and the agent are unchanged. Migration 3 is a single
+additive `ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, ADD COLUMN IF
+NOT EXISTS content_digest TEXT NULL` (the digest column is folded into v3 because v3 had not shipped;
+the runner is gated on the recorded version only, so a development database that already recorded the
+earlier row-count-only v3 must be reset with `UPDATE public.schema_meta SET version = 2 WHERE store =
+'device_inventory_store';` and a server restart, or recreated). The rollback note above
+holds after migrations 2 and 3: an older server that runs against the migrated database writes NULL
+there, so the sections it writes are unverified until a v3 server next does a full replace for that
+device.
+
+> **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the `keep_rows_if_present_seen` constrained policy (a constrained answer that lists at least one install keeps its rows; one that lists none skips the device's whole installed-software report for the cycle, retried daily on backoff, and the stored rows stay), not the `drop_source` policy of `runtimes.python`. `hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.
+
+### 2026-11-04 — `installed_software`: a publisher on every row, and the `via:` origin label
+
+Every row of every `installed_software` source carries a non-empty `publisher`, so slot 3 of the
+row (hashed on both the v2 and the v3 path) is always populated. The wire layout has no extra
+slot and the parser gains no rule for it: the server parses and hashes slot 3 on both paths, so the
+mechanism is a value rule on the agent, one recognition rule in the server normaliser, and golden
+vectors on both sides.
+
+**The value rule.** A row's publisher is the vendor its source declares; when the source
+declares none it is the origin label `via:<ecosystem>`, where the ecosystem is the row's own
+`ecosystem` value (`via:unknown` when that is empty, never the bare `via:`). The fallback is applied in exactly one place, the collector loop in
+`make_installed_software_source` (`vendor_or_origin`, after each adapter has run and the row's
+`source` is stamped), not inside `installed_software_canonical_blob`. The blob builder hashes the
+publisher as given (a fixture entry with an empty publisher hashes an empty slot), so the fixture
+cross-pins (`kCrossPinHash` and the extended, tail-order and mixed-blob pins) are independent of
+the fallback.
+
+| Source (`source`) | Publisher | Fallback |
+|---|---|---|
+| `installed_apps.list_inventory`, rpm | package `VENDOR` tag, else `PACKAGER` (a person or a build-system address; kept only when no vendor is set) | `via:rpm` |
+| same, deb | `Maintainer` | `via:deb` |
+| same, pacman, apk | none: `pacman -Q` and `apk info -v` list no vendor and a second subprocess per package is not worth it | `via:pacman`, `via:apk` |
+| same, Windows | the Uninstall key's `Publisher` | `via:windows` |
+| same, macOS apps | the signing certificate's leaf common name | `via:macos` |
+| same, macOS installer receipts | none: a reverse-domain id is an identifier, not a vendor, and no heuristic turns one into the other | `via:macos_pkgutil` |
+| `pkg_inventory.packages` (Homebrew, Chocolatey), `pkg_inventory.store_packages` (snap, flatpak, Appx) | none: `pkg_inventory` starts no process by design | `via:brew`, `via:chocolatey`, `via:snap`, `via:flatpak`, `via:appx` |
+| `pkg_inventory.managers` (Homebrew presence row) | the constant `Homebrew` | n/a |
+| `pkg_inventory.managers` (Chocolatey and winget presence rows) | none: no constant vendor is declared for them | `via:chocolatey`, `via:winget` |
+| `windows_optional_features.list` | the constant `Microsoft` (DISM features are Windows components; the middleware table's `IBM` is the precedent) | n/a |
+| `msi_packages.list_inventory` | the product's `Publisher` | `via:msi` |
+| `runtimes.python`, Windows | the row's vendor column (the `PythonCore` registry tag), unescaped | `via:python` when the column is `-` |
+| `runtimes.python`, Linux | none: the Linux producer always emits `-` in the vendor column | `via:python` |
+| `runtimes.python`, macOS | none: the column is a `CFBundleIdentifier` reverse-domain id (`org.python.python`), an identifier and not a vendor, and no heuristic turns one into the other; the adapter ignores the column on macOS | `via:python` |
+| `middleware.ibm_mq` | `IBM`, from the product table | n/a |
+| `runtimes.dotnet` | the constant `Microsoft` (.NET is a Microsoft product; the adapter drops the row's vendor column, which is `-` on Linux and on the native macOS root) | n/a |
+| `runtimes.jvm` | the row's vendor column: the `release` file's self-reported `IMPLEMENTOR`, or on macOS, for a bundle with an openable `Contents` and no `release` file under `Contents/Home`, its `Info.plist` `JVMVendor` | `via:jvm` when the column is `-` (the home reports no vendor, or it is a Windows home known only by its registry tag) |
+
+The rpm `list_inventory` query format has ten columns, `%{VENDOR}` the last; the pinned argv
+literal in `docs/agent-spawn-sink-manifest.md` carries the same format, and `parse_rpm_inv_line`
+takes ten tokens. The `list` action has its own columns.
+
+**The server rule.** `normalize_vendor` returns the empty vendor when the RAW value starts with
+`kOriginLabelPrefix` (`via:`), as its first statement, before lower-casing or tokenising. The test
+is case-sensitive and exact: the agent writes the prefix in lower case, so a Windows publisher of
+`VIA:Acme` is a vendor and normalises as one, and a vendor that merely contains `via:` is not a
+label. A labelled title therefore keys like a vendorless one.
+The catalogue treats a label as no vendor in two more places: `total_publishers` excludes
+`publisher LIKE 'via:%'`, and the representative publisher of a title (the rollup statement and
+the single-device catalogue read) prefers a non-label value and falls back to the plain maximum
+only when every row of the group is labelled.
+
+**Keys of `title_dimension` and `curation_queue`.** Both are keyed on the raw
+`(raw_name, raw_publisher, ecosystem)` triple, so a title with no declared vendor is keyed under
+its `via:` label, not under an empty publisher, and a `via:<ecosystem>` triple has its own
+`title_dimension` row. A label normalises to no vendor, so a pack or curated alias with an empty
+raw publisher covers it (the shipped aliases all have one, and such a title resolves `pack` and is
+not queued); a title no alias covers is `unnormalized` and queued as an open item.
+
+**Hash.** The publisher is part of each row's hash. The agent's collector characterisation
+digests over the real capture samples include it, and the agent and the server pin the same
+labelled row to the same digests.
+
+### 2026-11-05 — per-management-group collection settings (server side)
+
+The server stores a collection settings document per management group
+(`SoftwareCollectionSettingsStore`, schema `software_collection_settings_store`, tables `settings` and
+`settings_history`) and resolves the document that applies to a device. The agent behaviour is a hard
+requirement on the settings push, below. Wire reference: `docs/user-manual/rest-api.md`, "Software
+collection settings". Settings are managed by fleet administrators: a write needs the global
+`ManagementGroup:Write` grant (the administrator role while RBAC enforcement is off), and reads take
+the standard `ManagementGroup:Read` gate; group-scoped delegation is not part of this build. This
+build sends no settings to agents.
+
+- **Document.** `interval_s` 3600 to 604800, an optional window in minutes past local midnight, a zone
+  (empty = the machine's own, else an IANA name checked against `pg_timezone_names` in the write
+  transaction; names under `posix/`, `right/` or `SystemV/` and the placeholder `Factory` are refused,
+  as an agent cannot resolve them), a boolean per collector (`installed_apps`, `middleware`, `msi_packages`,
+  `pkg_inventory`, `runtimes`, `windows_optional_features`) and a priority 0 to 1000. A window needs a
+  whole-day interval: the agent fires a window once per local day, so a 25 hour interval with a window
+  has no meaning. `installed_apps` cannot be turned off by a document. The roadmap's `evidence`
+  collector has no plugin in the tree, so it has no key.
+- **Resolution** (pure, `collection_settings_resolve.hpp`). The root group's document is the fleet
+  default layer and never a competing candidate: every device is a member of the root group and groups
+  created without a parent sit beside it at depth 0, so a competing root document would win every
+  creation-time tie against a top-level group. A branch is a group the device belongs to, not a
+  document: a membership group that is an ancestor of another membership group is dropped, so a
+  device in a group and in its descendant resolves through the descendant whatever the priorities.
+  Each remaining branch's winner is the nearest group (itself, then its ancestors, excluding root)
+  with a document; an ancestor's document therefore competes for a sibling branch that has none of
+  its own (a device in G1 and G2, both children of X, with a document on X and on G2, compares X
+  against G2). The branch winners are chosen between by priority (higher wins), depth (deeper
+  wins), group creation time (older wins), group id (smaller wins). The kill-switch snapshot is applied last and
+  always wins; the host route reads the all-OS layer only, and a degraded kill-switch read is a `503`,
+  never a document with collectors off. The per-OS withheld set belongs to the settings push, which
+  knows the target OS.
+- **Versions.** `document_version` is the SHA-256 of a fixed-order canonical text including priority
+  (so `expected_version` catches a concurrent priority-only edit); `effective_version` hashes the
+  resolved fields only (interval, window, zone, sorted switches with the overlay applied), with no priority,
+  source group or timestamps. Golden vectors are pinned in `test_collection_settings_resolve.cpp`.
+- **Read rule.** A stored row whose `plugins_json` does not parse, holds a non-boolean or an unknown key,
+  whose `version` is not 64 lowercase hex, or whose scalar fields fail the validator is `Corrupt` (a
+  `503` with no retry hint), never a default document. A
+  missing known collector key reads as that collector's fleet default (on), and the stored `version`
+  is returned as written.
+- **Writes.** Create is `INSERT ... ON CONFLICT DO NOTHING RETURNING`; replace is `SELECT ... FOR
+  UPDATE`, a version compare, then `UPDATE ... WHERE version = $n RETURNING`. A stale version is a
+  conflict (`409`), never last-writer-wins. A create is refused once 20,000 documents exist, the cap
+  the list read enforces. History keeps the newest 200 rows per group, trimmed by count in the write
+  transaction.
+- **Hard requirement on the settings push.** The agent must honour an interval of 1 hour to 7 days, run
+  a window only at a whole-day interval of 24 hours or more in whole days, apply the IANA zone, honour
+  the per-collector switch, and reject any setting it cannot honour, then report the effective version
+  it applied. Until the push lands the settings have no effect on any agent.
