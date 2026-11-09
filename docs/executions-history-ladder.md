@@ -355,7 +355,7 @@ status, exit code and a failure text (`error_detail`). For a command of a Forens
 text is reduced, when it is stored and again when the tracker reads it, to a bounded machine token
 (`^[a-z0-9_]{1,32}(:[a-z0-9_.-]{1,48}){1,3}$`, at most 96 bytes) or to the fixed `forensics_error`
 (`forensics_error_detail.hpp`); status and exit code are unchanged, and other plugins' text is not
-touched when it is stored or published, except that a NUL byte in it is replaced by U+FFFD (a text column cannot hold one) before it reaches any of the sinks above (the response store replaces a NUL in the stored response row at its own bind) (the transition event of a mixed execution is built from the persisted text and can carry the reduced form). The tracker's reads decide per execution, not per command: in an
+touched when it is stored or published, except that a NUL byte in it is replaced by U+FFFD (a text column cannot hold one) before it reaches any of the sinks above. The response store replaces a NUL in the stored response row at its own bind. (The transition event of a mixed execution is built from the persisted text and can carry the reduced form). The tracker's reads decide per execution, not per command: in an
 execution that ran at least one Forensics-tier command, every agent's failure text is reduced on read,
 including the text of an ordinary plugin's command in the same execution (an over-reduction that
 exposes nothing). The same pure function (`AgentServiceImpl::failure_text_for_sinks`), evaluated once per frame on each ingest path
