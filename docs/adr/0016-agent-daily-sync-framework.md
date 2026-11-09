@@ -1473,7 +1473,11 @@ polled when, in what state.
   `totals_omitted: "scope"`.
 - **Version range.** `version_min` / `version_max` resolve against the title's fleet-wide distinct
   versions under the catalogue comparator into a version set, for every caller; a title at the
-  2000-version read cap is refused. The set is a predicate only.
+  2000-version read cap is refused. The set is a predicate only. The distinct versions are read
+  LIVE (`installed_software` for a title, `software_components` for a component, 5 s bounded, the
+  name indexes), never from the hourly rollups: a rollup lacks a version first reported since its
+  last refresh, which would drop that version from the set and serve a live, exact-looking zero
+  for software that is installed.
 - **Schema v12.** `catalog_rollup.row_count` (constant default, metadata-only; the migration also
   sets the catalogue stamp back to `building` so no reader sees a zero row count beside a non-zero
   device count), the two component rollup tables, and `software_components_name_idx`. The index is

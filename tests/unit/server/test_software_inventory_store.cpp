@@ -6899,6 +6899,54 @@ TEST_CASE("v12: the lookup objects exist and the meta singleton is seeded buildi
     CHECK(meta->refreshed_at == 0); // never computed: "building"
 }
 
+TEST_CASE("migration v12 resets the catalogue freshness stamp to building over a live v11 database, and re-runs idempotently",
+          "[pg][software_inventory][lookup]") {
+    // Reproduce a v11-era schema: drop the v12 additions, mark the catalogue rollup fresh, rewind
+    // schema_meta to 11, reconstruct so v12 runs over live data; then rewind and reconstruct again
+    // to prove the migration text is idempotent.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    {
+        SoftwareInventoryStore s1{pool};
+        REQUIRE(s1.is_open());
+    }
+    const auto rewind = [&] {
+        REQUIRE(sql_ok(pool, "UPDATE public.schema_meta SET version = 11 "
+                             "WHERE store = 'software_inventory_store'"));
+    };
+    REQUIRE(sql_ok(pool, "DROP TABLE software_inventory_store.component_rollup"));
+    REQUIRE(sql_ok(pool, "DROP TABLE software_inventory_store.component_rollup_meta"));
+    REQUIRE(sql_ok(pool, "DROP INDEX software_inventory_store.software_components_name_idx"));
+    REQUIRE(sql_ok(pool, "ALTER TABLE software_inventory_store.catalog_rollup DROP COLUMN row_count"));
+    REQUIRE(sql_ok(pool, "UPDATE software_inventory_store.catalog_rollup_meta SET refreshed_at = 12345 "
+                         "WHERE id = 1"));
+    REQUIRE(sql_rows(pool, "SELECT refreshed_at FROM software_inventory_store.catalog_rollup_meta "
+                           "WHERE id = 1")[0][0] == "12345");
+    rewind();
+    {
+        SoftwareInventoryStore store{pool}; // v12 over the v11 shape
+        REQUIRE(store.is_open());
+        // Rows written before row_count existed carry 0, so the stamp is reset: a reader sees
+        // `building`, never installs = 0 beside a non-zero device count.
+        const auto meta = store.catalog_rollup_meta();
+        REQUIRE(meta.has_value());
+        CHECK(meta->refreshed_at == 0);
+        CHECK(sql_rows(pool, "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+                             "'software_inventory_store' AND table_name = 'catalog_rollup' AND "
+                             "column_name = 'row_count'")[0][0] == "1");
+        const auto cmeta = store.component_rollup_meta();
+        REQUIRE(cmeta.has_value());
+        CHECK(cmeta->refreshed_at == 0); // seeded building
+        CHECK(sql_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = "
+                             "'software_inventory_store' AND indexname = "
+                             "'software_components_name_idx'")[0][0] == "1");
+    }
+    rewind();
+    SoftwareInventoryStore again{pool}; // second run over an already-migrated database
+    CHECK(again.is_open());
+}
+
 TEST_CASE("refresh_component_rollup: grain 0 and 1 counts are exact, devices_unconfirmed counts non-current facets",
           "[pg][software_inventory][lookup]") {
     SWINV_SHARED(store, pool);
@@ -7113,25 +7161,59 @@ TEST_CASE("query_components: the name-driven plan reaches software_components_na
                   .find("software_components_name_idx") != std::string::npos);
 }
 
-TEST_CASE("component_versions: distinct versions of one component, capped at kCatalogRowCap",
+TEST_CASE("component_versions: LIVE distinct non-empty versions of one component, capped at kCatalogRowCap",
           "[pg][software_inventory][lookup]") {
     SWINV_SHARED(store, pool);
+    // Read straight from software_components: no rollup refresh is ever run in this case.
     REQUIRE(sql_ok(pool,
-                   "INSERT INTO software_inventory_store.component_rollup (kind, name, version, "
-                   "grain, instances, devices) SELECT 'jar', 'libfoo', 'v' || g, 0, 1, 1 FROM "
-                   "generate_series(1, 2100) g"));
+                   "INSERT INTO software_inventory_store.software_components (agent_id, kind, "
+                   "path_hash, path, name, version, row_hash, first_seen) SELECT 'dev-a', 'jar', "
+                   "'ph' || g, '/p' || g, 'libfoo', 'v' || g, 'rh', 1 FROM generate_series(1, 2100) g"));
     REQUIRE(sql_ok(pool,
-                   "INSERT INTO software_inventory_store.component_rollup (kind, name, version, "
-                   "grain, instances, devices) VALUES ('jar', 'libfoo', '', 1, 2100, 1), "
-                   "('so', 'libfoo', 'v1', 0, 1, 1), ('jar', 'other', 'x', 0, 1, 1)"));
+                   "INSERT INTO software_inventory_store.software_components (agent_id, kind, "
+                   "path_hash, path, name, version, row_hash, first_seen) VALUES "
+                   "('dev-b', 'jar', 'ph1', '/b', 'libfoo', 'v1', 'rh', 1), "
+                   "('dev-a', 'jar', 'phe', '/e', 'libfoo', '', 'rh', 1), "
+                   "('dev-a', 'so', 'ph1', '/s', 'libfoo', 'v1', 'rh', 1), "
+                   "('dev-a', 'jar', 'pho1', '/o1', 'other', '2.0', 'rh', 1), "
+                   "('dev-b', 'jar', 'ph2', '/o2', 'other', '1.0', 'rh', 1), "
+                   "('dev-c', 'jar', 'ph3', '/o3', 'other', '1.0', 'rh', 1), "
+                   "('dev-c', 'jar', 'ph4', '/o4', 'other', '', 'rh', 1)"));
     const auto capped = store.component_versions("jar", "libfoo");
     REQUIRE(capped.has_value());
     CHECK(capped->size() == static_cast<std::size_t>(kCatalogRowCap)); // never more
-    // Another kind and another component are separate; an empty kind spans kinds (distinct).
+    // Another kind is separate; an empty kind spans kinds (distinct). The shared version of two
+    // devices is one entry, and the empty version is never listed.
     REQUIRE(store.component_versions("so", "libfoo").has_value());
-    CHECK(store.component_versions("so", "libfoo")->size() == 1);
-    CHECK(store.component_versions("jar", "other")->size() == 1);
+    CHECK(*store.component_versions("so", "libfoo") == std::vector<std::string>{"v1"});
+    CHECK(*store.component_versions("jar", "other") == std::vector<std::string>{"1.0", "2.0"});
+    CHECK(*store.component_versions("", "other") == std::vector<std::string>{"1.0", "2.0"});
     CHECK(store.component_versions("jar", "").value().empty()); // no name: empty value
+    CHECK(store.component_versions("jar", "absent").value().empty());
+}
+
+TEST_CASE("installed_software_distinct_versions: LIVE distinct non-empty versions of one title, capped",
+          "[pg][software_inventory][lookup]") {
+    SWINV_SHARED(store, pool);
+    // Rows land with no catalogue refresh: a version-range lookup must still see all of them.
+    REQUIRE(sql_ok(pool,
+                   "INSERT INTO software_inventory_store.installed_software (agent_id, name, version, "
+                   "source) SELECT 'a' || g, 'bigtitle', 'v' || g, 'src.x' FROM generate_series(1, 2100) g"));
+    REQUIRE(sql_ok(pool,
+                   "INSERT INTO software_inventory_store.installed_software (agent_id, name, version, "
+                   "source) VALUES ('d1', 'git', '1.9', 'src.x'), ('d2', 'git', '1.10', 'src.x'), "
+                   "('d3', 'git', '1.9', 'src.x'), ('d4', 'git', '', 'src.x'), "
+                   "('d5', 'gitk', '7.7', 'src.x')"));
+    const auto git = store.installed_software_distinct_versions("git");
+    REQUIRE(git.has_value());
+    // Distinct (d1 and d3 share 1.9), the empty version excluded, another title excluded.
+    CHECK(std::set<std::string>(git->begin(), git->end()) == std::set<std::string>{"1.9", "1.10"});
+    CHECK(git->size() == 2);
+    const auto big = store.installed_software_distinct_versions("bigtitle");
+    REQUIRE(big.has_value());
+    CHECK(big->size() == static_cast<std::size_t>(kCatalogRowCap)); // never more
+    CHECK(store.installed_software_distinct_versions("").value().empty());
+    CHECK(store.installed_software_distinct_versions("absent").value().empty());
 }
 
 TEST_CASE("catalog_title_totals counts install ROWS and distinct devices; version-set totals count a device once",

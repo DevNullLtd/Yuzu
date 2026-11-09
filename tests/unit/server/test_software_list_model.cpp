@@ -10,7 +10,9 @@
 #include "software_list_model.hpp"
 
 #include <algorithm>
+#include <set>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <vector>
@@ -579,6 +581,83 @@ TEST_CASE("CSV: 22-column installs header; quoting; the components header", "[se
 
     const auto ccsv = components_csv({comp_row("libfoo", "a1", "01")}, facts);
     CHECK(ccsv.starts_with(std::string(kComponentsCsvHeader) + "\n"));
+    // The components route names its stamp apart from the installs route's last_confirmed_at.
+    CHECK(kComponentsCsvHeader.ends_with(",component_last_confirmed_at"));
+}
+
+TEST_CASE("component_row_json: the exact key set; 0 stamps are null", "[server][software_list_model]") {
+    auto r = comp_row("libfoo", "a1", "01");
+    r.last_confirmed_at = 0;
+    DeviceFacts facts;
+    auto j = component_row_json(r, facts);
+    std::set<std::string> keys;
+    for (const auto& [k, v] : j.items())
+        keys.insert(k);
+    CHECK(keys == std::set<std::string>{"agent_id", "hostname", "last_seen", "kind", "name", "version",
+                                        "version_source", "path", "anchor_app", "first_seen",
+                                        "status", "component_last_confirmed_at"});
+    CHECK(j["hostname"].is_null());
+    CHECK(j["last_seen"].is_null());
+    CHECK(j["component_last_confirmed_at"].is_null());
+    r.last_confirmed_at = 1700000500;
+    CHECK(component_row_json(r, facts)["component_last_confirmed_at"] == 1700000500);
+}
+
+TEST_CASE("totals_omitted reasons are named constants", "[server][software_list_model]") {
+    CHECK(kOmittedScope == "scope");
+    CHECK(kOmittedFilters == "filters");
+    CHECK(kOmittedBuilding == "building");
+    CHECK(totals_decision(false, SoftwareFleetQuery{}).omitted == kOmittedScope);
+    CHECK(totals_decision(true, SoftwareFleetQuery{}).omitted == kOmittedFilters);
+}
+
+TEST_CASE("load_device_facts: one roster read per page, only the page's devices, last polls from the store",
+          "[server][software_list_model]") {
+    int roster_reads = 0;
+    FactsReads io;
+    io.hostnames = [&] {
+        ++roster_reads;
+        return std::unordered_map<std::string, std::string>{
+            {"a1", "host-a1"}, {"a2", "host-a2"}, {"offline-9", "host-offline"}};
+    };
+    io.last_seen = [](const std::vector<std::string>& ids) {
+        std::unordered_map<std::string, std::int64_t> m;
+        for (const auto& id : ids)
+            if (id == "a1")
+                m[id] = 1700000100;
+        return std::optional(std::move(m));
+    };
+
+    const auto facts = load_device_facts(io, {"a1", "a2", "a3"});
+    REQUIRE(facts.has_value());
+    CHECK(roster_reads == 1);
+    CHECK(facts->hostname.size() == 2); // a3 is unknown; offline-9 is not on the page
+    CHECK(facts->hostname.at("a1") == "host-a1");
+    CHECK(facts->hostname.contains("a2"));
+    CHECK_FALSE(facts->hostname.contains("offline-9"));
+    CHECK(facts->last_seen.size() == 1);
+    CHECK(facts->last_seen.at("a1") == 1700000100);
+
+    // An empty page reads nothing at all.
+    roster_reads = 0;
+    const auto none = load_device_facts(io, {});
+    REQUIRE(none.has_value());
+    CHECK(roster_reads == 0);
+    CHECK(none->hostname.empty());
+
+    // No roster wired: hostnames stay unknown, the poll times are still served.
+    FactsReads bare;
+    bare.last_seen = io.last_seen;
+    const auto no_roster = load_device_facts(bare, {"a1"});
+    REQUIRE(no_roster.has_value());
+    CHECK(no_roster->hostname.empty());
+    CHECK(no_roster->last_seen.size() == 1);
+
+    // A degraded last-poll read is a failure, never a blank page of facts.
+    FactsReads degraded;
+    degraded.last_seen = [](const std::vector<std::string>&)
+        -> std::optional<std::unordered_map<std::string, std::int64_t>> { return std::nullopt; };
+    CHECK_FALSE(load_device_facts(degraded, {"a1"}).has_value());
 }
 
 TEST_CASE("parse_components_params: rules, limits and the export cap", "[server][software_list_model]") {

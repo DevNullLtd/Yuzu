@@ -36,7 +36,6 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp"
 #include "authz_gates.hpp"
-#include "device_api.hpp"
 #include "device_ci_kinds.hpp"
 #include "hardware_list_model.hpp"
 #include "openapi_spec_access.hpp"
@@ -108,17 +107,6 @@ yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
         throw std::runtime_error("swinv template: store failed to migrate");
 }};
 
-// The hostname source the lookup rows read (one roster read per page).
-class FakeDeviceApi : public DeviceApi {
-public:
-    std::vector<DeviceListRow> rows;
-    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override { return rows; }
-    [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
-    lookup_device(const std::string&) const override {
-        return std::optional<DeviceDetail>{std::nullopt};
-    }
-};
-
 struct AuditRecord {
     std::string action;
     std::string result;
@@ -157,7 +145,10 @@ struct InvHarness {
     std::vector<AuditRecord> audit_log;
 
     yuzu::MetricsRegistry metrics;
-    std::shared_ptr<FakeDeviceApi> device_api = std::make_shared<FakeDeviceApi>();
+    // The device table's roster the lookup rows' hostname reads: agent_id -> hostname, one read
+    // per page.
+    std::unordered_map<std::string, std::string> hostnames;
+    int hostname_reads{0};
     RestApiV1 api;
 
     explicit InvHarness(SoftwareInventoryStore* store, bool wire_fleet_read_fn = true) {
@@ -197,6 +188,10 @@ struct InvHarness {
             };
         }
 
+        api.set_hostnames_fn([this]() -> std::unordered_map<std::string, std::string> {
+            ++hostname_reads;
+            return hostnames;
+        });
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
@@ -218,7 +213,7 @@ struct InvHarness {
                             /*stream_budget=*/nullptr, /*exec_visible_fn=*/{},
                             /*list_read_fn=*/{}, std::move(fleet_read_fn),
                             /*agents_fn=*/{}, /*response_visible_set_fn=*/{}, /*verify_api=*/{},
-                            device_api, /*dex_api=*/{});
+                            /*device_api=*/{}, /*dex_api=*/{});
     }
 
     bool has_audit(const std::string& result) const {
@@ -1735,14 +1730,21 @@ TEST_CASE("REST inventory/software: lookup rows carry hostname, last_seen, statu
     REQUIRE(store.is_open());
     seed_v3(store, "dev-a", V3Status::kFull, {lookup_entry("git", "2.1", "amd64")});
     InvHarness h{&store};
-    h.device_api->rows.push_back(DeviceListRow{.agent_id = "dev-a", .hostname = "host-a"});
+    h.hostnames["dev-a"] = "host-a";
+    h.hostnames["dev-elsewhere"] = "host-elsewhere"; // on the roster, not on this page
 
     const auto body = get_lookup(h, "?name=git");
     const auto& rows = body.at("data").at("software");
     REQUIRE(rows.size() == 1);
+    CHECK(h.hostname_reads == 1); // one roster read per page
     const auto& r = rows[0];
     CHECK(r["hostname"] == "host-a");
+    // last_seen is exactly the store's own figure for the device's installed_software poll.
+    const auto seen = store.source_last_seen_bulk("installed_software", {"dev-a"});
+    REQUIRE(seen.has_value());
+    REQUIRE(seen->contains("dev-a"));
     CHECK(r["last_seen"].is_number());
+    CHECK(r["last_seen"].get<std::int64_t>() == seen->at("dev-a"));
     CHECK(r["status"] == "current");
     CHECK(r["last_confirmed_at"].is_number());
     CHECK(r["install_type"] == "package_manager");
@@ -1821,7 +1823,7 @@ TEST_CASE("REST inventory/software: match=prefix and contains filter; exact is u
     CHECK(get_lookup(h, "?name=git&match=regex", 400).contains("error"));
 }
 
-TEST_CASE("REST inventory/software: version_min/version_max resolve through the title's versions; building before the first refresh",
+TEST_CASE("REST inventory/software: version_min/version_max resolve through the title's live versions, with or without a catalogue refresh",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1833,13 +1835,6 @@ TEST_CASE("REST inventory/software: version_min/version_max resolve through the 
     seed(store, "dev-c", {{"git", "2.0-rc1", "", ""}});
     seed(store, "dev-d", {{"git", "2.0", "", ""}});
     InvHarness h{&store};
-
-    // No catalogue refresh yet: a range cannot be resolved, so it is a retryable 503.
-    auto early = h.sink.Get("/api/v1/inventory/software?name=git&version_min=1.9");
-    REQUIRE(early);
-    CHECK(early->status == 503);
-
-    REQUIRE(store.refresh_catalog_rollup());
     auto agents = [&](const std::string& query) {
         std::set<std::string> out;
         const auto body = get_lookup(h, query);
@@ -1847,6 +1842,18 @@ TEST_CASE("REST inventory/software: version_min/version_max resolve through the 
             out.insert(r["agent_id"].get<std::string>());
         return out;
     };
+
+    // No catalogue refresh yet: the range resolves against the live versions, so it serves rows
+    // (and live totals) rather than a building 503.
+    REQUIRE(store.catalog_rollup_meta()->refreshed_at == 0);
+    CHECK(agents("?name=git&version_min=2.0") == std::set<std::string>{"dev-d"});
+    const auto early = get_lookup(h, "?name=git&version_min=1.9&version_max=1.10").at("data");
+    REQUIRE(early.at("totals").is_object());
+    CHECK(early.at("totals").at("installs") == 2);
+    CHECK(early.at("totals").at("devices") == 2);
+    CHECK(early.at("totals").at("as_of").is_null());
+
+    REQUIRE(store.refresh_catalog_rollup());
     // 1.9 < 1.10 (numeric), 2.0-rc1 < 2.0; bounds are inclusive.
     CHECK(agents("?name=git&version_min=1.9&version_max=2.0-rc1") ==
           std::set<std::string>{"dev-a", "dev-b", "dev-c"});
@@ -1855,6 +1862,55 @@ TEST_CASE("REST inventory/software: version_min/version_max resolve through the 
     CHECK(agents("?name=git&version_min=5") == std::set<std::string>{}); // an empty range is empty, not an error
     CHECK(get_lookup(h, "?version_min=1.0", 400).contains("error"));
     CHECK(get_lookup(h, "?name=git&match=prefix&version_max=1.0", 400).contains("error"));
+}
+
+TEST_CASE("REST inventory/software: a range sees a version first reported after the last refresh (never a false zero)",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"git", "1.0", "", ""}});
+    REQUIRE(store.refresh_catalog_rollup());
+    seed(store, "dev-b", {{"git", "2.5", "", ""}}); // after the refresh: the hourly rollups lack 2.5
+
+    InvHarness h{&store};
+    const auto exact = get_lookup(h, "?name=git&version=2.5").at("data");
+    CHECK(exact.at("totals").at("devices") == 1);
+    const auto range = get_lookup(h, "?name=git&version_min=2.0").at("data");
+    REQUIRE(range.at("software").size() == 1);
+    CHECK(range.at("software")[0]["agent_id"] == "dev-b");
+    REQUIRE(range.at("totals").is_object());
+    CHECK(range.at("totals").at("installs") == 1);
+    CHECK(range.at("totals").at("devices") == 1);
+    CHECK(range.at("totals").at("as_of").is_null()); // live and exact, as the manual states
+    // An open lower bound with the upper bound below the new version still excludes it.
+    CHECK(get_lookup(h, "?name=git&version_max=2.0").at("data").at("software").size() == 1);
+}
+
+TEST_CASE("REST inventory/software: the audit target carries the lookup filters",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"git", "1.9", "", ""}});
+    InvHarness h{&store};
+    const std::vector<std::pair<std::string, std::string>> cases{
+        {"?name=git&match=prefix", "name=git;match=prefix"},
+        {"?name=git&status=current", "name=git;status=current"},
+        {"?name=git&version_min=1.0&version_max=2.0", "name=git;version_min=1.0;version_max=2.0"},
+        {"?name=git&match=prefix&status=disabled", "name=git;match=prefix;status=disabled"},
+    };
+    for (const auto& [query, target] : cases) {
+        CAPTURE(query);
+        h.audit_log.clear();
+        get_lookup(h, query);
+        REQUIRE_FALSE(h.audit_log.empty());
+        CHECK(h.audit_log.back().target_id == target);
+    }
 }
 
 TEST_CASE("REST inventory/software: totals - exact name, global admission; install rows vs distinct devices",

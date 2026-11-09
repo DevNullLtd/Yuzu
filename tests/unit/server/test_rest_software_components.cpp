@@ -10,12 +10,12 @@
 
 #include "rest_api_v1.hpp"
 #include "authz_gates.hpp"
-#include "device_api.hpp"
 #include "inventory_blob_v3.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "software_inventory_store.hpp"
+#include "software_list_model.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -30,8 +30,10 @@
 #include "../test_helpers.hpp"
 
 #include <expected>
+#include <algorithm>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -50,16 +52,6 @@ yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
         throw std::runtime_error("swinv template: store failed to migrate");
 }};
 
-class FakeDeviceApi : public DeviceApi {
-public:
-    std::vector<DeviceListRow> rows;
-    [[nodiscard]] std::vector<DeviceListRow> list_devices() const override { return rows; }
-    [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
-    lookup_device(const std::string&) const override {
-        return std::optional<DeviceDetail>{std::nullopt};
-    }
-};
-
 struct AuditRecord {
     std::string action;
     std::string result;
@@ -68,14 +60,16 @@ struct AuditRecord {
 };
 
 struct CompHarness {
+    yuzu::MetricsRegistry metrics;
+    RestApiV1 api; // the route owner is declared BEFORE the sink that holds handlers capturing it
     yuzu::server::test::TestRouteSink sink;
     bool fleet_admitted{true};
     std::optional<std::unordered_set<std::string>> fleet_scope; // nullopt = unfiltered (AdmitAll)
     std::vector<AuditRecord> audit_log;
     int gate_calls{0};
-    yuzu::MetricsRegistry metrics;
-    std::shared_ptr<FakeDeviceApi> device_api = std::make_shared<FakeDeviceApi>();
-    RestApiV1 api;
+    // The device table's roster the hostname field reads: agent_id -> hostname, one read per page.
+    std::unordered_map<std::string, std::string> hostnames;
+    int hostname_reads{0};
 
     explicit CompHarness(SoftwareInventoryStore* store, bool wire_fleet_read_fn = true) {
         auto auth_fn = [](const httplib::Request&,
@@ -108,6 +102,10 @@ struct CompHarness {
                 return {true, fleet_scope};
             };
         }
+        api.set_hostnames_fn([this]() -> std::unordered_map<std::string, std::string> {
+            ++hostname_reads;
+            return hostnames;
+        });
         api.register_routes(
             sink, auth_fn, perm_fn, audit_fn,
             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
@@ -128,8 +126,8 @@ struct CompHarness {
             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
             /*auth_db=*/nullptr, /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
             /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, std::move(fleet_read_fn),
-            /*agents_fn=*/{}, /*response_visible_set_fn=*/{}, /*verify_api=*/{}, device_api,
-            /*dex_api=*/{});
+            /*agents_fn=*/{}, /*response_visible_set_fn=*/{}, /*verify_api=*/{},
+            /*device_api=*/{}, /*dex_api=*/{});
     }
 
     std::size_t audits(const std::string& action, const std::string& result,
@@ -197,6 +195,14 @@ nlohmann::json get_json(CompHarness& h, const std::string& query, int expect_sta
     return nlohmann::json::parse(res->body, nullptr, false);
 }
 
+// "<agent>|<path>" of every row of a page: the exact set a predicate selected.
+std::set<std::string> row_keys(const nlohmann::json& body) {
+    std::set<std::string> out;
+    for (const auto& r : body.at("data").at("components"))
+        out.insert(r.at("agent_id").get<std::string>() + "|" + r.at("path").get<std::string>());
+    return out;
+}
+
 } // namespace
 
 // ── No-PG branches ───────────────────────────────────────────────────────────
@@ -260,7 +266,7 @@ TEST_CASE("REST components: the path and its typed body are in the OpenAPI spec"
 
 // ── PG-backed ────────────────────────────────────────────────────────────────
 
-TEST_CASE("REST components: rows carry hostname, last_seen, status and last_confirmed_at",
+TEST_CASE("REST components: rows carry hostname, last_seen, status and component_last_confirmed_at",
           "[pg][rest][inventory_components]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -270,20 +276,121 @@ TEST_CASE("REST components: rows carry hostname, last_seen, status and last_conf
     seed_components(store, "dev-a", {comp("libfoo", "/opt/a/libfoo.jar", "1.0")});
 
     CompHarness h{&store};
-    h.device_api->rows.push_back(DeviceListRow{.agent_id = "dev-a", .hostname = "host-a"});
+    h.hostnames["dev-a"] = "host-a";
+    h.hostnames["dev-elsewhere"] = "host-elsewhere"; // on the roster, not on this page
     const auto body = get_json(h, "?name=libfoo");
     const auto& rows = body.at("data").at("components");
     REQUIRE(rows.size() == 1);
+    CHECK(h.hostname_reads == 1); // one roster read per page
     CHECK(rows[0]["agent_id"] == "dev-a");
     CHECK(rows[0]["hostname"] == "host-a");
     CHECK(rows[0]["status"] == "current");
-    CHECK(rows[0]["last_confirmed_at"].is_number()); // the full section confirmed it
+    CHECK(rows[0]["component_last_confirmed_at"].is_number()); // the full section confirmed it
+    CHECK_FALSE(rows[0].contains("last_confirmed_at")); // the installs route's name, not this one's
     CHECK(rows[0]["kind"] == "jar");
+    CHECK(rows[0]["name"] == "libfoo");
     CHECK(rows[0]["version"] == "1.0");
+    CHECK(rows[0]["version_source"] == "manifest");
     CHECK(rows[0]["path"] == "/opt/a/libfoo.jar");
     CHECK(rows[0]["anchor_app"] == "AcmeApp");
-    CHECK(rows[0].contains("last_seen")); // null here: no installed_software report was accepted
+    CHECK(rows[0]["first_seen"].is_number());
+    // The v3 apply path stamps the device's installed_software poll, and the row reports exactly
+    // the store's own figure for it.
+    const auto seen = store.source_last_seen_bulk("installed_software", {"dev-a"});
+    REQUIRE(seen.has_value());
+    REQUIRE(seen->contains("dev-a"));
+    CHECK(rows[0]["last_seen"].is_number());
+    CHECK(rows[0]["last_seen"].get<std::int64_t>() == seen->at("dev-a"));
     CHECK(h.audits("inventory.components.view", "success", "rows=1") == 1);
+    // The audit target names the component lookup.
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.front().target_id == "components:name=libfoo");
+}
+
+TEST_CASE("REST components: the CSV export carries all 12 cells of a row and a full-width truncation trailer",
+          "[pg][rest][inventory_components][export]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_components(store, "dev-a",
+                    {comp("libfoo", "/opt/a/libfoo.jar", "1.0"), comp("libfoo", "/opt/b/libfoo.jar", "1.0")});
+
+    CompHarness h{&store};
+    h.hostnames["dev-a"] = "host-a";
+    auto whole = h.sink.Get(std::string(kPath) + "?format=csv");
+    REQUIRE(whole);
+    REQUIRE(whole->status == 200);
+    CHECK(whole->body.starts_with(std::string(software_list::kComponentsCsvHeader) + "\n"));
+    const auto first_nl = whole->body.find('\n');
+    const auto second_nl = whole->body.find('\n', first_nl + 1);
+    REQUIRE(second_nl != std::string::npos);
+    const std::string record = whole->body.substr(first_nl + 1, second_nl - first_nl - 1);
+    std::vector<std::string> cells;
+    for (std::size_t from = 0;;) {
+        const auto comma = record.find(',', from);
+        cells.push_back(record.substr(from, comma == std::string::npos ? comma : comma - from));
+        if (comma == std::string::npos)
+            break;
+        from = comma + 1;
+    }
+    REQUIRE(cells.size() == software_list::kComponentsCsvColumns);
+    CHECK(cells[0] == "dev-a");
+    CHECK(cells[1] == "host-a");
+    for (std::size_t i = 0; i < cells.size(); ++i) {
+        CAPTURE(i);
+        CHECK_FALSE(cells[i].empty()); // every value of this fully-populated row is present
+    }
+    CHECK(cells[3] == "jar");
+    CHECK(cells[4] == "libfoo");
+    CHECK(cells[6] == "manifest");
+    CHECK(cells[10] == "current");
+
+    // A capped page ends with a trailer record as wide as the header.
+    auto cut = h.sink.Get(std::string(kPath) + "?format=csv&limit=1");
+    REQUIRE(cut);
+    CHECK(cut->get_header_value("X-Result-Truncated-By-Cap") == "true");
+    CHECK(cut->body.ends_with("# result_truncated_by_cap cause=row_cap" +
+                              std::string(software_list::kComponentsCsvColumns - 1, ',') +
+                              "\r\n"));
+}
+
+TEST_CASE("REST components: q, kind, name, agent_id and status predicates each select an exact row set",
+          "[pg][rest][inventory_components]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    auto widget = comp("zzz", "/srv/special/zzz", "3.0");
+    widget.anchor_app = "WidgetSuite";
+    auto bar = comp("libbar", "/usr/lib/libbar.so", "1.0", "so");
+    bar.anchor_app = "OtherApp";
+    seed_components(store, "dev-a", {comp("libfoo", "/opt/a/libfoo.jar", "1.0"), bar});
+    seed_components(store, "dev-b", {comp("libfoo", "/opt/b/libfoo.jar", "1.0"), widget});
+    seed_components(store, "dev-c", {comp("libfoo", "/lib/libfoo.so", "1.0", "so")});
+    set_facet_status(store, "dev-c", V3Status::kDisabled);
+
+    CompHarness h{&store};
+    const std::set<std::string> everything{"dev-a|/opt/a/libfoo.jar", "dev-a|/usr/lib/libbar.so",
+                                           "dev-b|/opt/b/libfoo.jar", "dev-b|/srv/special/zzz",
+                                           "dev-c|/lib/libfoo.so"};
+    CHECK(row_keys(get_json(h, "")) == everything); // the default page includes the disabled row
+    CHECK(row_keys(get_json(h, "?q=special")) ==
+          std::set<std::string>{"dev-b|/srv/special/zzz"}); // path
+    CHECK(row_keys(get_json(h, "?q=widgetsuite")) ==
+          std::set<std::string>{"dev-b|/srv/special/zzz"}); // anchor_app, case-insensitive
+    CHECK(row_keys(get_json(h, "?q=libbar")) ==
+          std::set<std::string>{"dev-a|/usr/lib/libbar.so"}); // name
+    CHECK(row_keys(get_json(h, "?kind=so")) ==
+          std::set<std::string>{"dev-a|/usr/lib/libbar.so", "dev-c|/lib/libfoo.so"});
+    CHECK(row_keys(get_json(h, "?name=libfoo&kind=jar")) ==
+          std::set<std::string>{"dev-a|/opt/a/libfoo.jar", "dev-b|/opt/b/libfoo.jar"});
+    CHECK(row_keys(get_json(h, "?agent_id=dev-a")) ==
+          std::set<std::string>{"dev-a|/opt/a/libfoo.jar", "dev-a|/usr/lib/libbar.so"});
+    CHECK(row_keys(get_json(h, "?status=disabled")) ==
+          std::set<std::string>{"dev-c|/lib/libfoo.so"});
 }
 
 TEST_CASE("REST components: the scope confines every row and an out-of-scope agent_id is denied",
@@ -417,6 +524,36 @@ TEST_CASE("REST components: a version range resolves and its totals are exact (a
 
     // The resolved set never appears in the response.
     CHECK(body.dump().find("version_min") == std::string::npos);
+}
+
+TEST_CASE("REST components: a range sees a version first reported after the last refresh, and works before any refresh",
+          "[pg][rest][inventory_components]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_components(store, "dev-a", {comp("libfoo", "/a", "1.0")});
+
+    CompHarness h{&store};
+    // Before the first rollup refresh a range is live: rows and totals, never a building 503.
+    const auto early = get_json(h, "?name=libfoo&kind=jar&version_max=1.5");
+    REQUIRE(early.at("data").at("totals").is_object());
+    CHECK(early.at("data").at("totals").at("instances") == 1);
+    CHECK(early.at("data").at("totals").at("as_of").is_null());
+
+    REQUIRE(store.refresh_component_rollup());
+    seed_components(store, "dev-b", {comp("libfoo", "/b", "2.5")}); // after the refresh
+    const auto late = get_json(h, "?name=libfoo&kind=jar&version_min=2.0");
+    CHECK(row_keys(late) == std::set<std::string>{"dev-b|/b"});
+    const auto& totals = late.at("data").at("totals");
+    REQUIRE(totals.is_object());
+    CHECK(totals.at("instances") == 1);
+    CHECK(totals.at("devices") == 1);
+    CHECK(totals.at("as_of").is_null()); // live: the figure is exact, not a rollup epoch
+    // And the audit target records the range inputs, not the resolved set.
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().target_id == "components:name=libfoo;kind=jar;version_min=2.0");
 }
 
 TEST_CASE("REST components: a version range without name is a 400; a bare exact version is not",

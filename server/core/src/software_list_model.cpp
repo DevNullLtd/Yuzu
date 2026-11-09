@@ -1,7 +1,6 @@
 #include "software_list_model.hpp"
 
 #include "data_export.hpp"
-#include "device_api.hpp"
 #include "list_keyset.hpp"
 #include "model_param_helpers.hpp"
 #include "software_catalog_rules.hpp"
@@ -304,11 +303,11 @@ std::optional<DeviceFacts> load_device_facts(const FactsReads& io, const std::ve
             return std::nullopt;
         f.last_seen = std::move(*seen);
     }
-    if (io.device_api) {
+    if (io.hostnames) {
         const std::unordered_set<std::string> want(ids.begin(), ids.end());
-        for (auto& d : io.device_api->list_devices_basic()) // hostnames only: no health read
-            if (want.contains(d.agent_id))
-                f.hostname.emplace(std::move(d.agent_id), std::move(d.hostname));
+        for (auto& [id, host] : io.hostnames())
+            if (want.contains(id))
+                f.hostname.emplace(id, std::move(host));
     }
     return f;
 }
@@ -317,19 +316,21 @@ std::optional<DeviceFacts> load_device_facts(const FactsReads& io, const std::ve
 
 TotalsDecision totals_decision(bool admit_all, const SoftwareFleetQuery& q) {
     if (!admit_all)
-        return {false, "scope"};
+        return {false, kOmittedScope};
     const bool exact_name = !q.name.empty() && q.match == NameMatch::kExact;
     const bool other = !q.agent_id.empty() || !q.q.empty() || !q.status.empty() ||
                        !q.ecosystem.empty() || !q.source.empty() || !q.kind.empty();
-    return exact_name && !other ? TotalsDecision{true, {}} : TotalsDecision{false, "filters"};
+    return exact_name && !other ? TotalsDecision{true, {}}
+                                : TotalsDecision{false, kOmittedFilters};
 }
 
 TotalsDecision totals_decision(bool admit_all, const SoftwareComponentQuery& q) {
     if (!admit_all)
-        return {false, "scope"};
+        return {false, kOmittedScope};
     const bool exact_name = !q.name.empty() && q.match == NameMatch::kExact;
     const bool other = !q.agent_id.empty() || !q.q.empty() || !q.status.empty();
-    return exact_name && !other ? TotalsDecision{true, {}} : TotalsDecision{false, "filters"};
+    return exact_name && !other ? TotalsDecision{true, {}}
+                                : TotalsDecision{false, kOmittedFilters};
 }
 
 TotalsOutcome read_application_totals(const TotalsReads& io, const SoftwareFleetQuery& q) {
@@ -467,7 +468,7 @@ nlohmann::json component_row_json(const SoftwareComponentRow& r, const DeviceFac
         {"anchor_app", r.anchor_app},
         {"first_seen", r.first_seen},
         {"status", std::string(derive_status(r.facet_status, r.facet_enabled))},
-        {"last_confirmed_at", epoch_or_null(r.last_confirmed_at)},
+        {"component_last_confirmed_at", epoch_or_null(r.last_confirmed_at)},
     };
 }
 

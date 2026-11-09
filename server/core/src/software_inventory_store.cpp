@@ -3499,6 +3499,40 @@ SoftwareInventoryStore::query_components(const SoftwareComponentQuery& q) {
     return bounded_query(pool_, metrics_, "query_components", samplers, sql, params, parse);
 }
 
+namespace {
+
+// The one-column distinct-version read both version-range resolvers share.
+std::vector<std::string> first_column(const pg::PgResult& res) {
+    std::vector<std::string> out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
+    return out;
+}
+
+} // namespace
+
+std::optional<std::vector<std::string>>
+SoftwareInventoryStore::installed_software_distinct_versions(std::string_view name) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: installed_software_distinct_versions degraded — "
+                         "store not open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (name.empty())
+        return std::vector<std::string>{};
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "installed_software_distinct_versions", samplers,
+                         "SELECT DISTINCT version FROM software_inventory_store.installed_software "
+                         "WHERE name = $1 AND version <> '' ORDER BY version LIMIT " +
+                             std::to_string(kCatalogRowCap),
+                         std::vector<std::string>{std::string(name)}, first_column);
+}
+
 std::optional<std::vector<std::string>>
 SoftwareInventoryStore::component_versions(std::string_view kind, std::string_view name) {
     if (!open_) {
@@ -3511,8 +3545,8 @@ SoftwareInventoryStore::component_versions(std::string_view kind, std::string_vi
     }
     if (name.empty())
         return std::vector<std::string>{};
-    std::string sql = "SELECT DISTINCT version FROM software_inventory_store.component_rollup "
-                      "WHERE name = $1 AND grain = 0 AND version <> ''";
+    std::string sql = "SELECT DISTINCT version FROM software_inventory_store.software_components "
+                      "WHERE name = $1 AND version <> ''";
     std::vector<std::string> params{std::string(name)};
     if (!kind.empty()) {
         sql += " AND kind = $2";
@@ -3521,14 +3555,7 @@ SoftwareInventoryStore::component_versions(std::string_view kind, std::string_vi
     sql += " ORDER BY version LIMIT " + std::to_string(kCatalogRowCap);
     static SiteSamplers samplers;
     return bounded_query(pool_, metrics_, "component_versions", samplers, sql, params,
-                         [](const pg::PgResult& res) {
-                             std::vector<std::string> out;
-                             const int n = PQntuples(res.get());
-                             out.reserve(static_cast<std::size_t>(n));
-                             for (int i = 0; i < n; ++i)
-                                 out.emplace_back(PQgetvalue(res.get(), i, 0));
-                             return out;
-                         });
+                         first_column);
 }
 
 std::optional<SoftwareTotals> SoftwareInventoryStore::catalog_title_totals(std::string_view name) {

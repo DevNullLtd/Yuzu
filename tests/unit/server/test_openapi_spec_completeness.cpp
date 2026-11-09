@@ -53,6 +53,7 @@
 #include "settings_model.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_deployment_store.hpp"
+#include "software_list_model.hpp" // component_row_json: the serialiser the components row schema mirrors
 #include "pg/pg_pool.hpp" // an unparseable-conninfo pool backs the unopened stand-in stores
 #include "test_route_sink.hpp"
 
@@ -1105,6 +1106,36 @@ TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are 
     // function the test below exercises on a synthetic template, where the exact bound holds).
     const auto& built = yuzu::server::openapi_spec_with_guides_json();
     CHECK(built.capacity() - built.size() < built.size() / 2);
+}
+
+TEST_CASE("openapi_spec_json(): the components lookup row is typed and its keys are exactly component_row_json's",
+          "[openapi][software]") {
+    const json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/inventory/software/components"));
+    const auto& data = spec["paths"]["/inventory/software/components"]["get"]["responses"]["200"]
+                           ["content"]["application/json"]["schema"]["properties"]["data"];
+    const auto& item = data["properties"]["components"]["items"];
+    REQUIRE(item.contains("properties")); // an untyped {"type":"object"} row would fail here
+    std::set<std::string> documented;
+    for (const auto& [k, v] : item["properties"].items())
+        documented.insert(k);
+    std::set<std::string> required;
+    for (const auto& k : item["required"])
+        required.insert(k.get<std::string>());
+    std::set<std::string> served;
+    for (const auto& [k, v] : yuzu::server::software_list::component_row_json(
+                                  yuzu::server::SoftwareComponentRow{}, {})
+                                  .items())
+        served.insert(k);
+    CHECK(documented == served);
+    CHECK(required == served); // the serialiser emits every key on every row
+    // The components route's stamp is named apart from the installs route's last_confirmed_at.
+    CHECK(documented.contains("component_last_confirmed_at"));
+    CHECK_FALSE(documented.contains("last_confirmed_at"));
+    CHECK(item["properties"]["status"]["enum"] == json::array({"current", "unconfirmed", "disabled"}));
+    CHECK(item["properties"]["hostname"]["nullable"] == true);
+    CHECK(item["properties"]["last_seen"]["nullable"] == true);
 }
 
 TEST_CASE("expand_ecosystem_tokens(): the output is allocated once at its final size",

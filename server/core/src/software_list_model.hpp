@@ -26,6 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -35,10 +36,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
-namespace yuzu::server {
-class DeviceApi;
-}
 
 namespace yuzu::server::software_list {
 
@@ -53,16 +50,28 @@ inline constexpr std::string_view kListCsvHeader =
     "hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,"
     "instance_key";
 inline constexpr std::size_t kListCsvColumns = 22;
+static_assert(static_cast<std::size_t>(std::ranges::count(kListCsvHeader, ',')) + 1 ==
+                  kListCsvColumns,
+              "kListCsvColumns must equal the number of columns in kListCsvHeader");
 
 inline constexpr std::string_view kComponentsCsvHeader =
     "agent_id,hostname,last_seen,kind,name,version,version_source,path,anchor_app,first_seen,"
-    "status,last_confirmed_at";
+    "status,component_last_confirmed_at";
 inline constexpr std::size_t kComponentsCsvColumns = 12;
+static_assert(static_cast<std::size_t>(std::ranges::count(kComponentsCsvHeader, ',')) + 1 ==
+                  kComponentsCsvColumns,
+              "kComponentsCsvColumns must equal the number of columns in kComponentsCsvHeader");
 
 /// The refusal for a title whose distinct versions fill the read cap (wording-neutral: it names
 /// no title and no count).
 inline constexpr std::string_view kRangeNotResolvable =
     "version range not resolvable for this title; use version=";
+
+/// The `totals_omitted` reasons, all three in one place. Scope and filters are decided by
+/// totals_decision; building is the rollup-served read that has no computed figure yet.
+inline constexpr std::string_view kOmittedScope = "scope";
+inline constexpr std::string_view kOmittedFilters = "filters";
+inline constexpr std::string_view kOmittedBuilding = "building";
 
 // ── Status ───────────────────────────────────────────────────────────────────
 
@@ -174,7 +183,9 @@ struct FactsReads {
     std::function<std::optional<std::unordered_map<std::string, std::int64_t>>(
         const std::vector<std::string>&)>
         last_seen;
-    const DeviceApi* device_api{nullptr}; ///< null = no registry wired (hostnames stay unknown)
+    /// agent_id -> hostname: the device table's roster (the one the UI device table reads, offline
+    /// devices included). One call per page. Empty function = no roster wired (hostnames unknown).
+    std::function<std::unordered_map<std::string, std::string>()> hostnames;
 };
 
 /// The distinct agent ids of a page, in first-seen order.
@@ -188,9 +199,8 @@ template <class Row>
     return out;
 }
 
-/// Hostnames from ONE roster read per page (list_devices_basic, the crypto precedent) and last
-/// polls from one bulk store read. nullopt = the store read degraded (503, never a blank).
-/// Empty `ids` -> empty facts, no read.
+/// Hostnames from ONE roster read per page and last polls from one bulk store read. nullopt = the
+/// store read degraded (503, never a blank). Empty `ids` -> empty facts, no read.
 [[nodiscard]] std::optional<DeviceFacts> load_device_facts(const FactsReads& io,
                                                            const std::vector<std::string>& ids);
 
@@ -198,7 +208,7 @@ template <class Row>
 
 struct TotalsDecision {
     bool serve{false};
-    std::string_view omitted; ///< "scope" | "filters" when !serve
+    std::string_view omitted; ///< kOmittedScope | kOmittedFilters when !serve
 };
 
 /// `admit_all` is the gate's decision == ListReadDecision::AdmitAll. See the file banner.
@@ -234,7 +244,7 @@ struct TotalsOutcome {
 
 // ── JSON / CSV ───────────────────────────────────────────────────────────────
 
-/// device_row_json fields (unchanged) + hostname (null when the registry does not know the
+/// device_row_json fields (unchanged) + hostname (null when the roster does not know the
 /// device), last_seen (null when never synced), status, last_confirmed_at (null when 0),
 /// install_type, install_scope, install_location, instance_key.
 [[nodiscard]] nlohmann::json list_row_json(const SoftwareFleetRow& r, const DeviceFacts& facts);

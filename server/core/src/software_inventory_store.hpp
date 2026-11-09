@@ -292,6 +292,7 @@ struct SoftwareComponentQuery {
 /// rollup-served and a live-computed figure. `devices_unconfirmed` (components only, else 0) is
 /// the distinct devices whose row status is not `current`.
 struct SoftwareTotals {
+    /// Install rows; on the components route, component instances (serialised as `instances`).
     std::int64_t installs{0};
     std::int64_t devices{0};
     std::int64_t devices_unconfirmed{0};
@@ -709,9 +710,18 @@ public:
     [[nodiscard]] std::optional<std::vector<SoftwareComponentRow>>
     query_components(const SoftwareComponentQuery& q);
 
-    /// Distinct versions of one component (kind may be empty = any kind), from the components
-    /// rollup, at most kCatalogRowCap rows (version order is the caller's: the rollup is
-    /// unordered). Bounded read; nullopt on degrade. Empty name -> empty value.
+    /// Distinct non-empty versions of one installed title, LIVE from `installed_software` (served
+    /// by installed_software_name_idx), ordered, at most kCatalogRowCap rows: a read that returns
+    /// that many may have been cut (the caller must treat it as unresolvable). Live, not the hourly
+    /// version_rollup, so a version first reported since the last refresh is never missing from a
+    /// range resolved against it. 5 s bound; nullopt on degrade. Empty name -> empty value.
+    [[nodiscard]] std::optional<std::vector<std::string>>
+    installed_software_distinct_versions(std::string_view name);
+
+    /// Distinct non-empty versions of one component (kind may be empty = any kind), LIVE from
+    /// `software_components` (served by software_components_name_idx), ordered, at most
+    /// kCatalogRowCap rows (the same cut-read rule as installed_software_distinct_versions). 5 s
+    /// bound; nullopt on degrade. Empty name -> empty value.
     [[nodiscard]] std::optional<std::vector<std::string>>
     component_versions(std::string_view kind, std::string_view name);
 

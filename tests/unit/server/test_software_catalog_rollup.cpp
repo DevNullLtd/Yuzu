@@ -10,6 +10,7 @@
 
 #include "software_catalog_rollup.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "software_inventory_store.hpp"
 
@@ -17,11 +18,15 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <libpq-fe.h>
+
 #include <yuzu/metrics.hpp>
 
 #include <chrono>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <vector>
 
 using yuzu::server::SoftwareCatalogRollup;
 using yuzu::server::SoftwareInventoryStore;
@@ -116,4 +121,54 @@ TEST_CASE("SoftwareCatalogRollup::request_stop — no NEW recompute starts, the 
     const auto t = std::chrono::steady_clock::now();
     rollup.stop(); // the thread already exited on the flag; the join is immediate
     CHECK(std::chrono::steady_clock::now() - t < std::chrono::seconds{1});
+}
+
+TEST_CASE("SoftwareCatalogRollup worker refreshes the components rollup and emits its three metrics",
+          "[pg][software_inventory][rollup]") {
+    // The hourly worker is the ONLY caller of refresh_component_rollup: delete that call and every
+    // store-level test stays green while the components totals stay `building` forever. This pins
+    // the wiring: one tick of a long-interval worker stamps the rollup, counts a success and sets
+    // the liveness gauge. The test waits on the last thing the tick emits (the success timestamp),
+    // never on a sleep.
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO software_inventory_store.software_components (agent_id, kind, path_hash, "
+            "path, name, version, row_hash, first_seen) VALUES ('dev-a', 'jar', 'ph', '/a', "
+            "'libfoo', '1.0', 'rh', 1)",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    const auto before = store.component_rollup_meta();
+    REQUIRE(before.has_value());
+    REQUIRE(before->refreshed_at == 0); // never computed
+
+    yuzu::MetricsRegistry metrics;
+    constexpr const char* kStem = "yuzu_inventory_component_rollup";
+    const std::string stamp = std::string(kStem) + "_last_success_timestamp";
+    SoftwareCatalogRollup rollup{store, std::chrono::hours{1}, &metrics};
+    rollup.start();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{60};
+    while (metrics.gauge(stamp).value() <= 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    rollup.stop(); // joins: everything the tick wrote is visible below
+
+    CHECK(metrics.counter(std::string(kStem) + "_total", {{"outcome", "success"}}).value() == 1);
+    CHECK(metrics.counter(std::string(kStem) + "_total", {{"outcome", "error"}}).value() == 0);
+    CHECK(metrics.gauge(stamp).value() > 0);
+    CHECK(metrics.gauge(std::string(kStem) + "_duration_seconds").value() >= 0);
+    const auto after = store.component_rollup_meta();
+    REQUIRE(after.has_value());
+    CHECK(after->refreshed_at > 0);
+    const auto totals = store.component_totals("jar", "libfoo", std::nullopt); // the rollup row
+    REQUIRE(totals.has_value());
+    CHECK(totals->installs == 1);
+    CHECK(totals->devices == 1);
 }
