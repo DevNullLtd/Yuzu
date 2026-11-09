@@ -7857,6 +7857,61 @@ groups:
             (one persistent data directory per replica; an ephemeral one makes
             the mechanism inert).
 
+  - name: yuzu-echo
+    # Echo fleet signals. DECISION (#6521): the five registry_* keys of the on-demand echo.status
+    # action have NO fleet gauge, so there is deliberately no alert on them yet. Exporting one
+    # (for example "watcher dead": unarmed roots == roots) needs a new heartbeat tag on the agent
+    # and a new gauge on the server; that is a deferred follow-up. Recorded in
+    # docs/observability-conventions.md.
+    rules:
+      # yuzu_fleet_echo_db_corruption_agents counts agents whose cumulative-ever quarantine total
+      # is > 0 at the sweep. Each agent counts once per sweep regardless of its total, so a RISE
+      # is a LOWER BOUND on new quarantines, not an event count. Three limits, all by design:
+      #   - an agent returning to the fleet with an old quarantine raises the gauge (false
+      #     positive: nothing new happened);
+      #   - a repeat quarantine on an agent that is already counted does not raise it (missed);
+      #   - a departure in the same window can mask an arrival (missed).
+      # The gauge counts only agents currently reporting heartbeats. It is a gauge, so `delta`,
+      # not `increase`. `for: 0m`: a rise is an event, a sustained condition would never clear.
+      # Warning, not critical: the value is agent-self-reported inside the heartbeat trust
+      # boundary, so one forged or buggy agent can raise it.
+      - alert: YuzuEchoDbCorruptionDetected
+        expr: |
+          delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The count of agents with a quarantined Echo database rose in the last hour"
+          description: >-
+            At least one more agent than an hour ago reports that its Echo database failed its
+            integrity check and was quarantined. This is a lower bound on new quarantines, not an
+            event count: the gauge counts agents once per sweep, so an agent returning from
+            offline with an old quarantine raises it, a repeat quarantine on an agent already
+            counted does not, and an agent leaving in the same window can mask one arriving. The
+            echo.db.corruption_quarantined audit rows name the affected agents.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
+
+      # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the
+      # description carries the Echo remedy. The family is absent-not-zero, so a clean fleet
+      # returns no series and the rule stays quiet.
+      - alert: YuzuPluginInitFailed
+        expr: |
+          yuzu_fleet_plugin_init_failed > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} agent(s) report plugin {{ $labels.plugin }} failed to initialise"
+          description: >-
+            For more than 15 minutes, {{ $value }} agent(s) have reported that plugin
+            {{ $labels.plugin }} failed init (heartbeat tag yuzu.plugins_failed); it is loaded but
+            not running, as distinct from not installed. For plugin="echo" the usual causes are
+            the two cases the agent refuses after the tar.db to echo.db rename (adoption failed,
+            or both databases exist) and a corrupt echo.db that could not be moved aside; the
+            remedies are in the upgrade notes. The value is agent-self-reported.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
+
   - name: yuzu-web-writes
     # Cookie-session requests refused by the pre-routing same-site gate
     # (yuzu_server_csrf_denied_total{path_class,reason}). Every path_class x

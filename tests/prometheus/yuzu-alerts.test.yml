@@ -8455,3 +8455,71 @@ tests:
       - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
         eval_time: 125m
         exp_samples: []
+
+  # -- YuzuEchoDbCorruptionDetected / YuzuPluginInitFailed (#5033, #6696) -------
+  # CASE -- the corruption gauge steps 0 -> 1 at minute 30: fires at 31m (delta over 1h > 0).
+  - interval: 1m
+    name: echo corruption gauge rising by one fires
+    input_series:
+      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
+        values: "0x30 1x60"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: YuzuEchoDbCorruptionDetected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: yuzu
+              instance: s1
+            exp_annotations:
+              summary: "The count of agents with a quarantined Echo database rose in the last hour"
+              description: "At least one more agent than an hour ago reports that its Echo database failed its integrity check and was quarantined. This is a lower bound on new quarantines, not an event count: the gauge counts agents once per sweep, so an agent returning from offline with an old quarantine raises it, a repeat quarantine on an agent already counted does not, and an agent leaving in the same window can mask one arriving. The echo.db.corruption_quarantined audit rows name the affected agents."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
+
+  # CASE -- negative control: a flat non-zero gauge (old, already-counted quarantines) stays quiet.
+  - interval: 1m
+    name: echo corruption gauge flat and non-zero stays quiet
+    input_series:
+      - series: 'yuzu_fleet_echo_db_corruption_agents{job="yuzu",instance="s1"}'
+        values: "2x90"
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: YuzuEchoDbCorruptionDetected
+        exp_alerts: []
+      - eval_time: 80m
+        alertname: YuzuEchoDbCorruptionDetected
+        exp_alerts: []
+
+  # CASE -- plugin init failure held for 16m (past for: 15m) fires with the plugin label.
+  - interval: 1m
+    name: plugin init failed for echo held past 15m fires
+    input_series:
+      - series: 'yuzu_fleet_plugin_init_failed{job="yuzu",instance="s1",plugin="echo"}'
+        values: "1x30"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: YuzuPluginInitFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: yuzu
+              instance: s1
+              plugin: echo
+            exp_annotations:
+              summary: "1 agent(s) report plugin echo failed to initialise"
+              description: "For more than 15 minutes, 1 agent(s) have reported that plugin echo failed init (heartbeat tag yuzu.plugins_failed); it is loaded but not running, as distinct from not installed. For plugin=\"echo\" the usual causes are the two cases the agent refuses after the tar.db to echo.db rename (adoption failed, or both databases exist) and a corrupt echo.db that could not be moved aside; the remedies are in the upgrade notes. The value is agent-self-reported."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
+
+  # CASE -- negative control: a failure that clears after 10m never reaches for: 15m.
+  - interval: 1m
+    name: plugin init failed cleared inside 15m stays quiet
+    input_series:
+      - series: 'yuzu_fleet_plugin_init_failed{job="yuzu",instance="s1",plugin="echo"}'
+        values: "1x10 0x20"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: YuzuPluginInitFailed
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: YuzuPluginInitFailed
+        exp_alerts: []
