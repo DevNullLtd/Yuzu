@@ -27,7 +27,13 @@ Three checks over server/core/src/*.{cpp,hpp}, comments removed:
      (c) the provider is constructed under `if (runtime_config_store_ && runtime_config_store_->is_open())`
      in the scope that declares `dex_api`, ahead of the `if (guaranteed_state_store_) {` block
      (it depends only on the runtime config store, so nested inside that block the routes answer
-     503 wherever the signals store is absent).
+     503 wherever the signals store is absent);
+     (d) the DEX Scoring tab's copy, `settings_routes_->set_dex_score_policy_writer(`, is one
+     active line under the same `if (dex_score_policy_provider_) {` and comes BEFORE the REST
+     setter, which std::moves the deps (a copy taken after the move compiles and leaves the tab
+     answering 503);
+     (e) `settings_routes_->set_dex_apps_fn(` is one active line under exactly `if (dex_api)`
+     (the scorer exists only where the signals store does) and inside that same provider block.
 
 LIMITS. A lexical scan, not a proof: it cannot see a key held in a variable and passed to a
 write call, a write through a helper that takes the key as a parameter, or a spelling built at
@@ -86,9 +92,18 @@ def wiring_problems(text):
     register = at("rest_api_v1_->register_routes(")
     provider = at("dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(")
     decl = at("std::shared_ptr<yuzu::server::DexApi> dex_api;")
+    tab_writer = at("settings_routes_->set_dex_score_policy_writer(")
+    tab_apps = at("settings_routes_->set_dex_apps_fn(")
+
+    def nearest_if(i):
+        return next(((j, ln) for j, ln in reversed(list(enumerate(lines[:i]))) if ln.startswith("if (")),
+                    (-1, ""))
+
     out = []
     for name, found in (("set_dex_score_policy_writer", setter), ("register_routes", register),
-                        ("provider construction", provider), ("dex_api declaration", decl)):
+                        ("provider construction", provider), ("dex_api declaration", decl),
+                        ("Scoring tab set_dex_score_policy_writer", tab_writer),
+                        ("Scoring tab set_dex_apps_fn", tab_apps)):
         if len(found) != 1:
             out.append(f"{SERVER_FILE}: expected exactly one active {name} line, found {len(found)}")
     if out:
@@ -96,7 +111,7 @@ def wiring_problems(text):
     if setter[0] > register[0]:
         out.append("set_dex_score_policy_writer must be called BEFORE register_routes: the deps are "
                    "captured by value there, so a later call leaves all three routes answering 503")
-    guard = next((ln for ln in reversed(lines[:setter[0]]) if ln.startswith("if (")), "")
+    guard = nearest_if(setter[0])[1]
     if guard != "if (dex_score_policy_provider_) {":
         out.append("the writer deps must be set under exactly `if (dex_score_policy_provider_) {`; "
                    "any other guard changes where the three routes answer 503")
@@ -107,6 +122,21 @@ def wiring_problems(text):
     if provider[0] > decl[0] or body.count("{") != body.count("}"):
         out.append("the provider must be constructed in the scope that declares dex_api, before it "
                    "(it depends only on the runtime config store, not on the signals store)")
+    tab_guard_at, tab_guard = nearest_if(tab_writer[0])
+    if tab_guard != "if (dex_score_policy_provider_) {":
+        out.append("the Scoring tab's writer deps must be set under exactly "
+                   "`if (dex_score_policy_provider_) {`; any other guard changes where the tab "
+                   "answers 503")
+    if tab_writer[0] > setter[0]:
+        out.append("the Scoring tab's writer deps must be copied BEFORE the REST setter, which "
+                   "std::moves them: a later copy is a moved-from object and the tab answers 503")
+    if nearest_if(tab_apps[0])[1] != "if (dex_api)":
+        out.append("the Scoring tab's Apps scorer must be set under exactly `if (dex_api)`: it is "
+                   "built from the signals store, which a runtime-config-only deployment lacks")
+    between = "\n".join(lines[max(tab_guard_at, 0):tab_apps[0]])
+    if tab_guard_at < 0 or tab_apps[0] < tab_guard_at or between.count("{") <= between.count("}"):
+        out.append("the Scoring tab's Apps scorer must be set inside the "
+                   "`if (dex_score_policy_provider_) {` block that sets its writer deps")
     return out
 
 
@@ -119,7 +149,10 @@ if (guaranteed_state_store_) {
     dex_api = make_local_dex_api();
 }
 if (dex_score_policy_provider_) {
-    rest_api_v1_->set_dex_score_policy_writer({});
+    settings_routes_->set_dex_score_policy_writer(deps);
+    rest_api_v1_->set_dex_score_policy_writer(std::move(deps));
+    if (dex_api)
+        settings_routes_->set_dex_apps_fn([dex_api](const auto& p) { return dex_api->apps(p); });
 }
 rest_api_v1_->register_routes(*web_server_);
 """
@@ -135,7 +168,13 @@ def self_test():
     assert literal_count('x = "dex_score_policy"; // "dex_score_policy"') == 1
     assert literal_count("/* \"dex_score_policy\" */") == 0
     assert wiring_problems(GOOD_WIRING) == [], "the reference wiring must pass"
-    setter = "if (dex_score_policy_provider_) {\n    rest_api_v1_->set_dex_score_policy_writer({});\n}\n"
+    setter = ("if (dex_score_policy_provider_) {\n"
+              "    settings_routes_->set_dex_score_policy_writer(deps);\n"
+              "    rest_api_v1_->set_dex_score_policy_writer(std::move(deps));\n"
+              "    if (dex_api)\n"
+              "        settings_routes_->set_dex_apps_fn([dex_api](const auto& p) "
+              "{ return dex_api->apps(p); });\n"
+              "}\n")
     register = "rest_api_v1_->register_routes(*web_server_);\n"
     assert setter + register in GOOD_WIRING
     late = GOOD_WIRING.replace(setter + register, register + setter)
@@ -146,6 +185,25 @@ def self_test():
     swapped = GOOD_WIRING.replace("if (dex_score_policy_provider_) {", "if (guaranteed_state_store_) {")
     assert any("if (dex_score_policy_provider_) {" in p for p in wiring_problems(swapped)), \
         "swapped setter guard"
+    assert wiring_problems(GOOD_WIRING.replace("    settings_routes_->set_dex_score_policy_writer(deps);\n", "")), \
+        "missing Scoring tab writer deps"
+    assert wiring_problems(GOOD_WIRING.replace("settings_routes_->set_dex_apps_fn",
+                                               "// settings_routes_->set_dex_apps_fn")), \
+        "commented-out Scoring tab scorer"
+    tab = "    settings_routes_->set_dex_score_policy_writer(deps);\n"
+    rest = "    rest_api_v1_->set_dex_score_policy_writer(std::move(deps));\n"
+    assert tab + rest in GOOD_WIRING
+    assert any("BEFORE the REST setter" in p
+               for p in wiring_problems(GOOD_WIRING.replace(tab + rest, rest + tab))), \
+        "Scoring tab deps copied after the move"
+    assert any("under exactly `if (dex_api)`" in p
+               for p in wiring_problems(GOOD_WIRING.replace("    if (dex_api)\n", "    if (ready)\n"))), \
+        "Scoring tab scorer under the wrong guard"
+    apps = ("    if (dex_api)\n        settings_routes_->set_dex_apps_fn([dex_api](const auto& p) "
+            "{ return dex_api->apps(p); });\n")
+    assert apps + "}\n" in GOOD_WIRING
+    assert any("inside the" in p for p in wiring_problems(GOOD_WIRING.replace(apps + "}\n", "}\n" + apps))), \
+        "Scoring tab scorer outside the provider block"
     nested = """\
 std::shared_ptr<yuzu::server::DexApi> dex_api;
 if (guaranteed_state_store_) {
@@ -182,7 +240,8 @@ def main():
         return 1
     print(f"OK: the score policy key is written only in {WRITER_FILE}: {', '.join(writer_calls)}; "
           f"{SERVER_FILE} wires the writer deps before register_routes, only under "
-          "`if (dex_score_policy_provider_)`, and the provider outside the signals-store block")
+          "`if (dex_score_policy_provider_)`, the provider outside the signals-store block, and "
+          "the Scoring tab's writer deps and Apps scorer in the same wiring")
     return 0
 
 
