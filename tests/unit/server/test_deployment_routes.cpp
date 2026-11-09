@@ -877,12 +877,10 @@ TEST_CASE("deployment routes: the deploy results script reveals the empty notice
     CHECK(h.find("vis?'none':''") == std::string::npos);
 }
 
-// A run id with an embedded NUL must be refused before the create route reaches either
-// duplicate-deployment guard (find_running_for_run, succeeded_agents_for_run). A running
-// deployment exists for the id's prefix, so a guard that saw the prefix would resume or exclude
-// from it; the route has to answer "not found" and touch nothing instead.
-TEST_CASE("deployment routes: POST run with a run id carrying an embedded NUL is refused before "
-          "either guard, nothing is created, resumed or dispatched",
+// A run id with an embedded NUL is refused at the create route: the answer is "not found" and
+// nothing is created, resumed or dispatched.
+TEST_CASE("deployment routes: POST run with a run id carrying an embedded NUL is refused, "
+          "nothing is created, resumed or dispatched",
           "[pg][deployment][routes][validation]") {
     YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
     YUZU_REQUIRE_PG_DB_TPL(predb, preflight_routes_tpl);
@@ -946,7 +944,7 @@ TEST_CASE("deployment routes: POST run with a run id carrying an embedded NUL is
     CHECK(dispatched == 0);
     CHECK(audit_log.empty()); // no create, no resume, nothing
 
-    // The prefix run's deployment is untouched and no second one was minted.
+    // The existing run's deployment is untouched and no second one was minted.
     auto still_running = deploy_store.find_running_for_run(run_id, "alice");
     REQUIRE(still_running.has_value());
     CHECK(*still_running == dep_id);

@@ -2334,11 +2334,9 @@ TEST_CASE("assign_management_group_role's input schema still offers only Operato
 // ── Role-name validation on the role-removal surface ────────────────────────
 //
 // The role argument of the role-removal tool is deliberately free text (so it can clean up an
-// out-of-band grant), which means the checks that look at it and the statement that acts on it
-// must all see the same, validated value. These cases pin: a role carrying a NUL or other control
-// byte is refused as invalid params BEFORE any guard, the refusal is audited as denied, the
-// grants are untouched, and the existing self-removal and last-Administrator guards still hold
-// for the plain spelling.
+// out-of-band grant). These cases pin: a role carrying a NUL or other control byte is refused as
+// invalid params, the refusal is audited as denied, the grants are untouched, and the plain
+// spelling behaves as before.
 
 namespace {
 

@@ -28106,12 +28106,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // `role` is free text within the clean-text rule (see below), so it is validated
-                // here, BEFORE any guard or write looks at it: a value with a NUL or other control
-                // byte is refused as invalid params and the refusal is audited. The role is then
-                // resolved once to the stored role name, and that one name is what both guards, the
-                // delete and the audit row use; an unknown but well-formed name stays an
-                // idempotent no-op.
+                // `role` is free text within the clean-text rule (see below): a value with a NUL
+                // or other control byte is refused as invalid params and the refusal is audited.
+                // An unknown but well-formed name stays an idempotent no-op.
                 if (!rbac_text_is_clean(role_name)) {
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
                                    audit_token(principal_id), "invalid_role_name");

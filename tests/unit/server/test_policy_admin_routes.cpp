@@ -377,11 +377,10 @@ TEST_CASE("POST /api/policies: policy.create audit records an empty group list a
     CHECK(a.detail == "scope=ostype____\"linux\" groups=0");
 }
 
-// ── Identifier handling: an id carrying a NUL byte must not act on its prefix ─────────────────
+// ── Identifier handling: an id carrying a NUL byte is refused ─────────────────────────────────
 //
-// The id in these routes is a path capture. A value with an embedded NUL has to be refused as a
-// whole: no policy is deleted, enabled or disabled through its prefix, and no success audit row
-// or event names an id that differs from the row that was acted on.
+// The id in these routes is a path capture. A value with an embedded NUL is refused as a whole:
+// no policy is deleted, enabled or disabled, and no success audit row is written.
 
 namespace {
 

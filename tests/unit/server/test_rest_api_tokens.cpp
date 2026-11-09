@@ -374,7 +374,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: an id with an embedded NUL revokes nothin
     CHECK(res->body.find("token store unavailable") != std::string::npos);
     CHECK(res->body.find("\"revoked\"") == std::string::npos);
 
-    // The real token (the prefix of the submitted id) is untouched.
+    // The existing token is untouched.
     auto looked_up = h.token_store()->get_token(token_id).value();
     REQUIRE(looked_up.has_value());
     CHECK_FALSE(looked_up->revoked);

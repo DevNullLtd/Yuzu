@@ -49,7 +49,7 @@ TEST_CASE("exec_params: a parameter with an embedded NUL is refused, nothing is 
 
     const std::string with_nul("abc\0def", 7);
 
-    SECTION("a write is refused and stores nothing, not even the prefix") {
+    SECTION("a write is refused and stores nothing") {
         auto r = exec_params(lease.get(), "INSERT INTO pg_exec_params_t (k) VALUES ($1)",
                              std::vector<std::string>{with_nul});
         CHECK_FALSE(r.ok());
@@ -57,7 +57,7 @@ TEST_CASE("exec_params: a parameter with an embedded NUL is refused, nothing is 
         CHECK(count_rows(lease.get()) == 0);
     }
 
-    SECTION("a delete keyed on a NUL-bearing value does not act on the prefix row") {
+    SECTION("a delete keyed on a NUL-bearing value deletes nothing") {
         {
             auto ins = exec_params(lease.get(), "INSERT INTO pg_exec_params_t (k) VALUES ($1)",
                                    std::vector<std::string>{"abc"});

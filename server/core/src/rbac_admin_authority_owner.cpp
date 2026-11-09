@@ -250,8 +250,7 @@ RbacAdminAuthorityOwner::UnassignOutcome
 RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
                                        const std::string& principal_id,
                                        const std::string& role_name) const {
-    // The comparisons below and the statements that act on these values must all see the same
-    // bytes, so a value that is not clean text is refused before any of them runs.
+    // A value that is not clean text is refused up front.
     if (!rbac_text_is_clean(role_name) || !rbac_text_is_clean(principal_type) ||
         !rbac_text_is_clean(principal_id)) {
         UnassignOutcome refused;
