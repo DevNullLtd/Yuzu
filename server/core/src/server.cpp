@@ -2446,6 +2446,8 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
+                          "sections_query_error for device_ci: the record read answered but its "
+                          "v2 hardware sections did not, and "
                           "admission_full for installed_software and ca_issued: a /crypto read "
                           "refused by its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
@@ -2454,6 +2456,20 @@ public:
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
+        // Hardware record section integrity (#7159): faults SERVED on a record read, by closed
+        // reason set (the label values are section_fault_label()'s). Pre-seeded so a dashboard
+        // can tell "no fault" from "series absent".
+        metrics_.describe("yuzu_hardware_section_integrity_total",
+                          "Hardware record sections served downgraded to constrained because the "
+                          "rows read back disagree with the row count or content digest the server "
+                          "recorded when the section was written (row_count_mismatch, "
+                          "content_digest_mismatch), or the server could not compute the digest to "
+                          "compare (digest_unverifiable: a fault of this server, not of the "
+                          "device). Counts served reads, once per section per read, so a polled "
+                          "device inflates it; it is not a count of distinct defects",
+                          "counter");
+        for (const auto reason : {"row_count_mismatch", "content_digest_mismatch", "digest_unverifiable"})
+            metrics_.counter("yuzu_hardware_section_integrity_total", {{"reason", reason}});
         // /crypto admission refusals (reason=admission_full): pre-seeded so the series is
         // present on a healthy server (the three store-side reasons are emitted on demand).
         metrics_.counter("yuzu_inventory_read_degrade_total",
@@ -20247,6 +20263,12 @@ private:
                 // replace generation; the pure mapping keeps a failed sections read as the error
                 // (the REST route 503s and the MCP tool answers a retryable error on it).
                 apply_ci_with_sections_read(detail, device_inventory_store_->get_device_ci_with_sections(agent_id));
+                // Count (and sample-log) every integrity fault this read SERVES, once per
+                // section per read. Here, and only here: this closure is the one composition
+                // both the REST record route and the MCP tool share, and the dashboard (which
+                // asks CiRead::RecordOnly) never reaches it.
+                if (detail.ci_sections && *detail.ci_sections)
+                    record_section_integrity(**detail.ci_sections, agent_id, &metrics_);
             } else {
                 detail.ci = device_inventory_store_->get_device_ci(agent_id);
             }

@@ -13,6 +13,8 @@
 /// failure withholds the data, strict argument bounds, REST byte identity, output-schema
 /// conformance, and the audit-row contents.
 
+#include "device_ci_kinds.hpp"
+#include "device_ci_section_digest.hpp"
 #include "hardware_list_model.hpp"
 #include "hardware_routes.hpp"
 #include "mcp_jsonrpc.hpp"
@@ -25,6 +27,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <functional>
@@ -131,6 +134,7 @@ struct Twin {
     int roster_calls = 0;
     int ci_calls = 0;
     std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call
+    yuzu::MetricsRegistry metrics; // the integrity counter the fake ci_detail_fn below feeds
     std::vector<std::string> dex_calls_for;
 
     // Domain-verb audit sink (deps.audit_fn on both transports).
@@ -189,7 +193,13 @@ struct Twin {
             ++ci_calls;
             ci_reads.push_back(ci_read);
             const auto it = ci_by_id.find(id);
-            return it != ci_by_id.end() ? it->second : absent_detail();
+            HardwareCiDetail detail = it != ci_by_id.end() ? it->second : absent_detail();
+            // Mirrors the hw_ci_detail_fn closure in server.cpp (the real one is pinned lexically
+            // by test_hw_ci_detail_wiring_lexical.cpp): count after the sections read, for
+            // WithSections only, and only for a READ list.
+            if (ci_read == CiRead::WithSections && detail.ci_sections && *detail.ci_sections)
+                record_section_integrity(**detail.ci_sections, id, &metrics);
+            return detail;
         };
         HardwareRoutes::DexScoreFn dex_fn = [this](const std::string& id) {
             dex_calls_for.push_back(id);
@@ -1440,4 +1450,105 @@ TEST_CASE("mcp hardware twins: the schema states the byte bound and the case rul
               std::string::npos);
     CHECK(tool_entry(listed, "get_hardware_ci")["description"].get<std::string>().find(
               "only the audit row") == std::string::npos);
+}
+
+// ───────────────────── served section integrity faults are counted (#7159) ─────────────────────
+
+namespace {
+// A cpu section whose stored digest and row count describe `good` rows, served with `served` rows.
+DeviceCiSection cpu_section_serving(std::vector<std::vector<std::string>> good,
+                                    std::vector<std::vector<std::string>> served) {
+    DeviceCiSection s;
+    s.kind = "cpu";
+    s.level = "ok";
+    const auto idx = device_ci_section_index("cpu");
+    s.row_count = static_cast<int>(good.size());
+    s.content_digest = section_content_digest(kDeviceCiSections[*idx], good);
+    s.rows = std::move(served);
+    return s;
+}
+
+double integrity(Twin& t, const char* reason) {
+    return t.metrics.counter("yuzu_hardware_section_integrity_total", {{"reason", reason}}).value();
+}
+} // namespace
+
+// Kills: counting in a place only one transport reaches, counting a section the body does not
+// serve as faulted, and a counted cause that differs from the served token. REST and MCP read the
+// same device, so each read moves the counter by exactly one and the body carries the same token.
+TEST_CASE("mcp hardware twins: a served integrity fault is counted once per read and agrees with "
+          "the body",
+          "[mcp][hardware][sections][metrics]") {
+    const std::vector<std::vector<std::string>> r2 = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""},
+                                                      {"1", "Xeon", "8", "16", "2400", "CPU1", ""}};
+    Twin t;
+    t.roster_rows = {make_row("rc", "h", "linux", true), make_row("cd", "h", "linux", true),
+                     make_row("ok", "h", "linux", true)};
+    auto with_cpu = [&](const char* id, DeviceCiSection cpu) {
+        HardwareCiDetail d = full_detail(id);
+        d.ci_sections = std::vector<DeviceCiSection>{std::move(cpu)};
+        t.ci_by_id[id] = d;
+    };
+    with_cpu("rc", cpu_section_serving(r2, {r2[0]})); // one row lost: the count disagrees
+    auto edited = r2;
+    edited[1][1] = "Edited";
+    with_cpu("cd", cpu_section_serving(r2, edited)); // same count, different content
+    with_cpu("ok", cpu_section_serving(r2, r2));     // intact
+
+    const auto served_reason = [&](const json& sc) {
+        return sc["ci"]["sections"][0]["reason"].get<std::string>();
+    };
+
+    // MCP: row-count fault.
+    const json rc = t.call("get_hardware_ci", {{"agent_id", "rc"}})["result"]["structuredContent"];
+    CHECK(served_reason(rc) == section_fault_token(SectionFault::RowCount));
+    CHECK(integrity(t, "row_count_mismatch") == 1.0);
+    CHECK(integrity(t, "content_digest_mismatch") == 0.0);
+    // REST reads the same record: counted again (served reads, not distinct defects).
+    const json rest_rc = t.rest_data("/api/v1/hardware/rc");
+    CHECK(served_reason(rest_rc) == served_reason(rc)); // the transports agree byte for byte
+    CHECK(integrity(t, "row_count_mismatch") == 2.0);
+
+    // Content fault, both transports.
+    const json cd = t.call("get_hardware_ci", {{"agent_id", "cd"}})["result"]["structuredContent"];
+    CHECK(served_reason(cd) == section_fault_token(SectionFault::Content));
+    CHECK(t.rest_data("/api/v1/hardware/cd")["ci"]["sections"][0]["reason"] == served_reason(cd));
+    CHECK(integrity(t, "content_digest_mismatch") == 2.0);
+    CHECK(integrity(t, "row_count_mismatch") == 2.0);
+    CHECK(integrity(t, "digest_unverifiable") == 0.0);
+
+    // An intact device and a list read count nothing.
+    (void)t.call("get_hardware_ci", {{"agent_id", "ok"}});
+    (void)t.rest_data("/api/v1/hardware/ok");
+    (void)t.call("list_hardware_ci");
+    CHECK(integrity(t, "row_count_mismatch") == 2.0);
+    CHECK(integrity(t, "content_digest_mismatch") == 2.0);
+}
+
+// Kills: moving the fetch (and so the count) above the scope check - a caller outside its scope
+// would then move a fleet-wide counter and could probe which hidden ids carry damage. The fake
+// ci_detail_fn is never reached for an out-of-scope id on either transport.
+TEST_CASE("mcp hardware twins: an out-of-scope read does not fetch the record or move the "
+          "integrity counter",
+          "[mcp][hardware][sections][metrics][security]") {
+    const std::vector<std::vector<std::string>> r2 = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""},
+                                                      {"1", "Xeon", "8", "16", "2400", "CPU1", ""}};
+    Twin t;
+    t.roster_rows = {make_row("a", "h", "linux", true), make_row("hidden", "h", "linux", true)};
+    HardwareCiDetail d = full_detail("hidden");
+    d.ci_sections = std::vector<DeviceCiSection>{cpu_section_serving(r2, {r2[0]})}; // faulted
+    t.ci_by_id["hidden"] = d;
+    t.ci_by_id["a"] = full_detail("a");
+    t.scope = std::unordered_set<std::string>{"a"};
+
+    const json mcp = t.call("get_hardware_ci", {{"agent_id", "hidden"}});
+    CHECK(mcp.contains("error"));
+    auto res = t.sink.Get("/api/v1/hardware/hidden");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(t.ci_reads.empty()); // never fetched
+    CHECK(integrity(t, "row_count_mismatch") == 0.0);
+    // The in-scope device still reads and counts nothing for an intact record.
+    (void)t.call("get_hardware_ci", {{"agent_id", "a"}});
+    CHECK(integrity(t, "row_count_mismatch") == 0.0);
 }

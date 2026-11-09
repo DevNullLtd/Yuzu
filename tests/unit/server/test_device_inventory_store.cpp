@@ -2844,3 +2844,54 @@ TEST_CASE("a failing digest provider aborts the full replace and leaves the prev
     REQUIRE(put_record(store, "agent-dp", second) == InventoryIngestOutcome::kStored);
     CHECK(served_section(store, "agent-dp", "dimm")["rows"].size() == 4);
 }
+
+// ── #7159: the sections-read degrade reason is its own ──────────────────────────────────────────
+
+// Kills: both failures counting under one reason (an operator cannot tell "the record read failed"
+// from "the record read but its sections did not", which are answered differently), and a
+// failure that moves no counter at all. The standalone sections reader takes the sections reason.
+TEST_CASE("the read-degrade counter tells a failed record read from a failed sections read",
+          "[pg][device_ci][v2][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto degrades = [&](const char* reason) {
+        return metrics
+            .counter("yuzu_inventory_read_degrade_total",
+                     {{"reason", reason}, {"source", "device_ci"}})
+            .value();
+    };
+
+    const DeviceCiRecord a = distinct_v2_record("A");
+    REQUIRE(store.apply_device_ci("agent-dg2", DeviceInventoryStore::canonical_hash(a),
+                                  std::optional<DeviceCiRecord>{a},
+                                  1) == InventoryIngestOutcome::kStored);
+    CHECK(degrades("query_error") == 0.0);
+    CHECK(degrades("sections_query_error") == 0.0);
+
+    SECTION("a failed sections statement counts sections_query_error, keeps the record") {
+        exec_stmt(pool,
+                  "ALTER TABLE device_inventory_store.device_ci_cpu RENAME COLUMN idx TO idx_x");
+        auto got = store.get_device_ci_with_sections("agent-dg2");
+        REQUIRE(got.has_value());
+        CHECK(got->sections_failed);
+        CHECK(degrades("sections_query_error") == 1.0);
+        CHECK(degrades("query_error") == 0.0);
+        // The single-purpose sections reader fails on the same fault and counts the same reason.
+        CHECK_FALSE(store.get_device_ci_sections("agent-dg2").has_value());
+        CHECK(degrades("sections_query_error") == 2.0);
+        CHECK(degrades("query_error") == 0.0);
+    }
+    SECTION("a failed record statement counts query_error and no sections reason") {
+        exec_stmt(pool,
+                  "ALTER TABLE device_inventory_store.device_ci RENAME COLUMN model TO model_x");
+        auto got = store.get_device_ci_with_sections("agent-dg2");
+        REQUIRE_FALSE(got.has_value());
+        CHECK(degrades("query_error") == 1.0);
+        CHECK(degrades("sections_query_error") == 0.0);
+    }
+}

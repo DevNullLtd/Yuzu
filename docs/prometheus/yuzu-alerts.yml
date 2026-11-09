@@ -5977,6 +5977,8 @@ groups:
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
         # reason = store_not_open | pool_acquire_timeout | query_error, plus
+        # sections_query_error (source=device_ci: the hardware record read answered but its
+        # sections did not), plus
         # admission_full (source=installed_software or ca_issued): a /crypto read
         # refused by its per-process in-flight bound BEFORE any store call. The
         # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)

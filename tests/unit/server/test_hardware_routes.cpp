@@ -20,6 +20,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -77,6 +78,7 @@ struct HwHarness {
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
     std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call, in order
+    yuzu::MetricsRegistry metrics; // the integrity counter the fake ci_detail_fn below feeds
 
     int dex_calls = 0;
     std::vector<std::string> dex_calls_for; // agent_ids scored, in call order
@@ -180,9 +182,15 @@ struct HwHarness {
             out.roster_degraded = roster_degraded;
             return out;
         };
-        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&, CiRead ci_read) {
+        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string& id, CiRead ci_read) {
             ci_reads.push_back(ci_read);
-            return ci_detail;
+            HardwareCiDetail detail = ci_detail;
+            // Mirrors the hw_ci_detail_fn closure in server.cpp (the real one is pinned lexically
+            // by test_hw_ci_detail_wiring_lexical.cpp): count after the sections read, for
+            // WithSections only, and only for a READ list.
+            if (ci_read == CiRead::WithSections && detail.ci_sections && *detail.ci_sections)
+                record_section_integrity(**detail.ci_sections, id, &metrics);
+            return detail;
         };
         HardwareRoutes::ScopedProbeFn probe = [this](const httplib::Request&, const std::string& type,
                                                      const std::string& op, const std::string&) {
@@ -2467,4 +2475,63 @@ TEST_CASE("software lens header: count and last synced, never-synced told apart 
                    "last synced time unavailable"));
     // Click-to-load hosts ride the same lens and nothing is fetched on render.
     CHECK(contains(synced, "hx-trigger=\"click\""));
+}
+
+// #7159: only the sections-reading record route moves the integrity counter. The dashboard
+// fragment, the sync-now poll and the actions lens ask for the record only, so they never reach the
+// count even for a record whose sections are faulted. Kills: counting on a RecordOnly read.
+TEST_CASE(
+    "route: only the REST record moves the section integrity counter; the dashboard never does",
+    "[hardware][route][rest][sections][metrics]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    // A cpu section stored with 2 rows but served with 1: the row-count rule faults it.
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "ok";
+    cpu.row_count = 2;
+    cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+    h.ci_detail.ci_sections = std::vector<DeviceCiSection>{cpu};
+    h.actions_plugins = {{.name = "firewall", .version = "1", .actions = {"rules"}}};
+    const auto count = [&] {
+        return h.metrics
+            .counter("yuzu_hardware_section_integrity_total", {{"reason", "row_count_mismatch"}})
+            .value();
+    };
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview"));
+    REQUIRE(
+        h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview&lens_only=1&await_since=1000"));
+    REQUIRE(h.sink.Get("/fragments/hardware/ci/actions?id=agent-x"));
+    CHECK(count() == 0.0);
+
+    auto rest = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(rest);
+    REQUIRE(rest->status == 200);
+    CHECK(nlohmann::json::parse(rest->body)["data"]["ci"]["sections"][0]["reason"] ==
+          std::string(section_fault_token(SectionFault::RowCount)));
+    CHECK(count() == 1.0);
+}
+
+// Kills: moving the fetch above the scope check: a caller outside its scope would move a
+// fleet-wide counter (and could probe which hidden ids carry damage).
+TEST_CASE(
+    "route: an out-of-scope REST read neither fetches the record nor moves the integrity counter",
+    "[hardware][route][rest][sections][metrics][security]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "ok";
+    cpu.row_count = 2;
+    cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+    h.ci_detail.ci_sections = std::vector<DeviceCiSection>{cpu};
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(h.ci_reads.empty());
+    CHECK(h.metrics
+              .counter("yuzu_hardware_section_integrity_total", {{"reason", "row_count_mismatch"}})
+              .value() == 0.0);
 }

@@ -43,6 +43,10 @@
 #include <utility>
 #include <vector>
 
+namespace yuzu {
+class MetricsRegistry; // sdk/include/yuzu/metrics.hpp; the header stays metrics-free
+}
+
 namespace yuzu::server {
 
 /// Whitelisted sort keys for the Hardware CI list. Never accept an arbitrary column
@@ -248,9 +252,16 @@ inline constexpr std::string_view kSectionRowCountMismatchReason = "server:row_c
 ///    The rows that WERE read are still served (a constrained section serves its rows).
 ///  - `unavailable`, `permission_denied`, an unknown level and a blank level are never touched:
 ///    by contract they serve no rows, so there is nothing to reconcile.
+///
+/// `fault` is the PURE cause of the downgrade this server applied (None when it applied none: an
+/// agent-reported `constrained` stays None). It is the one source for both the served token and
+/// the `yuzu_hardware_section_integrity_total` counter label (`record_section_integrity`), so the
+/// two can never disagree about why a section was downgraded.
+enum class SectionFault : std::uint8_t { None, RowCount, Content, Unverifiable };
 struct SectionVerdict {
     std::string level;
     std::string reason;
+    SectionFault fault{SectionFault::None};
 };
 [[nodiscard]] SectionVerdict verify_section_row_count(const DeviceCiSection& section);
 
@@ -259,6 +270,20 @@ struct SectionVerdict {
 /// rows were edited, swapped for another generation's, or otherwise changed out of band - a
 /// change the row count alone cannot see when the number of rows is unchanged.
 inline constexpr std::string_view kSectionContentDigestMismatchReason = "server:content_digest_mismatch";
+
+/// The reason token a section carries when the server could NOT compute the digest to compare
+/// (the digest provider failed - `EVP_Digest` returned an error - which is a fault of THIS SERVER,
+/// not of the device or its stored rows). Served with level `constrained`, rows served, exactly as
+/// the two mismatch tokens; it is a distinct token so an operator does not chase the device.
+inline constexpr std::string_view kSectionContentDigestUnverifiableReason =
+    "server:content_digest_unverifiable";
+
+/// The reason token a downgrade of kind `fault` is served with; empty for `SectionFault::None`.
+[[nodiscard]] std::string_view section_fault_token(SectionFault fault) noexcept;
+
+/// The `reason` label `yuzu_hardware_section_integrity_total` counts `fault` under
+/// (`row_count_mismatch` / `content_digest_mismatch` / `digest_unverifiable`); empty for None.
+[[nodiscard]] std::string_view section_fault_label(SectionFault fault) noexcept;
 
 /// The level and reason a table-backed section is SERVED with: `verify_section_row_count` first,
 /// then the content digest. This is the function every serving path uses (`ci_sections_json`);
@@ -278,9 +303,12 @@ inline constexpr std::string_view kSectionContentDigestMismatchReason = "server:
 ///    more specific report of the same loss, and a lost row always changes the digest too, so a
 ///    second token would only repeat it.
 ///  - Otherwise the digest of the rows read (`section_content_digest`, the writer's own function)
-///    is compared with the stored one; any difference - or a digest the server cannot compute -
-///    DOWNGRADES `ok` to `constrained` and appends `server:content_digest_mismatch` to the reason
-///    (`;`-joined, idempotent). An already `constrained` section keeps its level and tokens.
+///    is compared with the stored one; any difference DOWNGRADES `ok` to `constrained` and appends
+///    `server:content_digest_mismatch` to the reason (`;`-joined, idempotent). A digest the server
+///    cannot compute (the provider failed) downgrades the same way but appends
+///    `server:content_digest_unverifiable` instead: that is a fault of this server, not of the
+///    stored rows (owner ruling 2026-11-09). An already `constrained` section keeps its level
+///    and tokens.
 ///  - The rows that were read are STILL SERVED (as for the count mismatch). On a digest mismatch
 ///    they are NOT the generation the agent reported: they may be edited or swapped values, so a
 ///    consumer must not treat them as the device's reported hardware.
@@ -293,6 +321,27 @@ inline constexpr std::string_view kSectionContentDigestMismatchReason = "server:
 /// passes `sha256_hex`; only a test passes anything else, to drive the "provider failed" branch.
 [[nodiscard]] SectionVerdict verify_section_content(const DeviceCiSection& section,
                                                     DigestFn digest);
+
+/// Counts the integrity faults of the sections of ONE served read of a record, and logs the first
+/// of an episode: `yuzu_hardware_section_integrity_total{reason}` once per faulted section per
+/// read (the served-read count, NOT distinct defects: a polled device inflates it), plus a
+/// rate-limited WARN per reason naming the device id and the section kind, never row contents.
+///
+/// It calls `verify_section_content` itself, so the counted cause is by construction the one the
+/// served body carries (never a parallel verifier). Re-verifying costs two SHA-256 passes over at
+/// most 96 KiB of section rows (the `device_ci_kinds.hpp` static_assert), sub-millisecond against
+/// a Postgres round-trip; precomputing the verdicts at read time and carrying them would create
+/// the second serving path this header forbids. The provider is a PARAMETER (no process-global
+/// state); nullptr (the default) means `sha256_hex`. `metrics` may be null (nothing counted, still
+/// logged). Called from the one `hw_ci_detail_fn` closure, after the sections read, for
+/// `CiRead::WithSections` only - so both transports are covered and the dashboard is not.
+void record_section_integrity(const std::vector<DeviceCiSection>& sections,
+                              std::string_view agent_id, yuzu::MetricsRegistry* metrics,
+                              DigestFn digest = nullptr);
+
+/// TEST SEAM (#7159): forget the per-reason WARN sampling state, so a test can assert the
+/// leading-edge WARN regardless of which tests ran before it in the same process.
+void reset_section_integrity_log_state_for_test() noexcept;
 
 inline constexpr std::size_t kHwSoftwareCap = 2000;
 

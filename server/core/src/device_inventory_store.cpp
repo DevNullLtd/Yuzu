@@ -51,6 +51,11 @@ constexpr int kListRowCap = 100000;
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// A failed read of the v2 per-section statements (the section status SELECT or a per-kind row
+// SELECT) after - or, for the standalone `get_device_ci_sections`, instead of - the record read:
+// kept apart from `query_error` (the record read failed) because the two are answered differently
+// (REST 503 / MCP retryable error versus `ci: null`, HTTP 200) and fixed differently.
+constexpr const char* kReasonSectionsQueryError = "sections_query_error";
 // Sample the per-site degrade WARN (leading edge of an episode, then every Nth)
 // so a sustained PG outage during a roster poll cannot flood the log — the counter
 // is the continuous signal, the log a sampled breadcrumb. Values match the
@@ -851,7 +856,7 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
     if (!ok) {
         // Never an empty success on a failed read: a degrade the caller can surface.
         static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+        if (note_read_degrade(metrics_, kReasonSectionsQueryError, s).should_log)
             spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
                          pool_.last_error());
         return std::unexpected(CiReadError::kDegraded);
@@ -924,7 +929,7 @@ DeviceInventoryStore::get_device_ci_with_sections(std::string_view agent_id) {
         // The record read answered; only a section statement failed. Say so - never an
         // empty-sections success - and keep the record the caller may still need.
         static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+        if (note_read_degrade(metrics_, kReasonSectionsQueryError, s).should_log)
             spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
                          pool_.last_error());
         result.record->sections.clear();

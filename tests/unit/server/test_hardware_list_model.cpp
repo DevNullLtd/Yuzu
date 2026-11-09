@@ -28,6 +28,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <yuzu/metrics.hpp>
+
+#include "../test_log_capture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1794,25 +1797,154 @@ std::optional<std::string> failing_digest(std::string_view) {
 } // namespace
 
 // #7163: the reader's provider-failure branch, reached through the DigestFn seam. A section whose
-// stored digest is intact must NEVER be served ok when the server cannot recompute the digest.
+// stored digest is intact must NEVER be served ok when the server cannot recompute the digest, and
+// (owner ruling 2026-11-09) it carries its own token: the fault is the server's, not the rows'.
 TEST_CASE("verify_section_content: a failing digest provider is never served ok",
           "[hardware][model][sections][digest]") {
     const auto s = digested_section("cpu", "ok", "", cpu_rows(2));
     REQUIRE(verify_section_content(s).level == "ok"); // the default provider verifies it
     const auto v = verify_section_content(s, &failing_digest);
     CHECK(v.level == "constrained");
-    CHECK(v.reason == "server:content_digest_mismatch");
+    CHECK(v.reason ==
+          "server:content_digest_unverifiable"); // a server fault: not the mismatch token
+    CHECK(v.fault == SectionFault::Unverifiable);
     // An already-constrained section keeps its level and tokens and gains the digest token.
     const auto c = digested_section("cpu", "constrained", "server_cap:2", cpu_rows(2));
     const auto cv = verify_section_content(c, &failing_digest);
     CHECK(cv.level == "constrained");
-    CHECK(cv.reason == "server_cap:2;server:content_digest_mismatch");
+    CHECK(cv.reason == "server_cap:2;server:content_digest_unverifiable");
     // A section that needs no digest is not touched by a failing provider.
     auto none = digested_section("cpu", "ok", "", cpu_rows(2));
     none.content_digest.reset();
     CHECK(verify_section_content(none, &failing_digest).level == "ok");
     auto denied = digested_section("cpu", "permission_denied", "x", {});
     CHECK(verify_section_content(denied, &failing_digest).level == "permission_denied");
+}
+
+// ── #7159: the pure cause, the counter and the sampled WARN ────────────────────────────────────
+
+namespace {
+double integrity_count(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter("yuzu_hardware_section_integrity_total", {{"reason", reason}}).value();
+}
+} // namespace
+
+TEST_CASE(
+    "verify_section_content: the pure cause is None for an intact or agent-constrained section",
+    "[hardware][model][sections][digest][metrics]") {
+    CHECK(verify_section_content(digested_section("cpu", "ok", "", cpu_rows(2))).fault ==
+          SectionFault::None);
+    CHECK(
+        verify_section_content(digested_section("cpu", "constrained", "agent:partial", cpu_rows(2)))
+            .fault == SectionFault::None);
+    auto none = digested_section("cpu", "ok", "", cpu_rows(2));
+    none.content_digest.reset();
+    none.row_count.reset();
+    CHECK(verify_section_content(none).fault == SectionFault::None);
+    CHECK(section_fault_token(SectionFault::None).empty());
+    CHECK(section_fault_label(SectionFault::None).empty());
+}
+
+// The counted cause and the served token come from ONE verdict, so they cannot disagree: for each
+// of the three causes the served reason contains exactly that fault's token, and the label counted
+// for the same section is that fault's label.
+TEST_CASE(
+    "record_section_integrity: the counted cause equals the served token for the same section",
+    "[hardware][model][sections][digest][metrics]") {
+    struct Case {
+        DeviceCiSection section;
+        DigestFn digest;
+        SectionFault expect;
+        const char* label;
+        const char* token;
+    };
+    auto lost = digested_section("cpu", "ok", "", cpu_rows(3));
+    lost.rows.pop_back(); // count and digest both disagree: the count token alone
+    auto edited = digested_section("cpu", "ok", "", cpu_rows(2));
+    edited.rows[0][1] = "Edited"; // same count, different content
+    const auto intact = digested_section("cpu", "ok", "", cpu_rows(2));
+    const Case cases[] = {
+        {lost, nullptr, SectionFault::RowCount, "row_count_mismatch", "server:row_count_mismatch"},
+        {edited, nullptr, SectionFault::Content, "content_digest_mismatch",
+         "server:content_digest_mismatch"},
+        {intact, &failing_digest, SectionFault::Unverifiable, "digest_unverifiable",
+         "server:content_digest_unverifiable"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.label);
+        const auto verdict = verify_section_content(c.section, c.digest);
+        REQUIRE(verdict.fault == c.expect);
+        CHECK(verdict.reason.find(c.token) != std::string::npos);
+        CHECK(section_fault_token(verdict.fault) == c.token);
+        CHECK(section_fault_label(verdict.fault) == c.label);
+        yuzu::MetricsRegistry m;
+        record_section_integrity({c.section}, "agent-1", &m, c.digest);
+        for (const char* reason :
+             {"row_count_mismatch", "content_digest_mismatch", "digest_unverifiable"})
+            CHECK(integrity_count(m, reason) == (std::string_view(reason) == c.label ? 1.0 : 0.0));
+    }
+}
+
+TEST_CASE(
+    "record_section_integrity: one increment per faulted section per call, nothing for intact ones",
+    "[hardware][model][sections][digest][metrics]") {
+    yuzu::MetricsRegistry m;
+    auto lost = digested_section("cpu", "ok", "", cpu_rows(3));
+    lost.rows.pop_back();
+    auto lost_swap = digested_section("swap", "ok", "", Rows{{"a", "1", "2"}});
+    lost_swap.rows.clear();
+    auto edited = digested_section("cpu", "ok", "", cpu_rows(2));
+    edited.rows[0][1] = "Edited";
+    const std::vector<DeviceCiSection> sections = {
+        lost, digested_section("cpu", "ok", "", cpu_rows(2)), lost_swap, edited,
+        digested_section("cpu", "unavailable", "x", {})};
+    record_section_integrity(sections, "agent-1", &m);
+    CHECK(integrity_count(m, "row_count_mismatch") == 2.0);
+    CHECK(integrity_count(m, "content_digest_mismatch") == 1.0);
+    CHECK(integrity_count(m, "digest_unverifiable") == 0.0);
+    // Counts served reads, not distinct defects: the same call again doubles it.
+    record_section_integrity(sections, "agent-1", &m);
+    CHECK(integrity_count(m, "row_count_mismatch") == 4.0);
+    // An empty list (a v1 record, or nothing stored) counts nothing; a null registry is safe.
+    yuzu::MetricsRegistry empty;
+    record_section_integrity({}, "agent-1", &empty);
+    CHECK(integrity_count(empty, "row_count_mismatch") == 0.0);
+    record_section_integrity(sections, "agent-1", nullptr);
+}
+
+// The WARN names the device id and the section kind and never the row contents, and is sampled per
+// reason: the leading edge of an episode logs, the rest of that episode does not.
+TEST_CASE(
+    "record_section_integrity: the WARN names agent and kind, never row contents, and is sampled",
+    "[hardware][model][sections][digest][metrics]") {
+    reset_section_integrity_log_state_for_test();
+    auto lost = digested_section("cpu", "ok", "", cpu_rows(3));
+    lost.rows.pop_back();
+    lost.rows[0][1] = "SECRET-CPU-MODEL";
+    std::string logs;
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        record_section_integrity({lost}, "agent-warn", nullptr);
+        record_section_integrity({lost}, "agent-warn", nullptr); // same episode: no second line
+        cap.stop();
+        logs = cap.text();
+    }
+    CHECK(logs.find("agent=agent-warn") != std::string::npos);
+    CHECK(logs.find("kind=cpu") != std::string::npos);
+    CHECK(logs.find("reason=row_count_mismatch") != std::string::npos);
+    CHECK(logs.find("SECRET-CPU-MODEL") == std::string::npos);
+    const auto first = logs.find("section integrity fault");
+    REQUIRE(first != std::string::npos);
+    CHECK(logs.find("section integrity fault", first + 1) == std::string::npos); // sampled
+    // A different reason has its own episode and logs on its own leading edge.
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        auto edited = digested_section("cpu", "ok", "", cpu_rows(2));
+        edited.rows[0][1] = "Edited";
+        record_section_integrity({edited}, "agent-warn", nullptr);
+        cap.stop();
+        CHECK(cap.text().find("reason=content_digest_mismatch") != std::string::npos);
+    }
 }
 
 // Kills: verifying (or downgrading) a section that has no stored digest - the pre-feature path.
