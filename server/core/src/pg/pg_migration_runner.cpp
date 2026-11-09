@@ -83,8 +83,10 @@ bool exec_ok(PGconn* conn, const std::string& sql, std::string_view what, std::s
 
 // The heading the drift log line points at. Kept in one place so the log and the
 // header comment agree; docs/user-manual/upgrading.md must carry the same words
-// (nothing checks that mechanically, which is the defect #7164 had between a log
-// line and a renamed heading).
+// after a "Behaviour change: " prefix (tests/test_migration_drift_doc_heading.py,
+// suite docs, checks that: the defect #7164 had between a log line and a renamed
+// heading). That test reads this declaration, so keep it one plain string literal
+// (adjacent-literal concatenation is fine).
 constexpr const char* kDriftDocHeading =
     "a Postgres store refuses to open when its recorded migration differs from this build "
     "(the server stops, except for three stores)";
