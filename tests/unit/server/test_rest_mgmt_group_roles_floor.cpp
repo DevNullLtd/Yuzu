@@ -713,3 +713,139 @@ TEST_CASE("POST /management-groups/{id}/roles: a control byte in principal_id is
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].result == "success");
 }
+
+// ---------------------------------------------------------------------------
+// A well-formed id that names no group is a 404 (the caller's mistake), not a retryable 503,
+// and it writes no failure row. Ids that are not valid UTF-8 are refused 400 before the store.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("POST /management-groups/{id}/members: a group id naming no group answers 404 with no "
+          "audit row and no retry hint",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+
+    auto res = h.sink.Post("/api/v1/management-groups/deadbeef0000/members",
+                           R"({"agent_id":"agent-1"})");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(res->body.find("\"added\":true") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"] == "group not found");
+    CHECK_FALSE(body["error"]["retry_after_ms"].is_number());
+
+    CHECK(h.audits.empty());
+    CHECK(h.mgmt_bundle->get_members("deadbeef0000").empty());
+}
+
+TEST_CASE("POST /management-groups/{id}/roles: a group id naming no group answers 404 with no "
+          "audit row and no retry hint",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+
+    auto res = h.sink.Post("/api/v1/management-groups/deadbeef0000/roles",
+                           R"({"principal_id":"someone","role_name":"Viewer"})");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(res->body.find("\"assigned\":true") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"] == "group not found");
+    CHECK_FALSE(body["error"]["retry_after_ms"].is_number());
+
+    CHECK(h.audits.empty());
+    CHECK(h.mgmt_bundle->get_group_roles("deadbeef0000").empty());
+}
+
+TEST_CASE("POST /management-groups/{id}/roles: a store error on an existing group still answers "
+          "503 with a failure row",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-assign-fault");
+    drop_mgmt_table(h, "management_group_store.management_group_roles");
+
+    auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                           R"({"principal_id":"someone","role_name":"Viewer"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"assigned\":true") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_number());
+
+    CHECK(h.audit_count("management_group.assign_role", "success") == 0);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "management_group.assign_role");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].target_id == gid);
+    CHECK(h.audits[0].detail == "store_error");
+}
+
+TEST_CASE("POST /management-groups/{id}/roles: a role name with a control byte is refused 400 "
+          "with a denied row, not a 403",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-assign-role");
+
+    for (const char* body : {R"({"principal_id":"someone","role_name":"View\u0000er"})",
+                             R"({"principal_id":"someone","role_name":"View\ter"})",
+                             R"({"principal_id":"someone","role_name":"View\u001ber"})"}) {
+        INFO(body);
+        h.audits.clear();
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("role name must not contain control characters") !=
+              std::string::npos);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "management_group.assign_role");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].target_id == gid);
+        CHECK(h.audits[0].detail == "invalid_role_name");
+    }
+}
+
+TEST_CASE("POST /management-groups/{id}/members: a body that is not valid UTF-8 JSON is refused "
+          "400 and nothing is added",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-add-utf8");
+
+    const std::string body = std::string(R"({"agent_id":"a)") + "\xff" + R"(b"})";
+    auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/members", body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("\"added\":true") == std::string::npos);
+    CHECK(h.mgmt_bundle->get_members(gid).empty());
+    CHECK(h.audit_count("management_group.add_member", "success") == 0);
+    CHECK(h.audit_count("management_group.add_member", "failure") == 0);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: an agent id that is not valid UTF-8 is "
+          "refused 400 with a denied row and the member is kept",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-remove-utf8");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+
+    const std::vector<std::string> ids = {
+        std::string("agent") + "\xff" + "1",         // stray byte
+        std::string("agent") + "\xc0\x80" + "1",     // overlong NUL
+        std::string("agent") + "\xed\xa0\x80" + "1", // surrogate
+        std::string("agent") + "\xf4\x90\x80\x80",   // above U+10FFFF
+    };
+    for (const auto& id : ids) {
+        INFO("agent id length " << id.size());
+        h.audits.clear();
+        auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/members/" + id);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("\"removed\":true") == std::string::npos);
+        CHECK(h.mgmt_bundle->get_members(gid).size() == 1);
+
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "management_group.remove_member");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].target_id == gid);
+        CHECK(h.audits[0].detail == "invalid_agent_id");
+    }
+}

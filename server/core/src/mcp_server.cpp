@@ -6739,6 +6739,34 @@ MgmtGroupErrorInfo classify_mgmt_group_error(const std::string& msg) {
     return {kInvalidParams, -1};
 }
 
+// The management-group id fields reach a text bind: a control byte or an invalid
+// UTF-8 sequence is refused as invalid params instead of surfacing as a retryable
+// store fault. Twin: mgmt_text_ok in rest_api_v1.cpp (same rule).
+bool mgmt_text_ok(std::string_view s) {
+    if (!rbac_text_is_clean(s))
+        return false;
+    for (std::size_t i = 0; i < s.size();) {
+        if (static_cast<unsigned char>(s[i]) < 0x80) {
+            ++i;
+            continue;
+        }
+        const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
+        if (len == 0)
+            return false;
+        i += len;
+    }
+    return true;
+}
+
+// True only when the store answered authoritatively that the group does not
+// exist (a failed read is not "absent"). Used after a write failed to tell a
+// missing group (the caller's mistake) from a store fault. Twin: the same check
+// in rest_api_v1.cpp.
+bool mgmt_group_confirmed_absent(const ManagementGroupStore& store, const std::string& group_id) {
+    auto g = store.get_group_checked(group_id);
+    return g.has_value() && !g->has_value();
+}
+
 // KekOpResult::Failure → JSON-RPC error (#2395 track C). Reuses
 // kek_routes.hpp's `KekOpResult::Failure` classification directly (no
 // re-derivation) so REST and MCP answer identically for the same failure.
@@ -13341,12 +13369,9 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── add_management_group_member (B4, #2146 API-parity) ────────
-            // Mirrors POST /api/v1/management-groups/{id}/members. NOTE (out of
-            // scope for this PR, reported rather than silently fixed): the REST
-            // handler calls add_member() and ignores its std::expected result
-            // entirely, always reporting 201 — this tool DOES check it, since
-            // every other MCP write tool in this file does and check-mcp-retry-
-            // hints.py requires an honest outcome on a checked store call.
+            // Mirrors POST /api/v1/management-groups/{id}/members: both check the
+            // store result, and check-mcp-retry-hints.py requires an honest
+            // outcome on a checked store call.
             if (tool_name == "add_management_group_member") {
                 if (!tier_allows(tier, "ManagementGroup", "Write")) {
                     res.set_content(
@@ -13373,6 +13398,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         "group_id and agent_id must each be at most {} bytes", kMgmtGroupIdMaxLen));
                     return;
                 }
+                // Same refusal as the REST twin: a control byte or invalid UTF-8 in an id
+                // is invalid params, audited with a fixed detail (the value is never echoed).
+                if (!mgmt_text_ok(group_id) || !mgmt_text_ok(agent_id)) {
+                    const char* detail_token =
+                        !mgmt_text_ok(agent_id) ? "invalid_agent_id" : "invalid_group_id";
+                    (void)audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
+                                   audit_token(group_id), detail_token);
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "group_id and agent_id must not contain control characters or "
+                                 "invalid UTF-8"),
+                        "application/json");
+                    return;
+                }
                 if (!mgmt_store) {
                     res.set_content(a4_error(kInternalError, "Management group store unavailable",
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
@@ -13382,13 +13421,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto result = mgmt_store->add_member(group_id, agent_id);
                 if (!result) {
                     const auto info = classify_mgmt_group_error(result.error());
+                    // A well-formed id naming no group fails the membership foreign key:
+                    // not found (the sibling tools' answer), no failure row, no retry hint.
+                    if (info.retry_after_ms > 0 && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
+                        mcp_audit("denied", "group not found");
+                        res.set_content(a4_error(kInvalidParams, "group not found"),
+                                        "application/json");
+                        return;
+                    }
+                    spdlog::warn("add_management_group_member store failure: {}", result.error());
                     const bool audit_ok = audit_fn(req, "management_group.add_member", "failure",
-                                                   "ManagementGroup", group_id, result.error());
+                                                   "ManagementGroup", group_id, "store_error");
                     res.set_content(
-                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
-                                 {}, audit_ok),
+                        a4_error(info.code, "management group store unavailable", "retry shortly",
+                                 /*retry_after_ms=*/info.retry_after_ms, {}, audit_ok),
                         "application/json");
-                    mcp_audit("failure", result.error());
+                    mcp_audit("failure", "store_error");
                     return;
                 }
                 const bool audit_ok = audit_fn(req, "management_group.add_member", "success",
@@ -13533,6 +13581,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Checked before the closed role list so a role name holding a control byte
+                // or invalid UTF-8 is invalid params with its own denied row, not a
+                // permission error.
+                if (!mgmt_text_ok(role_name)) {
+                    (void)audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
+                                   audit_token(group_id), "invalid_role_name");
+                    res.set_content(a4_error(kInvalidParams,
+                                             "role name must not contain control characters"),
+                                    "application/json");
+                    return;
+                }
                 if (role_name != "Operator" && role_name != "Viewer") {
                     mcp_audit("denied", "only Operator and Viewer roles can be delegated");
                     res.set_content(
@@ -13558,6 +13617,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
+                // Same refusal as the REST twin: a control byte or invalid UTF-8 in a field
+                // is invalid params, audited with a fixed detail (the value is never echoed).
+                if (!mgmt_text_ok(group_id) || !mgmt_text_ok(principal_type) ||
+                    !mgmt_text_ok(principal_id)) {
+                    const char* detail_token = !mgmt_text_ok(principal_id)
+                                                   ? "invalid_principal_id"
+                                               : !mgmt_text_ok(principal_type)
+                                                   ? "invalid_principal_type"
+                                                   : "invalid_group_id";
+                    (void)audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
+                                   audit_token(group_id), detail_token);
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "group_id, principal_id and principal_type must not contain "
+                                 "control characters or invalid UTF-8"),
+                        "application/json");
+                    return;
+                }
+
                 GroupRoleAssignment assignment;
                 assignment.group_id = group_id;
                 assignment.principal_type = principal_type;
@@ -13567,14 +13645,32 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto result = mgmt_store->assign_role(assignment);
                 if (!result) {
                     const auto info = classify_mgmt_group_error(result.error());
+                    const bool store_fault = info.retry_after_ms > 0;
+                    // A well-formed id naming no group fails the role foreign key: not
+                    // found (the sibling tools' answer), no failure row, no retry hint.
+                    if (store_fault && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
+                        mcp_audit("denied", "group not found");
+                        res.set_content(a4_error(kInvalidParams, "group not found"),
+                                        "application/json");
+                        return;
+                    }
+                    if (store_fault)
+                        spdlog::warn("assign_management_group_role store failure: {}",
+                                     result.error());
+                    // A store fault is audited with a fixed detail and answered with a fixed
+                    // message; a store validation message (no libpq text) is passed through.
+                    const std::string fault_detail = store_fault ? "store_error" : result.error();
                     const bool audit_ok =
                         audit_fn(req, "management_group.assign_role", "failure", "ManagementGroup",
-                                 group_id, result.error());
+                                 group_id, fault_detail);
                     res.set_content(
-                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
-                                 {}, audit_ok),
+                        a4_error(info.code,
+                                 store_fault ? std::string("management group store unavailable")
+                                             : result.error(),
+                                 store_fault ? "retry shortly" : "",
+                                 /*retry_after_ms=*/info.retry_after_ms, {}, audit_ok),
                         "application/json");
-                    mcp_audit("failure", result.error());
+                    mcp_audit("failure", fault_detail);
                     return;
                 }
                 const bool audit_ok =
@@ -27419,8 +27515,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!rbac_text_is_clean(role_name)) {
                     (void)audit_fn(req, "engine_principal.role.assigned", "denied",
                                    "EnginePrincipal", principal_id, "invalid_role_name");
-                    res.set_content(error_response(id, kInvalidParams, "invalid role format"),
-                                    "application/json");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid role format: role name must not contain control "
+                                       "characters"),
+                        "application/json");
                     return;
                 }
 
@@ -27545,8 +27644,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!rbac_text_is_clean(role_name)) {
                     (void)audit_fn(req, "engine_principal.role.unassigned", "denied",
                                    "EnginePrincipal", principal_id, "invalid_role_name");
-                    res.set_content(error_response(id, kInvalidParams, "invalid role format"),
-                                    "application/json");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid role format: role name must not contain control "
+                                       "characters"),
+                        "application/json");
                     return;
                 }
                 // Idempotent DELETE (success even if the role was not held).
@@ -28008,8 +28110,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!rbac_text_is_clean(role_name)) {
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
                                    audit_token(principal_id), "invalid_role_name");
-                    res.set_content(error_response(id, kInvalidParams, "invalid role format"),
-                                    "application/json");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid role format: role name must not contain control "
+                                       "characters"),
+                        "application/json");
                     return;
                 }
                 const std::string role_id = [&] {

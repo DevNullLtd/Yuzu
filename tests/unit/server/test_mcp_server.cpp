@@ -51888,3 +51888,289 @@ TEST_CASE("MCP reevaluate_result_set: a NUL in the stored sql or parameters is r
         expect_refused(rs_id, "instruction_result");
     }
 }
+
+// ── management-group member and role tools: input refusal, missing group, store fault ──────────
+//
+// A control byte in an id is invalid params with a denied row carrying a fixed token (the value is
+// never echoed), a group id naming no group is the not-found answer (invalid params, no failure
+// row, no retry hint), and a store fault is an internal error with the fixed `store_error` detail.
+
+namespace {
+
+/// Drop one table of the per-test management-group schema so the next write to it fails.
+void mcp_drop_mgmt_table(const std::string& dsn, const char* qualified_table) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult d{
+        PQexec(conn.get(), (std::string("DROP TABLE ") + qualified_table).c_str())};
+    REQUIRE(d.ok());
+}
+
+} // namespace
+
+TEST_CASE("MCP add_management_group_member: a control byte in an id is refused as invalid params "
+          "with a denied row and nothing stored",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Member Validation";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+
+    struct Case {
+        std::string group_id;
+        std::string agent_id;
+        std::string token;
+    };
+    const std::vector<Case> cases = {
+        {gid, std::string("a\0b", 3), "invalid_agent_id"},
+        {gid, "a\tb", "invalid_agent_id"},
+        {gid, "a\x1b"
+              "b",
+         "invalid_agent_id"},
+        {gid, "a\x7f"
+              "b",
+         "invalid_agent_id"},
+        {gid + std::string("\0x", 2), "agent-1", "invalid_group_id"},
+        {gid + "\t", "agent-1", "invalid_group_id"},
+    };
+    for (const auto& c : cases) {
+        INFO("token " << c.token << ", agent id length " << c.agent_id.size());
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("add_management_group_member",
+                                             {{"group_id", c.group_id}, {"agent_id", c.agent_id}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(store.get_members(gid).empty());
+
+        const auto denied = wf_rows_since(ts, before, "management_group.add_member|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == c.token);
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|success").empty());
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|failure").empty());
+        for (const auto& detail : ts.audit_details)
+            CHECK(detail.find('\0') == std::string::npos);
+    }
+
+    // Clean controls (including a space and a multi-byte character) still add the member.
+    for (const std::string agent : {std::string("agent-1"), std::string("agent \xc3\xa9 2")}) {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("add_management_group_member",
+                                             {{"group_id", gid}, {"agent_id", agent}}));
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|success").size() == 1);
+    }
+    CHECK(store.get_members(gid).size() == 2);
+}
+
+TEST_CASE("MCP assign_management_group_role: a control byte in a field is refused as invalid "
+          "params with a denied row and nothing stored",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Role Validation";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+    // The rbac store is required to be non-null by the tool's gate and is never read here.
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start();
+
+    struct Case {
+        std::string group_id;
+        std::string principal_type;
+        std::string principal_id;
+        std::string role_name;
+        std::string token;
+    };
+    const std::vector<Case> cases = {
+        {gid, "user", "alice", std::string("Oper\0ator", 9), "invalid_role_name"},
+        {gid, "user", "alice", "Oper\tator", "invalid_role_name"},
+        {gid, "user", "alice", "Oper\x1b"
+                               "ator",
+         "invalid_role_name"},
+        {gid, "user", "alice", "Viewer\x7f", "invalid_role_name"},
+        {gid, "user", std::string("al\0ice", 6), "Operator", "invalid_principal_id"},
+        {gid, "user", "al\tice", "Operator", "invalid_principal_id"},
+        {gid, std::string("us\0er", 5), "alice", "Operator", "invalid_principal_type"},
+        {gid, "us\ter", "alice", "Operator", "invalid_principal_type"},
+        {gid + "\t", "user", "alice", "Operator", "invalid_group_id"},
+    };
+    for (const auto& c : cases) {
+        INFO("token " << c.token);
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", c.group_id},
+                                              {"principal_type", c.principal_type},
+                                              {"principal_id", c.principal_id},
+                                              {"role_name", c.role_name}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(store.get_group_roles(gid).empty());
+
+        const auto denied = wf_rows_since(ts, before, "management_group.assign_role|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == c.token);
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").empty());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|failure").empty());
+        for (const auto& detail : ts.audit_details)
+            CHECK(detail.find('\0') == std::string::npos);
+    }
+
+    // The clean control still assigns.
+    const auto before = ts.audit_log.size();
+    auto ok = ts.call(rs_tool_call_body("assign_management_group_role",
+                                        {{"group_id", gid},
+                                         {"principal_id", "alice"},
+                                         {"role_name", "Operator"}}));
+    REQUIRE(ok);
+    CHECK_FALSE(nlohmann::json::parse(ok->body).contains("error"));
+    CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").size() == 1);
+    CHECK(store.get_group_roles(gid).size() == 1);
+}
+
+TEST_CASE("MCP management-group member and role tools: a group id naming no group is the "
+          "not-found answer with no failure row and no retry hint",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start();
+    const std::string missing = "deadbeef0000";
+
+    SECTION("add_management_group_member") {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("add_management_group_member",
+                                             {{"group_id", missing}, {"agent_id", "agent-1"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "group not found");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(store.get_members(missing).empty());
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|failure").empty());
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|success").empty());
+    }
+
+    SECTION("assign_management_group_role") {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", missing},
+                                              {"principal_id", "alice"},
+                                              {"role_name", "Operator"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "group not found");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(store.get_group_roles(missing).empty());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|failure").empty());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").empty());
+    }
+}
+
+TEST_CASE("MCP management-group member and role tools: a store fault on an existing group is a "
+          "retryable internal error with the fixed store_error detail and no store text",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Fault Target";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start();
+
+    SECTION("add_management_group_member") {
+        mcp_drop_mgmt_table(db.dsn(), "management_group_store.management_group_members");
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("add_management_group_member",
+                                             {{"group_id", gid}, {"agent_id", "agent-1"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().find("failed") == std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_number());
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|success").empty());
+        const auto failure = wf_rows_since(ts, before, "management_group.add_member|failure");
+        REQUIRE(failure.size() == 1);
+        CHECK(failure.front() == "store_error");
+        const auto mcp_failure = wf_rows_since(ts, before, "mcp.add_management_group_member|failure");
+        REQUIRE(mcp_failure.size() == 1);
+        CHECK(mcp_failure.front() == "store_error");
+    }
+
+    SECTION("assign_management_group_role") {
+        mcp_drop_mgmt_table(db.dsn(), "management_group_store.management_group_roles");
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", gid},
+                                              {"principal_id", "alice"},
+                                              {"role_name", "Operator"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().find("failed") == std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_number());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").empty());
+        const auto failure = wf_rows_since(ts, before, "management_group.assign_role|failure");
+        REQUIRE(failure.size() == 1);
+        CHECK(failure.front() == "store_error");
+        const auto mcp_failure = wf_rows_since(ts, before, "mcp.assign_management_group_role|failure");
+        REQUIRE(mcp_failure.size() == 1);
+        CHECK(mcp_failure.front() == "store_error");
+    }
+}

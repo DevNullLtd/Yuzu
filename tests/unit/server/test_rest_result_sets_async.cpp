@@ -4981,7 +4981,7 @@ TEST_CASE("result-set producers: a NUL in the name, sql, a parameter or parent_i
                                      const std::string& kind) {
         CHECK(status == 400);
         CHECK(j["error"]["message"].get<std::string>() ==
-              "RESULT_SET_BAD_REQUEST: name, parameters, parent_id and matcher must not contain a "
+              "RESULT_SET_BAD_REQUEST: name, parameters and parent_id must not contain a "
               "NUL byte");
         CHECK(h.calls.empty()); // the dispatch mock recorded zero sends
         REQUIRE(h.audits.size() == 1);
@@ -5061,6 +5061,79 @@ TEST_CASE("result-set producers: a NUL in the name, sql, a parameter or parent_i
         h.post("/api/v1/result-sets/from-instruction-result", instr.dump(), status);
         CHECK(status == 202);
         CHECK(h.calls.size() == 2);
+        for (const auto& a : h.audits)
+            CHECK(a.result != "denied");
+    }
+}
+
+// The direct create route refuses a NUL byte in the name, the source kind or parent_id before any
+// store call, with the same denied row and wording as the three producers. Nothing is created.
+TEST_CASE("POST /api/v1/result-sets: a NUL in the name, source_kind or parent_id is refused with "
+          "400 and one denied audit row, nothing created",
+          "[pg][result_set][security][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    const auto expect_refused = [&h](int status, const nlohmann::json& j, const std::string& kind) {
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: name, parameters and parent_id must not contain a "
+              "NUL byte");
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "result_set.create");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].detail == "reason=field_contains_nul source_kind=" + kind);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    };
+
+    SECTION("a NUL in the name") {
+        nlohmann::json body;
+        body["name"] = std::string("a\0b", 3);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", body.dump(), status);
+        expect_refused(status, j, "manual_curate");
+    }
+
+    SECTION("a NUL in parent_id") {
+        nlohmann::json body;
+        body["name"] = "child";
+        body["source_kind"] = "echo_query";
+        body["parent_id"] = std::string("rs_a\0b", 6);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", body.dump(), status);
+        expect_refused(status, j, "echo_query");
+    }
+
+    SECTION("a NUL in source_kind") {
+        nlohmann::json body;
+        body["name"] = "x";
+        body["source_kind"] = std::string("echo\0query", 10);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", body.dump(), status);
+        // The audit detail carries the neutralised kind, never the raw byte.
+        CHECK(status == 400);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].detail.find('\0') == std::string::npos);
+        CHECK(h.audits[0].detail.rfind("reason=field_contains_nul source_kind=", 0) == 0);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+
+    SECTION("control: a clean name and parent_id still create the set") {
+        auto parent = h.seed_materialized("nul-control-parent", {"a1"});
+        h.audits.clear();
+        nlohmann::json body;
+        body["name"] = "clean";
+        body["source_kind"] = "echo_query";
+        body["source_payload"] = {{"sql", "SELECT 1"}};
+        body["parent_id"] = parent;
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets", body.dump(), status);
+        CHECK(status == 201);
         for (const auto& a : h.audits)
             CHECK(a.result != "denied");
     }

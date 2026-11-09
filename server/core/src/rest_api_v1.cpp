@@ -1724,8 +1724,8 @@ const std::string& openapi_spec() {
       "overview": ["A management group is a named set of devices. Groups form a tree under one built-in root group called All Devices. Operators use them to organise the fleet, and to give a person or team a role over the devices in one branch only.", "Group membership and group roles feed the device confinement that other API groups apply. A role held on a group reaches the agents in that group and in the groups below it. This group of calls manages the groups, their members and the roles delegated on them.", "The group routes check global grants on the ManagementGroup securable. The roles routes add one group-scoped path, ITServiceOwner of that group, described under access."],
       "how_it_works": [{"title": "Root group", "text": "At start the server creates the root group All Devices (id 000000000000) if it is missing. Every agent is added to it when it registers, directly or through a gateway."}, {"title": "Build the tree", "text": "Create groups with an optional parent id. Add agents to a group one at a time. Group names must be unique across the whole tree."}, {"title": "Delegate roles", "text": "Assign Operator or Viewer to a user or a group principal on a management group. No other role can be delegated here."}, {"title": "Scope applies", "text": "When RBAC enforcement is on, a role held on a group is resolved to the agents in that group and the groups below it. Other API groups then confine their device reads and actions to that set."}],
       "tables": [{"title": "Kinds of group", "caption": "How members arrive and what the calls in this group can change.", "columns": ["Kind", "How members arrive", "What these calls can do"], "rows": [["Root (All Devices)", "Every agent is added on registration.", "Rename or describe it. Delete is refused with 403 and a new parent is refused with 400."], ["Static group", "You add agents one at a time.", "Add and remove members."], ["Dynamic group", "Entries marked source dynamic, written only by the server.", "Remove member never deletes a dynamic entry."], ["Service group", "Created by the server when a service tag is written, named Service: followed by the tag value.", "Same as a dynamic group. Members are filled from agents holding the tag when it is created."]]}],
-      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written after a group is created.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written after an add member call.", "management_group.remove_member, written after a remove member call.", "management_group.assign_role, written after a role is assigned.", "management_group.unassign_role, written after a role is unassigned. All seven are written on success and the write result is not checked, so a failed audit write does not fail the request. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
-      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Writes that report success", "text": "Add member returns 201 and remove member returns 200 without checking the outcome, so an unknown group id, a store failure or an agent that was not a member still gets a success body. Unassign role also always returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
+      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written after a group is created.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written after an add member call. A control byte or invalid UTF-8 in agent_id is written as denied (detail invalid_agent_id) and a store fault as failure (detail store_error).", "management_group.remove_member, written after a remove member call, with the same denied and failure rows.", "management_group.assign_role, written after a role is assigned. A control byte or invalid UTF-8 in the role name, principal_id or principal_type is written as denied (detail invalid_role_name, invalid_principal_id or invalid_principal_type) and a store fault as failure (detail store_error).", "management_group.unassign_role, written after a role is unassigned, with the same denied and failure rows. The success rows are written only after the store reports success, and the audit write result is not checked, so a failed audit write does not fail the request. A group id that names no group answers 404 on add member and assign role and writes no row. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
+      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Write outcomes", "text": "Add member, remove member, assign role and unassign role answer success only after the store accepted the write. A control byte or invalid UTF-8 in an id is a 400, a group id naming no group on add member or assign role is a 404, and a store fault is a 503 with a retry hint. Removing an agent that was not a member, or unassigning a role that was not held, is not an error and still returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
       "docs": ["docs/user-manual/management-groups.md"]
     }},
 )json"
@@ -1968,25 +1968,25 @@ const std::string& openapi_spec() {
 )json"
         R"json(
     "/management-groups/{id}/members": {
-      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Member added", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}}}
+      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Member added", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}, "400": {"description": "agent_id missing, or it holds a control byte or invalid UTF-8"}, "404": {"description": "No management group has that id; nothing is written and no audit row is added"}, "503": {"description": "Store fault: nothing was added (retryable; envelope includes retry_after_ms)"}}}
     },
     "/management-groups/{id}/members/{agent_id}": {
-      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Member removed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}}}
+      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Member removed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}, "400": {"description": "agent_id holds a control byte or invalid UTF-8"}, "503": {"description": "Store fault: nothing was removed (retryable; envelope includes retry_after_ms)"}}}
     },
     "/management-groups/{id}/roles": {
       "get": {"operationId": "getManagementGroupsByIdRoles", "summary": "List roles assigned to a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of role assignments", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleListResponse"}}}}}},
-      "post": {"operationId": "postManagementGroupsByIdRoles", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_id", "role_name"], "properties": {"principal_type": {"type": "string", "default": "user"}, "principal_id": {"type": "string"}, "role_name": {"type": "string", "enum": ["Operator", "Viewer"], "description": "Only these two roles can be delegated; any other value is a 403."}}}}}}, "summary": "Assign a role on a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Role assigned", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleAssignedResponse"}}}}}},
-      "delete": {"operationId": "deleteManagementGroupsByIdRoles", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "description": "The body, not the URL, names the grant to remove.", "properties": {"principal_type": {"type": "string", "default": "user"}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}}}}}}, "summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleUnassignedResponse"}}}}}}
+      "post": {"operationId": "postManagementGroupsByIdRoles", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_id", "role_name"], "properties": {"principal_type": {"type": "string", "default": "user"}, "principal_id": {"type": "string"}, "role_name": {"type": "string", "enum": ["Operator", "Viewer"], "description": "Only these two roles can be delegated; any other value is a 403."}}}}}}, "summary": "Assign a role on a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Role assigned", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleAssignedResponse"}}}}, "400": {"description": "Invalid JSON, a missing field, a control byte or invalid UTF-8 in a field, or the store refuses the assignment as invalid"}, "404": {"description": "No management group has that id; nothing is written and no audit row is added"}, "503": {"description": "Store fault: nothing was assigned (retryable; envelope includes retry_after_ms)"}}},
+      "delete": {"operationId": "deleteManagementGroupsByIdRoles", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "description": "The body, not the URL, names the grant to remove.", "properties": {"principal_type": {"type": "string", "default": "user"}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}}}}}}, "summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleUnassignedResponse"}}}}, "400": {"description": "Invalid JSON, or a control byte or invalid UTF-8 in a field"}, "503": {"description": "Store fault: nothing was unassigned (retryable; envelope includes retry_after_ms)"}}}
     },
     "/management-groups/agent-count-preview": {
       "get": {"operationId": "getManagementGroupsAgentCountPreview", "summary": "Preview the agent count a would-be management group would match", "tags": ["Management Groups"], "description": "MCP twin: preview_management_group_agent_count. REST/MCP twin of the dashboard's /fragments/create-group-form live scoped count; this route and the MCP twin return the same result; the dashboard fragment computes its own equivalent count, except that for an over-bound filter it hides the count and shows a static sentence. Used before POST /api/v1/management-groups to preview how many currently-visible agents would match. Requires ManagementGroup:Write, matching the fragment's permission check exactly (only an operator who could create the group may preview it), not ManagementGroup:Read, even though this route performs no mutation. filters are supplied as repeated query params using the SAME mangling the fragment applies to a column name (lowercase, spaces/dashes -> underscore, e.g. Local Addr -> local_addr) but WITHOUT the fragment's f_ key prefix (supply local_addr, not f_local_addr); an empty filter set returns a genuine 0 (no scoped count to report), never a store read. Scope is the set of agents visible to the caller under Response:Read, with an elevated session getting the JIT full-fleet view. The response also carries unindexed_filter_keys (always present; empty when none): the mangled keys of any filter whose value is longer than 2048 bytes as ingest stores it (a NUL or invalid UTF-8 byte counts as 3), in a stable order (sorted by key) without duplicates. Such a value is not indexed in newly stored responses, so when this list is non-empty agent_count can be 0 or an undercount. Forensics-tier rows (those written by a plugin with an action on the Forensics securable) are counted only for a caller who also holds Forensics:Read: a global grant (there is no management-group-scoped read tier for these rows, so a grant scoped to a management group does not admit them), and with RBAC off Forensics:Read is administrator-only. For any other caller those rows are absent from the count, with no marker, so a low or zero count does NOT prove that no matching data exists. If the caller's Forensics authority cannot be determined the route answers a retryable 503 (retry_after_ms) instead of a partial count.", "parameters": [{"name": "command_id", "in": "query", "schema": {"type": "string"}, "description": "The response set's instruction/command id to count against"}, {"name": "plugin", "in": "query", "schema": {"type": "string"}, "description": "Plugin name whose response columns the filter keys are matched against"}], "responses": {"200": {"description": "{data: {agent_count, unindexed_filter_keys}, meta}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupAgentCountPreviewResponse"}}}}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks ManagementGroup:Write"}, "503": {"description": "Response store degraded (preview unavailable), or the caller's Forensics authority could not be determined (retryable); envelope includes retry_after_ms."}}}
     },
     "/engine-principals/{id}/roles": {
       "get": {"operationId": "getEnginePrincipalsByIdRoles", "summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/SecurityEngineRoleAssignment"}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "RBAC store unavailable"}}},
-      "post": {"operationId": "postEnginePrincipalsByIdRoles", "summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"assigned": {"type": "boolean"}, "principal_id": {"type": "string"}, "role": {"type": "string"}}, "required": ["assigned", "principal_id", "role"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller lacks Security:Write, or is an engine session (always refused)"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
+      "post": {"operationId": "postEnginePrincipalsByIdRoles", "summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"assigned": {"type": "boolean"}, "principal_id": {"type": "string"}, "role": {"type": "string"}}, "required": ["assigned", "principal_id", "role"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected / role name holds a control byte"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller lacks Security:Write, or is an engine session (always refused)"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
     },
     "/engine-principals/{id}/roles/{role}": {
-      "delete": {"operationId": "deleteEnginePrincipalsByIdRolesByRole", "summary": "Unassign a fleet-wide RBAC role from an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}, {"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned (idempotent — success even if not held)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"unassigned": {"type": "boolean", "description": "True even when the role was not held (idempotent)."}}, "required": ["unassigned"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller lacks Security:Write, or is an engine session (always refused)"}, "503": {"description": "RBAC store unavailable"}}}
+      "delete": {"operationId": "deleteEnginePrincipalsByIdRolesByRole", "summary": "Unassign a fleet-wide RBAC role from an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}, {"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned (idempotent — success even if not held)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"unassigned": {"type": "boolean", "description": "True even when the role was not held (idempotent)."}}, "required": ["unassigned"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "Role name holds a control byte"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller lacks Security:Write, or is an engine session (always refused)"}, "503": {"description": "RBAC store unavailable"}}}
     })json"
         // Split here so each raw-string literal stays under MSVC's 16,380-byte
         // C2026 cap. Adjacent string literals are concatenated at compile time,
@@ -4838,10 +4838,52 @@ void RestApiV1::register_routes(
             "application/json");
     };
 
+    // The member and role id fields reach a text bind: a control byte or an
+    // invalid UTF-8 sequence is refused up front (400) instead of becoming a
+    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (same rule).
+    const auto mgmt_text_ok = [](std::string_view s) {
+        if (!rbac_text_is_clean(s))
+            return false;
+        for (std::size_t i = 0; i < s.size();) {
+            if (static_cast<unsigned char>(s[i]) < 0x80) {
+                ++i;
+                continue;
+            }
+            const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
+            if (len == 0)
+                return false;
+            i += len;
+        }
+        return true;
+    };
+
+    // True only when the store answered authoritatively that the group does not
+    // exist (a failed read is not "absent"). Used after a write failed to tell a
+    // missing group (the caller's mistake, 404) from a store fault (503). Twin:
+    // the same check in mcp_server.cpp.
+    const auto mgmt_group_confirmed_absent = [](auto& store, const std::string& group_id) {
+        auto g = store->get_group_checked(group_id);
+        return g.has_value() && !g->has_value();
+    };
+
+    // The store reports a fault as "database not open", "pool acquire timed out"
+    // or "<verb> failed: ..."; every other message is a validation answer.
+    // Twin: classify_mgmt_group_error in mcp_server.cpp.
+    const auto mgmt_error_is_store_fault = [](const std::string& msg) {
+        return msg == "database not open" || msg == "pool acquire timed out" ||
+               msg.find("failed") != std::string::npos;
+    };
+
+    const auto mgmt_group_not_found = [](httplib::Response& res) {
+        res.status = 404;
+        res.set_content(detail::a4_error(res, "group not found"), "application/json");
+    };
+
     // Members
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
-              [perm_fn, audit_fn, mgmt_store, mgmt_write_failed](const httplib::Request& req,
-                                                                 httplib::Response& res) {
+              [perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
+               mgmt_group_confirmed_absent, mgmt_group_not_found](const httplib::Request& req,
+                                                                  httplib::Response& res) {
                   if (!perm_fn(req, res, "ManagementGroup", "Write"))
                       return;
                   if (!mgmt_store) {
@@ -4852,13 +4894,19 @@ void RestApiV1::register_routes(
 
                   auto group_id = req.matches[1].str();
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  if (body.is_discarded() || !body.is_object()) {
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "invalid JSON: body must be a JSON object"),
+                                      "application/json");
+                      return;
+                  }
                   auto agent_id = body.value("agent_id", "");
                   if (agent_id.empty()) {
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "agent_id required"), "application/json");
                       return;
                   }
-                  if (!rbac_text_is_clean(agent_id)) {
+                  if (!mgmt_text_ok(agent_id)) {
                       audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
                                group_id, "invalid_agent_id");
                       res.status = 400;
@@ -4866,7 +4914,14 @@ void RestApiV1::register_routes(
                                       "application/json");
                       return;
                   }
-                  if (!mgmt_store->add_member(group_id, agent_id)) {
+                  if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
+                      // A well-formed id naming no group fails the membership foreign
+                      // key: answer 404 (no failure row, no retry hint), not a retryable 503.
+                      if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
+                          mgmt_group_not_found(res);
+                          return;
+                      }
+                      spdlog::warn("management_group.add_member store failure: {}", added.error());
                       audit_fn(req, "management_group.add_member", "failure", "ManagementGroup",
                                group_id, "store_error");
                       mgmt_write_failed(res);
@@ -4880,8 +4935,8 @@ void RestApiV1::register_routes(
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
-        [perm_fn, audit_fn, mgmt_store, mgmt_write_failed](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [perm_fn, audit_fn, mgmt_store, mgmt_write_failed,
+         mgmt_text_ok](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Write"))
                 return;
             if (!mgmt_store) {
@@ -4892,7 +4947,7 @@ void RestApiV1::register_routes(
 
             auto group_id = req.matches[1].str();
             auto agent_id = req.matches[2].str();
-            if (!rbac_text_is_clean(agent_id)) {
+            if (!mgmt_text_ok(agent_id)) {
                 audit_fn(req, "management_group.remove_member", "denied", "ManagementGroup",
                          group_id, "invalid_agent_id");
                 res.status = 400;
@@ -4900,7 +4955,8 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            if (!mgmt_store->remove_member(group_id, agent_id)) {
+            if (auto removed = mgmt_store->remove_member(group_id, agent_id); !removed) {
+                spdlog::warn("management_group.remove_member store failure: {}", removed.error());
                 audit_fn(req, "management_group.remove_member", "failure", "ManagementGroup",
                          group_id, "store_error");
                 mgmt_write_failed(res);
@@ -4989,8 +5045,9 @@ void RestApiV1::register_routes(
              });
 
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
-              [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
-                                                                   httplib::Response& res) {
+              [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store, mgmt_write_failed, mgmt_text_ok,
+               mgmt_group_confirmed_absent, mgmt_group_not_found,
+               mgmt_error_is_store_fault](const httplib::Request& req, httplib::Response& res) {
                   auto session = auth_fn(req, res);
                   if (!session)
                       return;
@@ -5016,6 +5073,18 @@ void RestApiV1::register_routes(
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "principal_id and role_name required"),
                                       "application/json");
+                      return;
+                  }
+
+                  // Checked before the closed role list so a role name holding a control byte
+                  // or invalid UTF-8 is a 400 with its own denied row, not a generic 403.
+                  if (!mgmt_text_ok(role_name)) {
+                      audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
+                               group_id, "invalid_role_name");
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, "role name must not contain control characters"),
+                          "application/json");
                       return;
                   }
 
@@ -5053,20 +5122,16 @@ void RestApiV1::register_routes(
                       return;
                   }
 
-                  if (!rbac_text_is_clean(principal_type) || !rbac_text_is_clean(principal_id) ||
-                      !rbac_text_is_clean(role_name)) {
-                      const char* detail_token = !rbac_text_is_clean(role_name)
-                                                     ? "invalid_role_name"
-                                                 : !rbac_text_is_clean(principal_id)
+                  if (!mgmt_text_ok(principal_type) || !mgmt_text_ok(principal_id)) {
+                      const char* detail_token = !mgmt_text_ok(principal_id)
                                                      ? "invalid_principal_id"
                                                      : "invalid_principal_type";
                       audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
                                group_id, detail_token);
                       res.status = 400;
-                      res.set_content(
-                          detail::a4_error(res, "role_name, principal_id and principal_type must not "
-                                                "contain control characters"),
-                          "application/json");
+                      res.set_content(detail::a4_error(res, "principal_id and principal_type must "
+                                                            "not contain control characters"),
+                                      "application/json");
                       return;
                   }
 
@@ -5078,6 +5143,20 @@ void RestApiV1::register_routes(
 
                   auto result = mgmt_store->assign_role(assignment);
                   if (!result) {
+                      if (mgmt_error_is_store_fault(result.error())) {
+                          // A well-formed id naming no group fails the role foreign key:
+                          // 404 with no failure row; any other store fault is a 503.
+                          if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
+                              mgmt_group_not_found(res);
+                              return;
+                          }
+                          spdlog::warn("management_group.assign_role store failure: {}",
+                                       result.error());
+                          audit_fn(req, "management_group.assign_role", "failure",
+                                   "ManagementGroup", group_id, "store_error");
+                          mgmt_write_failed(res);
+                          return;
+                      }
                       res.status = 400;
                       res.set_content(detail::a4_error(res, result.error()), "application/json");
                       return;
@@ -5090,8 +5169,8 @@ void RestApiV1::register_routes(
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
-        [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store,
-         mgmt_write_failed](const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store, mgmt_write_failed,
+         mgmt_text_ok](const httplib::Request& req, httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -5135,24 +5214,30 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            if (!rbac_text_is_clean(principal_type) || !rbac_text_is_clean(principal_id) ||
-                !rbac_text_is_clean(role_name)) {
-                const char* detail_token = !rbac_text_is_clean(role_name)
-                                               ? "invalid_role_name"
-                                           : !rbac_text_is_clean(principal_id)
+            if (!mgmt_text_ok(principal_type) || !mgmt_text_ok(principal_id) ||
+                !mgmt_text_ok(role_name)) {
+                const bool role_bad = !mgmt_text_ok(role_name);
+                const char* detail_token = role_bad ? "invalid_role_name"
+                                           : !mgmt_text_ok(principal_id)
                                                ? "invalid_principal_id"
                                                : "invalid_principal_type";
                 audit_fn(req, "management_group.unassign_role", "denied", "ManagementGroup",
                          group_id, detail_token);
                 res.status = 400;
                 res.set_content(
-                    detail::a4_error(res, "role_name, principal_id and principal_type must not "
-                                          "contain control characters"),
+                    detail::a4_error(res, role_bad ? "role name must not contain control "
+                                                     "characters"
+                                                   : "principal_id and principal_type must not "
+                                                     "contain control characters"),
                     "application/json");
                 return;
             }
 
-            if (!mgmt_store->unassign_role(group_id, principal_type, principal_id, role_name)) {
+            if (auto unassigned =
+                    mgmt_store->unassign_role(group_id, principal_type, principal_id, role_name);
+                !unassigned) {
+                spdlog::warn("management_group.unassign_role store failure: {}",
+                             unassigned.error());
                 audit_fn(req, "management_group.unassign_role", "failure", "ManagementGroup",
                          group_id, "store_error");
                 mgmt_write_failed(res);
@@ -5343,7 +5428,7 @@ void RestApiV1::register_routes(
                                                     "EnginePrincipal", principal_id,
                                                     "invalid_role_name");
                 res.status = 400;
-                res.set_content(detail::a4_error(res, "role must not contain control characters"),
+                res.set_content(detail::a4_error(res, "role name must not contain control characters"),
                                 "application/json");
                 return;
             }
@@ -5462,7 +5547,7 @@ void RestApiV1::register_routes(
                                                     "EnginePrincipal", principal_id,
                                                     "invalid_role_name");
                 res.status = 400;
-                res.set_content(detail::a4_error(res, "role must not contain control characters"),
+                res.set_content(detail::a4_error(res, "role name must not contain control characters"),
                                 "application/json");
                 return;
             }
@@ -14401,8 +14486,9 @@ void RestApiV1::register_routes(
             // A value with an embedded NUL cannot be stored in the result-set row, and the row is
             // written AFTER the command has been dispatched. Refuse it here, before anything is
             // sent, so a command is never run and then reported as failed. The checked values are
-            // the name, every dispatched parameter key and value, and a string parent_id; the
-            // matcher and source payload checks are kept as defence in depth.
+            // the name, every dispatched parameter key and value, and a string parent_id. The
+            // matcher and source payload checks are defence in depth only: the request body
+            // builder escapes a NUL when it serialises, so neither can carry one from a request.
             const auto has_nul = [](std::string_view v) {
                 return v.find('\0') != std::string_view::npos;
             };
@@ -14426,7 +14512,7 @@ void RestApiV1::register_routes(
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
                 rs_err(res, 400,
-                       "RESULT_SET_BAD_REQUEST: name, parameters, parent_id and matcher must not "
+                       "RESULT_SET_BAD_REQUEST: name, parameters and parent_id must not "
                        "contain a NUL byte");
                 return;
             }
@@ -14924,6 +15010,30 @@ void RestApiV1::register_routes(
                     rs_err(res, 400,
                            std::format("source_kind must be at most {} bytes",
                                        yuzu::server::mcp::kResultSetSourceKindMaxLen));
+                    return;
+                }
+            }
+            // A NUL byte in a stored text value cannot be kept in the row: refuse it before
+            // any store call, with the same denied row and wording as the three producers.
+            {
+                const auto has_nul = [](std::string_view v) {
+                    return v.find('\0') != std::string_view::npos;
+                };
+                const std::string nul_kind =
+                    body.contains("source_kind")
+                        ? body["source_kind"].get<std::string>()
+                        : std::string(source_kind::kManualCurate);
+                if (has_nul(body.value("name", "")) || has_nul(nul_kind) ||
+                    (body.contains("parent_id") && body["parent_id"].is_string() &&
+                     has_nul(body["parent_id"].get_ref<const std::string&>()))) {
+                    const bool nul_audit_ok = audit_fn(
+                        req, "result_set.create", "denied", "ResultSet", "",
+                        "reason=field_contains_nul source_kind=" + audit_token(nul_kind));
+                    if (!nul_audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    rs_err(res, 400,
+                           "RESULT_SET_BAD_REQUEST: name, parameters and parent_id must not "
+                           "contain a NUL byte");
                     return;
                 }
             }
