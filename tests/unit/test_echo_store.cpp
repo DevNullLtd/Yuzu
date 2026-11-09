@@ -14,6 +14,7 @@
 #include "test_log_capture.hpp"
 
 #include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption
+#include <sqlite_quarantine.hpp>                   // the shared no-overwrite quarantine move
 
 #include <sqlite3.h> // raw handle for the reopen-after-DROP upgrade simulation
 
@@ -24,11 +25,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -2425,6 +2428,20 @@ struct AclDir {
 
 constexpr const char* kFiles[] = {"", "-wal", "-shm", "-journal"};
 
+// True when `dir` is on NTFS or ReFS. Hard links need one of them, so a hard-link case run from a
+// temp dir on FAT/exFAT or a network share would fail at its set-up, not in the code it tests.
+bool volume_has_hard_links(const fs::path& dir) {
+    wchar_t root[MAX_PATH] = {};
+    if (!::GetVolumePathNameW(dir.c_str(), root, MAX_PATH))
+        return false;
+    wchar_t fs_name[MAX_PATH] = {};
+    DWORD flags = 0;
+    if (!::GetVolumeInformationW(root, nullptr, 0, nullptr, nullptr, &flags, fs_name, MAX_PATH))
+        return false;
+    const std::wstring name = fs_name;
+    return name == L"NTFS" || name == L"ReFS";
+}
+
 } // namespace
 
 TEST_CASE("EchoDatabase (Windows): a fresh db and its sidecars are created owner-only",
@@ -2514,6 +2531,8 @@ TEST_CASE("EchoDatabase (Windows): a foreign-owned echo.db refuses the open",
 TEST_CASE("EchoDatabase (Windows): a hard-linked sidecar is replaced and its target left alone",
           "[echo][store][lifecycle][hardening]") {
     AclDir d;
+    if (!volume_has_hard_links(d.dir.path))
+        SKIP("the temp directory's volume is not NTFS or ReFS: no hard links");
     { REQUIRE(EchoDatabase::open(d.db).has_value()); } // created, then closed
     const fs::path decoy = d.dir.path / "decoy.bin"; // ours, inherits the directory's Users ACE
     { std::ofstream(decoy, std::ios::binary) << "not a wal"; }
@@ -2542,6 +2561,8 @@ TEST_CASE("EchoDatabase (Windows): a hard-linked sidecar is replaced and its tar
 TEST_CASE("EchoDatabase (Windows): a hard-linked echo.db refuses the open",
           "[echo][store][lifecycle][hardening]") {
     AclDir d;
+    if (!volume_has_hard_links(d.dir.path))
+        SKIP("the temp directory's volume is not NTFS or ReFS: no hard links");
     { REQUIRE(EchoDatabase::open(d.db).has_value()); } // created, then closed
     const fs::path alias = d.dir.path / "alias.db";
     std::error_code ec;
@@ -2589,6 +2610,45 @@ TEST_CASE("EchoDatabase (Windows): a foreign sidecar that denies WRITE_DAC is st
     const std::string owner = owner_sid(wal);
     CHECK((owner == token_user_sid() || owner == kSystem || owner == kAdministrators));
     assert_owner_only(wal);
+}
+
+// #6362. A planted sidecar that is read-only is refused by DeleteFileW (access denied), which would
+// leave the foreign file in place and stop the open: it is deleted through a handle with POSIX
+// semantics that ignore the read-only attribute.
+TEST_CASE("EchoDatabase (Windows): a foreign read-only sidecar is still replaced",
+          "[echo][store][lifecycle][hardening]") {
+    if (!enable_restore_privilege())
+        SKIP("SeRestorePrivilege unavailable");
+    AclDir d;
+    { REQUIRE(EchoDatabase::open(d.db).has_value()); } // created, then closed
+    const fs::path wal = d.file("-wal");
+    { std::ofstream plant(wal, std::ios::binary | std::ios::trunc); }
+    REQUIRE(::SetFileAttributesW(wal.c_str(), FILE_ATTRIBUTE_READONLY)); // before the owner change
+    set_owner(wal, kUsers);
+
+    auto reopened = EchoDatabase::open(d.db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->set_config("acl_probe", "1"));
+    const std::string owner = owner_sid(wal);
+    CHECK((owner == token_user_sid() || owner == kSystem || owner == kAdministrators));
+    CHECK((::GetFileAttributesW(wal.c_str()) & FILE_ATTRIBUTE_READONLY) == 0); // the new file
+    assert_owner_only(wal);
+}
+
+// #1527. A junction at the database path is a reparse point std::filesystem may not call a symlink.
+TEST_CASE("EchoDatabase (Windows): a junction at echo.db is refused",
+          "[echo][store][lifecycle][hardening]") {
+    AclDir d;
+    const fs::path target = d.dir.path / "junction_target";
+    REQUIRE(fs::create_directories(target));
+    // mklink /J needs no privilege; a directory junction at a name SQLite would open as a file.
+    const std::string cmd = "cmd /c mklink /J \"" + d.db.string() + "\" \"" + target.string() +
+                            "\" >nul 2>&1";
+    if (std::system(cmd.c_str()) != 0 || !fs::exists(d.db))
+        SKIP("cannot create a junction here");
+    auto refused = EchoDatabase::open(d.db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("symbolic link or reparse point") != std::string::npos);
 }
 #endif // _WIN32
 
@@ -3721,6 +3781,327 @@ TEST_CASE("adopt_legacy_echo_db: a rename that cannot complete fails closed and 
     REQUIRE_FALSE(opened.has_value());
     CHECK(opened.error().find("tar.db") != std::string::npos);
     CHECK_FALSE(fs::exists(echo_db));
+}
+
+// ── Echo open hardening: busy, links, shared quarantine, planted-file self-heal ──────────
+//
+// Helpers (SqliteOwner, exec_sql, slurp_file, spit_file, make_legacy_tar_db*, ScratchDir) come from
+// the adoption block above.
+namespace {
+
+namespace sq = yuzu::shared::sqlite_quarantine;
+
+// Names in `dir` that start with `prefix`.
+std::vector<std::string> names_with_prefix(const fs::path& dir, const std::string& prefix) {
+    std::vector<std::string> out;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        const std::string n = e.path().filename().string();
+        if (n.rfind(prefix, 0) == 0)
+            out.push_back(n);
+    }
+    return out;
+}
+
+// A closed, healthy echo.db with one recognisable config row.
+fs::path make_healthy_echo_db(const fs::path& dir) {
+    REQUIRE(fs::create_directories(dir));
+    const auto db = dir / "echo.db";
+    auto opened = EchoDatabase::open(db);
+    REQUIRE(opened.has_value());
+    REQUIRE(opened->set_config("process_enabled", "false")); // a paused source: must survive
+    return db;
+}
+
+} // namespace
+
+// #7286. echo.db is WAL-mode, so a plain BEGIN IMMEDIATE writer would NOT block a reader and this
+// case would pass green without proving anything. A connection in locking_mode=EXCLUSIVE does:
+// it bypasses the wal-index and holds the file, so every other connection's first read returns
+// SQLITE_BUSY once its busy handler expires. The case records the rc that integrity_check sees on
+// a connection configured like open()'s (busy timeout 0 here, so the probe itself does not wait),
+// asserts it is BUSY, and then asserts open() refuses WITHOUT moving the file. open() waits out
+// its full 5 s busy timeout once: acceptable for a boot-time call, and the only wait in the case.
+TEST_CASE("EchoDatabase: a busy echo.db is refused and never quarantined (#7286)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_busy_"};
+    const auto db = make_healthy_echo_db(dir.path);
+
+    auto holder = std::make_unique<SqliteOwner>();
+    REQUIRE(sqlite3_open_v2(db.string().c_str(), &holder->db, SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK);
+    exec_sql(holder->db, "PRAGMA locking_mode=EXCLUSIVE");
+    exec_sql(holder->db, "BEGIN IMMEDIATE");
+    exec_sql(holder->db, "INSERT OR REPLACE INTO echo_config(key, value) VALUES ('busy_probe', '1')");
+
+    {   // What the integrity stage observes: BUSY (or LOCKED), not a snapshot read.
+        SqliteOwner probe;
+        REQUIRE(sqlite3_open_v2(db.string().c_str(), &probe.db, SQLITE_OPEN_READWRITE, nullptr) ==
+                SQLITE_OK);
+        sqlite3_busy_timeout(probe.db, 0);
+        sqlite3_stmt* raw = nullptr;
+        int rc = sqlite3_prepare_v2(probe.db, "PRAGMA integrity_check", -1, &raw, nullptr);
+        if (rc == SQLITE_OK)
+            rc = sqlite3_step(raw);
+        sqlite3_finalize(raw);
+        INFO("observed rc at the integrity stage = " << rc << " (" << sqlite3_errstr(rc) << ")");
+        CHECK(((rc & 0xff) == SQLITE_BUSY || (rc & 0xff) == SQLITE_LOCKED));
+    }
+
+    auto refused = EchoDatabase::open(db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("busy") != std::string::npos);
+    CHECK(refused.error().find("not quarantined") != std::string::npos);
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty()); // nothing moved aside
+    CHECK(fs::exists(db));
+
+    exec_sql(holder->db, "COMMIT");
+    holder.reset();
+
+    // The holder is gone: the very same file opens, healthy, with its paused source intact.
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    CHECK_FALSE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->get_config("process_enabled", "true") == "false");
+    CHECK(reopened->get_config("busy_probe", "") == "1");
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+}
+
+TEST_CASE("EchoDatabase: a genuinely corrupt echo.db is still quarantined, and its handle is closed (#7286, #6698)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_stillcorrupt_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    for (const char* sfx : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db.string() + sfx}, ec);
+    }
+    spit_file(db, "this is not a SQLite database -- busy change must not hide it");
+
+    {
+        auto reopened = EchoDatabase::open(db);
+        REQUIRE(reopened.has_value());
+        REQUIRE(reopened->quarantined_this_open().has_value());
+        CHECK(reopened->get_config("process_enabled", "true") == "true"); // fresh database
+    }
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").size() == 1);
+
+    // The failed-integrity handle was closed exactly once: nothing still holds the file, so a raw
+    // connection takes the exclusive lock at once (a leaked handle would answer SQLITE_BUSY).
+    SqliteOwner o;
+    REQUIRE(sqlite3_open_v2(db.string().c_str(), &o.db, SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK);
+    sqlite3_busy_timeout(o.db, 0);
+    CHECK(sqlite3_exec(o.db, "BEGIN EXCLUSIVE", nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_exec(o.db, "ROLLBACK", nullptr, nullptr, nullptr);
+}
+
+// #1527. A link at the database path (or a sidecar) is refused before anything is opened, moved or
+// secured; the link's target is never touched. A dangling link is refused as well. Windows needs a
+// privilege to create a symlink, so the case skips where it cannot; the junction/reparse arm is
+// exercised on the Windows leg only.
+TEST_CASE("EchoDatabase: a symlink at echo.db or a sidecar is refused (#1527)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
+        for (const bool dangling : {false, true}) {
+            INFO("suffix='" << suffix << "' dangling=" << dangling);
+            yuzu::test::TempDir dir{"yuzu_test_echo_link_"};
+            REQUIRE(fs::create_directories(dir.path));
+            const auto db = dir.path / "echo.db";
+            const fs::path target = dir.path / "elsewhere.bin";
+            if (!dangling)
+                spit_file(target, "target bytes");
+            const fs::path link{db.string() + suffix};
+            std::error_code ec;
+            fs::create_symlink(target, link, ec);
+            if (ec)
+                SKIP("cannot create a symlink here: " << ec.message());
+
+            auto refused = EchoDatabase::open(db);
+            REQUIRE_FALSE(refused.has_value());
+            CHECK(refused.error().find("symbolic link or reparse point") != std::string::npos);
+            CHECK(fs::is_symlink(link));                      // not replaced, not followed
+            CHECK(fs::exists(target) == !dangling);           // nothing created through it
+            if (!dangling)
+                CHECK(slurp_file(target) == "target bytes");   // never opened or quarantined
+            CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+        }
+    }
+}
+
+#ifndef _WIN32
+// #6366. A non-empty -wal beside a corrupt echo.db is evidence. A second connection keeps the WAL
+// open (and un-checkpointed) across the corrupt reopen, as a concurrent reader would; the quarantine
+// must carry the WAL byte for byte and leave nothing byte-ful beside the fresh database.
+TEST_CASE("EchoDatabase: a non-empty -wal held open by another connection travels with the quarantine (#6366)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_realwal_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path wal{db.string() + "-wal"};
+
+    SqliteOwner keeper;
+    REQUIRE(sqlite3_open_v2(db.string().c_str(), &keeper.db, SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK);
+    exec_sql(keeper.db, "PRAGMA journal_mode=WAL");
+    exec_sql(keeper.db, "PRAGMA wal_autocheckpoint=0");
+    exec_sql(keeper.db, "INSERT OR REPLACE INTO echo_config(key, value) VALUES ('wal_row', 'x')");
+    REQUIRE(fs::exists(wal));
+    REQUIRE(fs::file_size(wal) > 0);
+    const std::string wal_bytes = slurp_file(wal);
+    spit_file(db, "this is not a SQLite database -- corrupt main file beside a live WAL");
+
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->quarantined_this_open().has_value());
+    const std::string qfile = reopened->get_config("db_health_last_quarantine_file", "");
+    REQUIRE_FALSE(qfile.empty());
+    REQUIRE(fs::exists(dir.path / (qfile + "-wal")));
+    CHECK(slurp_file(dir.path / (qfile + "-wal")) == wal_bytes); // byte for byte
+    CHECK((!fs::exists(wal) || slurp_file(wal) != wal_bytes));   // not replayed by the fresh file
+}
+
+TEST_CASE("EchoDatabase: a rollback journal beside echo.db is owner-only after open (#6366)",
+          "[echo][store][lifecycle][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_jmode_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path journal{db.string() + "-journal"};
+    spit_file(journal, ""); // empty: not hot, so SQLite leaves it and open() only re-modes it
+    std::error_code ec;
+    fs::permissions(journal, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
+                                 fs::perms::others_read,
+                    fs::perm_options::replace, ec);
+    REQUIRE_FALSE(ec);
+
+    auto opened = EchoDatabase::open(db);
+    REQUIRE(opened.has_value());
+    REQUIRE(fs::exists(journal));
+    CHECK((fs::status(journal).permissions() & fs::perms::mask) ==
+          (fs::perms::owner_read | fs::perms::owner_write));
+}
+#endif // !_WIN32
+
+// #6914 / #1527. The shared quarantine, driven through its seam: a sidecar whose rename fails is
+// copied before the original goes, and two claims in the same second never overwrite each other.
+TEST_CASE("sqlite_quarantine: the echo database files keep their evidence (#6914, #1527)",
+          "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_sharedq_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    spit_file(db, "main one");
+    spit_file(fs::path{db.string() + "-wal"}, "wal one");
+
+    sq::FsOps fail_move;
+    fail_move.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    const auto first = sq::quarantine_corrupt_db(db, 100, fail_move);
+    REQUIRE(first.dest.has_value());
+    CHECK(slurp_file(fs::path{first.dest->string() + "-wal"}) == "wal one"); // copied, then removed
+    CHECK_FALSE(fs::exists(fs::path{db.string() + "-wal"}));
+
+    spit_file(db, "main two");
+    const auto second = sq::quarantine_corrupt_db(db, 100); // same second
+    REQUIRE(second.dest.has_value());
+    CHECK(*second.dest != *first.dest);
+    CHECK(slurp_file(*first.dest) == "main one"); // not overwritten
+    CHECK(slurp_file(*second.dest) == "main two");
+
+    spit_file(db, "main three");
+    const auto clamped = sq::quarantine_corrupt_db(db, -5);
+    REQUIRE(clamped.dest.has_value());
+    CHECK(clamped.dest->filename().string() == "echo.db.corrupt-0");
+}
+
+// #6695. The both-present arm's decisions, driven with a fake owner probe so they run on every
+// host (the real Windows probe is EchoDbOwnerProbe; it is exercised on the Windows leg).
+namespace {
+
+using yuzu::agent::EchoFileOwner;
+
+// Probe by file name: anything not listed is ours.
+yuzu::agent::EchoOwnerProbe probe_by_name(std::map<std::string, EchoFileOwner> table) {
+    return [table = std::move(table)](const fs::path& f) {
+        const auto it = table.find(f.filename().string());
+        return it == table.end() ? EchoFileOwner::ours : it->second;
+    };
+}
+
+} // namespace
+
+TEST_CASE("adopt_legacy_echo_db: a foreign-owned echo.db beside tar.db is moved aside alone and tar.db adopted (#6695)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(echo_db, "planted by another account");
+
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(
+                echo_db, probe_by_name({{"echo.db", EchoFileOwner::foreign}}))
+                .has_value());
+    const auto planted = names_with_prefix(d.path(), "echo.db.planted-");
+    REQUIRE(planted.size() == 1);
+    CHECK(slurp_file(d.path() / planted[0]) == "planted by another account"); // kept as evidence
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    auto db = EchoDatabase::open(echo_db);
+    REQUIRE(db.has_value());
+    CHECK(db->get_config("wal_marker", "") == "x"); // the legitimate WAL-only row came along
+}
+
+TEST_CASE("adopt_legacy_echo_db: an owner-verified echo.db wins and nothing is moved (#6695)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db(d.path());
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(echo_db, "ours");
+
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db, probe_by_name({})).has_value());
+    CHECK(slurp_file(echo_db) == "ours");
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK(names_with_prefix(d.path(), "echo.db.planted-").empty());
+}
+
+TEST_CASE("adopt_legacy_echo_db: an owner that cannot be resolved moves nothing (#6695)",
+          "[echo][store][adopt]") {
+    for (const auto& unresolved : {std::string{"echo.db"}, std::string{"echo.db-wal"}}) {
+        INFO("unresolvable: " << unresolved);
+        ScratchDir d;
+        make_legacy_tar_db(d.path());
+        const auto echo_db = d.path() / "echo.db";
+        spit_file(echo_db, "maybe planted");
+        spit_file(d.path() / "echo.db-wal", "maybe a wal");
+        // echo.db-wal unresolvable, echo.db foreign -> still nothing moves; echo.db unresolvable -> same.
+        auto table = std::map<std::string, EchoFileOwner>{{unresolved, EchoFileOwner::unknown}};
+        if (unresolved != "echo.db")
+            table["echo.db"] = EchoFileOwner::foreign;
+
+        REQUIRE(yuzu::agent::adopt_legacy_echo_db(echo_db, probe_by_name(table)).has_value());
+        CHECK(slurp_file(echo_db) == "maybe planted");
+        CHECK(slurp_file(d.path() / "echo.db-wal") == "maybe a wal");
+        CHECK(fs::exists(d.path() / "tar.db"));
+        CHECK(names_with_prefix(d.path(), "echo.db.planted-").empty());
+    }
+}
+
+// The documented resume state is "tar.db present, its WAL already moved to echo.db-wal". A planted
+// echo.db appearing on top of it must not take the legitimate WAL away: only the foreign file moves.
+TEST_CASE("adopt_legacy_echo_db: an interrupted adoption plus a planted echo.db keeps the resumable WAL (#6695)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal"); // the interrupted step
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(echo_db, "planted by another account");
+
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(
+                echo_db, probe_by_name({{"echo.db", EchoFileOwner::foreign}}))
+                .has_value());
+    const auto planted = names_with_prefix(d.path(), "echo.db.planted-");
+    REQUIRE(planted.size() == 1); // echo.db alone: no planted-*-wal, the group was not carried off
+    CHECK(planted[0].find("-wal") == std::string::npos);
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK(fs::exists(d.path() / "echo.db-wal"));
+
+    auto db = EchoDatabase::open(echo_db);
+    REQUIRE(db.has_value());
+    CHECK(db->get_config("wal_marker", "") == "x"); // the committed WAL-only row is still there
 }
 
 // =============================================================================

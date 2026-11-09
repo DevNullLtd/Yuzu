@@ -22,6 +22,7 @@
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 #include <yuzu/log_token.hpp> // yuzu::log_key_token: a registry key/value name is attacker-chosen (CWE-117)
+#include <sqlite_quarantine.hpp> // the one no-overwrite quarantine move (#6914), shared with command_dedup
 
 #include <algorithm>
 #include <array>
@@ -73,6 +74,17 @@ struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
 using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
+
+// RAII owner of the raw connection while open() builds it (#6698): every error return closes it,
+// and only the success path hands it to the EchoDatabase (release()). Same shape as DbGuard in
+// agents/core/src/command_dedup_store.cpp.
+struct DbCloser {
+    void operator()(sqlite3* d) const {
+        if (d)
+            sqlite3_close(d);
+    }
+};
+using DbGuard = std::unique_ptr<sqlite3, DbCloser>;
 
 // Owning holder for the `char*` sqlite3_exec writes through its last parameter.
 // That string is malloc'd by SQLite and must be released with sqlite3_free.
@@ -215,18 +227,32 @@ constexpr const char* kCreateSchema = R"(
 // failure, so a corrupt DB would read every `<source>_enabled` key as its
 // "true" default and silently re-enable sources an operator deliberately paused
 // for forensic preservation — defeating the #539 retention guard with no
-// telemetry. Returns true only when the check reports the canonical "ok".
-bool integrity_ok(sqlite3* db) noexcept {
+// telemetry.
+//
+// Three answers, not two (#7286): a database another connection holds past the busy timeout is
+// BUSY, not corrupt, and quarantining it would move a healthy file (and the paused-source state in
+// it) out from under its holder. The caller refuses to open on busy and quarantines nothing. Every
+// other failure to read the file (a prepare that fails for a non-database file, a corrupt page, an
+// I/O error) stays corrupt, the fail-closed side.
+enum class IntegrityCheck { ok, busy, corrupt };
+
+bool is_busy_rc(int rc) noexcept {
+    const int primary = rc & 0xff; // an extended code (SQLITE_BUSY_SNAPSHOT, ...) keeps it in the low byte
+    return primary == SQLITE_BUSY || primary == SQLITE_LOCKED;
+}
+
+IntegrityCheck check_integrity(sqlite3* db) noexcept {
     sqlite3_stmt* raw = nullptr;
-    if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &raw, nullptr) != SQLITE_OK)
-        return false; // can't even read the DB → treat as corrupt
+    const int prc = sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &raw, nullptr);
     StmtPtr stmt(raw);
-    bool ok = false;
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+    if (prc != SQLITE_OK)
+        return is_busy_rc(prc) ? IntegrityCheck::busy : IntegrityCheck::corrupt;
+    const int src = sqlite3_step(stmt.get());
+    if (src == SQLITE_ROW) {
         const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-        ok = txt && std::string_view{txt} == "ok";
+        return txt && std::string_view{txt} == "ok" ? IntegrityCheck::ok : IntegrityCheck::corrupt;
     }
-    return ok;
+    return is_busy_rc(src) ? IntegrityCheck::busy : IntegrityCheck::corrupt;
 }
 
 // The integer in an echo_config `schema_version` value; an unparseable one reads as 0.
@@ -238,63 +264,52 @@ int parse_schema_version(const std::string& text) {
     }
 }
 
-// Move a corrupt echo.db (and its -wal/-shm/-journal sidecars, the four files SQLite reads for
-// it) aside to a timestamped `.corrupt-<epoch>` path for forensic review, so open() can
-// re-initialise a fresh, trustworthy database rather than refusing to load Echo entirely.
-// Returns the quarantine path, or std::nullopt if the corrupt main file could
-// NOT be moved aside (read-only mount, locked file on Windows, permissions) —
-// in which case the caller MUST fail closed rather than re-open-and-trust the
-// still-corrupt file (#559 / UP-1). A sidecar that can't be moved is removed
-// instead, so the freshly-created DB can never adopt a stale -wal/-shm/-journal; the
-// caller's post-reopen integrity re-check is the backstop if even that fails.
-// An EMPTY sidecar is removed rather than kept: it holds no evidence.
-std::optional<std::filesystem::path>
-quarantine_corrupt_db(const std::filesystem::path& path) {
-    const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                           std::chrono::system_clock::now().time_since_epoch())
-                           .count();
-    std::filesystem::path dest = path;
-    dest += std::format(".corrupt-{}", epoch);
-    // Collision-safe naming: `epoch` is only 1-second granular, and the wall
-    // clock can step backward (NTP correction, RTC reset). A second corruption
-    // that resolved to an already-existing `.corrupt-<epoch>` would otherwise
-    // rename ON TOP of the earlier quarantine and silently destroy preserved
-    // forensic evidence. Append a disambiguator so every quarantine is kept.
-    {
-        std::error_code exists_ec;
-        for (int n = 1; n < 10'000 && std::filesystem::exists(dest, exists_ec); ++n) {
-            dest = path;
-            dest += std::format(".corrupt-{}-{}", epoch, n);
+// #1527 — refuse a symlink (every OS) or reparse point (Windows: a junction is not a symlink to
+// std::filesystem on every toolchain) at echo.db or one of its sidecars. SQLite follows a link, so a
+// local user who can plant one in the state directory would steer the agent's database writes (and
+// the quarantine's moves) at a file of their choosing. Fail closed: nothing is opened, moved or
+// secured. A path that is absent is fine (the open creates it). Returns the refusal text.
+std::optional<std::string> refuse_linked_db_files(const std::filesystem::path& db) {
+    namespace fs = std::filesystem;
+    for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
+        fs::path file = db;
+        file += suffix;
+#ifdef _WIN32
+        const std::string name = yuzu::win::from_wide(file.c_str());
+#else
+        const std::string name = file.string();
+#endif
+        std::error_code ec;
+        const auto st = fs::symlink_status(file, ec);
+        if (st.type() == fs::file_type::not_found)
+            continue;
+        if (ec) {
+            return std::format("cannot examine {} ({}); echo.db was not opened", name,
+                               ec.message());
+        }
+        bool linked = fs::is_symlink(st);
+#ifdef _WIN32
+        if (!linked) {
+            const DWORD attrs = ::GetFileAttributesW(file.c_str());
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                const DWORD err = ::GetLastError();
+                if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+                    continue;
+                return std::format("cannot read the attributes of {} (error {}); echo.db was not "
+                                   "opened",
+                                   name, err);
+            }
+            linked = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        }
+#endif
+        if (linked) {
+            return std::format("{} is a symbolic link or reparse point, and echo.db was not "
+                               "opened: remove it so the agent can create a regular file, then "
+                               "restart the agent",
+                               name);
         }
     }
-    std::error_code ec;
-    std::filesystem::rename(path, dest, ec);
-    if (ec)
-        return std::nullopt; // could not move the corrupt DB aside — fail closed
-    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
-        std::filesystem::path side = path;
-        side += suffix;
-        std::error_code ec2;
-        if (std::filesystem::exists(side, ec2)) {
-            // A zero-length sidecar holds nothing to preserve (the Windows open() pre-creates both,
-            // protected): drop it, so one corruption leaves one quarantine file, not three.
-            std::error_code size_ec;
-            if (std::filesystem::file_size(side, size_ec) == 0) {
-                std::filesystem::remove(side, ec2);
-                continue;
-            }
-            std::filesystem::path side_dest = dest;
-            side_dest += suffix;
-            std::filesystem::rename(side, side_dest, ec2);
-            if (ec2) {
-                // Couldn't preserve the sidecar — remove it so the fresh DB
-                // can't replay a stale WAL belonging to the quarantined file.
-                std::error_code ec3;
-                std::filesystem::remove(side, ec3);
-            }
-        }
-    }
-    return dest;
+    return std::nullopt;
 }
 
 /// Execute a multi-statement DDL batch inside ONE transaction.
@@ -492,6 +507,40 @@ private:
     bool ok_ = false;
 };
 
+// Delete a planted sidecar THROUGH a handle opened for DELETE (#6362): POSIX semantics unlink the
+// name at once even while another process holds the file open, and the read-only attribute does
+// not stop it. A plain DeleteFileW fails (sharing violation / access denied) for exactly those two
+// shapes, which is how a planted read-only or held-open sidecar would refuse the open. The handle
+// is opened no-follow, so a link is deleted as the link. Returns ERROR_SUCCESS, or the Win32 error.
+// An OS without FileDispositionInfoEx (before Windows 10 1809) answers ERROR_INVALID_PARAMETER or
+// ERROR_NOT_SUPPORTED, and the old call is tried instead.
+//
+// The struct and constants are declared here rather than taken from winbase.h/winnt.h, whose
+// definitions sit behind an NTDDI_VERSION guard this build does not set: FileDispositionInfoEx is
+// FILE_INFO_BY_HANDLE_CLASS 21, and the flags are FILE_DISPOSITION_FLAG_DELETE (0x1),
+// _POSIX_SEMANTICS (0x2) and _IGNORE_READONLY_ATTRIBUTE (0x10).
+DWORD delete_planted_file(const std::filesystem::path& file) {
+    struct DispositionInfoEx {
+        DWORD Flags;
+    };
+    constexpr auto kFileDispositionInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(21);
+    constexpr DWORD kDispositionFlags = 0x1 | 0x2 | 0x10;
+    constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    HANDLE raw = ::CreateFileW(file.c_str(), DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                               kShareAll, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (raw != INVALID_HANDLE_VALUE) {
+        const HandlePtr h{raw, ::CloseHandle};
+        DispositionInfoEx info{kDispositionFlags};
+        if (::SetFileInformationByHandle(h.get(), kFileDispositionInfoEx, &info, sizeof(info)))
+            return ERROR_SUCCESS;
+        const DWORD err = ::GetLastError();
+        if (err != ERROR_INVALID_PARAMETER && err != ERROR_NOT_SUPPORTED)
+            return err;
+    }
+    return ::DeleteFileW(file.c_str()) ? ERROR_SUCCESS : ::GetLastError();
+}
+
 // Creates or re-secures echo.db, echo.db-wal, -shm and -journal (see the block comment above).
 // Returns a refusal message when a planted file must stop the open, else nullopt.
 std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
@@ -564,9 +613,9 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
             if (suffix[0] == '\0')
                 return std::format("echo.db at {} {}, and was not opened: {}", name, why, remedy);
             h.reset(); // release our handle before deleting; a link loses only OUR name
-            if (!::DeleteFileW(file.c_str())) {
+            if (const DWORD del_err = delete_planted_file(file); del_err != ERROR_SUCCESS) {
                 return std::format("{} {}, and could not be removed (error {}): {}", name, why,
-                                   ::GetLastError(), remedy);
+                                   del_err, remedy);
             }
             raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, dacl.sa(), CREATE_NEW, kFlags,
                                 nullptr);
@@ -756,6 +805,10 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
                         (path.parent_path() / "tar.db").string()));
     }
 
+    // #1527 — a link at echo.db or a sidecar is refused before anything touches the paths.
+    if (auto refusal = refuse_linked_db_files(path))
+        return std::unexpected(*refusal);
+
     // #1567 — set when this open quarantined a corrupt file; persisted into the
     // fresh DB's echo_config once it is fully initialised (see end of open()).
     std::optional<int64_t> quarantined_at;
@@ -766,33 +819,57 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // refuse a planted file (foreign owner or extra hard link); see the DACL block above.
     EchoDbDacl dacl;
     if (!dacl.ok()) {
+        // Without the DACL there is no token user to compare owners against, so the foreign-owner
+        // and hard-link checks on echo.db and its sidecars are skipped as well (U-11).
         spdlog::warn("EchoDatabase: owner-only DACL not built (error {}); echo.db keeps the "
-                     "directory's inherited ACL",
+                     "directory's inherited ACL, and the owner and hard-link checks are skipped",
                      dacl.build_error());
     }
     if (auto refusal = secure_echo_db_files(path, dacl))
         return std::unexpected(*refusal);
 #endif
 
-    sqlite3* raw_db = nullptr;
-    int rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        std::string err = raw_db ? sqlite3_errmsg(raw_db) : "unknown error";
-        if (raw_db)
-            sqlite3_close(raw_db);
-        return std::unexpected(std::format("failed to open echo.db: {}", err));
-    }
+    // Open the main connection, give it its busy timeout at once (so the integrity check below
+    // waits for a holder instead of reading "locked" as corrupt, #7286) and hand it to the guard.
+    // SQLite returns a handle even when the open fails; the guard closes it either way.
+    DbGuard guard;
+    const auto open_main = [&]() -> std::expected<void, std::string> {
+        sqlite3* opened = nullptr;
+        const int orc = sqlite3_open_v2(
+            path.string().c_str(), &opened,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr);
+        guard.reset(opened);
+        if (orc != SQLITE_OK)
+            return std::unexpected(opened ? sqlite3_errmsg(opened) : "unknown error");
+        sqlite3_busy_timeout(opened, kBusyTimeoutMs);
+        return {};
+    };
+    if (auto opened = open_main(); !opened)
+        return std::unexpected(std::format("failed to open echo.db: {}", opened.error()));
 
     // #559 — corruption self-test BEFORE we trust the DB. A fresh/empty file
     // passes trivially; an existing corrupt one is quarantined aside and a clean
     // DB is re-opened in its place, so the agent never silently serves garbage
     // config (which would re-enable operator-paused sources, compounding #539).
-    if (!integrity_ok(raw_db)) {
-        sqlite3_close(raw_db);
-        raw_db = nullptr;
-        auto quarantined = quarantine_corrupt_db(path);
+    switch (check_integrity(guard.get())) {
+    case IntegrityCheck::ok:
+        break;
+    case IntegrityCheck::busy:
+        // Another connection holds the file past the busy timeout. That says nothing about its
+        // health, so quarantine nothing (a quarantine would move a healthy file away from its
+        // holder) and refuse to open: Echo fails closed rather than trusting a file it could not
+        // check, and the next start retries (#7286).
+        return std::unexpected(std::format(
+            "echo.db is busy (another connection holds it for more than {} ms): not quarantined "
+            "and not opened; it is retried on the next start: {}",
+            kBusyTimeoutMs, path.string()));
+    case IntegrityCheck::corrupt: {
+        guard.reset();
+        const auto quarantine = yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(
+            path, now_epoch_seconds());
+        for (const auto& note : quarantine.notes)
+            spdlog::warn("EchoDatabase: {}", note);
+        const auto& quarantined = quarantine.dest;
         if (!quarantined) {
             // FAIL CLOSED (UP-1): the corrupt DB could not be moved aside, so we
             // must NOT re-open and trust it — doing so would silently serve the
@@ -800,7 +877,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
             // re-enable sources an operator paused for forensic preservation,
             // the exact failure #559 guards against. Refuse to open; the
             // operator must clear the underlying fault (read-only mount, locked
-            // file, permissions) and restart.
+            // file, permissions, a filesystem without hard links) and restart.
             return std::unexpected(std::format(
                 "echo.db failed integrity_check and could not be quarantined "
                 "(corrupt and unmovable): {}",
@@ -816,27 +893,24 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         if (auto refusal = secure_echo_db_files(path, dacl))
             return std::unexpected(*refusal);
 #endif
-        rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-        if (rc != SQLITE_OK) {
-            std::string err = raw_db ? sqlite3_errmsg(raw_db) : "unknown error";
-            if (raw_db)
-                sqlite3_close(raw_db);
+        if (auto reopened = open_main(); !reopened) {
             return std::unexpected(
-                std::format("failed to re-open echo.db after quarantine: {}", err));
+                std::format("failed to re-open echo.db after quarantine: {}", reopened.error()));
         }
         // Backstop (UP-2): the freshly-created DB must itself be clean — this
         // also catches the case where a -wal/-shm sidecar belonging to the
         // quarantined file could neither be moved nor removed and was adopted by
-        // the new file. If even the fresh DB is corrupt, fail closed.
-        if (!integrity_ok(raw_db)) {
-            sqlite3_close(raw_db);
+        // the new file. If even the fresh DB is not clean (or is busy), fail closed.
+        if (check_integrity(guard.get()) != IntegrityCheck::ok) {
             return std::unexpected(std::format(
                 "echo.db re-initialised after quarantine still fails integrity_check: {}",
                 path.string()));
         }
+        break;
     }
+    }
+    sqlite3* raw_db = guard.get();
+    int rc = SQLITE_OK;
 
     // Incremental auto_vacuum, BEFORE journal_mode=WAL: SQLite fixes the mode when the first
     // table is created, and the WAL switch writes page 1 of an empty file. On a database that
@@ -854,13 +928,11 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown";
         sqlite3_free(err_msg);
-        sqlite3_close(raw_db);
         return std::unexpected(std::format("failed to enable WAL mode: {}", err));
     }
     sqlite3_free(err_msg);
 
-    // Busy timeout for concurrent access
-    sqlite3_busy_timeout(raw_db, kBusyTimeoutMs);
+    // (The busy timeout is already set: open_main applies it before the integrity check.)
 
     // Secure delete -- zeroes deleted content; required for security
     err_msg = nullptr;
@@ -868,7 +940,6 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown";
         sqlite3_free(err_msg);
-        sqlite3_close(raw_db);
         return std::unexpected(std::format("failed to enable secure_delete: {}", err));
     }
     sqlite3_free(err_msg);
@@ -886,7 +957,6 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // schema below, which would otherwise create empty echo_* tables beside the populated tar_*
     // ones and boot the agent with default config. Failure is fail-closed for the same reason.
     if (auto renamed = rename_legacy_tables(raw_db); !renamed) {
-        sqlite3_close(raw_db);
         return std::unexpected(
             std::format("failed to rename legacy tar_* tables: {}", renamed.error()));
     }
@@ -898,7 +968,6 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown error";
         sqlite3_free(err_msg);
-        sqlite3_close(raw_db);
         return std::unexpected(std::format("failed to create Echo schema: {}", err));
     }
 
@@ -918,7 +987,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         }
     }
 
-    auto db = EchoDatabase{raw_db};
+    auto db = EchoDatabase{guard.release()};
     db.fold_ = std::make_unique<EchoFold>();
 
     // Ensure every registry-declared warehouse table exists on EVERY open —

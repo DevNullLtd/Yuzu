@@ -855,7 +855,7 @@ TEST_CASE("dedup_quarantine: non-empty sidecars travel with the main file, empty
     write_bytes(fs::path(db.string() + "-journal"), "journal bytes");
     write_bytes(fs::path(db.string() + "-shm"), ""); // empty: holds no evidence
 
-    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    const auto dest = dq::quarantine_corrupt_db(db, 1234).dest;
     REQUIRE(dest.has_value());
     CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234");
     CHECK(read_bytes(*dest) == "main");
@@ -878,7 +878,7 @@ TEST_CASE("dedup_quarantine: a taken name gets a -n suffix and an earlier quaran
     write_bytes(taken, "earlier");
     write_bytes(db, "second");
 
-    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    const auto dest = dq::quarantine_corrupt_db(db, 1234).dest;
     REQUIRE(dest.has_value());
     CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234-1");
     CHECK(read_bytes(taken) == "earlier");
@@ -908,7 +908,7 @@ TEST_CASE("dedup_quarantine: a clock before 1970 still yields a name the pruner 
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
     const auto db = dir.path / "command_dedup.db";
     write_bytes(db, "main");
-    const auto dest = dq::quarantine_corrupt_db(db, -5);
+    const auto dest = dq::quarantine_corrupt_db(db, -5).dest;
     REQUIRE(dest.has_value());
     CHECK(dest->filename().string() == "command_dedup.db.corrupt-0");
     CHECK(dq::parse_quarantine_name("command_dedup.db.corrupt-", dest->filename().string())
@@ -965,6 +965,98 @@ TEST_CASE("dedup_quarantine: prune keeps the newest groups and touches only well
     CHECK(fs::exists(dir.path / "echo.db.corrupt-1"));
 }
 
+namespace sq = yuzu::shared::sqlite_quarantine;
+
+TEST_CASE("dedup_quarantine: a sidecar whose rename fails is copied before the original is removed",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    write_bytes(fs::path(db.string() + "-wal"), "wal bytes");
+
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied); // the injected rename failure
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(r.dest.has_value());
+    CHECK(read_bytes(*r.dest) == "main");
+    CHECK(read_bytes(fs::path(r.dest->string() + "-wal")) == "wal bytes"); // preserved by copy
+    CHECK_FALSE(fs::exists(fs::path(db.string() + "-wal")));             // original gone
+    // The note replaces the former spdlog::warn: the caller logs it.
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("copied") != std::string::npos);
+}
+
+TEST_CASE("dedup_quarantine: a sidecar quarantine name that is taken is never overwritten",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    write_bytes(fs::path(db.string() + "-wal"), "new wal");
+    write_bytes(fs::path(db.string() + ".corrupt-1234-wal"), "stray older wal");
+
+    const auto r = dq::quarantine_corrupt_db(db, 1234);
+    REQUIRE(r.dest.has_value());
+    CHECK(r.dest->filename().string() == "command_dedup.db.corrupt-1234");
+    CHECK(read_bytes(fs::path(r.dest->string() + "-wal")) == "stray older wal"); // not replaced
+    CHECK_FALSE(fs::exists(fs::path(db.string() + "-wal"))); // the stale original still goes
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("taken") != std::string::npos);
+}
+
+TEST_CASE("sqlite_quarantine: claim_quarantine_name moves one file and no sidecar",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "main");
+    write_bytes(fs::path(db.string() + "-wal"), "wal");
+
+    const auto dest = sq::claim_quarantine_name(db, 77, ".planted-");
+    REQUIRE(dest.has_value());
+    CHECK(dest->filename().string() == "x.db.planted-77");
+    CHECK(read_bytes(*dest) == "main");
+    CHECK_FALSE(fs::exists(db));
+    CHECK(read_bytes(fs::path(db.string() + "-wal")) == "wal"); // the sidecar stays put
+    CHECK_FALSE(fs::exists(fs::path(dest->string() + "-wal")));
+}
+
+TEST_CASE("sqlite_quarantine: two claims in the same second never overwrite each other",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "first");
+    const auto a = sq::claim_quarantine_name(db, 5, ".corrupt-");
+    write_bytes(db, "second");
+    const auto b = sq::claim_quarantine_name(db, 5, ".corrupt-");
+    write_bytes(db, "third");
+    const auto c = sq::claim_quarantine_name(db, -9, ".corrupt-"); // clamps to 0
+    REQUIRE((a && b && c));
+    CHECK(a->filename().string() == "x.db.corrupt-5");
+    CHECK(b->filename().string() == "x.db.corrupt-5-1");
+    CHECK(c->filename().string() == "x.db.corrupt-0");
+    CHECK(read_bytes(*a) == "first");
+    CHECK(read_bytes(*b) == "second");
+}
+
+TEST_CASE("sqlite_quarantine: a filesystem without hard links fails the claim closed, naming the cause",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "main");
+    sq::FsOps ops;
+    ops.link = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::operation_not_permitted); // e.g. FAT
+    };
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(db, 5, ".corrupt-", &notes, ops).has_value());
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("hard links") != std::string::npos);
+    CHECK(read_bytes(db) == "main"); // untouched, and no rename fallback ran
+    for (const auto& e : fs::directory_iterator(dir.path))
+        CHECK(e.path() == db);
+}
+
 #ifndef _WIN32
 TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replaced",
           "[command_dedup][corruption][quarantine_fs]") {
@@ -983,7 +1075,7 @@ TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replac
     REQUIRE_FALSE(ec);
     write_bytes(db, "corrupt");
 
-    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    const auto dest = dq::quarantine_corrupt_db(db, 1234).dest;
     REQUIRE(dest.has_value());
     CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234-1");
     CHECK(fs::is_symlink(wanted));        // untouched
@@ -991,10 +1083,11 @@ TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replac
     CHECK(read_bytes(*dest) == "corrupt");
 }
 
-TEST_CASE("dedup_quarantine: when the hard link fails the rename fallback still moves it aside",
+TEST_CASE("dedup_quarantine: when the hard link fails the claim fails closed and nothing moves",
           "[command_dedup][corruption][quarantine_fs]") {
     // link(2) on a DIRECTORY fails with EPERM (not EEXIST), which is the "hard links are unavailable
-    // here" arm: the fallback must skip a taken name and rename onto the next free one.
+    // here" arm. There is no check-then-rename fallback any more (it could overwrite evidence), so
+    // the claim returns nullopt, names the cause, and the original is untouched.
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
     const auto db = dir.path / "command_dedup.db";
     std::error_code ec;
@@ -1005,12 +1098,12 @@ TEST_CASE("dedup_quarantine: when the hard link fails the rename fallback still 
     taken += ".corrupt-1234";
     write_bytes(taken, "earlier");
 
-    const auto dest = dq::quarantine_corrupt_db(db, 1234);
-    REQUIRE(dest.has_value());
-    CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234-1");
-    CHECK(read_bytes(*dest / "inside.txt") == "payload");
-    CHECK_FALSE(fs::exists(db));
-    CHECK(read_bytes(taken) == "earlier"); // not replaced by the fallback either
+    const auto r = dq::quarantine_corrupt_db(db, 1234);
+    CHECK_FALSE(r.dest.has_value());
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("hard links") != std::string::npos);
+    CHECK(read_bytes(db / "inside.txt") == "payload");
+    CHECK(read_bytes(taken) == "earlier");
 }
 
 namespace {

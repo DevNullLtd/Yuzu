@@ -279,8 +279,11 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
         // a disk that corrupts every fresh file degrades (observably) instead of spinning. The
         // failed attempt's handle is already closed (DbGuard) before the rename.
         const std::string reason = attempt.error().message;
-        auto moved =
+        const auto quarantine =
             dedup_quarantine::quarantine_corrupt_db(db_path, now_epoch_seconds());
+        for (const auto& note : quarantine.notes)
+            spdlog::warn("CommandDedupStore: {}", note);
+        const auto& moved = quarantine.dest;
         if (!moved) {
             // Fail-open, observable (invariant 7): the original file is untouched.
             return std::unexpected(CommandDedupError{

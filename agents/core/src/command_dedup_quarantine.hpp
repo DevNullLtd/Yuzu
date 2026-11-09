@@ -11,15 +11,17 @@
 ///
 /// Invariants (docs/command-dedup.md invariant 7, "Corruption recovery"):
 ///  - quarantine_corrupt_db NEVER overwrites an earlier quarantine: on a collision it appends
-///    `-<n>`, and if every name is taken it FAILS (nullopt) rather than overwrite.
+///    `-<n>`, and if every name is taken, or the filesystem has no hard links, it FAILS (nullopt)
+///    rather than overwrite (agents/shared/sqlite_quarantine.hpp).
 ///  - prune_old_quarantines is COUNT-based (keep the newest kKeepQuarantined groups), not a
 ///    wall-clock cutoff, and NEVER throws and never removes the file the same recovery just made.
 ///  - Both only ever touch names of the exact form
 ///    `<db filename>.corrupt-<digits>[-<digits>][-wal|-shm|-journal]` in the db's own directory.
-///  - This is a copy of the idea in agents/plugins/echo/src/echo_db.cpp (quarantine_corrupt_db,
-///    #559); hoisting both into agents/shared is tracked in #6914.
+///  - The move itself is shared with agents/plugins/echo/src/echo_db.cpp (#559, #6914).
 
 #include <spdlog/spdlog.h>
+
+#include <sqlite_quarantine.hpp>
 
 #include <charconv>
 #include <cstddef>
@@ -84,133 +86,20 @@ inline std::optional<std::pair<long long, long long>> parse_quarantine_name(std:
     return std::pair{epoch, n};
 }
 
-/// Move a corrupt database aside to `<path>.corrupt-<epoch>[-n]` and carry any NON-EMPTY
-/// -wal/-shm/-journal sidecars with it (`<that name>-wal`, ...). Returns the main file's new path,
-/// or nullopt if it could not be moved — the caller then fails (observably, fail-open) and the
-/// original file is untouched. An EMPTY sidecar holds no evidence and is removed; a sidecar that
-/// cannot be renamed is removed instead, best effort, so the fresh database does not replay a stale
-/// WAL belonging to the quarantined file. (If that remove also fails, a stale sidecar can survive
-/// beside the fresh file. That needs the main rename to succeed while both sidecar operations fail,
-/// which is vanishingly unlikely; echo carries a post-reopen integrity backstop, dedup deliberately
-/// does not, because an integrity scan would also discard a usable file.)
-///
-/// NEVER OVERWRITES an earlier quarantine, even against a concurrent second process: the name is
-/// CLAIMED with a hard link, which fails with EEXIST if the name is taken (a check-then-rename would
-/// not: rename() replaces its destination on both POSIX and Windows, so two processes recovering in
-/// the same second could destroy each other's evidence). The original name is then dropped. If the
-/// hard link fails for ANY reason other than the name being taken (a filesystem without hard links,
-/// a permission rule), it falls back to check-then-rename, and the concurrent-process guarantee does
-/// not hold for that call. If 10,000 names are taken it FAILS (nullopt) rather than overwrite.
+/// Move a corrupt database aside to `<path>.corrupt-<epoch>[-n]`, carrying its sidecars: the shared
+/// primitive (agents/shared/sqlite_quarantine.hpp), which owns the no-overwrite and copy-preserve
+/// contract. `dest` nullopt = it could not be moved, the original is untouched, and the caller
+/// degrades (observably, fail-open). The caller logs `notes`.
 ///
 /// This protects the EVIDENCE only. It does not make recovery safe for two agent daemons on one data
 /// dir (unsupported; no instance lock covers the dedup store, and the Guardian boot-epoch lock
 /// guards only the epoch claim): process B can still drop the fresh store that process A just
 /// created, leaving A on an orphaned inode.
-///
-/// `epoch_seconds` is clamped to >= 0: a clock before 1970 would otherwise write `.corrupt--5`,
-/// which parse_quarantine_name rejects, so the file could never be pruned. The moved file and its carried
-/// sidecars are then set owner-only, best effort (0600 on POSIX; a read-only-attribute toggle on Windows).
-inline std::optional<std::filesystem::path> quarantine_corrupt_db(const std::filesystem::path& path,
-                                                                 std::int64_t epoch_seconds) {
-    const std::int64_t epoch = epoch_seconds < 0 ? 0 : epoch_seconds;
-    const auto name_for = [&](int n) {
-        std::filesystem::path dest = path;
-        dest += n == 0 ? std::format(".corrupt-{}", epoch) : std::format(".corrupt-{}-{}", epoch, n);
-        return dest;
-    };
-
-    std::optional<std::filesystem::path> claimed;
-    bool hard_link_unavailable = false;
-    for (int n = 0; n < 10'000; ++n) {
-        const auto dest = name_for(n);
-        std::error_code lec;
-        std::filesystem::create_hard_link(path, dest, lec);
-        if (!lec) {
-            // The name is ours, atomically. Drop the original name; if that fails the file is still
-            // at `path` (also at `dest`), so try to give the claim back and report "could not move".
-            // If the give-back also fails a stray `dest` name stays: harmless (it is prunable and
-            // names the same inode), but logged.
-            std::error_code rec;
-            std::filesystem::remove(path, rec);
-            if (rec) {
-                std::error_code undo;
-                std::filesystem::remove(dest, undo);
-                if (undo) {
-                    spdlog::warn("CommandDedupStore: could not drop {} after claiming {} ({}); the "
-                                 "stray name is left in place",
-                                 path.string(), dest.string(), undo.message());
-                }
-                return std::nullopt;
-            }
-            claimed = dest;
-            break;
-        }
-        if (lec == std::errc::file_exists)
-            continue; // taken: try the next suffix
-        hard_link_unavailable = true; // no hard links here, or a real error: fall back below
-        break;
-    }
-    if (!claimed && hard_link_unavailable) {
-        for (int n = 0; n < 10'000; ++n) {
-            const auto dest = name_for(n);
-            std::error_code exists_ec;
-            if (std::filesystem::exists(dest, exists_ec) || exists_ec)
-                continue;
-            std::error_code ec;
-            std::filesystem::rename(path, dest, ec);
-            if (ec)
-                return std::nullopt;
-            claimed = dest;
-            break;
-        }
-    }
-    if (!claimed)
-        return std::nullopt;
-    const auto& dest = *claimed;
-    // Best effort: these files can hold saved command responses, and a corrupt file that never
-    // opened successfully may have kept a looser mode (a restored backup, say) because the owner-
-    // only chmod runs only after a good open. A no-op for the read-only attribute on Windows.
-    const auto owner_only =
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
-    {
-        std::error_code pec;
-        if (std::filesystem::is_regular_file(dest, pec)) {
-            std::filesystem::permissions(dest, owner_only, std::filesystem::perm_options::replace,
-                                         pec);
-        }
-    }
-    for (std::string_view sfx : kSidecars) {
-        std::filesystem::path side = path;
-        side += std::string{sfx};
-        std::error_code ec2;
-        const bool present = std::filesystem::exists(side, ec2);
-        if (ec2) {
-            // Cannot tell whether it is there: drop it rather than leave a possibly stale sidecar
-            // beside the fresh database. Best effort.
-            std::error_code ec3;
-            std::filesystem::remove(side, ec3);
-            continue;
-        }
-        if (!present)
-            continue;
-        std::error_code size_ec;
-        if (std::filesystem::file_size(side, size_ec) == 0) {
-            std::filesystem::remove(side, ec2);
-            continue;
-        }
-        std::filesystem::path side_dest = dest;
-        side_dest += std::string{sfx};
-        std::filesystem::rename(side, side_dest, ec2);
-        if (ec2) {
-            std::error_code ec3;
-            std::filesystem::remove(side, ec3);
-        } else {
-            std::error_code pec;
-            std::filesystem::permissions(side_dest, owner_only,
-                                         std::filesystem::perm_options::replace, pec);
-        }
-    }
-    return dest;
+using QuarantineResult = yuzu::shared::sqlite_quarantine::QuarantineResult;
+[[nodiscard]] inline QuarantineResult
+quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seconds,
+                      const yuzu::shared::sqlite_quarantine::FsOps& ops = {}) {
+    return yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(path, epoch_seconds, ops);
 }
 
 /// Keep only the newest kKeepQuarantined quarantined stores in the db's directory. COUNT-based,
