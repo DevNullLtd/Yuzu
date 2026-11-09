@@ -897,7 +897,7 @@ Remove an agent from a management group.
 }
 ```
 
-**Errors:** `400` if `agent_id` contains a NUL or other control byte (audited `management_group.remove_member`, `result=denied`, `detail=invalid_agent_id`); a member whose stored id already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `removed: true` and the success audit row are only produced after the store reports the removal.
+**Errors:** `400` if `agent_id` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.remove_member`, `result=denied`, `detail=invalid_agent_id`); a member whose stored id already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `removed: true` and the success audit row are only produced after the store reports the removal.
 
 ---
 
@@ -980,7 +980,7 @@ Assign a role to a principal within this management group. Only the `Operator` a
 }
 ```
 
-**Other errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte (audited `management_group.assign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`), or if `principal_id` is not valid UTF-8; `404` if the group does not exist (no audit row, no retry hint); `503` if the store could not apply the assignment (audited `result=failure`, `detail=store_error`, with a retry hint). `assigned: true` and the success audit row are only produced after the store reports the assignment.
+**Other errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte (audited `management_group.assign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`), or if any of the three is not valid UTF-8; `404` if the group does not exist (no audit row, no retry hint); `503` if the store could not apply the assignment (audited `result=failure`, `detail=store_error`, with a retry hint). `assigned: true` and the success audit row are only produced after the store reports the assignment.
 
 ---
 
@@ -1009,7 +1009,7 @@ Remove a role assignment from this management group.
 }
 ```
 
-**Errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte (audited `management_group.unassign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`); a grant whose stored `principal_id` or `role_name` already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `unassigned: true` and the success audit row are only produced after the store reports the removal.
+**Errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.unassign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`); a grant whose stored `principal_id` or `role_name` already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `unassigned: true` and the success audit row are only produced after the store reports the removal.
 
 ---
 
@@ -13277,7 +13277,9 @@ minutes used to become an every-minute schedule) is `400` and nothing is created
 A NUL byte in `name`, `definition_id`, `frequency_type`, `time_of_day` or `scope_expression` is `400`
 and nothing is created (audited `schedule.create`, `result=denied`, `detail=field_contains_nul`). A
 value the store refuses as invalid text (for example a byte sequence that is not valid UTF-8) or as a
-constraint violation is also `400`, with no audit row. A store fault (the database is not open, or the
+constraint violation is also `400`, audited `result=denied`, `detail=invalid_field_value` (empty target,
+the value is never echoed). A body that is not valid JSON is `400` with the fixed message
+`invalid JSON in request body`, and no audit row. A store fault (the database is not open, or the
 insert failed) answers `503` with `retry_after_ms` and is audited `result=failure`,
 `detail=store_error`; a `503` is never a created schedule.
 

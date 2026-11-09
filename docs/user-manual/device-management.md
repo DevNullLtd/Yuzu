@@ -501,7 +501,18 @@ curl -s -X POST http://localhost:8080/api/settings/updates/upload \
 | `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`). An empty value is the default; a malformed value (`0x5`, `5abc`, `1e1`) is `400` and nothing is stored, it never becomes `100`; an out-of-range integer is clamped to 0--100 |
 | `mandatory` | No | Whether agents must apply this update (`true`/`false`, default: `false`) |
 
-The `platform`, `arch` and file name must not contain a NUL or other control byte, and must be valid UTF-8; otherwise the upload is refused with `400` (audited `ota.package.uploaded`, `result=denied`, `detail=invalid_package_field`) before anything is written. If the registry write fails after the files were published, the answer is `503` and the package is left exactly as it was: the new files are removed and, when the upload replaced a package of the same file name, the earlier binary and signature sidecar are put back. A later successful upload of that file name leaves no backup files behind.
+The `platform`, `arch` and file name must not contain a NUL or other control byte, and must be valid UTF-8; otherwise the upload is refused with `400` (audited `ota.package.uploaded`, `result=denied`, `detail=invalid_package_field`) before anything is written. If the registry write fails after the files were published, the answer is `503`, the new files are removed and, when the upload replaced a package of the same file name, the earlier binary and signature sidecar are put back. To make that possible the previous files are kept as copies named `<file>.yuzu_prev_<suffix>` in the update directory until the write succeeds (a hard link where the filesystem allows, otherwise a copy; the live file name is never absent). A write that reports failure but whose row is found stored with this upload's SHA-256 counts as a success.
+
+A process crash between keeping a copy and finishing the upload can leave a `*.yuzu_prev_*` copy behind, and nothing removes it. An operator may delete `*.yuzu_prev_*` files older than any running upload, and should exclude them from file-level backups of the update directory (see "Leftover `*.yuzu_prev_*` files" in the server administration guide).
+
+The upload can also answer `500`, and in each case the page shows the message:
+
+| Message | Meaning |
+|---|---|
+| `Could not prepare the package directory. Nothing was changed; retry the upload.` | A non-regular file (for example a directory) sits at the binary or signature path, or no copy of the previous file could be made. Nothing was written. |
+| `The upload failed and the previous package could not be fully restored. The previous file is kept as <file>; see the server log.` | The registry write failed and putting a previous file back also failed. The named `<file>.yuzu_prev_<suffix>` copy is the previous file: rename it back by hand. |
+| `The old signature could not be removed, so the upload was rolled back. Retry the upload.` | An unsigned re-upload could not remove the earlier signature file; the previous package is back as it was. |
+
 
 ### View Available Updates
 

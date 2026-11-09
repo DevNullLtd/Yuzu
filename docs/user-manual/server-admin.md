@@ -364,7 +364,7 @@ separately.
 
 > **Fresh deployment only for 0.15.0.** Entries below that tell you to upgrade, roll back or restore an earlier build are historical and not a supported path (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). Entries describing behaviour of the 0.15.0 build still apply.
 
-### vNEXT - role removal, engine-role assignment and management-group member and role routes refuse a control byte; a NUL byte in a database text value is refused (breaking for deployments with such a role or member)
+### vNEXT - role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte; a NUL byte in a database text value is refused (breaking for deployments with such a role or member)
 
 **What changed.** `unassign_rbac_role` (MCP), the engine-role unassign (REST `DELETE /api/v1/engine-principals/{id}/roles/{role}` and MCP `unassign_engine_role`) and the engine-role assign (REST `POST /api/v1/engine-principals/{id}/roles` and MCP `assign_engine_role`) refuse a role name containing a NUL byte, any other control byte (0x01-0x1F) or DEL (0x7F): REST answers `400`, MCP answers invalid params (-32602), and the audit row is `result=denied` with the fixed detail `invalid_role_name`. Every other role name is accepted, including one granted out of band. Separately, a text value containing a NUL byte is now refused rather than shortened before it reaches the database.
 
@@ -374,9 +374,15 @@ separately.
 SELECT name FROM rbac_store.roles WHERE name ~ '[\x01-\x1f\x7f]';
 ```
 
-**What to do.** Delete the role in SQL (`DELETE FROM rbac_store.roles WHERE name = '<name>';` also removes its permissions and every grant of it, through the foreign keys' `ON DELETE CASCADE` on `principal_roles`, `role_permissions` and `revoked_seed_defaults`; a role that has grants cannot be renamed, because those foreign keys have no `ON UPDATE CASCADE`), then re-create it under a clean name if it is still needed and grant it again. A direct SQL delete does not bump the RBAC generation, so restart every serving replica afterwards (cached permissions can keep being served until a restart or another RBAC write). This SQL is unsupported and not audited, so record it in the change ticket.
+**What to do.** Delete the role in SQL. This form works on the output of the query above, where a control byte shows as `\x01`, without copying the name:
 
-**Management-group members and roles.** Removing a member or unassigning a role on a management group (REST) refuses a control byte in `agent_id`, `role_name`, `principal_id` or `principal_type` with `400`; adding a member and assigning a role (REST and the MCP tools `add_management_group_member` and `assign_management_group_role`) refuse it too, and an `agent_id` or `principal_id` that is not valid UTF-8. A missing group answers `404` on add and assign, and a store fault `503` (`result=failure`, `detail=store_error`). A member or grant whose stored id already carries a control byte can no longer be removed through the API. Find them with:
+```sql
+DELETE FROM rbac_store.roles WHERE name ~ '[\x01-\x1f\x7f]' RETURNING name;
+```
+
+(With `standard_conforming_strings = on`, the default, the `\x01` in a plain literal is passed to the regular-expression engine, which reads it as a hex escape.) The delete also removes the role's permissions and every FLEET-WIDE grant of it, through the foreign keys' `ON DELETE CASCADE` on the three tables that refer to it (`principal_roles`, `role_permissions` and `revoked_seed_defaults`); a role that has grants cannot be renamed, because those foreign keys have no `ON UPDATE CASCADE`. A grant of the same role on a MANAGEMENT GROUP lives in `management_group_store.management_group_roles`, which has no key into the `rbac_store` schema, so the delete does not touch it: remove those rows with the management-group query below. Then re-create the role under a clean name if it is still needed and grant it again (a deleted role's grants are not restored). A direct SQL delete does not bump the RBAC generation, so restart every serving replica afterwards (cached permissions can keep being served until a restart or another RBAC write). This SQL is unsupported and not audited, so record it in the change ticket.
+
+**Management-group members and roles.** Removing a member or unassigning a role on a management group (REST) refuses a control byte in `agent_id`, `role_name`, `principal_id` or `principal_type` with `400`; adding a member and assigning a role (REST and the MCP tools `add_management_group_member` and `assign_management_group_role`) refuse it too. All four operations (add, assign, remove and unassign) also refuse a value that is not valid UTF-8, in every one of those fields. The MCP tools validate `group_id` the same way and audit it as `invalid_group_id` (MCP only). A missing group answers `404` on add and assign (REST); on MCP it is the `group not found` invalid-params error, and the only audit row is the generic `mcp.<tool>` row with `result=denied`, `detail=group not found`, not a `management_group.*` row. A store fault is `503` (`result=failure`, `detail=store_error`). A member or grant whose stored id already carries a control byte can no longer be removed through the API. Find them with:
 
 ```sql
 SELECT group_id, agent_id FROM management_group_store.management_group_members
@@ -386,14 +392,33 @@ SELECT group_id, principal_type, principal_id, role_name FROM management_group_s
     OR role_name ~ '[\x01-\x1f\x7f]';
 ```
 
-Remove each row with a `DELETE` that names its full key. This SQL is unsupported and not audited, so record it in the change ticket, and restart every serving replica afterwards (a direct SQL change does not notify the other replicas).
+The second query also finds a grant whose role name carries a control byte, so it covers the management-group half of the role removal above. Remove the rows with these statements, which match by pattern and so work on the query output without copying the value:
+
+```sql
+DELETE FROM management_group_store.management_group_members
+ WHERE agent_id ~ '[\x01-\x1f\x7f]' RETURNING group_id, agent_id;
+DELETE FROM management_group_store.management_group_roles
+ WHERE principal_type ~ '[\x01-\x1f\x7f]' OR principal_id ~ '[\x01-\x1f\x7f]'
+    OR role_name ~ '[\x01-\x1f\x7f]' RETURNING *;
+```
+
+(The pattern form is the one tested on PostgreSQL with `standard_conforming_strings = on`, the default.) This SQL is unsupported and not audited, so record it in the change ticket, and restart every serving replica afterwards (a direct SQL change does not notify the other replicas).
+
+**OTA package delete.** `DELETE /api/settings/updates/{platform}/{arch}/{version}` refuses a control byte (0x01-0x1F or DEL) or invalid UTF-8 in `platform`, `arch` or `version` with `400` (`result=denied`, `detail=invalid_package_field`), as the upload already does. A stored package whose key holds such a byte (written out of band) can no longer be deleted through the API. Find one with:
+
+```sql
+SELECT platform, arch, version FROM update_registry.update_packages
+ WHERE platform ~ '[\x01-\x1f\x7f]' OR arch ~ '[\x01-\x1f\x7f]' OR version ~ '[\x01-\x1f\x7f]';
+```
+
+To remove it, delete the row in SQL (`DELETE FROM update_registry.update_packages WHERE <the same condition> RETURNING platform, arch, version, filename;` names the binary), remove the binary and its `.sig` sidecar from the update directory by hand, and restart every serving replica. This SQL is unsupported and not audited, so record it in the change ticket.
 
 **Other effects.**
 
 - Where an input check exists, a NUL byte is answered as a client error (`400`, or -32602 on MCP). Elsewhere it may surface as a server error that retrying will not fix: treat it as permanent and do not retry. Database logs may show new SQLSTATE `22021` errors from a statement beginning `DO $yuzu_param$`; the value itself is never logged.
 - Directory sync skips and counts a record with a NUL byte in a key field, replaces a NUL byte in a display field with U+FFFD, and refuses a snapshot in which every user (or every group) would be skipped, leaving the stored roster unchanged. An already-synced record that gains a NUL byte in a key field is removed on the next sync, as any record absent upstream is.
 - A gateway that sends a NUL byte in a stream identifier receives `INVALID_ARGUMENT`.
-- OTA package upload restores the previously published binary and signature sidecar of the same filename when the registry write fails (the answer stays `503`), and refuses invalid UTF-8 in the platform, architecture or filename (and in the delete route's key fields) with `400`. Schedule enable, disable and delete answer `404`/`503` instead of `200` when the change did not apply, and schedule create answers `400` for a NUL or other refused text and `503` for a store fault. The Entra directory sync response and audit row report the counts that sync applied.
+- OTA package upload puts the previously published binary and signature sidecar of the same filename back when the registry write fails (the answer stays `503`); the previous files are kept as `<file>.yuzu_prev_<suffix>` copies until the write succeeds (see "Leftover `*.yuzu_prev_*` files" under OTA Agent Updates). The upload refuses invalid UTF-8 in the platform, architecture or filename (and the delete route's key fields) with `400`. Schedule enable and disable answer `404` (not visible to the caller) or `503` (store fault) instead of `200` when the change did not apply. Schedule delete answers `503` on a store fault, and a schedule that does not exist stays `200` with `{"deleted":false}` and no audit row. Schedule create answers `400` for a NUL byte or other refused text and `503` for a store fault. The Entra directory sync response and audit row report the counts that sync applied.
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)): every server replica and gateway runs this build. A replica on an earlier build keeps the earlier behaviour, which is outside the deployment contract; mixed-version operation is not supported. See also [Upgrading](upgrading.md).
 
@@ -4211,6 +4236,10 @@ The server can distribute agent binary updates to enrolled endpoints.
 **Package filenames may not end in `.sig`** (case-insensitive); the upload is
 rejected with a 400. That suffix is reserved for signature sidecars, named
 `<binary>.sig`, so a package called `x.sig` would occupy package `x`'s slot.
+
+**If the registry write fails, the previous package comes back.** Before an upload publishes over an existing file of the same name, the server keeps the previous binary and its `.sig` sidecar as copies named `<file>.yuzu_prev_<suffix>` in the update directory (a hard link where the filesystem allows, otherwise a copy; the live file name is never absent). When the registry write succeeds the copies are deleted; when it fails the new files are removed and the copies are put back, and the upload answers `503`. If a restore itself fails, the upload answers `500` naming the kept file and the server log records it. A non-regular file at the binary or sidecar path, or no way to keep a copy, answers `500` "Could not prepare the package directory" with nothing written.
+
+**Leftover `*.yuzu_prev_*` files.** A process crash between keeping the copy and finishing the upload can leave a `*.yuzu_prev_*` file behind, and nothing removes it. List them with `find <update-dir> -name '*.yuzu_prev_*'` (the update directory is `agent-updates/` under the data directory, or `--update-dir`). A copy that is older than any upload still running is safe to delete; a copy that a failed restore reported by name is the only remaining copy of that previous file, so restore it by hand (rename it to the file name it was kept from) before deleting anything. Exclude `*.yuzu_prev_*` from file-level backups of the update directory: the files are transient and a restored copy would look like a package.
 
 ### Promoting to Production
 
