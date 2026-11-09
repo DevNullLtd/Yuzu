@@ -1754,8 +1754,8 @@ TEST_CASE("MCP unassign_rbac_role C5: a CRLF/ANSI-escape role is refused as inva
           "[pg][mcp][rbac][a2]") {
     // Contract change: this case used to assert that such a role was accepted as an idempotent
     // no-op and neutralized in the success row's detail. A role carrying a control byte is now
-    // refused up front (the role is validated before any guard or write sees it), so the audit
-    // row is a fixed-text denial that carries no part of the role at all.
+    // refused as invalid params, so the audit row is a fixed-text denial that carries no part of
+    // the role at all.
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
 
@@ -2356,8 +2356,8 @@ bool any_success_row(const RbacRoleHarness& h) {
 
 } // namespace
 
-TEST_CASE("MCP unassign_rbac_role: a role with an embedded NUL is refused as invalid params, "
-          "audited as denied, and the caller's own grant stays",
+TEST_CASE("MCP unassign_rbac_role: a role with an embedded NUL is refused as invalid params and "
+          "audited as denied",
           "[pg][mcp][rbac][a2][validation]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
@@ -2382,8 +2382,7 @@ TEST_CASE("MCP unassign_rbac_role: a role with an embedded NUL is refused as inv
     CHECK_FALSE(any_success_row(h));
 }
 
-TEST_CASE("MCP unassign_rbac_role: a role with an embedded NUL does not remove the fleet's last "
-          "Administrator",
+TEST_CASE("MCP unassign_rbac_role: a role with an embedded NUL is refused and every grant stays",
           "[pg][mcp][rbac][a2][validation]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
@@ -2404,8 +2403,7 @@ TEST_CASE("MCP unassign_rbac_role: a role with an embedded NUL does not remove t
     CHECK_FALSE(any_success_row(h));
 }
 
-TEST_CASE("MCP unassign_rbac_role: any control byte in the role is refused before a guard or a "
-          "write",
+TEST_CASE("MCP unassign_rbac_role: any control byte in the role is refused as invalid params",
           "[pg][mcp][rbac][a2][validation]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
@@ -2429,7 +2427,7 @@ TEST_CASE("MCP unassign_rbac_role: any control byte in the role is refused befor
     CHECK_FALSE(any_success_row(h));
 }
 
-TEST_CASE("MCP unassign_rbac_role: the self-removal guard still holds for the plain spelling",
+TEST_CASE("MCP unassign_rbac_role: removing the caller's own Administrator grant is still refused",
           "[pg][mcp][rbac][a2][validation]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
@@ -2450,8 +2448,8 @@ TEST_CASE("MCP unassign_rbac_role: the self-removal guard still holds for the pl
     CHECK_FALSE(any_success_row(h));
 }
 
-TEST_CASE("MCP unassign_rbac_role: the last-Administrator guard still holds for the plain "
-          "spelling",
+TEST_CASE("MCP unassign_rbac_role: removing the fleet's last Administrator grant is still "
+          "refused",
           "[pg][mcp][rbac][a2][validation]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
@@ -2474,7 +2472,7 @@ TEST_CASE("MCP unassign_rbac_role: the last-Administrator guard still holds for 
              .value() == 1);
 }
 
-TEST_CASE("MCP unassign_rbac_role: the audit row names the role that was actually removed",
+TEST_CASE("MCP unassign_rbac_role: the audit row names the removed role",
           "[pg][mcp][rbac][a2][validation]") {
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);

@@ -877,10 +877,10 @@ TEST_CASE("deployment routes: the deploy results script reveals the empty notice
     CHECK(h.find("vis?'none':''") == std::string::npos);
 }
 
-// A run id with an embedded NUL is refused at the create route: the answer is "not found" and
-// nothing is created, resumed or dispatched.
-TEST_CASE("deployment routes: POST run with a run id carrying an embedded NUL is refused, "
-          "nothing is created, resumed or dispatched",
+// A run id that is not valid is refused at the create route: the answer is "not found" and
+// nothing is created or dispatched.
+TEST_CASE("deployment routes: POST run with an invalid run id is refused, nothing is created or "
+          "dispatched",
           "[pg][deployment][routes][validation]") {
     YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
     YUZU_REQUIRE_PG_DB_TPL(predb, preflight_routes_tpl);
@@ -892,11 +892,11 @@ TEST_CASE("deployment routes: POST run with a run id carrying an embedded NUL is
     REQUIRE(preflight_store.is_open());
 
     const auto t = now_ms();
-    const std::string run_id = "run-nul-guard-1";
+    const std::string run_id = "run-invalid-1";
     auto run = make_run(run_id, "alice", t);
     run.go = 1;
     REQUIRE(preflight_store.create_run(run, {{"agent-1", "host-1", "windows"}}));
-    const std::string dep_id = "dep-nul-guard-1";
+    const std::string dep_id = "dep-invalid-1";
     REQUIRE(deploy_store.create_deployment(make_dep(dep_id, run_id, "alice", t), {tgt("agent-1")}));
 
     auto okAuth = [](const httplib::Request&, httplib::Response&) {

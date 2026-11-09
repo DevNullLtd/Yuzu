@@ -357,8 +357,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: unknown token id returns 404 with no audi
     CHECK(h.audit_log.empty());
 }
 
-TEST_CASE("REST DELETE /api/v1/tokens: an id with an embedded NUL revokes nothing and audits no "
-          "success",
+TEST_CASE("REST DELETE /api/v1/tokens: an invalid id revokes nothing and audits no success",
           "[pg][rest][token][validation]") {
     RestTokensHarness h;
     auto token_id = h.create_token_for("alice", "alice-key");

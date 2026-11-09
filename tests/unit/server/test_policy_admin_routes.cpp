@@ -377,9 +377,9 @@ TEST_CASE("POST /api/policies: policy.create audit records an empty group list a
     CHECK(a.detail == "scope=ostype____\"linux\" groups=0");
 }
 
-// ── Identifier handling: an id carrying a NUL byte is refused ─────────────────────────────────
+// ── Identifier handling: an invalid id is refused ─────────────────────────────────────────────
 //
-// The id in these routes is a path capture. A value with an embedded NUL is refused as a whole:
+// The id in these routes is a path capture. An id that is not valid is refused as a whole:
 // no policy is deleted, enabled or disabled, and no success audit row is written.
 
 namespace {
@@ -401,7 +401,7 @@ scope: "tags.env == 'production'"
 
 } // namespace
 
-TEST_CASE("DELETE /api/policies/:id: an id with an embedded NUL deletes nothing and audits no success",
+TEST_CASE("DELETE /api/policies/:id: an invalid id deletes nothing and audits no success",
           "[pg][compliance][admin][validation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -426,7 +426,7 @@ TEST_CASE("DELETE /api/policies/:id: an id with an embedded NUL deletes nothing 
     CHECK(h.emitted_events.empty());
 }
 
-TEST_CASE("POST /api/policies/:id/disable|enable: an id with an embedded NUL changes nothing",
+TEST_CASE("POST /api/policies/:id/disable|enable: an invalid id changes nothing",
           "[pg][compliance][admin][validation]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
