@@ -1967,6 +1967,73 @@ TEST_CASE("REST inventory/software: a range over a title with kCatalogRowCap dis
     CHECK(exact.at("software").size() == 1);
 }
 
+TEST_CASE("REST inventory/software: a confined caller's range is resolved over its own rows: a title with "
+          "kCatalogRowCap versions outside its scope answers exactly as an unknown title, never a 400",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // Every one of the cap's worth of distinct versions lives on a device OUTSIDE the caller's
+    // scope. A fleet-wide distinct-version read would fill the cap and answer the range 400
+    // (kRangeNotResolvable): one bit about the fleet a confined caller must not learn.
+    std::vector<SoftwareEntry> rows;
+    rows.reserve(static_cast<std::size_t>(kCatalogRowCap));
+    for (int i = 0; i < kCatalogRowCap; ++i)
+        rows.push_back(lookup_entry("git", std::to_string(i)));
+    seed_v3(store, "dev-out", V3Status::kFull, std::move(rows));
+    seed_v3(store, "dev-in", V3Status::kFull, {lookup_entry("other", "1.0")});
+
+    InvHarness h{&store};
+    h.fleet_scope = std::unordered_set<std::string>{"dev-in"};
+    const auto capped = get_lookup(h, "?name=git&version_min=1");
+    const auto unknown = get_lookup(h, "?name=no-such-title&version_min=1");
+    CHECK(capped.at("data") == unknown.at("data")); // byte-for-byte the unknown-title answer
+    CHECK(capped.at("data").at("software").empty());
+    CHECK(capped.at("data").at("totals_omitted") == "scope");
+    CHECK_FALSE(h.has_audit("failure"));
+
+    // Deny-all (engaged-empty) is the same answer, with no store read for the range.
+    h.fleet_scope = std::unordered_set<std::string>{};
+    CHECK(get_lookup(h, "?name=git&version_min=1").at("data").at("software").empty());
+
+    // The unfiltered caller still sees the fleet-wide cut: for it the refusal is the truth.
+    h.fleet_scope.reset();
+    CHECK(get_lookup(h, "?name=git&version_min=1", 400).contains("error"));
+}
+
+TEST_CASE("REST inventory/software: a catalogue rollup row whose row_count was never computed reads building, never zero",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_v3(store, "dev-a", V3Status::kFull, {lookup_entry("git", "1.0")});
+    seed_v3(store, "dev-b", V3Status::kFull, {lookup_entry("git", "1.0")});
+    REQUIRE(store.refresh_catalog_rollup());
+    InvHarness h{&store};
+    CHECK(get_lookup(h, "?name=git").at("data").at("totals").at("installs") == 2);
+    { // The shape an older-ladder replica's refresh leaves (its INSERT names no row_count).
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(), "UPDATE software_inventory_store.catalog_rollup SET row_count = NULL",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    const auto body = get_lookup(h, "?name=git").at("data");
+    CHECK(body.at("software").size() == 2); // rows are live and unaffected
+    CHECK(body.at("totals").is_null());
+    CHECK(body.at("totals_omitted") == "building");
+    // A version filter is a live aggregate and never reads the rollup row.
+    CHECK(get_lookup(h, "?name=git&version=1.0").at("data").at("totals").at("devices") == 2);
+    // The next refresh computes the figure and the totals return.
+    REQUIRE(store.refresh_catalog_rollup());
+    CHECK(get_lookup(h, "?name=git").at("data").at("totals").at("installs") == 2);
+}
+
 TEST_CASE("REST inventory/software: a failed version read for a range is a 503 with retry_after_ms and one failure audit row",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -2087,7 +2154,17 @@ TEST_CASE("REST inventory/software: a confined caller gets scoped rows and NO to
         CHECK(body.at("software")[0]["agent_id"] == "dev-in");
         CHECK(body.at("totals").is_null());
         CHECK(body.at("totals_omitted") == "scope");
-        // No fleet figure (3 installs / 3 devices) reaches a confined caller in any form.
+        // No fleet figure (3 installs / 3 devices) reaches a confined caller in any form: the
+        // body has exactly the documented keys, and no number in it is the fleet's 3.
+        std::set<std::string> keys;
+        for (const auto& [k, v] : body.items()) {
+            keys.insert(k);
+            if (v.is_number())
+                CHECK(v.get<std::int64_t>() != 3);
+        }
+        CHECK(keys == std::set<std::string>{"software", "count", "next_cursor", "devices_omitted",
+                                            "totals", "totals_omitted"});
+        CHECK(body.at("count") == 1);
         CHECK(body.dump().find("dev-out") == std::string::npos);
     }
     h.fleet_scope.reset(); // the same request, unfiltered
@@ -2121,6 +2198,8 @@ TEST_CASE("REST inventory/software: a degraded totals read alone is a 503 with r
     REQUIRE_FALSE(body.is_discarded());
     CHECK(body.contains("error"));
     CHECK_FALSE(body.contains("data"));
-    CHECK(res->body.find("retry_after_ms") != std::string::npos);
+    CHECK(body.at("error").at("retry_after_ms") == 5000);
+    CHECK(body.at("error").at("message") ==
+          "software inventory store degraded — totals read failed");
     CHECK(h.has_audit("failure"));
 }

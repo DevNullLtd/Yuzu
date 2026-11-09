@@ -192,6 +192,12 @@ resolve_version_range(const std::vector<std::string>& distinct_versions, std::st
     return out;
 }
 
+std::optional<std::vector<std::string>> scope_ids(const authz::VisibleSet& scope) {
+    if (!scope)
+        return std::nullopt;
+    return std::vector<std::string>(scope->begin(), scope->end());
+}
+
 // ── Fingerprints, audit targets, cursors ─────────────────────────────────────
 
 std::string list_fingerprint(const ListRequest& rq) {
@@ -355,6 +361,11 @@ TotalsOutcome read_rollup_totals(const MetaFn& meta_fn, const RowFn& row_fn) {
         const auto t = row_fn();
         if (!t)
             return out;
+        if (!t->computed) {
+            // The row predates the figure (row_count NULL, schema v12): building, never zero.
+            out.status = TotalsStatus::kBuilding;
+            return out;
+        }
         const auto after = meta_fn();
         if (!after)
             return out;

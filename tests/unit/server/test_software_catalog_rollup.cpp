@@ -131,7 +131,8 @@ TEST_CASE("SoftwareCatalogRollup worker refreshes the components rollup and emit
     // the wiring: one tick of a long-interval worker stamps the rollup, counts a success and sets
     // the liveness gauge. The catalogue leg of the same tick is made to fail (its table is
     // dropped), so the case also pins that the components leg does not depend on it. The test
-    // waits on the last thing the tick emits (the success timestamp), never on a sleep.
+    // polls the last thing the tick emits (the success timestamp) under a deadline, never a fixed
+    // sleep (the reason for the poll is below).
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());

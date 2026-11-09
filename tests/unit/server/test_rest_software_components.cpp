@@ -438,6 +438,16 @@ TEST_CASE("REST components: a confined caller gets rows and NO totals; the same 
     CHECK(confined.at("data").at("totals").is_null()); // no fleet count leaks
     CHECK(confined.at("data").at("totals_omitted") == "scope");
     CHECK(confined.dump().find("dev-out") == std::string::npos);
+    // Exactly the documented keys, and every number is 0: the fleet's one instance on dev-out
+    // is in no field of a confined caller's empty page.
+    std::set<std::string> keys;
+    for (const auto& [k, v] : confined.at("data").items()) {
+        keys.insert(k);
+        if (v.is_number())
+            CHECK(v.get<std::int64_t>() == 0);
+    }
+    CHECK(keys == std::set<std::string>{"components", "count", "next_cursor", "devices_omitted",
+                                        "totals", "totals_omitted"});
 
     h.fleet_scope.reset(); // AdmitAll
     const auto global = get_json(h, "?name=libfoo&kind=jar");
@@ -635,6 +645,39 @@ TEST_CASE("REST components: a range over a component with kCatalogRowCap distinc
     CHECK(exact.at("data").at("components").size() == 1);
 }
 
+TEST_CASE("REST components: a confined caller's range is resolved over its own rows: a component with "
+          "kCatalogRowCap versions outside its scope answers exactly as an unknown component, never a 400",
+          "[pg][rest][inventory_components][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<V3Component> rows;
+    rows.reserve(static_cast<std::size_t>(kCatalogRowCap));
+    for (int i = 0; i < kCatalogRowCap; ++i)
+        rows.push_back(comp("libfoo", "/p/" + std::to_string(i), std::to_string(i)));
+    seed_components(store, "dev-out", std::move(rows)); // the whole cap, all out of scope
+    seed_components(store, "dev-in", {comp("other", "/i", "1.0")});
+
+    CompHarness h{&store};
+    h.fleet_scope = std::unordered_set<std::string>{"dev-in"};
+    const auto capped = get_json(h, "?name=libfoo&kind=jar&version_min=1");
+    const auto unknown = get_json(h, "?name=no-such-component&kind=jar&version_min=1");
+    CHECK(capped.at("data") == unknown.at("data"));
+    CHECK(capped.at("data").at("components").empty());
+    CHECK(capped.at("data").at("totals_omitted") == "scope");
+    CHECK(h.audits("inventory.components.view", "failure") == 0);
+
+    h.fleet_scope = std::unordered_set<std::string>{}; // deny-all: the same empty answer
+    CHECK(get_json(h, "?name=libfoo&kind=jar&version_min=1").at("data").at("components").empty());
+
+    h.fleet_scope.reset(); // unfiltered: the fleet-wide cut is this caller's truth
+    auto res = h.sink.Get(std::string(kPath) + "?name=libfoo&kind=jar&version_min=1");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
 TEST_CASE("REST components: a failed version read for a range is a 503 with retry_after_ms and one failure audit row",
           "[pg][rest][inventory_components]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
@@ -717,7 +760,9 @@ TEST_CASE("REST components: a degraded totals read alone is a 503 with retry_aft
     auto body = nlohmann::json::parse(res->body, nullptr, false);
     REQUIRE_FALSE(body.is_discarded());
     CHECK(body.contains("error"));
-    CHECK(body.dump().find("retry_after_ms") != std::string::npos);
+    CHECK(body.at("error").at("retry_after_ms") == 5000);
+    CHECK(body.at("error").at("message") ==
+          "software inventory store degraded — totals read failed");
     CHECK(h.audits("inventory.components.view", "failure") == 1);
 }
 
@@ -746,6 +791,11 @@ TEST_CASE("REST components: a 100k-row CSV export walks every page with a contin
     std::string cursor;
     std::size_t data_rows = 0;
     int pages = 0;
+    // Every (agent, path) exactly once across the walk: a row repeated or skipped at a page
+    // boundary would keep the total right and still be a wrong export.
+    std::unordered_set<std::string> seen;
+    seen.reserve(static_cast<std::size_t>(kDevices) * kPerDevice);
+    const std::string header(software_list::kComponentsCsvHeader);
     for (;;) {
         std::string q = "?format=csv";
         if (!cursor.empty())
@@ -756,9 +806,29 @@ TEST_CASE("REST components: a 100k-row CSV export walks every page with a contin
         ++pages;
         REQUIRE(pages <= 12);
         std::size_t lines = 0;
-        for (char c : res->body)
-            if (c == '\n')
-                ++lines;
+        for (std::size_t from = 0;;) {
+            const auto nl = res->body.find('\n', from);
+            if (nl == std::string::npos)
+                break;
+            ++lines;
+            std::string line = res->body.substr(from, nl - from);
+            from = nl + 1;
+            if (line.ends_with('\r'))
+                line.pop_back();
+            if (line == header || line.starts_with('#'))
+                continue;
+            // No cell of this seed holds a comma or quote: agent_id is cell 0, path cell 7.
+            std::vector<std::string> cells;
+            for (std::size_t c = 0;;) {
+                const auto comma = line.find(',', c);
+                cells.push_back(line.substr(c, comma == std::string::npos ? comma : comma - c));
+                if (comma == std::string::npos)
+                    break;
+                c = comma + 1;
+            }
+            REQUIRE(cells.size() == software_list::kComponentsCsvColumns);
+            REQUIRE(seen.insert(cells[0] + "|" + cells[7]).second);
+        }
         REQUIRE(lines >= 1);
         const bool more = res->has_header("X-Next-Cursor");
         if (more) {
@@ -773,6 +843,7 @@ TEST_CASE("REST components: a 100k-row CSV export walks every page with a contin
         cursor = res->get_header_value("X-Next-Cursor");
     }
     CHECK(data_rows == static_cast<std::size_t>(kDevices) * kPerDevice);
+    CHECK(seen.size() == data_rows);
     // The export cap is 10000 rows per call. A page that comes back full always carries a
     // continuation (the documented count == limit rule, "more rows may exist", shared with the
     // installs route), so a total that is an exact multiple of the cap ends on one more,

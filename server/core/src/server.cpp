@@ -2643,6 +2643,21 @@ public:
                           "now - this exceeds the rollup cadence (a stuck/failing thread leaves the "
                           "/inventory catalogue silently stale)",
                           "gauge");
+        metrics_.describe("yuzu_inventory_component_rollup_total",
+                          "Software components rollup (component_rollup, the totals of "
+                          "GET /api/v1/inventory/software/components) refresh outcomes, by outcome "
+                          "(success/error). Keep-last-good on error; both series are seeded at 0.",
+                          "counter");
+        metrics_.describe("yuzu_inventory_component_rollup_duration_seconds",
+                          "Wall-clock of the last components rollup refresh (one GROUP BY over "
+                          "software_components, off the request path, on the catalogue rollup "
+                          "thread)",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_component_rollup_last_success_timestamp",
+                          "Epoch seconds of the last successful components rollup refresh (0 until "
+                          "the first); alert when now - this exceeds the rollup cadence guarded by "
+                          "> 0 (a failing refresh leaves the components totals aging or building)",
+                          "gauge");
         metrics_.describe("yuzu_software_normalization_pass_total",
                           "Software-title normalisation ticks by outcome (success/error); hourly, "
                           "or every 60 s while a backlog remains or the catalogue rollup has not "

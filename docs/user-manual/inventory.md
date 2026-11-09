@@ -768,9 +768,14 @@ curl -H "Authorization: Bearer $TOKEN" \
 - **Components.** [`GET /api/v1/inventory/software/components`](rest-api.md#get-apiv1inventorysoftwarecomponents)
   answers the same question for components found inside applications, under the same gate,
   scope confinement, status and `totals` rule; its totals come from an hourly rollup on the
-  catalogue rollup's thread (`yuzu_inventory_component_rollup_total{outcome}`,
-  `yuzu_inventory_component_rollup_duration_seconds`,
-  `yuzu_inventory_component_rollup_last_success_timestamp`).
+  catalogue rollup's thread (`yuzu_inventory_component_rollup_total{outcome}`, both outcomes
+  seeded at 0 so the first failure is an increase; `yuzu_inventory_component_rollup_duration_seconds`;
+  `yuzu_inventory_component_rollup_last_success_timestamp`, seeded 0 until the first success).
+  The refresh runs at server start and then hourly, with no manual trigger (a restart runs
+  one at once); a failed, cancelled or over-budget refresh keeps the last-good rollup and its
+  stamp, and the figures read `building` until the first refresh completes. The freshness
+  stamp is the single row `component_rollup_meta` (`id = 1`), seeded by the schema: if that
+  row is deleted every refresh fails (keep-last-good) until it is restored, so never delete it.
 - **Carries the same scope push-down as the MCP tool** — the SAME
   `require_fleet_read` gate, so REST and MCP cannot observe a different
   admit/filter decision for the same caller (see the MCP note above). A positive
@@ -1324,8 +1329,10 @@ hourly by the background `SoftwareCatalogRollup` thread) emits three further ser
   `…_last_success_timestamp` means recomputes are failing (PG outage, a statement over
   its 60 s limit, or the 10-minute whole-refresh limit exceeded at scale) and the
   catalogue is going stale; keep-last-good serves the prior rollup meanwhile, except for
-  the first refresh after the v8 upgrade, which has no last-good and leaves the catalogue
-  "building". The failing statement and its cause are in the server log (warning).
+  a first refresh that has no last-good (a fresh deployment whose refresh fails or never
+  fits its limit), which leaves the catalogue "building" for as long as the refreshes keep
+  failing; on a fleet above the ceiling below that is permanent until the rollup is made
+  incremental. The failing statement and its cause are in the server log (warning).
 - `yuzu_inventory_catalog_rollup_duration_seconds` (gauge) — the last recompute's
   whole-refresh wall-clock. Compare it with the two compile-time limits (not flags): 60 s
   per statement and 600 s for the whole refresh. A value rising towards either is the

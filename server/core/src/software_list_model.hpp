@@ -9,10 +9,13 @@
 ///
 /// Rules this file owns (each stated once, here):
 ///  * VERSION RANGE: `version_min`/`version_max` are inclusive bounds under the catalogue's
-///    transitive comparator (`software_catalog::catalog_version_compare`), resolved against the
-///    title's fleet-wide distinct versions into an exact version SET that becomes a SQL
-///    predicate. The set never appears in a response (a confined caller learns nothing beyond its
-///    own rows). A title with kCatalogRowCap distinct versions cannot be resolved (refused).
+///    transitive comparator (`software_catalog::catalog_version_compare`), resolved LIVE against
+///    the title's distinct versions WITHIN THE CALLER'S SCOPE (the gate's VisibleSet pushed into
+///    the read; a global caller reads the fleet) into an exact version SET that becomes a SQL
+///    predicate. The set never appears in a response, and the kCatalogRowCap cut that refuses a
+///    range is decided over the same scoped rows, so a confined caller learns nothing beyond its
+///    own rows: a title with kCatalogRowCap distinct versions outside its scope answers exactly
+///    as an unknown title does.
 ///  * TOTALS (ADR-0017: a fleet rollup cannot be confined, and distinct counts are not additive):
 ///    a `totals` block is served ONLY when the gate admitted the caller globally
 ///    (ListReadDecision::AdmitAll) AND the filters are exactly `name` with match=exact, plus
@@ -116,11 +119,20 @@ struct ComponentsRequest {
 
 /// The members of `distinct_versions` within [min, max] (an empty bound is open) under
 /// catalog_version_compare; the empty version never matches a bound. `distinct_versions` is a
-/// fleet-wide read bounded at kCatalogRowCap: a read that returned that many rows may be cut, so
-/// it is refused with kRangeNotResolvable rather than resolved against a partial set.
+/// live read over the caller's scope (see scope_ids) bounded at kCatalogRowCap: a read that
+/// returned that many rows may be cut, so it is refused with kRangeNotResolvable rather than
+/// resolved against a partial set.
 [[nodiscard]] std::expected<std::vector<std::string>, std::string>
 resolve_version_range(const std::vector<std::string>& distinct_versions, std::string_view version_min,
                       std::string_view version_max);
+
+/// The gate's scope as the store's `agent_ids` push-down for the distinct-version reads: nullopt
+/// (unfiltered) stays nullopt; an engaged set, empty included, is passed whole (the store's
+/// present-empty rule returns an empty value with no SQL). Unlike the page read there is no
+/// post-filter alternative for a scope wider than kScopePushdownMaxIds: a distinct-version set
+/// cannot be filtered after the fact (a cut read would leak the fleet property), so the whole
+/// set is pushed into the one bounded statement.
+[[nodiscard]] std::optional<std::vector<std::string>> scope_ids(const authz::VisibleSet& scope);
 
 // ── Fingerprints, audit targets, cursors ─────────────────────────────────────
 

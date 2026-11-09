@@ -6899,17 +6899,23 @@ TEST_CASE("v12: the lookup objects exist and the meta singleton is seeded buildi
     CHECK(meta->refreshed_at == 0); // never computed: "building"
 }
 
-TEST_CASE("migration v12 resets the catalogue freshness stamp to building over a live v11 database, and re-runs idempotently",
+TEST_CASE("migration v12 adds a nullable row_count over a live v11 database: the stamp survives, a row "
+          "it did not compute reads building, and the step re-runs idempotently",
           "[pg][software_inventory][lookup]") {
-    // Reproduce a v11-era schema: drop the v12 additions, mark the catalogue rollup fresh, rewind
-    // schema_meta to 11, reconstruct so v12 runs over live data; then rewind and reconstruct again
-    // to prove the migration text is idempotent.
+    // Reproduce a v11-era schema holding a refreshed catalogue: drop the v12 additions (the rows of
+    // catalog_rollup stay), mark the catalogue rollup fresh, rewind schema_meta to 11, reconstruct
+    // so v12 runs over live data; then rewind and reconstruct again to prove the migration text is
+    // idempotent.
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     {
         SoftwareInventoryStore s1{pool};
         REQUIRE(s1.is_open());
+        REQUIRE(s1.apply_installed_software("mig-a", "",
+                                            std::vector<SoftwareEntry>{{"git", "1", "P", ""}},
+                                            1) == InventoryIngestOutcome::kStored);
+        REQUIRE(s1.refresh_catalog_rollup()); // a published rollup row for "git"
     }
     const auto rewind = [&] {
         REQUIRE(sql_ok(pool, "UPDATE public.schema_meta SET version = 11 "
@@ -6927,20 +6933,37 @@ TEST_CASE("migration v12 resets the catalogue freshness stamp to building over a
     {
         SoftwareInventoryStore store{pool}; // v12 over the v11 shape
         REQUIRE(store.is_open());
-        // Rows written before row_count existed carry 0, so the stamp is reset: a reader sees
-        // `building`, never installs = 0 beside a non-zero device count.
+        // The column comes back nullable and empty for the rows already there; the freshness
+        // stamp is NOT reset (the catalogue's other readers keep their last-good rollup).
         const auto meta = store.catalog_rollup_meta();
         REQUIRE(meta.has_value());
-        CHECK(meta->refreshed_at == 0);
-        CHECK(sql_rows(pool, "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
-                             "'software_inventory_store' AND table_name = 'catalog_rollup' AND "
-                             "column_name = 'row_count'")[0][0] == "1");
+        CHECK(meta->refreshed_at == 12345);
+        CHECK(sql_rows(pool, "SELECT is_nullable FROM information_schema.columns WHERE table_schema "
+                             "= 'software_inventory_store' AND table_name = 'catalog_rollup' AND "
+                             "column_name = 'row_count'")[0][0] == "YES");
+        CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.catalog_rollup WHERE "
+                             "row_count IS NULL")[0][0] != "0");
+        // A row whose figure was never computed reads "not computed", never installs = 0 beside
+        // a non-zero device count. The same shape results from an older-ladder replica's refresh
+        // (its INSERT names no row_count).
+        const auto before = store.catalog_title_totals("git");
+        REQUIRE(before.has_value());
+        CHECK_FALSE(before->computed);
         const auto cmeta = store.component_rollup_meta();
         REQUIRE(cmeta.has_value());
         CHECK(cmeta->refreshed_at == 0); // seeded building
         CHECK(sql_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = "
                              "'software_inventory_store' AND indexname = "
                              "'software_components_name_idx'")[0][0] == "1");
+        // The next refresh computes it.
+        REQUIRE(store.refresh_catalog_rollup());
+        const auto after = store.catalog_title_totals("git");
+        REQUIRE(after.has_value());
+        CHECK(after->computed);
+        CHECK(after->installs == 1);
+        CHECK(after->devices == 1);
+        CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.catalog_rollup WHERE "
+                             "row_count IS NULL")[0][0] == "0");
     }
     rewind();
     SoftwareInventoryStore again{pool}; // second run over an already-migrated database
@@ -7027,6 +7050,91 @@ TEST_CASE("refresh_component_rollup: a cancelled refresh keeps the last-good rol
     REQUIRE(store.refresh_component_rollup());
     CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup")[0][0] ==
           "2");
+}
+
+TEST_CASE("refresh_component_rollup: a peer holding the lock makes this replica skip as success; a deleted "
+          "meta row and a starved pool fail without touching the last-good rollup",
+          "[pg][software_inventory][lookup]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    apply_components(store, "dev-a", {comp("libfoo", "/a", "1.0")});
+
+    // The advisory-lock skip (its OWN key, not the catalogue's): held by a peer, refresh returns
+    // true and recomputes nothing; released, it recomputes.
+    auto holder = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(holder);
+    pg::PgResult lk = pg::exec_params(
+        holder.get(),
+        "SELECT pg_advisory_lock(hashtextextended('software_inventory_store:component_rollup', 0))",
+        std::vector<std::string>{});
+    REQUIRE(lk.status() == PGRES_TUPLES_OK);
+    CHECK(store.refresh_component_rollup());
+    CHECK(store.component_rollup_meta()->refreshed_at == 0); // skipped: still building
+    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup")[0][0] ==
+          "0");
+    pg::PgResult ul = pg::exec_params(
+        holder.get(),
+        "SELECT pg_advisory_unlock(hashtextextended('software_inventory_store:component_rollup', 0))",
+        std::vector<std::string>{});
+    REQUIRE(ul.status() == PGRES_TUPLES_OK);
+    holder = {};
+    REQUIRE(store.refresh_component_rollup());
+    const auto good = store.component_rollup_meta();
+    REQUIRE(good.has_value());
+    REQUIRE(good->refreshed_at > 0);
+
+    // The meta singleton gone: the stamp UPDATE returns no row, the refresh is false and the
+    // rollup rows it would have replaced are rolled back to the last-good set.
+    apply_components(store, "dev-b", {comp("libbar", "/b", "1.0")});
+    REQUIRE(sql_ok(pool, "DELETE FROM software_inventory_store.component_rollup_meta"));
+    CHECK_FALSE(store.refresh_component_rollup());
+    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup")[0][0] ==
+          "1"); // libbar never published
+    REQUIRE(sql_ok(pool, "INSERT INTO software_inventory_store.component_rollup_meta (id, "
+                         "refreshed_at) VALUES (1, $1)",
+                   {std::to_string(good->refreshed_at)}));
+
+    // A starved pool (the only lease held) is false, and the last-good rollup and stamp survive.
+    PgPool one{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(one.valid());
+    SoftwareInventoryStore starved{one};
+    REQUIRE(starved.is_open());
+    auto held = one.acquire();
+    REQUIRE(held);
+    CHECK_FALSE(starved.refresh_component_rollup());
+    held = {};
+    CHECK(store.component_rollup_meta()->refreshed_at == good->refreshed_at);
+}
+
+TEST_CASE("refresh_component_rollup: a statement failing after the DELETE rolls the whole refresh back and "
+          "keeps the last-good rollup and stamp",
+          "[pg][software_inventory][lookup]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    apply_components(store, "dev-a", {comp("libfoo", "/a", "1.0")});
+    REQUIRE(store.refresh_component_rollup());
+    const auto good = store.component_rollup_meta();
+    REQUIRE(good.has_value());
+    REQUIRE(good->refreshed_at > 0);
+    // The DELETE of component_rollup succeeds; the INSERT ... SELECT FROM software_components
+    // fails (the source table is gone): one transaction, so the DELETE is undone too.
+    REQUIRE(sql_ok(pool, "DROP TABLE software_inventory_store.software_components"));
+    CHECK_FALSE(store.refresh_component_rollup());
+    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup")[0][0] ==
+          "1");
+    const auto after = store.component_rollup_meta();
+    REQUIRE(after.has_value());
+    CHECK(after->refreshed_at == good->refreshed_at);
+    const auto totals = store.component_totals("jar", "libfoo", std::nullopt);
+    REQUIRE(totals.has_value());
+    CHECK(totals->installs == 1); // still served from the last-good row
+    CHECK(store.is_open());
 }
 
 TEST_CASE("query_components: keyset order, scope push-down, prefix and contains escape LIKE metacharacters",
@@ -7189,6 +7297,15 @@ TEST_CASE("component_versions: LIVE distinct non-empty versions of one component
     CHECK(*store.component_versions("", "other") == std::vector<std::string>{"1.0", "2.0"});
     CHECK(store.component_versions("jar", "").value().empty()); // no name: empty value
     CHECK(store.component_versions("jar", "absent").value().empty());
+    // The caller's scope is pushed into the read: a confined caller's set and its cap are about
+    // its own devices only (dev-b holds one version of the capped component; dev-c none).
+    const std::optional<std::vector<std::string>> only_b{{"dev-b"}};
+    CHECK(*store.component_versions("jar", "libfoo", only_b) == std::vector<std::string>{"v1"});
+    const std::optional<std::vector<std::string>> only_c{{"dev-c"}};
+    CHECK(store.component_versions("jar", "libfoo", only_c).value().empty());
+    CHECK(*store.component_versions("jar", "other", only_c) == std::vector<std::string>{"1.0"});
+    const std::optional<std::vector<std::string>> none{std::vector<std::string>{}};
+    CHECK(store.component_versions("jar", "libfoo", none).value().empty()); // deny-all: no SQL
 }
 
 TEST_CASE("installed_software_distinct_versions: LIVE distinct non-empty versions of one title, capped",
@@ -7213,6 +7330,59 @@ TEST_CASE("installed_software_distinct_versions: LIVE distinct non-empty version
     CHECK(big->size() == static_cast<std::size_t>(kCatalogRowCap)); // never more
     CHECK(store.installed_software_distinct_versions("").value().empty());
     CHECK(store.installed_software_distinct_versions("absent").value().empty());
+    // Scoped: the capped title has one version per device, so a two-device scope reads two, and
+    // a scope with none of its devices reads nothing (never the fleet's cut).
+    const std::optional<std::vector<std::string>> two{{"a1", "a2"}};
+    CHECK(*store.installed_software_distinct_versions("bigtitle", two) ==
+          std::vector<std::string>{"v1", "v2"});
+    const std::optional<std::vector<std::string>> d1{{"d1"}};
+    CHECK(*store.installed_software_distinct_versions("git", d1) == std::vector<std::string>{"1.9"});
+    CHECK(store.installed_software_distinct_versions("bigtitle", d1).value().empty());
+    const std::optional<std::vector<std::string>> none{std::vector<std::string>{}};
+    CHECK(store.installed_software_distinct_versions("git", none).value().empty());
+}
+
+TEST_CASE("query_software: match=prefix and a status filter run under the 5 s statement bound, never to "
+          "the pool's lock or statement default",
+          "[pg][software_inventory][lookup]") {
+    // A peer holds ACCESS EXCLUSIVE on installed_software inside an open transaction, so any read
+    // of the table waits on the lock. The bounded path's SET LOCAL statement_timeout (5 s,
+    // kSearchStatementTimeout) cancels that wait; the bare-lease path would wait to the pool's
+    // lock_timeout (10 s) and, on a scan, its statement_timeout (30 s). Elapsed time therefore
+    // tells the two paths apart: both shapes must degrade (nullopt) well inside 10 s. Costs
+    // about 10 s of wall-clock (two 5 s bounds); the ordering is of two server-side timers, not
+    // of this process's scheduling.
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    auto holder = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(holder);
+    for (const char* sql : {"BEGIN", "LOCK TABLE software_inventory_store.installed_software IN "
+                                     "ACCESS EXCLUSIVE MODE"}) {
+        pg::PgResult r = pg::exec_params(holder.get(), sql, std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    SoftwareFleetQuery prefix;
+    prefix.name = "zz";
+    prefix.match = NameMatch::kPrefix;
+    prefix.limit = 10;
+    SoftwareFleetQuery status;
+    status.status = "disabled";
+    status.limit = 10;
+    for (const auto* q : {&prefix, &status}) {
+        CAPTURE(q->name, q->status);
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK_FALSE(store.query_software(*q).has_value()); // degraded, never an empty page
+        const auto secs =
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0)
+                .count();
+        CHECK(secs < 9); // the 5 s bound fired, not the 10 s lock_timeout
+    }
+    pg::PgResult rb = pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+    REQUIRE(rb.status() == PGRES_COMMAND_OK);
+    CHECK(store.is_open());
 }
 
 TEST_CASE("catalog_title_totals counts install ROWS and distinct devices; version-set totals count a device once",

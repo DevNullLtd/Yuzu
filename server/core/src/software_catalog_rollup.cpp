@@ -52,9 +52,15 @@ void SoftwareCatalogRollup::run() {
     // (the ongoing-failure case is covered by ..._rollup_total{outcome="error"}).
     if (metrics_)
         metrics_->gauge("yuzu_inventory_catalog_rollup_last_success_timestamp").set(0);
-    // The components rollup rides this thread (SAM-17); its liveness gauge is seeded the same way.
-    if (metrics_)
+    // The components rollup rides this thread (SAM-17); its liveness gauge is seeded the same way,
+    // and both families' outcome counters are seeded at 0 so the first failure is an increase()
+    // a rate rule can see (observability-conventions.md, #5177), not the birth of a series.
+    if (metrics_) {
         metrics_->gauge("yuzu_inventory_component_rollup_last_success_timestamp").set(0);
+        for (const char* stem : {"yuzu_inventory_catalog_rollup", "yuzu_inventory_component_rollup"})
+            for (const char* outcome : {"success", "error"})
+                metrics_->counter(std::string(stem) + "_total", {{"outcome", outcome}}).increment(0);
+    }
     bool first = true;
     while (!stop_.load(std::memory_order_acquire)) {
         if (!first) {
@@ -110,8 +116,12 @@ void SoftwareCatalogRollup::run() {
                         [this](auto&& cancelled) { return store_.refresh_catalog_rollup(cancelled); });
 
             // The components rollup (same thread, same cancel flag, its own advisory lock and
-            // keep-last-good), run whether or not the catalogue refresh succeeded: neither
-            // result gates the other. Skipped once a stop was requested.
+            // keep-last-good), run whether or not the catalogue refresh RETURNED false: neither
+            // result gates the other. A throw from the catalogue leg (the store returns bool, so
+            // none is expected) ends this tick for both legs in the catch below; the next tick
+            // runs both again. Skipped once a stop was requested.
+            YUZU_ASSERT_BACKGROUND_JOB(
+                "software_catalog_rollup.refresh_component_rollup"); // WS-10 ReplicaSafe
             if (!stop_.load(std::memory_order_acquire))
                 run_refresh("yuzu_inventory_component_rollup", "Software components rollup",
                             [this](auto&& cancelled) {

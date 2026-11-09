@@ -296,6 +296,11 @@ struct SoftwareTotals {
     std::int64_t installs{0};
     std::int64_t devices{0};
     std::int64_t devices_unconfirmed{0};
+    /// false when the rollup row exists but its figure was never computed (`catalog_rollup.row_count`
+    /// IS NULL: a row written before schema v12, or by an older-ladder replica's refresh). The
+    /// counts above are then meaningless and the caller reports "building", never a zero. Always
+    /// true for a live aggregate and for a row the current refresh wrote.
+    bool computed{true};
 };
 
 /// Freshness stamp of the components rollup (refreshed_at == 0: never computed, "building").
@@ -714,16 +719,23 @@ public:
     /// by installed_software_name_idx), ordered, at most kCatalogRowCap rows: a read that returns
     /// that many may have been cut (the caller must treat it as unresolvable). Live, not the hourly
     /// version_rollup, so a version first reported since the last refresh is never missing from a
-    /// range resolved against it. 5 s bound; nullopt on degrade. Empty name -> empty value.
+    /// range resolved against it. `agent_ids` is the caller's scope pushed into the WHERE (the
+    /// SoftwareFleetQuery::agent_ids rule: nullopt = the whole fleet; present-empty = an empty
+    /// value with no SQL), so the cap and the set a confined caller's range resolves against are
+    /// about its own rows only. 5 s bound; nullopt on degrade. Empty name -> empty value.
     [[nodiscard]] std::optional<std::vector<std::string>>
-    installed_software_distinct_versions(std::string_view name);
+    installed_software_distinct_versions(
+        std::string_view name,
+        const std::optional<std::vector<std::string>>& agent_ids = std::nullopt);
 
     /// Distinct non-empty versions of one component (kind may be empty = any kind), LIVE from
     /// `software_components` (served by software_components_name_idx), ordered, at most
-    /// kCatalogRowCap rows (the same cut-read rule as installed_software_distinct_versions). 5 s
-    /// bound; nullopt on degrade. Empty name -> empty value.
+    /// kCatalogRowCap rows (the same cut-read and `agent_ids` scope rules as
+    /// installed_software_distinct_versions). 5 s bound; nullopt on degrade. Empty name -> empty
+    /// value.
     [[nodiscard]] std::optional<std::vector<std::string>>
-    component_versions(std::string_view kind, std::string_view name);
+    component_versions(std::string_view kind, std::string_view name,
+                       const std::optional<std::vector<std::string>>& agent_ids = std::nullopt);
 
     /// Exact application totals for one title (name-only grain of the catalogue rollup):
     /// installs = install rows, devices = distinct devices. nullopt on degrade; a title absent

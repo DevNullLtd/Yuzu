@@ -482,11 +482,13 @@ const std::vector<pg::PgMigration>& migrations() {
          // rollup, and the components name index.
          // catalog_rollup.row_count: install ROWS of the group (count(*)), beside device_count
          // (distinct devices), so a title's totals report the SAME `installs` (rows) rollup-served
-         // and live. A constant-default ADD COLUMN is metadata-only (the v5 precedent). The rows
-         // already there carry 0 until the next refresh recomputes them, so the same statement
-         // sets catalog_rollup_meta.refreshed_at back to 0 ("building", the v8 precedent): a
-         // reader sees `building` for the first refresh interval, never installs = 0 beside a
-         // non-zero device count. The background rollup thread runs its first refresh at start.
+         // and live. NULLABLE with NO default (a metadata-only ADD COLUMN): a row whose row_count
+         // is NULL was written by a refresh that did not compute it (a row that predates v12, or
+         // a refresh by an older-ladder replica, whose INSERT names no row_count), and
+         // catalog_title_totals reads NULL as "building" (SoftwareTotals::computed = false).
+         // That is the data's own marker, so no freshness-stamp reset is needed: a reader never
+         // sees installs = 0 beside a non-zero device count, and the catalogue's other readers
+         // (KPIs, export, versions drill) keep the last-good rollup through the migration.
          // component_rollup: one row per (kind, name) with exact instance (row) and
          // distinct-device counts, replaced whole by refresh_component_rollup. component_rollup_meta is the singleton freshness stamp,
          // seeded refreshed_at = 0 ("building"). Two new EMPTY tables: online.
@@ -496,8 +498,7 @@ const std::vector<pg::PgMigration>& migrations() {
          // path is live, so a v3 fixture can fill it), so this plain CREATE INDEX inside the ladder
          // transaction holds ACCESS EXCLUSIVE on an empty table for no measurable time and needs no
          // CONCURRENTLY, exactly like software_components_row_hash_idx in v11.
-         "ALTER TABLE catalog_rollup ADD COLUMN IF NOT EXISTS row_count BIGINT NOT NULL DEFAULT 0;"
-         "UPDATE catalog_rollup_meta SET refreshed_at = 0 WHERE id = 1;"
+         "ALTER TABLE catalog_rollup ADD COLUMN IF NOT EXISTS row_count BIGINT;"
          "CREATE TABLE IF NOT EXISTS component_rollup ("
          "  kind                TEXT     NOT NULL,"
          "  name                TEXT     NOT NULL,"
@@ -1022,10 +1023,12 @@ std::string q_arms(const std::string& ph, std::string_view name, std::string_vie
 
 
 // The name predicate of the fleet lookups. exact: `col = $n`; prefix: a LIKE-escaped `col LIKE
-// $n%` (the btree on name serves it where the database collation allows a LIKE prefix scan,
-// else it is a filtered scan under the row limit); contains: a literal ILIKE. Returns true when
-// the predicate is a scan-shaped one (contains) that the caller must run under the 5 s bound.
-// `name` is parser-validated text (strict UTF-8, no NUL, <= 1024 bytes).
+// $n%`; contains: a literal ILIKE. Returns true when the predicate is scan-shaped and the caller
+// must run it under the 5 s bound: contains always, and prefix too, because the btree on name
+// serves a LIKE prefix only under the C collation; under a locale collation (en_US.UTF-8, the
+// common default) it is a sequential scan of the whole table that the row LIMIT does not bound
+// when few or no rows match (measured: parallel seq scan at 2M and 3M rows). Only exact is
+// index-driven everywhere. `name` is parser-validated text (strict UTF-8, no NUL, <= 1024 bytes).
 bool add_name_predicate(std::string& sql, std::vector<std::string>& params, int& p,
                         std::string_view col, const std::string& name, NameMatch m) {
     if (name.empty())
@@ -1039,7 +1042,7 @@ bool add_name_predicate(std::string& sql, std::vector<std::string>& params, int&
     case NameMatch::kPrefix:
         sql += " AND " + std::string(col) + " LIKE " + ph + " ESCAPE '\\'";
         params.push_back(sc::like_escape(name) + "%");
-        return false;
+        return true;
     case NameMatch::kContains:
         sql += " AND " + std::string(col) + " ILIKE '%' || " + ph + " || '%' ESCAPE '\\'";
         params.push_back(sc::like_escape(name));
@@ -1057,12 +1060,16 @@ void add_version_set(std::string& sql, std::vector<std::string>& params, int& p,
 }
 
 // The row-status filter over the shared derivation (kRowStatusCaseSql, facet joined as `fs`).
-void add_status_filter(std::string& sql, std::vector<std::string>& params, int& p,
+// Returns true when a filter was added: the derived status is not indexable, so with no name the
+// predicate walks the whole index and must run under the 5 s bound (status=disabled over 2M
+// rows with no match: 2.65 s, linear).
+bool add_status_filter(std::string& sql, std::vector<std::string>& params, int& p,
                        const std::string& status) {
     if (status.empty())
-        return;
+        return false;
     sql += " AND (" + std::string(kRowStatusCaseSql) + ") = $" + std::to_string(++p);
     params.push_back(status);
+    return true;
 }
 
 } // namespace
@@ -2331,7 +2338,8 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     }
     if (q.versions)
         add_version_set(sql, params, p, "i.version", *q.versions);
-    add_status_filter(sql, params, p, q.status);
+    if (add_status_filter(sql, params, p, q.status))
+        scan_shaped = true;
     if (q.agent_ids) {
         // Scope push-down: filter in SQL so the last returned row IS the keyset cursor.
         std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
@@ -2394,8 +2402,10 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     };
 
     if (scan_shaped) {
-        // The seq-scan ILIKE arms (q, match=contains) are the only unbounded-cost path: bound
-        // them (5 s).
+        // The shapes whose cost the name index does not bound (q, match=contains, match=prefix
+        // under a locale collation, a status filter) run under the 5 s statement bound and
+        // degrade to the audited 503, never to a pool lease held to the 30 s pool default. The
+        // exact-name and plain scope reads below stay index-driven on the bare lease.
         static SiteSamplers samplers;
         return bounded_query(pool_, metrics_, "query_software", samplers, sql, params, parse);
     }
@@ -3508,8 +3518,23 @@ std::vector<std::string> first_column(const pg::PgResult& res) {
 
 } // namespace
 
+namespace {
+// The caller's scope on a distinct-version read: nullopt leaves the whole fleet; an engaged set
+// is `agent_id = ANY($n::text[])` (the query_software push-down), so a confined caller's version
+// set, and the kCatalogRowCap cut that refuses a range, are decided over its own rows only (a
+// fleet-wide cut would tell a confined caller that a title has 2000 or more versions somewhere
+// in the fleet). The caller has already returned an empty value for a present-empty set.
+void add_scope_predicate(std::string& sql, std::vector<std::string>& params, int& p,
+                         std::string_view col, const std::vector<std::string>& agent_ids) {
+    const std::vector<std::string_view> ids(agent_ids.begin(), agent_ids.end());
+    sql += " AND " + std::string(col) + " = ANY($" + std::to_string(++p) + "::text[])";
+    params.push_back(pg::to_text_array(ids));
+}
+} // namespace
+
 std::optional<std::vector<std::string>>
-SoftwareInventoryStore::installed_software_distinct_versions(std::string_view name) {
+SoftwareInventoryStore::installed_software_distinct_versions(
+    std::string_view name, const std::optional<std::vector<std::string>>& agent_ids) {
     if (!open_) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
@@ -3518,18 +3543,23 @@ SoftwareInventoryStore::installed_software_distinct_versions(std::string_view na
                          d.occurrence);
         return std::nullopt;
     }
-    if (name.empty())
+    if (name.empty() || (agent_ids && agent_ids->empty()))
         return std::vector<std::string>{};
+    std::string sql = "SELECT DISTINCT version FROM software_inventory_store.installed_software "
+                      "WHERE name = $1 AND version <> ''";
+    std::vector<std::string> params{std::string(name)};
+    int p = 1;
+    if (agent_ids)
+        add_scope_predicate(sql, params, p, "agent_id", *agent_ids);
+    sql += " ORDER BY version LIMIT " + std::to_string(kCatalogRowCap);
     static SiteSamplers samplers;
-    return bounded_query(pool_, metrics_, "installed_software_distinct_versions", samplers,
-                         "SELECT DISTINCT version FROM software_inventory_store.installed_software "
-                         "WHERE name = $1 AND version <> '' ORDER BY version LIMIT " +
-                             std::to_string(kCatalogRowCap),
-                         std::vector<std::string>{std::string(name)}, first_column);
+    return bounded_query(pool_, metrics_, "installed_software_distinct_versions", samplers, sql,
+                         params, first_column);
 }
 
 std::optional<std::vector<std::string>>
-SoftwareInventoryStore::component_versions(std::string_view kind, std::string_view name) {
+SoftwareInventoryStore::component_versions(std::string_view kind, std::string_view name,
+                                           const std::optional<std::vector<std::string>>& agent_ids) {
     if (!open_) {
         static DegradeSampler sampler;
         if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
@@ -3538,15 +3568,18 @@ SoftwareInventoryStore::component_versions(std::string_view kind, std::string_vi
                          d.occurrence);
         return std::nullopt;
     }
-    if (name.empty())
+    if (name.empty() || (agent_ids && agent_ids->empty()))
         return std::vector<std::string>{};
     std::string sql = "SELECT DISTINCT version FROM software_inventory_store.software_components "
                       "WHERE name = $1 AND version <> ''";
     std::vector<std::string> params{std::string(name)};
+    int p = 1;
     if (!kind.empty()) {
-        sql += " AND kind = $2";
+        sql += " AND kind = $" + std::to_string(++p);
         params.emplace_back(kind);
     }
+    if (agent_ids)
+        add_scope_predicate(sql, params, p, "agent_id", *agent_ids);
     sql += " ORDER BY version LIMIT " + std::to_string(kCatalogRowCap);
     static SiteSamplers samplers;
     return bounded_query(pool_, metrics_, "component_versions", samplers, sql, params,
@@ -3574,6 +3607,12 @@ std::optional<SoftwareTotals> SoftwareInventoryStore::catalog_title_totals(std::
         std::vector<std::string>{std::string(name)}, [](const pg::PgResult& res) {
             SoftwareTotals t; // a title absent from the rollup is a genuine zero
             if (PQntuples(res.get()) == 1) {
+                // A NULL row_count is a row no v12 refresh has recomputed (see migration v12):
+                // not computed, never zero.
+                if (PQgetisnull(res.get(), 0, 0)) {
+                    t.computed = false;
+                    return t;
+                }
                 t.installs = result_i64(res, 0, 0);
                 t.devices = result_i64(res, 0, 1);
             }

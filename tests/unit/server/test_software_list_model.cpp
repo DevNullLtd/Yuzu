@@ -278,7 +278,11 @@ namespace {
 struct FakeTotals {
     std::int64_t refreshed_at{1700000000};
     bool ok{true};
+    bool computed{true}; ///< false: the rollup row's row_count is NULL (never computed)
     int moves_left{0}; ///< rollup refreshes that commit under the next rollup row reads
+    // The rollup-served counts vary with the generation (one more install per refresh), so a
+    // read that paired an older row with a newer as_of is visible as a wrong count.
+    std::int64_t gen_offset() const { return (refreshed_at - 1700000000) / 100; }
     int title_reads{0};
     int set_reads{0};
     int comp_reads{0};
@@ -303,7 +307,9 @@ struct FakeTotals {
             move();
             if (!ok)
                 return std::nullopt;
-            return SoftwareTotals{10, 4, 0};
+            SoftwareTotals t{10 + gen_offset(), 4, 0};
+            t.computed = computed;
+            return t;
         };
         io.version_set_totals = [this](std::string_view,
                                        const std::vector<std::string>& v) -> std::optional<SoftwareTotals> {
@@ -321,7 +327,7 @@ struct FakeTotals {
             last_had_versions = v.has_value();
             if (!ok)
                 return std::nullopt;
-            return SoftwareTotals{9, 3, 2};
+            return SoftwareTotals{9 + gen_offset(), 3, 2};
         };
         return io;
     }
@@ -381,6 +387,16 @@ TEST_CASE("read_application_totals: building before the first refresh; a failed 
     CHECK(read_application_totals(f.reads(), q).status == TotalsStatus::kDegraded);
     q.version = "1";
     CHECK(read_application_totals(f.reads(), q).status == TotalsStatus::kDegraded);
+
+    // A fresh stamp but a rollup row whose figure was never computed (row_count NULL, schema
+    // v12: a row an older-ladder refresh wrote): building, never the zero the row would read as.
+    FakeTotals stale;
+    stale.computed = false;
+    q.version.reset();
+    const auto t2 = read_application_totals(stale.reads(), q);
+    CHECK(t2.status == TotalsStatus::kBuilding);
+    CHECK_FALSE(t2.as_of.has_value());
+    CHECK(stale.title_reads == 1);
 }
 
 TEST_CASE("rollup totals: a refresh under the row read is re-read against the new epoch once; a "
@@ -394,6 +410,7 @@ TEST_CASE("rollup totals: a refresh under the row read is re-read against the ne
     CHECK(t.status == TotalsStatus::kServed);
     REQUIRE(t.as_of.has_value());
     CHECK(*t.as_of == 1700000100); // the epoch the served counts belong to, never the first one
+    CHECK(t.totals.installs == 11);  // the NEW generation's count, not the first read's 10
     CHECK(f.title_reads == 2);
 
     f.moves_left = 2;
@@ -411,6 +428,7 @@ TEST_CASE("rollup totals: a refresh under the row read is re-read against the ne
     CHECK(t.status == TotalsStatus::kServed);
     REQUIRE(t.as_of.has_value());
     CHECK(*t.as_of == f.refreshed_at);
+    CHECK(t.totals.installs == 9 + f.gen_offset()); // the row of the generation as_of names
     CHECK(f.comp_reads == 2);
 
     f.moves_left = 2;
@@ -627,6 +645,68 @@ TEST_CASE("CSV: 22-column installs header; quoting; the components header", "[se
 
     const auto ccsv = components_csv({comp_row("libfoo", "a1", "01")}, facts);
     CHECK(ccsv.starts_with(std::string(kComponentsCsvHeader) + "\n"));
+}
+
+TEST_CASE("CSV: every agent- or device-influenced cell of both exports is formula-neutralised (CWE-1236)",
+          "[server][software_list_model][security]") {
+    // A cell starting with = + - @ TAB or CR is a spreadsheet formula trigger; both serialisers
+    // route every cell through csv_escape, which prefixes it with an apostrophe. A regression to
+    // the quote-only csv_quote keeps every other CSV test green; these pins fail.
+    auto r = fleet_row("=cmd|' /C calc'!A0", "a1", 1);
+    r.entry.install_location = "+1+1";
+    r.entry.publisher = "-2";
+    DeviceFacts facts;
+    facts.hostname["a1"] = "@SUM(1)";
+    const auto csv = list_csv({r}, facts);
+    for (const char* hostile : {"'=cmd|' /C calc'!A0", "'+1+1", "'-2", "'@SUM(1)"}) {
+        CAPTURE(hostile);
+        CHECK(csv.find(hostile) != std::string::npos);
+    }
+    CHECK(csv.find(",=cmd") == std::string::npos);
+    CHECK(csv.find("\"=cmd") == std::string::npos);
+
+    auto c = comp_row("libfoo", "a1", "01");
+    c.path = "-1";
+    c.anchor_app = "\tapp";
+    c.version = "@2";
+    const auto ccsv = components_csv({c}, facts);
+    for (const char* hostile : {"'-1", "'\tapp", "'@2", "'@SUM(1)"}) {
+        CAPTURE(hostile);
+        CHECK(ccsv.find(hostile) != std::string::npos);
+    }
+    CHECK(ccsv.find(",-1,") == std::string::npos);
+}
+
+TEST_CASE("fingerprints: each filter alone moves the components and list fingerprints (a cursor never "
+          "crosses filter sets)",
+          "[server][software_list_model]") {
+    const auto base = parse_components_params(params({{"name", "libfoo"}}));
+    REQUIRE(base);
+    std::set<std::string> seen{components_fingerprint(*base)};
+    const std::vector<std::pair<std::string, std::string>> singles{
+        {"kind", "jar"},        {"match", "prefix"},   {"match", "contains"}, {"version", "1.0"},
+        {"version_min", "1.0"}, {"version_max", "2.0"}, {"agent_id", "a1"},    {"q", "lib"},
+        {"status", "current"}};
+    for (const auto& [k, v] : singles) {
+        CAPTURE(k, v);
+        const auto rq = parse_components_params(params({{"name", "libfoo"}, {k, v}}));
+        REQUIRE(rq);
+        CHECK(seen.insert(components_fingerprint(*rq)).second); // distinct from every other
+    }
+    CHECK(seen.size() == singles.size() + 1);
+
+    const auto lbase = parse_list_params(params({{"name", "git"}}));
+    REQUIRE(lbase);
+    std::set<std::string> lseen{list_fingerprint(*lbase)};
+    for (const auto& [k, v] : std::vector<std::pair<std::string, std::string>>{
+             {"match", "prefix"}, {"match", "contains"}, {"status", "disabled"},
+             {"version_min", "1.0"}, {"version_max", "1.0"}, {"version", "1.0"}}) {
+        CAPTURE(k, v);
+        const auto rq = parse_list_params(params({{"name", "git"}, {k, v}}));
+        REQUIRE(rq);
+        CHECK(lseen.insert(list_fingerprint(*rq)).second);
+    }
+    CHECK(lseen.size() == 7);
 }
 
 TEST_CASE("component_row_json: the exact key set; 0 stamps are null", "[server][software_list_model]") {
