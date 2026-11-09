@@ -147,7 +147,8 @@ def main() -> int:
     # on Windows (#6386). The prefix keeps the name inside the Defender exclusion.
     with tempfile.TemporaryDirectory(prefix="yuzu_test_bell_") as tmp:
         driver = pathlib.Path(tmp) / "driver.js"
-        driver.write_text(DRIVER, encoding="utf-8", newline="\n")
+        with open(driver, "w", encoding="utf-8", newline="\n") as f:
+            f.write(DRIVER)
         r = subprocess.run([node, str(driver)], input=js, capture_output=True, text=True, timeout=30)
     sys.stdout.write(r.stdout + r.stderr)
     return r.returncode

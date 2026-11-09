@@ -2123,7 +2123,7 @@ jobs:
             'HKCU:\Software' = "YuzuTest-selftest-$scope-probe-hkcu"
             'HKLM:\SOFTWARE' = "YuzuTest-selftest-$scope-probe-hklm"
             'HKLM:\SOFTWARE\Wow6432Node' = "YuzuTest-selftest-$scope-probe-wow"
-            'HKLM:\SYSTEM\CurrentControlSet\Services\bam' = "YuzuTest-selftest-$scope-probe-bam"
+            'HKLM:\SYSTEM\CurrentControlSet\Services\bam' = "YuzuTest-selftest-$scope-probe-bamroot"
             'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings' = "YuzuTest-selftest-$scope-probe-bamstate"
           }
           function Arm($s, $want, $kind, $name) {
@@ -2206,9 +2206,10 @@ jobs:
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
           # #6488: the registry plugin's real-registry cases (tests/unit/test_registry_write_local_dispatcher.cpp
-          # skip_or_fail, tests/unit/test_registry_win_internals.cpp skip_or_fail) WARN-and-skip when registry.dll is
-          # missing or the process cannot write HKLM, and a skip is green. This job runs as LOCAL SYSTEM (see the
-          # shell comment above), which is elevated, so a skip here is a regression: "1" turns it into a FAIL.
+          # skip_or_fail, tests/unit/test_registry_win_internals.cpp skip_or_fail, and the Echo bam live case's
+          # tests/unit/test_echo_registry_bam_live.cpp skip_or_fail) WARN-or-SKIP when registry.dll is missing or the
+          # process cannot write HKLM, and a skip is green. This job runs as LOCAL SYSTEM (see the shell comment
+          # above), which is elevated, so a skip here is a regression: "1" turns it into a FAIL.
           YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS: "1"
           # The fixtures' key-name scope (YUZU_TEST_REGISTRY_SCOPE) is the job-level env above.
         run: |
@@ -2252,7 +2253,8 @@ jobs:
           python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows non-pg"
 
       # #6488: the registry plugin's tests create scratch keys under HKLM\SOFTWARE (and Wow6432Node) and HKCU\Software
-      # (HKU\.DEFAULT for LOCAL SYSTEM) and each fixture removes its own; this step is the tripwire that notices one that
+      # (HKU\.DEFAULT for LOCAL SYSTEM), and the Echo bam live case (#6898) two under
+      # HKLM\SYSTEM\CurrentControlSet\Services\bam and its State\UserSettings; each fixture removes its own; this step is the tripwire that notices one that
       # did not. Only a key of THIS job's scope (YuzuTest-<scope>-..., see the job-level env) fails the job. Any other
       # YuzuTest-* key is a ::warning only: an orphan of a cancelled or crashed job (a cancelled job skips this step), a
       # concurrent job's live key on the shared box, or the nightly windows-asan leg's unscoped keys. It REPORTS and

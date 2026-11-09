@@ -5102,12 +5102,14 @@ struct LinkKey {
 
 // #7173: name the machine's ETW sessions in a failure message. Total active sessions, plus each
 // session named Yuzu*Etw-<pid> with whether that pid is still alive (a dead owner is a stale
-// session holding one of the machine's session slots). Read-only; never throws.
+// session holding one of the machine's session slots; alive=? when the answer could not be had).
+// Read-only (it allocates, so it can throw bad_alloc like any code).
 std::string etw_session_table() {
     constexpr ULONG kMax = 64;
     constexpr ULONG kName = 1024; // wchar_t slots reserved for each logger name
     const size_t stride = sizeof(EVENT_TRACE_PROPERTIES) + 2 * kName * sizeof(wchar_t);
     std::vector<BYTE> buf(stride * kMax, 0);
+    // Alignment: vector<BYTE>::data() is max_align_t-aligned and the stride is a multiple of 8.
     EVENT_TRACE_PROPERTIES* ptrs[kMax];
     for (ULONG i = 0; i < kMax; ++i) {
         auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data() + i * stride);
@@ -5125,18 +5127,28 @@ std::string etw_session_table() {
         const auto* name = reinterpret_cast<const wchar_t*>(reinterpret_cast<const BYTE*>(ptrs[i]) +
                                                             ptrs[i]->LoggerNameOffset);
         const std::wstring n(name, wcsnlen(name, kName));
-        const auto dash = n.rfind(L'-');
-        if (n.rfind(L"Yuzu", 0) != 0 || n.find(L"Etw-") == std::wstring::npos || dash == std::wstring::npos)
+        // The reaper's name rule, hand-coded: ^Yuzu[A-Za-z]*Etw-[0-9]+\z
+        const auto is_letter = [](wchar_t c) { return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z'); };
+        const auto is_digit = [](wchar_t c) { return c >= L'0' && c <= L'9'; };
+        const auto dash = n.find(L'-');
+        if (n.rfind(L"Yuzu", 0) != 0 || dash == std::wstring::npos || dash < 7 || n.compare(dash - 3, 3, L"Etw") != 0 ||
+            !std::all_of(n.begin() + 4, n.begin() + (dash - 3), is_letter) || dash + 1 >= n.size() ||
+            !std::all_of(n.begin() + dash + 1, n.end(), is_digit))
             continue;
         const DWORD pid = static_cast<DWORD>(std::wcstoul(n.c_str() + dash + 1, nullptr, 10));
-        bool alive = false;
-        if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
-            DWORD code = 0;
-            alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
-            CloseHandle(h);
+        const char* alive = "?"; // refused, or an unparsed pid: not evidence of a dead owner
+        if (pid != 0) {
+            const HANDLE raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            const DWORD err = raw != nullptr ? ERROR_SUCCESS : GetLastError();
+            if (const std::unique_ptr<void, decltype(&::CloseHandle)> h{raw, &::CloseHandle}; h) {
+                DWORD code = 0;
+                if (GetExitCodeProcess(h.get(), &code))
+                    alive = code == STILL_ACTIVE ? "1" : "0";
+            } else if (err == ERROR_INVALID_PARAMETER) {
+                alive = "0"; // no such pid
+            }
         }
-        out += std::format(" {}:alive={}", yuzu::win::from_wide(n.c_str(), static_cast<int>(n.size())),
-                           static_cast<int>(alive));
+        out += std::format(" {}:alive={}", yuzu::win::from_wide(n.c_str(), static_cast<int>(n.size())), alive);
     }
     return out;
 }
@@ -5221,19 +5233,23 @@ struct LiveRun {
                     "all writers through the reader's filter since this write ({} buffered, {} "
                     "evicted since the session started); events_lost={} rt_buffers_lost={} "
                     "decode_failed={} loss_query_ok={} etw_running={} from_this_pid={} "
-                    "registry_capture_method={} {}",
+                    "registry_capture_method={}",
                     src->buffer_for_test().pushed() - pushed_before,
                     src->buffer_for_test().size(), evicted, counter(loss.events_lost),
                     counter(loss.rt_buffers_lost), loss.decode_failed,
                     static_cast<int>(loss.query_ok), static_cast<int>(etw_running()),
-                    static_cast<int>(from_this_pid), t.db.get_config("registry_capture_method", ""),
-                    etw_session_table());
+                    static_cast<int>(from_this_pid), t.db.get_config("registry_capture_method", ""));
                 // meson's job-log tail is the last 100 lines of the test's stdout then its
                 // stderr section, and hundreds of lines of per-case output follow this case,
                 // so a Catch2 message alone reaches only the uploaded meson-logs artifact.
                 // stderr is printed last: put the same text there too.
                 std::fputs(std::format("[#7135] {}\n", detail).c_str(), stderr);
-                FAIL(detail);
+                // The session table is a separate line, after this one: QueryAllTracesW has no
+                // deadline, and in the unhealthy-ETW state this diagnoses a hang there must not
+                // lose the line above (#7173).
+                const std::string table = etw_session_table();
+                std::fputs(std::format("[#7135] {}\n", table).c_str(), stderr);
+                FAIL(detail + " " + table);
             }
         } else if (await_event) {
             // The ETW attribution wait is skipped when the session is not running (a host that

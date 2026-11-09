@@ -43,12 +43,14 @@ $roots = 'HKLM:\SOFTWARE', 'HKLM:\SOFTWARE\Wow6432Node', 'HKCU:\Software',
 $failed = @()
 $all = @(foreach ($root in $roots) {
     if (-not (Test-Path -LiteralPath $root)) { continue }   # a root this OS does not have holds nothing
-    try { Get-ChildItem -LiteralPath $root -ErrorAction Stop | Where-Object { $_.PSChildName -like 'YuzuTest-*' } }
+    # Names only, from the parent: listing needs enumerate access on the root, not read access on each child, so one
+    # unreadable child (the bam live case denies read on its scratch key while it runs) cannot fail the whole root.
+    try { (Get-Item -LiteralPath $root -ErrorAction Stop).GetSubKeyNames() | Where-Object { $_ -like 'YuzuTest-*' } | ForEach-Object { "$root\$_" } }
     catch { $failed += $root; Write-Host "::error::could not list $root so its leftovers are unknown: $($_.Exception.Message)" }
 })
-$mine, $others = $all.Where({ $_.PSChildName.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }, 'Split')
-foreach ($k in $others) { Write-Host "::warning::registry key from another job or a cancelled run, not removed: $($k.Name)" }
-foreach ($k in $mine) { Write-Host "::error::leftover registry key $($k.Name)" }
+$mine, $others = $all.Where({ $_.Substring($_.LastIndexOf('\') + 1).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }, 'Split')
+foreach ($k in $others) { Write-Host "::warning::registry key from another job or a cancelled run, not removed: $k" }
+foreach ($k in $mine) { Write-Host "::error::leftover registry key $k" }
 if ($mine.Count -gt 0 -or $failed.Count -gt 0) { exit 1 }
 Write-Host 'no YuzuTest-* keys left by this job'
 exit 0
