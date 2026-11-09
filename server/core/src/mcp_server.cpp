@@ -6470,7 +6470,8 @@ std::span<const ToolRecord> registered_tool_records() {
     static const std::vector<ToolRecord> records = [] {
         std::vector<ToolRecord> all;
         for (const auto span : {discovery_tool_records(), hardware_tool_records(),
-                                containment_tool_records(), crypto_tool_records()})
+                                containment_tool_records(), crypto_tool_records(),
+                                dex_tool_records()})
             all.insert(all.end(), span.begin(), span.end());
         return all;
     }();

@@ -33121,6 +33121,7 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
              R"({"id":1,"expected_config_version":1,"name":"n","ca_certificates":["x"],"crl_urls":[{"url":"http://crl.example.com/a.crl"}]})")},
         {"remove_revocation_source", nlohmann::json::parse(R"({"id":1})")},
         {"reset_revocation_source_high_water", nlohmann::json::parse(R"({"id":1})")},
+        {"reset_dex_score_policy", nlohmann::json::parse(R"({"if_match":"default"})")},
         // #2146 batch B: Workflow:Execute is supervised-tier gated (requires_approval(), owner
         // ruling 2026-10-30); the operator tier is denied outright by tier_allows().
         {"execute_workflow",

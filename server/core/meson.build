@@ -820,6 +820,7 @@ yuzu_server_core_lib = static_library(
     'src/mcp_tools_hardware.cpp',
     'src/mcp_tools_containment.cpp',
     'src/mcp_tools_crypto.cpp',
+    'src/mcp_tools_dex.cpp',
     'src/mcp_transport.cpp',
     'src/compliance_model.cpp',
     'src/compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam

@@ -949,6 +949,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      confidence level; typed as `DexScorePolicyDocument` in `openapi_spec()`),
      while the #6087 twins have not landed, so the 2026-10-23 exception now
      covers a larger surface.
+     - **Retired 2026-11-09.** The #6087 twins (`get_dex_score_policy`,
+       `set_dex_score_policy`, `reset_dex_score_policy`) take the version 2
+       document and the one write function, as this entry anticipated; the
+       entry below records their posture. The text that follows is kept as the
+       record of the interval.
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
        as **#6087**; **revisit by 2027-01-31**. When the twins land they take
        the same document shape and the one write function
@@ -977,6 +982,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      Decision 1's both-surfaces requirement, recorded rather than fixed in the
      same change because the REST routes and the one write function behind
      them ship first and the MCP twins follow over that function.
+     - **Retired 2026-11-09.** The three twins landed under #6087 (see the
+       2026-11-09 entry); this exception no longer stands. The text that
+       follows is kept as the record of the interval.
      - **No MCP twin - tracked follow-up, not a permanent exception.** The
        three twins are tracked as **#6087**; **revisit by 2027-01-31**. Until
        they land, this row stands as the open exception for these routes, and
@@ -1499,6 +1507,83 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        shared deny-on-degrade `403` on the list and the device route. The A4 envelope and the OpenAPI
        entries hold for all four. Wire reference: `docs/user-manual/rest-api.md`,
        "Software collection settings".
+     - Recorded by the change author; ADR-owner acceptance pending.
+
+   - **2026-11-09 - MCP twins of the DEX score policy routes (#6087):
+     `get_dex_score_policy`, `set_dex_score_policy`, `reset_dex_score_policy`.**
+     This entry retires the 2026-10-23 and 2026-11-02 #6087 exceptions above.
+     The three tools are registry records in `server/core/src/mcp_tools_dex.cpp`
+     over the one write function `apply_dex_score_policy`, reached through a
+     single forwarding closure on `ToolDeps`: no second validator, no second
+     `If-Match` parser, no second audit-row shape. The pure argument, status and
+     payload logic is `dex_score_policy_mcp.hpp`.
+     - **Posture.** `get_dex_score_policy` is `GuaranteedState:Read`, readable
+       at every MCP tier, and writes no domain audit row (as for the REST `GET`).
+       `set_dex_score_policy` is `Infrastructure:Write` and
+       `reset_dex_score_policy` is the distinct operation
+       `Infrastructure:Delete`; both are supervised-tier only (`tier_allows`
+       refuses `Write` and `Delete` below it), `destructiveHint` true,
+       idempotent. Both handlers repeat the loud `tier_allows` plus `perm_fn`
+       pair (never `probe_permission`) and then require `GuaranteedState:Read`
+       as a second loud gate, because the answer carries application names; the
+       REST `PUT` and `DELETE` require only `Infrastructure:Write`. That REST
+       gap is recorded here, not changed.
+     - **Reset needs an approval ticket; set does not.** Registering reset as
+       `Infrastructure:Delete` puts it under the existing generic supervised
+       rule (`operation == "Delete"`, `mcp_policy.hpp`), the mechanism
+       `delete_plugin_config` and `delete_result_set` already use and the
+       `ApiToken:Rotate` precedent for "a distinct operation, never a
+       tool-local exception". `set` is `Infrastructure:Write` with no ticket,
+       like `set_runtime_config` and the REST `PUT`. MCP is therefore stricter
+       than the REST `DELETE`: a principal that holds `Infrastructure:Write`
+       but not `Infrastructure:Delete` under RBAC can reset over REST but not
+       over MCP. That is deliberate; it is the price of using the one core
+       approval primitive.
+     - **A failure after approval spends the ticket.** The generic gate
+       consumes the ticket before the handler runs, so a retryable writer,
+       store or audit failure on reset burns it, and a repeat with the same
+       `approval_id` answers "approval already used". The tool description,
+       the retryable-error remediation and `docs/user-manual/mcp.md` say so:
+       call `get_dex_score_policy`, compare its `revision` with the one the
+       error names, then submit a new request without `approval_id`. The gate
+       is not changed here.
+     - **No `deny_mcp_token_session`.** The REST routes admit MCP-tier tokens
+       (a plain `perm_fn`), and the twins exist to serve them; fencing them
+       would make the twin unreachable by its audience. A service-scoped token
+       is refused at the generic C8 gate (`ServiceScopeClass::denied`).
+     - **Audit.** `apply_dex_score_policy` writes the `attempted` row itself
+       before it touches the store and fails closed when that row is refused;
+       the MCP handlers additionally refuse an unwired audit sink or an
+       unresolvable caller (stricter than REST, which treats an empty sink as
+       audit-off). `apply` discards the result of every later row, so the
+       per-request hook records whether any row was dropped and the answer
+       reports `audit_persisted:false` (success) or the A4 audit flag (error);
+       REST reaches the same signal through `Sec-Audit-Failed`. A result-level
+       flag on the write result, so both surfaces share one signal, is a core
+       follow-up on #6087, not part of this change.
+     - **`mcp_tool_deps.hpp` admission criterion amended.** The write-capable
+       closure criterion admitted only a pure forward of the REST twin's `*Api`
+       method with the handler writing `attempted` before the call. The score
+       policy closure forwards the REST twin's shared audit-first function,
+       which writes `attempted` itself and fails closed on it, with the sink
+       injected per request and the handler refusing without one. The banner
+       now admits both shapes and states the pre-mutation-row guarantee for
+       each; the dex closure is the second shape, not literally the first.
+     - **Still open on #6087.** The headless tier-change diff (a preview twin)
+       needs a REST and core precursor and then its own MCP change; the preview
+       POST of the Settings page keeps its ledger exception. `prior_document`
+       on reset audit rows is a core audit-row change, deferred as a follow-up.
+       Reader size is tracked as #6619. The REST registration lambdas hold no
+       readable gate call (the `perm_fn` sits in the shared
+       `score_policy_write` lambda), so gate parity (check 6) cannot compare
+       the two REST rows to their twins: they are named in
+       `GATE_PARITY_NO_GATE_ALLOWED` and `GATE_PARITY_NO_GATE_MAX` rises by two
+       (14 to 16) by this ruling. A REST refactor that inlines the gate is the
+       alternative and is not taken here (this change is MCP only).
+     - Wire reference: `docs/user-manual/mcp.md` (tools 213 to 215),
+       `docs/user-manual/rest-api.md` "GET / PUT / DELETE
+       /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`
+       (verbs unchanged).
      - Recorded by the change author; ADR-owner acceptance pending.
 
 ## Interim rules (until the named follow-ups ship)

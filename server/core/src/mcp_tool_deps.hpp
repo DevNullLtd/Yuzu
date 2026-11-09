@@ -13,14 +13,24 @@
 //
 // ToolDeps holds provider closures and no store instance. The closures are not
 // all reads: audit_fn writes audit rows, `crypto_set_dashboard_layout_fn` writes the
-// CALLER'S OWN /crypto dashboard layout, and the others compose read-only views. A
-// write-capable closure is admitted only when ALL of these hold (the criterion every
-// later family's mutating closure is held to): it is a pure forward of the very same
-// *Api method the REST twin calls, so the two cannot drift; the gate stays central (the
+// CALLER'S OWN /crypto dashboard layout, `dex_score_policy_apply_fn` writes the
+// fleet-wide DEX score policy, and the others compose read-only views. A
+// write-capable closure is admitted only when it is a pure forward of the very same
+// code the REST twin calls (so the two cannot drift), the gate stays central (the
 // record's securable / operation / ServiceScopeClass drive the generic tier and C8
-// checks, and the closure never re-decides it); and its handler writes its "attempted"
-// audit row BEFORE calling it and refuses to run without an audit sink ("no audit row,
-// no mutation"). Nothing else here dispatches, pushes a tag or mutates a store.
+// checks, and the closure never re-decides it), and the pre-mutation "attempted" audit
+// row is guaranteed. Two shapes meet that:
+//   (i)  a pure forward of the REST twin's `*Api` method, where the HANDLER writes its
+//        "attempted" audit row BEFORE calling the closure and refuses to run without an
+//        audit sink ("no audit row, no mutation");
+//   (ii) a pure forward of the REST twin's shared audit-first apply function (today
+//        `apply_dex_score_policy`), which itself writes "attempted" before touching the
+//        store and fails closed when that row is refused. The audit sink is injected per
+//        request by the handler, which refuses to call the closure without one. The dex
+//        closure is this shape, not literally (i): the guarantee is kept, the handler is
+//        just not the one writing the row.
+// Either way there is one write path and one audit-row shape shared with REST. Nothing
+// else here dispatches, pushes a tag or mutates a store.
 //
 // What a handler must not reach: any store, AgentRegistry, AuthDB, RbacStore, an
 // McpServer member, or any write-capable callable beyond audit_fn and a closure
@@ -48,6 +58,7 @@
 #include "authz_gates.hpp"        // authz::FleetReadGate
 #include "crypto_api.hpp"         // CryptoApi's query / result types (the abstract seam, no store)
 #include "crypto_widget_catalogue.hpp" // crypto_widgets::Access / WidgetGate
+#include "dex_score_policy_writer.hpp"  // DexScorePolicyProvider::ReadFn, the write request / result / audit hook
 #include "hardware_list_model.hpp" // HardwareCiDetail
 #include "inventory_types.hpp"    // InventoryDevicesResult
 #include "quarantine_visible.hpp" // QuarantineListFn
@@ -125,6 +136,18 @@ struct ToolDeps {
     CryptoSetLayoutFn crypto_set_dashboard_layout_fn;
     CryptoAccessFn crypto_access_fn;
     UsernameFn username_fn;
+
+    // ── DEX score policy (mcp_tools_dex.cpp) ────────────────────────────────────────────
+    // The OBSERVED store text (what GET /api/v1/dex/score-policy serves) and the ONE write
+    // path (apply_dex_score_policy) with the REST route's store closures, provider and clock
+    // already bound; only the per-request audit sink is passed in. Both are EMPTY when the
+    // deployment has no runtime-config store, and a handler then answers an internal error.
+    using DexScorePolicyReadFn = DexScorePolicyProvider::ReadFn;
+    using DexScorePolicyAuditFn = decltype(DexScorePolicyWriteDeps::audit);
+    using DexScorePolicyApplyFn = std::function<DexScorePolicyWriteResult(
+        const DexScorePolicyWriteRequest&, DexScorePolicyAuditFn)>;
+    DexScorePolicyReadFn dex_score_policy_read_fn;
+    DexScorePolicyApplyFn dex_score_policy_apply_fn;
 };
 
 } // namespace yuzu::server::mcp
