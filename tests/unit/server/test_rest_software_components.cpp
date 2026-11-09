@@ -419,7 +419,7 @@ TEST_CASE("REST components: a version range resolves and its totals are exact (a
     CHECK(body.dump().find("version_min") == std::string::npos);
 }
 
-TEST_CASE("REST components: a version filter without name is a 400",
+TEST_CASE("REST components: a version range without name is a 400; a bare exact version is not",
           "[pg][rest][inventory_components]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -427,7 +427,7 @@ TEST_CASE("REST components: a version filter without name is a 400",
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
     CompHarness h{&store};
-    for (const char* q : {"?version_min=1.0", "?version_max=2.0", "?version=1.0",
+    for (const char* q : {"?version_min=1.0", "?version_max=2.0",
                           "?name=lib&match=prefix&version_min=1.0"}) {
         CAPTURE(q);
         auto res = h.sink.Get(std::string(kPath) + q);
@@ -435,6 +435,15 @@ TEST_CASE("REST components: a version filter without name is a 400",
         CHECK(res->status == 400);
     }
     CHECK(h.audit_log.empty()); // a 400 writes nothing
+
+    // A bare exact version is a plain equality predicate (as on the installs route): it filters
+    // the fleet, and a filter on the whole fleet is never a total.
+    seed_components(store, "dev-1", {comp("libfoo", "/a", "1.0"), comp("libbar", "/b", "2.0")});
+    const auto bare = get_json(h, "?version=1.0");
+    REQUIRE(bare.at("data").at("components").size() == 1);
+    CHECK(bare.at("data").at("components")[0].at("name") == "libfoo");
+    CHECK(bare.at("data").at("totals").is_null());
+    CHECK(bare.at("data").at("totals_omitted") == "filters");
 }
 
 TEST_CASE("REST components: a closed pool -> 503 with a failure audit row, never an empty 200",
@@ -526,14 +535,19 @@ TEST_CASE("REST components: a 100k-row CSV export walks every page with a contin
             --lines; // the in-band trailer record
         }
         data_rows += lines - 1; // minus the header line
-        if (!more)
+        if (!more) {
+            CHECK(lines == 1); // the closing page holds the header line only
             break;
+        }
         cursor = res->get_header_value("X-Next-Cursor");
     }
     CHECK(data_rows == static_cast<std::size_t>(kDevices) * kPerDevice);
-    CHECK(pages == 10); // the export cap is 10000 rows per call
-    CHECK(h.audits("inventory.components.export", "success", "page=continuation") == 9);
-    CHECK(h.audits("inventory.components.export", "success") == 10);
+    // The export cap is 10000 rows per call. A page that comes back full always carries a
+    // continuation (the documented count == limit rule, "more rows may exist", shared with the
+    // installs route), so a total that is an exact multiple of the cap ends on one more page.
+    CHECK(pages == 11);
+    CHECK(h.audits("inventory.components.export", "success", "page=continuation") == 10);
+    CHECK(h.audits("inventory.components.export", "success") == 11);
 }
 
 TEST_CASE("REST components: every JSON page is audited, continuation pages are tagged",

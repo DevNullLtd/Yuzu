@@ -8673,7 +8673,7 @@ Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareIn
 |---|---|---|---|
 | `name` | string | No | Exact software-name filter |
 | `agent_id` | string | No | Exact agent filter |
-| `version` | string | No | Exact version filter. A **present-empty** value (`?version=`) selects only the rows with an empty version; omit the parameter for any version |; needs `name` with `match=exact` |
+| `version` | string | No | Exact version filter. A **present-empty** value (`?version=`) selects only the rows with an empty version; omit the parameter for any version |
 | `match` | `exact` \| `prefix` \| `contains` | No | How `name` matches (default `exact`). `prefix` is a literal prefix, `contains` a literal case-insensitive substring (`%` and `_` are not wildcards). Both need `name` |
 | `version_min` / `version_max` | string | No | Inclusive version bounds under the catalogue comparator (`1.10` is above `1.9`; `2.0` is above `2.0-rc1`). Need `name` with `match=exact`; not combined with `version` |
 | `status` | `current` \| `unconfirmed` \| `disabled` | No | Row status filter. **Never applied by default**: unconfirmed rows are returned unless you ask otherwise |
@@ -8756,7 +8756,7 @@ A degraded totals read is a `503` with `retry_after_ms`, never a `null` a client
 
 | Status | Condition |
 |---|---|
-| 400 | `limit` is not a valid integer, `format` is not `json`/`csv`, or the `cursor` is malformed / was issued for a different filter set; a parameter that is not valid UTF-8 or contains a NUL byte; or an over-long value (`agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, `name`/`version` over 1024 bytes); an unknown `match` or `status`; a `version`, `version_min` or `version_max` without `name` and `match=exact`, or `version` together with a range; or a range that cannot be resolved |
+| 400 | `limit` is not a valid integer, `format` is not `json`/`csv`, or the `cursor` is malformed / was issued for a different filter set; a parameter that is not valid UTF-8 or contains a NUL byte; or an over-long value (`agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, `name`/`version` over 1024 bytes); an unknown `match` or `status`; a `version_min` or `version_max` without `name` and `match=exact`, or `version` together with a range; or a range that cannot be resolved |
 | 401 | Unauthenticated |
 | 403 | No management-group grant for `Inventory:Read`; or a service-scoped token whose RBAC/ITServiceOwner grant is missing, or whose RBAC enforcement is disabled fleet-wide (a service-scoped token always hard-denies when RBAC is off) |
 | 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded (including a failed read of the `ITServiceOwner` ceiling for a service-scoped token), the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
@@ -8769,7 +8769,7 @@ Looks up **components**: libraries and similar artefacts found inside an applica
 
 **Permission and scope:** exactly the raw installs route above: `Inventory:Read` through `require_fleet_read` as the sole gate, rows confined to the caller's management groups and service tag on every page, a denied named `agent_id` answered with an empty page and a `denied` audit row.
 
-**Query parameters:** `name` (with `match=exact|prefix|contains`, default `exact`), `kind`, `version`, `version_min` / `version_max` (inclusive, the catalogue comparator; they need `name` with `match=exact`, and resolve against the component's fleet-wide distinct versions with the same 2000-version limit as the installs route), `agent_id`, `q` (literal substring over name, path and anchor application), `status`, `limit` (default 100, max 1000), `cursor`, `format=json|csv`. Repeated parameters keep the first value.
+**Query parameters:** `name` (with `match=exact|prefix|contains`, default `exact`), `kind`, `version`, `version_min` / `version_max` (the bounds are inclusive under the catalogue comparator; they need `name` with `match=exact`, and resolve against the component's fleet-wide distinct versions with the same 2000-version limit as the installs route), `agent_id`, `q` (literal substring over name, path and anchor application), `status`, `limit` (default 100, max 1000), `cursor`, `format=json|csv`. Repeated parameters keep the first value.
 
 **Response (200):** `{"data": {"components": [...], "count", "next_cursor", "devices_omitted", "totals", "totals_omitted"?, "result_truncated_by_cap"?}}`. Each component row carries `agent_id`, `hostname` (`null` if unknown), `last_seen` (the device's last accepted installed-software report, `null` if never), `kind`, `name`, `version`, `version_source`, `path`, `anchor_app`, `first_seen`, `status` and `last_confirmed_at` (`null` if never). `status` is derived from the device's `component_inventory` facet exactly as on the installs route; unconfirmed rows are **included by default** and `status=current` excludes them.
 
@@ -8777,7 +8777,7 @@ Looks up **components**: libraries and similar artefacts found inside an applica
 
 **Export and audit.** `format=csv` returns the 12-column `text/csv` `agent_id,hostname,last_seen,kind,name,version,version_source,path,anchor_app,first_seen,status,last_confirmed_at`; `limit` is the total cap (default and max 10000), and a capped export carries `X-Result-Truncated-By-Cap`, `X-Next-Cursor` and an in-band trailer record, as the installs export does. Every served call is audited as `inventory.components.view` (`inventory.components.export` for an export; continuation pages carry `page=continuation`); a `400` writes nothing.
 
-**Errors:** as the installs route: `400` for a malformed parameter, a version filter without `name` and `match=exact`, an unresolvable range or a refused cursor; `401`; `403`; `503` (store, last-poll, version or totals read degraded, or a range before the first components refresh) with `retry_after_ms`, **never an empty 200**.
+**Errors:** as the installs route: `400` for a malformed parameter, `version_min` or `version_max` without `name` and `match=exact`, an unresolvable range or a refused cursor; `401`; `403`; `503` (store, last-poll, version or totals read degraded, or a range before the first components refresh) with `retry_after_ms`, **never an empty 200**.
 
 #### `GET /api/v1/inventory/software/catalogue`
 

@@ -80,9 +80,10 @@ struct ListRequest {
 };
 
 /// parse_devices_params + `match` (exact|prefix|contains), `status` (current|unconfirmed|
-/// disabled), `version_min`, `version_max`. `version`, `version_min` and `version_max` REQUIRE a
-/// non-empty `name` with match=exact; a non-exact `match` requires `name`; `version` cannot be
-/// combined with a range. The error is the 400 message.
+/// disabled), `version_min`, `version_max`. `version_min` and `version_max` REQUIRE a non-empty
+/// `name` with match=exact; a bare exact `version` is a plain equality predicate and needs no name;
+/// a non-exact `match` requires `name`; `version` cannot be combined with a range. The error is the
+/// 400 message.
 [[nodiscard]] std::expected<ListRequest, std::string> parse_list_params(const Params& p);
 
 struct ComponentsRequest {

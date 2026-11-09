@@ -64,22 +64,29 @@ TEST_CASE("parse_list_params: match defaults exact; prefix and contains are acce
     CHECK_FALSE(parse_list_params(params({{"match", "prefix"}})));
 }
 
-TEST_CASE("parse_list_params: a version filter requires name with match=exact",
+TEST_CASE("parse_list_params: a version range requires name with match=exact; a bare version does not",
           "[server][software_list_model]") {
-    for (const char* key : {"version", "version_min", "version_max"}) {
+    for (const char* key : {"version_min", "version_max"}) {
         CAPTURE(key);
         CHECK_FALSE(parse_list_params(params({{key, "1.0"}})));
         CHECK_FALSE(parse_list_params(params({{"name", "git"}, {"match", "prefix"}, {key, "1.0"}})));
         auto ok = parse_list_params(params({{"name", "git"}, {key, "1.0"}}));
         REQUIRE(ok);
     }
-    // An exact version cannot be combined with a range.
-    CHECK_FALSE(parse_list_params(params({{"name", "git"}, {"version", "1"}, {"version_min", "0"}})));
-    // A present-empty version stays the exact empty-version bucket (still needs name).
-    auto empty = parse_list_params(params({{"name", "git"}, {"version", ""}}));
+    // A bare exact `version` is the plain equality predicate it was before the range filters:
+    // still accepted without a name (the route's pre-existing contract), with a non-exact match,
+    // and as the present-empty bucket.
+    auto bare = parse_list_params(params({{"version", "2.0"}}));
+    REQUIRE(bare);
+    REQUIRE(bare->base.query.version.has_value());
+    CHECK(*bare->base.query.version == "2.0");
+    CHECK(parse_list_params(params({{"name", "git"}, {"match", "prefix"}, {"version", "2.0"}})));
+    auto empty = parse_list_params(params({{"version", ""}}));
     REQUIRE(empty);
     REQUIRE(empty->base.query.version.has_value());
     CHECK(empty->base.query.version->empty());
+    // An exact version cannot be combined with a range.
+    CHECK_FALSE(parse_list_params(params({{"name", "git"}, {"version", "1"}, {"version_min", "0"}})));
 }
 
 TEST_CASE("parse_list_params: status is a closed set and the defaults add no filter",
@@ -169,6 +176,10 @@ TEST_CASE("totals_decision: scoped admission never serves; global admission serv
     bad.match = NameMatch::kContains;
     CHECK(totals_decision(true, bad).omitted == "filters");
     CHECK(totals_decision(true, SoftwareFleetQuery{}).omitted == "filters"); // no name at all
+    // A bare `version` (accepted without a name) is a filter on the whole fleet: never a total.
+    bad = SoftwareFleetQuery{};
+    bad.version = "2.0";
+    CHECK(totals_decision(true, bad).omitted == "filters");
 
     // Components: kind is permitted.
     SoftwareComponentQuery c;
@@ -572,11 +583,17 @@ TEST_CASE("CSV: 22-column installs header; quoting; the components header", "[se
 
 TEST_CASE("parse_components_params: rules, limits and the export cap", "[server][software_list_model]") {
     CHECK_FALSE(parse_components_params(params({{"version_min", "1"}})));       // needs name
-    CHECK_FALSE(parse_components_params(params({{"name", "x"}, {"match", "contains"}, {"version", "1"}})));
+    CHECK_FALSE(parse_components_params(
+        params({{"name", "x"}, {"match", "contains"}, {"version_min", "1"}}))); // needs match=exact
     auto v = parse_components_params(params({{"name", "x"}, {"version", "1"}}));
     REQUIRE(v);
     REQUIRE(v->query.versions.has_value());
     CHECK(*v->query.versions == std::vector<std::string>{"1"});
+    // A bare exact version is a plain equality predicate and needs no name.
+    auto bare = parse_components_params(params({{"version", "1"}}));
+    REQUIRE(bare);
+    REQUIRE(bare->query.versions.has_value());
+    CHECK(*bare->query.versions == std::vector<std::string>{"1"});
     auto page = parse_components_params(params({{"limit", "5000"}}));
     REQUIRE(page);
     CHECK(page->query.limit == static_cast<int>(swc::kCataloguePageMax));

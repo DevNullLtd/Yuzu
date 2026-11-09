@@ -7001,12 +7001,28 @@ TEST_CASE("query_components: keyset order, scope push-down, prefix and contains 
     auto all = store.query_components(q);
     REQUIRE(all.has_value());
     REQUIRE(all->size() == 6);
-    // Ordered (name, agent_id, kind, path_hash).
+    // Ordered (name, agent_id, kind, path_hash) under the DATABASE's collation, so the reference
+    // order is read from Postgres itself: byte order differs from en_US.UTF-8, where lib_fo <
+    // libfoo < libXfo. Ordering and the keyset predicate share that collation, so paging is
+    // self-consistent in any deployment (the name index serves the default collation).
+    const auto reference = sql_rows(
+        pool, "SELECT agent_id, kind, path_hash, name FROM software_inventory_store."
+              "software_components ORDER BY name, agent_id, kind, path_hash");
+    REQUIRE(reference.size() == all->size());
+    for (std::size_t i = 0; i < all->size(); ++i) {
+        CAPTURE(i);
+        CHECK((*all)[i].agent_id == reference[i][0]);
+        CHECK((*all)[i].kind == reference[i][1]);
+        CHECK((*all)[i].path_hash == reference[i][2]);
+        CHECK((*all)[i].name == reference[i][3]);
+    }
+    // Within one name the tail (agent_id, kind, path_hash) is collation-independent here.
     for (std::size_t i = 1; i < all->size(); ++i) {
         const auto& a = (*all)[i - 1];
         const auto& b = (*all)[i];
-        CHECK(std::tie(a.name, a.agent_id, a.kind, a.path_hash) <
-              std::tie(b.name, b.agent_id, b.kind, b.path_hash));
+        if (a.name == b.name)
+            CHECK(std::tie(a.agent_id, a.kind, a.path_hash) <
+                  std::tie(b.agent_id, b.kind, b.path_hash));
     }
 
     // Keyset paging: pages of 3 cover every row exactly once.

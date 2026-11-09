@@ -82,16 +82,17 @@ std::expected<CommonFilters, std::string> parse_common(const Params& p) {
     return c;
 }
 
-// The version-filter rule: any of version / version_min / version_max needs `name` with
-// match=exact (a version of "any title" or of a title pattern has no single comparator order),
-// and the exact form cannot be mixed with a range.
+// The version-filter rule: version_min / version_max need `name` with match=exact (a range of
+// "any title" or of a title pattern has no single comparator order); a bare exact `version` is a
+// plain equality predicate as it always was and needs no name. The exact form cannot be mixed
+// with a range.
 std::optional<std::string> version_rule_error(bool has_version, const CommonFilters& c,
                                               const std::string& name) {
     const bool has_range = !c.version_min.empty() || !c.version_max.empty();
     if (c.match != NameMatch::kExact && name.empty())
         return std::string("match requires name");
-    if ((has_version || has_range) && (name.empty() || c.match != NameMatch::kExact))
-        return std::string("version, version_min and version_max require name with match=exact");
+    if (has_range && (name.empty() || c.match != NameMatch::kExact))
+        return std::string("version_min and version_max require name with match=exact");
     if (has_version && has_range)
         return std::string("version cannot be combined with version_min or version_max");
     return std::nullopt;
