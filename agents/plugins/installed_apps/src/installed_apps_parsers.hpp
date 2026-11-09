@@ -416,6 +416,34 @@ constexpr long kErrorNoMoreItems = 259;
     return HiveRead::failed;
 }
 
+// ── Which Uninstall roots may degrade a Windows collection ──────────────────
+// list_inventory is MACHINE-scope data. Three roots are walked (installed_apps_plugin.cpp
+// windows_roots): the native HKLM view, the WOW6432Node view and the agent identity's OWN HKCU.
+//   - a failed read of the own HKCU never degrades the collection: it holds the service
+//     account's per-user entries, which the inventory does not report;
+//   - the WOW6432Node view is absent only on a 32-bit OS: on a 64-bit OS its Uninstall key is
+//     part of a healthy hive, so "not found" there is a broken view, not an empty one;
+//   - the native HKLM view is never allowed to be absent.
+// Every other status (access denied, more data, an enumeration that does not end in
+// ERROR_NO_MORE_ITEMS) degrades regardless of root (classify_reg_status).
+enum class UninstallView { hklm_native, hklm_wow64, own_hkcu };
+
+[[nodiscard]] constexpr bool failed_root_degrades(UninstallView v) noexcept {
+    return v != UninstallView::own_hkcu;
+}
+
+[[nodiscard]] constexpr bool root_absent_ok(UninstallView v, bool os_is_64bit) noexcept {
+    switch (v) {
+    case UninstallView::hklm_native:
+        return false;
+    case UninstallView::hklm_wow64:
+        return !os_is_64bit;
+    case UninstallView::own_hkcu:
+        return true;
+    }
+    return false;
+}
+
 // ── Degraded-acquisition contract (every OS) ────────────────────────────────
 // ONE place declares what a degraded acquisition looks like to the caller, so
 // list / query / list_per_user / list_inventory cannot drift. Templated on the
@@ -478,10 +506,12 @@ void report_hive_file_refused(Ctx& ctx, std::string_view sid, std::string_view t
         yuzu::util::safe_output_field(yuzu::util::sanitize_utf8(std::string(token)))));
 }
 
-// list_inventory: a degraded collection emits NO rows and returns rc 1 (the
-// daily sync, sync_source_installed_software.cpp, skips the cycle on any
-// nonzero rc, so a partial snapshot is never committed as authoritative).
-// `fmt` renders one record to its wire row; a record with no name is dropped.
+// list_inventory: a degraded collection emits NO rows and returns rc 1 (the daily sync,
+// sync_source_installed_software.cpp, reports the facet constrained on any nonzero rc, so a
+// partial snapshot is never committed as authoritative); a clean pass declares OK / FULL, the
+// completeness signal the sync's gate reads (an undeclared answer is UNKNOWN, never FULL).
+// `fmt` renders one record to its wire row; a record with no name is dropped. This is the one
+// chokepoint every OS leg reaches (registry_walk.hpp, the macOS and Linux collectors).
 template <class Ctx, class Rec, class Fmt>
 int emit_inventory(Ctx& ctx, bool degraded, const std::vector<Rec>& records, Fmt&& fmt) {
     if (degraded) {
@@ -493,6 +523,7 @@ int emit_inventory(Ctx& ctx, bool degraded, const std::vector<Rec>& records, Fmt
             continue;
         ctx.write_output(fmt(r));
     }
+    ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
     return 0;
 }
 

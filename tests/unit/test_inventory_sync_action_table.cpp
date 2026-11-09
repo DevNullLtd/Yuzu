@@ -92,3 +92,24 @@ TEST_CASE("installed-software action table matches real plugin descriptors",
         CHECK(in_actions);
     }
 }
+
+TEST_CASE("the hardware drivers_inventory row is last in the table and resolves to the real plugin",
+          "[sync][table]") {
+    // hardware.drivers_inventory joined the daily sync as the LAST row: the facet order is the
+    // order sections are planned in, and the server's kSoftwareSources vocabulary follows it
+    // (tests/test_software_vocabulary_consistency.py compares the ordered lists).
+    const auto table = yuzu::agent::installed_software_actions();
+    REQUIRE_FALSE(table.empty());
+    CHECK(table.back() == std::make_pair(std::string_view{"hardware"},
+                                         std::string_view{"drivers_inventory"}));
+
+    auto loaded = yuzu::agent::PluginHandle::load(find_plugin("hardware"));
+    REQUIRE(loaded.has_value());
+    const YuzuPluginDescriptor* d = loaded->descriptor();
+    REQUIRE(d != nullptr);
+    CHECK(std::string_view{d->name} == "hardware");
+    bool declared = false;
+    for (const char* const* a = d->actions; a && *a; ++a)
+        declared = declared || std::string_view{*a} == "drivers_inventory";
+    CHECK(declared);
+}

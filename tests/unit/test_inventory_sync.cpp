@@ -1,10 +1,13 @@
-// Agent daily-sync tests (ADR-0016): the canonical-hash cross-pin with the
-// server, installed_apps output parsing, and the SyncScheduler hash-skip /
-// need_full / first-run state machine (gRPC + KV injected — no network).
+// Agent daily-sync tests (ADR-0016): installed_apps output parsing, the action adapters, the v3
+// sectioned collector (sections, deltas, commit-on-ack, bounded single-flight workers) and the
+// SyncScheduler hash-skip / need_full / first-run state machine, hooks included (gRPC + KV
+// injected -- no network). The writer's cross-side golden vectors are in
+// test_installed_software_v3.cpp.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "installed_apps_inventory.hpp" // the plugin's own row parsers/builder feed the publisher cases
+#include "installed_software_v3.hpp"
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
@@ -21,6 +24,7 @@
 #include <yuzu/plugin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -28,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
@@ -40,8 +45,8 @@
 #include <vector>
 
 using yuzu::agent::AdaptedRows;
-using yuzu::agent::ConstrainedPolicy;
-using yuzu::agent::installed_software_canonical_blob;
+using yuzu::agent::CollectorTuning;
+using yuzu::agent::CollectorWorkers;
 using yuzu::agent::make_installed_software_source;
 using yuzu::agent::parse_middleware_output;
 using yuzu::agent::parse_msi_packages_list_inventory_output;
@@ -52,6 +57,7 @@ using yuzu::agent::parse_runtimes_dotnet_output;
 using yuzu::agent::parse_runtimes_jvm_output;
 using yuzu::agent::parse_runtimes_python_output;
 using yuzu::agent::parse_windows_optional_features_output;
+using yuzu::agent::parse_hardware_drivers_inventory_output;
 using yuzu::agent::parse_installed_apps_output;
 using yuzu::agent::sha256_hex;
 using yuzu::agent::SwEntry;
@@ -59,47 +65,7 @@ using yuzu::agent::SyncPluginMap;
 using yuzu::agent::SyncScheduler;
 using yuzu::agent::SyncSource;
 
-namespace {
-// THE cross-side pin (ADR-0016 §4, blob contract v2 — 12 fields): the server
-// computes the SAME hash for the SAME input
-// (tests/unit/server/test_software_inventory_store.cpp — identical constant).
-// A one-byte drift in either canonicalisation fails one assertion.
-constexpr const char* kCrossPinHash =
-    "430dc97e02b5d217276a9558393d702366bcd3b5415d5867c9efd4e95a02c848";
-
-// Fully-populated v2 entry — the identical fixture the server pin test uses.
-SwEntry full_v2_entry() {
-    SwEntry e;
-    e.name = "bash";
-    e.version = "5.2.21";
-    e.publisher = "Fedora Project";
-    e.install_date = "Mon 01 Jan 2026";
-    e.kind = "package";
-    e.ecosystem = "rpm";
-    e.epoch = "0";
-    e.release = "3.fc40";
-    e.arch = "x86_64";
-    e.signature_status = "signed";
-    e.distro_id = "fedora";
-    e.distro_version = "40";
-    return e;
-}
-} // namespace
-
-TEST_CASE("installed_software canonical hash matches the cross-pin", "[sync][hash]") {
-    // Unsorted + duplicate + one entry populating ALL 12 v2 fields:
-    // canonical_blob must sort + dedup to the exact bytes the constant was
-    // computed from.
-    std::vector<SwEntry> e = {
-        {"Zeta", "9", "", ""},
-        full_v2_entry(),
-        {"Acme Reader", "1.2", "Acme", "2026-01-02"},
-        {"Acme Reader", "1.2", "Acme", "2026-01-02"},
-    };
-    CHECK(sha256_hex(installed_software_canonical_blob(e)) == kCrossPinHash);
-}
-
-TEST_CASE("parse_installed_apps_output keeps inv| rows only (blob v2)", "[sync][parse]") {
+TEST_CASE("parse_installed_apps_output keeps inv| rows only", "[sync][parse]") {
     const std::string out =
         "inv|bash|5.2.21|Fedora Project|Mon 01 Jan 2026|package|rpm|0|3.fc40|x86_64|signed|"
         "fedora|40\n"
@@ -324,8 +290,8 @@ TEST_CASE("clamp_field scrubs invalid UTF-8 to U+FFFD before hashing (UP-IN1)",
     REQUIRE(e.size() == 1);
     CHECK(e[0].name == std::string("Caf\xef\xbf\xbd")); // 0xE9 → U+FFFD
     CHECK(e[0].name.find('\xe9') == std::string::npos); // no raw byte survives
-    // The whole canonical blob is valid UTF-8 (no stray invalid byte).
-    CHECK(installed_software_canonical_blob(e).find('\xe9') == std::string::npos);
+    // The whole written record is valid UTF-8 (no stray invalid byte).
+    CHECK(yuzu::agent::v3_record(e[0]).find('\xe9') == std::string::npos);
 }
 
 // Raw bytes exercising EVERY PG-strict rejection branch (overlong, surrogate,
@@ -377,28 +343,28 @@ TEST_CASE("a name that becomes empty after clamping is dropped (UP-1 hash parity
     CHECK(e[0].name == "Real");
 }
 
-TEST_CASE("canonical blob is the exact wire format the server parses", "[sync][hash]") {
-    // Pins the byte layout (not just the hash): sorted, 0x1F between the 12 v2
-    // fields, 0x1E terminating each entry. The server's parse_software_blob
-    // reads this same form (tests/unit/server/test_software_inventory_store.cpp).
-    std::vector<SwEntry> e = {{"B", "2", "", ""}, {"A", "1", "P", "D"}}; // unsorted
-    // A|1|P|D|×8-empty<rec>  B|2|×10-empty<rec>  (| == 0x1F, <rec> == 0x1E);
-    // 11 separators per record regardless of how many trailing fields are empty.
-    CHECK(installed_software_canonical_blob(e) ==
-          std::string("A\037" "1\037P\037D\037\037\037\037\037\037\037\037\036"
-                      "B\037" "2\037\037\037\037\037\037\037\037\037\037\036"));
-}
-
 TEST_CASE("empty inventory parses to no entries and a stable empty hash",
           "[sync][parse]") {
     // A host with zero machine-scope apps must still hash-skip cleanly, not look
-    // broken: empty list → empty canonical blob → the well-known SHA-256 of "".
+    // broken: an empty list hashes the well-known SHA-256 of "".
     auto e = parse_installed_apps_output(
         "user_app|x|y|1|p|d\napp|No applications found|-|-|-|-|-\n");
     CHECK(e.empty());
-    CHECK(installed_software_canonical_blob({}) == "");
+    CHECK(yuzu::agent::v3_section_hash({}) == sha256_hex(""));
     CHECK(sha256_hex("") ==
           "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+TEST_CASE("parse_installed_apps_output reads the 14th token as install_location",
+          "[sync][parse]") {
+    auto e = parse_installed_apps_output(
+        "inv|Alpha|1|Pub|d|app|windows|||x64||||C:\\Program Files\\Alpha\n"
+        "inv|Old|1|Pub|d|app|windows||||||\n"            // the previous 13-token layout
+        "inv|Extra|1|Pub|d|app|windows|||x64||||/opt/x|JUNK\n");
+    REQUIRE(e.size() == 3);
+    CHECK(e[0].install_location == "C:\\Program Files\\Alpha");
+    CHECK(e[1].install_location.empty());
+    CHECK(e[2].install_location == "/opt/x"); // tokens past the 14th are dropped
 }
 
 // --- LocalDispatcher capture_cap plumbing (regression: the parameter must
@@ -1225,29 +1191,6 @@ namespace fs = std::filesystem;
 namespace pkg = yuzu::pkg_inventory;
 namespace msi = yuzu::msi_packages::inventory;
 using Status = AdaptedRows::Status;
-// The ConstrainedPolicy each action's table row carries in the collector
-// (sync_source_installed_software.cpp kInventoryActions): managers keeps a constrained answer's
-// rows when a present row was seen, every other status-row action fails the cycle.
-constexpr ConstrainedPolicy kKeepPolicy = ConstrainedPolicy::keep_rows_if_present_seen;
-constexpr ConstrainedPolicy kFailPolicy = ConstrainedPolicy::fail;
-
-// Server-side fixtures, copied verbatim from
-// tests/unit/server/test_software_inventory_store.cpp: the agent builder and the
-// server's canonical_hash must produce these exact digests (blob v2 + 4-slot tail).
-constexpr const char* kCrossPinHashExtended =
-    "371b647c95b0f48a039ff98790c6085947ef71fcfd40a399c3cd70d70321291d";
-constexpr const char* kTailOrderPinHash =
-    "ab2abf993a2b0868b9c69397497799920773fd44c29cde86380e8c4369ccbe8d";
-constexpr const char* kMixedBlobHash =
-    "7b37bca935f3ae92a042949ef4280d69b25edc8ee6e518f993ded0eeec7e76f3";
-
-SwEntry full_extended_entry() {
-    SwEntry e = full_v2_entry();
-    e.package_id = "bash-5.2.21-3.fc40.x86_64";
-    e.source = "installed_apps.list_inventory";
-    return e;
-}
-
 // Lines strictly between `== action=<action>` and the next `== action=` /
 // `[result_status]` line of a committed real capture. Never skips: a missing
 // sample is a failure. The record counts pinned in the collector tests below are
@@ -1308,6 +1251,81 @@ std::vector<std::string> fields_of(const std::string& rec) {
     }
 }
 
+// ── blob v3 decoding: the collector's output, read the way the server's parser reads it ──
+// `+` records are returned as the 16-slot body (fields_of() indexes them exactly as it indexed
+// the v2 tail records), one string per row across every section.
+std::vector<std::string> plus_records(const std::string& blob) {
+    std::vector<std::string> out;
+    for (const auto& rec : records_of(blob)) {
+        if (rec.size() > 2 && rec[0] == '+' && rec[1] == '\x1f')
+            out.push_back(rec.substr(2));
+    }
+    return out;
+}
+
+struct V3Sec {
+    std::string facet, status, base, token, expect;
+    std::string duration_ms, bytes_read;
+    std::vector<std::string> adds; // `+` bodies, see plus_records
+    std::vector<std::string> dels; // `-` row hashes
+};
+
+std::vector<V3Sec> sections_of(const std::string& blob) {
+    std::vector<V3Sec> out;
+    REQUIRE(blob.starts_with(std::string(yuzu::agent::kV3Header)));
+    for (const auto& rec : records_of(blob.substr(yuzu::agent::kV3Header.size()))) {
+        if (rec.empty())
+            continue;
+        const auto f = fields_of(rec);
+        if (f[0] == "S") {
+            REQUIRE(f.size() == 8);
+            out.push_back({f[1], f[2], f[3], f[4], f[7], f[5], f[6], {}, {}});
+        } else if (f[0] == "+") {
+            REQUIRE_FALSE(out.empty());
+            out.back().adds.push_back(rec.substr(2));
+        } else if (f[0] == "-") {
+            REQUIRE_FALSE(out.empty());
+            out.back().dels.push_back(f[1]);
+        }
+    }
+    return out;
+}
+
+// The rows of a section as agent entries, read back from the `+` bodies.
+std::vector<SwEntry> entries_of(const V3Sec& sec) {
+    std::vector<SwEntry> out;
+    for (const auto& body : sec.adds) {
+        const auto f = fields_of(body);
+        REQUIRE(f.size() == 16);
+        SwEntry e;
+        e.name = f[0];
+        e.version = f[1];
+        e.publisher = f[2];
+        e.install_date = f[3];
+        e.kind = f[4];
+        e.ecosystem = f[5];
+        e.epoch = f[6];
+        e.release = f[7];
+        e.arch = f[8];
+        e.signature_status = f[9];
+        e.distro_id = f[10];
+        e.distro_version = f[11];
+        e.install_location = f[12];
+        e.package_id = f[14];
+        e.source = f[15];
+        out.push_back(std::move(e));
+    }
+    return out;
+}
+
+const V3Sec* find_sec(const std::vector<V3Sec>& secs, std::string_view facet) {
+    for (const auto& s : secs) {
+        if (s.facet == facet)
+            return &s;
+    }
+    return nullptr;
+}
+
 // --- fake in-process plugins: canned output per action, test-set rc ---
 struct FakeOut {
     std::map<std::string, std::string> out;
@@ -1317,8 +1335,8 @@ struct FakeOut {
     std::map<std::string, std::tuple<YuzuResultStatus, YuzuResultCompleteness, std::string>>
         result_status;
 };
-FakeOut g_fake[6]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features, 3 msi_packages,
-                   // 4 runtimes, 5 middleware (not in all_plugins())
+FakeOut g_fake[7]; // 0 installed_apps, 1 pkg_inventory, 2 windows_optional_features, 3 msi_packages,
+                   // 4 runtimes, 5 middleware and 6 hardware (the last two are not in all_plugins())
 
 template <int I>
 int fake_execute(YuzuCommandContext* ctx, const char* action, const YuzuParam* /*params*/,
@@ -1343,6 +1361,7 @@ const char* const kFakeWofActions[] = {"list", nullptr};
 const char* const kFakeMsiActions[] = {"list_inventory", nullptr};
 const char* const kFakeRtActions[] = {"python", "dotnet", "jvm", nullptr};
 const char* const kFakeMiddlewareActions[] = {"ibm_mq", nullptr};
+const char* const kFakeHwActions[] = {"drivers_inventory", nullptr};
 
 #define YUZU_FAKE_DESC(var, plugin_name, actions, idx)                                            \
     const YuzuPluginDescriptor var = {YUZU_PLUGIN_ABI_VERSION, plugin_name, "1.0.0", "test fake", \
@@ -1354,6 +1373,7 @@ YUZU_FAKE_DESC(kFakeWof, "windows_optional_features", kFakeWofActions, 2);
 YUZU_FAKE_DESC(kFakeMsi, "msi_packages", kFakeMsiActions, 3);
 YUZU_FAKE_DESC(kFakeRt, "runtimes", kFakeRtActions, 4);
 YUZU_FAKE_DESC(kFakeMiddleware, "middleware", kFakeMiddlewareActions, 5);
+YUZU_FAKE_DESC(kFakeHw, "hardware", kFakeHwActions, 6);
 #undef YUZU_FAKE_DESC
 
 SyncPluginMap all_plugins() {
@@ -1408,12 +1428,58 @@ void fake_windows() {
 // name), counted from the sample itself so a recapture does not break the pinned totals.
 std::size_t msi_sample_mapped_rows() {
     return parse_msi_packages_list_inventory_output(
-               capture_section("msi_packages", "windows.txt", "list_inventory"), kFailPolicy)
+               capture_section("msi_packages", "windows.txt", "list_inventory"))
         .entries.size();
 }
 
+// One installed_software source wired the way the agent wires it, with a fake `__sync__` KV, a fake
+// clock for the cooldown and its own single-flight state. Not movable: the accessors capture `this`.
+struct Collector {
+    std::map<std::string, std::string> kv;
+    std::shared_ptr<CollectorWorkers> workers = std::make_shared<CollectorWorkers>();
+    std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::time_point{} + std::chrono::hours{1};
+    SyncSource src;
+
+    explicit Collector(SyncPluginMap plugins, yuzu::agent::CollectorTuning tuning = {}) {
+        tuning.clock = [this] { return now; };
+        src = make_installed_software_source(
+            std::move(plugins),
+            [this](const std::string& k) {
+                const auto it = kv.find(k);
+                return it == kv.end() ? std::string{} : it->second;
+            },
+            [this](const std::string& k, const std::string& v) { kv[k] = v; }, workers,
+            std::move(tuning));
+    }
+    Collector(const Collector&) = delete;
+    Collector& operator=(const Collector&) = delete;
+
+    std::optional<std::pair<std::string, std::string>> collect() { return src.collect(); }
+    // The scheduler's clean (no tokens) or nacked acknowledgement of the last collect().
+    void ack(const std::vector<std::string>& tokens = {}) { src.on_ack(tokens); }
+    // One pass as the scheduler runs it: a forced send first calls on_force_full.
+    std::optional<std::pair<std::string, std::string>> collect_forced() {
+        src.on_force_full();
+        return src.collect();
+    }
+    void pass_cooldown() { now += yuzu::agent::kPassCooldown + std::chrono::minutes{1}; }
+};
+
+// A first collection from a fresh source: every facet is a first contact.
 std::optional<std::pair<std::string, std::string>> collect_with(SyncPluginMap plugins) {
-    return make_installed_software_source(std::move(plugins)).collect();
+    Collector c(std::move(plugins));
+    return c.collect();
+}
+
+// The section a one-shot collection wrote for `facet`, or nullopt when it wrote none.
+std::optional<V3Sec> section_of(const SyncPluginMap& plugins, std::string_view facet) {
+    const auto got = collect_with(plugins);
+    if (!got)
+        return std::nullopt;
+    const auto secs = sections_of(got->first);
+    const V3Sec* s = find_sec(secs, facet);
+    return s ? std::optional<V3Sec>(*s) : std::nullopt;
 }
 
 std::string supported_status(std::string_view action) {
@@ -1445,86 +1511,9 @@ void check_blob_size(const std::string& blob, std::size_t records) {
 }
 } // namespace
 
-TEST_CASE("extended tail: agent blob hashes to the server's three contract pins",
-          "[sync][hash][extended_row]") {
-    CHECK(sha256_hex(installed_software_canonical_blob({full_extended_entry()})) ==
-          kCrossPinHashExtended);
-
-    SwEntry first = full_extended_entry();
-    first.source = "installed_apps.list_apps";
-    CHECK(sha256_hex(installed_software_canonical_blob({full_extended_entry(), first})) ==
-          kTailOrderPinHash);
-
-    SwEntry alpha;
-    alpha.name = "alpha";
-    alpha.version = "1.0";
-    alpha.publisher = "AlphaCo";
-    alpha.install_date = "2026-01-01";
-    alpha.kind = "app";
-    SwEntry zed;
-    zed.name = "zed";
-    zed.version = "1";
-    zed.source = "installed_apps.list_inventory"; // source-only tail
-    CHECK(sha256_hex(installed_software_canonical_blob({zed, full_extended_entry(), alpha})) ==
-          kMixedBlobHash);
-}
-
-TEST_CASE("extended tail rule: the tail enters the blob only when package_id or source is set",
-          "[sync][hash][extended_row]") {
-    const std::vector<SwEntry> v2 = {
-        {"Zeta", "9", "", ""},
-        full_v2_entry(),
-        {"Acme Reader", "1.2", "Acme", "2026-01-02"},
-    };
-    CHECK(sha256_hex(installed_software_canonical_blob(v2)) == kCrossPinHash);
-
-    auto with_source = v2;
-    with_source[0].source = "installed_apps.list_apps";
-    const auto h_src = sha256_hex(installed_software_canonical_blob(with_source));
-    CHECK(h_src != kCrossPinHash);
-
-    auto only_pkg = v2;
-    only_pkg[0].package_id = "x-1";
-    const auto h_pkg = sha256_hex(installed_software_canonical_blob(only_pkg));
-    CHECK(h_pkg != kCrossPinHash);
-    CHECK(h_pkg != h_src);
-
-    const SwEntry base = full_extended_entry();
-    const auto one = sha256_hex(installed_software_canonical_blob({base}));
-    for (auto field : {&SwEntry::package_id, &SwEntry::source}) {
-        SwEntry other = base;
-        other.*field = "zz-different";
-        const auto both = sha256_hex(installed_software_canonical_blob({other, base}));
-        CHECK(both != one); // distinct rows never collapse
-        CHECK(both == sha256_hex(installed_software_canonical_blob({base, other})));
-    }
-    CHECK(sha256_hex(installed_software_canonical_blob({base, base})) == one); // exact dup dedups
-}
-
-TEST_CASE("extended tail order: package_id sorts before source, even when they disagree",
-          "[sync][hash][extended_row]") {
-    // Same v2 fields, so the tail decides: a{pid a, src z} vs b{pid b, src a}. A
-    // comparator that swapped the two would put b first.
-    SwEntry a;
-    a.name = "same";
-    a.package_id = "a";
-    a.source = "z";
-    SwEntry b = a;
-    b.package_id = "b";
-    b.source = "a";
-    for (const auto& in : {std::vector<SwEntry>{a, b}, std::vector<SwEntry>{b, a}}) {
-        const auto recs = records_of(installed_software_canonical_blob(in));
-        REQUIRE(recs.size() == 2);
-        CHECK(fields_of(recs[0])[14] == "a");
-        CHECK(fields_of(recs[0])[15] == "z");
-        CHECK(fields_of(recs[1])[14] == "b");
-        CHECK(fields_of(recs[1])[15] == "a");
-    }
-}
-
 TEST_CASE("pkg_inventory packages adapter: real macOS capture", "[sync][parse][adapter]") {
     const auto r = parse_pkg_inventory_packages_output(
-        capture_section("pkg_inventory", "macos.txt", "packages"), kFailPolicy);
+        capture_section("pkg_inventory", "macos.txt", "packages"));
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 70);
     CHECK(r.entries[0].name == "actionlint");
@@ -1542,8 +1531,7 @@ TEST_CASE("pkg_inventory packages adapter maps casks to kind app", "[sync][parse
     const auto r = parse_pkg_inventory_packages_output(
         nl({supported_status("packages"),
             pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula),
-            pkg::format_package_row("firefox", "130.0", pkg::PackageKind::cask)}),
-        kFailPolicy);
+            pkg::format_package_row("firefox", "130.0", pkg::PackageKind::cask)}));
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 2);
     CHECK(r.entries[0].kind == "pkg");
@@ -1552,7 +1540,7 @@ TEST_CASE("pkg_inventory packages adapter maps casks to kind app", "[sync][parse
 
 TEST_CASE("pkg_inventory managers adapter: one Homebrew presence row", "[sync][parse][adapter]") {
     const auto r = parse_pkg_inventory_managers_output(
-        capture_section("pkg_inventory", "macos.txt", "managers"), kKeepPolicy);
+        capture_section("pkg_inventory", "macos.txt", "managers"));
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 1);
     CHECK(r.entries[0].name == "homebrew");
@@ -1569,7 +1557,7 @@ TEST_CASE("pkg_inventory managers adapter: presence semantics and Homebrew-only"
     SECTION("two prefixes parse to two identical entries; the collector yields ONE record") {
         const std::string managers = nl({supported_status("managers"), hb_row("/opt/homebrew"),
                                          hb_row("/usr/local")});
-        const auto r = parse_pkg_inventory_managers_output(managers, kKeepPolicy);
+        const auto r = parse_pkg_inventory_managers_output(managers);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 2);
         CHECK(r.entries[0].name == r.entries[1].name);
@@ -1580,7 +1568,7 @@ TEST_CASE("pkg_inventory managers adapter: presence semantics and Homebrew-only"
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         std::size_t homebrew = 0;
-        for (const auto& rec : records_of(got->first))
+        for (const auto& rec : plus_records(got->first))
             if (fields_of(rec)[0] == "homebrew")
                 ++homebrew;
         CHECK(homebrew == 1);
@@ -1589,8 +1577,7 @@ TEST_CASE("pkg_inventory managers adapter: presence semantics and Homebrew-only"
         const auto r = parse_pkg_inventory_managers_output(
             nl({supported_status("managers"),
                 pkg::format_manager_row(pkg::Manager::dpkg, pkg::Presence::present, "1.22", "/",
-                                        "-", "")}),
-            kKeepPolicy);
+                                        "-", "")}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
@@ -1599,8 +1586,7 @@ TEST_CASE("pkg_inventory managers adapter: presence semantics and Homebrew-only"
             nl({supported_status("managers"),
                 pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable, "",
                                         "/usr/local", "-",
-                                        "macos:homebrew_cellar:permission_denied")}),
-            kKeepPolicy);
+                                        "macos:homebrew_cellar:permission_denied")}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
@@ -1610,47 +1596,43 @@ TEST_CASE("pkg_inventory adapters: status grammar", "[sync][parse][adapter]") {
     const std::string good_row = pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula);
 
     SECTION("no status row") {
-        CHECK(parse_pkg_inventory_packages_output(nl({good_row}), kFailPolicy).status ==
+        CHECK(parse_pkg_inventory_packages_output(nl({good_row})).status ==
               Status::failed);
     }
     SECTION("constrained carries the reason") {
         const auto r = parse_pkg_inventory_packages_output(
             nl({yuzu::shared::format_status_row("packages", yuzu::shared::StatusLevel::constrained,
                                                 "x"),
-                good_row}),
-            kFailPolicy);
-        CHECK(r.status == Status::failed);
+                good_row}));
+        CHECK(r.status == Status::constrained); // no rows are ever taken from an incomplete read
+        CHECK(r.entries.empty());
         CHECK(r.reason == "x");
     }
     SECTION("two status rows") {
         CHECK(parse_pkg_inventory_packages_output(
-                  nl({supported_status("packages"), supported_status("packages"), good_row}),
-                  kFailPolicy)
+                  nl({supported_status("packages"), supported_status("packages"), good_row}))
                   .status == Status::failed);
     }
     SECTION("an unknown level") {
         CHECK(parse_pkg_inventory_packages_output(
-                  nl({std::string("status|packages|") + "bogus" + "|-", good_row}), kFailPolicy)
+                  nl({std::string("status|packages|") + "bogus" + "|-", good_row}))
                   .status == Status::failed);
     }
     SECTION("a malformed data row is dropped; status decides") {
         const auto r = parse_pkg_inventory_packages_output(
-            nl({supported_status("packages"), good_row, "package|homebrew|onlythree"}),
-            kFailPolicy);
+            nl({supported_status("packages"), good_row, "package|homebrew|onlythree"}));
         REQUIRE(r.status == Status::ok);
         CHECK(r.entries.size() == 1);
     }
     SECTION("a status row for the other action is not accepted") {
-        CHECK(parse_pkg_inventory_packages_output(nl({supported_status("managers"), good_row}),
-                                                  kFailPolicy)
+        CHECK(parse_pkg_inventory_packages_output(nl({supported_status("managers"), good_row}))
                   .status == Status::failed);
-        CHECK(parse_pkg_inventory_managers_output(nl({supported_status("packages"), good_row}),
-                                                  kKeepPolicy)
+        CHECK(parse_pkg_inventory_managers_output(nl({supported_status("packages"), good_row}))
                   .status == Status::failed);
     }
     SECTION("empty input") {
-        CHECK(parse_pkg_inventory_packages_output("", kFailPolicy).status == Status::failed);
-        CHECK(parse_pkg_inventory_managers_output("", kKeepPolicy).status == Status::failed);
+        CHECK(parse_pkg_inventory_packages_output("").status == Status::failed);
+        CHECK(parse_pkg_inventory_managers_output("").status == Status::failed);
     }
 }
 
@@ -1658,17 +1640,17 @@ TEST_CASE("pkg_inventory adapters: the Linux sample (a toolchain container with 
           "[sync][parse][adapter]") {
     // managers: supported, with present dpkg/apt rows that map to nothing.
     const auto m = parse_pkg_inventory_managers_output(
-        capture_section("pkg_inventory", "linux.txt", "managers"), kKeepPolicy);
+        capture_section("pkg_inventory", "linux.txt", "managers"));
     CHECK(m.status == Status::ok);
     CHECK(m.entries.empty());
     // packages: unsupported by design (installed_apps owns the Linux roster).
     const auto p = parse_pkg_inventory_packages_output(
-        capture_section("pkg_inventory", "linux.txt", "packages"), kFailPolicy);
+        capture_section("pkg_inventory", "linux.txt", "packages"));
     CHECK(p.status == Status::unsupported);
     CHECK(p.entries.empty());
     // store_packages: supported, zero rows (the container has neither snapd nor flatpak).
     const auto s = parse_pkg_inventory_store_packages_output(
-        capture_section("pkg_inventory", "linux.txt", "store_packages"), kFailPolicy);
+        capture_section("pkg_inventory", "linux.txt", "store_packages"));
     CHECK(s.status == Status::ok);
     CHECK(s.entries.empty());
 }
@@ -1701,8 +1683,7 @@ TEST_CASE("pkg_inventory store_packages adapter: active rows map, the rest are s
             snap_store_row("oldsnap", "1.0", "app", "1", pkg::StoreState::inactive),
             snap_store_row("mystery", "1.0", "app", "1", pkg::StoreState::unknown),
             // Not nine tokens, and an unknown store token: dropped.
-            "package|snap|short|1.0|app|1|-|active", "package|apt|x|1.0|app|1|-|-|active"}),
-        kFailPolicy);
+            "package|snap|short|1.0|app|1|-|active", "package|apt|x|1.0|app|1|-|-|active"}));
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 5);
     CHECK(r.reason.empty());
@@ -1738,96 +1719,89 @@ TEST_CASE("pkg_inventory store_packages adapter: an over-wide row is dropped, ne
     const std::string good = snap_store_row("btop", "1.4.7", "app", "1073");
     for (const std::string extra : {"|x", "|x|y"}) {
         const auto r = parse_pkg_inventory_store_packages_output(
-            nl({supported_status("store_packages"), good + extra}), kFailPolicy);
+            nl({supported_status("store_packages"), good + extra}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
     const auto ok = parse_pkg_inventory_store_packages_output(
-        nl({supported_status("store_packages"), good}), kFailPolicy);
+        nl({supported_status("store_packages"), good}));
     CHECK(ok.entries.size() == 1);
 }
 
 TEST_CASE("pkg_inventory store_packages adapter: status grammar", "[sync][parse][adapter]") {
     const std::string row = snap_store_row("btop", "1.4.7", "app", "1073");
-    SECTION("constrained fails (a partial roster would delete stored rows)") {
+    SECTION("constrained contributes no rows (a partial roster is never reported)") {
         const auto r = parse_pkg_inventory_store_packages_output(
             nl({yuzu::shared::format_status_row("store_packages",
                                                 yuzu::shared::StatusLevel::constrained,
                                                 "linux:flatpak_app:permission_denied"),
-                row}),
-            kFailPolicy);
-        CHECK(r.status == Status::failed);
+                row}));
+        CHECK(r.status == Status::constrained);
+        CHECK(r.entries.empty());
         CHECK(r.reason == "linux:flatpak_app:permission_denied");
     }
     SECTION("unsupported") {
         const auto r = parse_pkg_inventory_store_packages_output(
-            nl({pkg::unsupported_status_row("store_packages", "macos:owned_by_installed_apps")}),
-            kFailPolicy);
+            nl({pkg::unsupported_status_row("store_packages", "macos:owned_by_installed_apps")}));
         CHECK(r.status == Status::unsupported);
         CHECK(r.entries.empty());
     }
     SECTION("a status row for another action, no status row, empty input") {
-        CHECK(parse_pkg_inventory_store_packages_output(nl({supported_status("packages"), row}),
-                                                        kFailPolicy)
+        CHECK(parse_pkg_inventory_store_packages_output(nl({supported_status("packages"), row}))
                   .status == Status::failed);
-        CHECK(parse_pkg_inventory_store_packages_output(nl({row}), kFailPolicy).status ==
+        CHECK(parse_pkg_inventory_store_packages_output(nl({row})).status ==
               Status::failed);
-        CHECK(parse_pkg_inventory_store_packages_output("", kFailPolicy).status == Status::failed);
+        CHECK(parse_pkg_inventory_store_packages_output("").status == Status::failed);
     }
     SECTION("supported with zero rows is a legitimate answer") {
         const auto r = parse_pkg_inventory_store_packages_output(
-            nl({supported_status("store_packages")}), kFailPolicy);
+            nl({supported_status("store_packages")}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
 }
 
-TEST_CASE("pkg_inventory managers adapter: a constrained answer that names a present manager keeps "
-          "the cycle even when the row maps to nothing",
+TEST_CASE("pkg_inventory managers adapter: a constrained answer contributes no rows, whatever it names",
           "[sync][parse][adapter]") {
-    // The first constrained Linux `managers` answer carries dpkg/apt rows, which map to no
-    // installed_software entry. MUTATION: counting MAPPED entries (the old `entries.empty()`
-    // rule) instead of present rows fails the first section and skips every Linux cycle.
+    // The old policy kept a constrained answer's rows when a present manager row was seen. A
+    // degraded read is now a status-only section with the tokens (R23: the server keeps the facet's
+    // rows and shows them unconfirmed), so a present row beside a constrained status is not used.
     const std::string token = "linux:apt_sources_d:permission_denied";
     const auto constrained =
         yuzu::shared::format_status_row("managers", yuzu::shared::StatusLevel::constrained, token);
-    SECTION("an unmapped present row: ok, zero entries, reason = the token") {
+    SECTION("a mapped present row beside a constrained status") {
         const auto r = parse_pkg_inventory_managers_output(
-            nl({constrained, pkg::format_manager_row(pkg::Manager::dpkg, pkg::Presence::present, "",
-                                                     "", "-", "")}),
-            kKeepPolicy);
-        CHECK(r.status == Status::ok);
+            nl({constrained, pkg::format_manager_row(pkg::Manager::homebrew,
+                                                     pkg::Presence::present, "", "/opt/homebrew",
+                                                     "-", "")}));
+        CHECK(r.status == Status::constrained);
         CHECK(r.entries.empty());
         CHECK(r.reason == token);
     }
-    SECTION("zero data rows still fails") {
-        CHECK(parse_pkg_inventory_managers_output(nl({constrained}), kKeepPolicy).status ==
-              Status::failed);
-    }
-    SECTION("only an unavailable row still fails") {
-        CHECK(parse_pkg_inventory_managers_output(
-                  nl({constrained,
-                      pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable,
-                                              "", "/usr/local", "-", token)}),
-                  kKeepPolicy)
-                  .status == Status::failed);
+    SECTION("an unmapped present row, or none at all") {
+        const auto r = parse_pkg_inventory_managers_output(
+            nl({constrained, pkg::format_manager_row(pkg::Manager::dpkg, pkg::Presence::present, "",
+                                                     "", "-", "")}));
+        CHECK(r.status == Status::constrained);
+        CHECK(parse_pkg_inventory_managers_output(nl({constrained})).status ==
+              Status::constrained);
     }
 }
 
-TEST_CASE("collector: Linux store_packages rows are collected, and a degraded row does not skip the cycle",
+TEST_CASE("collector: Linux store_packages rows are collected, and a degraded row does not constrain the facet",
           "[sync][collector]") {
     fake_mac();
     // A Linux-shaped pkg_inventory answer layered on the Mac fakes: supported status, active
     // capture-valued rows, PLUS one degraded ACTIVE row (version `-`, kind unknown) under a
     // SUPPORTED status. MUTATION: a status token on the degraded row makes the adapter fail it
-    // and skips the whole report.
+    // and reports the whole facet constrained.
     g_fake[1].out["store_packages"] =
         nl({supported_status("store_packages"), snap_store_row("btop", "1.4.7", "app", "1073"),
             snap_store_row("jq", "", "unknown", "6"),
             flatpak_store_row("org.gnome.Calculator", "app", kCalcCommit)});
     const auto got = collect_with(all_plugins());
     REQUIRE(got.has_value());
-    const auto recs = records_of(got->first);
+    const auto recs = plus_records(got->first);
     CHECK(recs.size() == 393 + 70 + 1 + 3);
     std::map<std::string, std::string> eco_by_name;
     std::size_t store = 0;
@@ -1843,12 +1817,21 @@ TEST_CASE("collector: Linux store_packages rows are collected, and a degraded ro
     CHECK(eco_by_name["jq"] == "snap");
     CHECK(eco_by_name["org.gnome.Calculator"] == "flatpak");
 
-    // A constrained store_packages answer (an incomplete LIST) skips the cycle: nothing is deleted.
+    // A constrained store_packages answer (an incomplete LIST) is a status-only section: no rows
+    // from it, so nothing is deleted, and every other facet is unaffected.
     g_fake[1].out["store_packages"] = nl(
         {yuzu::shared::format_status_row("store_packages", yuzu::shared::StatusLevel::constrained,
                                          "linux:snapd_snaps:permission_denied"),
          snap_store_row("btop", "1.4.7", "app", "1073")});
-    CHECK_FALSE(collect_with(all_plugins()).has_value());
+    const auto degraded = collect_with(all_plugins());
+    REQUIRE(degraded.has_value());
+    const auto secs = sections_of(degraded->first);
+    const V3Sec* st = find_sec(secs, "pkg_inventory.store_packages");
+    REQUIRE(st != nullptr);
+    CHECK(st->status == "constrained");
+    CHECK(st->token == "linux:snapd_snaps:permission_denied");
+    CHECK(st->adds.empty());
+    CHECK(find_sec(secs, "installed_apps.list_inventory")->status == "full");
 }
 
 TEST_CASE("windows_optional_features adapter: real capture keeps every feature with its state",
@@ -1914,8 +1897,7 @@ TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
     SECTION("packages: 0x1F stripped from the name, version truncated") {
         const auto r = parse_pkg_inventory_packages_output(
             nl({supported_status("packages"),
-                std::string("package|homebrew|wg\037et|") + too_long + "|formula"}),
-            kFailPolicy);
+                std::string("package|homebrew|wg\037et|") + too_long + "|formula"}));
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].name == "wget");
@@ -1924,8 +1906,7 @@ TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
     SECTION("managers: over-length version truncated") {
         const auto r = parse_pkg_inventory_managers_output(
             nl({supported_status("managers"),
-                "manager|homebrew|present|" + too_long + "|/opt/homebrew|-|-"}),
-            kKeepPolicy);
+                "manager|homebrew|present|" + too_long + "|/opt/homebrew|-|-"}));
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].version.size() == 1024);
@@ -1933,8 +1914,7 @@ TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
     SECTION("msi: every field truncated, invalid UTF-8 in the name becomes U+FFFD") {
         const auto r = parse_msi_packages_list_inventory_output(
             nl({"status|list_inventory|supported|-",
-                "inv|" + too_long + "|Caf\xe9|" + too_long + "|" + too_long}),
-            kFailPolicy);
+                "inv|" + too_long + "|Caf\xe9|" + too_long + "|" + too_long}));
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].package_id.size() == 1024);
@@ -1995,7 +1975,7 @@ std::string msi_rendered_fixture(std::size_t* machine_rows = nullptr) {
 TEST_CASE("msi_packages adapter: maps the builder-rendered Kingsley capture",
           "[sync][parse][adapter][msi_packages]") {
     std::size_t n = 0;
-    const auto r = parse_msi_packages_list_inventory_output(msi_rendered_fixture(&n), kFailPolicy);
+    const auto r = parse_msi_packages_list_inventory_output(msi_rendered_fixture(&n));
     REQUIRE(r.status == Status::ok);
     REQUIRE(n == 118);
     REQUIRE(r.entries.size() == 118);
@@ -2022,7 +2002,11 @@ TEST_CASE("msi_packages adapter: maps the builder-rendered Kingsley capture",
     CHECK(e.source.empty()); // the collector stamps source
     for (const auto& x : r.entries)
         CHECK(x.package_id != "{665A0435-D5D5-4A49-9DE0-FBC23C5425ED}");
-    check_blob_size(installed_software_canonical_blob(r.entries), 118);
+    check_blob_size(yuzu::agent::write_v3_blob(
+                        {yuzu::agent::plan_section("msi_packages.list_inventory", r.entries,
+                                                   std::nullopt, false)})
+                        .blob,
+                    118);
 }
 
 TEST_CASE("msi_packages adapter: a pipe-bearing product survives the producer/collector round trip",
@@ -2036,7 +2020,7 @@ TEST_CASE("msi_packages adapter: a pipe-bearing product survives the producer/co
     std::string out;
     for (const auto& row : msi::render(inv))
         out += row + '\n';
-    const auto r = parse_msi_packages_list_inventory_output(out, kFailPolicy);
+    const auto r = parse_msi_packages_list_inventory_output(out);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 1);
     CHECK(r.entries[0].name == "Foo  Bar Agent");
@@ -2046,7 +2030,7 @@ TEST_CASE("msi_packages adapter: a pipe-bearing product survives the producer/co
 
 TEST_CASE("msi_packages adapter: the real Windows sample", "[sync][parse][adapter][msi_packages]") {
     const auto r = parse_msi_packages_list_inventory_output(
-        capture_section("msi_packages", "windows.txt", "list_inventory"), kFailPolicy);
+        capture_section("msi_packages", "windows.txt", "list_inventory"));
     REQUIRE(r.status == Status::ok);
     REQUIRE_FALSE(r.entries.empty());
     for (const auto& e : r.entries) {
@@ -2064,37 +2048,37 @@ TEST_CASE("msi_packages adapter: status grammar", "[sync][parse][adapter][msi_pa
     const auto status = [](std::string_view level, std::string_view tokens) {
         return "status|list_inventory|" + std::string{level} + "|" + std::string{tokens};
     };
-    SECTION("constrained fails (a partial roster would delete stored msi rows)") {
+    SECTION("constrained contributes no rows (a partial roster is never reported)") {
         const auto r = parse_msi_packages_list_inventory_output(
-            nl({status("constrained", "windows:msi_enum:1610"), row}), kFailPolicy);
-        CHECK(r.status == Status::failed);
+            nl({status("constrained", "windows:msi_enum:1610"), row}));
+        CHECK(r.status == Status::constrained);
+        CHECK(r.entries.empty());
         CHECK(r.reason == "windows:msi_enum:1610");
     }
     SECTION("unsupported on macOS and Linux") {
         for (const char* token : {"macos:owned_by_installed_apps", "linux:no_msi"}) {
             const auto r = parse_msi_packages_list_inventory_output(
-                nl({status("unsupported", token)}), kFailPolicy);
+                nl({status("unsupported", token)}));
             CHECK(r.status == Status::unsupported);
             CHECK(r.entries.empty());
         }
     }
     SECTION("no status row, another action's status row, empty input") {
-        CHECK(parse_msi_packages_list_inventory_output(nl({row}), kFailPolicy).status ==
+        CHECK(parse_msi_packages_list_inventory_output(nl({row})).status ==
               Status::failed);
-        CHECK(parse_msi_packages_list_inventory_output(nl({"status|packages|supported|-", row}),
-                                                       kFailPolicy)
+        CHECK(parse_msi_packages_list_inventory_output(nl({"status|packages|supported|-", row}))
                   .status == Status::failed);
-        CHECK(parse_msi_packages_list_inventory_output("", kFailPolicy).status == Status::failed);
+        CHECK(parse_msi_packages_list_inventory_output("").status == Status::failed);
     }
     SECTION("supported with zero rows is a legitimate answer") {
         const auto r =
-            parse_msi_packages_list_inventory_output(nl({status("supported", "-")}), kFailPolicy);
+            parse_msi_packages_list_inventory_output(nl({status("supported", "-")}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
     SECTION("two status rows fail") {
         CHECK(parse_msi_packages_list_inventory_output(
-                  nl({status("supported", "-"), status("supported", "-")}), kFailPolicy)
+                  nl({status("supported", "-"), status("supported", "-")}))
                   .status == Status::failed);
     }
 }
@@ -2106,41 +2090,38 @@ TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_package
         // MUTATION: split_tokens truncation to 5 would map the 6-token row.
         const auto r = parse_msi_packages_list_inventory_output(
             nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0", good + "|extra",
-                good + "|extra|more"}),
-            kFailPolicy);
+                good + "|extra|more"}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
     SECTION("an empty code is mapped with an empty package_id (the adapter invents no key)") {
-        const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, "inv||name|1|pub"}),
-                                                                kFailPolicy);
+        const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, "inv||name|1|pub"}));
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].package_id.empty());
     }
     SECTION("an empty name is seen but not mapped") {
         const auto r = parse_msi_packages_list_inventory_output(
-            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}||1|pub"}), kFailPolicy);
+            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}||1|pub"}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
     }
     SECTION("legacy list rows and product_codes rows are ignored") {
         const auto r = parse_msi_packages_list_inventory_output(
             nl({ok_status, "msi|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|-",
-                "product_code|{AAAAAAAA-0000-0000-0000-000000000001}|App", good}),
-            kFailPolicy);
+                "product_code|{AAAAAAAA-0000-0000-0000-000000000001}|App", good}));
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].name == "App");
     }
 }
 
-TEST_CASE("collector: msi_packages rows ride the extended tail and a constrained answer skips",
+TEST_CASE("collector: msi_packages rows carry package_id and source, and a constrained answer is status-only",
           "[sync][collector][msi_packages]") {
     SECTION("Windows-shaped run: msi records carry package_id and source, slots 13-14 stay empty") {
         fake_windows();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         std::size_t msi_records = 0;
-        for (const auto& rec : records_of(got->first)) {
+        for (const auto& rec : plus_records(got->first)) {
             const auto f = fields_of(rec);
             REQUIRE(f.size() == 16);
             if (f[15] != "msi_packages.list_inventory")
@@ -2155,27 +2136,36 @@ TEST_CASE("collector: msi_packages rows ride the extended tail and a constrained
         CHECK(msi_records == msi_sample_mapped_rows());
         CHECK(msi_records > 0);
     }
-    SECTION("a constrained enumeration skips the whole cycle with the named reason") {
+    SECTION("a constrained enumeration is a status-only section with the named reason") {
         fake_windows();
         g_fake[3].out["list_inventory"] =
             "status|list_inventory|constrained|windows:msi_enum:5\n"
             "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub\n";
-        auto src = make_installed_software_source(all_plugins());
-        REQUIRE(src.skip_reason);
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "msi_packages.list_inventory:windows:msi_enum:5");
+        const auto sec = section_of(all_plugins(), "msi_packages.list_inventory");
+        REQUIRE(sec.has_value());
+        CHECK(sec->status == "constrained");
+        CHECK(sec->token == "windows:msi_enum:5");
+        CHECK(sec->adds.empty());
+        // ...and the other facets are untouched.
+        const auto apps = section_of(all_plugins(), "installed_apps.list_inventory");
+        REQUIRE(apps.has_value());
+        CHECK(apps->status == "full");
     }
-    SECTION("macOS: the unsupported answer is skipped silently and the cycle collects") {
+    SECTION("macOS: the unsupported answer is not_collected and contributes no rows") {
         fake_mac();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
-        for (const auto& rec : records_of(got->first))
+        for (const auto& rec : plus_records(got->first))
             CHECK(fields_of(rec)[15] != "msi_packages.list_inventory");
+        const auto sec = section_of(all_plugins(), "msi_packages.list_inventory");
+        REQUIRE(sec.has_value());
+        CHECK(sec->status == "not_collected");
+        CHECK(sec->token == "unsupported");
     }
 }
 
-TEST_CASE("extended tail: an msi entry's package_id participates in the canonical blob",
-          "[sync][hash][extended_row][msi_packages]") {
+TEST_CASE("an msi entry's package_id participates in the section hash",
+          "[sync][hash][msi_packages]") {
     SwEntry with_id;
     with_id.name = "CMake";
     with_id.version = "4.3.4";
@@ -2186,12 +2176,11 @@ TEST_CASE("extended tail: an msi entry's package_id participates in the canonica
     with_id.source = "msi_packages.list_inventory";
     SwEntry without_id = with_id;
     without_id.package_id.clear();
-    CHECK(sha256_hex(installed_software_canonical_blob({with_id})) !=
-          sha256_hex(installed_software_canonical_blob({without_id})));
+    CHECK(yuzu::agent::v3_section_hash({with_id}) != yuzu::agent::v3_section_hash({without_id}));
     // Two products with the same name/version/publisher but different codes stay two rows.
     SwEntry other = with_id;
     other.package_id = "{B7526150-1C45-45B5-932D-A4CF5A23403D}";
-    CHECK(records_of(installed_software_canonical_blob({with_id, other})).size() == 2);
+    CHECK(yuzu::agent::v3_normalise_rows({with_id, other}).size() == 2);
 }
 
 TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence row",
@@ -2199,121 +2188,181 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
     fake_mac();
     const auto got = collect_with(all_plugins());
     REQUIRE(got.has_value());
-    const auto recs = records_of(got->first);
+    const auto recs = plus_records(got->first);
     CHECK(recs.size() == 393 + 70 + 1);
     const std::set<std::string> sources = {"installed_apps.list_inventory",
                                            "pkg_inventory.packages", "pkg_inventory.managers"};
-    std::vector<SwEntry> parsed;
     std::map<std::string, std::size_t> per_source;
     for (const auto& rec : recs) {
         const auto f = fields_of(rec);
         REQUIRE(f.size() == 16);
-        CHECK(f[12].empty());
         CHECK(f[13].empty());
         CHECK(sources.count(f[15]) == 1);
         ++per_source[f[15]];
-        SwEntry e;
-        e.name = f[0];
-        e.version = f[1];
-        e.publisher = f[2];
-        e.install_date = f[3];
-        e.kind = f[4];
-        e.ecosystem = f[5];
-        e.epoch = f[6];
-        e.release = f[7];
-        e.arch = f[8];
-        e.signature_status = f[9];
-        e.distro_id = f[10];
-        e.distro_version = f[11];
-        e.package_id = f[14];
-        e.source = f[15];
-        parsed.push_back(std::move(e));
     }
     CHECK(per_source["installed_apps.list_inventory"] == 393);
     CHECK(per_source["pkg_inventory.packages"] == 70);
     CHECK(per_source["pkg_inventory.managers"] == 1);
-    CHECK(installed_software_canonical_blob(parsed) == got->first); // sorted, stable
-    CHECK(got->second == sha256_hex(got->first));
+    // The claimed report hash is the v3 hash over the facets the call holds: one full section each
+    // (the unsupported ones are status-only and not held).
+    const auto secs = sections_of(got->first);
+    std::vector<std::pair<std::string, std::string>> held;
+    for (const auto& sec : secs) {
+        if (sec.status != "full")
+            continue;
+        held.emplace_back(sec.facet, yuzu::agent::v3_section_hash(entries_of(sec)));
+    }
+    CHECK(held.size() == 6); // apps, packages, managers and the three honest-empty runtimes facets
+    CHECK(got->second == yuzu::agent::v3_report_hash(held));
     check_blob_size(got->first, recs.size());
 }
 
-TEST_CASE("collector: an absent plugin is skipped", "[sync][collector]") {
+TEST_CASE("collector: an absent plugin is reported not_collected, the others are collected",
+          "[sync][collector]") {
     fake_mac();
     SyncPluginMap m = all_plugins();
     m.erase("pkg_inventory");
     m.erase("windows_optional_features");
     const auto got = collect_with(m);
     REQUIRE(got.has_value());
-    const auto recs = records_of(got->first);
+    const auto recs = plus_records(got->first);
     CHECK(recs.size() == 393);
     for (const auto& rec : recs)
         CHECK(fields_of(rec)[15] == "installed_apps.list_inventory");
+    const auto secs = sections_of(got->first);
+    for (const char* absent : {"pkg_inventory.managers", "pkg_inventory.packages",
+                               "pkg_inventory.store_packages", "windows_optional_features.list",
+                               "hardware.drivers_inventory"}) {
+        const V3Sec* s = find_sec(secs, absent);
+        REQUIRE(s != nullptr);
+        CHECK(s->status == "not_collected");
+        CHECK(s->token == "not_loaded");
+    }
 }
 
-TEST_CASE("collector: installed_apps absent idles the source (UP-IN6)", "[sync][collector]") {
+TEST_CASE("collector: installed_apps absent is its own not_collected section, not an idle source",
+          "[sync][collector]") {
+    // UP-IN6 used to idle the whole source because the other plugins' rows alone would have
+    // replaced the stored inventory. A status-only section deletes nothing, so the other facets
+    // are still reported.
     fake_mac();
     SyncPluginMap m = all_plugins();
     m.erase("installed_apps");
-    CHECK_FALSE(collect_with(m).has_value());
+    const auto got = collect_with(m);
+    REQUIRE(got.has_value());
+    const auto secs = sections_of(got->first);
+    const V3Sec* ia = find_sec(secs, "installed_apps.list_inventory");
+    REQUIRE(ia != nullptr);
+    CHECK(ia->status == "not_collected");
+    CHECK(ia->token == "not_loaded");
+    CHECK(find_sec(secs, "pkg_inventory.packages")->status == "full");
 }
 
-TEST_CASE("collector: one failing action skips the whole cycle", "[sync][collector]") {
-    SECTION("pkg_inventory rc != 0") {
+TEST_CASE("collector: a failing action is a status-only section, never a skipped report",
+          "[sync][collector]") {
+    const auto status_of = [](std::string_view facet) {
+        const auto s = section_of(all_plugins(), facet);
+        REQUIRE(s.has_value());
+        return std::make_pair(s->status, s->token);
+    };
+    using P = std::pair<std::string, std::string>;
+    SECTION("an action's non-zero rc") {
         fake_mac();
         g_fake[1].rc["packages"] = 1;
-        CHECK_FALSE(collect_with(all_plugins()).has_value());
+        CHECK(status_of("pkg_inventory.packages") == P{"constrained", "rc=1"});
+        // every other facet is collected beside it
+        CHECK(status_of("installed_apps.list_inventory").first == "full");
+        CHECK(status_of("pkg_inventory.managers").first == "full");
     }
-    SECTION("pkg_inventory constrained") {
+    SECTION("a constrained status row") {
         fake_mac();
         g_fake[1].out["packages"] =
             yuzu::shared::format_status_row("packages", yuzu::shared::StatusLevel::constrained,
                                             "macos:x") +
             "\n";
-        CHECK_FALSE(collect_with(all_plugins()).has_value());
+        CHECK(status_of("pkg_inventory.packages") == P{"constrained", "macos:x"});
     }
     SECTION("windows_optional_features unavailable") {
         fake_windows();
         g_fake[2].out["list"] =
             yuzu::wof::format_unavailable_row("list", "windows:dism:timeout") + "\n";
-        CHECK_FALSE(collect_with(all_plugins()).has_value());
+        CHECK(status_of("windows_optional_features.list") ==
+              P{"constrained", "windows:dism:timeout"});
+        CHECK(status_of("msi_packages.list_inventory").first == "full");
     }
-    SECTION("installed_apps empty while brew has rows (UP-IN6 per plugin)") {
+    SECTION("installed_apps empty is no_rows, never a deleting full (UP-IN6)") {
         fake_mac();
         g_fake[0].out["list_inventory"] = "";
-        CHECK_FALSE(collect_with(all_plugins()).has_value());
+        CHECK(status_of("installed_apps.list_inventory") == P{"constrained", "no_rows"});
+        CHECK(status_of("pkg_inventory.packages").first == "full");
+    }
+    SECTION("typed PARTIAL completeness, with the plugin's provenance as the token") {
+        fake_mac();
+        g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                               YUZU_RESULT_COMPLETENESS_PARTIAL, "x"};
+        CHECK(status_of("pkg_inventory.packages") == P{"constrained", "x"});
+        g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                               YUZU_RESULT_COMPLETENESS_PARTIAL, ""};
+        CHECK(status_of("pkg_inventory.packages") == P{"constrained", "partial"});
+    }
+    SECTION("an undeclared completeness (the fakes declare nothing) is collected; only PARTIAL degrades") {
+        fake_mac();
+        CHECK(status_of("installed_apps.list_inventory").first == "full");
     }
     SECTION("a truncated capture (rc 0, over the capture cap)") {
         fake_mac();
         // A first write the adapter accepts, then one write past kInventoryCaptureCap
-        // (3'670'016): the real capture path drops it and flags truncation, leaving a
-        // parseable prefix, so only the collector's truncation check can skip the cycle.
+        // (3'670'016): the real capture path drops it and flags truncation, leaving a parseable
+        // prefix, so only the collector's truncation check reports it.
         g_fake[1].out["packages"] = supported_status("packages") + "\n";
         g_fake[1].overflow["packages"] = std::string(3'700'000, 'x');
-        CHECK_FALSE(collect_with(all_plugins()).has_value());
+        CHECK(status_of("pkg_inventory.packages") == P{"constrained", "truncated"});
+    }
+    SECTION("an over-long reason is cut at the heartbeat bound in the section token") {
+        fake_windows();
+        g_fake[2].out["list"] =
+            yuzu::wof::format_unavailable_row("list", std::string(100, 'x')) + "\n";
+        const auto s = section_of(all_plugins(), "windows_optional_features.list");
+        REQUIRE(s.has_value());
+        CHECK(s->status == "constrained");
+        CHECK(s->token.size() == 64);
+    }
+    SECTION("an unsupported answer is not_collected") {
+        fake_windows();
+        CHECK(status_of("pkg_inventory.managers") == P{"not_collected", "unsupported"});
     }
 }
 
-TEST_CASE("collector: successful-empty answers are not failures", "[sync][collector]") {
+TEST_CASE("collector: successful-empty answers are honest-empty full sections",
+          "[sync][collector]") {
     fake_mac();
     const auto full = collect_with(all_plugins());
     REQUIRE(full.has_value());
 
-    SECTION("brew with no formulae and no managers: the apps stay") {
+    SECTION("brew with no formulae and no managers: the apps stay and the empty facets retire their rows") {
         g_fake[1].out["packages"] = supported_status("packages") + "\n";
         g_fake[1].out["managers"] = supported_status("managers") + "\n";
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
-        const auto recs = records_of(got->first);
+        const auto recs = plus_records(got->first);
         CHECK(recs.size() == 393);
         for (const auto& rec : recs)
             CHECK(fields_of(rec)[15] == "installed_apps.list_inventory");
+        const auto secs = sections_of(got->first);
+        // A zero-row FULL (not a status): the server retires the stored rows of the facet.
+        for (const char* facet : {"pkg_inventory.packages", "pkg_inventory.managers"}) {
+            const V3Sec* s = find_sec(secs, facet);
+            REQUIRE(s != nullptr);
+            CHECK(s->status == "full");
+            CHECK(s->adds.empty());
+        }
         CHECK(got->second != full->second);
     }
     SECTION("Windows: every feature is reported, enabled and disabled hash differently") {
         fake_windows();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
-        const auto recs = records_of(got->first);
+        const auto recs = plus_records(got->first);
         CHECK(recs.size() == 241 + 137 + msi_sample_mapped_rows());
         std::size_t disabled = 0;
         std::size_t enabled = 0;
@@ -2335,8 +2384,7 @@ TEST_CASE("collector: successful-empty answers are not failures", "[sync][collec
         on.version = "enabled";
         SwEntry off = on;
         off.version = "disabled";
-        CHECK(sha256_hex(installed_software_canonical_blob({on})) !=
-              sha256_hex(installed_software_canonical_blob({off})));
+        CHECK(yuzu::agent::v3_section_hash({on}) != yuzu::agent::v3_section_hash({off}));
     }
 }
 
@@ -2353,42 +2401,71 @@ TEST_CASE("collector: Windows-shaped run with the real captures", "[sync][collec
     }();
     const auto got = collect_with(all_plugins());
     REQUIRE(got.has_value());
-    CHECK(records_of(got->first).size() == 241 + 17 + msi_sample_mapped_rows());
+    CHECK(plus_records(got->first).size() == 241 + 17 + msi_sample_mapped_rows());
 }
 
-TEST_CASE("entry cap: the splitter reads one past kMaxEntries and the collector skips above it",
+TEST_CASE("entry cap: the splitter reads one past kMaxEntries; the collector reports oversize above it",
           "[sync][collector][cap]") {
     CHECK(parse_installed_apps_output(inv_lines(20001)).size() == 20001);
 
     reset_fakes();
     SyncPluginMap only_ia = {{"installed_apps", &kFakeIa}};
+    const auto ia = [&] { return section_of(only_ia, "installed_apps.list_inventory"); };
+
     g_fake[0].out["list_inventory"] = inv_lines(20001);
-    CHECK_FALSE(collect_with(only_ia).has_value());
+    {
+        const auto s = ia();
+        REQUIRE(s.has_value());
+        CHECK(s->status == "oversize");
+        CHECK(s->token == "rows=20001");
+        CHECK(s->adds.empty());
+    }
 
+    // 20000 rows of tiny names fit: a full section at the cap.
     g_fake[0].out["list_inventory"] = inv_lines(20000);
-    const auto got = collect_with(only_ia);
-    REQUIRE(got.has_value());
-    CHECK(records_of(got->first).size() == 20000);
+    {
+        const auto s = ia();
+        REQUIRE(s.has_value());
+        CHECK(s->status == "full");
+        CHECK(s->adds.size() == 20000);
+    }
 
-    // 20,001 RAW rows where one is an exact duplicate: the splitter stopped at the
-    // cap, so the deduped count (20,000) must not launder a truncated read.
+    // 20,001 RAW rows where one is an exact duplicate: the splitter stopped at the cap, so the
+    // deduped count (20,000) must not launder a truncated read.
     g_fake[0].out["list_inventory"] = inv_lines(20000) + "inv|n0|1|\n";
-    CHECK_FALSE(collect_with(only_ia).has_value());
+    {
+        const auto s = ia();
+        REQUIRE(s.has_value());
+        CHECK(s->status == "oversize");
+        CHECK(s->token == "rows=20001");
+    }
 
-    // Byte cap: the entry cap runs first, so the over-cap input stays <= 20,000
-    // rows and under the raw capture cap, but its canonical blob exceeds kMaxBlobBytes.
-    // 12,000 x 200 B names is proven under the cap by the test itself.
+    // Byte budget: 12,000 x 200 B names is under it (the test proves its own premise)...
     const std::string under = inv_lines(12000, 200);
-    CHECK(installed_software_canonical_blob(parse_installed_apps_output(under)).size() <
-          3u * 1024 * 1024);
+    {
+        const auto rows = parse_installed_apps_output(under);
+        const auto plan = yuzu::agent::plan_section("installed_apps.list_inventory", rows,
+                                                    std::nullopt, false);
+        CHECK(plan.full_bytes < yuzu::agent::kV3SectionByteBudget);
+    }
     g_fake[0].out["list_inventory"] = under;
-    REQUIRE(collect_with(only_ia).has_value());
-
-    // The capture itself must not be truncated (that would skip for the wrong reason).
+    {
+        const auto s = ia();
+        REQUIRE(s.has_value());
+        CHECK(s->status == "full");
+    }
+    // ...and 16,000 of them is over it with the capture itself untruncated (a status-only
+    // `oversize bytes=` section, never deferred, never split).
     const std::string over = inv_lines(16000, 200);
     CHECK(over.size() < 3'670'016); // kInventoryCaptureCap
     g_fake[0].out["list_inventory"] = over;
-    CHECK_FALSE(collect_with(only_ia).has_value());
+    {
+        const auto s = ia();
+        REQUIRE(s.has_value());
+        CHECK(s->status == "oversize");
+        CHECK(s->token.starts_with("bytes="));
+        CHECK(s->adds.empty());
+    }
 }
 
 // --- constrained managers, typed PARTIAL guard ---
@@ -2403,166 +2480,76 @@ std::string constrained_managers_with_present_row() {
 }
 } // namespace
 
-TEST_CASE("collector: constrained managers keeps a present row", "[sync][collector]") {
-    SECTION("present row: the cycle succeeds with one managers record") {
-        fake_mac();
-        g_fake[1].out["managers"] = constrained_managers_with_present_row();
-        const auto got = collect_with(all_plugins());
-        REQUIRE(got.has_value());
-        const auto recs = records_of(got->first);
-        CHECK(recs.size() == 393 + 70 + 1);
-        std::size_t managers = 0;
-        for (const auto& rec : recs)
-            if (fields_of(rec)[15] == "pkg_inventory.managers")
-                ++managers;
-        CHECK(managers == 1);
+TEST_CASE("collector: a constrained managers answer is status-only, even beside a present row",
+          "[sync][collector]") {
+    fake_mac();
+    g_fake[1].out["managers"] = constrained_managers_with_present_row();
+    const auto got = collect_with(all_plugins());
+    REQUIRE(got.has_value());
+    const auto secs = sections_of(got->first);
+    const V3Sec* m = find_sec(secs, "pkg_inventory.managers");
+    REQUIRE(m != nullptr);
+    CHECK(m->status == "constrained");
+    CHECK(m->token == "macos:homebrew_taps:permission_denied");
+    CHECK(m->adds.empty());
+    CHECK(plus_records(got->first).size() == 393 + 70); // no managers row
+    // The facet is not held: it is absent from the claimed report hash.
+    std::vector<std::pair<std::string, std::string>> held;
+    for (const auto& sec : secs) {
+        if (sec.status == "full")
+            held.emplace_back(sec.facet, yuzu::agent::v3_section_hash(entries_of(sec)));
     }
-    SECTION("only an unavailable row: skipped") {
-        fake_mac();
-        g_fake[1].out["managers"] =
-            nl({yuzu::shared::format_status_row("managers", yuzu::shared::StatusLevel::constrained,
-                                                "macos:homebrew_taps:permission_denied"),
-                pkg::format_manager_row(pkg::Manager::homebrew, pkg::Presence::unavailable, "",
-                                        "/usr/local", "-",
-                                        "macos:homebrew_cellar:permission_denied")});
-        CHECK_FALSE(collect_with(all_plugins()).has_value());
-    }
+    CHECK(got->second == yuzu::agent::v3_report_hash(held));
 }
 
-TEST_CASE("pkg_inventory adapters: constrained managers with a present row is ok and carries "
-          "its reason",
-          "[sync][parse][adapter]") {
-    const std::string token = "macos:homebrew_taps:permission_denied";
-    const auto m =
-        parse_pkg_inventory_managers_output(constrained_managers_with_present_row(), kKeepPolicy);
-    CHECK(m.status == AdaptedRows::Status::ok);
-    CHECK(m.entries.size() == 1);
-    CHECK(m.reason == token);
-}
-
-// The skip on a typed PARTIAL is pinned in the skip_reason case below (collect() is nullopt with
-// the `:partial` token); this case pins the paths that must NOT skip.
-TEST_CASE("collector: typed completeness - FULL collected; an opted-in PARTIAL accepted; in-band "
-          "unsupported wins",
+TEST_CASE("collector: typed completeness - FULL and an undeclared answer collect; PARTIAL does not; "
+          "in-band unsupported wins",
           "[sync][collector]") {
     constexpr auto kPartial = YUZU_RESULT_COMPLETENESS_PARTIAL;
     SECTION("packages OK/FULL: collected") {
         fake_mac();
         g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_OK,
                                                YUZU_RESULT_COMPLETENESS_FULL, ""};
-        CHECK(collect_with(all_plugins()).has_value());
+        CHECK(section_of(all_plugins(), "pkg_inventory.packages")->status == "full");
     }
-    SECTION("managers CONSTRAINED/PARTIAL with a present row: opt-in accepts") {
+    SECTION("managers CONSTRAINED/PARTIAL with a present row: no opt-in, status-only") {
         fake_mac();
         g_fake[1].out["managers"] = constrained_managers_with_present_row();
         g_fake[1].result_status["managers"] = {YUZU_RESULT_STATUS_CONSTRAINED, kPartial, "x"};
-        CHECK(collect_with(all_plugins()).has_value());
+        CHECK(section_of(all_plugins(), "pkg_inventory.managers")->status == "constrained");
     }
     SECTION("in-band unsupported wins over UNAVAILABLE/PARTIAL (WOF on mac)") {
         fake_mac();
         g_fake[2].result_status["list"] = {YUZU_RESULT_STATUS_UNAVAILABLE, kPartial, "r"};
-        const auto got = collect_with(all_plugins());
-        REQUIRE(got.has_value());
-        CHECK(records_of(got->first).size() == 393 + 70 + 1);
+        const auto s = section_of(all_plugins(), "windows_optional_features.list");
+        REQUIRE(s.has_value());
+        CHECK(s->status == "not_collected");
+        CHECK(s->token == "unsupported");
     }
 }
 
-TEST_CASE("collector: installed_software carries the 01:00-05:00 local nightly window",
+TEST_CASE("collector: installed_software carries the 01:00-05:00 local nightly window and no skip ladder",
           "[sync][collector][window]") {
     // The only place the window is set: every other source keeps a plain 24 h phase slot.
     fake_mac();
-    const auto src = make_installed_software_source(all_plugins());
-    REQUIRE(src.window);
-    CHECK(src.window->start_min == 60);
-    CHECK(src.window->end_min == 300);
-}
-
-TEST_CASE("collector: skip_reason names the cause of each skip and clears on success",
-          "[sync][collector]") {
-    fake_mac();
-    auto src = make_installed_software_source(all_plugins());
-    CHECK(src.skip_backoff);
-    REQUIRE(src.skip_reason);
-    SECTION("an action's non-zero rc") {
-        g_fake[1].rc["packages"] = 1;
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "pkg_inventory.packages:rc=1");
-        g_fake[1].rc.clear();
-        CHECK(src.collect().has_value());
-        CHECK(src.skip_reason() == "");
-    }
-    SECTION("the anchor plugin absent") {
-        SyncPluginMap m = all_plugins();
-        m.erase("installed_apps");
-        auto s2 = make_installed_software_source(std::move(m));
-        CHECK_FALSE(s2.collect().has_value());
-        CHECK(s2.skip_reason() == "installed_apps:not_loaded");
-    }
-    SECTION("an adapter failure reason") {
-        fake_windows();
-        g_fake[2].out["list"] =
-            yuzu::wof::format_unavailable_row("list", "windows:dism:timeout") + "\n";
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "windows_optional_features.list:windows:dism:timeout");
-    }
-    SECTION("typed PARTIAL completeness") {
-        g_fake[1].result_status["packages"] = {YUZU_RESULT_STATUS_CONSTRAINED,
-                                               YUZU_RESULT_COMPLETENESS_PARTIAL, "x"};
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "pkg_inventory.packages:partial");
-    }
-    SECTION("the anchor emits no rows") {
-        // The anchor adapter fails an empty listing ("an empty parse is a plugin
-        // hiccup, not everything uninstalled"), before the merged no-rows check.
-        g_fake[0].out["list_inventory"] = "";
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "installed_apps.list_inventory:no inv rows");
-    }
-    SECTION("a truncated capture") {
-        // A parseable first write, then one past kInventoryCaptureCap (3'670'016).
-        g_fake[1].out["packages"] = supported_status("packages") + "\n";
-        g_fake[1].overflow["packages"] = std::string(3'700'000, 'x');
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "pkg_inventory.packages:truncated");
-    }
-    SECTION("one action reads more than kMaxEntries raw rows") {
-        g_fake[0].out["list_inventory"] = inv_lines(20001);
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "installed_apps.list_inventory:row_cap");
-    }
-    SECTION("the merged inventory exceeds kMaxEntries") {
-        // Each action is under the raw-row cap (12,000 applications, 9,000 formulae); the
-        // merge (plus the managers presence row) is over it.
-        g_fake[0].out["list_inventory"] = inv_lines(12000);
-        std::string formulae = supported_status("packages") + "\n";
-        for (int i = 0; i < 9000; ++i)
-            formulae += pkg::format_package_row("f" + std::to_string(i), "1.0",
-                                                pkg::PackageKind::formula) + "\n";
-        g_fake[1].out["packages"] = formulae;
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "installed_software:entry_cap");
-    }
-    SECTION("an over-long adapter reason is cut at the heartbeat bound") {
-        fake_windows();
-        g_fake[2].out["list"] =
-            yuzu::wof::format_unavailable_row("list", std::string(100, 'x')) + "\n";
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason().size() == 64);
-        CHECK(src.skip_reason().starts_with("windows_optional_features.list:"));
-    }
-    SECTION("the canonical blob exceeds kMaxBlobBytes") {
-        g_fake[0].out["list_inventory"] = inv_lines(16000, 200);
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "installed_software:blob_cap");
-    }
+    const Collector c(all_plugins());
+    REQUIRE(c.src.window);
+    CHECK(c.src.window->start_min == 60);
+    CHECK(c.src.window->end_min == 300);
+    // A v3 collect always produces a report (a failing facet is a section), so there is no skip
+    // to back off from; the four hooks are what the scheduler drives.
+    CHECK_FALSE(c.src.skip_backoff);
+    CHECK(c.src.on_force_full);
+    CHECK(c.src.wants_blob);
+    CHECK(c.src.on_ack);
+    CHECK(c.src.has_more);
 }
 
 // --- Adapter characterisation: the whole observable result of each status-row adapter ---
 //
 // Every cell asserts the whole observable result of an adapter: status, reason, entry count and
-// ALL fourteen fields of every entry. The cells reach the adapters only through the four binders
-// below, so the way the constrained policy reaches an adapter is the binders' concern alone and
-// the expectations stay put. Status rows are written as raw text (not through a formatter) so
+// ALL fifteen fields of every entry. The cells reach the adapters only through the four binders
+// below, so how an adapter is bound is the binders' concern alone and the expectations stay put. Status rows are written as raw text (not through a formatter) so
 // they are independent of the producer.
 
 namespace {
@@ -2571,7 +2558,8 @@ std::string show_entry(const SwEntry& e) {
     std::string s;
     for (const std::string* f : {&e.name, &e.version, &e.publisher, &e.install_date, &e.kind,
                                  &e.ecosystem, &e.epoch, &e.release, &e.arch, &e.signature_status,
-                                 &e.distro_id, &e.distro_version, &e.package_id, &e.source}) {
+                                 &e.distro_id, &e.distro_version, &e.install_location, &e.package_id,
+                                 &e.source}) {
         s += *f;
         s += ',';
     }
@@ -2581,7 +2569,7 @@ std::string show_entry(const SwEntry& e) {
 std::string show(const AdaptedRows& r) {
     std::string s = r.status == Status::ok            ? "ok"
                     : r.status == Status::unsupported ? "unsupported"
-                    : r.status == Status::withheld    ? "withheld"
+                    : r.status == Status::constrained ? "constrained"
                                                       : "failed";
     s += "|reason=" + r.reason + "|n=" + std::to_string(r.entries.size());
     for (const auto& e : r.entries)
@@ -2631,16 +2619,16 @@ std::string crlf(std::string s) {
 
 // The four binders: the ONLY place the cells touch an adapter.
 AdaptedRows bind_managers(const std::string& s) {
-    return parse_pkg_inventory_managers_output(s, kKeepPolicy);
+    return parse_pkg_inventory_managers_output(s);
 }
 AdaptedRows bind_packages(const std::string& s) {
-    return parse_pkg_inventory_packages_output(s, kFailPolicy);
+    return parse_pkg_inventory_packages_output(s);
 }
 AdaptedRows bind_store(const std::string& s) {
-    return parse_pkg_inventory_store_packages_output(s, kFailPolicy);
+    return parse_pkg_inventory_store_packages_output(s);
 }
 AdaptedRows bind_msi(const std::string& s) {
-    return parse_msi_packages_list_inventory_output(s, kFailPolicy);
+    return parse_msi_packages_list_inventory_output(s);
 }
 
 struct Grammar {
@@ -2650,7 +2638,6 @@ struct Grammar {
     SwEntry entry;
     std::string unmapped;        // a row that is SEEN but maps to nothing
     std::string notseen;         // a row of the wrong shape: neither seen nor mapped
-    bool keeps_constrained_rows; // managers: a constrained answer keeps its rows iff one was seen
 };
 
 // Every status-grammar cell, shared by the four adapters that read `status|<action>|...`.
@@ -2678,28 +2665,17 @@ void check_status_matrix(const Grammar& g) {
     CHECK(run({st(g.action, "unsupported", "linux:no_such"), g.mapped}) == res("unsupported", ""));
     CHECK(run({st(g.action, "unsupported", "t|extra"), g.mapped}) == res("unsupported", ""));
 
-    // constrained: field 4 is the reason
-    if (g.keeps_constrained_rows) {
-        CHECK(run({st(g.action, "constrained", "tok"), g.mapped}) == res("ok", "tok", {g.entry}));
-        CHECK(run({st(g.action, "constrained", "tok|extra"), g.mapped}) ==
-              res("ok", "tok", {g.entry}));
-        CHECK(show(g.bind(crlf(nl({st(g.action, "constrained", "tok"), g.mapped})))) ==
-              res("ok", "tok", {g.entry}));
-        // seen-but-unmapped counts as evidence the read worked
-        CHECK(run({st(g.action, "constrained", "tok"), g.unmapped}) == res("ok", "tok"));
-    } else {
-        CHECK(run({st(g.action, "constrained", "tok"), g.mapped}) == res("failed", "tok"));
-        CHECK(run({st(g.action, "constrained", "tok|extra"), g.mapped}) == res("failed", "tok"));
-        CHECK(show(g.bind(crlf(nl({st(g.action, "constrained", "tok"), g.mapped})))) ==
-              res("failed", "tok"));
-        CHECK(run({st(g.action, "constrained", "tok"), g.unmapped}) == res("failed", "tok"));
-    }
-    // zero rows, or only rows that are not even seen, fail on every adapter
-    CHECK(run({st(g.action, "constrained", "tok")}) == res("failed", "tok"));
-    CHECK(run({st(g.action, "constrained", "tok"), g.notseen}) == res("failed", "tok"));
+    // constrained: field 4 is the reason, and no row of the answer is ever taken
+    CHECK(run({st(g.action, "constrained", "tok"), g.mapped}) == res("constrained", "tok"));
+    CHECK(run({st(g.action, "constrained", "tok|extra"), g.mapped}) == res("constrained", "tok"));
+    CHECK(show(g.bind(crlf(nl({st(g.action, "constrained", "tok"), g.mapped})))) ==
+          res("constrained", "tok"));
+    CHECK(run({st(g.action, "constrained", "tok"), g.unmapped}) == res("constrained", "tok"));
+    CHECK(run({st(g.action, "constrained", "tok")}) == res("constrained", "tok"));
+    CHECK(run({st(g.action, "constrained", "tok"), g.notseen}) == res("constrained", "tok"));
     // an escaped pipe in a status token is cut at the raw split (format escapes, parse does not)
     CHECK(run({"status|" + g.action + "|constrained|a\\|b", g.mapped}) ==
-          (g.keeps_constrained_rows ? res("ok", "a\\", {g.entry}) : res("failed", "a\\")));
+          res("constrained", "a\\"));
 
     // bad status: zero or two counted status rows, a short row, an unknown level
     const std::string bad = res("failed", "bad status");
@@ -2741,8 +2717,7 @@ TEST_CASE("characterisation: packages", "[sync][characterisation][adapter]") {
               "package|homebrew|wget|1.24|formula",
               entry_of("wget", "1.24", "", "pkg", "brew"),
               "package|homebrew|mystery|1.0|bogus",
-              "package|homebrew|onlythree",
-              false};
+              "package|homebrew|onlythree"};
     check_status_matrix(g);
 
     const auto run = [](std::initializer_list<std::string> lines) {
@@ -2776,15 +2751,10 @@ TEST_CASE("characterisation: packages", "[sync][characterisation][adapter]") {
         CHECK(r.entries[0].name == std::string(1024, 'n'));
         CHECK(r.entries[0].version == std::string(1024, 'v'));
     }
-    SECTION("only keep_rows_if_present_seen keeps a constrained answer's rows") {
-        // A scoped enum admits values that are neither enumerator; keeping rows is the opt-in,
-        // so an out-of-range policy fails closed even though a mapped row was seen.
+    SECTION("a constrained answer carries its token and none of its rows") {
         const auto out =
             nl({st("packages", "constrained", "tok"), "package|homebrew|wget|1.24|formula"});
-        CHECK(show(parse_pkg_inventory_packages_output(out, kKeepPolicy)) ==
-              res("ok", "tok", {entry_of("wget", "1.24", "", "pkg", "brew")}));
-        CHECK(show(parse_pkg_inventory_packages_output(out, static_cast<ConstrainedPolicy>(9))) ==
-              res("failed", "tok"));
+        CHECK(show(parse_pkg_inventory_packages_output(out)) == res("constrained", "tok"));
     }
 }
 
@@ -2794,8 +2764,7 @@ TEST_CASE("characterisation: store_packages", "[sync][characterisation][adapter]
               "package|snap|btop|1.4.7|app|1073|-|-|active",
               entry_of("btop", "1.4.7", "", "app", "snap", "", "1073"),
               "package|snap|btop|1|app|1|-|-|inactive",
-              "package|snap|btop|1|app|1|-|-",
-              false};
+              "package|snap|btop|1|app|1|-|-"};
     check_status_matrix(g);
 
     const auto run = [](std::initializer_list<std::string> lines) {
@@ -2820,9 +2789,9 @@ TEST_CASE("characterisation: store_packages", "[sync][characterisation][adapter]
         CHECK(run({sup, "package|homebrew|a|1|app|1|-|-|active"}) == res("ok", ""));
         CHECK(run({sup, "package|snap|a|1|app|1|-|-|unknown"}) == res("ok", ""));
         CHECK(run({sup, "package|snap||1|app|1|-|-|active"}) == res("ok", ""));
-        // a constrained answer still fails: the policy for this action is fail whatever was seen
+        // a constrained answer is status-only whatever was seen
         CHECK(run({st("store_packages", "constrained", "tok"),
-                   "package|homebrew|a|1|app|1|-|-|active"}) == res("failed", "tok"));
+                   "package|homebrew|a|1|app|1|-|-|active"}) == res("constrained", "tok"));
     }
     SECTION("over-wide and short rows are dropped, not truncated") {
         CHECK(run({sup, "package|snap|a|1|app|1|-|-|active|extra"}) == res("ok", ""));
@@ -2836,8 +2805,7 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
               "manager|homebrew|present|-|/opt/homebrew|-|-",
               entry_of("homebrew", "", "Homebrew", "app", "brew"),
               "manager|snap|present|2.60|/|-|-",
-              "manager|homebrew|present|-|/opt/homebrew|-",
-              true};
+              "manager|homebrew|present|-|/opt/homebrew|-"};
     check_status_matrix(g);
 
     const auto run = [](std::initializer_list<std::string> lines) {
@@ -2858,25 +2826,23 @@ TEST_CASE("characterisation: managers", "[sync][characterisation][adapter]") {
             const std::string row = std::string("manager|") + m + "|present|1.0|/|-|-";
             INFO(m);
             CHECK(run({sup, row}) == res("ok", ""));
-            CHECK(run({st("managers", "constrained", "tok"), row}) == res("ok", "tok"));
+            CHECK(run({st("managers", "constrained", "tok"), row}) == res("constrained", "tok"));
         }
-        // a dropped manager next to a mapped one: only the mapped one is an entry
+        // a dropped manager next to a mapped one: constrained takes neither
         CHECK(run({st("managers", "constrained", "tok"), "manager|snap|present|1|/|-|-", hb}) ==
-              res("ok", "tok", {entry_of("homebrew", "4.1", "Homebrew", "app", "brew")}));
+              res("constrained", "tok"));
     }
     SECTION("an unavailable manager is neither seen nor mapped") {
         const std::string un =
             "manager|homebrew|unavailable|-|/usr/local|-|macos:homebrew_cellar:permission_denied";
         CHECK(run({sup, un}) == res("ok", ""));
-        CHECK(run({st("managers", "constrained", "tok"), un}) == res("failed", "tok"));
+        CHECK(run({st("managers", "constrained", "tok"), un}) == res("constrained", "tok"));
         CHECK(run({st("managers", "constrained", "tok"), un, "manager|snap|present|1|/|-|-"}) ==
-              res("ok", "tok"));
-        CHECK(run({st("managers", "constrained", "tok"), "manager|homebrew|bogus|-|/|-|-"}) ==
-              res("failed", "tok"));
+              res("constrained", "tok"));
     }
     SECTION("over-wide rows are dropped, not truncated") {
         CHECK(run({sup, hb + "|extra"}) == res("ok", ""));
-        CHECK(run({st("managers", "constrained", "tok"), hb + "|extra"}) == res("failed", "tok"));
+        CHECK(run({st("managers", "constrained", "tok"), hb + "|extra"}) == res("constrained", "tok"));
     }
     SECTION("supported keeps no reason, whatever field 4 holds") {
         CHECK(run({st("managers", "supported", "tok|more"), hb}) ==
@@ -2895,8 +2861,7 @@ TEST_CASE("characterisation: msi list_inventory",
               "inv|" + code + "|App|1.0|Pub",
               entry_of("App", "1.0", "Pub", "pkg", "msi", code),
               "inv|" + code + "||1.0|Pub",
-              "inv|" + code + "|App|1.0",
-              false};
+              "inv|" + code + "|App|1.0"};
     check_status_matrix(g);
 
     const auto run = [](std::initializer_list<std::string> lines) {
@@ -2922,134 +2887,136 @@ TEST_CASE("characterisation: msi list_inventory",
     }
 }
 
-// Collector level: the whole blob, pinned. The blob is hashed byte-identically on agent and
-// server (ADR-0016), so any movement here is a one-sided change. Re-measure ONLY on a sample
-// recapture, the same rule as the record counts above.
+// Collector level: the section hashes of each committed plugin sample, pinned, plus the report
+// hash. A section hash is hashed byte-identically on agent and server (ADR-0016), so any
+// movement here is a one-sided change (the cross-side vectors themselves are pinned in
+// test_installed_software_v3.cpp). Re-measure ONLY on a sample recapture, the same rule as the
+// record counts above.
 //
 // Every row carries a non-empty publisher (a declared vendor, else `via:<ecosystem>`), so the
-// digests below include it. The SwEntry fixture cross-pins (kCrossPinHash and the extended /
-// tail-order / mixed-blob pins) are independent of the fallback, which is applied in the
-// collector, not in installed_software_canonical_blob.
-TEST_CASE("characterisation: collector blob digests are byte-pinned",
+// digests include it. The macOS and Linux values were measured on a macOS host. The Windows leg
+// compiles different adapters (the python vendor column, the three pkg_inventory collectors,
+// DISM), so its pins are measured on the Windows leg.
+namespace {
+std::map<std::string, std::string> section_hashes_of(const std::string& blob) {
+    std::map<std::string, std::string> out;
+    for (const auto& sec : sections_of(blob)) {
+        if (sec.status == "full")
+            out[sec.facet] = yuzu::agent::v3_section_hash(entries_of(sec));
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("characterisation: collector section digests are byte-pinned",
           "[sync][characterisation][collector]") {
-    constexpr const char* kMac = "64e09c0cdc2fb0011487b2d423db2301c3488c59068cbb16c2ab63bb153da631";
-    constexpr const char* kWindows =
-        "d9d4a2681b82bd7513fb57068d327be30db77a09677da1e11aa8daeaf2776ee5";
-    constexpr const char* kLinuxManagers =
-        "fe4b1ba29b6c0e31d42ed519ece8ac674818a6b1ab423acf6f4854735f667d17";
-    const auto digest = [](const char* what) {
+    const auto digests = [](const char* what) {
         const auto got = collect_with(all_plugins());
         INFO(what);
         REQUIRE(got.has_value());
-        CHECK(sha256_hex(got->first) == got->second);
-        return got->second;
+        return std::make_pair(section_hashes_of(got->first), got->second);
+    };
+    constexpr const char* kEmpty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    // The three runtimes facets answer a clean, empty read in every sample-shaped run: an
+    // honest-empty FULL section each (the server retires the stored rows of a facet it holds).
+    const auto check_empty_runtimes = [&](const std::map<std::string, std::string>& hashes) {
+        for (const char* f : {"runtimes.python", "runtimes.dotnet", "runtimes.jvm"})
+            CHECK(hashes.at(f) == kEmpty);
     };
     SECTION("Mac-shaped run") {
         fake_mac();
-        CHECK(digest("mac") == kMac);
+        const auto [hashes, report] = digests("mac");
+        REQUIRE(hashes.size() == 6);
+        CHECK(hashes.at("installed_apps.list_inventory") == "0fd2f99dae065cffe3253f3e555bb97a2e826bfc530e8421854bd08bd32ca4a5");
+        CHECK(hashes.at("pkg_inventory.packages") == "7c8fbeeb6502b712034ab6ae188287e60a3d33d919d41265ca698b0277fbb685");
+        CHECK(hashes.at("pkg_inventory.managers") == "e3131d004316be18633e1e86d3d625fe525ccbe1b8a78b221f0aae3f700adcae");
+        check_empty_runtimes(hashes);
+        CHECK(report == "v3:4a0432236dee712f773bd400c1334d8bbe6fb4407276d084709da4e7c24c6484");
     }
+#if defined(_WIN32)
     SECTION("Windows-shaped run") {
+        // TODO(gate 4, kingsley): measure the Windows-leg digests on the Windows run; the macOS
+        // host cannot produce them (different adapters compile in) and they are NOT guessed here.
         fake_windows();
-        CHECK(digest("windows") == kWindows);
+        const auto [hashes, report] = digests("windows");
+        REQUIRE(hashes.size() == 6);
+        CHECK_FALSE(report.empty());
     }
-    SECTION("Mac-shaped run with a constrained managers answer that keeps its present row") {
+#else
+    SECTION("Windows-shaped run (the capture-fed facets; the Windows-leg digests are measured on kingsley)") {
+        fake_windows();
+        const auto [hashes, report] = digests("windows");
+        REQUIRE(hashes.size() == 6);
+        CHECK(hashes.at("installed_apps.list_inventory") == "eb1a5ae4dcf7738cb9746fd534a72b3b0feb19f643fdd36377a4564ffb93d553");
+        CHECK(hashes.at("windows_optional_features.list") == "0087ac29fe70cd0b85a5cd15c0a9127fb03794965f04a88164d8536b30afdd23");
+        CHECK(hashes.at("msi_packages.list_inventory") == "3ca14b8682e50625f4600008641bb936aa6ecf63fa28cdc51a176feb0351a1cc");
+        check_empty_runtimes(hashes);
+        CHECK(report == "v3:4925e695c1dec23c5bcc73dfef7c69b42adc1b84ae2df66b7594442a2ad498c9");
+    }
+#endif
+    SECTION("a constrained managers answer drops only the managers facet from the report") {
         fake_mac();
+        const auto base = digests("mac");
         g_fake[1].out["managers"] = constrained_managers_with_present_row();
-        // Same digest as the Mac-shaped run: the kept present row maps to the one homebrew
-        // record the capture already carries, so the constrained answer must not move a byte.
-        CHECK(digest("mac+constrained managers") == kMac);
-    }
-    SECTION("Linux-shaped managers answer: present dpkg/apt rows under a constrained status") {
-        fake_mac();
-        g_fake[1].out["managers"] =
-            nl({st("managers", "constrained", "linux:apt_sources_d:permission_denied"),
-                "manager|dpkg|present|1.22|/|-|-", "manager|apt|present|2.7|/|-|-"});
-        CHECK(digest("mac+linux managers") == kLinuxManagers);
+        const auto got = digests("mac+constrained managers");
+        CHECK(got.first.size() == 5);
+        CHECK(got.first.count("pkg_inventory.managers") == 0);
+        for (const char* f : {"installed_apps.list_inventory", "pkg_inventory.packages"})
+            CHECK(got.first.at(f) == base.first.at(f)); // untouched byte for byte
+        CHECK(got.second != base.second);
     }
 }
 
-TEST_CASE("characterisation: collector skip reasons per status mix",
+TEST_CASE("characterisation: collector section statuses per status mix",
           "[sync][characterisation][collector]") {
     struct Case {
         int fake;
         const char* plugin;
         const char* action;
-        bool windows;       // which sample set the other actions come from
-        const char* mapped; // a valid row the action maps; empty for managers (they keep it)
-        bool withholds = false; // table policy drop_source: constrained withholds the rows, not the cycle
-        bool keeps = false;     // keep_rows_if_present_seen: a constrained answer WITH a mapped row keeps it
+        bool windows; // which sample set the other actions come from
     };
-    const Case cases[] = {
-        {1, "pkg_inventory", "packages", false, "package|homebrew|wget|1.24|formula"},
-        {1, "pkg_inventory", "store_packages", false,
-         "package|snap|btop|1.4.7|app|1073|-|-|active"},
-        {1, "pkg_inventory", "managers", false, ""},
-        {3, "msi_packages", "list_inventory", true,
-         "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub"},
-        {4, "runtimes", "python", false, "python|cpython|3.14.6|C:/P/|PythonCore", true},
-        {4, "runtimes", "dotnet", false, "dotnet|runtime|8.0.33|C:/Program Files/dotnet/|Microsoft", false,
-         true},
-        {4, "runtimes", "jvm", false, "jvm|jdk|21.0.12.1|C:/Program Files/Microsoft/jdk-21.0.12.101-hotspot/|Microsoft", false,
-         true}};
+    const Case cases[] = {{1, "pkg_inventory", "packages", false},
+                          {1, "pkg_inventory", "store_packages", false},
+                          {1, "pkg_inventory", "managers", false},
+                          {3, "msi_packages", "list_inventory", true},
+                          {4, "runtimes", "python", false},
+                          {4, "runtimes", "dotnet", false},
+                          {4, "runtimes", "jvm", false}};
+    using P = std::pair<std::string, std::string>;
     for (const auto& c : cases) {
         INFO(c.plugin << "." << c.action);
         const std::string source = std::string(c.plugin) + "." + c.action;
-        const auto setup = [&] {
-            c.windows ? fake_windows() : fake_mac();
-        };
-        const auto skip_with = [&](const std::string& output) {
-            setup();
-            g_fake[c.fake].out[c.action] = output;
-            auto src = make_installed_software_source(all_plugins());
-            const bool collected = src.collect().has_value();
-            return std::make_pair(collected, src.skip_reason());
-        };
         const std::string a = c.action;
-        // What a constrained answer does to the cycle, per the action table's `constrained` column:
-        // fail skips it with the status token as the reason; drop_source (runtimes.python) lets it
-        // continue with only that source's rows withheld (the collector-level case in the
-        // runtimes.python test below pins the rows).
-        const auto constrained_outcome = c.withholds ? std::make_pair(true, std::string{})
-                                                     : std::make_pair(false, source + ":tok");
-        // constrained with no data row
-        CHECK(skip_with(nl({st(a, "constrained", "tok")})) == constrained_outcome);
-        // constrained with a row of the wrong shape: the same outcome
-        CHECK(skip_with(nl({st(a, "constrained", "tok"), "garbage|row"})) == constrained_outcome);
-        // constrained with a row the adapter MAPS: the same outcome, so the action table's
-        // `constrained` column is what is pinned, not just the zero-row fallback.
-        // Managers is the one action that keeps such a cycle (cases below).
-        if (c.mapped[0] != '\0') {
-            CHECK(skip_with(nl({st(a, "constrained", "tok"), c.mapped})) ==
-                  (c.keeps ? std::make_pair(true, std::string{}) : constrained_outcome));
-        }
+        const auto with = [&](const std::string& output) {
+            c.windows ? fake_windows() : fake_mac();
+            g_fake[c.fake].out[c.action] = output;
+            const auto s = section_of(all_plugins(), source);
+            REQUIRE(s.has_value());
+            return P{s->status, s->token};
+        };
+        // A constrained answer is a status-only section with the status token, with or without a
+        // row, and with a row of the wrong shape: the rows of an incomplete read are never used.
+        CHECK(with(nl({st(a, "constrained", "tok")})) == P{"constrained", "tok"});
+        CHECK(with(nl({st(a, "constrained", "tok"), "garbage|row"})) == P{"constrained", "tok"});
         // zero, two, short and mis-levelled status rows
-        CHECK(skip_with("") == std::make_pair(false, source + ":bad status"));
-        CHECK(skip_with(nl({"status|" + a + "|supported"})) ==
-              std::make_pair(false, source + ":bad status"));
-        CHECK(skip_with(nl({st(a, "supported", "-"), st(a, "supported", "-")})) ==
-              std::make_pair(false, source + ":bad status"));
-        CHECK(skip_with(nl({st(a, "wrong", "-")})) ==
-              std::make_pair(false, source + ":bad status"));
-        // unsupported is silently skipped (the cycle succeeds, nothing recorded as a skip)
-        CHECK(skip_with(nl({st(a, "unsupported", "tok")})) == std::make_pair(true, std::string{}));
-        // supported with zero rows is a legitimate answer
-        CHECK(skip_with(nl({st(a, "supported", "-")})) == std::make_pair(true, std::string{}));
+        CHECK(with("") == P{"constrained", "bad_status"});
+        CHECK(with(nl({"status|" + a + "|supported"})) == P{"constrained", "bad_status"});
+        CHECK(with(nl({st(a, "supported", "-"), st(a, "supported", "-")})) ==
+              P{"constrained", "bad_status"});
+        CHECK(with(nl({st(a, "wrong", "-")})) == P{"constrained", "bad_status"});
+        // unsupported is reported not_collected
+        CHECK(with(nl({st(a, "unsupported", "tok")})) == P{"not_collected", "unsupported"});
+        // supported with zero rows is a legitimate answer: an honest-empty full section
+        CHECK(with(nl({st(a, "supported", "-")})) == P{"full", ""});
     }
-    SECTION("managers: a constrained answer with only a present, unmapped row keeps the cycle") {
+    SECTION("managers: a constrained answer naming only an unmapped present row is still constrained") {
         fake_mac();
         g_fake[1].out["managers"] =
             nl({st("managers", "constrained", "tok"), "manager|dpkg|present|1.0|/|-|-"});
-        auto src = make_installed_software_source(all_plugins());
-        CHECK(src.collect().has_value());
-        CHECK(src.skip_reason().empty());
-    }
-    SECTION("managers: a constrained answer with only an unavailable row skips") {
-        fake_mac();
-        g_fake[1].out["managers"] =
-            nl({st("managers", "constrained", "tok"), "manager|homebrew|unavailable|-|/|-|why"});
-        auto src = make_installed_software_source(all_plugins());
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "pkg_inventory.managers:tok");
+        const auto s = section_of(all_plugins(), "pkg_inventory.managers");
+        REQUIRE(s.has_value());
+        CHECK(s->status == "constrained");
+        CHECK(s->token == "tok");
     }
 }
 
@@ -3089,26 +3056,25 @@ TEST_CASE("manager-ecosystem table: each row maps through its own action only",
                   res("ok", ""));
         }
     }
-    SECTION("a dropped manager still counts as seen under a constrained managers answer") {
+    SECTION("a constrained managers answer is status-only whatever manager it names") {
         for (const char* m : {"snap", "flatpak", "dpkg"}) {
             CHECK(show(bind_managers(nl({st("managers", "constrained", "tok"),
                                          std::string("manager|") + m + "|present|1|/|-|-"}))) ==
-                  res("ok", "tok"));
+                  res("constrained", "tok"));
         }
     }
 }
 
 // runtimes.python through the COLLECTOR (the adapter cases below call the parser directly): the
-// table row is what wires the plugin in, so removing it, or flipping its ConstrainedPolicy away
-// from drop_source, turns a section here red.
-TEST_CASE("collector: runtimes.python contributes sourced rows, a constrained Python read withholds "
-          "only them and a PARTIAL one aborts the cycle",
+// table row is what wires the plugin in, so removing it turns a section here red.
+TEST_CASE("collector: runtimes.python contributes sourced rows; a constrained or PARTIAL Python read "
+          "is status-only and costs only its own facet",
           "[sync][collector][runtimes]") {
     const std::string python_row =
         "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python";
     const auto python_records = [](const std::string& blob) {
         std::size_t n = 0;
-        for (const auto& rec : records_of(blob)) {
+        for (const auto& rec : plus_records(blob)) {
             const auto f = fields_of(rec);
             REQUIRE(f.size() == 16);
             // Every record sourced runtimes.python is a python-ecosystem Python entry, and back.
@@ -3127,7 +3093,7 @@ TEST_CASE("collector: runtimes.python contributes sourced rows, a constrained Py
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 1);
-        CHECK(records_of(got->first).size() == 393 + 70 + 1 + 1);
+        CHECK(plus_records(got->first).size() == 393 + 70 + 1 + 1);
     }
     SECTION("escaped pipes in the free-text fields do not cost the sourced row") {
         // Built by the real producer: vendor and install_path go through safe_output_field, so a
@@ -3144,41 +3110,43 @@ TEST_CASE("collector: runtimes.python contributes sourced rows, a constrained Py
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 1);
-        CHECK(records_of(got->first).size() == 393 + 70 + 1 + 1);
+        CHECK(plus_records(got->first).size() == 393 + 70 + 1 + 1);
     }
     SECTION("a clean empty read contributes nothing and does not skip the cycle") {
         fake_mac();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 0);
-        CHECK(records_of(got->first).size() == 393 + 70 + 1);
+        CHECK(plus_records(got->first).size() == 393 + 70 + 1);
     }
-    SECTION("a constrained status withholds the python rows only, even one that carries a row") {
+    SECTION("a constrained status reports the python facet status-only, even one that carries a row") {
         fake_mac();
         g_fake[4].out["python"] =
             nl({st("python", "constrained", "linux:runtimes:permission_denied"), python_row});
-        // The real leg also types the answer CONSTRAINED + PARTIAL (runtimes_legs.hpp emit_read):
-        // the withheld verdict must win over the PARTIAL skip, which would cost the whole cycle.
+        // The real leg also types the answer CONSTRAINED + PARTIAL (runtimes_legs.hpp emit_read).
         g_fake[4].result_status["python"] = {YUZU_RESULT_STATUS_CONSTRAINED,
                                              YUZU_RESULT_COMPLETENESS_PARTIAL,
                                              "linux:runtimes:permission_denied"};
-        auto src = make_installed_software_source(all_plugins());
-        REQUIRE(src.skip_reason);
-        const auto got = src.collect();
-        REQUIRE(got.has_value()); // the cycle continues
-        CHECK(src.skip_reason().empty());
+        const auto got = collect_with(all_plugins());
+        REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 0);
-        CHECK(records_of(got->first).size() == 393 + 70 + 1); // every other source's rows survive
+        CHECK(plus_records(got->first).size() == 393 + 70 + 1); // every other source's rows survive
+        const auto secs = sections_of(got->first);
+        const V3Sec* py = find_sec(secs, "runtimes.python");
+        REQUIRE(py != nullptr);
+        CHECK(py->status == "constrained");
+        CHECK(py->token == "linux:runtimes:permission_denied");
     }
-    SECTION("a supported status with typed PARTIAL completeness skips the cycle") {
+    SECTION("a supported status with typed PARTIAL completeness is constrained, with the provenance") {
         fake_mac();
         g_fake[4].out["python"] = nl({supported_status("python"), python_row});
         g_fake[4].result_status["python"] = {YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                              "x"};
-        auto src = make_installed_software_source(all_plugins());
-        REQUIRE(src.skip_reason);
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "runtimes.python:partial");
+        const auto s = section_of(all_plugins(), "runtimes.python");
+        REQUIRE(s.has_value());
+        CHECK(s->status == "constrained");
+        CHECK(s->token == "x");
+        CHECK(s->adds.empty());
     }
 }
 
@@ -3194,8 +3162,7 @@ TEST_CASE("runtimes python adapter: real-capture rows map to Python / app / pyth
         nl({"status|python|supported|-",
             "python|unmodelled|3.11|/usr/bin/python3.11|-",
             "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python",
-            "python|cpython|3.14.6|C:/Python314/|PythonCore"}),
-        kFailPolicy, /*vendor_column_is_vendor=*/true);
+            "python|cpython|3.14.6|C:/Python314/|PythonCore"}), /*vendor_column_is_vendor=*/true);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 3);
     const char* versions[] = {"3.11", "3.13.1", "3.14.6"};
@@ -3216,7 +3183,7 @@ TEST_CASE("runtimes python adapter: macOS ignores the vendor column (a bundle id
                          "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python",
                          "python|cpython|3.12.4|/opt/py|Some Vendor"});
     SECTION("vendor column is an identifier: publisher stays empty for the via:python label") {
-        const auto r = parse_runtimes_python_output(out, kFailPolicy, /*vendor_column_is_vendor=*/false);
+        const auto r = parse_runtimes_python_output(out, /*vendor_column_is_vendor=*/false);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 2);
         CHECK(r.entries[0].version == "3.13.1");
@@ -3224,7 +3191,7 @@ TEST_CASE("runtimes python adapter: macOS ignores the vendor column (a bundle id
         CHECK(r.entries[1].publisher.empty());
     }
     SECTION("vendor column is a vendor (Windows, Linux): read as the publisher") {
-        const auto r = parse_runtimes_python_output(out, kFailPolicy, /*vendor_column_is_vendor=*/true);
+        const auto r = parse_runtimes_python_output(out, /*vendor_column_is_vendor=*/true);
         REQUIRE(r.entries.size() == 2);
         CHECK(r.entries[0].publisher == "org.python.python");
         CHECK(r.entries[1].publisher == "Some Vendor");
@@ -3243,7 +3210,7 @@ TEST_CASE("runtimes python adapter: rows built by the producer round-trip throug
     // Pin the wire form the adapter has to read, so a producer change shows up here.
     REQUIRE(row == "python|cpython|3.13.1|C:/Python\\|313/|org.python\\|custom");
     SECTION("one piped vendor and path: one entry, version unchanged") {
-        const auto r = parse_runtimes_python_output(nl({"status|python|supported|-", row}), kFailPolicy,
+        const auto r = parse_runtimes_python_output(nl({"status|python|supported|-", row}),
                                                     /*vendor_column_is_vendor=*/true);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
@@ -3254,7 +3221,7 @@ TEST_CASE("runtimes python adapter: rows built by the producer round-trip throug
     SECTION("more escaped pipes than the split width still read as five logical fields") {
         rec.vendor = "a|b|c|d|e|f|g|h|i|j|k|l";
         const auto r = parse_runtimes_python_output(
-            nl({"status|python|supported|-", yuzu::runtimes::python_row(rec)}), kFailPolicy,
+            nl({"status|python|supported|-", yuzu::runtimes::python_row(rec)}),
             /*vendor_column_is_vendor=*/true);
         REQUIRE(r.status == Status::ok);
         REQUIRE(r.entries.size() == 1);
@@ -3268,8 +3235,7 @@ TEST_CASE("runtimes python adapter: `-` version is empty; malformed rows are dro
     using Status = AdaptedRows::Status;
     const auto r = parse_runtimes_python_output(
         nl({"status|python|supported|-", "python|unmodelled|-|/usr/bin/python3.x|-",
-            "python|cpython|3.1|/p", "jvm|jdk|17|/x|-", "python|cpython|3.2|/p|v|extra"}),
-        kFailPolicy, /*vendor_column_is_vendor=*/true);
+            "python|cpython|3.1|/p", "jvm|jdk|17|/x|-", "python|cpython|3.2|/p|v|extra"}), /*vendor_column_is_vendor=*/true);
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 1);
     CHECK(r.entries[0].version.empty());
@@ -3280,43 +3246,32 @@ TEST_CASE("runtimes python adapter: `-` version is empty; malformed rows are dro
 TEST_CASE("runtimes python adapter: status grammar decides the answer", "[sync][parse][adapter][runtimes]") {
     using Status = AdaptedRows::Status;
     // No status row, or one for another action: bad status.
-    CHECK(parse_runtimes_python_output(nl({"python|cpython|3.14.6|C:/P/|PythonCore"}), kFailPolicy,
+    CHECK(parse_runtimes_python_output(nl({"python|cpython|3.14.6|C:/P/|PythonCore"}),
                                        /*vendor_column_is_vendor=*/true)
               .status == Status::failed);
-    CHECK(parse_runtimes_python_output(nl({"status|jvm|supported|-"}), kFailPolicy,
+    CHECK(parse_runtimes_python_output(nl({"status|jvm|supported|-"}),
                                        /*vendor_column_is_vendor=*/true)
               .status == Status::failed);
-    // constrained under the table row's drop_source policy: status withheld, zero entries even
-    // though a row was present, reason = the status tokens (what the collector logs).
+    // constrained: zero entries even though a row was present, reason = the status tokens.
     const auto w = parse_runtimes_python_output(
         nl({"status|python|constrained|linux:runtimes:permission_denied",
-            "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
-        ConstrainedPolicy::drop_source, /*vendor_column_is_vendor=*/true);
-    CHECK(show(w) == res("withheld", "linux:runtimes:permission_denied"));
-    // the adapter still honours an explicit fail policy
-    const auto c = parse_runtimes_python_output(
-        nl({"status|python|constrained|linux:runtimes:permission_denied",
-            "python|unmodelled|3.11|/usr/bin/python3.11|-"}),
-        ConstrainedPolicy::fail, /*vendor_column_is_vendor=*/true);
-    CHECK(c.status == Status::failed);
-    CHECK(c.reason == "linux:runtimes:permission_denied");
+            "python|unmodelled|3.11|/usr/bin/python3.11|-"}), /*vendor_column_is_vendor=*/true);
+    CHECK(show(w) == res("constrained", "linux:runtimes:permission_denied"));
     // unsupported is skipped with no entries.
-    const auto u = parse_runtimes_python_output(nl({"status|python|unsupported|macos:planned"}), kFailPolicy,
+    const auto u = parse_runtimes_python_output(nl({"status|python|unsupported|macos:planned"}),
                                                 /*vendor_column_is_vendor=*/true);
     CHECK(u.status == Status::unsupported);
     CHECK(u.entries.empty());
 }
 
-// --- middleware (SAM.2): the generic product adapter, ConstrainedPolicy::drop_source ---
+// --- middleware (SAM.2): the generic product adapter ---
 
 namespace {
-constexpr ConstrainedPolicy kDropPolicy = ConstrainedPolicy::drop_source;
-
 // REAL-CAPTURE-shaped row (IBM MQ 9.4.5.0 registered install; the leg reports VRM, 9.4.5):
 // <id>|<title>|<name>|<version or ->|<install_path>|<edition or ->
 constexpr const char* kMqRow = "ibm_mq|IBM MQ|Installation1|9.4.5|/opt/mqm|-";
 
-AdaptedRows bind_mq(const std::string& s) { return parse_middleware_output(s, "ibm_mq", kDropPolicy); }
+AdaptedRows bind_mq(const std::string& s) { return parse_middleware_output(s, "ibm_mq"); }
 
 SyncPluginMap with_middleware() {
     SyncPluginMap m = all_plugins();
@@ -3326,7 +3281,7 @@ SyncPluginMap with_middleware() {
 
 std::size_t count_source(const std::string& blob, std::string_view source) {
     std::size_t n = 0;
-    for (const auto& rec : records_of(blob))
+    for (const auto& rec : plus_records(blob))
         if (fields_of(rec)[15] == source)
             ++n;
     return n;
@@ -3356,9 +3311,9 @@ TEST_CASE("middleware adapter: a row maps to the product table's entry",
 TEST_CASE("middleware adapter: an action that is not in the product table fails",
           "[sync][parse][adapter][middleware]") {
     CHECK(show(parse_middleware_output(nl({st("nope", "supported", "-"), "nope|IBM MQ|n|1|/p|-"}),
-                                       "nope", kDropPolicy)) ==
+                                       "nope")) ==
           res("failed", "unknown middleware product"));
-    CHECK(show(parse_middleware_output("", "", kDropPolicy)) ==
+    CHECK(show(parse_middleware_output("", "")) ==
           res("failed", "unknown middleware product"));
 }
 
@@ -3374,11 +3329,9 @@ TEST_CASE("middleware adapter: a row is accepted only when its title equals the 
         CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), bad, good, bad}))) ==
               res("ok", "", {entry_of("IBM MQ", "9.4.5", "IBM", "app", "ibm_mq")}));
         CHECK(show(bind_mq(nl({st("ibm_mq", "supported", "-"), bad}))) == res("ok", ""));
-        // dropped rows are COUNTED (seen, not mapped): under keep_rows_if_present_seen a
-        // constrained answer holding only such rows is kept, not failed
-        CHECK(show(parse_middleware_output(nl({st("ibm_mq", "constrained", "tok"), bad}), "ibm_mq",
-                                           ConstrainedPolicy::keep_rows_if_present_seen)) ==
-              res("ok", "tok"));
+        // a constrained answer is status-only whatever rows it holds
+        CHECK(show(parse_middleware_output(nl({st("ibm_mq", "constrained", "tok"), bad}), "ibm_mq")) ==
+              res("constrained", "tok"));
     }
 }
 
@@ -3394,7 +3347,7 @@ TEST_CASE("middleware adapter: an escaped pipe in a free-text field is one field
               .entries.empty());
 }
 
-TEST_CASE("middleware adapter: status grammar and row shape and the drop_source policy",
+TEST_CASE("middleware adapter: status grammar and row shape",
           "[sync][parse][adapter][middleware]") {
     const std::string bad = res("failed", "bad status");
     // bad or missing status fails the cycle (it is not a constrained answer)
@@ -3408,14 +3361,14 @@ TEST_CASE("middleware adapter: status grammar and row shape and the drop_source 
     // unsupported: skipped silently, zero entries, no reason
     CHECK(show(bind_mq(nl({st("ibm_mq", "unsupported", "macos:planned"), kMqRow}))) ==
           res("unsupported", ""));
-    // constrained under drop_source: zero entries, reason = the tokens, status withheld --
-    // with rows, without rows, and with a row the adapter would not even see
+    // constrained: zero entries, reason = the tokens -- with rows, without rows, and with a row the
+    // adapter would not even see
     const std::string tok = "linux:middleware:mqinst_ini:permission_denied";
-    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok), kMqRow}))) == res("withheld", tok));
-    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok)}))) == res("withheld", tok));
-    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok), "garbage"}))) == res("withheld", tok));
+    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok), kMqRow}))) == res("constrained", tok));
+    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok)}))) == res("constrained", tok));
+    CHECK(show(bind_mq(nl({st("ibm_mq", "constrained", tok), "garbage"}))) == res("constrained", tok));
     CHECK(show(bind_mq(crlf(nl({st("ibm_mq", "constrained", tok), kMqRow})))) ==
-          res("withheld", tok));
+          res("constrained", tok));
     // row shape: only exactly six tokens with this action's tag are rows
     const std::string r = kMqRow;
     CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), r + "|extra"})).entries.empty()); // 7 tokens
@@ -3423,23 +3376,18 @@ TEST_CASE("middleware adapter: status grammar and row shape and the drop_source 
     CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), "oracle" + r.substr(6)})).entries.empty());
     // over-wide rows (more than the splitter's ten tokens) are rejected, never truncated
     CHECK(bind_mq(nl({st("ibm_mq", "supported", "-"), r + "|1|2|3|4|5|6|7"})).entries.empty());
-    // the policy is the only difference: the same constrained answer fails under `fail`
-    CHECK(show(parse_middleware_output(nl({st("ibm_mq", "constrained", "tok"), kMqRow}), "ibm_mq",
-                                       kFailPolicy)) == res("failed", "tok"));
 }
 
-TEST_CASE("collector: middleware.ibm_mq publishes its mapped fields; a withheld one contributes "
-          "nothing and the cycle continues",
+TEST_CASE("collector: middleware.ibm_mq publishes its mapped fields; a constrained one is status-only",
           "[sync][collector][middleware]") {
     SECTION("a supported answer publishes IBM MQ with source middleware.ibm_mq") {
         fake_windows();
         g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
-        auto src = make_installed_software_source(with_middleware());
-        const auto got = src.collect();
+        const auto got = collect_with(with_middleware());
         REQUIRE(got.has_value());
         CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
         CHECK(count_source(got->first, "msi_packages.list_inventory") > 0);
-        for (const auto& rec : records_of(got->first)) {
+        for (const auto& rec : plus_records(got->first)) {
             const auto f = fields_of(rec);
             if (f[15] != "middleware.ibm_mq")
                 continue;
@@ -3450,92 +3398,108 @@ TEST_CASE("collector: middleware.ibm_mq publishes its mapped fields; a withheld 
             CHECK(f[5] == "ibm_mq");
         }
     }
-    SECTION("a constrained answer is withheld: the blob equals the no-middleware baseline") {
+    SECTION("a constrained answer is status-only: no middleware rows, the rest unchanged") {
         fake_windows();
-        const auto baseline = collect_with(all_plugins());
+        const auto baseline = collect_with(with_middleware());
         REQUIRE(baseline.has_value());
         g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "constrained", "linux:middleware:mqinst_ini:permission_denied"),
                                       kMqRow});
-        // the typed answer a constrained read carries; a withheld source never reaches the
-        // PARTIAL check, so the cycle is not skipped for it
         g_fake[5].result_status["ibm_mq"] = {YUZU_RESULT_STATUS_CONSTRAINED,
                                              YUZU_RESULT_COMPLETENESS_PARTIAL,
                                              "linux:middleware:mqinst_ini:permission_denied"};
-        auto src = make_installed_software_source(with_middleware());
-        const auto got = src.collect();
+        const auto got = collect_with(with_middleware());
         REQUIRE(got.has_value());
-        CHECK(got->second == baseline->second); // identical hash: nothing from middleware
-        CHECK(got->first == baseline->first);
-        REQUIRE(src.skip_reason);
-        CHECK(src.skip_reason().empty());
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+        const auto secs = sections_of(got->first);
+        const V3Sec* mq = find_sec(secs, "middleware.ibm_mq");
+        REQUIRE(mq != nullptr);
+        CHECK(mq->status == "constrained");
+        CHECK(mq->token == "linux:middleware:mqinst_ini:permission_denied");
+        // The other facets are byte-identical to a run where middleware answered nothing.
+        for (const char* f : {"installed_apps.list_inventory", "msi_packages.list_inventory"})
+            CHECK(section_hashes_of(got->first).at(f) == section_hashes_of(baseline->first).at(f));
     }
-    SECTION("an unsupported answer contributes nothing and the cycle continues") {
+    SECTION("an unsupported answer is not_collected and contributes nothing") {
         fake_windows();
-        const auto baseline = collect_with(all_plugins());
-        REQUIRE(baseline.has_value());
         g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "unsupported", "macos:planned")});
         const auto got = collect_with(with_middleware());
         REQUIRE(got.has_value());
-        CHECK(got->first == baseline->first);
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
+        CHECK(find_sec(sections_of(got->first), "middleware.ibm_mq")->status == "not_collected");
     }
-    SECTION("a failing source still skips the cycle beside a healthy middleware") {
+    SECTION("a failing source beside a healthy middleware costs only itself") {
         fake_windows();
         g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
         g_fake[3].out["list_inventory"] = "status|list_inventory|constrained|windows:msi_enum:5\n";
-        auto src = make_installed_software_source(with_middleware());
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "msi_packages.list_inventory:windows:msi_enum:5");
+        const auto got = collect_with(with_middleware());
+        REQUIRE(got.has_value());
+        const auto secs = sections_of(got->first);
+        CHECK(find_sec(secs, "msi_packages.list_inventory")->status == "constrained");
+        CHECK(find_sec(secs, "msi_packages.list_inventory")->token == "windows:msi_enum:5");
+        CHECK(find_sec(secs, "middleware.ibm_mq")->status == "full");
+        CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
     }
-    SECTION("a malformed middleware status is a failure and not a withheld source") {
+    SECTION("a malformed middleware status is constrained bad_status") {
         fake_windows();
         g_fake[5].out["ibm_mq"] = nl({kMqRow}); // no status row
-        auto src = make_installed_software_source(with_middleware());
-        CHECK_FALSE(src.collect().has_value());
-        CHECK(src.skip_reason() == "middleware.ibm_mq:bad status");
+        const auto s = section_of(with_middleware(), "middleware.ibm_mq");
+        REQUIRE(s.has_value());
+        CHECK(s->status == "constrained");
+        CHECK(s->token == "bad_status");
     }
-    SECTION("a middleware rc != 0 skips the cycle") {
+    SECTION("a middleware rc != 0 is constrained rc=1") {
         fake_windows();
         g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-")});
         g_fake[5].rc["ibm_mq"] = 1;
-        CHECK_FALSE(collect_with(with_middleware()).has_value());
+        const auto s = section_of(with_middleware(), "middleware.ibm_mq");
+        REQUIRE(s.has_value());
+        CHECK(s->status == "constrained");
+        CHECK(s->token == "rc=1");
     }
 }
 
-TEST_CASE("collector: populated -> constrained -> recovered middleware cycles",
+TEST_CASE("collector: populated -> constrained -> recovered middleware passes (one source, acked)",
           "[sync][collector][middleware]") {
-    // Each cycle replaces the agent's whole stored inventory server-side, so a constrained cycle
-    // must publish the no-middleware blob (the IBM MQ rows go away) and recovery must restore it.
+    // Under v3 a constrained pass does not remove the rows: the facet's acked set is erased on the
+    // status-only ack (the server keeps its rows, shown unconfirmed) and recovery sends a FULL
+    // section that re-confirms them.
     fake_windows();
-    const auto baseline = collect_with(all_plugins());
-    REQUIRE(baseline.has_value());
-    // No log assertions: the collector lives in libyuzu_agent_core, whose spdlog registry is a
-    // separate image from this binary's on macOS (test_log_capture.hpp, #3355), so a capture here
-    // would pass or fail by platform. The withheld status and reason are pinned at the adapter
-    // level above (parse_middleware_output); this case pins the published blob.
-    const auto populated = [] {
-        g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
-        g_fake[5].result_status.erase("ibm_mq");
+    Collector c(with_middleware());
+    const auto facet = std::string("middleware.ibm_mq");
+    // By value: the section vector is a temporary, so a returned pointer into it would dangle.
+    const auto sec_of = [&](const std::string& blob) {
+        const auto secs = sections_of(blob);
+        const V3Sec* s = find_sec(secs, facet);
+        return s ? std::optional<V3Sec>(*s) : std::nullopt;
     };
 
-    populated();
-    const auto c1 = collect_with(with_middleware());
+    g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+    const auto c1 = c.collect_forced();
     REQUIRE(c1.has_value());
-    CHECK(count_source(c1->first, "middleware.ibm_mq") == 1);
-    CHECK(c1->second != baseline->second);
+    REQUIRE(sec_of(c1->first).has_value());
+    CHECK(sec_of(c1->first)->status == "full");
+    CHECK(sec_of(c1->first)->adds.size() == 1);
+    c.ack();
 
-    g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "constrained", "linux:middleware:mqinst_ini:permission_denied")});
-    const auto c2 = collect_with(with_middleware());
+    c.pass_cooldown();
+    g_fake[5].out["ibm_mq"] =
+        nl({st("ibm_mq", "constrained", "linux:middleware:mqinst_ini:permission_denied")});
+    const auto c2 = c.collect();
     REQUIRE(c2.has_value());
+    REQUIRE(sec_of(c2->first).has_value());
+    CHECK(sec_of(c2->first)->status == "constrained");
     CHECK(count_source(c2->first, "middleware.ibm_mq") == 0);
-    CHECK(c2->second == baseline->second);
-    CHECK(c2->first == baseline->first);
-    CHECK(count_source(c2->first, "msi_packages.list_inventory") > 0); // the other sources stayed
+    CHECK(c2->second != c1->second); // the facet left the held set
+    c.ack();
 
-    populated();
-    const auto c3 = collect_with(with_middleware());
+    c.pass_cooldown();
+    g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+    const auto c3 = c.collect();
     REQUIRE(c3.has_value());
-    CHECK(c3->second == c1->second);
-    CHECK(c3->first == c1->first);
+    REQUIRE(sec_of(c3->first).has_value());
+    CHECK(sec_of(c3->first)->status == "full"); // never a delta after a status-only ack
+    CHECK(sec_of(c3->first)->base.empty());
+    CHECK(c3->second == c1->second);            // held again: the same report hash
 }
 
 // --- the REAL runner's output through the collector (data faults keep their siblings) ---
@@ -3577,8 +3541,6 @@ constexpr const char* kGoodStanza = "Installation:\n   Name=Installation1\n   Fi
 TEST_CASE("collector: a malformed mqinst.ini stanza beside a valid one still publishes IBM MQ",
           "[sync][collector][middleware]") {
     fake_windows();
-    const auto baseline = collect_with(all_plugins());
-    REQUIRE(baseline.has_value());
     const std::string denied = "linux:middleware:mqinst_ini:permission_denied";
 
     SECTION("a dropped stanza and a valid sibling: supported, the sibling's row is published") {
@@ -3586,22 +3548,21 @@ TEST_CASE("collector: a malformed mqinst.ini stanza beside a valid one still pub
         fs.ini = {mwr::Read::Outcome::ok, std::string{kBrokenStanza} + kGoodStanza};
         const std::string out = run_ibm_mq(fs);
         REQUIRE(out.starts_with("status|ibm_mq|supported|-\n"));
-        // the adapter keeps the answer (not withheld) and maps the one row
+        // the adapter keeps the answer (supported) and maps the one row
         CHECK(show(bind_mq(out)) == res("ok", "", {entry_of("IBM MQ", "", "IBM", "app", "ibm_mq")}));
 
         g_fake[5].out["ibm_mq"] = out; // no typed status: the leg declares OK/FULL
         const auto got = collect_with(with_middleware());
         REQUIRE(got.has_value());
         CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
-        CHECK(got->second != baseline->second);
     }
-    SECTION("every stanza dropped: constrained, malformed, withheld (never an empty supported)") {
+    SECTION("every stanza dropped: constrained, malformed (never an empty supported)") {
         MwFakeFs fs;
         fs.ini = {mwr::Read::Outcome::ok, kBrokenStanza};
         const std::string out = run_ibm_mq(fs);
         const std::string token = "linux:middleware:mqinst_ini:malformed";
         REQUIRE(out == "status|ibm_mq|constrained|" + token + "\n");
-        CHECK(show(bind_mq(out)) == res("withheld", token));
+        CHECK(show(bind_mq(out)) == res("constrained", token));
 
         g_fake[5].out["ibm_mq"] = out;
         g_fake[5].result_status["ibm_mq"] = {YUZU_RESULT_STATUS_CONSTRAINED,
@@ -3609,14 +3570,14 @@ TEST_CASE("collector: a malformed mqinst.ini stanza beside a valid one still pub
         const auto got = collect_with(with_middleware());
         REQUIRE(got.has_value());
         CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
-        CHECK(got->second == baseline->second);
+        CHECK(find_sec(sections_of(got->first), "middleware.ibm_mq")->status == "constrained");
     }
-    SECTION("positive control: a permission fault on the same file still withholds the source") {
+    SECTION("positive control: a permission fault on the same file is status-only too") {
         MwFakeFs fs;
         fs.ini = {mwr::Read::Outcome::denied, {}};
         const std::string out = run_ibm_mq(fs);
         REQUIRE(out == "status|ibm_mq|constrained|" + denied + "\n");
-        CHECK(show(bind_mq(out)) == res("withheld", denied));
+        CHECK(show(bind_mq(out)) == res("constrained", denied));
 
         g_fake[5].out["ibm_mq"] = out;
         g_fake[5].result_status["ibm_mq"] = {YUZU_RESULT_STATUS_CONSTRAINED,
@@ -3624,7 +3585,7 @@ TEST_CASE("collector: a malformed mqinst.ini stanza beside a valid one still pub
         const auto got = collect_with(with_middleware());
         REQUIRE(got.has_value());
         CHECK(count_source(got->first, "middleware.ibm_mq") == 0);
-        CHECK(got->second == baseline->second);
+        CHECK(find_sec(sections_of(got->first), "middleware.ibm_mq")->status == "constrained");
     }
 }
 
@@ -3665,10 +3626,10 @@ TEST_CASE("middleware adapter and collector: a leg row built from NUL-bearing in
     CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
 }
 
-TEST_CASE("collector: one drop_source source withheld does not touch the other",
+TEST_CASE("collector: one constrained source does not touch the other",
           "[sync][collector][runtimes][middleware]") {
-    // python and ibm_mq both withhold on a CONSTRAINED answer (each its own `continue` in the
-    // collector loop). Withholding one must leave the other's rows in the blob, in both directions.
+    // python and ibm_mq are each their own section: constraining one leaves the other's rows in
+    // the blob, in both directions.
     const std::string python_row = "python|cpython|3.13.1|/Library/Frameworks/Python.framework/Versions/3.13|org.python.python";
     const std::string tok = "linux:middleware:mqinst_ini:permission_denied";
     const auto constrain = [](std::size_t slot, const char* action, const std::string& token) {
@@ -3676,7 +3637,7 @@ TEST_CASE("collector: one drop_source source withheld does not touch the other",
                                               YUZU_RESULT_COMPLETENESS_PARTIAL, token};
     };
 
-    SECTION("python withheld, ibm_mq kept") {
+    SECTION("python constrained, ibm_mq kept") {
         fake_mac();
         g_fake[4].out["python"] = nl({st("python", "constrained", "linux:runtimes:permission_denied"), python_row});
         constrain(4, "python", "linux:runtimes:permission_denied");
@@ -3686,7 +3647,7 @@ TEST_CASE("collector: one drop_source source withheld does not touch the other",
         CHECK(count_source(got->first, "runtimes.python") == 0);
         CHECK(count_source(got->first, "middleware.ibm_mq") == 1);
     }
-    SECTION("ibm_mq withheld, python kept") {
+    SECTION("ibm_mq constrained, python kept") {
         fake_mac();
         g_fake[4].out["python"] = nl({supported_status("python"), python_row});
         g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "constrained", tok), kMqRow});
@@ -3700,36 +3661,33 @@ TEST_CASE("collector: one drop_source source withheld does not touch the other",
 
 // --- runtimes dotnet / jvm adapters (SAM-32) ---
 
-TEST_CASE("runtimes dotnet and jvm: a constrained answer keeps its rows, and with none never deletes",
-          "[sync][parse][adapter][runtimes]") {
+TEST_CASE("runtimes dotnet and jvm adapters: a constrained answer contributes no rows",
+          "[sync][parse][adapter][runtimes][collector]") {
     using Status = AdaptedRows::Status;
     const std::string tok = "windows:runtimes:jvm:release_unreadable";
-    // Constrained WITH a row: the row is kept (status ok, reason = the token).
+    // Constrained WITH a row: the row is NOT taken (a status-only section; the server keeps the
+    // stored rows and reads them unconfirmed).
     CHECK(show(parse_runtimes_jvm_output(
-              nl({st("jvm", "constrained", tok), "jvm|jdk|17|/x|Acme"}), kKeepPolicy)) ==
-          res("ok", tok, {entry_of("Java JDK", "17", "Acme", "app", "jvm")}));
+              nl({st("jvm", "constrained", tok), "jvm|jdk|17|/x|Acme"}))) == res("constrained", tok));
     CHECK(show(parse_runtimes_dotnet_output(
-              nl({st("dotnet", "constrained", tok), "dotnet|runtime|8.0.1|/p|Microsoft"}),
-              kKeepPolicy)) ==
-          res("ok", tok, {entry_of(".NET Runtime", "8.0.1", "Microsoft", "app", "dotnet")}));
-    // Constrained with NO row: failed (the collector skips the cycle, so stored rows stay), never
-    // withheld (which would delete them) and never an ok-and-empty answer.
+              nl({st("dotnet", "constrained", tok), "dotnet|runtime|8.0.1|/p|Microsoft"}))) ==
+          res("constrained", tok));
     for (const char* a : {"jvm", "dotnet"}) {
         const auto parse = std::string(a) == "jvm" ? parse_runtimes_jvm_output
                                                    : parse_runtimes_dotnet_output;
         for (const auto& out : {nl({st(a, "constrained", tok)}),
                                 nl({st(a, "constrained", tok), "garbage|row"})}) {
-            const auto r = parse(out, kKeepPolicy);
-            CHECK(r.status == Status::failed);
+            const auto r = parse(out);
+            CHECK(r.status == Status::constrained);
             CHECK(r.entries.empty());
             CHECK(r.reason == tok);
         }
     }
 }
 
-TEST_CASE("collector: a constrained dotnet/jvm answer keeps its rows; with none the cycle is skipped",
+TEST_CASE("collector: a constrained dotnet/jvm answer is status-only, with or without a row",
           "[sync][collector][runtimes]") {
-    // The real leg types the answer CONSTRAINED + PARTIAL; the table row opts in to PARTIAL.
+    // The real leg types the answer CONSTRAINED + PARTIAL.
     const auto constrain_leg = [](const char* action) {
         g_fake[4].result_status[action] = {YUZU_RESULT_STATUS_CONSTRAINED,
                                            YUZU_RESULT_COMPLETENESS_PARTIAL, "tok"};
@@ -3745,30 +3703,23 @@ TEST_CASE("collector: a constrained dotnet/jvm answer keeps its rows; with none 
     for (const auto& leg : legs) {
         const char* const a = leg.a;
         const char* const row = leg.row;
-        const char* const src_name = leg.src_name;
         INFO(a);
-        const auto count = [&](const std::string& blob) {
-            std::size_t n = 0;
-            for (const auto& rec : records_of(blob))
-                if (fields_of(rec).at(15) == src_name)
-                    ++n;
-            return n;
-        };
-        SECTION(std::string(a) + " constrained with a row: the row is in the blob") {
-            fake_mac();
-            g_fake[4].out[a] = nl({st(a, "constrained", "tok"), row});
-            constrain_leg(a);
-            const auto got = collect_with(all_plugins());
-            REQUIRE(got.has_value());
-            CHECK(count(got->first) == 1);
-        }
-        SECTION(std::string(a) + " constrained with no row: the cycle is skipped, not a delete") {
-            fake_mac();
-            g_fake[4].out[a] = nl({st(a, "constrained", "tok")});
-            constrain_leg(a);
-            auto src = make_installed_software_source(all_plugins());
-            CHECK_FALSE(src.collect().has_value());
-            CHECK(src.skip_reason() == std::string("runtimes.") + a + ":tok");
+        for (const bool with_row : {true, false}) {
+            SECTION(std::string(a) + (with_row ? " constrained with a row" : " constrained with no row")) {
+                fake_mac();
+                g_fake[4].out[a] = with_row ? nl({st(a, "constrained", "tok"), row})
+                                            : nl({st(a, "constrained", "tok")});
+                constrain_leg(a);
+                const auto got = collect_with(all_plugins());
+                REQUIRE(got.has_value());
+                CHECK(count_source(got->first, leg.src_name) == 0);
+                const auto secs = sections_of(got->first);
+                const auto* sec = find_sec(secs, leg.src_name);
+                REQUIRE(sec != nullptr);
+                CHECK(sec->status == "constrained");
+                CHECK(sec->token == "tok");
+                CHECK(find_sec(secs, "installed_apps.list_inventory")->status == "full");
+            }
         }
     }
 }
@@ -3788,8 +3739,7 @@ TEST_CASE("runtimes dotnet adapter: rows from all three OS legs map to .NET / ap
             "dotnet|core|8.0.31|/usr/share/dotnet/shared/Microsoft.NETCore.App/8.0.31|-",
             "dotnet|sdk|8.0.404|/usr/local/share/dotnet/sdk/8.0.404|-",
             "dotnet|unmodelled|7.0.1|/usr/share/dotnet/shared/Other.App/7.0.1|-",
-            "dotnet|runtime|-|-|-"}),
-        kFailPolicy);
+            "dotnet|runtime|-|-|-"}));
     REQUIRE(r.status == Status::ok);
     CHECK(show(r) ==
           res("ok", "",
@@ -3816,8 +3766,7 @@ TEST_CASE("runtimes jvm adapter: rows from all three OS legs map to Java / app /
             "jvm|jdk|21.0.13|C:/Program Files/Temurin/|Eclipse Adoptium",
             "jvm|jdk|17.0.20|/opt/java/openjdk|Eclipse Adoptium",
             "jvm|jre|11.0.2|/Library/Java/JavaVirtualMachines/x.jdk|Oracle Corporation",
-            "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-amd64|-"}),
-        kFailPolicy);
+            "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-amd64|-"}));
     REQUIRE(r.status == Status::ok);
     CHECK(show(r) ==
           res("ok", "",
@@ -3834,27 +3783,25 @@ TEST_CASE("runtimes dotnet and jvm adapters: producer rows round-trip; bad shape
     // A vendor with a literal pipe is escaped by the producer; width stays five logical fields.
     const auto row = yuzu::runtimes::format_runtime_row("jvm", "jdk", "17.0.1", "/opt/j", "A|B");
     REQUIRE(row == "jvm|jdk|17.0.1|/opt/j|A\\|B");
-    const auto r = parse_runtimes_jvm_output(nl({"status|jvm|supported|-", row}), kFailPolicy);
+    const auto r = parse_runtimes_jvm_output(nl({"status|jvm|supported|-", row}));
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 1);
     CHECK(r.entries[0].version == "17.0.1");
     // malformed width and another action's tag are dropped, the status keeps the cycle ok
     const auto d = parse_runtimes_dotnet_output(
         nl({"status|dotnet|supported|-", "dotnet|runtime|8.0.1|/p", "jvm|jdk|17|/x|-",
-            "dotnet|runtime|8.0.1|/p|Microsoft|extra"}),
-        kFailPolicy);
+            "dotnet|runtime|8.0.1|/p|Microsoft|extra"}));
     REQUIRE(d.status == Status::ok);
     CHECK(d.entries.empty());
     // status grammar: a status row for the wrong action fails; constrained is withheld under
     // drop_source (the adapter still honours it for any caller); unsupported is skipped.
-    CHECK(parse_runtimes_dotnet_output(nl({"status|jvm|supported|-"}), kFailPolicy).status ==
+    CHECK(parse_runtimes_dotnet_output(nl({"status|jvm|supported|-"})).status ==
           Status::failed);
     CHECK(show(parse_runtimes_jvm_output(
               nl({"status|jvm|constrained|windows:runtimes:jvm_reg:access_denied",
-                  "jvm|jdk|17|/x|Acme"}),
-              ConstrainedPolicy::drop_source)) ==
-          res("withheld", "windows:runtimes:jvm_reg:access_denied"));
-    const auto u = parse_runtimes_dotnet_output(nl({"status|dotnet|unsupported|macos:planned"}), kFailPolicy);
+                  "jvm|jdk|17|/x|Acme"}))) ==
+          res("constrained", "windows:runtimes:jvm_reg:access_denied"));
+    const auto u = parse_runtimes_dotnet_output(nl({"status|dotnet|unsupported|macos:planned"}));
     CHECK(u.status == Status::unsupported);
     CHECK(u.entries.empty());
 }
@@ -3888,8 +3835,7 @@ TEST_CASE("pkg_inventory store_packages adapter: appx rows map to {appx, app, na
             // An unparsable key name: the row degrades to `-`, the entry keeps the whole key.
             appx_row("not-a-package-name", "", ""),
             // A snap row beside it still maps through its own arm.
-            snap_store_row("btop", "1.4.7", "app", "1073")}),
-        kFailPolicy);
+            snap_store_row("btop", "1.4.7", "app", "1073")}));
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 4);
     CHECK(r.entries[0].name == "Microsoft.BingNews");
@@ -3910,9 +3856,8 @@ TEST_CASE("pkg_inventory store_packages adapter: appx rows map to {appx, app, na
               nl({constrained_status("store_packages",
                                      "windows:pkg_inventory:appx_applications:access_denied"),
                   appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
-                           "neutral")}),
-              kFailPolicy)
-              .status == Status::failed);
+                           "neutral")}))
+              .status == Status::constrained);
     // Width guard (`!= 9`): this adapter splits on a bare `|` and never unescapes, so a key name
     // carrying pipes (each written `\|`) and a short row are dropped, never shifted. MUTATION:
     // without the guard the hostile name below (six pipes, the last segment `active`) puts
@@ -3925,8 +3870,7 @@ TEST_CASE("pkg_inventory store_packages adapter: appx rows map to {appx, app, na
                 appx_row("a|b|c|d|e|f|active", "", ""),
                 "package|appx|Short_1.0.0.0_x64__8wekyb3d8bbwe|1.0.0.0|app",
                 appx_row("Microsoft.BingNews_4.1.24002.0_neutral_~_8wekyb3d8bbwe", "4.1.24002.0",
-                         "neutral")}),
-            kFailPolicy);
+                         "neutral")}));
         REQUIRE(w.status == Status::ok);
         REQUIRE(w.entries.size() == 1);
         CHECK(w.entries[0].name == "Microsoft.BingNews");
@@ -3941,8 +3885,7 @@ TEST_CASE("pkg_inventory packages adapter: chocolatey pkg rows map to {chocolate
             "package|chocolatey|jq|-|pkg",
             pkg::format_package_row("wget", "1.24", pkg::PackageKind::formula),
             // an appx row has no business in `packages`: not counted, not mapped
-            appx_row("X.Y_1.0.0.0_x64__8wekyb3d8bbwe", "1.0.0.0", "x64")}),
-        kFailPolicy);
+            appx_row("X.Y_1.0.0.0_x64__8wekyb3d8bbwe", "1.0.0.0", "x64")}));
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 3);
     CHECK(r.entries[0].name == "7zip");
@@ -3953,12 +3896,11 @@ TEST_CASE("pkg_inventory packages adapter: chocolatey pkg rows map to {chocolate
     CHECK(r.entries[1].version.empty());
     CHECK(r.entries[2].ecosystem == "brew");       // Homebrew is unchanged
     CHECK(r.entries[2].version == "1.24");
-    // constrained packages answers still fail the cycle (policy unchanged)
+    // a constrained packages answer is status-only: no rows from an incomplete list
     CHECK(parse_pkg_inventory_packages_output(
               nl({constrained_status("packages", "windows:pkg_inventory:chocolatey_lib:entry_cap"),
-                  "package|chocolatey|7zip|26.5.0|pkg"}),
-              kFailPolicy)
-              .status == Status::failed);
+                  "package|chocolatey|7zip|26.5.0|pkg"}))
+              .status == Status::constrained);
     // Width guard (`!= 5`): an id carrying pipes (each written `\|`) and a short row (four tokens)
     // are dropped, never shifted. MUTATION: without the guard the second id below puts `pkg` at
     // the kind column and maps a shifted entry named `a\` with version `b\`; a short row would
@@ -3968,8 +3910,7 @@ TEST_CASE("pkg_inventory packages adapter: chocolatey pkg rows map to {chocolate
             nl({supported_status("packages"),
                 pkg::format_package_row("we|ird", "1.0", pkg::PackageKind::pkg, "chocolatey"),
                 pkg::format_package_row("a|b|pkg", "1.0", pkg::PackageKind::pkg, "chocolatey"),
-                "package|chocolatey|short|1.0", "package|chocolatey|7zip|26.5.0|pkg"}),
-            kFailPolicy);
+                "package|chocolatey|short|1.0", "package|chocolatey|7zip|26.5.0|pkg"}));
         REQUIRE(w.status == Status::ok);
         REQUIRE(w.entries.size() == 1);
         CHECK(w.entries[0].name == "7zip");
@@ -3989,7 +3930,7 @@ TEST_CASE("pkg_inventory managers adapter: chocolatey and winget presence rows m
         pkg::Manager::chocolatey, pkg::Presence::unavailable, "", "C:\\ProgramData\\chocolatey", "",
         "windows:pkg_inventory:chocolatey_lib:access_denied");
     const auto r = parse_pkg_inventory_managers_output(
-        nl({supported_status("managers"), choco, winget, unavailable}), kKeepPolicy);
+        nl({supported_status("managers"), choco, winget, unavailable}));
     REQUIRE(r.status == Status::ok);
     REQUIRE(r.entries.size() == 2); // an unavailable row is not a presence row
     CHECK(r.entries[0].name == "chocolatey");
@@ -3999,20 +3940,19 @@ TEST_CASE("pkg_inventory managers adapter: chocolatey and winget presence rows m
     CHECK(r.entries[1].name == "winget");
     CHECK(r.entries[1].ecosystem == "winget");
     CHECK(r.entries[1].version == "1.29.379.0");
-    // Constrained with a present row seen: the rows are kept (managers policy unchanged).
+    // Constrained with a present row seen: status-only, the row is not taken.
     const auto c = parse_pkg_inventory_managers_output(
         nl({constrained_status("managers", "windows:pkg_inventory:appx_applications:access_denied"),
-            choco}),
-        kKeepPolicy);
-    CHECK(c.status == Status::ok);
+            choco}));
+    CHECK(c.status == Status::constrained);
     CHECK_FALSE(c.reason.empty());
-    CHECK(c.entries.size() == 1);
+    CHECK(c.entries.empty());
 }
 
 TEST_CASE("pkg_inventory adapters: the committed windows.txt sample round-trips through all three",
           "[sync][parse][adapter][windows]") {
     const auto m = parse_pkg_inventory_managers_output(
-        capture_section("pkg_inventory", "windows.txt", "managers"), kKeepPolicy);
+        capture_section("pkg_inventory", "windows.txt", "managers"));
     REQUIRE(m.status == Status::ok);
     REQUIRE(m.entries.size() == 2);
     CHECK(m.entries[0].ecosystem == "chocolatey");
@@ -4020,7 +3960,7 @@ TEST_CASE("pkg_inventory adapters: the committed windows.txt sample round-trips 
     CHECK(m.entries[1].version == "2026.917.151.0");
 
     const auto p = parse_pkg_inventory_packages_output(
-        capture_section("pkg_inventory", "windows.txt", "packages"), kFailPolicy);
+        capture_section("pkg_inventory", "windows.txt", "packages"));
     REQUIRE(p.status == Status::ok);
     CHECK(p.entries.size() == 18); // 19 lib directories, `chocolatey` has no loose nuspec
     for (const auto& e : p.entries) {
@@ -4030,7 +3970,7 @@ TEST_CASE("pkg_inventory adapters: the committed windows.txt sample round-trips 
     }
 
     const auto s = parse_pkg_inventory_store_packages_output(
-        capture_section("pkg_inventory", "windows.txt", "store_packages"), kFailPolicy);
+        capture_section("pkg_inventory", "windows.txt", "store_packages"));
     REQUIRE(s.status == Status::ok);
     // 119 captured Appx rows; the adapter keeps the 118 active ones and drops the 1 deprovisioned.
     CHECK(s.entries.size() == 118);
@@ -4466,39 +4406,38 @@ TEST_CASE("vendor_or_origin: a declared vendor stays, an empty one becomes via:<
     vendor_or_origin(no_eco);
     CHECK(no_eco.publisher == "via:unknown");
 
-    // The fallback lives in the collector, not in the blob builder: a fixture entry with an empty
-    // publisher hashes an empty slot 3, so the cross-pins above are independent of the fallback.
+    // The pure record and hash functions take the publisher as given (so the server's golden vectors
+    // for a publisher-less fixture hold); the PLANNER is the writer's single fallback site.
     SwEntry bare;
     bare.name = "n";
     bare.ecosystem = "brew";
-    const auto blob = installed_software_canonical_blob({bare});
-    CHECK(fields_of(records_of(blob)[0])[2].empty());
+    CHECK(fields_of(yuzu::agent::v3_record(bare))[2].empty());
+    const auto plan = yuzu::agent::plan_section("pkg_inventory.packages", {bare}, std::nullopt, false);
+    REQUIRE(plan.adds.size() == 1);
+    CHECK(plan.adds[0].publisher == "via:brew");
 }
 
-TEST_CASE("a row whose publisher is an origin label hashes to the server's pinned digests",
+TEST_CASE("a row whose publisher is an origin label hashes to the server's pinned digest",
           "[sync][hash][vendor]") {
-    // The same row and the same digests as the server test "canonical_section_hash pins a row
-    // whose publisher is an origin label (via:brew)" in test_software_inventory_store.cpp. Recipes:
-    //   16-field form (source set):
-    //     printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\037\037\037\037pkg_inventory.packages\036' | shasum -a 256
-    //   12-field v2 form (no source):
-    //     printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\036' | shasum -a 256
+    // The same row and digest as the server test "canonical_section_hash pins a row whose
+    // publisher is an origin label (via:brew)" in test_software_inventory_store.cpp. Recipe:
+    //   printf 'wget\0371.24\037via:brew\037\037pkg\037brew\037\037\037\037\037\037\037\037\037\037pkg_inventory.packages\036' | shasum -a 256
     SwEntry e;
     e.name = "wget";
     e.version = "1.24";
     e.publisher = "via:brew";
     e.kind = "pkg";
     e.ecosystem = "brew";
-    CHECK(sha256_hex(installed_software_canonical_blob({e})) ==
-          "3efab992b1c46e477f74297ee3d55e9c1a0cc923aa3d2dd112fe9a074ead29a9");
     e.source = "pkg_inventory.packages";
-    CHECK(sha256_hex(installed_software_canonical_blob({e})) ==
+    CHECK(yuzu::agent::v3_section_hash({e}) ==
           "906ce129e4448180dcee1d554df55367a898b40e73551cf9dbfaa73d26d0c69f");
     // ...and the label is in the hash: the same row with the slot empty hashes differently.
     SwEntry bare = e;
     bare.publisher.clear();
-    CHECK(sha256_hex(installed_software_canonical_blob({bare})) !=
-          sha256_hex(installed_software_canonical_blob({e})));
+    CHECK(yuzu::agent::v3_section_hash({bare}) != yuzu::agent::v3_section_hash({e}));
+    // The planner labels the bare row to exactly the pinned form.
+    CHECK(yuzu::agent::plan_section("pkg_inventory.packages", {bare}, std::nullopt, false)
+              .section_hash == yuzu::agent::v3_section_hash({e}));
 }
 
 namespace {
@@ -4525,7 +4464,7 @@ std::string inv_row(std::string name, std::string publisher, std::string kind, s
 std::map<std::string, std::set<std::string>> publishers_by_source_and_ecosystem(
     const std::string& blob) {
     std::map<std::string, std::set<std::string>> out;
-    for (const auto& rec : records_of(blob)) {
+    for (const auto& rec : plus_records(blob)) {
         const auto f = fields_of(rec);
         REQUIRE(f.size() == 16);
         out[f[15] + "|" + f[5]].insert(f[2]);
@@ -4609,8 +4548,17 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
                                "jvm|jdk|17.0.20|/opt/java/openjdk|Eclipse Adoptium",
                                "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-amd64|-"});
     g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
+    // hardware.drivers_inventory: the WMI provider (else the signer) is the publisher on Windows;
+    // the fixed Linux provider `kernel` is not a vendor, so a module is labelled by origin.
+    g_fake[6].out["drivers_inventory"] = nl({
+        st("drivers_inventory", "supported", "-"),
+        "driver_inv|AMD Audio|6.0.0.109|2025-03-26|AMD|SYSTEM|Some Signer|signed|oem18.inf|PCI/X",
+        "driver_inv|Signer Only|1|2025-01-01|-|SYSTEM|Contoso Signer|signed|oem1.inf|PCI/Y",
+        "driver_inv|No Vendor|-|-|-|-|-|-|-|ACP/Z"});
+    auto plugins = with_middleware();
+    plugins["hardware"] = &kFakeHw;
 
-    const auto got = collect_with(with_middleware());
+    const auto got = collect_with(plugins);
     REQUIRE(got.has_value());
     const auto by = publishers_by_source_and_ecosystem(got->first);
 
@@ -4642,6 +4590,11 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
         {"middleware.ibm_mq|ibm_mq", {"IBM"}},
         {"runtimes.dotnet|dotnet", {"Microsoft"}},
         {"runtimes.jvm|jvm", {"Eclipse Adoptium", "via:jvm"}},
+#if defined(_WIN32)
+        {"hardware.drivers_inventory|windows", {"AMD", "Contoso Signer", "via:windows"}},
+#else
+        {"hardware.drivers_inventory|kernel_module", {"via:kernel_module"}},
+#endif
     };
     CHECK(by == expected);
 
@@ -4654,4 +4607,811 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
         });
         CHECK(seen);
     }
+}
+
+// ============================================================================
+// hardware.drivers_inventory (SAM-15: drivers are a daily-sync section)
+// ============================================================================
+
+TEST_CASE("hardware drivers adapter: the Windows sample maps to kind driver / ecosystem windows",
+          "[sync][parse][adapter][drivers]") {
+    const auto r = parse_hardware_drivers_inventory_output(
+        capture_section("hardware", "windows.txt", "drivers_inventory"),
+        /*kernel_module_leg=*/false);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE_FALSE(r.entries.empty());
+    for (const auto& e : r.entries) {
+        CHECK(e.kind == "driver");
+        CHECK(e.ecosystem == "windows");
+        CHECK_FALSE(e.name.empty());
+        CHECK(e.source.empty()); // the collector stamps source
+        CHECK((e.signature_status == "signed" || e.signature_status == "unsigned" ||
+               e.signature_status.empty()));
+    }
+    const auto by_name = [&](std::string_view n) -> const SwEntry& {
+        const auto it = std::find_if(r.entries.begin(), r.entries.end(),
+                                     [&](const SwEntry& e) { return e.name == n; });
+        REQUIRE(it != r.entries.end());
+        return *it;
+    };
+    // A bound driver: version, date, provider and signature from the row; class/INF/hwid dropped.
+    const auto& amd = by_name("AMD Audio CoProcessor");
+    CHECK(amd.version == "6.0.0.109");
+    CHECK(amd.install_date == "2025-03-26");
+    CHECK(amd.publisher == "AMD");
+    CHECK(amd.signature_status == "signed");
+    // A device with no driver bound: every absent value (`-`) is empty, not a literal dash.
+    const auto& bare = by_name("ACP HDA Node");
+    CHECK(bare.version.empty());
+    CHECK(bare.install_date.empty());
+    CHECK(bare.publisher.empty()); // the writer labels it via:windows
+    CHECK(bare.signature_status.empty());
+}
+
+TEST_CASE("hardware drivers adapter: publisher is the provider, else the signer; unsigned is carried",
+          "[sync][parse][adapter][drivers]") {
+    const auto r = parse_hardware_drivers_inventory_output(
+        nl({st("drivers_inventory", "supported", "-"),
+            "driver_inv|A|1|2025-01-01|Prov|SYSTEM|Sig|signed|a.inf|PCI/A",
+            "driver_inv|B|-|-|-|-|Only Signer|unsigned|-|-",
+            "driver_inv|C|-|-|-|-|-|bogus|-|-",
+            "driver_inv|-|1|-|P|-|-|-|-|-",          // no name: seen, not mapped
+            "driver_inv|too|few|tokens",             // wrong width: dropped
+            "driver_inv|D|1|-|P|-|-|-|-|-|extra"}),  // over-wide: dropped, never truncated
+        /*kernel_module_leg=*/false);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 3);
+    CHECK(r.entries[0].publisher == "Prov");
+    CHECK(r.entries[1].publisher == "Only Signer");
+    CHECK(r.entries[1].signature_status == "unsigned");
+    CHECK(r.entries[2].publisher.empty());
+    CHECK(r.entries[2].signature_status.empty()); // anything but signed|unsigned proves nothing
+    // An escaped pipe in a free-text field is one field, unescaped.
+    const auto p = parse_hardware_drivers_inventory_output(
+        nl({st("drivers_inventory", "supported", "-"),
+            "driver_inv|Foo \\| Bar|1|-|Acme \\| Co|-|-|-|-|-"}),
+        false);
+    REQUIRE(p.entries.size() == 1);
+    CHECK(p.entries[0].name == "Foo | Bar");
+    CHECK(p.entries[0].publisher == "Acme | Co");
+}
+
+TEST_CASE("hardware drivers adapter: the Linux sample maps to kernel_module and blanks the fixed provider",
+          "[sync][parse][adapter][drivers]") {
+    const auto r = parse_hardware_drivers_inventory_output(
+        capture_section("hardware", "linux.txt", "drivers_inventory"),
+        /*kernel_module_leg=*/true);
+    REQUIRE(r.status == Status::ok);
+    REQUIRE_FALSE(r.entries.empty());
+    for (const auto& e : r.entries) {
+        CHECK(e.kind == "driver");
+        CHECK(e.ecosystem == "kernel_module");
+        // `kernel` is the producer's fixed label for the source, not a vendor: not carried, so the
+        // writer's origin label (via:kernel_module) is the publisher.
+        CHECK(e.publisher.empty());
+        CHECK(e.install_date.empty());
+    }
+    const auto it = std::find_if(r.entries.begin(), r.entries.end(),
+                                 [](const SwEntry& e) { return e.name == "bridge"; });
+    REQUIRE(it != r.entries.end());
+    CHECK(it->version == "2.3");
+    const auto bare = std::find_if(r.entries.begin(), r.entries.end(),
+                                   [](const SwEntry& e) { return e.name == "autofs4"; });
+    REQUIRE(bare != r.entries.end());
+    CHECK(bare->version.empty());
+}
+
+TEST_CASE("hardware drivers adapter: the status row decides; macOS is unsupported with no rows",
+          "[sync][parse][adapter][drivers]") {
+    const auto mac = parse_hardware_drivers_inventory_output(
+        capture_section("hardware", "macos.txt", "drivers_inventory"), true);
+    CHECK(mac.status == Status::unsupported);
+    CHECK(mac.entries.empty());
+    const std::string row = "driver_inv|A|1|-|P|-|-|-|-|-";
+    const auto constrained = parse_hardware_drivers_inventory_output(
+        nl({st("drivers_inventory", "constrained", "linux:drivers_inventory:row_cap"), row}), true);
+    CHECK(constrained.status == Status::constrained);
+    CHECK(constrained.entries.empty());
+    CHECK(constrained.reason == "linux:drivers_inventory:row_cap");
+    CHECK(parse_hardware_drivers_inventory_output(nl({row}), true).status == Status::failed);
+    CHECK(parse_hardware_drivers_inventory_output("", true).status == Status::failed);
+    CHECK(parse_hardware_drivers_inventory_output(nl({st("drivers_inventory", "supported", "-")}), true)
+              .status == Status::ok);
+}
+
+TEST_CASE("collector: drivers are their own section, kind driver, no per-user path",
+          "[sync][collector][drivers]") {
+    fake_mac();
+    g_fake[6].out["drivers_inventory"] = nl({
+        st("drivers_inventory", "supported", "-"),
+        "driver_inv|bridge|2.3|-|kernel|module|-|-|-|-",
+        "driver_inv|autofs4|-|-|kernel|module|-|-|-|-"});
+    auto plugins = all_plugins();
+    plugins["hardware"] = &kFakeHw;
+    const auto got = collect_with(plugins);
+    REQUIRE(got.has_value());
+    const auto secs = sections_of(got->first);
+    const V3Sec* d = find_sec(secs, "hardware.drivers_inventory");
+    REQUIRE(d != nullptr);
+    CHECK(d->status == "full");
+    REQUIRE(d->adds.size() == 2);
+    for (const auto& body : d->adds) {
+        const auto f = fields_of(body);
+        CHECK(f[4] == "driver");
+        CHECK(f[15] == "hardware.drivers_inventory");
+        CHECK_FALSE(f[2].empty()); // publisher: via:<ecosystem>
+        CHECK(f[12].empty());      // install_location
+    }
+    // The mac host has no drivers inventory: not_collected, no rows (the plugin answers unsupported).
+    g_fake[6].out["drivers_inventory"] =
+        yuzu::shared::format_status_row("drivers_inventory", yuzu::shared::StatusLevel::unsupported,
+                                        "macos:no_enumeration_api") +
+        "\n";
+    const auto mac = section_of(plugins, "hardware.drivers_inventory");
+    REQUIRE(mac.has_value());
+    CHECK(mac->status == "not_collected");
+    CHECK(mac->adds.empty());
+}
+
+// ============================================================================
+// SAM-15: the v3 sectioned collector, driven the way the scheduler drives it
+// ============================================================================
+
+namespace {
+
+constexpr const char* kFacetApps = "installed_apps.list_inventory";
+constexpr const char* kFacetPkgs = "pkg_inventory.packages";
+constexpr const char* kFacetPy = "runtimes.python";
+
+// Every facet answers a clean read, so each is a FULL section: installed_apps carries three rows,
+// the rest are honest-empty. (A fake_mac() run leaves several facets status-only, which emit a
+// section every pass and so cannot show a quiet pass.)
+void fake_all_supported() {
+    reset_fakes();
+    g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\ninv|beta|2.0|Acme\ninv|gamma|3.0|Acme\n";
+    g_fake[1].out["managers"] = supported_status("managers") + "\n";
+    g_fake[1].out["packages"] = supported_status("packages") + "\n";
+    g_fake[1].out["store_packages"] = supported_status("store_packages") + "\n";
+    g_fake[2].out["list"] = "feature|Feat|enabled|0\n";
+    g_fake[3].out["list_inventory"] = "status|list_inventory|supported|-\n";
+    g_fake[5].out["ibm_mq"] = supported_status("ibm_mq") + "\n";
+    g_fake[6].out["drivers_inventory"] = supported_status("drivers_inventory") + "\n";
+}
+
+SyncPluginMap every_plugin() {
+    SyncPluginMap m = with_middleware();
+    m["hardware"] = &kFakeHw;
+    return m;
+}
+
+std::string acked_key(std::string_view facet) {
+    return "sync.installed_software." + std::string(facet) + ".acked";
+}
+
+std::size_t full_sections(const std::string& blob) {
+    std::size_t n = 0;
+    for (const auto& sec : sections_of(blob))
+        n += sec.status == "full";
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("collector: an unchanged pass writes no section, keeps the report hash and asks for no blob",
+          "[sync][collector][v3]") {
+    fake_all_supported();
+    Collector c(every_plugin());
+    const auto first = c.collect_forced();
+    REQUIRE(first.has_value());
+    CHECK(full_sections(first->first) == 11); // one full section per facet, none status-only
+    CHECK(c.src.wants_blob());
+    c.ack();
+
+    c.pass_cooldown(); // past the cooldown: the plugins are dispatched again
+    const auto second = c.collect();
+    REQUIRE(second.has_value());
+    CHECK(second->second == first->second);        // identical report hash
+    CHECK(sections_of(second->first).empty());      // nothing changed: no section at all
+    CHECK_FALSE(c.src.wants_blob());                // so the scheduler sends the hash alone
+    CHECK_FALSE(c.src.has_more());
+}
+
+TEST_CASE("collector: one upgraded row is exactly one delta section with one - and one + and expect",
+          "[sync][collector][v3]") {
+    fake_all_supported();
+    Collector c(every_plugin());
+    const auto first = c.collect_forced();
+    REQUIRE(first.has_value());
+    const auto before = sections_of(first->first);
+    const auto base_hash = yuzu::agent::v3_section_hash(entries_of(*find_sec(before, kFacetApps)));
+    c.ack();
+
+    c.pass_cooldown();
+    g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\ninv|beta|2.1|Acme\ninv|gamma|3.0|Acme\n";
+    const auto second = c.collect();
+    REQUIRE(second.has_value());
+    const auto secs = sections_of(second->first);
+    REQUIRE(secs.size() == 1); // every other section is omitted
+    const V3Sec& d = secs[0];
+    CHECK(d.facet == kFacetApps);
+    CHECK(d.status == "delta");
+    CHECK(d.base == base_hash);
+    CHECK(d.dels.size() == 1);
+    REQUIRE(d.adds.size() == 1);
+    CHECK(fields_of(d.adds[0])[0] == "beta");
+    CHECK(fields_of(d.adds[0])[1] == "2.1");
+    // expect = the section hash after the delta: the full set under the new rows
+    std::vector<SwEntry> now;
+    for (const auto* v : {"1.0", "2.1", "3.0"}) {
+        SwEntry e;
+        e.name = std::string(v) == "1.0" ? "alpha" : std::string(v) == "2.1" ? "beta" : "gamma";
+        e.version = v;
+        e.publisher = "Acme";
+        e.source = kFacetApps;
+        now.push_back(e);
+    }
+    CHECK(d.expect == yuzu::agent::v3_section_hash(now));
+    CHECK(c.src.wants_blob());
+    // the removed row's hash is the OLD beta's (the server's instance_key)
+    SwEntry old_beta;
+    old_beta.name = "beta";
+    old_beta.version = "2.0";
+    old_beta.publisher = "Acme";
+    old_beta.source = kFacetApps;
+    CHECK(d.dels[0] == yuzu::agent::v3_row_hash(old_beta));
+}
+
+TEST_CASE("collector: a degraded plugin is status-only, the others still full or delta, and a changed "
+          "token reaches the server even though the held hash did not move",
+          "[sync][collector][v3]") {
+    fake_all_supported();
+    Collector c(every_plugin());
+    g_fake[4].out["python"] = nl({supported_status("python")});
+    g_fake[4].result_status["python"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                         YUZU_RESULT_COMPLETENESS_PARTIAL, "linux:runtimes:a"};
+    const auto first = c.collect_forced();
+    REQUIRE(first.has_value());
+    const auto s1 = sections_of(first->first);
+    CHECK(find_sec(s1, kFacetPy)->status == "constrained");
+    CHECK(find_sec(s1, kFacetPy)->token == "linux:runtimes:a");
+    CHECK(find_sec(s1, kFacetApps)->status == "full");
+    CHECK(full_sections(first->first) == 10);
+    c.ack();
+
+    // Same degradation, a different token: the held set (and so the report hash) is unchanged, but
+    // a section was emitted, so the blob is sent and the server learns the new reason.
+    c.pass_cooldown();
+    g_fake[4].result_status["python"] = {YUZU_RESULT_STATUS_CONSTRAINED,
+                                         YUZU_RESULT_COMPLETENESS_PARTIAL, "linux:runtimes:b"};
+    const auto second = c.collect();
+    REQUIRE(second.has_value());
+    CHECK(second->second == first->second);
+    const auto s2 = sections_of(second->first);
+    REQUIRE(s2.size() == 1);
+    CHECK(s2[0].facet == kFacetPy);
+    CHECK(s2[0].token == "linux:runtimes:b");
+    CHECK(c.src.wants_blob());
+    c.ack();
+
+    // Recovery: the facet's acked set was erased by the status-only ack, so the next row-bearing
+    // section is FULL (the server refuses a delta over a facet whose status is not full or delta).
+    c.pass_cooldown();
+    g_fake[4].result_status.erase("python");
+    g_fake[4].out["python"] = nl({supported_status("python"), "python|cpython|3.13.1|/p|PythonCore"});
+    const auto third = c.collect();
+    REQUIRE(third.has_value());
+    const auto s3 = sections_of(third->first);
+    REQUIRE(s3.size() == 1);
+    CHECK(s3[0].status == "full");
+    CHECK(s3[0].base.empty());
+}
+
+TEST_CASE("collector: acknowledgement commits sections; nacks mark a facet or the whole source full",
+          "[sync][collector][v3]") {
+    fake_all_supported();
+    Collector c(every_plugin());
+    const auto first = c.collect_forced();
+    REQUIRE(first.has_value());
+    // The acked value is written only by a clean acknowledgement, never by collect().
+    CHECK(c.kv.count(acked_key(kFacetApps)) == 0);
+    c.ack();
+    REQUIRE(c.kv.count(acked_key(kFacetApps)) == 1);
+    const auto decoded = yuzu::agent::acked_decode(c.kv[acked_key(kFacetApps)]);
+    REQUIRE(decoded.has_value());
+    CHECK(decoded->row_hashes.size() == 3);
+
+    // A per-facet nack: that facet is full again, nothing else is resent.
+    c.pass_cooldown();
+    g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\ninv|beta|2.1|Acme\ninv|gamma|3.0|Acme\n";
+    const auto delta = c.collect();
+    REQUIRE(delta.has_value());
+    CHECK(find_sec(sections_of(delta->first), kFacetApps)->status == "delta");
+    c.ack({std::string("installed_software:") + kFacetApps});
+    // the nacked delta was NOT committed: the persisted set is still the first pass's
+    CHECK(yuzu::agent::acked_decode(c.kv[acked_key(kFacetApps)])->section_hash ==
+          decoded->section_hash);
+    CHECK(c.kv["sync.installed_software.installed_apps.list_inventory.need_full"] == "1");
+    c.pass_cooldown();
+    const auto resend = c.collect();
+    REQUIRE(resend.has_value());
+    const auto rs = sections_of(resend->first);
+    REQUIRE(rs.size() == 1);
+    CHECK(rs[0].facet == kFacetApps);
+    CHECK(rs[0].status == "full");
+    c.ack();
+    CHECK(c.kv["sync.installed_software.installed_apps.list_inventory.need_full"] == "0");
+
+    // A whole-source nack: every facet is full next, and nothing from the nacked pass is committed.
+    c.pass_cooldown();
+    c.ack({"installed_software"});
+    c.pass_cooldown();
+    const auto all_again = c.collect();
+    REQUIRE(all_again.has_value());
+    CHECK(full_sections(all_again->first) == 11);
+}
+
+TEST_CASE("collector: a status-only acknowledgement erases the acked set", "[sync][collector][v3]") {
+    fake_all_supported();
+    Collector c(every_plugin());
+    REQUIRE(c.collect_forced().has_value());
+    c.ack();
+    REQUIRE_FALSE(c.kv[acked_key(kFacetPkgs)].empty());
+
+    c.pass_cooldown();
+    g_fake[1].rc["packages"] = 1;
+    const auto bad = c.collect();
+    REQUIRE(bad.has_value());
+    CHECK(find_sec(sections_of(bad->first), kFacetPkgs)->status == "constrained");
+    CHECK(c.src.wants_blob());
+    c.ack();
+    CHECK(c.kv[acked_key(kFacetPkgs)].empty()); // erased
+
+    c.pass_cooldown();
+    g_fake[1].rc.clear();
+    const auto good = c.collect();
+    REQUIRE(good.has_value());
+    const auto secs = sections_of(good->first);
+    REQUIRE(secs.size() == 1);
+    CHECK(secs[0].status == "full"); // never a delta after a status-only section
+}
+
+TEST_CASE("collector: the acked state survives a restart, and a garbled value is read as no acked set",
+          "[sync][collector][v3]") {
+    fake_all_supported();
+    std::map<std::string, std::string> persisted;
+    {
+        Collector c(every_plugin());
+        REQUIRE(c.collect_forced().has_value());
+        c.ack();
+        persisted = c.kv;
+    }
+    SECTION("a valid value round-trips: the restarted source sends nothing for an unchanged facet") {
+        Collector c(every_plugin());
+        c.kv = persisted;
+        const auto got = c.collect();
+        REQUIRE(got.has_value());
+        CHECK(sections_of(got->first).empty());
+    }
+    SECTION("a garbled acked value (bad head / torn body) is read as no acked set: that facet is full") {
+        for (const auto& bad : {std::string("not-a-hash\nabc"),
+                                persisted[acked_key(kFacetApps)].substr(
+                                    0, persisted[acked_key(kFacetApps)].size() - 5)}) {
+            Collector c(every_plugin());
+            c.kv = persisted;
+            c.kv[acked_key(kFacetApps)] = bad;
+            const auto got = c.collect();
+            REQUIRE(got.has_value());
+            const auto secs = sections_of(got->first);
+            REQUIRE(secs.size() == 1);
+            CHECK(secs[0].facet == kFacetApps);
+            CHECK(secs[0].status == "full");
+        }
+    }
+    SECTION("a persisted need_full flag survives a restart") {
+        Collector c(every_plugin());
+        c.kv = persisted;
+        c.kv["sync.installed_software.runtimes.python.need_full"] = "1";
+        const auto got = c.collect();
+        REQUIRE(got.has_value());
+        const auto secs = sections_of(got->first);
+        REQUIRE(secs.size() == 1);
+        CHECK(secs[0].facet == kFacetPy);
+        CHECK(secs[0].status == "full");
+    }
+}
+
+TEST_CASE("collector: a first contact over the per-call row cap is split across collections",
+          "[sync][collector][v3][cap]") {
+    reset_fakes();
+    // 24,000 rows over two facets: 12,000 `+` per facet, 20,000 per call.
+    g_fake[0].out["list_inventory"] = inv_lines(12000);
+    std::string formulae = supported_status("packages") + "\n";
+    for (int i = 0; i < 12000; ++i)
+        formulae += pkg::format_package_row("f" + std::to_string(i), "1.0",
+                                            pkg::PackageKind::formula) + "\n";
+    g_fake[1].out["packages"] = formulae;
+    g_fake[1].out["managers"] = supported_status("managers") + "\n";
+    g_fake[1].out["store_packages"] = supported_status("store_packages") + "\n";
+    SyncPluginMap plugins = {{"installed_apps", &kFakeIa}, {"pkg_inventory", &kFakePkg}};
+    Collector c(plugins);
+
+    const auto first = c.collect_forced();
+    REQUIRE(first.has_value());
+    const auto s1 = sections_of(first->first);
+    CHECK(find_sec(s1, kFacetApps)->status == "full");
+    CHECK(find_sec(s1, kFacetPkgs) == nullptr); // deferred, not written
+    CHECK(c.src.has_more());
+    // Not held until sent: the claimed hash covers the facets actually written (apps plus the two
+    // small pkg_inventory facets), so the server converges to it after this call.
+    std::vector<std::pair<std::string, std::string>> held;
+    for (const auto& sec : s1) {
+        if (sec.status == "full")
+            held.emplace_back(sec.facet, yuzu::agent::v3_section_hash(entries_of(sec)));
+    }
+    CHECK(first->second == yuzu::agent::v3_report_hash(held));
+    c.ack();
+
+    // The next collection (inside the cooldown: no plugin is dispatched again) sends the rest.
+    const auto second = c.collect();
+    REQUIRE(second.has_value());
+    const auto s2 = sections_of(second->first);
+    // The only row-bearing section is the deferred one (the absent plugins' status-only sections
+    // ride every pass).
+    std::vector<const V3Sec*> rows;
+    for (const auto& sec : s2) {
+        if (sec.status == "full" || sec.status == "delta")
+            rows.push_back(&sec);
+    }
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0]->facet == kFacetPkgs);
+    CHECK(rows[0]->status == "full");
+    CHECK(rows[0]->adds.size() == 12000);
+    CHECK_FALSE(c.src.has_more());
+}
+
+namespace {
+// A plugin whose every action blocks until the test releases it, counting how many times it was
+// entered: the detached-worker half of the collector, driven with a real thread and no sleep.
+std::atomic<int> g_blocking_entered{0};
+std::promise<void> g_blocking_release_p;
+std::shared_future<void> g_blocking_release;
+
+int blocking_execute(YuzuCommandContext* ctx, const char* /*action*/, const YuzuParam* /*params*/,
+                     std::size_t /*param_count*/) {
+    ++g_blocking_entered;
+    g_blocking_release.wait();
+    yuzu_ctx_write_output(ctx, "inv|alpha|1.0|Acme\n");
+    return 0;
+}
+const char* const kBlockingActions[] = {"list_inventory", nullptr};
+const YuzuPluginDescriptor kBlockingIa = {YUZU_PLUGIN_ABI_VERSION, "installed_apps", "1.0.0",
+                                          "test fake", kBlockingActions, nullptr, nullptr,
+                                          blocking_execute, nullptr};
+} // namespace
+
+TEST_CASE("collector: a blocked plugin times out alone, stays single-flight, and clears when it returns",
+          "[sync][collector][v3][workers]") {
+    g_blocking_entered = 0;
+    g_blocking_release_p = std::promise<void>{};
+    g_blocking_release = g_blocking_release_p.get_future().share();
+    CollectorTuning tuning;
+    tuning.time_limit = std::chrono::milliseconds{50}; // a blocked worker NEVER returns by itself
+    Collector c({{"installed_apps", &kBlockingIa}}, tuning);
+
+    const auto first = c.collect();
+    REQUIRE(first.has_value());
+    const auto s1 = sections_of(first->first);
+    const V3Sec* a = find_sec(s1, kFacetApps);
+    REQUIRE(a != nullptr);
+    CHECK(a->status == "timeout");
+    CHECK(a->token == "timeout");
+    CHECK(c.workers->outstanding() == 1);     // the abandoned worker is still inside the plugin
+    CHECK(g_blocking_entered.load() <= 1);
+
+    // The next pass does not start a second worker: `busy`.
+    const auto second = c.collect();
+    REQUIRE(second.has_value());
+    CHECK(find_sec(sections_of(second->first), kFacetApps)->token == "busy");
+    CHECK(c.workers->outstanding() == 1);
+
+    // Release it; the flag clears when the worker physically returns.
+    g_blocking_release_p.set_value();
+    CHECK(yuzu::agent::drain_collector_workers(*c.workers, std::chrono::seconds{10}, {}));
+    CHECK(c.workers->outstanding() == 0);
+    CHECK(g_blocking_entered.load() == 1);
+
+    const auto third = c.collect();
+    REQUIRE(third.has_value());
+    CHECK(find_sec(sections_of(third->first), kFacetApps)->status == "full");
+}
+
+TEST_CASE("collector: a rejected bounded call is timeout:rejected and its flag is clear at once",
+          "[sync][collector][v3][workers]") {
+    std::atomic<int> invoked{0};
+    CollectorTuning tuning;
+    tuning.runner = [&invoked](std::chrono::milliseconds,
+                               std::function<yuzu::agent::LocalDispatcher::Result()>)
+        -> yuzu::agent::CollectorCallResult {
+        // The ceiling (or thread creation) refused: fn() is never invoked and no worker exists.
+        ++invoked;
+        return {std::nullopt, yuzu::shared::BoundedCallStatus::Rejected};
+    };
+    Collector c({{"installed_apps", &kFakeIa}}, tuning);
+    reset_fakes();
+    g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\n";
+    const auto got = c.collect();
+    REQUIRE(got.has_value());
+    const auto secs = sections_of(got->first);
+    const V3Sec* a = find_sec(secs, kFacetApps);
+    REQUIRE(a != nullptr);
+    CHECK(a->status == "timeout");
+    CHECK(a->token == "rejected");
+    CHECK(invoked.load() == 1);
+    CHECK(c.workers->outstanding() == 0); // the CALLER cleared the flag: no worker ever ran
+    // ...so the next pass is not `busy`: it tries again.
+    const auto again = c.collect();
+    REQUIRE(again.has_value());
+    CHECK(invoked.load() == 2);
+    CHECK(find_sec(sections_of(again->first), kFacetApps)->token == "rejected");
+}
+
+TEST_CASE("the teardown barrier waits the grace for outstanding workers, then escalates",
+          "[sync][collector][v3][workers]") {
+    CollectorWorkers w;
+    SECTION("none outstanding: returns at once without escalating") {
+        bool stuck = false;
+        CHECK(yuzu::agent::drain_collector_workers(w, std::chrono::seconds{30},
+                                                   [&](std::size_t) { stuck = true; }));
+        CHECK_FALSE(stuck);
+    }
+    SECTION("one outstanding past the grace: the escalation hook runs with the count") {
+        REQUIRE(w.try_begin("installed_apps.list_inventory"));
+        std::size_t seen = 0;
+        CHECK_FALSE(yuzu::agent::drain_collector_workers(w, std::chrono::milliseconds{60},
+                                                         [&](std::size_t n) { seen = n; }));
+        CHECK(seen == 1);
+        w.end("installed_apps.list_inventory");
+        CHECK(yuzu::agent::drain_collector_workers(w, std::chrono::milliseconds{60}, {}));
+    }
+    SECTION("single flight: a facet cannot be begun twice until it ends") {
+        CHECK(w.try_begin("a"));
+        CHECK_FALSE(w.try_begin("a"));
+        CHECK(w.try_begin("b"));
+        CHECK(w.outstanding() == 2);
+        w.end("a");
+        CHECK(w.try_begin("a"));
+    }
+}
+
+// ============================================================================
+// SAM-15: the scheduler hooks (on_force_full, wants_blob, on_ack, has_more, prefix nack)
+// ============================================================================
+
+namespace {
+
+// A sectioned source that records the order the scheduler drives it in.
+struct HookSource {
+    std::vector<std::string> events;
+    std::string hash = "h1";
+    std::string blob = "b1";
+    bool wants = false;
+    bool more = false;
+    SyncSource src;
+
+    HookSource() {
+        src.name = "installed_software";
+        src.interval = std::chrono::seconds{86400};
+        src.on_force_full = [this] { events.push_back("force"); };
+        src.collect = [this]() -> std::optional<std::pair<std::string, std::string>> {
+            events.push_back("collect");
+            return std::make_pair(blob, hash);
+        };
+        src.wants_blob = [this] { return wants; };
+        src.has_more = [this] { return more; };
+        src.on_ack = [this](const std::vector<std::string>& tokens) {
+            std::string e = "ack";
+            for (const auto& t : tokens)
+                e += ":" + t;
+            events.push_back(e);
+        };
+    }
+};
+
+struct HookRig {
+    std::map<std::string, std::string> kv;
+    HookSource hs;
+    std::vector<std::string> need; // what the server answers
+    int sends = 0;
+    bool last_blob = false;
+    SyncScheduler sched;
+
+    HookRig()
+        : sched(
+              "agent-1",
+              [this](const std::string& k) {
+                  const auto it = kv.find(k);
+                  return it == kv.end() ? std::string{} : it->second;
+              },
+              [this](const std::string& k, const std::string& v) { kv[k] = v; },
+              [this](const std::vector<std::pair<std::string, std::string>>&,
+                     const std::vector<std::pair<std::string, std::string>>& blobs)
+                  -> std::optional<std::vector<std::string>> {
+                  ++sends;
+                  last_blob = !blobs.empty();
+                  return need;
+              }) {
+        sched.add_source(hs.src);
+    }
+    // The first send: past the startup jitter. Returns the clock.
+    std::int64_t first_send() {
+        sched.tick(1000);
+        sched.tick(1000 + 700);
+        REQUIRE(sends == 1);
+        return 1700;
+    }
+};
+
+} // namespace
+
+TEST_CASE("SyncScheduler: on_force_full runs before collect when nothing has been acknowledged yet, "
+          "and ack follows the send",
+          "[sync][scheduler][v3]") {
+    HookRig r;
+    r.first_send();
+    CHECK(r.last_blob);
+    CHECK(r.hs.events == std::vector<std::string>{"force", "collect", "ack"});
+}
+
+TEST_CASE("SyncScheduler: an unchanged pass neither forces nor sends a blob; wants_blob forces the blob",
+          "[sync][scheduler][v3]") {
+    HookRig r;
+    std::int64_t t = r.first_send();
+    r.hs.events.clear();
+    t = live_advance(r.sched, t, t + 86400 + 1, [&] { return r.sends == 2; });
+    REQUIRE(r.sends == 2);
+    CHECK_FALSE(r.last_blob);
+    CHECK(r.hs.events == std::vector<std::string>{"collect", "ack"}); // no force: not due
+
+    // The hash did not move, but the source emitted a section (a status or token changed).
+    r.hs.wants = true;
+    r.hs.events.clear();
+    t = live_advance(r.sched, t, t + 86400 + 1, [&] { return r.sends == 3; });
+    REQUIRE(r.sends == 3);
+    CHECK(r.last_blob);
+}
+
+TEST_CASE("SyncScheduler: request_now forces the source, so the send carries a full payload",
+          "[sync][scheduler][v3]") {
+    HookRig r;
+    std::int64_t t = r.first_send();
+    r.hs.events.clear();
+    REQUIRE(r.sched.request_now("installed_software") == std::vector<std::string>{"installed_software"});
+    r.sched.tick(t + 10);
+    REQUIRE(r.sends == 2);
+    CHECK(r.last_blob);
+    CHECK(r.hs.events == std::vector<std::string>{"force", "collect", "ack"});
+}
+
+TEST_CASE("SyncScheduler: the weekly floor calls on_force_full before collect", "[sync][scheduler][v3]") {
+    HookRig r;
+    std::int64_t t = r.first_send();
+    r.hs.events.clear();
+    // Seven days of unchanged hash-only passes, then the floor falls due.
+    const auto forced = [&] {
+        return std::find(r.hs.events.begin(), r.hs.events.end(), "force") != r.hs.events.end();
+    };
+    t = live_advance(r.sched, t, t + 8 * 86400, forced);
+    const auto it = std::find(r.hs.events.begin(), r.hs.events.end(), "force");
+    REQUIRE(it != r.hs.events.end());
+    REQUIRE(it + 1 != r.hs.events.end());
+    CHECK(*(it + 1) == "collect"); // told BEFORE it collects
+    CHECK(r.last_blob);            // and the floor send carries the payload
+}
+
+TEST_CASE("SyncScheduler: a whole-source nack forces every section full next; a section nack does not",
+          "[sync][scheduler][v3]") {
+    HookRig r;
+    std::int64_t t = r.first_send();
+
+    // A per-section nack token: the source is nacked and the token reaches on_ack...
+    r.hs.events.clear();
+    r.hs.wants = true;
+    r.need = {"installed_software:runtimes.python"};
+    t = live_advance(r.sched, t, t + 86400 + 1, [&] { return r.sends == 2; });
+    REQUIRE(r.sends == 2);
+    CHECK(r.hs.events.back() == "ack:installed_software:runtimes.python");
+    // ...but the scheduler does not force EVERY section full for it: the source resends the one.
+    r.need = {};
+    r.hs.events.clear();
+    t = live_advance(r.sched, t, t + 1000, [&] { return r.sends == 3; });
+    REQUIRE(r.sends == 3);
+    CHECK(r.hs.events.front() == "collect"); // no "force"
+
+    // The whole-source token DOES force: on_force_full runs before the next collect.
+    r.need = {"installed_software"};
+    r.hs.events.clear();
+    t = live_advance(r.sched, t, t + 86400 + 1, [&] { return r.sends == 4; });
+    REQUIRE(r.sends == 4);
+    CHECK(r.hs.events.back() == "ack:installed_software");
+    r.need = {};
+    r.hs.events.clear();
+    t = live_advance(r.sched, t, t + 1000, [&] { return r.sends == 5; });
+    REQUIRE(r.sends == 5);
+    CHECK(r.hs.events == std::vector<std::string>{"force", "collect", "ack"});
+    CHECK(r.last_blob);
+}
+
+TEST_CASE("SyncScheduler: a token that merely starts with the source name, or names another source, "
+          "is not this source's nack",
+          "[sync][scheduler][v3]") {
+    HookRig r;
+    std::int64_t t = r.first_send();
+    r.hs.events.clear();
+    r.need = {"device_ci:x", "installed_software_extra", "installed_softwar"};
+    t = live_advance(r.sched, t, t + 86400 + 1, [&] { return r.sends == 2; });
+    REQUIRE(r.sends == 2);
+    CHECK(r.hs.events.back() == "ack"); // delivered with no tokens: a clean acknowledgement
+}
+
+TEST_CASE("SyncScheduler: a source that left part of its payload comes back at the minimum tick",
+          "[sync][scheduler][v3]") {
+    HookRig r;
+    r.hs.more = true;
+    std::int64_t t = r.first_send();
+    // Not the next daily slot: kMinTickSeconds after the clean acknowledgement.
+    r.sched.tick(t + SyncScheduler::kMinTickSeconds.count() - 1);
+    CHECK(r.sends == 1);
+    r.hs.hash = "h2"; // the rest of the payload arrived in the held set
+    r.hs.more = false;
+    r.sched.tick(t + SyncScheduler::kMinTickSeconds.count());
+    CHECK(r.sends == 2);
+    CHECK(r.last_blob);
+    // ...and with nothing left it settles back to its regular cadence.
+    r.sched.tick(t + 2 * SyncScheduler::kMinTickSeconds.count() + 5);
+    CHECK(r.sends == 2);
+}
+
+TEST_CASE("SyncScheduler + installed_software: a forced send always carries a full section per facet "
+          "(never a header-only blob)",
+          "[sync][scheduler][collector][v3]") {
+    fake_all_supported();
+    Collector c(every_plugin());
+    SyncSource src = c.src;
+    src.window.reset(); // plain phase-slot cadence: this case is about the blob, not the window
+    std::vector<std::string> blobs_sent;
+    std::vector<std::string> hashes_sent;
+    SyncScheduler sched(
+        "agent-1",
+        [&](const std::string& k) {
+            const auto it = c.kv.find(k);
+            return it == c.kv.end() ? std::string{} : it->second;
+        },
+        [&](const std::string& k, const std::string& v) { c.kv[k] = v; },
+        [&](const std::vector<std::pair<std::string, std::string>>& hashes,
+            const std::vector<std::pair<std::string, std::string>>& blobs)
+            -> std::optional<std::vector<std::string>> {
+            for (const auto& h : hashes)
+                hashes_sent.push_back(h.second);
+            blobs_sent.push_back(blobs.empty() ? std::string{} : blobs.front().second);
+            return std::vector<std::string>{};
+        });
+    sched.add_source(src);
+
+    sched.tick(1000);
+    sched.tick(1700);
+    REQUIRE(blobs_sent.size() == 1);
+    CHECK(full_sections(blobs_sent[0]) == 11); // first contact: every facet in full
+
+    c.pass_cooldown();
+    std::int64_t t = live_advance(sched, 1700, 1700 + 86400 + 1, [&] { return blobs_sent.size() == 2; });
+    REQUIRE(blobs_sent.size() == 2);
+    CHECK(blobs_sent[1].empty()); // nothing changed: the hash alone
+    CHECK(hashes_sent[1] == hashes_sent[0]);
+
+    // A forced "Sync now": the source is told, so every facet is full and the blob is never empty.
+    REQUIRE(sched.request_now("installed_software").size() == 1);
+    sched.tick(t + 5);
+    REQUIRE(blobs_sent.size() == 3);
+    REQUIRE_FALSE(blobs_sent[2].empty());
+    CHECK(full_sections(blobs_sent[2]) == 11);
 }

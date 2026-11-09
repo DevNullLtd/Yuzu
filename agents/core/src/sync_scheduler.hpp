@@ -62,6 +62,31 @@ struct SyncSource {
     /// Unset (the default) keeps the interval/phase-slot cadence unchanged. A
     /// compile-time default per source: no settings channel pushes it yet.
     std::optional<SyncWindow> window;
+
+    /// A source that keeps its own per-section state (installed_software, blob v3) is told when
+    /// the scheduler is about to send FULL regardless of what it collects: the operator forced
+    /// the source (request_now), the server nacked it (force_full), no hash has ever been
+    /// acknowledged, or the weekly floor is due. Called on the ticking thread immediately
+    /// BEFORE collect(), in both tick passes, so a forced send always carries a full payload.
+    /// Unset for every other source.
+    std::function<void()> on_force_full;
+
+    /// OR-ed into the full decision after the hash comparison: true when the payload this
+    /// source just collected must reach the server even though its content hash did not move
+    /// (a section whose status or token changed). A source that returns true MUST have put
+    /// something the server can parse in the blob. Unset = the hash alone decides.
+    std::function<bool()> wants_blob;
+
+    /// The acknowledgement of one report that carried this source: the `need_full` tokens that
+    /// name it (the source name itself, or `<name>:<detail>`), empty on a clean acknowledgement.
+    /// Called on the ticking thread BEFORE the scheduler persists its own state, on both the
+    /// clean and the nacked branch. Unset = nothing to commit.
+    std::function<void(const std::vector<std::string>&)> on_ack;
+
+    /// True when the last collect() deliberately left part of the payload for the next one
+    /// (a first contact split over several calls). A clean acknowledgement then re-fires the
+    /// source after kMinTickSeconds instead of at its next regular slot. Unset = false.
+    std::function<bool()> has_more;
 };
 
 /// Sanitise a skip reason for the KV / heartbeat tag: keep [A-Za-z0-9_.:=,-],
@@ -204,10 +229,16 @@ private:
     /// offset in [0, kCatchUpWindow), and persist it. last_hash and force_full are
     /// left untouched.
     void catch_up_if_overdue(std::size_t idx, std::int64_t now_secs);
+    /// The part of the full decision that does not depend on the collected hash: an operator
+    /// force or a server nack, no acknowledged hash yet, or the weekly floor. Computed BEFORE
+    /// collect() so a source can be told (SyncSource::on_force_full) and is therefore
+    /// guaranteed to produce a full payload whenever decide_full will ask for one.
+    bool forced_full_due(const State& st, std::int64_t now_secs) const;
     /// Hash-skip decision for one source at `now_secs`, given its freshly
     /// collected `hash` — factored out of tick() so the forced-source (pass 1)
     /// and batched (pass 2) paths make the identical decision.
-    bool decide_full(const State& st, const std::string& hash, std::int64_t now_secs) const;
+    bool decide_full(std::size_t idx, const State& st, const std::string& hash,
+                     std::int64_t now_secs) const;
     /// Apply one source's ReportInventory outcome (a name lookup against the
     /// ack's need_full list) to its persisted State — the exact success/nack
     /// state-transition tick() ran inline before this factor-out, now shared by

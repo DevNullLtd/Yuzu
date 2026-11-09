@@ -9,51 +9,46 @@ cadences.
 
 ## What is collected
 
-- **Machine-wide installed software** (blob contract v2): name, version,
-  publisher, install date, plus the package-manager fields below. The daily
-  sync calls seven inventory actions in-process and merges their rows:
-  `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
-  account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
-  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew;
+- **Machine-wide installed software** (blob contract v3): name, version,
+  publisher, install date, plus the package-manager fields below and
+  `install_location`. The daily sync calls eleven inventory actions in-process,
+  one at a time, and reports each as its own section (see "The per-source
+  report (blob v3)" below): `installed_apps` `list_inventory` (Windows: `HKLM`
+  plus the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
+  macOS: `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew;
   Chocolatey and winget on Windows) and `store_packages` (Linux snaps and
   flatpaks; the Windows Appx roster), and
   `windows_optional_features` `list` and `msi_packages` `list_inventory`
   (Windows machine-context MSI products), `runtimes` `python`, `dotnet` and `jvm` (installed
-  Python, .NET and Java runtimes), and `middleware` `ibm_mq` (IBM MQ
-  installations; Linux). An action whose plugin is not loaded, or
-  that answers "unsupported on this OS", is skipped. A plugin that is not
-  loaded is logged at warn (the rows its action produced are removed on the next
-  report); without `installed_apps` the source stays idle and sends nothing,
-  because it anchors the report.
-  An action that fails (non-zero exit, truncated output, a typed result
-  completeness of `PARTIAL` unless the action opts in, a `constrained` or
-  `unavailable` answer, a malformed status row, no feature rows from
-  `windows_optional_features`, or no applications at all from `installed_apps`)
-  skips that day's report and keeps the last good state — nothing is deleted. A
-  `constrained` `managers` answer that still names at least one present manager
-  is accepted: the constraint concerns manager facts the presence row never
-  carried. A `constrained` `runtimes` `dotnet` or `jvm` answer that still lists at least one install is
-  accepted the same way: the constraint names a home or root that could not be fully read, the installs
-  found keep their rows and any install the read could not see is deleted server-side with no marker;
-  one that lists none skips the device's whole installed-software report for the day (retried daily
-  on backoff) and keeps the last good state. A `constrained` `runtimes` `python` or `middleware` `ibm_mq` answer is the other
-  exception: it withholds only that source's rows and the cycle continues, so the
-  stored rows of that source are removed until a later read succeeds (see
-  Troubleshooting). A skipped cycle
-  is retried sooner on a phase-aligned backoff: waits that double from 1 h after
-  each consecutive skip (1 h, 2 h, 4 h, 8 h, …), each retry capped so it never
-  lands after the next daily slot — up to four extra attempts — then one attempt
-  per daily slot until a collection succeeds.
-  While it is skipping, the agent publishes the heartbeat tags
-  `yuzu.sync.installed_software.skip_streak` (consecutive skips since the last
-  success, uncapped) and `yuzu.sync.installed_software.last_skip` (the reason
-  token); the heartbeat carries them to the server, but no server page or API
-  returns them yet, so read the reason from the agent's own log. Every row's
+  Python, .NET and Java runtimes), `middleware` `ibm_mq` (IBM MQ
+  installations; Linux) and `hardware` `drivers_inventory` (Windows PnP signed drivers; Linux
+  loaded kernel modules). Each action runs on its own bounded worker, 120 seconds for
+  `installed_apps`, `windows_optional_features` and `hardware`, 60 for the rest. **A source that
+  cannot answer costs only its own section, never the report.** A plugin that is not loaded, or
+  that answers "unsupported on this OS", is reported `not_collected` (tokens `not_loaded` and
+  `unsupported`). An action that fails (a non-zero exit, `rc=<n>`; truncated output, `truncated`; a
+  `constrained` or malformed status row or an `unavailable` answer, the status tokens; a typed result
+  completeness of `PARTIAL`, the plugin's provenance token; no feature rows from
+  `windows_optional_features`; or no applications at all from `installed_apps`, `no_rows`) is
+  reported `constrained` with that token and contributes **no rows**: the server keeps the source's
+  last confirmed rows and shows them as unconfirmed until a later `full` section confirms them, so a
+  degraded read never deletes anything. This holds for every source, including `runtimes` `python`,
+  `dotnet` and `jvm`, `middleware` `ibm_mq` and `pkg_inventory` `managers`, whose constrained answers
+  once kept some rows or removed all of them; a clean read that finds nothing (`supported` with zero
+  rows) is a `full` section with no rows and does retire the source's stored rows. A worker still
+  running from an earlier day is reported `timeout` with token `busy` and is not started twice; when a
+  worker cannot be started the token is `rejected`; a source whose rows exceed 20,000, or whose full
+  section cannot fit in one report, is `oversize` (`rows=<n>`, `bytes=<n>`) and sends no rows. A
+  status-only section is sent again each day it persists, so a changed reason reaches the server. The
+  source no longer skips a report, so it no longer publishes the
+  `yuzu.sync.installed_software.skip_streak` and `yuzu.sync.installed_software.last_skip` heartbeat
+  tags (the other sources still do); a failing source is its section's status and token instead. Every row's
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
   `windows_optional_features.list`, `msi_packages.list_inventory`,
-  `runtimes.python`, `runtimes.dotnet`, `runtimes.jvm`, `middleware.ibm_mq`); `package_id`
+  `runtimes.python`, `runtimes.dotnet`, `runtimes.jvm`, `middleware.ibm_mq`,
+  `hardware.drivers_inventory`); `package_id`
   is empty for these producers except `msi_packages.list_inventory`, where it is
   the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
@@ -92,19 +87,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch), except `publisher`, which is never empty: see below. Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java | Chocolatey | winget | Appx package |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` | `app` | `app` | `pkg` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` | `dotnet` | `jvm` | `chocolatey` | `winget` | `appx` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) | ✓ (`.NET Runtime`, `.NET SDK`, `.NET Framework`) | ✓ (`Java JDK`, `Java JRE`) | ✓ (package id) | ✓ (`winget`) | ✓ (package name) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ | ✓ (empty if the install records none) | ✓ (empty if the build has no `release` file) | ✓ (nuspec `<version>`; empty if unreadable) | ✓ (App Installer package version) | ✓ (from the package full name) |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ |
-  | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` | `Microsoft` | the build's self-reported `IMPLEMENTOR`, else `via:jvm` | `via:chocolatey` | `via:winget` | `via:appx` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product | Python | IBM MQ | .NET | Java | Chocolatey | winget | Appx package | Device driver |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` | `app` | `app` | `app` | `app` | `pkg` | `app` | `app` | `driver` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` | `python` | `ibm_mq` | `dotnet` | `jvm` | `chocolatey` | `winget` | `appx` | `windows` (WMI) or `kernel_module` (Linux) |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) | ✓ (`Python`) | ✓ (`IBM MQ`) | ✓ (`.NET Runtime`, `.NET SDK`, `.NET Framework`) | ✓ (`Java JDK`, `Java JRE`) | ✓ (package id) | ✓ (`winget`) | ✓ (package name) | ✓ (driver or module name) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) | ✓ (Windows and macOS: x.y.z; Linux: major.minor only) | ✓ | ✓ (empty if the install records none) | ✓ (empty if the build has no `release` file) | ✓ (nuspec `<version>`; empty if unreadable) | ✓ (App Installer package version) | ✓ (from the package full name) | ✓ (driver version; a Linux module's `version` file, else empty) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ | — |
+  | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` | `Microsoft` | the build's self-reported `IMPLEMENTOR`, else `via:jvm` | `via:chocolatey` | `via:winget` | `via:appx` | provider, else signer, else `via:windows`; Linux `via:kernel_module` |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — | ✓ (Windows driver date) |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — | `signed`/`unsigned`; empty = unknown |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
   **`publisher` is never empty.** It is the vendor the source itself declares; when a
   source declares none, it is the label `via:<ecosystem>` (`via:brew`, `via:snap`,
@@ -154,7 +149,7 @@ cadences.
   `version` is empty because a flatpak branch (`stable`, `51`) is a ref, not a
   version. An inactive revision is not installed software and is not
   collected, and an incomplete listing (for example an unreadable flatpak
-  directory) skips the cycle rather than publishing a partial roster.
+  directory) is reported `constrained` and contributes no rows rather than a partial roster.
 
   **Windows package managers and Store apps** are collected through
   `pkg_inventory` (`source` `pkg_inventory.packages`, `pkg_inventory.managers`
@@ -183,9 +178,9 @@ cadences.
   Chocolatey package is listed with an empty version and the status stays supported. A roster key or `lib`
   directory that is denied (`constrained`, reason
   `windows:pkg_inventory:<source>:access_denied`), over the row or byte cap or
-  cannot be listed makes that daily cycle skip for every source: the previously
-  stored roster is kept and the agent logs a warning (this policy is shared with
-  snaps and flatpaks and is tracked in #6093).
+  cannot be listed makes that one source `constrained` for the day: its previously
+  stored roster is kept and shown as unconfirmed, the other sources are still reported
+  and the agent logs a warning.
 
   **Windows optional features** are collected with `ecosystem`
   `optional_feature` and `kind` `feat`, every feature the host knows, enabled or
@@ -205,14 +200,14 @@ cadences.
   user is never listed by this source. A property the product does not have is
   empty, except `publisher`, which becomes `via:msi`; a product with no name (for example one that is advertised but not
   installed) is dropped. A property read that fails for any other reason makes
-  the whole roster constrained, so the cycle is skipped rather than a product
-  silently disappearing. The same product normally also has an `app`/`windows`
+  the whole roster constrained, so the source is reported `constrained` (its stored rows kept)
+  rather than a product silently disappearing. The same product normally also has an `app`/`windows`
   row from `installed_apps`' registry walk, so a Windows host normally carries
   two rows per MSI product. The `msi` row adds the product code (stored as
   `package_id`; the REST and MCP software routes do not return that column yet)
   and the machine-context guarantee. Install location and uninstall string are
   not collected (wire slots 13-14 stay reserved and empty, #5186). If the
-  enumeration itself fails the cycle is skipped (see Troubleshooting).
+  enumeration itself fails the source is reported `constrained` (see Troubleshooting).
 
   **Python interpreters** are collected through `runtimes` `python` (all three OSes;
   `source` `runtimes.python`) as one `app` row per interpreter, `name` `Python`,
@@ -233,11 +228,11 @@ cadences.
   interpreter, so it is not guessed.
   Homebrew, pyenv, conda, virtual environments and Xcode's Python are not walked. A
   read that cannot be completed (an unreadable or network-mounted root, a cap, an
-  access-denied registry key) withholds only the `python` rows from that day's report
-  and every other source is still sent; the report replaces the device's stored
-  software rows, so the stored `python` rows are removed until a read succeeds again
-  (see Troubleshooting). A missing or unreadable version file never does this, the
-  row reports the version it could determine.
+  access-denied registry key) reports only the `python` source `constrained` (the status-only
+  section carries the tokens) and every other source is still sent; the server keeps the stored
+  `python` rows and shows them as unconfirmed until a read succeeds again (see Troubleshooting). A
+  missing or unreadable version file never does this, the row reports the version it could
+  determine.
 
   **.NET runtimes** are collected through `runtimes` `dotnet` (all three OSes; `source`
   `runtimes.dotnet`) as one `app` row per installed runtime, SDK or Framework version, `ecosystem`
@@ -248,8 +243,9 @@ cadences.
   zip or `dotnet-install` copy is not); Linux and macOS list the `shared/<framework>/<version>` and `sdk/<version>` directory names
   under the standard machine roots (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; macOS
   `/usr/local/share/dotnet`). Homebrew, `dotnet-install` and per-user installs are not walked.
-  A constrained read keeps the rows it found (see the managers rule above); if it found none, the day's
-  report is skipped and the stored `dotnet` rows stay.
+  A constrained read (a home or root that could not be fully read) reports the `dotnet` source
+  `constrained` and sends none of the rows it did find; the stored `dotnet` rows stay, shown as
+  unconfirmed.
 
   **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
@@ -267,9 +263,8 @@ cadences.
   and a home on a removable, optical, remote or otherwise non-fixed drive keeps its row but its
   `release` file is not read (`windows:runtimes:jvm:release_unreadable`); `supported` with no rows
   means none was found at the standard roots, not that none is installed. A
-  constrained read keeps the rows it found (installs it could not read are deleted server-side with no
-  marker); if it found none, the device's whole installed-software report is skipped for the day and
-  the stored `jvm` rows stay. The macOS Java leg is verified against fixture
+  constrained read reports the `jvm` source `constrained` and sends none of the rows it did find; the
+  stored `jvm` rows stay, shown as unconfirmed. The macOS Java leg is verified against fixture
   trees built from the documented bundle layout, not a real JDK install.
 
   **IBM MQ** is collected through the `middleware` plugin's `ibm_mq` action (Linux; `source`
@@ -282,14 +277,12 @@ cadences.
   unprivileged uid on one IBM MQ 9.4.5.0 Ubuntu-debs install; not measured as the packaged
   `yuzu-agent` account or on another version or distribution). If the answer is `constrained`
   (an access or walk fault such as a refused read or a cap; an unusable `mqinst.ini` stanza
-  beside a usable one is only logged) the collector withholds this source's rows for the
-  cycle, logs a warning, and carries on with every other source, rather than failing the
-  whole report. Because each cycle replaces the agent's stored inventory, the withheld IBM MQ
-  rows are REMOVED from the stored inventory until the source recovers, so they are absent
-  from the Software page. The server sees no signal for this and cannot tell a withheld
-  source from one with no IBM MQ installed; the state is visible only by running the
-  `ibm_mq` action on the device and reading its status row. This is the second such exception to the
-  skip-the-cycle rule above, with Python. Windows and macOS answer `unsupported` (planned).
+  beside a usable one is only logged) the collector reports this source `constrained` with the
+  tokens, logs a warning, and carries on with every other source. The stored IBM MQ rows are
+  kept (shown as unconfirmed) until a later read confirms them; a `constrained` section is the
+  signal the server holds, and it cannot by itself tell a device with no IBM MQ from one whose
+  read keeps failing: run the `ibm_mq` action on the device and read its status row. Windows and
+  macOS answer `unsupported` (planned) and are reported `not_collected`.
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -322,20 +315,23 @@ cadences.
   precision the receipt never recorded. Bounded at 5000 receipts per collection,
   again a runaway guard rather than a routine limit.
 
-  **On every OS, degraded collections are skipped, not published.** If
+  **On every OS, degraded collections are reported, not published.** If
   any acquisition step does not complete on its own terms — a timeout, a spawn
   failure, a killed child, a capture truncation, a nonzero exit from a
   top-level enumerator, exhaustion of the 120-second whole-collection budget
   mid-enrichment or mid-receipt-walk, either runaway guard above, or (macOS
   only) `system_profiler` or `pkgutil` running successfully and reporting
-  nothing at all — the agent reports the whole collection as degraded and the
-  daily sync SKIPS that cycle. The previous inventory is retained. This is
+  nothing at all — the agent reports the whole collection as degraded (return code 1,
+  result `CONSTRAINED`/`PARTIAL`, no rows) and the daily sync reports the
+  `installed_apps` source `constrained` with a status-only section. The server's previous
+  rows for it are retained. This is
   deliberate: an incomplete snapshot is indistinguishable from a complete one
   once it reaches the server, so the omissions would be read as uninstalls. A
   stale inventory is recoverable; a confidently wrong one is not. Degraded
   cycles are logged as warnings, and a host that degrades every day will stop
-  updating — treat repeated warnings as actionable. On Windows the degraded
-  conditions are the registry ones described below.
+  updating this source — treat repeated warnings as actionable. A clean pass declares
+  result `OK`/`FULL` on every OS, the signal the sync reads before it publishes rows. On Windows the
+  degraded conditions are the registry ones described below.
 
   The "ran but reported nothing" trigger is macOS-only by design: every Mac has
   GUI applications and installer receipts, so zero means the tool failed. On
@@ -346,12 +342,14 @@ cadences.
   subprocess cases above do not apply, but an Uninstall root that cannot be
   opened or enumerated to the end, or an application subkey whose open fails
   (access denied above all), marks the collection degraded: `list_inventory`
-  emits no rows and returns rc 1 (the daily sync skips the cycle; see the
+  emits no rows and returns rc 1 (the daily sync reports the source `constrained`; see the
   troubleshooting entry), and `list`/`query` return one
   `error|installed_apps: acquisition degraded (...)` row with rc 1 instead of a
   partial list; `list_per_user` keeps the rows it read and appends
-  `warning|hive_read_failed`. A missing HKCU or WoW6432Node Uninstall key is
-  normal, not degraded. A value-level failure (a non-REG_SZ or over-64 KiB
+  `warning|hive_read_failed`. A missing HKCU Uninstall key is normal, and a failed read of the
+  agent identity's own HKCU never degrades the machine inventory (it holds per-user entries the
+  inventory does not report); a missing WoW6432Node Uninstall key is normal only on a 32-bit OS and
+  degrades the collection on a 64-bit one. A value-level failure (a non-REG_SZ or over-64 KiB
   DisplayName) is not distinguished from an absent value (plugin README caveat
   1).
 - **rpm fields:** `publisher` is the rpm **VENDOR** tag, else the **PACKAGER**
@@ -369,10 +367,11 @@ cadences.
   them and stores neither, and an agent that fills them gets a full-resend request
   every cycle. The sectioned v3 blob stores `install_location` and keeps
   `uninstall_string` reserved (see "Install type, scope and location, and the
-  sectioned report" below). No shipped agent sends either slot, and the agent-side
-  change that starts sending `install_location` decides what a machine-scope
-  collector may put in it, since a path under a user's profile names an account
-  (ADR-0016 §8, #5186). (The only `HKCU`
+  sectioned report" below). This build's agent sends `install_location` (the Windows
+  `InstallLocation`, the macOS `.app` path) and never `uninstall_string`; since a path under a
+  user's profile names an account, the agent blanks any location under `<drive>:\Users\`,
+  `/Users/`, `/home/` or `/root` before it hashes or sends it, so the stored value and the change
+  history name machine-scope roots only (ADR-0016 §8, #5186). (The only `HKCU`
   read is the agent's own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
   the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
@@ -403,13 +402,16 @@ database.
   `package_manager` (`pkg_inventory.packages` and `pkg_inventory.managers`, which is the
   Homebrew presence row), `store` (`pkg_inventory.store_packages`), `optional_feature`
   (`windows_optional_features.list`), `runtime` (`runtimes.python`) and `middleware`
-  (`middleware.ibm_mq`). `component` and `driver` are reserved. A row whose source and ecosystem are both
+  (`middleware.ibm_mq`), and `driver` (`hardware.drivers_inventory`). `component` is reserved. A row whose source and ecosystem are both
   unrecognised reads an empty `install_type`.
 - **`install_scope`** is `machine` or `user`. The sync collects machine scope only, so every row
   reads `machine`.
 - **`install_location`** is the folder the software was installed into, when the collector reports
-  one. It is stored only from the v3 blob; the v2 blob's slot is ignored, so it is empty for every
-  device until an agent that sends v3 is deployed.
+  one. It is stored only from the v3 blob (the v2 blob's slot is ignored), so a device that has not
+  yet sent a v3 report has none. The agent fills it for Windows applications (the registry's
+  `InstallLocation`) and macOS applications (the `.app` path); Linux packages, MSI products, store
+  packages and the other sources have no single install folder, so it is empty for them. A folder
+  under an account's home is never sent (the agent blanks it).
 - **`purl`** is the row's Package URL (for example
   `pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12`), composed by the server from the
   row's name, version, release, epoch, architecture and distribution. Linux package rows
@@ -461,8 +463,8 @@ the last case is logged as a warning and, by decision, no counter or alert count
 software is simply deleted from the device's list; the history entry is the record that it was
 there. History older than 400 days is pruned, and decommissioning a device deletes its history
 and its components with it. Nothing in
-the dashboard or the API shows the change history or the components yet. No shipped agent sends v3
-yet. Operators can see the outcome of each section in
+the dashboard or the API shows the change history or the components yet. The agent of this build
+sends v3 (and no longer has a v2 writer). Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
 `need_full`, `mismatch`, `rejected` or `error`, and `facet` is the collector source
 (`unknown` for a name the server does not recognise), and the number of history entries in
@@ -472,15 +474,16 @@ again counts as `need_full`. A blob the server cannot split into sections at all
 as `dropped` there, and a call whose transaction failed counts as `error` for every section of the
 call that was not refused (a refused section stays `rejected`).
 
-**Sequencing, and what the shipped agent does with a per-section request.** Bring up every server
-replica before the agents of the same build enroll. The agent in this release does not understand the per-section request: it
-looks for its own source name in the acknowledgement's `need_full` list, and
-`installed_software:<source>` is not that name, so a per-section request reads to it as a clean
-sync until the agent release that sends v3 reads the new form. Nothing is lost today, because
-no shipped agent sends v3. One behaviour also changes with the format: when a collector that
-withholds its rows on a constrained read (the `drop_source` policy, for example
-`middleware.ibm_mq`) cannot answer, a v2 report replaces the device's rows without that
-source's, while a v3 report records a status-only section and keeps the previous rows.
+**Sequencing, and how the agent answers a per-section request.** Bring up every server
+replica before the agents of the same build enroll (a hard cutover: the agent has no v2 writer, and
+this record does not describe an agent of this build against an earlier server). The agent treats a
+nack token that equals its source name as a request to resend every section in full, and an
+`installed_software:<source>` token as a request to resend that one section in full: only the named
+section is sent again, the others are not. A section the agent could not collect (a plugin that
+failed, timed out or is not loaded) is sent as a status-only section and keeps the previous rows,
+whatever the source: the older per-source behaviours that removed a constrained source's rows
+(`runtimes.python`, `middleware.ibm_mq`) or kept only the rows it had seen (`runtimes.dotnet`,
+`runtimes.jvm`, `pkg_inventory.managers`) are gone.
 
 **When a section is refused.** `yuzu_inventory_section_ingest_total{outcome="rejected"}` counts a
 section that broke the blob v3 grammar, and the warn-level server log line "v3 section(s) ...
@@ -530,9 +533,20 @@ whole source name.
   immediate today. If its first send fails (the server is unreachable), the
   retries follow the pattern in Gentle catch-up, so it can arrive up to about
   45 minutes after the click.
+- **Sections and deltas.** The installed-software report is sectioned per source (see "The
+  per-source report (blob v3)"). The first report, and any section the server asks for again, is
+  sent in full; after that a changed source sends only a delta (the rows that left by hash, the
+  rows that arrived) and an unchanged source sends nothing. A source that did not answer sends a
+  status-only section naming why; the server keeps its previous rows. Sources run one at a time,
+  each on its own bounded worker (120 s for `installed_apps`, `windows_optional_features` and
+  `hardware`, 60 s for the rest), so one plugin that hangs costs its own section only, and it is
+  not started again while the earlier run is still going (`busy`). A first report larger than one
+  call (20,000 rows or 3 MiB) is split across successive calls 30 seconds apart. A source whose
+  rows alone cannot fit in one report is `oversize` and sends no rows. Sync now, a server request
+  for the whole source and the weekly safety net each resend every section in full.
 - **Hash-skip.** If a device's installed software hasn't changed since its last
-  successful sync, the agent sends only a small **content hash** instead of the
-  full list. The server replies asking for the full list only when it can't match
+  successful sync, the agent sends only a small **content hash** (the `v3:` report hash, over the
+  sections it holds) instead of any section. The server replies asking for the full list only when it can't match
   the hash (e.g. a fresh/restored server). A full list is also sent at least once
   a week regardless, as a safety net (up to 8 days for the nightly window, across
   a spring-forward clock change).
@@ -1084,59 +1098,53 @@ credentials.)
 ## Troubleshooting
 
 **The `installed_software` table is empty after upgrading agents.** Most likely
-the `installed_apps` plugin isn't loaded — the sync source then idles
-(it logs `sync: installed_apps plugin not loaded` at **warn**, and publishes
-`installed_apps:not_loaded` as its `yuzu.sync.installed_software.last_skip`
-heartbeat tag). Verify the
+the `installed_apps` plugin isn't loaded: the source then reports
+`installed_apps.list_inventory` as `not_collected` (token `not_loaded`) and logs
+`sync: installed_apps plugin not loaded` at **warn**; the other sources are still reported,
+but the device has no application rows. Verify the
 agent was built with `-Dbuild_agent=true` (the default for released binaries)
 and that `installed_apps` is present in the agent's `--plugin-dir`. The sync also
 only runs once per ~24 h per agent (spread across the fleet), so a freshly
 enrolled agent populates within minutes (jittered first sync), not instantly.
 
-**One host stopped reporting after upgrading agents; its log shows
-`sync: <plugin>.<action> … — skipping this cycle`.** One of the collected
-actions failed, and a failure skips the WHOLE report for that day — the
-applications too — and keeps the last good inventory (nothing is deleted).
-Typical causes: Windows DISM busy or `api_unavailable` (the
-`windows_optional_features` action answers `feature|unavailable|…`), a
-constrained Homebrew `packages` read on macOS (a constrained `managers` answer
-that names a present manager no longer skips), or on Linux an unreadable,
+**One source of a host reports nothing new; its log shows
+`sync: <plugin>.<action> … — reported constrained` (or `timeout`, `oversize`).** One of the
+collected actions failed, and a failure now affects only that source's section: the other
+sources are reported as usual and the failing source keeps its last good rows (nothing is
+deleted; they read as unconfirmed). The section's token names the cause:
+`rc=<n>` or `truncated` (the action exited non-zero or its output was cut at the capture cap),
+the action's own status tokens, the plugin's provenance token for a typed `PARTIAL` result, `bad_status`
+(a malformed status row), `no_rows` (an empty `installed_apps` listing: never reported as
+"everything uninstalled"), `timeout` (the action did not return within its limit; the worker is left
+to finish), `busy` (an earlier run is still going), `rejected` (no worker could be started), and
+`rows=<n>` or `bytes=<n>` (`oversize`: more software than one report can carry, so no rows are
+sent; review the host's inventory rather than removing a plugin). Typical causes: Windows DISM busy
+or `api_unavailable` (the `windows_optional_features` action answers `feature|unavailable|…`), a
+constrained Homebrew `packages` read on macOS, or on Linux an unreadable,
 symlinked or over-cap snap or flatpak store directory, or a MAC (SELinux or
-AppArmor) denial, which makes `store_packages` constrained; the skip reason
-reads `pkg_inventory.store_packages:linux:<source>:<detail>`, and the remedy is
+AppArmor) denial, which makes `store_packages` constrained (tokens
+`linux:<source>:<detail>`); the remedy is
 read access for the agent identity to `/var/lib/snapd/snaps` and
-`/var/lib/flatpak/{app,runtime}`. The warning names the action and the
-reason. A Windows host whose reason reads
-`msi_packages.list_inventory:windows:msi_enum:<code>` has a Windows Installer
-enumeration error (for example `1610`, a corrupt registration): the skip repeats
-every cycle until the host's Windows Installer registration is repaired, and
-nothing is deleted meanwhile (`last_seen` stops advancing). A reason that reads
-`msi_packages.list_inventory:windows:msi_prop:<code>` means a product property
+`/var/lib/flatpak/{app,runtime}`. A Windows host whose token reads
+`windows:msi_enum:<code>` has a Windows Installer
+enumeration error (for example `1610`, a corrupt registration): `msi_packages.list_inventory`
+repeats that status every cycle until the host's Windows Installer registration is repaired, and
+its stored rows are kept meanwhile. A token that reads
+`windows:msi_prop:<code>` means a product property
 could not be read for a reason other than the product not having it (or, as
 `windows:msi_prop:oversized`, the value was implausibly long); it behaves the same
-way. The same reason is published on the agent's heartbeat as
-`yuzu.sync.installed_software.last_skip` (characters outside
-`A-Z a-z 0-9 _ . : = , -` become `_`, and the value is cut at 64 bytes, so a long
-list of constraint tokens is shortened; no server page or API returns the tag
-yet), and
-`yuzu.sync.installed_software.skip_streak` counts consecutive skips (uncapped): an
-online host that is skipping publishes a non-zero streak, an offline host no
-heartbeat at all. The agent retries
-a skipped cycle on the bounded backoff described under *What is collected*, then
-falls back to one attempt per daily slot. A host that keeps skipping is flagged by `yuzu_inventory_stale_agents`
-after two missed daily cycles; fix the failing action, or remove its plugin,
-and the next retry or daily sync recovers. A warning of the form `sync: <plugin>.<action>
-read more than 20000 rows` (or a merged-entry or 3 MiB blob cap) is not an
-action failure: that host reports more software rows than one report can carry,
-so its report is skipped rather than sent truncated; review the host's
-inventory rather than removing a plugin.
+way. A token is cut at 64 bytes and characters outside `A-Z a-z 0-9 _ . : = , -` become `_`, so a long
+list of constraint tokens is shortened. The server keeps the latest status and token of each source
+per device; no server page or API returns them yet, so read the cause from the agent's own log. Fix
+the failing action, or remove its plugin, and the next daily sync recovers.
 
-**A device's Python rows vanished, but the rest of its software is still reported; its
-log shows `sync: runtimes.python constrained (<tokens>) — rows withheld this cycle`.**
-The `runtimes` `python` read was constrained, so the agent withheld only the Python rows
-rather than send a partial list. The report replaces the device's stored software rows,
-so its stored `python` rows are removed until a read succeeds again; no other source is
-affected and the cycle is not skipped. The tokens name the cause:
+**A device's Python (or IBM MQ, .NET or Java) rows are marked unconfirmed, but the rest of its
+software is still reported; the log shows `sync: runtimes.python constrained (<tokens>) — reported
+constrained`.**
+The `runtimes` `python` read was constrained, so the agent sent a status-only section for that
+source rather than a partial list. The server keeps the stored `python` rows (shown as unconfirmed)
+until a read succeeds again and a full section confirms them; no other source is affected. The same
+holds for `dotnet`, `jvm`, `middleware` `ibm_mq` and `pkg_inventory` `managers`. The tokens name the cause:
 `linux:runtimes:network_fs_skipped` (`/usr/bin`, `/usr/local/bin`, `/var/usrlocal/bin` or
 a directory above one of them, such as `/usr/local`, is on a network mount, so it is
 never opened), `linux:runtimes:permission_denied`,
@@ -1144,22 +1152,14 @@ never opened), `linux:runtimes:permission_denied`,
 the rpm-ostree `/usr/local -> ../var/usrlocal` link is covered and is not a cause),
 `linux:runtimes:mountinfo_unreadable` and `macos:runtimes:mountinfo_unreadable` (the
 mount table could not be read), `macos:runtimes:permission_denied`,
-`windows:runtimes:python_reg:access_denied` and any `<os>:runtimes:row_cap` or
-`windows:runtimes:python_reg:row_cap` (a walk cap was hit). Fix the named cause; the next
-daily sync restores the rows.
-
-**A device's whole installed-software report has frozen; its log shows
-`sync: runtimes.dotnet failed: <tokens> — skipping this cycle` (or `runtimes.jvm`).** The
-`dotnet` or `jvm` read was constrained and found no install at all, so the agent skipped the
-device's whole installed-software report rather than send an empty list, and retries daily on
-backoff while the answer stays constrained; the stored rows are kept and nothing is deleted. A
-constrained read that still found an install is not an error: its rows are sent, and the log shows
-`sync: runtimes.jvm constrained (<tokens>) — rows kept`. The tokens name the cause, for example `windows:runtimes:dotnet_reg:access_denied`,
-`windows:runtimes:jvm_reg:access_denied`, `windows:runtimes:jvm:release_unreadable`, `windows:runtimes:jvm:home_unusable`,
-`linux:runtimes:release_missing` or `macos:runtimes:release_unparsable`, and any `row_cap`; the
-`runtimes` README lists them all. On Linux a Java home with a java binary but no `release` file keeps the source constrained
-for as long as it is installed; on macOS the bundle's `Info.plist` supplies the version; on Windows
-such a home keeps its row with the registry's version key as its version and the source stays
+`windows:runtimes:python_reg:access_denied`, the .NET and Java tokens
+`windows:runtimes:dotnet_reg:access_denied`, `windows:runtimes:jvm_reg:access_denied`,
+`windows:runtimes:jvm:release_unreadable`, `windows:runtimes:jvm:home_unusable`,
+`linux:runtimes:release_missing` and `macos:runtimes:release_unparsable`, and any
+`<os>:runtimes:row_cap` or `windows:runtimes:python_reg:row_cap` (a walk cap was hit); the `runtimes`
+README lists them all. On Linux a Java home with a java binary but no `release` file keeps the source
+constrained for as long as it is installed; on macOS the bundle's `Info.plist` supplies the version; on
+Windows such a home keeps its row with the registry's version key as its version and the source stays
 supported. Fix the named cause; the next daily sync resumes.
 
 **Non-ASCII app names show as `?` after upgrading from a pre-#1662 build.** The
@@ -1265,9 +1265,11 @@ ingest is failing. Four further series sharpen the picture:
   it can stall while `yuzu_inventory_read_degrade_total` stays quiet).
 - `yuzu_fleet_inventory_sync_skipping{source}` (gauge) — agents currently
   heartbeating whose `source` skipped its latest collection cycle(s), from the agent
-  heartbeat tag `yuzu.sync.<source>.skip_streak` (today only `source="installed_software"`,
-  written by agents that include the skip-visibility change, #5327). The cause is in the agent's own log (the `sync: … — skipping this cycle`
-  warning, or `sync: installed_apps plugin not loaded`); the agent also publishes it as the
+  heartbeat tag `yuzu.sync.<source>.skip_streak` (written by agents that include the skip-visibility
+  change, #5327). `installed_software` no longer skips a report on an agent of this build (a failing
+  source is a status-only section instead), so the gauge no longer counts it; the sources that still skip a
+  cycle (device CI, licensing) are the ones it can show. The cause is in the agent's own log (the
+  `sync: … — skipping this cycle` warning); the agent also publishes it as the
   `yuzu.sync.<source>.last_skip` heartbeat tag, which no server page or API returns yet.
   Published every sweep, 0 included. The gauge only counts agents that emit the
   skip-streak heartbeat tag: an agent that does not emit it (older agents, during a
@@ -1409,7 +1411,9 @@ you have observed your fleet's normal stale-count baseline and set the threshold
 separate "agents offline" from "sync source broken / disabled". Also
 correlate with `yuzu_fleet_inventory_sync_skipping{source="installed_software"}`: a
 host counted there is online but its collector is skipping (the reason is in that agent's
-log, and in its `last_skip` heartbeat tag, which no server page or API returns yet). The two gauges count different populations (stored-receipt age over 48 h in
+log, and in its `last_skip` heartbeat tag, which no server page or API returns yet); only an agent
+older than this build can be counted there, because an agent of this build reports a failing
+source as a status-only section instead of skipping the report. The two gauges count different populations (stored-receipt age over 48 h in
 Postgres vs live heartbeats, which include hosts skipping for less than 48 h and
 hosts that have never reported), so read them side by side and never subtract one
 from the other. Agents that do not emit the skip tag (older agents, or during a

@@ -311,6 +311,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     std::size_t bad_prefix = 0, bad_field_count = 0, bad_sig_value = 0;
     std::size_t pkg_bad_ecosystem = 0, pkg_non_numeric_date = 0;
     std::size_t publisher_without_signature = 0;
+    std::size_t apps_with_location = 0;
 
     std::istringstream iss(result.captured);
     std::string line;
@@ -321,7 +322,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
             ++bad_prefix;
             continue;
         }
-        // ADR-0016 blob v2: "inv" + exactly 12 fields. Splitting manually
+        // ADR-0016 blob: "inv" + the 12 blob fields + install_location. Splitting manually
         // (not on a parser helper) keeps this a genuine wire-shape check.
         std::vector<std::string> f;
         std::size_t start = 0;
@@ -334,7 +335,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
             f.push_back(line.substr(start, bar - start));
             start = bar + 1;
         }
-        if (f.size() != 13) { // "inv" + 12 fields
+        if (f.size() != 14) { // "inv" + 12 fields + install_location
             ++bad_field_count;
             continue;
         }
@@ -349,6 +350,10 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
 
         if (kind == "app") {
             ++app_rows;
+            // A macOS app row carries its .app path as install_location when system_profiler
+            // reported a Location (a pkgutil receipt has none).
+            if (!f[13].empty())
+                ++apps_with_location;
             if (signature == "signed")
                 ++signed_apps;
             else if (signature == "unsigned")
@@ -375,6 +380,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     CHECK(bad_field_count == 0);
     CHECK(bad_sig_value == 0);
     CHECK(publisher_without_signature == 0);
+    CHECK(apps_with_location > 0);
 
     // The #2273 enrichment actually ran and populated the previously
     // always-empty fields.

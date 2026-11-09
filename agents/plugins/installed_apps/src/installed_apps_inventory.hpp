@@ -58,6 +58,10 @@ struct InvRecord {
                                   // tamper detection.
     std::string distro_id;        // /etc/os-release ID (Linux rows only)
     std::string distro_version;   // /etc/os-release VERSION_ID (Linux rows only)
+    std::string install_location; // Windows InstallLocation, macOS the .app path, Linux empty (no
+                                  // single prefix). Wire token 14 (blob v3 slot 13). The agent
+                                  // core blanks a path under an account's home before it hashes
+                                  // or sends it (installed_software_v3.hpp is_per_user_path).
 };
 
 // Epoch/version/release triple shared by the deb and pacman splitters.
@@ -352,7 +356,22 @@ inline std::string pipe_safe(std::string_view v) {
     return out;
 }
 
-// The one place that knows the 13-token `inv|` row layout. Keep in lockstep
+// A path that holds '|' keeps its place in the row: the bar becomes U+FFFD (a visibly altered
+// path) rather than being deleted (which would silently merge two different directories);
+// tab, CR and LF are deleted as pipe_safe does.
+inline std::string install_location_safe(std::string_view v) {
+    std::string out;
+    out.reserve(v.size());
+    for (char c : v) {
+        if (c == '|')
+            out += "\xEF\xBF\xBD";
+        else if (c != '\t' && c != '\r' && c != '\n')
+            out.push_back(c);
+    }
+    return out;
+}
+
+// The one place that knows the 14-token `inv|` row layout. Keep in lockstep
 // with parse_installed_apps_output (agents/core/src/sync_source_installed_software.cpp).
 inline std::string format_inv_row(const InvRecord& r) {
     std::string out = "inv";
@@ -364,6 +383,8 @@ inline std::string format_inv_row(const InvRecord& r) {
         out.push_back('|');
         out += pipe_safe(f);
     }
+    out.push_back('|');
+    out += install_location_safe(r.install_location);
     return out;
 }
 

@@ -33,7 +33,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-EXPECTED_KINDS = {"package", "app", "pkg", "feat"}
+EXPECTED_KINDS = {"package", "app", "pkg", "feat", "driver"}
 CATALOG_RULES = "server/core/src/software_catalog_rules.hpp"
 LANE1 = {"rpm", "deb", "apk", "pacman"}
 LANE3_KINDS = {"app", "feat"}

@@ -19041,7 +19041,7 @@ TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds
         INFO("tool=" << tool);
         const auto& props = schemas.at(tool).at("properties");
         CHECK(props.at("kind").at("enum") ==
-              nlohmann::json::array({"package", "app", "pkg", "feat"}));
+              nlohmann::json::array({"package", "app", "pkg", "feat", "driver"}));
         const auto served = props.at("ecosystem").at("enum").get<std::set<std::string>>();
         CHECK(served == ecosystems);
     }

@@ -47,7 +47,7 @@ struct InstallTypeRow {
 
 /// One row per collector source. `pkg_inventory.managers` (the Homebrew presence row) is
 /// stored in installed_software today, so it is typed like the packages it manages.
-inline constexpr std::array<InstallTypeRow, 10> kInstallTypeBySource{{
+inline constexpr std::array<InstallTypeRow, 11> kInstallTypeBySource{{
     {"installed_apps.list_inventory", "installer"},
     {"pkg_inventory.managers", "package_manager"},
     {"pkg_inventory.packages", "package_manager"},
@@ -58,6 +58,7 @@ inline constexpr std::array<InstallTypeRow, 10> kInstallTypeBySource{{
     {"runtimes.dotnet", "runtime"},
     {"runtimes.jvm", "runtime"},
     {"middleware.ibm_mq", "middleware"},
+    {"hardware.drivers_inventory", "driver"},
 }};
 
 /// Fallback for a row whose source is empty (a pre-tail agent) or not in the table.

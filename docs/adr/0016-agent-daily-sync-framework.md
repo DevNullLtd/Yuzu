@@ -1328,7 +1328,7 @@ holds after migrations 2 and 3: an older server that runs against the migrated d
 there, so the sections it writes are unverified until a v3 server next does a full replace for that
 device.
 
-> **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the `keep_rows_if_present_seen` constrained policy (a constrained answer that lists at least one install keeps its rows; one that lists none skips the device's whole installed-software report for the cycle, retried daily on backoff, and the stored rows stay), not the `drop_source` policy of `runtimes.python`. `hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.
+> **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the `keep_rows_if_present_seen` constrained policy (a constrained answer that lists at least one install keeps its rows; one that lists none skips the device's whole installed-software report for the cycle, retried daily on backoff, and the stored rows stay), not the `drop_source` policy of `runtimes.python`. (**Superseded 2026-11-09:** the constrained policies are retired and a constrained answer is a status-only section that keeps the stored rows, and `hardware.drivers_inventory` **is** now a daily-sync section, kind `driver`; both are set out in the Update of 2026-11-09 below. This sentence once read: "`hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.")
 
 ### 2026-11-04 — `installed_software`: a publisher on every row, and the `via:` origin label
 
@@ -1443,3 +1443,132 @@ build sends no settings to agents.
   a window only at a whole-day interval of 24 hours or more in whole days, apply the IANA zone, honour
   the per-collector switch, and reject any setting it cannot honour, then report the effective version
   it applied. Until the push lands the settings have no effect on any agent.
+
+### 2026-11-09 — the agent's blob-v3 writer, and drivers as a daily-sync section (SAM-15)
+
+The agent now writes the sectioned report the server has accepted since the 2026-11-04 Updates, and the
+v2 writer (`installed_software_canonical_blob`, `ConstrainedPolicy`, `accept_partial` and the
+`withheld` adapter status) is deleted. It is a hard cutover: this build's agent and server move
+together, the agent has no v2 path to fall back to, and the server's v2 parser stays only for blobs
+from older agents (it is untouched). The writer is
+`agents/core/src/installed_software_v3.{hpp,cpp}` (pure: records, hashes, planning, serialising) and the
+collector in `sync_source_installed_software.cpp`.
+
+**One section per source.** The facet of a section is the source's `plugin.action`, which is also
+the `source` of every row in it. A source that answered in full is `full` the first time and after
+any `need_full`, then a `delta` against the last acknowledged set, and no section at all while its set
+is unchanged; any other answer is a status-only section (`constrained`, `timeout`, `oversize`,
+`not_collected`) that costs only that source. The sources run one at a time, in the collector's table
+order, so a single detached worker is in flight at any moment.
+
+**Rows.** A `+` record is the 16 wire slots of the stored form: every field through `clamp_field` (scrub to
+UTF-8, clamp to 1,024 bytes on a codepoint boundary, then strip 0x1F, 0x1E and NUL, the one preparation
+step), a canonical epoch (`0` and rpm's `(none)` are written empty) and release (`(none)` is empty), a
+per-user `install_location` blanked, the facet as `source`, and a publisher that is never empty (the
+declared vendor, else `via:<ecosystem>`, applied by the planner to every row it plans). Rows are
+sorted and de-duplicated in the server's comparator order (the 15 stored fields in wire order, location
+before `package_id` and `source`). The section hash, the row hash (the server's `instance_key`), the
+`v3:` report hash and the component record, row hash and section hash reproduce the server's recipes
+byte for byte; the golden vectors of `tests/unit/server/test_software_inventory_store.cpp` are pinned in
+`tests/unit/test_installed_software_v3.cpp`. No plugin produces component rows yet (the evidence
+collector is a later change), so the component functions are shipped and pinned, not called.
+
+**The delta rule.** A `delta` is `+` for current rows whose hash is not in the acknowledged set and `-` for
+acknowledged hashes that are no longer current, with `base` the acknowledged section hash and `expect`
+the hash of the current set (emitted on every `delta` `S` record; the server refuses a delta without
+it). A delta that would carry more than 20,000 `+` or `-` records, or more bytes than a section may
+occupy, is sent as a `full` section instead. An acknowledged pair that is not self-consistent (the same
+row hashes under a different section hash) is not trusted: the facet is resent in full.
+
+**State and commit-on-ack.** The acknowledged set of a facet is one KV value,
+`sync.installed_software.<facet>.acked` = `<section hash>\n<concatenated sorted 64-hex row hashes>`,
+written by one `kv_set` (one SQLite statement, so the hash and the set commit together), plus
+`sync.installed_software.<facet>.need_full` (a torn write there costs one extra full section; the
+server's base and `expect` checks are the backstop). A value that is not exactly that shape reads as no
+acknowledged set, so the facet is sent in full. Nothing is written when a collection is made: the
+scheduler's `on_ack` hook commits what the last blob carried, after the server answered, and discards it
+when the RPC failed. A `full` or `delta` section that was acknowledged replaces the facet's set. A status-only
+section that was acknowledged **erases** the facet's set, because the server refuses a delta over any
+facet whose stored status is not `full` or `delta` (it clears a section hash only over `disabled`), so the
+first row-bearing section after any status-only section is always `full`. The held set the agent claims
+in its report hash is the facets it holds a set for, less those it sent status-only in this call, plus
+those it sent `full` or `delta`.
+
+**Acknowledgement and forced sends.** The scheduler matches a nack token that equals the source name or
+starts with `<name>:`. The whole-source token marks every facet `need_full` and makes the next send
+full (`SyncSource::on_force_full`, called before `collect()` in both tick passes whenever the
+scheduler is about to send full: `request_now`, a whole-source nack, no acknowledged hash yet, or the
+weekly floor, so a forced blob always carries a full section per facet and never a header-only blob,
+which the server's parser refuses). A per-section token (`installed_software:<facet>`) marks only that
+facet `need_full`; the scheduler does not force the other facets. `SyncSource::wants_blob` is OR-ed into
+the full decision after the hash comparison and is true whenever a collection wrote any section, so a
+status or token change reaches the server although the held-facet hash did not move; on a quiet pass it
+is false and the report is the hash alone. The weekly floor is therefore a full resend of every facet.
+
+**First contact larger than a call.** A call carries at most 20,000 `+`, 20,000 `-`, 20,000 `comp` and 3 MiB.
+Status-only sections are written first, then row-bearing sections in table order; one that would cross
+a cap (it fits alone) is **deferred**: not written, not claimed held. `SyncSource::has_more` is then
+true and a clean acknowledgement re-fires the source after `kMinTickSeconds` (30 s) instead of at its next
+slot; the collected rows are reused for `kPassCooldown` (10 minutes), so the follow-up calls do not dispatch
+the plugins again. A source whose rows exceed 20,000, or whose full section exceeds the section budget
+(3 MiB less the header and a status record for each possible section), is `oversize` with token
+`rows=<n>` or `bytes=<n>`: it is intrinsically unshippable and is neither deferred nor split.
+
+**Bounded workers.** Each source runs on a detached worker bounded by its time limit (`installed_apps`,
+`windows_optional_features` and `hardware.drivers_inventory` 120 s, the rest 60 s). The single-flight flag
+and the outstanding-worker count live in one object owned by the agent, not by the source (the source is
+rebuilt on every reconnect while a worker abandoned at its limit may still be inside a plugin); the flag is released by a
+guard inside the worker when it physically returns. A source whose worker is still running is `timeout`
+with token `busy`; a bounded call that could not start (the outstanding-call ceiling or thread creation)
+is `timeout` with token `rejected` and the caller clears the flag. **Teardown:** after the worker threads
+are joined and before any plugin `shutdown()` or unload, on both teardown paths of the agent, the agent
+waits `kOrphanDrainGrace` (3 s) for the count to reach zero and otherwise logs and exits with code 3
+(`hard_exit.hpp`), the F3 precedent for a detached worker: a plugin is never shut down under a
+worker still executing it. A plugin that never returns therefore makes the restart a hard exit. The
+sync thread is joined on every reconnect and on shutdown, so it can wait out a source's time limit; the
+shutdown watchdog (20 s) is shorter than 120 s, so a stop that lands inside such a wait ends in that
+watchdog (exit code 4), exactly as an unbounded in-process collection did before this change, and a
+reconnect waits up to the limit.
+
+**Retired policies.** `ConstrainedPolicy`, `accept_partial` and the `withheld` status are removed.
+Every degraded answer is a status-only section: a non-zero return, a truncated capture, a
+`constrained` status row, a typed PARTIAL completeness (the provenance is the token) and an
+`installed_apps` listing with no rows (`no_rows`; never a deleting `full`). The server keeps the facet's rows
+and reads them as unconfirmed (R23) until a `full` section confirms them again. This changes what a
+constrained `runtimes.python` or `middleware.ibm_mq` read does (the rows were removed under v2) and what a
+constrained `runtimes.dotnet`, `runtimes.jvm` or `pkg_inventory.managers` read does (the rows it had seen were
+kept and the rest removed): none of them replace or remove rows now. To retire a facet's rows the writer
+sends `full` with no rows, which only a clean `supported` answer with zero rows produces.
+
+**Row 1.4 (completeness).** `installed_apps.list_inventory` and `windows_optional_features.list` declare
+`OK`/`FULL` on a clean pass (on every OS leg of the first, through the one `emit_inventory` chokepoint) as
+they already declared `CONSTRAINED`/`PARTIAL` on a degraded one. The `inv|` row gains a 14th token,
+`install_location` (the Windows `InstallLocation`, the macOS `.app` path, empty on Linux; a `|` in it is
+written as U+FFFD), which the collector reads as wire slot 13. On Windows a failed read of the agent
+identity's own `HKCU` Uninstall key never degrades the machine-scope collection, and the `WOW6432Node` view is absent
+only on a 32-bit OS.
+
+**No per-user paths (ADR-0016 section 8).** The writer blanks an `install_location` under
+`<drive>:\Users\`, `<drive>:/Users/`, `/Users/`, `/home/` or `/root`, so the server's stored location
+and the change ledger's `identity_key` copy of it name machine-scope roots only; the blanking is part of the
+stored form, so it also keeps one app installed under two accounts one row. `tests/unit/test_installed_software_v3.cpp`
+covers the predicate and the blanked record.
+
+**Drivers are a daily-sync section.** This reverses the 2026-11-03 statement that
+`hardware.drivers_inventory` is not a daily-sync source. It is the eleventh and last row of the collector's
+table: kind `driver`; ecosystem `windows` on the WMI leg (publisher the driver provider, else the signer;
+version, date and signature state from the row; class, INF and hardware id are not carried) and
+`kernel_module` on the Linux leg. The Linux provider is the fixed literal `kernel`, a label for the
+source rather than a vendor, so it is not carried and a module is `via:kernel_module`; macOS answers
+`unsupported` and is `not_collected`. The server adds `driver` to the kind vocabulary (the catalogue
+table, the REST and MCP filters), `kernel_module` to the ecosystem table (family `linux`), and the source to the
+source and install-type tables (`driver`). Drivers get no CPE treatment: `is_os_native` routes the kind and the ecosystem to
+the lane that identifies but does not assess.
+
+**State size.** An acknowledged value is at most 64 + 20,000 x 64 hex characters (about 1.3 MB) per facet and
+about 14 MB for eleven facets in the worst case; typical hosts hold 100 to 300 KB. A more compact form is a
+later change if a measurement asks for it.
+
+**Not in this change.** The component facet (no plugin produces it), the settings push of the 2026-11-05
+Update, the binary-evidence plugin and its two-at-once pairing, and the `disabled` status (nothing in the agent
+turns a facet off yet).

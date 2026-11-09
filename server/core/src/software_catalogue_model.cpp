@@ -265,7 +265,7 @@ std::expected<DevicesRequest, std::string> parse_devices_params(const Params& p)
 }
 
 std::optional<std::string> strict_args_error(const nlohmann::json& args) {
-    constexpr std::string_view kKinds[] = {"package", "app", "pkg", "feat"};
+    constexpr std::string_view kKinds[] = {"package", "app", "pkg", "feat", "driver"};
     if (!args.is_object())
         return std::nullopt;
     struct StrKey {
