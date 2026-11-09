@@ -621,6 +621,7 @@ agent_test_exe = executable(
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_virtualization_parsers.cpp',         # virtualization: pure classifier/vendor tables/CPUID fact builder/row formatters over labelled fixtures; portable
     'unit/test_virtualization_local_dispatcher.cpp',  # virtualization: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_virtualization_wsl_parsers.cpp',     # virtualization wsl: Ops-faked Lxss walk + fake hive-access seam (live and offline outcomes) + budget + decide_wsl + row formatters, portable
     'unit/test_remote_access_audit_config_parsers.cpp',  # remote_access_audit: pure sshd_config/Include/service parsers over REAL CAPTURE + labelled fixtures; portable
     'unit/test_remote_access_audit_keys_parsers.cpp',    # remote_access_audit: pure authorized_keys/options/blob decoder/fingerprint over REAL ssh-keygen captures; portable
     'unit/test_remote_access_audit_legs.cpp',            # remote_access_audit: OS-free list_posix decision seam over injected fakes; portable
@@ -1811,6 +1812,8 @@ if build_server
       'unit/server/test_dex_score_policy_writer.cpp',
       # GET/PUT/DELETE /api/v1/dex/score-policy route shell through TestRouteSink - no store, no [pg]
       'unit/server/test_dex_score_policy_routes.cpp',
+      # pure form <-> document, renderer, tier preview (dex_score_policy_form.hpp) - no store, no I/O, no [pg]
+      'unit/server/test_dex_score_policy_form.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -1970,6 +1973,8 @@ if build_server
       'unit/server/test_enrollment_cfg_import.cpp', # WS-6 6.2 one-time legacy enrollment .cfg -> Postgres import
       'unit/server/test_settings_routes_enrollment.cpp', # WS-6 6.2 enrollment mutations: audit rows, atomic bulk, fail-closed
       'unit/server/test_settings_routes_dex_alerts.cpp',
+      # Scoring tab routes over TestRouteSink with fake writer deps and apps fn; REST-vs-fragment equivalence - no store, no [pg]
+      'unit/server/test_settings_routes_dex_scoring.cpp',
       'unit/server/test_settings_routes_ota_audit.cpp',
       'unit/server/test_settings_routes_cert_upload.cpp', # TLS server key created 0600 / dir 0700, symlink replaced not followed
       'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
@@ -4164,6 +4169,17 @@ test('Echo mapdrive hive-mount pin wiring lexical gate (#5291)',
   _python3_test,
   args: [files('test_echo_mapdrive_pin_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# virtualization `wsl`: static lexical gate over the Windows shell's wiring -- the one
+# with_user_hive call (default-on hive-file guard, no check argument), no HKEY_USERS enumeration,
+# REG_OPTION_OPEN_LINK on every registry open, and the SID-bearing mount name only in the agent
+# log. Source text only (the Windows body cannot run in the unit suites), so Python, no build.
+test('virtualization wsl Windows shell wiring lexical gate',
+  _python3_test,
+  args: [files('test_virtualization_wsl_pin_lexical.py')],
+  suite: 'docs',
   timeout: 30,
 )
 
