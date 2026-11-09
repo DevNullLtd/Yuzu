@@ -202,10 +202,13 @@ data).
   requirement is that no already-applied migration version's CONTENT changes: `PgMigrationRunner`
   tracks a bare version integer and only ever applies a migration with `version > current`, so
   editing an already-shipped version's SQL text in place is inert for any database that has
-  already passed it — the edited text simply never runs again there. (Update 2026-11-09, #7158:
-  the runner now also records a SHA-256 of each applied migration, and a database whose recorded
-  hash differs from this build's text is refused at start instead of ignored; the hazard analysis
-  below is otherwise unchanged.) "Never shipped" is one way
+  already passed it — the edited text simply never runs again there.
+
+  Update 2026-11-09 (#7158): the runner now also records a SHA-256 of each applied migration,
+  and a database whose recorded hash differs from this build's text is refused at start instead
+  of ignored; the hazard analysis below is otherwise unchanged.
+
+  "Never shipped" is one way
   to guarantee that (an unshipped version has, by definition, never been applied to any
   database); it is not the only way. `DeviceTokenStore`/`LicenseStore`/`SoftwareDeploymentStore`
   (`chore/retire-migrate-from-sqlite-batch-b`, #3623) each shipped a v1 migration to `dev` but

@@ -649,7 +649,9 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   the highest version in the calling binary's own `migrations()` vector (an older build started
   against a database a newer one already migrated), `run()` logs one `warn` per call naming the
   store and both versions, applies nothing and the ahead check itself still returns true (the #7158 hash
-  check that follows can still refuse; `PgMigrationRunner::is_schema_ahead` is the pure decision). It is **warn-only on purpose**, not
+  check that follows can still refuse, including for a database that is ahead AND carries edited
+  text for a version this binary knows: a second failure, refused on purpose, pinned by a test,
+  see the `PgMigrationRunner::run` header; `PgMigrationRunner::is_schema_ahead` is the pure decision). It is **warn-only on purpose**, not
   a refusal: the situation is already outside the supported procedure (rolling upgrades and a
   return to an earlier build are not supported at this stage; see the "Recorded exception" in the
   migrations section above and ADR-0053 "Update (2026-10-20)"), and a refusal would add a second

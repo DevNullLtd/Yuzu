@@ -110,7 +110,11 @@ public:
     /// that predates the table, and it assumes one build lineage per database
     /// (the hard-cutover deployment contract): a binary that applied different
     /// text and was later replaced is recorded as whatever the current build
-    /// holds. Steady state is one lock-free read; only first sight of an
+    /// holds. This includes a version that a build predating the hash table applied
+    /// when that build wins a concurrent first boot: it is recorded as THIS build's text on
+    /// first sight, without comparison. That is the same documented one-lineage limit, not a
+    /// separate gap (a refusal there would not close the sequential variant, so it is the
+    /// owner's decision). Steady state is one lock-free read; only first sight of an
     /// unhashed version takes the per-store lock. The table has a
     /// Yuzu-specific name because `public` is shared with whatever else lives
     /// in the database: a foreign `schema_migrations` (golang-migrate, Rails;

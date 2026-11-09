@@ -971,11 +971,15 @@ startup log lines — these are routine, not a fault:
 If instead you see `[HA] leader_elector could not open its coordination
 connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
 reach its Postgres coordination connection: it keeps serving and re-tries every
-election cycle (so a transient blip self-heals within seconds), but while the
+election cycle (so a transient connection blip self-heals within seconds; a
+recorded-migration refusal does not, see below), but while the
 message persists the leader-only background loops (the four above, plus command-outbox
 delivery) do not run. This is fail-closed
 by design — a paused loop never double-dispatches — and a persistent occurrence
-is a Postgres-reachability problem to investigate, not a server bug. (The
+is either a Postgres-reachability problem to investigate or a recorded-migration
+refusal: when the log also shows `PgMigrationRunner: store 'leader_elector' recorded
+migration`, the database is not unreachable, the elector will not recover on its own, and
+the way out is the repair in [Upgrading](upgrading.md), "Behaviour change: a Postgres store refuses to open when its recorded migration differs from this build (the server stops, except for three stores)". (The
 operator-triggered paths are unaffected: a manual policy remediation or evaluation,
 and an operator CRL revoke, run on whichever replica received the request — and a
 remediation/evaluation is also *completed* on that same replica, so it still reaches

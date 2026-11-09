@@ -389,10 +389,15 @@ fatal: `analytics_event_store` (degraded for the run), `crypto_dashboard_layout_
 exception: layouts answer 503) and `leader_elector` (the server boots with its leader-only loops
 paused; the elector re-runs `run()` every election cycle and meets the same refusal, so it does not
 recover until the database is repaired). The operator signals are the `PgMigrationRunner: store
-'<store>' recorded migration` log line and the `yuzu_server_leader_*` metrics. This is deliberately not the #3894 posture. A database ahead of the binary is
-off-procedure and a refusal would be a second failure; a recorded version whose text differs is
-on-procedure (same build lineage), the build knows exactly what is wrong, and the alternative is
-the fail-open at the first query that the issue names. There is no override flag and there was
+'<store>' recorded migration` log line and the `yuzu_server_leader_*` metrics.
+
+This is deliberately not the #3894 posture. A database ahead of the binary is off-procedure,
+and the ahead check itself does not refuse, because a refusal would be a second failure. A
+recorded version whose text differs is on-procedure (same build lineage), the build knows exactly
+what is wrong, and the alternative is the fail-open at the first query that the issue names. One
+sub-case is the exception: a database that is ahead AND carries edited text for a version this
+binary also knows does refuse (a second failure, refused on purpose, with no separate ruling
+recorded in #7158; see the `PgMigrationRunner::run` header). There is no override flag and there was
 no warn-only phase: drift can only be detected against a hash this feature wrote, so introducing
 it cannot refuse any existing database.
 
@@ -404,8 +409,9 @@ the same in every process and deployment. A migration must stay that way: no clo
 environment, address or unordered-container iteration may reach its text.
 
 The table is named `yuzu_schema_migrations` because `public` is shared with whatever else lives in
-the database. A foreign `schema_migrations` (golang-migrate, Rails; Flyway's default table is `flyway_schema_history`, which does not collide) would make the
-`IF NOT EXISTS` skip silently and fail every store on a missing column.
+the database. A foreign `schema_migrations` table (golang-migrate, Rails) would make the
+`IF NOT EXISTS` skip silently and fail every store on a missing column. Flyway's default,
+`flyway_schema_history`, does not collide.
 
 Trust on first use. A version applied before the table existed has no row. It is recorded as
 first seen with `recorded_by = 'tofu'`, so an auditor can tell it from a hash verified when
