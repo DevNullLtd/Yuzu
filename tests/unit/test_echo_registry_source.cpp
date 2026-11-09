@@ -5100,6 +5100,46 @@ struct LinkKey {
     }
 };
 
+// #7173: name the machine's ETW sessions in a failure message. Total active sessions, plus each
+// session named Yuzu*Etw-<pid> with whether that pid is still alive (a dead owner is a stale
+// session holding one of the machine's session slots). Read-only; never throws.
+std::string etw_session_table() {
+    constexpr ULONG kMax = 64;
+    constexpr ULONG kName = 1024; // wchar_t slots reserved for each logger name
+    const size_t stride = sizeof(EVENT_TRACE_PROPERTIES) + 2 * kName * sizeof(wchar_t);
+    std::vector<BYTE> buf(stride * kMax, 0);
+    EVENT_TRACE_PROPERTIES* ptrs[kMax];
+    for (ULONG i = 0; i < kMax; ++i) {
+        auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data() + i * stride);
+        p->Wnode.BufferSize = static_cast<ULONG>(stride);
+        p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        ptrs[i] = p;
+    }
+    ULONG count = 0;
+    const ULONG rc = QueryAllTracesW(ptrs, kMax, &count);
+    if (rc != ERROR_SUCCESS && rc != ERROR_MORE_DATA)
+        return std::format("etw_sessions=query_failed({})", rc);
+    std::string out = std::format("etw_sessions_total={}{}", count, rc == ERROR_MORE_DATA ? "+" : "");
+    for (ULONG i = 0; i < (std::min)(count, kMax); ++i) {
+        const auto* name = reinterpret_cast<const wchar_t*>(reinterpret_cast<const BYTE*>(ptrs[i]) +
+                                                            ptrs[i]->LoggerNameOffset);
+        const std::wstring n = name;
+        const auto dash = n.rfind(L'-');
+        if (n.rfind(L"Yuzu", 0) != 0 || n.find(L"Etw-") == std::wstring::npos || dash == std::wstring::npos)
+            continue;
+        const DWORD pid = static_cast<DWORD>(std::wcstoul(n.c_str() + dash + 1, nullptr, 10));
+        bool alive = false;
+        if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+            DWORD code = 0;
+            alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+            CloseHandle(h);
+        }
+        out += std::format(" {}:alive={}", yuzu::win::from_wide(n.c_str(), static_cast<int>(n.size())),
+                           static_cast<int>(alive));
+    }
+    return out;
+}
+
 // The production reader over the real mechanism, with a clock a test can step.
 RegistryReader live_reader() {
     auto r = make_windows_registry_reader();
@@ -5179,12 +5219,14 @@ struct LiveRun {
                     "no ETW event from this write within 15 s. session passed {} events from "
                     "all writers through the reader's filter since this write ({} buffered, {} "
                     "evicted since the session started); events_lost={} rt_buffers_lost={} "
-                    "decode_failed={} loss_query_ok={} etw_running={} from_this_pid={}",
+                    "decode_failed={} loss_query_ok={} etw_running={} from_this_pid={} "
+                    "registry_capture_method={} {}",
                     src->buffer_for_test().pushed() - pushed_before,
                     src->buffer_for_test().size(), evicted, counter(loss.events_lost),
                     counter(loss.rt_buffers_lost), loss.decode_failed,
                     static_cast<int>(loss.query_ok), static_cast<int>(etw_running()),
-                    static_cast<int>(from_this_pid));
+                    static_cast<int>(from_this_pid), t.db.get_config("registry_capture_method", ""),
+                    etw_session_table());
                 // meson's job-log tail is the last 100 lines of the test's stdout then its
                 // stderr section, and hundreds of lines of per-case output follow this case,
                 // so a Catch2 message alone reaches only the uploaded meson-logs artifact.

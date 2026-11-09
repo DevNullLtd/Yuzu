@@ -37,6 +37,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 JS = pathlib.Path(__file__).resolve().parents[1] / "server/core/static/yuzu-echo-timeline.js"
 
@@ -915,7 +916,12 @@ def main() -> int:
         return 77
     # YUZU_TL_JS may point at a mutated copy of the script (mutation checks).
     env = dict(os.environ, YUZU_TL_JS=os.environ.get("YUZU_TL_JS", str(JS)))
-    r = subprocess.run([node, "-e", DRIVER], capture_output=True, text=True, timeout=30, env=env)
+    # DRIVER goes to node as a file, not `node -e <source>`: a command line has a length limit
+    # on Windows (#6386). The prefix keeps the name inside the Defender exclusion.
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_echo_tl_") as tmp:
+        driver = pathlib.Path(tmp) / "driver.js"
+        driver.write_text(DRIVER, encoding="utf-8", newline="\n")
+        r = subprocess.run([node, str(driver)], capture_output=True, text=True, timeout=30, env=env)
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
     return r.returncode

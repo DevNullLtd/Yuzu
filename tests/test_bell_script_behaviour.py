@@ -16,6 +16,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "server/core/src/app_shell.cpp"
 OPEN, CLOSE = 'kBellScript = R"JS(<script>', "</script>)JS\""
@@ -142,7 +143,12 @@ def main() -> int:
     text = SRC.read_text()
     a = text.index(OPEN) + len(OPEN)
     js = text[a:text.index(CLOSE, a)]
-    r = subprocess.run([node, "-e", DRIVER], input=js, capture_output=True, text=True, timeout=30)
+    # DRIVER goes to node as a file, not `node -e <source>`: a command line has a length limit
+    # on Windows (#6386). The prefix keeps the name inside the Defender exclusion.
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_bell_") as tmp:
+        driver = pathlib.Path(tmp) / "driver.js"
+        driver.write_text(DRIVER, encoding="utf-8", newline="\n")
+        r = subprocess.run([node, str(driver)], input=js, capture_output=True, text=True, timeout=30)
     sys.stdout.write(r.stdout + r.stderr)
     return r.returncode
 

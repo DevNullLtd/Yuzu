@@ -2123,6 +2123,8 @@ jobs:
             'HKCU:\Software' = "YuzuTest-selftest-$scope-probe-hkcu"
             'HKLM:\SOFTWARE' = "YuzuTest-selftest-$scope-probe-hklm"
             'HKLM:\SOFTWARE\Wow6432Node' = "YuzuTest-selftest-$scope-probe-wow"
+            'HKLM:\SYSTEM\CurrentControlSet\Services\bam' = "YuzuTest-selftest-$scope-probe-bam"
+            'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings' = "YuzuTest-selftest-$scope-probe-bamstate"
           }
           function Arm($s, $want, $kind, $name) {
             $out = & pwsh -NoProfile -NonInteractive -File $script -Scope $s 2>&1 | Out-String
