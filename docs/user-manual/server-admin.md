@@ -979,7 +979,7 @@ by design — a paused loop never double-dispatches — and a persistent occurre
 is either a Postgres-reachability problem to investigate or a recorded-migration
 refusal: when the log also shows `PgMigrationRunner: store 'leader_elector' recorded
 migration`, the database is not unreachable, the elector will not recover on its own, and
-the way out is the repair in [Upgrading](upgrading.md), "Behaviour change: a Postgres store refuses to open when its recorded migration differs from this build (the server stops, except for three stores)". (The
+the way out is the restore described in [Upgrading](upgrading.md), "Behaviour change: a Postgres store refuses to open when its recorded migration differs from this build (the server stops, except for three stores)". (The
 operator-triggered paths are unaffected: a manual policy remediation or evaluation,
 and an operator CRL revoke, run on whichever replica received the request — and a
 remediation/evaluation is also *completed* on that same replica, so it still reaches
