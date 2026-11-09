@@ -21,7 +21,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
+#include <string_view>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -46,6 +48,16 @@ bool is_elevated() {
     const bool ok = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &len) != 0;
     CloseHandle(token);
     return ok && e.TokenIsElevated != 0;
+}
+
+// Mirrors skip_or_fail in test_registry_write_local_dispatcher.cpp: CI's non-pg step sets
+// YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS (non-empty, not "0") and runs elevated, so an environment
+// SKIP there would be a silent green; it FAILs instead. Both macros throw, so callers need no return.
+void skip_or_fail(const std::string& why) {
+    const char* req = std::getenv("YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS");
+    if (req != nullptr && req[0] != '\0' && std::string_view{req} != "0")
+        FAIL(why + " (YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS is set)");
+    SKIP(why);
 }
 
 std::string salt() { return std::to_string(::GetCurrentProcessId()) + "_" + std::to_string(::GetTickCount64()); }
@@ -86,14 +98,14 @@ TEST_CASE("registry live: bam\\State is never read -- a scratch value under bam 
           "is neither a row nor a gap (#6898)",
           "[echo][registry][windows][bam]") {
     if (!is_elevated())
-        SKIP("cannot write HKLM\\SYSTEM (not elevated)");
+        skip_or_fail("cannot write HKLM\\SYSTEM (not elevated)");
 
     const std::string bam = "SYSTEM\\CurrentControlSet\\Services\\bam";
     // ScratchKey::create would otherwise create (and orphan) bam\State\UserSettings on a Windows without it.
     HKEY present = nullptr;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings", 0,
                       KEY_READ, &present) != ERROR_SUCCESS)
-        SKIP("bam\\State\\UserSettings is not present on this Windows");
+        skip_or_fail("bam\\State\\UserSettings is not present on this Windows");
     RegCloseKey(present);
     const std::string leaf = yuzu::test::registry_scratch_prefix() + "bam-" + salt();
     ScratchKey control(bam + "\\" + leaf);                          // positive control: inside the watched root
@@ -107,7 +119,15 @@ TEST_CASE("registry live: bam\\State is never read -- a scratch value under bam 
 
     auto reader = make_windows_registry_reader();
     const std::string root = "HKLM\\" + bam;
-    const auto read = [&] { return reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns); };
+    // A peer job planting a direct child of the shared bam root mid-walk changes the root's metadata
+    // between the reader's two queries and caps the walk (Capped, partial keys). Re-read only that
+    // status; Unreadable and the deadline stay fatal.
+    const auto read = [&] {
+        auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+        for (int attempt = 1; attempt < 5 && r.status == RegistryReadStatus::Capped; ++attempt)
+            r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+        return r;
+    };
 
     const auto before = read();
     REQUIRE(before.status == RegistryReadStatus::Complete);

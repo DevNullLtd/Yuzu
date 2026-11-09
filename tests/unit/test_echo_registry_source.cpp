@@ -5124,7 +5124,7 @@ std::string etw_session_table() {
     for (ULONG i = 0; i < (std::min)(count, kMax); ++i) {
         const auto* name = reinterpret_cast<const wchar_t*>(reinterpret_cast<const BYTE*>(ptrs[i]) +
                                                             ptrs[i]->LoggerNameOffset);
-        const std::wstring n = name;
+        const std::wstring n(name, wcsnlen(name, kName));
         const auto dash = n.rfind(L'-');
         if (n.rfind(L"Yuzu", 0) != 0 || n.find(L"Etw-") == std::wstring::npos || dash == std::wstring::npos)
             continue;
