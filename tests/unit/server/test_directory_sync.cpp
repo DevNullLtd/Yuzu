@@ -1349,12 +1349,14 @@ nlohmann::json graph_ids(const std::vector<std::string>& ids) {
 /// A local server answering the three Graph collections `sync_entra` reads, wired into the
 /// store through its test hooks. Set `users`, `groups` and `members` before calling sync_entra.
 struct GraphStandIn {
-    LocalGraphServer graph;
     nlohmann::json users = nlohmann::json::array();
     nlohmann::json groups = nlohmann::json::array();
     std::map<std::string, nlohmann::json> members; // group id -> array of {"id": ...}
     std::mutex mu;
     std::vector<std::string> member_requests; // group ids a members request was made for
+    // Declared last so it is destroyed first: its handlers read the members above, and must
+    // have stopped before any of them is gone.
+    LocalGraphServer graph;
 
     explicit GraphStandIn(DirectorySync& store) {
         graph.svr.Get("/users", [this](const httplib::Request&, httplib::Response& res) {
@@ -1636,4 +1638,72 @@ TEST_CASE("DirectorySync[pg]: update_status reports whether the status row was w
         REQUIRE(renamed.ok());
     }
     CHECK_FALSE(acc.update_status("entra", "failed", 0, 0, "boom"));
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a directory sync whose status row cannot be written still reports "
+          "the counts it applied",
+          "[directory_sync][pg][routes][validation]") {
+    DirectorySyncPg store;
+    GraphStandIn graph{*store};
+    DirectoryRouteHarness h{store.get()};
+
+    graph.users.push_back(graph_user("u1", "Alice"));
+    graph.users.push_back(graph_user("u2", "Bob"));
+    graph.groups.push_back(graph_group("g1", "Engineering"));
+    graph.members["g1"] = graph_ids({"u1", "u2"});
+
+    // Refuse any write of a 'completed' status row. The 'running' row written at the start of
+    // the sync is unaffected, so after the sync the row still says 'running' with zero counts.
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "CREATE FUNCTION directory_sync.yuzu_test_refuse_completed() "
+                                "RETURNS trigger LANGUAGE plpgsql AS "
+                                "$$ BEGIN RAISE EXCEPTION 'status write refused'; END $$",
+                                std::vector<std::string>{})
+                    .ok());
+        REQUIRE(pg::exec_params(lease.get(),
+                                "CREATE TRIGGER yuzu_test_refuse_completed "
+                                "BEFORE INSERT OR UPDATE ON directory_sync.directory_sync_status "
+                                "FOR EACH ROW WHEN (NEW.status = 'completed') "
+                                "EXECUTE FUNCTION directory_sync.yuzu_test_refuse_completed()",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+
+    auto res = h.sink.Post(
+        "/api/directory/sync",
+        R"({"provider":"entra","tenant_id":"t","client_id":"c","client_secret":"s"})",
+        "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["status"] == "completed");
+    CHECK(body["user_count"] == 2);
+    CHECK(body["group_count"] == 1);
+
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "directory.sync");
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail ==
+          "Entra ID sync completed applied_users=2 applied_groups=1 skipped=0");
+
+    // The status write failed, so the stored row is not 'completed' and carries no counts.
+    auto status = store->get_status();
+    CHECK(status.status != "completed");
+    CHECK(status.user_count == 0);
+    CHECK(status.group_count == 0);
+
+    // The roster was applied.
+    auto count = store->get_synced_user_count_checked();
+    REQUIRE(count.has_value());
+    CHECK(*count == 2);
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0].id == "g1");
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    REQUIRE(alice->groups.size() == 1);
+    CHECK(alice->groups[0] == "Engineering");
 }

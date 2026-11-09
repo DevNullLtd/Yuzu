@@ -216,13 +216,15 @@ public:
     /// map this to HTTP 409, not 500 (see `discovery_routes.cpp`).
     std::expected<ApplyCounts, std::string> sync_entra(const EntraConfig& config);
 
-    /// TEST ONLY: when non-empty, replaces `https://graph.microsoft.com/v1.0` as the base of
-    /// every Graph request `sync_entra` makes, so a local server can stand in for Graph.
-    /// Empty (default) in production.
+    /// TEST ONLY: set before any sync starts and never from production code. When non-empty,
+    /// replaces `https://graph.microsoft.com/v1.0` as the base of every Graph request
+    /// `sync_entra` makes, so a local server can stand in for Graph. Empty (default) in
+    /// production.
     std::string test_hook_graph_base_url_;
 
-    /// TEST ONLY: when set, `sync_entra` takes its access token from this callable instead of
-    /// the OAuth2 token endpoint. Unset (default) in production.
+    /// TEST ONLY: set before any sync starts and never from production code. When set,
+    /// `sync_entra` takes its access token from this callable instead of the OAuth2 token
+    /// endpoint. Unset (default) in production.
     std::function<std::expected<std::string, std::string>(const EntraConfig&)>
         test_hook_acquire_token_;
 
@@ -283,9 +285,9 @@ public:
         return sanitized_fields_.load(std::memory_order_relaxed);
     }
 
-    /// Records skipped by the most recent snapshot apply on this object (same definition as
-    /// `skipped_records()`); 0 when that snapshot skipped nothing. A process-wide last value:
-    /// overlapping applies overwrite each other, so a report about one sync uses the result
+    /// The skipped count (same definition as `skipped_records()`) of the most recent snapshot
+    /// apply on this object; 0 when that snapshot skipped nothing. Overlapping applies on the
+    /// same object overwrite each other, so a report about one sync uses the result
     /// `sync_entra` returned instead.
     [[nodiscard]] std::uint64_t last_sync_skipped_records() const noexcept {
         return last_sync_skipped_.load(std::memory_order_relaxed);

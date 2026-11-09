@@ -933,7 +933,10 @@ DirectorySync::sync_entra(const EntraConfig& config) {
         auto err = apply_result.error().starts_with(kSnapshotRefusedPrefix)
                        ? apply_result.error()
                        : "applying sync result failed: " + apply_result.error();
-        (void)update_status("entra", "failed", fetched_users, fetched_groups, err);
+        if (!update_status("entra", "failed", fetched_users, fetched_groups, err)) {
+            spdlog::warn("DirectorySync: Entra sync failed and the status row could not be "
+                         "updated");
+        }
         spdlog::error("DirectorySync: {}", err);
         return std::unexpected(err);
     }
