@@ -688,21 +688,19 @@ TEST_CASE("REST components: a degraded totals read alone is a 503 with retry_aft
     CHECK(h.audits("inventory.components.view", "failure") == 1);
 }
 
-TEST_CASE("REST components: a CSV export walks every page with a continuation",
+TEST_CASE("REST components: a 100k-row CSV export walks every page with a continuation",
           "[pg][rest][inventory_components][export]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareInventoryStore store{pool};
     REQUIRE(store.is_open());
-    // The continuation walk and the exact-multiple-of-the-cap rule below do not depend on the cap's
-    // size, and in export mode `limit` IS the per-call cap, so the cap is set to 1000 here and the
-    // seed shrinks to 3000 rows over 10 apply calls. The default (kExportCap, 10000) is pinned by
-    // the pure parse case in test_software_list_model.cpp, and the shared read_limit's default and
-    // ceiling by the devices-params case in test_software_catalogue_model.cpp.
-    constexpr int kDevices = 10;
-    constexpr int kPerDevice = 300;
-    constexpr int kCap = 1000;
+    // The CMP-3 acceptance line: a 100k-row CSV stream (100 devices x 1000 components) walked
+    // under the DEFAULT export cap (kExportCap, 10000), not a smaller cap or a smaller seed. About
+    // 20 s on a local Postgres 18 (the seed is 100 apply calls of 1000 rows); the cost is the
+    // acceptance's own, so this case stays at full size.
+    constexpr int kDevices = 100;
+    constexpr int kPerDevice = 1000;
     for (int d = 0; d < kDevices; ++d) {
         std::vector<V3Component> rows;
         rows.reserve(kPerDevice);
@@ -716,14 +714,14 @@ TEST_CASE("REST components: a CSV export walks every page with a continuation",
     std::size_t data_rows = 0;
     int pages = 0;
     for (;;) {
-        std::string q = "?format=csv&limit=" + std::to_string(kCap);
+        std::string q = "?format=csv";
         if (!cursor.empty())
             q += "&cursor=" + cursor;
         auto res = h.sink.Get(std::string(kPath) + q);
         REQUIRE(res);
         REQUIRE(res->status == 200);
         ++pages;
-        REQUIRE(pages <= 5);
+        REQUIRE(pages <= 12);
         std::size_t lines = 0;
         for (char c : res->body)
             if (c == '\n')
@@ -742,12 +740,13 @@ TEST_CASE("REST components: a CSV export walks every page with a continuation",
         cursor = res->get_header_value("X-Next-Cursor");
     }
     CHECK(data_rows == static_cast<std::size_t>(kDevices) * kPerDevice);
-    // A page that comes back full always carries a continuation (the documented count == limit
-    // rule, "more rows may exist", shared with the installs route), so a total that is an exact
-    // multiple of the cap ends on one more, header-only page: 3 full pages + 1 closing page.
-    CHECK(pages == 4);
-    CHECK(h.audits("inventory.components.export", "success", "page=continuation") == 3);
-    CHECK(h.audits("inventory.components.export", "success") == 4);
+    // The export cap is 10000 rows per call. A page that comes back full always carries a
+    // continuation (the documented count == limit rule, "more rows may exist", shared with the
+    // installs route), so a total that is an exact multiple of the cap ends on one more,
+    // header-only page: 10 full pages + 1 closing page.
+    CHECK(pages == 11);
+    CHECK(h.audits("inventory.components.export", "success", "page=continuation") == 10);
+    CHECK(h.audits("inventory.components.export", "success") == 11);
 }
 
 TEST_CASE("REST components: every JSON page is audited, continuation pages are tagged",

@@ -333,6 +333,41 @@ TotalsDecision totals_decision(bool admit_all, const SoftwareComponentQuery& q) 
                                 : TotalsDecision{false, kOmittedFilters};
 }
 
+namespace {
+// A rollup row and its refresh epoch are read on separate pool leases, so a refresh committing
+// between the two would pair the new generation's counts with the old as_of. The same bracket as
+// software_catalogue_model's page read: epoch, row, epoch again; a moved epoch is read once more
+// against the new one, a second move is kDegraded (a 503, never a mismatched pair).
+template <class MetaFn, class RowFn>
+TotalsOutcome read_rollup_totals(const MetaFn& meta_fn, const RowFn& row_fn) {
+    TotalsOutcome out;
+    const auto meta = meta_fn();
+    if (!meta)
+        return out;
+    auto gen = meta->refreshed_at;
+    if (gen == 0) {
+        out.status = TotalsStatus::kBuilding;
+        return out;
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto t = row_fn();
+        if (!t)
+            return out;
+        const auto after = meta_fn();
+        if (!after)
+            return out;
+        if (after->refreshed_at == gen) {
+            out.status = TotalsStatus::kServed;
+            out.totals = *t;
+            out.as_of = gen;
+            return out;
+        }
+        gen = after->refreshed_at;
+    }
+    return out; // kDegraded
+}
+} // namespace
+
 TotalsOutcome read_application_totals(const TotalsReads& io, const SoftwareFleetQuery& q) {
     TotalsOutcome out;
     std::vector<std::string> single;
@@ -351,40 +386,15 @@ TotalsOutcome read_application_totals(const TotalsReads& io, const SoftwareFleet
         out.totals = *t;
         return out;
     }
-    const auto meta = io.catalog_meta();
-    if (!meta)
-        return out;
-    if (meta->refreshed_at == 0) {
-        out.status = TotalsStatus::kBuilding;
-        return out;
-    }
-    const auto t = io.title_totals(q.name);
-    if (!t)
-        return out;
-    out.status = TotalsStatus::kServed;
-    out.totals = *t;
-    out.as_of = meta->refreshed_at;
-    return out;
+    return read_rollup_totals(io.catalog_meta, [&] { return io.title_totals(q.name); });
 }
 
 TotalsOutcome read_component_totals(const TotalsReads& io, const SoftwareComponentQuery& q) {
+    if (!q.kind.empty() && !q.versions)
+        return read_rollup_totals(io.component_meta, [&] {
+            return io.component_totals(q.kind, q.name, std::nullopt);
+        });
     TotalsOutcome out;
-    if (!q.kind.empty() && !q.versions) {
-        const auto meta = io.component_meta();
-        if (!meta)
-            return out;
-        if (meta->refreshed_at == 0) {
-            out.status = TotalsStatus::kBuilding;
-            return out;
-        }
-        const auto t = io.component_totals(q.kind, q.name, std::nullopt);
-        if (!t)
-            return out;
-        out.status = TotalsStatus::kServed;
-        out.totals = *t;
-        out.as_of = meta->refreshed_at;
-        return out;
-    }
     const auto t = io.component_totals(q.kind, q.name, q.versions);
     if (!t)
         return out;

@@ -278,6 +278,7 @@ namespace {
 struct FakeTotals {
     std::int64_t refreshed_at{1700000000};
     bool ok{true};
+    int moves_left{0}; ///< rollup refreshes that commit under the next rollup row reads
     int title_reads{0};
     int set_reads{0};
     int comp_reads{0};
@@ -299,6 +300,7 @@ struct FakeTotals {
         };
         io.title_totals = [this](std::string_view) -> std::optional<SoftwareTotals> {
             ++title_reads;
+            move();
             if (!ok)
                 return std::nullopt;
             return SoftwareTotals{10, 4, 0};
@@ -315,12 +317,21 @@ struct FakeTotals {
                                      const std::optional<std::vector<std::string>>& v)
             -> std::optional<SoftwareTotals> {
             ++comp_reads;
+            move();
             last_had_versions = v.has_value();
             if (!ok)
                 return std::nullopt;
             return SoftwareTotals{9, 3, 2};
         };
         return io;
+    }
+    // A refresh committing between the epoch read and the row read: the row now belongs to the
+    // next generation.
+    void move() {
+        if (moves_left > 0) {
+            --moves_left;
+            refreshed_at += 100;
+        }
     }
 };
 } // namespace
@@ -370,6 +381,43 @@ TEST_CASE("read_application_totals: building before the first refresh; a failed 
     CHECK(read_application_totals(f.reads(), q).status == TotalsStatus::kDegraded);
     q.version = "1";
     CHECK(read_application_totals(f.reads(), q).status == TotalsStatus::kDegraded);
+}
+
+TEST_CASE("rollup totals: a refresh under the row read is re-read against the new epoch once; a "
+          "second move is degraded",
+          "[server][software_list_model]") {
+    FakeTotals f;
+    SoftwareFleetQuery q;
+    q.name = "git";
+    f.moves_left = 1;
+    auto t = read_application_totals(f.reads(), q);
+    CHECK(t.status == TotalsStatus::kServed);
+    REQUIRE(t.as_of.has_value());
+    CHECK(*t.as_of == 1700000100); // the epoch the served counts belong to, never the first one
+    CHECK(f.title_reads == 2);
+
+    f.moves_left = 2;
+    f.title_reads = 0;
+    t = read_application_totals(f.reads(), q);
+    CHECK(t.status == TotalsStatus::kDegraded);
+    CHECK_FALSE(t.as_of.has_value());
+    CHECK(f.title_reads == 2); // one retry, never a third
+
+    SoftwareComponentQuery c;
+    c.name = "libfoo";
+    c.kind = "library";
+    f.moves_left = 1;
+    t = read_component_totals(f.reads(), c);
+    CHECK(t.status == TotalsStatus::kServed);
+    REQUIRE(t.as_of.has_value());
+    CHECK(*t.as_of == f.refreshed_at);
+    CHECK(f.comp_reads == 2);
+
+    f.moves_left = 2;
+    f.comp_reads = 0;
+    t = read_component_totals(f.reads(), c);
+    CHECK(t.status == TotalsStatus::kDegraded);
+    CHECK(f.comp_reads == 2);
 }
 
 TEST_CASE("read_component_totals: kind without a version filter uses the rollup; else live",
