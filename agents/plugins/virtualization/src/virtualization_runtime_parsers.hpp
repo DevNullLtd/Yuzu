@@ -55,8 +55,6 @@ inline constexpr std::size_t kDaemonJsonCap = 256 * 1024;
 inline constexpr std::size_t kFieldCap = 256;
 inline constexpr std::size_t kShortFieldCap = 64;
 inline constexpr std::size_t kMaxSocketPath = 107; // sun_path is 108 bytes including the NUL
-/// Every request carries `Connection: close`; the shell sets exactly this value.
-inline constexpr std::string_view kConnectionHeaderValue = "close";
 
 // ---------------------------------------------------------------------------
 // Tokens
@@ -181,18 +179,11 @@ inline std::string normalise_path(std::string_view p) {
     return out;
 }
 
+/// True iff some '/'-delimited segment of `p` is exactly "..". Bracketing `p` with '/' turns the
+/// first and last segments into delimited ones, so "/../" occurs iff a ".." segment does (an empty
+/// segment, as in "a//../b", hides nothing; "..." and "a..b" are not "..").
 inline bool has_dotdot_segment(std::string_view p) {
-    std::size_t pos = 0;
-    while (pos <= p.size()) {
-        const auto slash = p.find('/', pos);
-        const auto end = slash == std::string_view::npos ? p.size() : slash;
-        if (p.substr(pos, end - pos) == "..")
-            return true;
-        if (slash == std::string_view::npos)
-            break;
-        pos = slash + 1;
-    }
-    return false;
+    return ("/" + std::string{p} + "/").find("/../") != std::string::npos;
 }
 
 /// Every refusal reason, plus `unset` (no endpoint), `ok` and `absent` (ENOENT: the endpoint is not
@@ -244,10 +235,6 @@ inline std::string_view endpoint_reason_token(EndpointVerdict v) {
     default:
         return "-";
     }
-}
-
-inline bool is_refusal(EndpointVerdict v) {
-    return v != EndpointVerdict::unset && v != EndpointVerdict::ok && v != EndpointVerdict::absent;
 }
 
 struct EndpointDecision {
@@ -362,8 +349,8 @@ inline std::string_view endpoint_status_token(EndpointStatus s) {
 }
 
 /// How one request ended at the transport. `other` is any connect-time failure that is not one of
-/// the named errnos; it reads `unreachable`.
-enum class Outcome { ok, eacces, enoent, econnrefused, timeout, oversized, not_http, other };
+/// the named errnos (a refused connection included); it reads `unreachable`.
+enum class Outcome { ok, eacces, enoent, timeout, oversized, not_http, other };
 
 /// The endpoint state a FAILED first exchange maps to (decide_endpoint's transport half).
 inline EndpointStatus endpoint_status_for(Outcome o) {
@@ -376,7 +363,6 @@ inline EndpointStatus endpoint_status_for(Outcome o) {
     case Outcome::oversized:
         return EndpointStatus::not_http;
     case Outcome::enoent:
-    case Outcome::econnrefused:
     case Outcome::timeout:
     case Outcome::other:
         return EndpointStatus::unreachable;
@@ -414,26 +400,11 @@ inline std::string failure_cause(Outcome o) {
     }
 }
 
-enum class RuntimeDetection { not_detected, detected, served };
-
-inline std::string_view detection_token(RuntimeDetection d) {
-    switch (d) {
-    case RuntimeDetection::not_detected:
-        return "not_detected";
-    case RuntimeDetection::detected:
-        return "detected";
-    case RuntimeDetection::served:
-        return "served";
-    }
-    return "not_detected";
-}
-
-/// `served` when the endpoint's /version identified this runtime, else `detected` when any
-/// standard-path artefact exists, else `not_detected`. An endpoint failure never reaches here.
-inline RuntimeDetection decide_runtime(bool any_artefact, bool served) {
-    if (served)
-        return RuntimeDetection::served;
-    return any_artefact ? RuntimeDetection::detected : RuntimeDetection::not_detected;
+/// The detection column: `served` when the endpoint's /version identified this runtime, else
+/// `detected` when any standard-path artefact exists, else `not_detected`. An endpoint failure
+/// never reaches here.
+inline std::string_view decide_runtime(bool any_artefact, bool served) {
+    return served ? "served" : any_artefact ? "detected" : "not_detected";
 }
 
 // ---------------------------------------------------------------------------
@@ -474,15 +445,17 @@ inline std::string socket_present_field(const StatResult& s) {
            std::to_string(s.gid);
 }
 
+/// `a` is `b` or lies under it, on a '/' boundary (`/ab` is not under `/a`). Callers special-case
+/// `b` == "/".
+inline bool path_is_or_under(std::string_view a, std::string_view b) {
+    return a == b || (a.size() > b.size() && a.substr(0, b.size()) == b && a[b.size()] == '/');
+}
+
 /// `p` is `m`, is under `m`, or contains `m` (the mount table speaks in mount points).
 inline bool path_touches_mount(std::string_view p, std::string_view m) {
     if (m == "/" || p == "/")
         return true;
-    const auto under = [](std::string_view a, std::string_view b) {
-        return a == b || (a.size() > b.size() && a.substr(0, b.size()) == b &&
-                          a[b.size()] == '/');
-    };
-    return under(p, m) || under(m, p);
+    return path_is_or_under(p, m) || path_is_or_under(m, p);
 }
 
 /// The agent can connect to this present default socket without the operator proxy: a group the
@@ -789,12 +762,9 @@ inline bool mount_exposes_runtime_socket(std::string_view source) {
     const std::string s = normalise_path(source);
     if (s.empty() || s.front() != '/')
         return false;
-    for (const auto d : kDefaultSockets) {
-        if (s == d || s == "/")
+    for (const auto d : kDefaultSockets)
+        if (s == "/" || path_is_or_under(d, s))
             return true;
-        if (d.size() > s.size() && d.substr(0, s.size()) == s && d[s.size()] == '/')
-            return true;
-    }
     return false;
 }
 
@@ -844,10 +814,10 @@ inline std::string format_endpoint_row(EndpointStatus s, std::string_view reason
     return join_row({"endpoint", endpoint_status_token(s), reason, dialect_token(dialect)});
 }
 
-inline std::string format_runtime_row(std::string_view runtime, RuntimeDetection d,
+inline std::string format_runtime_row(std::string_view runtime, std::string_view detection,
                                       std::string_view socket_field, std::string_view config_field,
                                       std::string_view version, std::string_view api_version) {
-    return join_row({"runtime", runtime, detection_token(d), socket_field, config_field, version,
+    return join_row({"runtime", runtime, detection, socket_field, config_field, version,
                      api_version});
 }
 

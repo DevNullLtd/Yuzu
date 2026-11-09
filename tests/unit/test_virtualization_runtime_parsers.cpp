@@ -104,8 +104,14 @@ TEST_CASE("runtime endpoint: lexical decision", "[virtualization][runtime][endpo
     CHECK(parse_endpoint("./x.sock").verdict == EndpointVerdict::relative);
     CHECK(parse_endpoint("/run/../x").verdict == EndpointVerdict::dotdot);
     CHECK(parse_endpoint("/run/yuzu-agent/..").verdict == EndpointVerdict::dotdot);
+    CHECK(parse_endpoint("/..").verdict == EndpointVerdict::dotdot);
+    CHECK(parse_endpoint("/x/..").verdict == EndpointVerdict::dotdot);
+    // an empty segment hides nothing
+    CHECK(parse_endpoint("/run//../x").verdict == EndpointVerdict::dotdot);
     // a name that merely contains dots is not a `..` segment
     CHECK(parse_endpoint("/run/yuzu..agent/a.sock").verdict == EndpointVerdict::ok);
+    CHECK(parse_endpoint("/...").verdict == EndpointVerdict::ok);
+    CHECK(parse_endpoint("/a..b").verdict == EndpointVerdict::ok);
 
     for (const auto s : kDefaultSockets)
         CHECK(parse_endpoint(s).verdict == EndpointVerdict::default_socket);
@@ -123,6 +129,16 @@ TEST_CASE("runtime endpoint: lexical decision", "[virtualization][runtime][endpo
     CHECK(parse_endpoint(at_limit).verdict == EndpointVerdict::ok);
     CHECK(parse_endpoint(at_limit + "a").verdict == EndpointVerdict::too_long);
     CHECK(parse_endpoint("//" + at_limit).verdict == EndpointVerdict::ok); // collapses to the limit
+}
+
+TEST_CASE("runtime endpoint: a `..` segment is exactly a whole segment, wherever it sits",
+          "[virtualization][runtime][endpoint]") {
+    for (const char* p : {"..", "/..", "../x", "a/..", "../..", "a//../b", "/./../x"})
+        CHECK(has_dotdot_segment(p));
+    for (const char* p : {"", "/", ".", "...", "/.../", "a..b", "..a", "a..", "/a/.b/c.."})
+        CHECK_FALSE(has_dotdot_segment(p));
+    const std::string with_nul{"/a\0/..", 6};
+    CHECK(has_dotdot_segment(with_nul)); // an embedded NUL is not a separator and hides nothing
 }
 
 TEST_CASE("runtime endpoint: normalise_path never resolves a dotdot", "[virtualization][runtime][endpoint]") {
@@ -202,14 +218,15 @@ TEST_CASE("runtime endpoint: status tables (decide_endpoint)", "[virtualization]
                          EndpointVerdict::group, EndpointVerdict::mode,
                          EndpointVerdict::insecure_ancestor, EndpointVerdict::stat_error}) {
         CHECK(endpoint_status_for(v) == EndpointStatus::endpoint_refused);
-        CHECK(is_refusal(v));
         CHECK(endpoint_reason_token(v) != "-");
     }
-    CHECK_FALSE(is_refusal(EndpointVerdict::absent));
+    // no reason for a verdict that is not a refusal: the endpoint row prints it as-is
+    for (const auto v : {EndpointVerdict::unset, EndpointVerdict::ok, EndpointVerdict::absent})
+        CHECK(endpoint_reason_token(v) == "-");
 
     CHECK(endpoint_status_for(Outcome::ok) == EndpointStatus::ok);
     CHECK(endpoint_status_for(Outcome::eacces) == EndpointStatus::permission_denied);
-    for (const auto o : {Outcome::enoent, Outcome::econnrefused, Outcome::timeout, Outcome::other})
+    for (const auto o : {Outcome::enoent, Outcome::timeout, Outcome::other})
         CHECK(endpoint_status_for(o) == EndpointStatus::unreachable);
     CHECK(endpoint_status_for(Outcome::not_http) == EndpointStatus::not_http);
     CHECK(endpoint_status_for(Outcome::oversized) == EndpointStatus::not_http);
@@ -217,10 +234,10 @@ TEST_CASE("runtime endpoint: status tables (decide_endpoint)", "[virtualization]
 
 TEST_CASE("runtime status: detection is about standard paths and an endpoint failure changes none",
           "[virtualization][runtime][status]") {
-    CHECK(decide_runtime(false, false) == RuntimeDetection::not_detected);
-    CHECK(decide_runtime(true, false) == RuntimeDetection::detected);
-    CHECK(decide_runtime(false, true) == RuntimeDetection::served);
-    CHECK(decide_runtime(true, true) == RuntimeDetection::served);
+    CHECK(decide_runtime(false, false) == "not_detected");
+    CHECK(decide_runtime(true, false) == "detected");
+    CHECK(decide_runtime(false, true) == "served");
+    CHECK(decide_runtime(true, true) == "served");
     // the endpoint state is not an input of decide_runtime at all: nothing to change.
 }
 
@@ -606,7 +623,7 @@ TEST_CASE("runtime rows: every field goes through wire_field", "[virtualization]
     CHECK(format_endpoint_row(EndpointStatus::endpoint_refused, "default_socket", Dialect::none) ==
           "endpoint|endpoint_refused|default_socket|-");
     CHECK(format_endpoint_row(EndpointStatus::ok, "", Dialect::podman) == "endpoint|ok|-|podman");
-    CHECK(format_runtime_row("docker", RuntimeDetection::served, "present:0660:0:998", "present",
+    CHECK(format_runtime_row("docker", "served", "present:0660:0:998", "present",
                              "27.3.1", "1.47") ==
           "runtime|docker|served|present:0660:0:998|present|27.3.1|1.47");
     CHECK(format_config_row("docker", "live-restore", "yes") == "config|docker|live-restore|yes");
@@ -626,7 +643,7 @@ TEST_CASE("runtime tokens: every token matches the plugin grammar", "[virtualiza
     CHECK(http_cause(-1) == "http_other");
     CHECK(http_cause(0) == "http_other");
     CHECK(std::regex_match(rt_token("x:" + http_cause(70000)), grammar));
-    for (const auto o : {Outcome::eacces, Outcome::enoent, Outcome::econnrefused, Outcome::timeout,
-                         Outcome::oversized, Outcome::not_http, Outcome::other})
+    for (const auto o : {Outcome::eacces, Outcome::enoent, Outcome::timeout, Outcome::oversized,
+                         Outcome::not_http, Outcome::other})
         CHECK(std::regex_match(rt_token("info:" + failure_cause(o)), grammar));
 }

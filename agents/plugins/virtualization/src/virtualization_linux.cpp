@@ -150,8 +150,6 @@ runtime::Outcome outcome_for_errno(int e) {
     case ENOENT:
     case ENXIO:
         return runtime::Outcome::enoent;
-    case ECONNREFUSED:
-        return runtime::Outcome::econnrefused;
     default:
         return runtime::Outcome::other;
     }
@@ -181,7 +179,7 @@ runtime::TransportResult one_request(const std::string& connect_path, const runt
 
     runtime::TransportResult out;
     bool oversized = false;
-    const httplib::Headers headers{{"Connection", std::string{runtime::kConnectionHeaderValue}}};
+    const httplib::Headers headers{{"Connection", "close"}};
     errno = 0;
     const auto started = steady_clock::now();
     auto res = cli.Get(req.path, headers, [&](const char* data, size_t n) {

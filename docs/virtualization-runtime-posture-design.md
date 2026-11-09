@@ -292,7 +292,7 @@ unknown fields for that verb plus one token `<verb>:http_<status>` or `<verb>:ma
 kept and later verbs still run while budget remains. A failed inspection keeps the list-derived row with
 the three inspect fields `unknown` and continues; the failures are counted in one token
 `inspect:failed:<n>`. An HTTP 404 on inspect (the container was removed between list and inspect) is
-expected churn: fields `unknown`, counted as `inspect:vanished:<n>`, no constraint.
+expected churn: fields `unknown`, no token and no constraint.
 
 **Exceptions.** The plugin's entry point is one `try/catch(...)` at the ABI seam (the existing
 `execute_action` in `virtualization_legs.hpp`, which `runtime_posture` joins as a further leg); the

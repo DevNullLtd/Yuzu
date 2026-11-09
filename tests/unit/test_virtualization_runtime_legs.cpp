@@ -153,7 +153,7 @@ struct Fake {
             budgets.push_back(budget);
             now += step;
             const auto it = replies.find(req.path);
-            return it == replies.end() ? fail(Outcome::econnrefused) : it->second;
+            return it == replies.end() ? fail(Outcome::other) : it->second;
         };
         const Clock clock = [this] { return now; };
         return runtime_posture_linux(fs, transport, clock, endpoint);
@@ -387,7 +387,6 @@ TEST_CASE("runtime seam: endpoint failures own the endpoint row and change no ru
     };
     for (const auto& c : {Case{Outcome::eacces, "endpoint|permission_denied|-|-"},
                           Case{Outcome::enoent, "endpoint|unreachable|-|-"},
-                          Case{Outcome::econnrefused, "endpoint|unreachable|-|-"},
                           Case{Outcome::timeout, "endpoint|unreachable|-|-"},
                           Case{Outcome::other, "endpoint|unreachable|-|-"},
                           Case{Outcome::not_http, "endpoint|not_http|-|-"},

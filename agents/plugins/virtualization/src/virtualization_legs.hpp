@@ -22,7 +22,6 @@
 #include "virtualization_runtime_parsers.hpp"
 
 #include <constraint_accumulator.hpp>
-#include <network_fstype.hpp>
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
@@ -55,21 +54,15 @@ int run_macos_runtime_posture(yuzu::CommandContext& ctx);
 /// The operator's `agent.runtime_endpoint`, stashed by the plugin's init() and read by the Linux
 /// leg. Empty (the default) means the action never opens a socket. Guarded: init() and a worker
 /// thread's execute() are not ordered by the plugin ABI.
-inline std::string& runtime_endpoint_slot() {
-    static std::string slot;
-    return slot;
-}
-inline std::mutex& runtime_endpoint_mutex() {
-    static std::mutex m;
-    return m;
-}
+inline std::mutex g_runtime_endpoint_mutex;
+inline std::string g_runtime_endpoint;
 inline void set_runtime_endpoint(std::string_view v) {
-    std::lock_guard<std::mutex> lk(runtime_endpoint_mutex());
-    runtime_endpoint_slot() = std::string{v};
+    std::lock_guard<std::mutex> lk(g_runtime_endpoint_mutex);
+    g_runtime_endpoint = std::string{v};
 }
 inline std::string runtime_endpoint() {
-    std::lock_guard<std::mutex> lk(runtime_endpoint_mutex());
-    return runtime_endpoint_slot();
+    std::lock_guard<std::mutex> lk(g_runtime_endpoint_mutex);
+    return g_runtime_endpoint;
 }
 
 enum class StatusState { supported, constrained, unsupported };
@@ -218,12 +211,6 @@ namespace detail {
 
 inline bool errno_absent(int e) { return e == ENOENT || e == ENOTDIR; }
 
-/// One decoded exchange: the transport result plus the parsed JSON when the status was 200.
-struct Exchange {
-    TransportResult t;
-    ParsedJson json;
-};
-
 } // namespace detail
 
 /// The whole action over injected boundaries (mgmt_posture_legs.hpp shape). No exception is
@@ -245,12 +232,6 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
     std::vector<ConfigRow> docker_config;
     bool docker_config_malformed = false;
 
-    const auto stat_default = [&](std::string_view path) {
-        const StatResult st = fs.stat(std::string{path});
-        default_stats.push_back(st);
-        return st;
-    };
-
     if (fs.mountinfo_unreadable)
         acc.add_failure(rt_token("mountinfo:unreadable"));
 
@@ -259,9 +240,10 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
         d.name = std::string{spec.name};
         bool socket_unreadable = false;
         for (const auto path : spec.sockets) {
-            const StatResult st = stat_default(path);
+            const StatResult st = fs.stat(std::string{path});
+            default_stats.push_back(st);
             if (st.ok()) {
-                if (!d.any || d.socket_field == "absent")
+                if (d.socket_field == "absent")
                     d.socket_field = socket_present_field(st);
                 d.any = true;
                 if (socket_overprivileged(st, fs.groups))
@@ -353,19 +335,15 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
     }
     if (verdict != EndpointVerdict::ok) {
         ep_status = endpoint_status_for(verdict);
-        if (is_refusal(verdict))
-            ep_reason = std::string{endpoint_reason_token(verdict)};
+        ep_reason = std::string{endpoint_reason_token(verdict)};
     } else {
         // Request budget: remaining time of the action deadline, never zero or negative. A
         // sub-millisecond remainder stops the action rather than reaching the client's "no limit".
-        bool exhausted = false;
         const auto send = [&](const Request& req) -> std::optional<TransportResult> {
             const auto remaining = deadline - clock();
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
             if (ms.count() < 1) {
-                if (!exhausted)
-                    acc.add_failure(rt_token("deadline_exhausted"));
-                exhausted = true;
+                acc.add_failure(rt_token("deadline_exhausted")); // deduped by the accumulator
                 return std::nullopt;
             }
             return transport(req, ms);
@@ -423,11 +401,9 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
             return pj;
         };
 
-        if (proceed && !exhausted) {
+        if (proceed) {
             if (const auto info = fetch(Verb::info, "info"))
                 info_rows = parse_info(info->value);
-        }
-        if (proceed && !exhausted) {
             if (const auto list = fetch(Verb::containers_list, "list")) {
                 ContainerList cl = containers_from_list(list->value);
                 if (cl.malformed)
@@ -439,23 +415,20 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
                 containers = std::move(cl.rows);
             }
         }
-        if (proceed && !containers.empty()) {
+        if (!containers.empty()) {
             if (containers.size() > kMaxInspections)
                 acc.add_failure(rt_token("inspect_capped"));
             std::size_t failed = 0;
-            std::size_t vanished = 0;
             const std::size_t n = std::min(containers.size(), kMaxInspections);
-            for (std::size_t i = 0; i < n && !exhausted; ++i) {
+            for (std::size_t i = 0; i < n; ++i) {
                 const auto req = build_request(Verb::container_inspect, containers[i].id);
                 if (!req)
                     continue;
                 const auto r = send(*req);
                 if (!r)
                     break;
-                if (r->outcome == Outcome::ok && r->http_status == 404) {
-                    ++vanished; // removed between list and inspect: expected churn
-                    continue;
-                }
+                if (r->outcome == Outcome::ok && r->http_status == 404)
+                    continue; // removed between list and inspect: expected churn, no constraint
                 if (r->outcome != Outcome::ok || r->http_status != 200) {
                     ++failed;
                     continue;
@@ -466,7 +439,6 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
             }
             if (failed > 0)
                 acc.add_failure(rt_token("inspect:failed:" + std::to_string(failed)));
-            (void)vanished; // counted, deliberately no constraint
         }
     }
 

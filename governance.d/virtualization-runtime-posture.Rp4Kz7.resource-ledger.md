@@ -19,7 +19,7 @@ opened only when the operator sets `agent.runtime_endpoint`. It adds no thread, 
 | R4 | Parsed JSON (`nlohmann::json`) | `ParsedJson` locals | `parse_limited` (non-throwing, callback discards nesting past 32) | scope exit | readers take const references | value type; nothing deeper than 32 levels is ever built |
 | R5 | Rows (`std::vector<ContainerRow>`, `ConfigRow`, formatted strings) | locals of `runtime_posture_linux` | from the list reply, capped at 256 rows; inspections at 64 | moved into the `Posture` | to `report` | value types; fields are truncated to 256 bytes (64 for network mode and versions) before escaping |
 | R6 | `std::atomic<bool>` single-flight flag (`runtime_posture_flight`) | function-local static, process lifetime | `compare_exchange_strong` at the top of the leg | the `Release` guard's destructor on every exit path, an exception included | none | RAII guard; a concurrent dispatch returns `busy` without touching the filesystem or the socket |
-| R7 | Operator endpoint string (`runtime_endpoint_slot`) | function-local static `std::string` behind a `std::mutex` | `init()` copies `agent.runtime_endpoint` | process lifetime | read by copy | none; written once in `init()`, read under the mutex |
+| R7 | Operator endpoint string (`g_runtime_endpoint`) | namespace-scope `inline` `std::string` behind an `inline` `std::mutex` (both constant-initialised) | `init()` copies `agent.runtime_endpoint` | process lifetime | read by copy | none; written once in `init()`, read under the mutex |
 | R8 | `static constexpr Legs kLegs` (now three leg pointers) | static storage, constant-initialised | none | none | none | none |
 
 ## Deadlines
