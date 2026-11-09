@@ -1547,6 +1547,9 @@ inline constexpr std::array<std::string_view, 3> kWinProfileLabels{"Domain", "Pr
 /// get_FirewallEnabled` read through classify_fw_hr, so nullopt is "unreadable"
 /// (S_FALSE or an error) and never a guess in either direction.
 using WinSwitchReading = std::array<std::optional<bool>, 3>;
+// A verdict's profile is a loop index over a reading, so this keeps the bare
+// kWinProfileLabels[profile] lookups below and in read_status in range.
+static_assert(std::tuple_size_v<WinSwitchReading> == kWinProfileLabels.size());
 
 struct WinSwitchVerdict {
     enum class Kind : std::uint8_t { ok, disabled, unreadable } kind = Kind::ok;
@@ -1576,10 +1579,9 @@ struct WinSwitchVerdict {
     case WinSwitchVerdict::Kind::ok:
         return {};
     case WinSwitchVerdict::Kind::disabled:
-        return std::format("firewall_disabled:{}", kWinProfileLabels[v.profile % kWinProfileLabels.size()]);
+        return std::format("firewall_disabled:{}", kWinProfileLabels[v.profile]);
     case WinSwitchVerdict::Kind::unreadable:
-        return std::format("firewall_state_unreadable:{}",
-                           kWinProfileLabels[v.profile % kWinProfileLabels.size()]);
+        return std::format("firewall_state_unreadable:{}", kWinProfileLabels[v.profile]);
     }
     return {};
 }
@@ -1605,16 +1607,6 @@ struct WinUpdatePlan {
             plan.remove.push_back(n);
     }
     return plan;
-}
-
-/// What a finished update still has to answer for: names in our group that are
-/// still present AFTER the removal pass and that the current generation does not
-/// own. An Allow rule outranks the default block, so each is a live allowance the
-/// record no longer lists.
-[[nodiscard]] inline std::vector<std::string>
-win_stale_residue(const std::vector<std::string>& ours_after_remove,
-                  const std::vector<WinRuleSpec>& specs) {
-    return win_update_plan(ours_after_remove, specs).remove;
 }
 
 // ── Linux: nftables ─────────────────────────────────────────────────────────

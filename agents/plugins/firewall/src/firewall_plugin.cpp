@@ -2076,7 +2076,7 @@ public:
             const int failed = remove_rules_by_name(*rules.get(), plan.remove);
             std::vector<std::string> after;
             stale_left = collect_our_rule_names(*rules.get(), after)
-                             ? fq::win_stale_residue(after, specs).size()
+                             ? fq::win_update_plan(after, specs).remove.size()
                              : static_cast<std::size_t>(failed);
         }
         os.stale_rules_left = static_cast<std::uint32_t>(stale_left);
@@ -2113,11 +2113,8 @@ public:
         // narrower than the quarantine at any point of the release (the reply to
         // this very command travels the control channel our rules keep open).
         // 1. Which of our rules exist (needed to decide the policy fallback below).
-        const auto collect_ours = [&](std::vector<std::string>& out) {
-            return collect_our_rule_names(*rules.get(), out);
-        };
         std::vector<std::string> ours_at_start;
-        if (!collect_ours(ours_at_start))
+        if (!collect_our_rule_names(*rules.get(), ours_at_start))
             return fq::StepResult::fail("rule_enumeration_failed");
         // 2. Re-enable what quarantine disabled. Names are not unique in Windows
         //    Firewall, so a duplicate-named pair is re-enabled together.
@@ -2173,7 +2170,7 @@ public:
         //    survive a release).
         for (int pass = 0; pass < 3; ++pass) {
             std::vector<std::string> ours;
-            if (!collect_ours(ours))
+            if (!collect_our_rule_names(*rules.get(), ours))
                 return fq::StepResult::fail("rule_enumeration_failed");
             if (ours.empty())
                 break;
@@ -2181,7 +2178,7 @@ public:
         }
         {
             std::vector<std::string> left;
-            if (!collect_ours(left))
+            if (!collect_our_rule_names(*rules.get(), left))
                 return fq::StepResult::fail("rule_enumeration_failed");
             if (!left.empty())
                 ++failures;

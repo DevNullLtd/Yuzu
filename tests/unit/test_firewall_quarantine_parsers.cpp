@@ -1042,16 +1042,16 @@ TEST_CASE("windows: a stale generation's rules that survive removal are residue"
         return out;
     };
     // a clean removal leaves exactly the current generation: no residue
-    CHECK(win_stale_residue(names(g2), g2).empty());
+    CHECK(win_update_plan(names(g2), g2).remove.empty());
     // an old rule that would not delete is residue; the current generation never is
     auto left = names(g2);
     left.push_back(names(g1)[1]);
-    CHECK(win_stale_residue(left, g2) == std::vector<std::string>{names(g1)[1]});
+    CHECK(win_update_plan(left, g2).remove == std::vector<std::string>{names(g1)[1]});
     // a second generation's leftover is counted beside the first's (recomputed per apply)
     left.push_back(names(g1)[2]);
-    CHECK(win_stale_residue(left, g2).size() == 2);
+    CHECK(win_update_plan(left, g2).remove.size() == 2);
     // nothing of the current generation, even when it is all that is left
-    CHECK(win_stale_residue(names(g1), g1).empty());
+    CHECK(win_update_plan(names(g1), g1).remove.empty());
 }
 
 // ── nftables ────────────────────────────────────────────────────────────────
