@@ -59,6 +59,10 @@ struct PurgeHarness {
     /// #7110: withdraw the per-device grant INSIDE the `requested` row write, the window in which
     /// production lets a grant move.
     bool revoke_on_requested{false};
+    /// #7110: the credentials stop resolving INSIDE the `requested` row write (the secondary
+    /// caller's own resolution then fails, which the route answers as caller_unresolved).
+    bool drop_session_on_requested{false};
+    bool session_gone{false};
     int scoped_calls{0};
     /// #7114: the chokepoint's refusal, carried on the dispatch outcome (nothing sent).
     std::optional<yuzu::server::detail::DispatchDenial> dispatch_denied;
@@ -80,8 +84,10 @@ struct PurgeHarness {
     bool wire_exec_visible{true};
 
     explicit PurgeHarness(bool with_exec_visible = true) : wire_exec_visible(with_exec_visible) {
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
+            if (session_gone)
+                return std::nullopt;
             auth::Session s;
             s.username = "purge-op";
             s.role = auth::Role::admin;
@@ -95,6 +101,8 @@ struct PurgeHarness {
             audits.push_back({a, r, tt, tid, d});
             if (r == "requested" && revoke_on_requested)
                 scope_allow = false;
+            if (r == "requested" && drop_session_on_requested)
+                session_gone = true;
             return audit_ok;
         };
         RestApiV1::ScopedPermFn scoped =
@@ -360,6 +368,24 @@ TEST_CASE("POST /api/v1/echo/retention-paused/purge: Infrastructure:Delete withd
     CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "denied"}}).value() == 1.0);
 }
 
+TEST_CASE("REST purge: a caller that stops resolving inside the requested-row write dispatches nothing "
+          "and writes failure caller_unresolved (#7110)",
+          "[server][echo][purge][rest][security][7110]") {
+    PurgeHarness h;
+    h.drop_session_on_requested = true;
+    int st = 0;
+    h.post(R"({"device_id":"dev-A","source":"process"})", st);
+    CHECK(h.calls.empty());
+    // The per-device gate passed twice (it consults no session here); the resolution is what failed.
+    CHECK(h.scoped_calls == 2);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "requested");
+    CHECK(h.audits[1].action == "echo.source.purge");
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].detail.rfind("caller_unresolved device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "denied"}}).value() == 1.0);
+}
+
 TEST_CASE("REST purge: a denied outcome is reported as dispatch_denied reason=<token> and counted, "
           "never as agent_not_connected (#7114)",
           "[server][echo][purge][rest][security][7114]") {
@@ -390,6 +416,15 @@ TEST_CASE("REST purge: a denied outcome is reported as dispatch_denied reason=<t
             const std::string token = d.token;
             CHECK(st == d.status);
             CHECK(body["error"]["message"] == "dispatch denied: reason=" + token);
+            // The 500 class is a server catalogue fault (the pair is a server literal): its hint
+            // must not tell the caller to confirm a plugin/action name they never chose.
+            const auto remediation = body["error"]["remediation"].get<std::string>();
+            if (d.status == 500) {
+                CHECK(remediation.find("server catalogue fault") != std::string::npos);
+                CHECK(remediation.find("confirm the plugin/action name") == std::string::npos);
+            } else {
+                CHECK(remediation.find("lacks this grant") != std::string::npos);
+            }
             REQUIRE(h.audits.size() == 2);
             CHECK(h.audits[1].result == "failure");
             CHECK(h.audits[1].detail.rfind("dispatch_denied reason=" + token +

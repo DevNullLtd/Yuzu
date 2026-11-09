@@ -107,7 +107,7 @@ struct Rig {
     ContainmentGate gate = ContainmentGate::exempt_control_plugin();
     std::optional<ConfinedDispatchOutcome> canned; // overrides the real seam for one outcome
     /// When set, the chokepoint dry run (`authorize_dispatch_fn`) refuses with this denial; a
-    /// test sets it inside `on_requested_row` to move the gate between the two runs (#7110).
+    /// test sets it inside `on_create` to move the gate between the two runs (#7110).
     std::optional<detail::DispatchDenial> authorize_denial;
     bool dispatch_throws = false;
     bool dispatch_throws_nonstd = false;
@@ -142,9 +142,10 @@ struct Rig {
     /// Audit rows and emitted events in the order they happened (one vector, so order is real).
     std::vector<std::string> trace;
     bool emit_throws = false;
-    /// Runs inside the `requested` audit write: the window in which production lets a grant, an
-    /// elevation or a visible set move (#7110).
-    std::function<void()> on_requested_row;
+    /// Runs inside the execution-row write, the route's last own write before the dispatch: the
+    /// window in which production lets a grant, an elevation or a visible set move (#7110).
+    std::function<void()> on_create;
+    bool session_gone = false; ///< the credentials no longer resolve (the recheck's auth_fn call)
 
     yuzu::server::test::TestRouteSink sink;
 
@@ -165,6 +166,8 @@ struct Rig {
         d.auth_fn = [this](const httplib::Request&,
                            httplib::Response&) -> std::optional<auth::Session> {
             ++auth_calls;
+            if (session_gone)
+                return std::nullopt;
             auto s = session;
             if (principal_flips && auth_calls >= 2)
                 s.username = "mallory";
@@ -196,8 +199,6 @@ struct Rig {
                             const std::string& detail) {
             trace.push_back("audit:" + result);
             audits.push_back({"<re-resolving>", "", action, result, tid, detail});
-            if (result == "requested" && on_requested_row)
-                on_requested_row();
             return true;
         };
         if (opts.session_writer)
@@ -207,8 +208,6 @@ struct Rig {
                                         const std::string& tid, const std::string& detail) {
                 trace.push_back("audit:" + result);
                 audits.push_back({s.username, role, action, result, tid, detail});
-                if (result == "requested" && on_requested_row)
-                    on_requested_row();
                 return result == "requested" ? requested_row_persists : outcome_row_persists;
             };
         d.classify_fn = [this](std::string_view p, std::string_view a) {
@@ -246,6 +245,8 @@ struct Rig {
                                     const std::string& params_json)
             -> std::expected<std::string, std::string> {
             exec_params.push_back(params_json);
+            if (on_create)
+                on_create();
             if (create_throws)
                 throw std::runtime_error("create boom");
             if (create_throws_nonstd)
@@ -1425,32 +1426,34 @@ TEST_CASE("command_v1: check_command_v1_request is total over non-objects",
 }
 
 TEST_CASE("POST /api/v1/commands: a destructive pair whose securable is withdrawn inside the "
-          "requested-row write dispatches nothing; failure row reason=permission_revoked (#7110)",
+          "execution-row write dispatches nothing, cancels the row; failure row reason=permission_revoked "
+          "(#7110)",
           "[server][command_v1][dispatch][security][7110]") {
     Rig rig;
     rig.facts = {.legacy_open = true};
     rig.visible_agents = Ids{kA};
-    rig.on_requested_row = [&] { rig.perm_denied.insert("Infrastructure:Delete"); };
+    rig.on_create = [&] { rig.perm_denied.insert("Infrastructure:Delete"); };
     const auto res = rig.post(
         {{"plugin", "echo"}, {"action", "purge_source"}, {"agent_ids", Ids{kA}}});
     CHECK(res->status == 403);
     CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
     CHECK(rig.dispatch_calls == 0);
     CHECK(rig.sent().empty());
-    CHECK(rig.exec_created == 0); // refused before the execution row
-    // Admission, then the recheck after the row: the pair's own securable both times.
+    CHECK(rig.exec_created == 1); // the execution row exists ...
+    CHECK(rig.cancelled == std::vector<std::string>{"exec-1"}); // ... and is closed, not left running
+    // Admission, then the recheck after the writes: the pair's own securable both times.
     CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), "Infrastructure:Delete") == 2);
     CHECK(rig.has_audit("requested"));
-    CHECK(rig.has_audit("failure", "reason=permission_revoked"));
+    CHECK(rig.has_audit("failure", "reason=permission_revoked gate=securable"));
     CHECK_FALSE(rig.has_audit("success"));
 }
 
-TEST_CASE("POST /api/v1/commands: the caller is re-derived after the row (visible set shrunk "
+TEST_CASE("POST /api/v1/commands: the caller is re-derived after the writes (visible set shrunk "
           "mid-write confines the dispatch)",
           "[server][command_v1][dispatch][security][7110]") {
     Rig rig;
     rig.facts = {.legacy_open = true};
-    rig.on_requested_row = [&] {
+    rig.on_create = [&] {
         rig.facts = {};
         rig.facts.scoped_visible = std::unordered_set<std::string>{kC};
     };
@@ -1474,43 +1477,75 @@ TEST_CASE("POST /api/v1/commands: a chokepoint denial on the outcome is zero-rea
     CHECK(rig.has_audit("failure", "reason=dispatch_denied"));
 }
 
-TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the requested-row write (Execution:Execute "
-          "at the route gate, or a chokepoint dry run that refuses) dispatches nothing for a "
-          "non-destructive pair; failure row reason=permission_revoked (#7110)",
+TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the execution-row write (the session, "
+          "Execution:Execute at the route gate, or a chokepoint dry run that refuses) dispatches "
+          "nothing for a non-destructive pair, cancels the row; failure row reason=permission_revoked "
+          "(#7110)",
           "[server][command_v1][dispatch][security][7110]") {
     struct Withdrawal {
         const char* name;
-        std::function<void(Rig&)> mutate; // runs INSIDE the requested-row write
+        std::function<void(Rig&)> mutate; // runs INSIDE the execution-row write
         const char* detail;
+        bool counted; // a chokepoint refusal also counts yuzu_server_dispatch_denied_total
     };
     const std::vector<Withdrawal> withdrawals = {
-        // Red-before-fix probe for the post-row Execution:Execute recheck: the dry run alone
+        // Red-before-fix probe for the post-write Execution:Execute recheck: the dry run alone
         // would not catch this (with RBAC off it admits every human principal).
-        {"gate=route: Execution:Execute withdrawn inside the requested-row write",
+        {"gate=route: Execution:Execute withdrawn inside the execution-row write",
          [](Rig& r) { r.perm_denied.insert("Execution:Execute"); },
-         "reason=permission_revoked gate=route"},
-        {"gate=dispatch: chokepoint dry run refuses after the row",
+         "reason=permission_revoked gate=route", false},
+        {"gate=session: the credentials no longer resolve",
+         [](Rig& r) { r.session_gone = true; }, "reason=permission_revoked gate=session", false},
+        {"gate=session: the credentials now resolve to another principal",
+         [](Rig& r) { r.principal_flips = true; }, "reason=permission_revoked gate=session", false},
+        {"gate=dispatch: chokepoint dry run refuses after the writes",
          [](Rig& r) {
              r.authorize_denial = detail::DispatchDenial{detail::DispatchDenialReason::ApprovalRequired,
                                                          "Infrastructure", authz::Operation::Write};
          },
-         "gate=dispatch dispatch_reason=approval_required"},
+         "gate=dispatch dispatch_reason=approval_required", true},
     };
     for (const auto& w : withdrawals) {
         DYNAMIC_SECTION(w.name) {
             Rig rig;
             rig.facts = {.legacy_open = true};
-            rig.on_requested_row = [&] { w.mutate(rig); };
+            rig.on_create = [&] { w.mutate(rig); };
             const auto res = rig.post(kRead);
             CHECK(res->status == 403);
             CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
             CHECK(rig.dispatch_calls == 0);
-            CHECK(rig.exec_created == 0);
-            // Admission, then the recheck after the row: the route's own gate both times.
-            CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), "Execution:Execute") == 2);
+            CHECK(rig.exec_created == 1);
+            CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
             CHECK(rig.has_audit("requested"));
             CHECK(rig.has_audit("failure", w.detail));
             CHECK_FALSE(rig.has_audit("success"));
+            // A chokepoint refusal is counted exactly as the admission dry run counts it (#7114).
+            CHECK(rig.metrics
+                      .counter("yuzu_server_dispatch_denied_total", {{"reason", "approval_required"}})
+                      .value() == (w.counted ? 1 : 0));
+            if (std::string_view(w.name).starts_with("gate=route"))
+                // Admission, then the recheck after the writes: the route's own gate both times.
+                CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), "Execution:Execute") == 2);
         }
     }
+}
+
+TEST_CASE("POST /api/v1/commands: the caller is derived from the session as it resolves AFTER the "
+          "writes (a JIT elevation that lapsed mid-write refuses an AdminOrApproval pair) (#7110)",
+          "[server][command_v1][dispatch][security][7110]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.visible_agents = Ids{kA};
+    rig.session.role = auth::Role::admin; // admin at both pre-row resolutions
+    rig.on_create = [&] { rig.session.role = auth::Role::user; }; // the elevation lapses mid-write
+    const auto res = rig.post({{"plugin", "script_exec"},
+                               {"action", "exec"},
+                               {"params", {{"command", "id"}}},
+                               {"agent_ids", Ids{kA}}});
+    CHECK(res->status == 403);
+    CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
+    CHECK(rig.dispatch_calls == 0);
+    CHECK(rig.sent().empty());
+    CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
+    CHECK(rig.has_audit("failure", "gate=dispatch dispatch_reason=approval_required"));
 }

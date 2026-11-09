@@ -248,6 +248,11 @@ struct RestGsHarness {
     // still fails closed with Sec-Audit-Failed rather than letting it escape.
     bool audit_throws{false};
 
+    // Runs inside every audit write with its result: the window in which production lets a
+    // grant, an elevation or a session move between the route's first decision and its dispatch
+    // (#7110).
+    std::function<void(const std::string& result)> on_audit;
+
     // When false, the live deps (response_store + command_dispatch_fn) are left
     // unwired so a test can prove /live → 503 when the substrate is unavailable.
     bool wire_live_deps{true};
@@ -579,6 +584,8 @@ struct RestGsHarness {
             if (audit_throws)
                 throw std::runtime_error("audit store unavailable (test)");
             audit_log.push_back({action, result, target_type, target_id, detail});
+            if (on_audit)
+                on_audit(result);
             return audit_succeeds;
         };
 
@@ -4504,6 +4511,47 @@ TEST_CASE("REST dex/devices/{id}/live: Execute denied but Read allowed → 403, 
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.last_live_plugin.empty()); // the Execute gate denied before any dispatch
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a scoped gate or the caller withdrawn inside the requested-row "
+          "write dispatches nothing; 403 / failure row (#7110)",
+          "[pg][rest][dex][device][live][scope][7110]") {
+    struct Withdrawal {
+        const char* name;
+        std::function<void(RestGsHarness&)> mutate; // runs INSIDE the `requested` audit write
+        std::optional<int> status; // nullopt: this harness's auth_fn writes none (production's 401)
+        const char* detail;
+    };
+    const std::vector<Withdrawal> withdrawals = {
+        {"Execution:Execute withdrawn", [](RestGsHarness& h) { h.deny_scoped_op = "Execute"; }, 403,
+         "permission_revoked"},
+        {"GuaranteedState:Read withdrawn (every scoped gate refuses)",
+         [](RestGsHarness& h) { h.grant_perms = false; }, 403, "permission_revoked"},
+        {"the session no longer resolves", [](RestGsHarness& h) { h.session_user.clear(); },
+         std::nullopt, "caller_unresolved"},
+    };
+    for (const auto& w : withdrawals) {
+        DYNAMIC_SECTION(w.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            RestGsHarness h(true, true, true, true, &pool);
+            h.on_audit = [&](const std::string& result) {
+                if (result == "requested")
+                    w.mutate(h);
+            };
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            if (w.status)
+                CHECK(res->status == *w.status);
+            CHECK(h.last_live_plugin.empty()); // nothing dispatched
+            REQUIRE(h.audit_log.size() == 2);
+            CHECK(h.audit_log[0].result == "requested");
+            CHECK(h.audit_log[1].action == "device.live.uptime");
+            CHECK(h.audit_log[1].result == "failure");
+            CHECK(h.audit_log[1].target_id == "WS-1");
+            CHECK(h.audit_log[1].detail.find(w.detail) == 0);
+        }
+    }
 }
 
 TEST_CASE("REST dex/devices/{id}/live: live substrate unavailable → 503",

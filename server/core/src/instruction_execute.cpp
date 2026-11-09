@@ -668,30 +668,6 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                        c.audit_dropped};
     }
 
-    // 7b. #7110: the `requested` row is written, so decide the surface's permission AGAIN and
-    //     re-derive the caller. A refusal here is a `failure` row (the `requested` row exists).
-    std::optional<DispatchCaller> readmitted;
-    try {
-        readmitted = p.readmit();
-    } catch (...) { // fail closed: a throwing recheck is a withdrawn permission
-        readmitted = std::nullopt;
-    }
-    if (!readmitted) {
-        c.audit("failure", "reason=permission_revoked definition=" + def_token);
-        return Outcome{make_refusal(RefusalKind::kPermissionRevoked, "permission_revoked",
-                                    "permission revoked after the request was recorded",
-                                    "this request was not dispatched; the permission it needs was "
-                                    "withdrawn while it was being recorded, and retrying will not "
-                                    "help until it is granted again"),
-                       c.audit_dropped};
-    }
-    const DispatchCaller& caller = *readmitted; // the fresh caller is the one dispatched
-    if (auto decision = p.authorize(caller, def.plugin, def.action); !decision) {
-        Refusal r = dispatch_denied_refusal(p, def, decision.error());
-        c.audit("failure", "reason=" + r.reason + " definition=" + def_token);
-        return Outcome{std::move(r), c.audit_dropped};
-    }
-
     // 8. The execution row BEFORE dispatch, so its id is known when the dispatch registers the
     //    command_id -> execution_id mapping (closes the fast-agent race, UP2-4).
     std::string execution_id;
@@ -732,6 +708,38 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
             spdlog::warn("instruction execute: execution row not created for '{}'; dispatching "
                          "with an empty execution_id",
                          def_token);
+    }
+
+    // 8b. #7110: the surface's own writes are done (the `requested` row and the execution row),
+    //     so decide its permission AGAIN, as late as the core can, and re-derive the caller: a
+    //     grant or a JIT elevation can move while either row is written. A refusal closes both
+    //     rows (`failure` outcome, execution cancelled) and dispatches nothing. What is NOT
+    //     re-decided: the dispatch chokepoint's own provenance-record write sits between its
+    //     authorization and the send (docs/user-manual/rest-api.md).
+    std::optional<DispatchCaller> readmitted;
+    try {
+        readmitted = p.readmit();
+    } catch (...) { // fail closed: a throwing recheck is a withdrawn permission
+        readmitted = std::nullopt;
+    }
+    if (!readmitted) {
+        c.audit("failure", "reason=permission_revoked definition=" + def_token +
+                               " execution_id=" + execution_id);
+        cancel_row(c, execution_id);
+        return Outcome{make_refusal(RefusalKind::kPermissionRevoked, "permission_revoked",
+                                    "permission revoked after the request was recorded",
+                                    "this request was not dispatched; the permission it needs was "
+                                    "withdrawn while it was being recorded, and retrying will not "
+                                    "help until it is granted again"),
+                       c.audit_dropped};
+    }
+    const DispatchCaller& caller = *readmitted; // the fresh caller is the one dispatched
+    if (auto decision = p.authorize(caller, def.plugin, def.action); !decision) {
+        Refusal r = dispatch_denied_refusal(p, def, decision.error());
+        c.audit("failure", "reason=" + r.reason + " definition=" + def_token +
+                               " execution_id=" + execution_id);
+        cancel_row(c, execution_id);
+        return Outcome{std::move(r), c.audit_dropped};
     }
 
     // OMITTED agent_ids + OMITTED scope is a deliberate broadcast and is NAMED, never inferred

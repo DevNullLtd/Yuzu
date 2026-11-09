@@ -168,15 +168,15 @@ struct Rig {
     /// #7110 post-row recheck. By default `readmit` answers the caller the last `request()` was
     /// built with (the surface re-derives the SAME principal); a test narrows that with
     /// `readmit_caller`, withdraws the permission with `readmit_withdrawn`, or leaves the port
-    /// unset with `readmit_unwired`. `on_requested` runs inside the `requested` audit write, the
-    /// window in which production lets a grant move.
+    /// unset with `readmit_unwired`. `on_create` runs inside the execution-row write (the core's
+    /// last own write before the recheck), the window in which production lets a grant move.
     bool readmit_unwired{false};
     bool readmit_withdrawn{false};
     bool readmit_throws{false}; ///< the recheck throws (a store fault): must read as withdrawn
     std::optional<DispatchCaller> readmit_caller;
     DispatchCaller last_caller;
     int readmits{0};
-    std::function<void()> on_requested;
+    std::function<void()> on_create;
     std::set<std::string> denied_securables; // has_permission() answers false for these
     bool authorize_unwired{false};
     bool classify_unwired{false};
@@ -316,6 +316,8 @@ struct Rig {
         p.visible_agents = [this](const std::string&) { return visible_agents; };
         if (ledger_wired) {
             p.create_execution = [this](const ExecutionRow& r) -> std::optional<std::string> {
+                if (on_create)
+                    on_create();
                 if (create_throws)
                     throw std::runtime_error("create boom");
                 if (create_throws_nonstd)
@@ -372,11 +374,8 @@ struct Rig {
             if (audit_throws)
                 throw std::runtime_error("audit boom");
             audits.push_back({std::string(result), detail_text});
-            if (result == "requested") {
-                if (on_requested)
-                    on_requested();
+            if (result == "requested")
                 return !audit_requested_fails;
-            }
             return !audit_other_fails;
         };
     }

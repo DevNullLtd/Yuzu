@@ -1321,3 +1321,43 @@ TEST_CASE("fragment re-enable/purge: a denial on the outcome is reported as disp
         }
     }
 }
+
+TEST_CASE("echo-execute and the echo.status scan: a denial on the outcome is reported as not permitted "
+          "and audited as a failure, never as no agents connected (#7114)",
+          "[pg][server][dashboard][echo-execute][echo][scan][fragment][audit][security][7114]") {
+    // Both routes gate on Execution:Execute but dispatch a pair classified Infrastructure:Read
+    // (echo.sql, echo.status), so a holder of only the first is refused on EVERY call.
+    struct Arm {
+        const char* path;
+        const char* body;
+        const char* action;
+        const char* no_agents_text; // what the pre-#7114 fold-in said
+    };
+    const Arm arms[] = {
+        {"/api/dashboard/echo-execute", "sql=SELECT+1", "echo.sql", "No agents connected"},
+        {"/fragments/echo/retention-paused/scan", "", "echo.status.scan",
+         "None of the agents in your scope are currently connected"},
+    };
+    for (const auto& arm : arms) {
+        DYNAMIC_SECTION(arm.action) {
+            FragmentHarness h;
+            h.dispatch_decide = [](const std::string&, const std::string&,
+                                   const yuzu::server::DispatchCaller&) {
+                return std::optional<yuzu::server::detail::DispatchDenial>{
+                    yuzu::server::detail::DispatchDenial{
+                        yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                        yuzu::server::authz::Operation::Read}};
+            };
+            auto res = h.post(arm.path, arm.body);
+            CHECK(res->status == 200);
+            CHECK(contains(res->body, "Not permitted: forbidden"));
+            CHECK_FALSE(contains(res->body, arm.no_agents_text));
+            REQUIRE(h.audits_for(arm.action, "failure") == 1);
+            CHECK(h.audit_detail(arm.action, "failure") ==
+                  "reason=dispatch_denied dispatch_reason=forbidden");
+            CHECK(h.audits_for(arm.action, "success") == 0);
+            if (std::string_view(arm.action) == "echo.status.scan")
+                CHECK(h.metric("yuzu_echo_scan_dispatched_total", "forbidden") == 1.0);
+        }
+    }
+}

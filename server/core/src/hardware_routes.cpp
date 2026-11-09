@@ -522,6 +522,15 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
+        // #7110: the `requested` row is stored, so decide the per-device gate AGAIN: a grant or a
+        // JIT elevation withdrawn while the row was being written dispatches nothing. The dispatch
+        // below authorizes as the system caller, so no layer past this one can see the operator's
+        // grant. The gate has written its own 403; the row that exists gets its outcome.
+        if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "failure",
+                                            "Agent", id, "permission_revoked");
+            return;
+        }
         const auto r = deps_.sync_dispatch_fn(id, source);
         if (!r.sent) {
             // No second audit row here — matching the /api/v1/dex/devices/{id}/live

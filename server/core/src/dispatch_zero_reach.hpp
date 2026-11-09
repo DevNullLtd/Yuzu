@@ -69,9 +69,11 @@
 //     workflow_routes.cpp answer with no `reason`; command_routes.cpp and
 //     server.cpp also carry no `retry_after_ms`; dashboard_routes.cpp keeps a
 //     plain message. The retryable flag below follows the MCP site.
-//   - denied (#7114, first here): absent from all five cascades, none of which
-//     reads `outcome.denied`; which run a dry run and which checks the field
-//     before its cascade is in `ConfinedDispatchOutcome::denied`'s doc comment.
+//   - denied (#7114): the classifier reads it first. Of the five legacy cascades
+//     only dashboard_routes.cpp checks `outcome.denied` (the exec console, the
+//     Echo re-enable and purge arms, and the echo-execute and echo.status scan
+//     arms), because it runs no pre-send dry run; the other four run the dry run,
+//     so a denial there is only a race. See `ConfinedDispatchOutcome::denied`.
 
 #include "dispatch_confined_arms.hpp"
 

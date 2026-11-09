@@ -233,12 +233,13 @@ struct Ports {
     std::function<std::expected<CommandCapability, detail::DispatchDenial>(
         const DispatchCaller&, std::string_view, std::string_view)>
         authorize;
-    /// #7110: the post-row recheck. Called ONCE, after the `requested` audit row and before any
-    /// execution row or dispatch: the surface re-decides its OWN route permission and re-derives
-    /// the caller (a grant or visible set can change while the audit write is in flight). Returns
-    /// the freshly derived caller, which is the one dispatched; `nullopt` = the surface's
-    /// permission was withdrawn (`kPermissionRevoked`, nothing dispatched). Unset ->
-    /// `Misconfigured` (fail closed, never "no gate"), refused BEFORE the `requested` row.
+    /// #7110: the post-write recheck. Called ONCE, after the `requested` audit row AND the execution
+    /// row (the core's last own writes) and before the dispatch: the surface re-decides its OWN route
+    /// permission and re-derives the caller (a grant, a JIT elevation or a visible set can change
+    /// while either write is in flight). Returns the freshly derived caller, which is the one
+    /// dispatched; `nullopt` = the surface's permission was withdrawn (`kPermissionRevoked`, the
+    /// execution row cancelled, nothing dispatched). Unset -> `Misconfigured` (fail closed, never
+    /// "no gate"), refused BEFORE the `requested` row.
     std::function<std::optional<DispatchCaller>()> readmit;
     /// `ApprovalManager::submit(def, user, scope, "", kInstruction, plugin, action)`. Unset means
     /// there is no approval manager: a non-auto definition then answers `ApprovalUnavailable`.
@@ -280,8 +281,9 @@ enum class RefusalKind : std::uint8_t {
     kClassifierUnavailable,///< 503: the destructive-targeting classifier is not wired
     kMisconfigured,        ///< 500: a required port is unwired (a server defect: NO retry hint, ever)
     kAuditUnavailable,     ///< 503 + Sec-Audit-Failed: nothing was dispatched without durable evidence
-    kPermissionRevoked,    ///< 403: the surface's own permission was withdrawn after the `requested` row was
-                           ///< written (`Ports::readmit` returned nullopt); NO `denial`, permanent
+    kPermissionRevoked,    ///< 403: the surface's own permission was withdrawn after the core's own writes
+                           ///< (`Ports::readmit` returned nullopt); the execution row is cancelled; NO `denial`,
+                           ///< permanent
     kDispatchFailed,       ///< 500: the dispatch threw (any exception type); the execution row (if any) is left
                            ///< `running` (NOT cancelled: agents may hold the command), a `failure` audit row is
                            ///< written, and NO retry is advertised (agents may have been sent it)

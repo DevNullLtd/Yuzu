@@ -2085,8 +2085,6 @@ struct RouteRig {
     };
     std::vector<Emitted> emitted;
     bool emit_throws{false};
-    /// Runs inside the `requested` audit write: the window in which a grant can move (#7110).
-    std::function<void()> on_requested;
 
     // `pre` arranges the core fake BEFORE the routes are registered: which seams are wired is a
     // construction-time fact (everything else is read live through `core`).
@@ -2112,11 +2110,8 @@ struct RouteRig {
                 CHECK(action == "instruction.execute");
                 CHECK(type == "instruction");
                 core.audits.push_back({result, detail_text + " [id=" + id + "]"});
-                if (result == "requested") {
-                    if (on_requested)
-                        on_requested();
+                if (result == "requested")
                     return !core.audit_requested_fails;
-                }
                 return !core.audit_other_fails;
             };
         }
@@ -3042,10 +3037,11 @@ TEST_CASE("REST execute: a confined operator reaches exactly its visible agent (
 // #7110: the post-`requested`-row recheck (Ports::readmit) and #7114: the dispatch denial.
 // ---------------------------------------------------------------------------------------------
 
-TEST_CASE("instruction execute: a readmit that withdraws (nullopt, or throws = fail closed) after the "
-          "requested row dispatches nothing and writes failure permission_revoked",
+TEST_CASE("instruction execute: a readmit that withdraws (nullopt, or throws = fail closed) inside the "
+          "execution-row write dispatches nothing, cancels the row and writes failure permission_revoked",
           "[instruction_execute][security]") {
-    // Each row flips the one Rig flag the readmit port reads; both inside the `requested` row write.
+    // Each row flips the one Rig flag the readmit port reads; both inside the execution-row write,
+    // the core's last own write before the dispatch.
     const std::vector<std::pair<const char*, bool Rig::*>> withdrawals = {
         {"readmit nullopt", &Rig::readmit_withdrawn},
         {"readmit throws reads as withdrawn (fail closed)", &Rig::readmit_throws},
@@ -3054,7 +3050,7 @@ TEST_CASE("instruction execute: a readmit that withdraws (nullopt, or throws = f
         DYNAMIC_SECTION(name) {
             Rig r;
             r.defs["d"] = make_def("d");
-            r.on_requested = [&] { r.*flag = true; }; // withdrawn INSIDE the row write
+            r.on_create = [&] { r.*flag = true; }; // withdrawn INSIDE the row write
             auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
             const auto* ref = as_refusal(out);
             REQUIRE(ref);
@@ -3064,11 +3060,13 @@ TEST_CASE("instruction execute: a readmit that withdraws (nullopt, or throws = f
             CHECK_FALSE(ref->retry_after_ms);
             CHECK(r.readmits == 1);
             CHECK(r.calls.empty());
-            CHECK(r.rows.empty()); // refused before the execution row
+            CHECK(r.rows.size() == 1); // the row exists ...
+            CHECK(r.cancelled == std::vector<std::string>{"exec-1"}); // ... and is closed, not left running
             REQUIRE(r.audits.size() == 2);
             CHECK(r.audits[0].result == "requested");
             CHECK(r.audits[1].result == "failure");
             CHECK(r.audits[1].detail.find("reason=permission_revoked") != std::string::npos);
+            CHECK(r.audits[1].detail.find("execution_id=exec-1") != std::string::npos);
         }
     }
 }
@@ -3093,9 +3091,9 @@ TEST_CASE("instruction execute: the re-derived caller is the one dispatched",
           "[instruction_execute][security][confinement]") {
     Rig r;
     r.defs["d"] = make_def("d");
-    // The caller the request was built with sees everything; the one re-derived after the row
-    // sees only agent-B (its visible set shrank while the row was written).
-    r.readmit_caller = make_caller("u", true, std::unordered_set<std::string>{kB});
+    // The caller the request was built with sees everything; the one re-derived after the writes
+    // sees only agent-B (its visible set shrank while the execution row was written).
+    r.on_create = [&] { r.readmit_caller = make_caller("u", true, std::unordered_set<std::string>{kB}); };
     auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
     REQUIRE(as_dispatched(out));
     REQUIRE(r.calls.size() == 1);
@@ -3106,14 +3104,15 @@ TEST_CASE("instruction execute: the dry run repeats for the re-derived caller",
           "[instruction_execute][security]") {
     Rig r;
     r.defs["d"] = make_def("d", "gated"); // AdminOrApproval: refuses a non-admin
-    // Admin at the first decision; demoted by the time the row is written.
-    r.readmit_caller = make_caller("u", false);
+    // Admin at the first decision; demoted by the time the execution row is written.
+    r.on_create = [&] { r.readmit_caller = make_caller("u", false); };
     auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
     const auto* ref = as_refusal(out);
     REQUIRE(ref);
     CHECK(ref->kind == RefusalKind::kDispatchDenied);
     REQUIRE(ref->denial);
     CHECK(r.calls.empty());
+    CHECK(r.cancelled == std::vector<std::string>{"exec-1"}); // the execution row is closed
     REQUIRE(r.audits.size() == 2);
     CHECK(r.audits[0].result == "requested");
     CHECK(r.audits[1].result == "failure"); // the requested row exists: a failure, not a denied
@@ -3142,10 +3141,10 @@ TEST_CASE("instruction execute: a dispatch denial on the outcome is zero-reach d
 TEST_CASE("render: kPermissionRevoked renders REST 403 with reason permission_revoked and no "
           "retry_after; MCP renders kPermissionDenied (no denial dereferenced)",
           "[instruction_execute][rest][security]") {
-    // REST, end to end: the route's own permission withdrawn inside the requested-row write.
+    // REST, end to end: the route's own permission withdrawn inside the execution-row write.
     RouteRig r;
     r.core.defs["d"] = make_def("d");
-    r.on_requested = [&] { r.perm_grant = false; };
+    r.core.on_create = [&] { r.perm_grant = false; };
     auto res = r.post("d", "{}");
     REQUIRE(res);
     CHECK(res->status == 403);
@@ -3153,6 +3152,7 @@ TEST_CASE("render: kPermissionRevoked renders REST 403 with reason permission_re
     CHECK(j["error"]["reason"] == "permission_revoked");
     CHECK(j["error"]["retry_after_ms"].is_null());
     CHECK(r.core.calls.empty());
+    CHECK(r.core.cancelled == std::vector<std::string>{"exec-1"}); // the row it created is closed
     REQUIRE_FALSE(r.core.audits.empty());
     CHECK(r.core.audits.back().result == "failure");
     CHECK(r.core.audits.back().detail.find("reason=permission_revoked") != std::string::npos);
@@ -3177,8 +3177,8 @@ TEST_CASE("REST execute: the caller is re-derived after the row", "[instruction_
     r.core.real_dispatch = true;
     r.core.defs["d"] = make_def("d");
     r.caller = make_caller("op", true);
-    // The visible set shrinks to agent-B while the requested row is written.
-    r.on_requested = [&] { r.caller = make_caller("op", true, std::unordered_set<std::string>{kB}); };
+    // The visible set shrinks to agent-B while the execution row is written.
+    r.core.on_create = [&] { r.caller = make_caller("op", true, std::unordered_set<std::string>{kB}); };
     auto res = r.post("d", R"({"agent_ids":["agent-A","agent-B"]})");
     REQUIRE(res);
     CHECK(res->status == 200);

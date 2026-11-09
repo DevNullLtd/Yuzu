@@ -986,6 +986,11 @@ TEST_CASE("workflow execute: every zero-reach cause is named per step with an ho
         {"quarantined", false, [](auto& o) { o.denied_quarantined_count = 2; }},
         {"plugin_not_found", false, [](auto& o) { o.unknown_plugin_count = 1; }},
         {"kill_switched_os", false, [](auto& o) { o.kill_switched_os_count = 1; }},
+        {"dispatch_denied", false,
+         [](auto& o) {
+             o.denied = detail::DispatchDenial{detail::DispatchDenialReason::Forbidden,
+                                               "Infrastructure", authz::Operation::Write};
+         }},
         {"no_agents_reached", true, [](auto&) {}},
     };
     for (const auto& r : rows) {
@@ -3728,6 +3733,11 @@ TEST_CASE("workflow execute: a KEYED zero-reach run is never retryable, whatever
         {"quarantined", false, [](auto& o) { o.denied_quarantined_count = 2; }},
         {"plugin_not_found", false, [](auto& o) { o.unknown_plugin_count = 1; }},
         {"kill_switched_os", false, [](auto& o) { o.kill_switched_os_count = 1; }},
+        {"dispatch_denied", false,
+         [](auto& o) {
+             o.denied = detail::DispatchDenial{detail::DispatchDenialReason::Forbidden,
+                                               "Infrastructure", authz::Operation::Write};
+         }},
     };
     for (const auto& r : rows) {
         INFO(r.token);

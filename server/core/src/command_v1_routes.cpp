@@ -59,6 +59,19 @@ void count_target_rejected(yuzu::MetricsRegistry* metrics, std::string_view reas
     }
 }
 
+/// A chokepoint refusal, counted by its closed reason token. Shared by the admission dry run and
+/// the post-row repeat of it, so both report one series.
+void count_dispatch_denied(yuzu::MetricsRegistry* metrics, std::string_view reason) {
+    if (metrics == nullptr)
+        return;
+    try {
+        metrics->counter("yuzu_server_dispatch_denied_total", {{"reason", std::string(reason)}})
+            .increment();
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+        // observability must never fail the request
+    }
+}
+
 void count_bookkeeping_failed(yuzu::MetricsRegistry* metrics, const char* op) {
     if (metrics == nullptr)
         return;
@@ -260,7 +273,7 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
 
     // The caller: identity AND the real principal_is_admin / exec_visible (service-scoped and
     // engine principals included). approval_provenance stays None: REST has no ticket flow.
-    DispatchCaller caller = d.derive_caller_fn(session); // re-derived after the `requested` row below
+    DispatchCaller caller = d.derive_caller_fn(session); // re-derived after the last write below
 
     // The dispatch chokepoint's dry run (classify + authorize + kill switch), so a denial is a
     // discriminated refusal rather than an ambiguous zero-reach.
@@ -288,14 +301,7 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
                                "cannot be redeemed yet (#6064)";
         spdlog::warn("dispatch denied: {} reason={} securable={} caller={}", what, reason,
                      audit_token(denial.securable), audit_token(session.username));
-        if (d.metrics != nullptr) {
-            try {
-                d.metrics
-                    ->counter("yuzu_server_dispatch_denied_total", {{"reason", std::string(reason)}})
-                    .increment();
-            } catch (...) { // NOLINT(bugprone-empty-catch)
-            }
-        }
+        count_dispatch_denied(d.metrics, reason);
         // No `.permission`: a chokepoint denial (approval, identity, kill switch) is not cured by
         // granting one securable, so the field would claim a false self-remediation.
         refuse(status, reason, text.message, text.remediation);
@@ -319,46 +325,6 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
                                        {.retry_after_ms = kRetryAfterMs,
                                         .remediation = "retry the request"}),
                             "application/json");
-            return;
-        }
-    }
-
-    // #7110: the `requested` row is stored, so decide the admission AGAIN. A grant, a JIT
-    // elevation or a visible set can change while the row is written; the first decision was
-    // taken before it. Same inputs as the first: the route's own Execution:Execute gate, then
-    // for a Destructive/Targeted pair the pair's own securable (each gate wrote its 403 on
-    // refusal), then the caller is re-derived (the one dispatched) and the chokepoint dry run
-    // repeats. The row that exists gets a `failure` outcome and nothing is dispatched.
-    {
-        const auto revoked = [&](std::string_view how) {
-            (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
-                                                "command", "",
-                                                "reason=permission_revoked " + std::string(how) +
-                                                    " " + what + " correlation_id=" + cid);
-            res.status = 403;
-            res.set_content(
-                error_body(res, 403, "permission revoked after the request was recorded",
-                           "permission_revoked",
-                           {.remediation = "this request was not dispatched; the permission it "
-                                           "needs was withdrawn while it was being recorded"}),
-                "application/json");
-        };
-        // The route's own gate first: with RBAC off the dry run below admits every human
-        // principal, so a JIT elevation that lapsed during the row write is caught only here.
-        if (!d.perm_fn(req, res, "Execution", "Execute")) {
-            revoked("gate=route");
-            return;
-        }
-        if (gate.verdict == DestructiveTargetingVerdict::Targeted && gate.capability &&
-            !d.perm_fn(req, res, std::string(gate.capability->securable),
-                       std::string(authz::to_string(gate.capability->operation)))) {
-            revoked("gate=securable");
-            return;
-        }
-        caller = d.derive_caller_fn(session);
-        if (const auto again = d.authorize_dispatch_fn(caller, plugin, action); !again) {
-            revoked(std::string("gate=dispatch dispatch_reason=") +
-                    std::string(detail::to_string(again.error().reason)));
             return;
         }
     }
@@ -412,6 +378,61 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
             count_bookkeeping_failed(d.metrics, "mark_cancelled");
         }
     };
+
+    // #7110: the route's own writes are done (the `requested` row and the execution row), so decide
+    // the admission AGAIN, as late as the route can: a grant, a JIT elevation or a visible set can
+    // move while either row is written, and the first decision was taken before both. Same inputs
+    // as the first, the session first (the one the caller is derived from, and the one dispatched
+    // as), then the route's own Execution:Execute gate, for a Destructive/Targeted pair the pair's
+    // own securable (each gate wrote its 403 on refusal), then the chokepoint dry run on the
+    // re-derived caller. A refusal closes both rows (`failure` outcome, execution cancelled) and
+    // dispatches nothing. What is NOT re-decided: the dispatch chokepoint's own provenance-record
+    // write sits between its authorization and the send (docs/user-manual/rest-api.md).
+    {
+        const auto revoked = [&](std::string_view how) {
+            (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
+                                                "command", "",
+                                                "reason=permission_revoked " + std::string(how) +
+                                                    " " + what + " correlation_id=" + cid +
+                                                    " execution_id=" + audit_token(execution_id));
+            cancel_execution();
+            res.status = 403;
+            res.set_content(
+                error_body(res, 403, "permission revoked after the request was recorded",
+                           "permission_revoked",
+                           {.remediation = "this request was not dispatched; the permission it "
+                                           "needs was withdrawn while it was being recorded"}),
+                "application/json");
+        };
+        // The credentials resolve again to the same principal, and the caller is derived from THAT
+        // resolution: the role and the admin bit are session snapshots (a JIT elevation that lapsed
+        // during the writes is gone from the fresh one).
+        const auto fresh = d.auth_fn(req, res);
+        if (!fresh || fresh->username != session.username) {
+            revoked("gate=session");
+            return;
+        }
+        // With RBAC off the dry run admits every human principal, so a JIT elevation that lapsed
+        // during the writes is caught only by the route's own gate.
+        if (!d.perm_fn(req, res, "Execution", "Execute")) {
+            revoked("gate=route");
+            return;
+        }
+        if (gate.verdict == DestructiveTargetingVerdict::Targeted && gate.capability &&
+            !d.perm_fn(req, res, std::string(gate.capability->securable),
+                       std::string(authz::to_string(gate.capability->operation)))) {
+            revoked("gate=securable");
+            return;
+        }
+        caller = d.derive_caller_fn(*fresh);
+        if (const auto again = d.authorize_dispatch_fn(caller, plugin, action); !again) {
+            const std::string_view reason = detail::to_string(again.error().reason);
+            // A chokepoint refusal is counted as the admission dry run counts it.
+            count_dispatch_denied(d.metrics, reason);
+            revoked(std::string("gate=dispatch dispatch_reason=") + std::string(reason));
+            return;
+        }
+    }
 
     // Built BEFORE the dispatch (execution_mutation.cpp's `threw_detail` pattern): a second
     // bad_alloc while building them after the throw must not escape without a `failure` row. The

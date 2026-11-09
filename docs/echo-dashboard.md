@@ -465,7 +465,7 @@ Per `docs/observability-conventions.md`:
 > uses the same value. Both surfaces write a dispatch chokepoint denial's own reason
 > token (`forbidden`, `approval_required`, `anonymous_operator`, `kill_switched`,
 > `unclassified`, `ambiguous`; #7114) when the seam refuses the pair before targeting;
-> those six are comparable. `success` and `agent_not_connected` are comparable; nothing else
+> those six are comparable. `yuzu_echo_scan_dispatched_total` writes the same six tokens when the scan's own dispatch is refused (the scan answers `Not permitted: <token>` and stores no scan state), and the Echo SQL console audits such a refusal as `echo.sql` `result=failure` (#7114). `success` and `agent_not_connected` are comparable; nothing else
 > is, and there is no `surface` label to split them.
 
 > The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).

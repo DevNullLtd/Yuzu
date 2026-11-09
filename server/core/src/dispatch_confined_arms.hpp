@@ -388,8 +388,10 @@ struct ConfinedDispatchOutcome {
     /// four (mcp_server.cpp, command_routes.cpp, server.cpp legacy forward,
     /// workflow_routes.cpp) run an authorize dry run before dispatching, so a
     /// denial there is only a race and they are left on their existing order;
-    /// dashboard_routes.cpp runs no dry run, so its Echo re-enable/purge arms
-    /// and its execute console check this field before their cascade.
+    /// dashboard_routes.cpp runs no dry run, so all five of its readers check
+    /// this field before their cascade: the execute console, the Echo
+    /// re-enable and purge arms, the echo-execute (SQL) arm and the echo.status
+    /// scan.
     std::optional<detail::DispatchDenial> denied;
 };
 
