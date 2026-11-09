@@ -885,6 +885,16 @@ public:
         post_attach_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#5719): records `why` as the cause a full_sync's scoped detach forced for
+    /// `rule_id`, exactly as apply_rules does from detach_rules_except's return. Takes NO lock:
+    /// call it only from a hook that already runs under mtx_ on the apply thread
+    /// (set_post_attach_hook_for_test). It exists to reach the engine's decision to consult that
+    /// record only when attach_rule reported a reason, which no runtime state a Rig can build
+    /// pairs with a forced entry. No production caller.
+    void force_rebuild_reason_unlocked_for_test(const std::string& rule_id, GuardianRebuildReason why) {
+        forced_rebuilds_[rule_id] = why;
+    }
+
     /// TEST-ONLY (#4783 Gate 8 re-review): arms legacy_sink_persist_race_hook_for_test_ -
     /// see that member's own doc comment for the exact firing point and its
     /// same-thread-relock CONTRACT. Set-then-use: arm this on the thread that

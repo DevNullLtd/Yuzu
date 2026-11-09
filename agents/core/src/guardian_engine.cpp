@@ -2566,21 +2566,23 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                 // for them: after the detach the kept rule's own attach sees KeyBusy (an io-class
                 // mechanism whose disarm claim is still queued) or FirstAttach (an inline type, or
                 // a disarm that already completed) depending on timing, never the key's cause.
-                // The local map is built first and installed with a move-assign (noexcept), so
-                // nothing can throw between the detach succeeding and the override being stored
-                // beyond the map construction itself. RESIDUAL: a throw while constructing the
-                // map (allocation failure) lands in the teardown catch below, after the detach
-                // has already happened: the generation is held for a retry, the forced reasons for
-                // this push are lost (the kept rules are already detached, so nothing re-derives
-                // them), and those rules are reported under whichever reason their own attach
-                // observes (KeyBusy or FirstAttach). The line is diagnostic only: no arm, skip or
-                // generation decision reads it.
+                // The local map is built first and installed with a move-assign (noexcept), in its
+                // own firewall below. The line is diagnostic only: no arm, skip or generation
+                // decision reads it.
                 const auto forced = spark_runtime_->detach_rules_except(push_ids);
-                std::unordered_map<std::string, GuardianRebuildReason> forced_map;
-                forced_map.reserve(forced.size());
-                for (const auto& f : forced)
-                    forced_map.emplace(f.rule_id, f.why);
-                forced_rebuilds_ = std::move(forced_map);
+                // The map is diagnostic only, so it is built in its OWN firewall: an allocation
+                // failure here must not count a reconcile failure or hold the generation (the
+                // detach above has already succeeded and origin/dev had no throw site at this
+                // point). On failure forced_rebuilds_ stays empty and the affected rules are
+                // reported under whichever reason their own attach observes.
+                try {
+                    std::unordered_map<std::string, GuardianRebuildReason> forced_map;
+                    forced_map.reserve(forced.size());
+                    for (const auto& f : forced)
+                        forced_map.emplace(f.rule_id, f.why);
+                    forced_rebuilds_ = std::move(forced_map); // noexcept: only after a full build
+                } catch (...) {
+                }
             }
             // F7: deliberately NOT unsupported_rules_.clear() here - that would make
             // every rule the loop below re-classifies Unsupported look "newly"
@@ -2695,7 +2697,12 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         //    put_rule_locked return above) logs neither this line nor the preserved one.
         //  - A wedge re-observation carries no reason and appears in neither line.
         try {
-            auto line = rebuild_tally_.format();
+            // The path marker uses the SAME expression reconcile_rule_locked uses to pick the arm
+            // path, so `path=legacy` means every carried rule was stopped and re-armed.
+            const auto path = prefer_spark_ && spark_availability_ == SparkAvailability::Available
+                                  ? GuardianRebuildPath::Spark
+                                  : GuardianRebuildPath::Legacy;
+            auto line = rebuild_tally_.format(path);
             spdlog::info("{}", line);
             last_full_sync_rebuild_line_for_test_ = std::move(line);
         } catch (...) {
@@ -3806,10 +3813,15 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
                 // the preserved tally above (apply_rules or start_local under mtx_). note() with
                 // None is a no-op, so a wedge re-observation (reason None) appears in neither
                 // line. A skipped outcome is never noted here: it is the preserved tally's.
-                const auto forced = forced_rebuilds_.find(rule.rule_id());
-                rebuild_tally_.note(rule.rule_id(), forced != forced_rebuilds_.end()
-                                                        ? forced->second
-                                                        : res->rebuild_reason);
+                // The override is consulted ONLY when attach_rule reported a reason: a wedge
+                // re-observation carries None and must appear in neither line, even for a kept
+                // rule whose key the scoped detach recorded as faulted.
+                if (res->rebuild_reason != GuardianRebuildReason::None) {
+                    const auto forced = forced_rebuilds_.find(rule.rule_id());
+                    rebuild_tally_.note(rule.rule_id(), forced != forced_rebuilds_.end()
+                                                            ? forced->second
+                                                            : res->rebuild_reason);
+                }
             }
             if (res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed)
                 return ReconcileOutcome::Armed; // attach_rule already enqueued its own "armed" audit entry,

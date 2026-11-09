@@ -3082,7 +3082,8 @@ void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
         // TEST-ONLY seam (#5719): consumed inside the try, after the lock_guard and before the
         // allocation it stands in for, so the catch below sees exactly what a real bad_alloc from
         // the reserve or an emplace_back would give it.
-        if (fail_next_sweep_snapshot_.exchange(false, std::memory_order_relaxed))
+        if (fail_next_sweep_snapshot_.load(std::memory_order_relaxed) &&
+            fail_next_sweep_snapshot_.exchange(false, std::memory_order_relaxed))
             throw std::bad_alloc{};
         snapshot.reserve(keys_.size());
         for (const auto& [key, pk] : keys_)
@@ -3493,9 +3494,10 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                     // state, or deadline - re-observation never revives or
                     // restarts anything, it only reports what is already true.
                     wedged_reobservations_.fetch_add(1, std::memory_order_relaxed);
+                    // No rebuild_reason: a wedge re-observation constructs nothing and appears
+                    // in neither the rebuilt nor the preserved line.
                     return AttachCoreResult{.state = AttachCoreState::Reobserved,
-                                            .generation = 0, .error = {}, .claim = head,
-                                            .rebuild_reason = rebuild_reason};
+                                            .generation = 0, .error = {}, .claim = head};
                 }
                 // A genuinely different claimant (different rule_id - the "same
                 // rule_id, different spec" case is structurally unreachable:
@@ -3758,10 +3760,8 @@ GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<
             (void)withdraw_rule_after_wedge_sweep_locked(rid, "disarmed");
         std::vector<std::string> rule_ids;
         rule_ids.reserve(rules_.size());
-        // #5719: at most one entry per kept rule, so rules_.size() bounds it. Reserved with
-        // rule_ids, before any teardown mutation, so growth cannot throw part-way through.
-        if (!keep.empty())
-            forced.reserve(rules_.size()); // nothing is kept for detach_all(): it pays nothing
+        // #5719: at most one entry per kept rule. Deliberately not reserved: that would be an
+        // allocation sized to the whole ruleset on every scoped detach, under registry_mu_.
         for (const auto& [rid, rg] : rules_) {
             // A kept rule on a key the mechanism reported faulted is detached too. Every rule on
             // a key shares its bit, so the key's refcount reaches zero and its deaf watcher is

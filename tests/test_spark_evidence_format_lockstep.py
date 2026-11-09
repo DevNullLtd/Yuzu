@@ -105,12 +105,29 @@ def _selfcheck(driver: types.ModuleType) -> None:
 
 
 def _check_rebuild_line_matches_no_driver_regex(driver: types.ModuleType) -> int:
-    """#5719: neither golden rebuild line may be read as any other evidence line."""
+    """#5719: neither golden rebuild line may be read as any other evidence line.
+
+    A negative check only: it pins that no golden line matches a driver regex. The line shape itself
+    is pinned by the C++ golden test (test_guardian_spark_reapply_skip_engine.cpp). Each case also
+    declares the arm path its line reports; the `path=` field is checked against it here so a
+    fixture edit cannot drop or contradict the marker.
+    """
     cases = json.loads(REBUILD_FIXTURE_PATH.read_text(encoding="utf-8"))["cases"]
-    if len(cases) < 2:
+    if len(cases) < 3:
         print(f"FAIL: {REBUILD_FIXTURE_PATH} lists {len(cases)} case(s); the check expects at "
-              "least the all-zero and the populated one")
+              "least the legacy all-zero, the spark all-zero and the populated one")
         return 1
+    paths = {case.get("path") for case in cases}
+    if not {"legacy", "spark"} <= paths:
+        print(f"FAIL: {REBUILD_FIXTURE_PATH} must carry at least one legacy-path and one "
+              f"spark-path case (found {sorted(str(p) for p in paths)})")
+        return 1
+    for case in cases:
+        marker = f"(rebuild attempted): path={case.get('path')} first_attach="
+        if marker not in case["expected_line"]:
+            print(f"FAIL: fixture case {case['name']!r} does not carry {marker!r}:")
+            print(f"  {case['expected_line']!r}")
+            return 1
     for name in DRIVER_REGEX_NAMES:
         if not hasattr(driver, name):
             print(f"FAIL: the driver no longer defines {name}; update DRIVER_REGEX_NAMES in this "
@@ -174,7 +191,7 @@ def main() -> int:
 
     print("OK: driver T2_RE parses tests/unit/fixtures/spark/arm_committed_line.json's "
           "expected_line into the pinned field tuple; #4665 forgery regression still refused; "
-          "no driver regex matches either #5719 rebuild-line golden")
+          "no driver regex matches any #5719 rebuild-line golden")
     return 0
 
 

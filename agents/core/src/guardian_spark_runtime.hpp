@@ -441,8 +441,8 @@ public:
     /// first), one entry per such rule (a key shared by several kept rules yields one entry per
     /// sibling), each with `why` = the key's recorded first cause (PerKey::unhealthy_why, else
     /// KeyFaulted). Rules omitted from `keep` are NOT listed (they are not "kept"), and a healthy
-    /// kept rule is not listed. Built under the same registry_mu_ hold as the detach and reserved
-    /// with its rule-id list; detach_all() discards it. It exists because, after this call, the
+    /// kept rule is not listed. Built under the same registry_mu_ hold as the detach (not
+    /// pre-reserved); detach_all() discards it. It exists because, after this call, the
     /// kept rule's own attach sees EITHER KeyBusy (an io-class key whose disarm claim is still
     /// queued) OR FirstAttach (an inline type, or a disarm that already completed), never the
     /// key's cause: the return value is the only place the cause survives. A caller on the engine
@@ -451,7 +451,7 @@ public:
         std::string rule_id;
         GuardianRebuildReason why{GuardianRebuildReason::None};
     };
-    std::vector<ForcedRebuild> detach_rules_except(const std::set<std::string, std::less<>>& keep);
+    [[nodiscard]] std::vector<ForcedRebuild> detach_rules_except(const std::set<std::string, std::less<>>& keep);
 
     /// The queued-handler body: resolve `ev.key` to its rules and run one
     /// evaluate_key(Event) pass. Safe to call on a detached thread post-shutdown

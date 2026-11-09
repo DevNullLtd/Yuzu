@@ -783,7 +783,7 @@ TEST_CASE("#4415 PR-A scoped detach 7b: detach_rules_except detaches only the om
     REQUIRE(rig.rt->rule_count() == 2);
     const auto epoch_before = rig.rt->application_fence_for_test().first;
 
-    rig.rt->detach_rules_except({"r3", "r4"});
+    (void)rig.rt->detach_rules_except({"r3", "r4"});
     CHECK(rig.rt->application_fence_for_test().first == epoch_before + 1);
     CHECK(rig.rt->wedge_candidate_count_for_test("r1") == 0);   // absent: gone for good
     CHECK(rig.rt->wedge_candidate_count_for_test("r3") == 0);   // kept, but the global sweep clears it
@@ -920,7 +920,7 @@ TEST_CASE("#4415 PR-A F1e: the health sweep sets the faulted bit and never clear
     // Faulted, no event: the scoped detach consults the backend before deciding, so the kept
     // rule goes with its key and the next per-rule reconcile re-arms a fresh watcher.
     rig.backend->set_health(sub, SubscriptionHealth::Faulted);
-    rig.rt->detach_rules_except({"r1"});
+    (void)rig.rt->detach_rules_except({"r1"});
     CHECK(rig.rt->rule_count() == 0);
     REQUIRE(yuzu::test::spin_until([&] { return rig.backend->disarm_entries.load() == 1; }, 10s));
 
@@ -1137,7 +1137,7 @@ TEST_CASE("#4415 PR-A F1f: a Dead key shared by two kept rules is rebuilt by the
     REQUIRE(rig.backend->armed_ids() == std::vector<std::uint64_t>{1}); // one shared watcher
     rig.backend->set_health(1, SubscriptionHealth::Dead); // no Lost event is delivered
 
-    rig.rt->detach_rules_except({"r1", "r2"});
+    (void)rig.rt->detach_rules_except({"r1", "r2"});
     CHECK(rig.rt->rule_count() == 0); // both went with their key
     REQUIRE(yuzu::test::spin_until([&] { return rig.backend->disarm_entries.load() == 1; }, 10s));
 
@@ -1173,7 +1173,7 @@ TEST_CASE("#4415 PR-A F1h: a throwing health query does not stop the scoped deta
     REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
     REQUIRE(rig.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true).has_value());
     rig.backend->set_health_hook([](std::uint64_t) { throw std::runtime_error("health"); });
-    rig.rt->detach_rules_except({"r1"});
+    (void)rig.rt->detach_rules_except({"r1"});
     CHECK_FALSE(rig.rt->status_for_rule("r2").has_value());
     CHECK_FALSE(rig.rt->status_for_rule("r1").has_value()); // unknown health: rebuilt
     REQUIRE(yuzu::test::spin_until([&] { return rig.backend->disarm_entries.load() == 2; }, 10s));
@@ -1246,7 +1246,7 @@ TEST_CASE("#4415 PR-A F1i: the registry lock is not held across the backend heal
     CHECK(again->skipped);                // the probe ran (and the rule is skipped)
     const int after_probe = reentered.load();
     CHECK(after_probe >= 1);              // the probe call site re-entered the registry
-    rig.rt->detach_rules_except({"r1", "r2"});       // the sweep asks for each armed key
+    (void)rig.rt->detach_rules_except({"r1", "r2"});       // the sweep asks for each armed key
     CHECK(reentered.load() - after_probe >= 1);      // the sweep call site did too (not an exact
                                                      // count: that is an implementation detail)
     CHECK(blocked.load() == 0);
@@ -1357,6 +1357,9 @@ RT::ArmOutcome attach_nw(Rig& rig, const std::string& rid, const SparkSpec& spec
     auto out = rig.rt->attach_rule(RT::NonWaiting{}, rid, spec, std::move(a), true);
     INFO("attach_rule(NonWaiting, " << rid << "): " << (out ? "ok" : out.error().message));
     REQUIRE(out.has_value());
+    // The defensive-invariant bucket is unreachable through the public API: no scenario in these
+    // cases may land in it, so a stray `other` fails the case that produced it.
+    CHECK(out->rebuild_reason != Why::Other);
     return *out;
 }
 
@@ -1382,8 +1385,10 @@ void deliver_faulted(Rig& rig, const SparkSpec& spec, std::uint64_t sub) {
 /// Collapses a returned vector to "rule_id:token" strings in a stable order.
 std::vector<std::string> forced_summary(const std::vector<RT::ForcedRebuild>& v) {
     std::vector<std::string> out;
-    for (const auto& f : v)
+    for (const auto& f : v) {
+        CHECK(f.why != Why::Other); // see attach_nw: `other` is never a forced cause either
         out.push_back(f.rule_id + ":" + why_tok(f.why));
+    }
     std::sort(out.begin(), out.end());
     return out;
 }
@@ -1824,6 +1829,48 @@ TEST_CASE("#5719 forced F1: the sweep does not overwrite an event-edge faulted_k
     CHECK(forced_summary(forced) == std::vector<std::string>{"r1:faulted_key"});
 }
 
+// Health order, recorded bit before the absent probe: a key whose faulted bit is set AND whose
+// health query throws (the probe is absent) reports the RECORDED cause, faulted_key, not
+// health_unknown. Both terms hold; the code evaluates the bit first.
+// Mutation: test `!probe` before `kit->second->faulted` in reuse_existing_locked (this reports
+// health_unknown: red).
+TEST_CASE("#5719 reason R12: a recorded faulted bit outranks an absent probe",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    deliver_faulted(rig, spec, last_sub(rig)); // the recorded bit
+    HookReset hook_reset{rig};
+    rig.backend->set_health_hook([](std::uint64_t) { throw std::runtime_error("health"); });
+    const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+    CHECK_FALSE(out.skipped);
+    CHECK(why_tok(out.rebuild_reason) == "faulted_key");
+    settle(rig, spec);
+}
+
+// A Recovered edge clears the key's recorded cause together with the bit. After it the next
+// identical attach is a skip with no reason, and a later unhealthy answer from the backend alone
+// (Dead, no event) is recorded under ITS cause, not under the stale faulted_key.
+// Mutation: leave unhealthy_why untouched on a recovered edge in on_subscription_faulted (the
+// scoped detach below returns faulted_key instead of dead_key: red).
+TEST_CASE("#5719 reason R13: a recovered edge clears the recorded cause, so the next attach skips "
+          "and a later Dead answer is reported as dead_key",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec = file_spec("/a");
+    REQUIRE(rig.rt->attach_rule("r1", spec, file_exists_rule("r1"), true).has_value());
+    const auto sub = last_sub(rig);
+    deliver_faulted(rig, spec, sub);
+    rig.rt->on_event(SparkEvent{.key = spark_key(spec), .kind = SparkEventKind::Recovered,
+                                .subscription_id = sub, .detail = "healed"});
+    const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+    CHECK(out.skipped);
+    CHECK(why_tok(out.rebuild_reason) == "none");
+    rig.backend->set_health(sub, SubscriptionHealth::Dead); // the backend alone, no event
+    const auto forced = rig.rt->detach_rules_except({"r1"});
+    CHECK(forced_summary(forced) == std::vector<std::string>{"r1:dead_key"});
+}
+
 // Why the engine needs the forced reason: on an INLINE key the scoped detach's disarm is
 // synchronous, so the kept rule's own later attach finds no committed entry and no claim and
 // would say first_attach. The return value is the only place the cause survives.
@@ -1887,7 +1934,7 @@ TEST_CASE("#5719 counters K2: every throwing key query is counted and the sweep 
             thrown.fetch_add(1);
             throw std::runtime_error("health");
         });
-        rig.rt->detach_rules_except({"r1"});
+        (void)rig.rt->detach_rules_except({"r1"});
         CHECK(calls.load() == 2); // both keys were asked
         CHECK(rig.rt->sweep_health_query_failures() == 2);
         CHECK(rig.rt->health_probe_failures() == 0);
@@ -1902,7 +1949,7 @@ TEST_CASE("#5719 counters K2: every throwing key query is counted and the sweep 
                 throw std::runtime_error("health");
             }
         });
-        rig.rt->detach_rules_except({"r1", "r2"});
+        (void)rig.rt->detach_rules_except({"r1", "r2"});
         CHECK(calls.load() == 2);
         CHECK(thrown.load() == 1);
         CHECK(rig.rt->sweep_health_query_failures() == 1);

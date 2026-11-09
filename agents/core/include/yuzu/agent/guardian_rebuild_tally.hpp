@@ -21,7 +21,8 @@
  * allocation failure; absent when apply_rules returns early on a persist failure). Counts are
  * always printed so the token set is stable; ` ids=[a,b]` follows an id-bearing group only when its
  * count is above zero:
- *   Guardian: full_sync rebuilt <N> rule(s) (rebuild attempted): first_attach=<A> content_changed=<B>
+ *   Guardian: full_sync rebuilt <N> rule(s) (rebuild attempted): path=<legacy|spark>
+ *   first_attach=<A> content_changed=<B>
  *   key_busy=<C> [ids=[..]] faulted_key=<D> [ids=[..]] dead_key=<E> [ids=[..]] health_unknown=<F>
  *   [ids=[..]] subscription_replaced=<G> [ids=[..]] unknown_episode=<H> [ids=[..]]
  *   baseline_empty=<I> [ids=[..]] baseline_differs=<J> [ids=[..]] other=<K> [ids=[..]] more=<M>
@@ -81,6 +82,15 @@ enum class GuardianRebuildReason : std::uint8_t {
     BaselineDiffers,
     Other,
 };
+
+/// Which arm path the push took: the legacy path (prefer_spark_ false or Spark not Available), where
+/// every carried rule is stopped and re-armed on each full_sync and the tally is never fed, or the
+/// Spark path, where the skip/rebuild decision applies. Printed as `path=legacy|spark`.
+enum class GuardianRebuildPath : std::uint8_t { Legacy = 0, Spark };
+
+[[nodiscard]] constexpr std::string_view guardian_rebuild_path_token(GuardianRebuildPath p) noexcept {
+    return p == GuardianRebuildPath::Spark ? "spark" : "legacy";
+}
 
 /// Unique lower-case log token: no space, comma or bracket. `none` is never printed.
 [[nodiscard]] constexpr std::string_view guardian_rebuild_reason_token(GuardianRebuildReason r) noexcept {
@@ -168,10 +178,12 @@ public:
         return i < kReasons ? ids_[i] : kEmpty;
     }
 
-    /// May throw (allocation); the caller guards its logging.
-    [[nodiscard]] std::string format() const {
+    /// May throw (allocation); the caller guards its logging. `path` is the arm path the push took
+    /// (the same expression reconcile_rule_locked uses to choose it).
+    [[nodiscard]] std::string format(GuardianRebuildPath path) const {
         std::string out = "Guardian: full_sync rebuilt " + std::to_string(total()) +
-                          " rule(s) (rebuild attempted):";
+                          " rule(s) (rebuild attempted): path=" +
+                          std::string{guardian_rebuild_path_token(path)};
         std::size_t id_bearing_total = 0;
         for (const auto why : kLineOrder) {
             const auto i = index(why);
@@ -194,6 +206,22 @@ public:
         }
         out += " more=" + std::to_string(id_bearing_total - listed_);
         return out;
+    }
+
+    /// True when the print order lists every non-None reason exactly once (checked at compile time
+    /// below the class: a new enumerator missing from the line, or listed twice, fails the build).
+    [[nodiscard]] static constexpr bool line_order_is_complete() noexcept {
+        std::array<unsigned, kReasons> seen{};
+        for (const auto why : kLineOrder) {
+            const auto i = index(why);
+            if (i == 0 || i >= kReasons)
+                return false;
+            ++seen[i];
+        }
+        for (std::size_t i = 1; i < kReasons; ++i)
+            if (seen[i] != 1)
+                return false;
+        return true;
     }
 
 private:
@@ -222,5 +250,13 @@ private:
     std::size_t listed_{0};   // ids listed across all id-bearing groups
     std::size_t id_bytes_{0}; // sum of those ids' bytes
 };
+
+static_assert(GuardianRebuildTally::line_order_is_complete(),
+              "kLineOrder must list every non-None GuardianRebuildReason exactly once");
+
+// The engine apply thread must never see these throw (note() is called inside reconcile).
+static_assert(noexcept(std::declval<GuardianRebuildTally&>().reset()));
+static_assert(noexcept(std::declval<GuardianRebuildTally&>().note(std::declval<const std::string&>(),
+                                                                  GuardianRebuildReason::KeyBusy)));
 
 } // namespace yuzu::agent
