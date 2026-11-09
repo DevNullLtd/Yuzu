@@ -1986,16 +1986,31 @@ public:
         const auto specs = fq::win_rule_specs(next, gen);
         const auto plan = fq::win_update_plan(ours, specs);
         std::vector<std::string> added;
+        // Until step 6 completes, EVERY exit (a failure return or an exception)
+        // takes this generation's own new rules back out: an update must not leave
+        // its looser rules live beside the previous generation's record (an initial
+        // apply is removed whole by the driver anyway, and the removal is
+        // idempotent). No exit can forget it, there is no call to delete. The
+        // destructor swallows everything: a COM call must not throw while unwinding.
+        struct UndoAdded {
+            INetFwRules& rules;
+            const std::vector<std::string>& names;
+            bool committed = false;
+            ~UndoAdded() {
+                if (committed)
+                    return;
+                try {
+                    (void)remove_rules_by_name(rules, names);
+                } catch (...) {
+                }
+            }
+        } undo{*rules.get(), added};
         for (const auto& spec : plan.add) {
-            if (dl.expired()) {
-                (void)remove_rules_by_name(*rules.get(), added);
+            if (dl.expired())
                 return fq::StepResult::fail("deadline_exceeded");
-            }
             const HRESULT ah = add_rule(*rules.get(), spec);
-            if (ah != S_OK) { // S_FALSE passes SUCCEEDED() but is not "added"
-                (void)remove_rules_by_name(*rules.get(), added);
+            if (ah != S_OK) // S_FALSE passes SUCCEEDED() but is not "added"
                 return fq::StepResult::fail(hr_token("rule_add_failed", ah));
-            }
             added.push_back(spec.name);
         }
 
@@ -2016,33 +2031,21 @@ public:
                 ++refused;
             return true;
         });
-        // Every failure from here to the end of step 6 takes this generation's own
-        // new rules back out (an update must not leave its looser rules live beside
-        // the previous generation's record; an initial apply is removed whole by the
-        // driver anyway, and the removal is idempotent).
-        const auto undo_added = [&] { (void)remove_rules_by_name(*rules.get(), added); };
-        if (!disabled_pass) {
-            undo_added();
+        if (!disabled_pass)
             return fq::StepResult::fail("rule_enumeration_failed");
-        }
-        if (dl.expired()) {
-            undo_added();
+        if (dl.expired())
             return fq::StepResult::fail("deadline_exceeded");
-        }
 
         // 6. Default-block, per profile, inbound and outbound.
         for (const auto profile : kQuarantineProfiles) {
             hr = policy->put_DefaultInboundAction(profile, NET_FW_ACTION_BLOCK);
-            if (hr != S_OK) {
-                undo_added();
+            if (hr != S_OK)
                 return fq::StepResult::fail(hr_token("default_inbound_failed", hr));
-            }
             hr = policy->put_DefaultOutboundAction(profile, NET_FW_ACTION_BLOCK);
-            if (hr != S_OK) {
-                undo_added();
+            if (hr != S_OK)
                 return fq::StepResult::fail(hr_token("default_outbound_failed", hr));
-            }
         }
+        undo.committed = true; // this generation is in force; nothing below can fail the update
 
         // 7. Remove the stale generation's rules LAST. One that will not go is
         //    only a looser allowance left behind: a note, not a failed update.
@@ -2420,13 +2423,14 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
     if (!exceptions)
         return emit_refusal(ctx, "exceptions_invalid:" + exceptions.error());
 
-    Containment rig(raw, /*for_apply=*/true);
-    if (!rig.leg)
+    Containment containment(raw, /*for_apply=*/true);
+    if (!containment.leg)
         return emit_refusal(ctx, "unsupported_platform");
 #ifndef _WIN32
     // The nft and pf legs hand a staged file to a privileged tool: no private
     // directory to stage it in, no apply (and nothing has been touched yet).
-    if ((rig.leg->kind() == fq::BackendKind::nft || rig.leg->kind() == fq::BackendKind::pf) &&
+    if ((containment.leg->kind() == fq::BackendKind::nft ||
+         containment.leg->kind() == fq::BackendKind::pf) &&
         private_staging_dir(raw).empty())
         return emit_refusal(ctx, "staging_unavailable");
 #endif
@@ -2443,7 +2447,7 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
     req.allow = *allow;
     req.probe_target = std::string{params.get("probe_target")};
     req.ttl_seconds = *ttl;
-    auto env = rig.env();
+    auto env = containment.env();
     fq::Deadline dl;
     auto o = fq::apply_and_verify(env, req, dl);
     o.notes.insert(o.notes.end(), allow->notes.begin(), allow->notes.end());
@@ -2457,11 +2461,11 @@ int do_release(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext
     const auto due = params.get("if_ttl_expired");
     req.if_ttl_expired = due == "1" || due == "true";
 
-    Containment rig(raw, /*for_apply=*/false);
-    if (!rig.leg) {
+    Containment containment(raw, /*for_apply=*/false);
+    if (!containment.leg) {
         // No firewall tool and no record of one: nothing of ours can be in force.
         fq::Outcome o;
-        if (rig.store.load().kind == fq::StateLoad::Kind::absent) {
+        if (containment.store.load().kind == fq::StateLoad::Kind::absent) {
             o.status = "inactive";
             o.notes.emplace_back("no_firewall_tool=1");
             emit(ctx, o);
@@ -2469,7 +2473,7 @@ int do_release(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext
         }
         return emit_refusal(ctx, "unsupported_platform");
     }
-    auto env = rig.env();
+    auto env = containment.env();
     fq::Deadline dl;
     auto o = fq::release(env, req, dl);
     settle_ttl(o, raw);
@@ -2487,10 +2491,10 @@ int do_quarantine_allow(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPlug
     if (exceptions->empty())
         return emit_refusal(ctx, "exceptions_required");
 
-    Containment rig(raw, /*for_apply=*/true);
-    if (!rig.leg)
+    Containment containment(raw, /*for_apply=*/true);
+    if (!containment.leg)
         return emit_refusal(ctx, "not_active");
-    auto env = rig.env();
+    auto env = containment.env();
     fq::Deadline dl;
     auto o = fq::update(env, op == "add", *exceptions, dl);
     emit(ctx, o);
@@ -2499,10 +2503,10 @@ int do_quarantine_allow(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPlug
 
 int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
                          const std::string& init_note) {
-    Containment rig(raw, /*for_apply=*/false);
+    Containment containment(raw, /*for_apply=*/false);
     fq::Outcome o;
-    if (!rig.leg) {
-        if (rig.store.load().kind == fq::StateLoad::Kind::absent) {
+    if (!containment.leg) {
+        if (containment.store.load().kind == fq::StateLoad::Kind::absent) {
             o.status = "inactive";
             o.notes.emplace_back("no_firewall_tool=1");
         } else {
@@ -2510,7 +2514,7 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
             o.reason = "os_unreadable";
         }
     } else {
-        auto env = rig.env();
+        auto env = containment.env();
         fq::Deadline dl;
         o = fq::report_status(env, dl);
     }
@@ -2530,14 +2534,19 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
         const auto l = probe_store.load();
         if (l.kind == fq::StateLoad::Kind::absent)
             return {};
-        Containment rig(raw, /*for_apply=*/true);
-        if (!rig.leg)
+        Containment containment(raw, /*for_apply=*/true);
+        if (!containment.leg)
             return "no_firewall_tool";
-        auto env = rig.env();
+        auto env = containment.env();
         fq::Deadline dl;
         auto o = fq::recover_at_init(env, dl);
         settle_ttl(o, raw);
-        return o.reason.empty() ? o.status : o.status + ":" + o.reason;
+        // `status[:reason][,note...]`: a cause that is only a note (a failed state
+        // flush, an unregistered TTL trigger) must survive into init_recovery.
+        auto summary = o.reason.empty() ? o.status : o.status + ":" + o.reason;
+        for (const auto& n : o.notes)
+            summary += "," + n;
+        return summary;
     } catch (...) {
         return "exception";
     }

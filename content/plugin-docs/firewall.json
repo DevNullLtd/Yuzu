@@ -369,7 +369,7 @@
       "completeness": "PARTIAL",
       "provenance": "`firewall:partial`, `firewall:degraded`",
       "status": "`CONSTRAINED`",
-      "when": "`partial`: contained but incomplete (rules the policy store would not disable, the TTL trigger not registered, a record that could not be updated, an operation in progress, on macOS an update whose connection flush failed: the new generation is in force and recorded, `state_flush_failed=1`). `degraded`: the record and the host disagree (policy not blocking, rules present without a record, a record that cannot be read, a failed boot-time re-apply)"
+      "when": "`partial`: contained but incomplete (rules the policy store would not disable, the TTL trigger not registered, a record that could not be updated, an operation in progress, on macOS an update or a boot-time re-apply whose connection flush failed: the new generation is in force and recorded, `state_flush_failed=1`). `degraded`: the record and the host disagree (policy not blocking, rules present without a record, a record that cannot be read, a failed boot-time re-apply)"
     },
     {
       "completeness": "PARTIAL",

@@ -2790,36 +2790,66 @@ TEST_CASE("pf: boot-time recovery repairs a disabled pf and re-applies after a r
           "[agent][firewall_quarantine]") {
     PfRig rig;
     auto dl = rig.dl();
-    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
-    const auto first = rig.token();
 
-    // same boot, still enforcing: verified only -- no -E, no load, no flush
-    const auto calls = rig.world.log.size();
-    CHECK(recover_at_init(rig.env, dl).status == "active");
-    CHECK(rig.world.count("pfctl -E", calls) == 0);
-    CHECK(rig.world.count(" -f ", calls) == 0);
-    CHECK(rig.world.flush_states == 1);
+    SECTION("a disabled pf is repaired in place; a reboot re-applies with a fresh reference") {
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto first = rig.token();
 
-    // same boot, pf switched off: repaired
-    rig.world.external_disable();
-    const auto o = recover_at_init(rig.env, dl);
-    CHECK(o.status == "active");
-    CHECK(contains(o.notes, "reapplied=1"));
-    CHECK(rig.world.enforcing());
-    CHECK(rig.token() != first);
+        // same boot, still enforcing: verified only -- no -E, no load, no flush
+        const auto calls = rig.world.log.size();
+        CHECK(recover_at_init(rig.env, dl).status == "active");
+        CHECK(rig.world.count("pfctl -E", calls) == 0);
+        CHECK(rig.world.count(" -f ", calls) == 0);
+        CHECK(rig.world.flush_states == 1);
 
-    // a reboot: no references, no anchor, a new boot time. A fresh -E, and the stale
-    // token is NOT released (the kernel's count reset; the token means nothing now)
-    const auto stale = rig.token();
-    rig.world.reboot();
-    CHECK(report_status(rig.env, dl).status == "degraded");
-    const auto before = rig.world.log.size();
-    CHECK(recover_at_init(rig.env, dl).status == "active");
-    CHECK(rig.world.enforcing());
-    CHECK(rig.world.count("-X " + stale, before) == 0);
-    CHECK(rig.store.state()->os.boot_time == kPfBoot2);
-    CHECK(rig.token() != stale);
-    CHECK(rig.world.tokens.size() == 1);
+        // same boot, pf switched off: repaired
+        rig.world.external_disable();
+        const auto o = recover_at_init(rig.env, dl);
+        CHECK(o.status == "active");
+        CHECK(contains(o.notes, "reapplied=1"));
+        CHECK(rig.world.enforcing());
+        CHECK(rig.token() != first);
+
+        // a reboot: no references, no anchor, a new boot time. A fresh -E, and the stale
+        // token is NOT released (the kernel's count reset; the token means nothing now)
+        const auto stale = rig.token();
+        rig.world.reboot();
+        CHECK(report_status(rig.env, dl).status == "degraded");
+        const auto before = rig.world.log.size();
+        CHECK(recover_at_init(rig.env, dl).status == "active");
+        CHECK(rig.world.enforcing());
+        CHECK(rig.world.count("-X " + stale, before) == 0);
+        CHECK(rig.store.state()->os.boot_time == kPfBoot2);
+        CHECK(rig.token() != stale);
+        CHECK(rig.world.tokens.size() == 1);
+    }
+
+    SECTION("a reboot whose re-apply cannot flush states reports partial, and update clears it") {
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto gen_before = rig.store.state()->generation;
+        const auto flushes = rig.world.flush_states;
+
+        // After a reboot the anchor is empty, so no earlier generation flushed the
+        // states opened since boot. The anchor load still committed the new
+        // generation and init never rolls back: it is in force, recorded, partial.
+        rig.world.reboot();
+        rig.world.fail_flush_states = 2;
+        const auto o = recover_at_init(rig.env, dl);
+        CHECK(o.status == "partial");
+        CHECK(contains(o.notes, "reapplied=1"));
+        CHECK(contains(o.notes, "state_flush_failed=1"));
+        CHECK(rig.world.enforcing());
+        CHECK(rig.world.flush_states == flushes + 2); // the attempt and its one retry
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::active);
+        CHECK(rig.store.state()->generation == gen_before + 1);
+        CHECK(rig.store.state()->os.boot_time == kPfBoot2);
+
+        // The remedy the note names: the next update flushes again.
+        const auto added = ex("10.0.0.9:22/tcp/in");
+        CHECK(update(rig.env, true, {added}, dl).status == "active");
+        CHECK(rig.world.flush_states == flushes + 3);
+    }
 }
 
 TEST_CASE("pf: a crash between -E and the token write leaks one reference, visible, never silent",

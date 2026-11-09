@@ -139,6 +139,7 @@ for tu in "${tus[@]}"; do
         fi
         extra_inc+=(-I "$libxml2_include")
     fi
+    grep -lq "quarantine_serialization.hpp" "$src_dir"/*.hpp "$src_dir"/*.cpp 2>/dev/null && extra_inc+=(-I agents/plugins/quarantine/src) # firewall's MutationGate include; retires with the quarantine plugin
     if "$CXX" -std=c++23 -fsyntax-only -fno-elide-constructors \
         -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
         -I "$shim" -I "$src_dir" -I agents/shared -I common/include -I agents/core/include -I sdk/include \

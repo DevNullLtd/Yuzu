@@ -2679,10 +2679,15 @@ public:
         }
         if (!flushed) {
             // The anchor load already committed `next`, and putting `prev` back would
-            // need its allow set, which Leg::apply is not given: an update therefore
-            // reports the generation that IS in force, partial. Connections the
-            // previous generation allowed and this one does not may live on until
-            // they end (the previous apply flushed the states that predate it).
+            // need its allow set, which Leg::apply is not given: an update or a
+            // recovery therefore reports the generation that IS in force, partial.
+            // What may live on is whatever pf already held: on a quarantine_allow
+            // update, the removed allowances' old streams; on a recovery that found
+            // our anchor not in force (a reboot, an external `pfctl -d`), every state
+            // created since it last was -- including, when another holder had pf on
+            // since boot, connections opened between boot and agent start. The next
+            // quarantine_allow (or a later repair) flushes again; a later agent start
+            // does not (recover_at_init leaves an enforcing anchor alone).
             if (prev_gen == 0)
                 return StepResult::fail("state_flush_failed");
             ok.partial = true;
@@ -3271,7 +3276,6 @@ public:
                                                 std::string_view config_json) = 0;
     [[nodiscard]] virtual bool unregister_trigger(std::string_view id) = 0;
 };
-
 
 /// The trigger's config: every `kTtlPollSeconds` the agent dispatches
 /// `firewall.release` with `if_ttl_expired=1`, a no-op until the record's TTL has

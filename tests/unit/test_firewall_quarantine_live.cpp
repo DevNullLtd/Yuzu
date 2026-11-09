@@ -777,6 +777,20 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
     rig.restart();
     CHECK(has_row(rig.run("quarantine_status").captured, "status|active"));
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
+
+    // a quarantine with a TTL, then a restart: init retries the TTL trigger (the
+    // standalone harness has no trigger engine, so it fails again, deterministically).
+    // This is the only place the init-time retry line executes against the built plugin.
+    REQUIRE(has_row(rig.run("release").captured, "status|inactive"));
+    auto ttl_params = env.quarantine_params();
+    ttl_params.emplace_back("ttl_seconds", "60");
+    REQUIRE(has_row(rig.run("quarantine", ttl_params).captured, "status|partial"));
+    rig.restart();
+    CHECK(has_row(rig.run("quarantine_status").captured,
+                  "note|init_recovery=partial,ttl_trigger_unregistered=1"));
+    rec = rig.record();
+    REQUIRE(rec.has_value());
+    CHECK(rec->ttl_expires > 0);
 }
 
 TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
