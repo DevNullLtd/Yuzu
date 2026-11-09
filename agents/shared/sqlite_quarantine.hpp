@@ -143,12 +143,11 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
 /// effort (0600 on POSIX; a read-only-attribute toggle on Windows).
 /// Two recorded limits of the sidecar step. It is exists-then-rename on the derived name, so a
 /// writer of the directory who squats `<claimed>-wal` ahead of time makes the rename and the copy
-/// fail and the sidecar is removed under the rule above: such a writer can remove the sidecar
-/// directly, and the packaged Windows state directory admits no such writer. And on Windows the
-/// copy fallback creates its file with the directory's inherited ACL (`secure` there is only the
-/// read-only attribute; a rename keeps the source's DACL), so a copied sidecar is as readable as
-/// the state directory, which the packaged install restricts to SYSTEM, Administrators and the
-/// agent account.
+/// fail and the sidecar is removed under the rule above (such a writer can remove it directly
+/// anyway). And on Windows the copy fallback creates its file with the directory's inherited ACL
+/// (`secure` there is only the read-only attribute; a rename keeps the source's DACL), so a copied
+/// sidecar is as readable as the state directory. Both are bounded by the same fact: the packaged
+/// Windows state directory is restricted to SYSTEM, Administrators and the agent account.
 [[nodiscard]] inline QuarantineResult quarantine_corrupt_db(const std::filesystem::path& path,
                                                            std::int64_t epoch_seconds,
                                                            const FsOps& ops = {}) {
