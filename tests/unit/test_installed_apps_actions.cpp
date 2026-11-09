@@ -384,13 +384,17 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     CHECK(bad_field_count == 0);
     CHECK(bad_sig_value == 0);
     CHECK(publisher_without_signature == 0);
-    // A location is whatever system_profiler reported for the host's apps (the sync writer blanks
-    // a per-user one), so how many rows carry one depends on the host and is only reported; the
-    // shape every one must have is the contract.
+    // A location is whatever system_profiler reported for the host's apps (the sync writer keeps
+    // it only under a machine root), so how many rows carry one depends on the host and is only
+    // reported; the shape every one must have is the contract.
     INFO("apps with an install_location: " << apps_with_location);
     // system_profiler reports a Location for the bundles it lists, so any host with an app row has
     // at least one. Without this the check below passes when every token is empty, and dropping
     // the assignment of the .app path (the row's primary value, row 1.4) would go unnoticed.
+    // HOST-GATED: this mutation claim holds only on a healthy Mac. A degraded or empty
+    // system_profiler run reaches the SKIP above (or `app_rows == 0` here) and reports skipped, not
+    // red, so a CI Mac with a degraded profiler proves nothing about the assignment; the pure
+    // record build has no fixture test yet.
     if (app_rows > 0)
         CHECK(apps_with_location >= 1);
     CHECK(relative_locations == 0);
