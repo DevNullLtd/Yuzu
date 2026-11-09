@@ -677,6 +677,30 @@ static bool read_rotate_overlap_secs(const httplib::Request& req, httplib::Respo
     return true;
 }
 
+// #7114: the reply of a REST route whose dispatch the chokepoint REFUSED, shared by the two routes
+// that run no pre-send dry run (Echo purge, DEX live) so the status split cannot drift. Writes the
+// status and the A4 body; returns the reason token for the caller's audit detail / metric. 403 for
+// the permission-class reasons; 500 for Unclassified / Ambiguous, DELIBERATELY unlike
+// describe_dispatch_denial's kInvalidParams (400): both callers dispatch a SERVER-named pair, so a
+// catalogue miss is a server catalogue fault, not a caller mistake (text.remediation for that class
+// would tell the caller to "confirm the plugin/action name": theirs is not the mistake).
+static std::string reply_dispatch_denied(httplib::Response& res, const std::string& cid,
+                                         const detail::DispatchDenial& denial,
+                                         const std::string& plugin, const std::string& action) {
+    std::string token(detail::to_string(denial.reason));
+    const auto text =
+        describe_dispatch_denial(denial.reason, plugin, action, denial, DenialSurface::kRest);
+    const bool permission_class = text.cls == DispatchDenialClass::kPermissionDenied;
+    res.status = permission_class ? 403 : 500;
+    res.set_content(detail::error_json_a4(
+                        res.status, "dispatch denied: reason=" + token, cid,
+                        permission_class ? text.remediation
+                                         : "server catalogue fault for a server-named pair; report "
+                                           "to the administrator"),
+                    "application/json");
+    return token;
+}
+
 // Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
 // The wire-format parsing (kind table + field extraction) is shared with the
 // dashboard HTML path via live_kinds.hpp so the two cannot drift (governance S2);
@@ -4532,28 +4556,14 @@ void RestApiV1::register_routes(
                                     /*execution_id=*/"", *caller);
             const auto& command_id = dispatch_outcome.command_id;
             const auto sent = dispatch_outcome.sent;
-            // #7114: a chokepoint refusal is reported as such, not as an offline device. 403 for
-            // the permission-class reasons; 500 for Unclassified/Ambiguous, DELIBERATELY unlike
-            // describe_dispatch_denial's kInvalidParams (400): ("echo","purge_source") is a SERVER
-            // literal, so a catalogue miss is a server catalogue fault, not a caller mistake.
+            // #7114: a chokepoint refusal is reported as such, not as an offline device. The pair
+            // is the server literal ("echo", "purge_source"), so Unclassified / Ambiguous answers
+            // 500 here, not the caller's 400 (see reply_dispatch_denied).
             if (dispatch_outcome.denied) {
-                const auto& denial = *dispatch_outcome.denied;
-                const std::string token(detail::to_string(denial.reason));
-                const auto text = describe_dispatch_denial(denial.reason, "echo", "purge_source",
-                                                           denial, DenialSurface::kRest);
-                const bool permission_class = text.cls == DispatchDenialClass::kPermissionDenied;
-                res.status = permission_class ? 403 : 500;
+                const auto token = reply_dispatch_denied(res, cid, *dispatch_outcome.denied,
+                                                         "echo", "purge_source");
                 fail("dispatch_denied reason=" + token);
                 bump(token.c_str());
-                // text.remediation for the 500 class would tell the caller to "confirm the
-                // plugin/action name": theirs is not the mistake (a server-named pair).
-                res.set_content(
-                    detail::error_json_a4(
-                        res.status, "dispatch denied: reason=" + token, cid,
-                        permission_class ? text.remediation
-                                         : "server catalogue fault for a server-named pair; report "
-                                           "to the administrator"),
-                    "application/json");
                 return;
             }
             if (sent == 0) {
@@ -18959,28 +18969,15 @@ void RestApiV1::register_routes(
                                                               /*execution_id=*/"", *caller);
             const auto& command_id = dispatch_outcome.command_id;
             const auto sent = dispatch_outcome.sent;
-            // #7114: a chokepoint refusal is reported as such, never as a retryable "offline" (this
-            // route runs no pre-send dry run: the chokepoint alone decides the pair's
-            // `Inventory:Read`). 403 for the permission-class reasons; 500 for Unclassified /
-            // Ambiguous, DELIBERATELY unlike describe_dispatch_denial's kInvalidParams (400): the
-            // (plugin, action) pair comes from the server's own kind table, so a catalogue miss is
-            // a server catalogue fault, not a caller mistake. No metric beyond the per-status
-            // outcome count above.
+            // #7114: a chokepoint refusal is reported as such, never as a retryable "offline". This
+            // route runs no pre-send dry run, so the chokepoint alone decides the pair's
+            // `Inventory:Read`; the (plugin, action) pair comes from the server's own kind table,
+            // so Unclassified / Ambiguous answers 500, not the caller's 400 (see
+            // reply_dispatch_denied). No metric beyond the per-status outcome count above.
             if (dispatch_outcome.denied) {
-                const auto& denial = *dispatch_outcome.denied;
-                const std::string token(detail::to_string(denial.reason));
-                const auto text =
-                    describe_dispatch_denial(denial.reason, plugin, action, denial, DenialSurface::kRest);
-                const bool permission_class = text.cls == DispatchDenialClass::kPermissionDenied;
-                res.status = permission_class ? 403 : 500;
+                const auto token =
+                    reply_dispatch_denied(res, cid, *dispatch_outcome.denied, plugin, action);
                 fail("dispatch_denied reason=" + token);
-                res.set_content(
-                    detail::error_json_a4(
-                        res.status, "dispatch denied: reason=" + token, cid,
-                        permission_class ? text.remediation
-                                         : "server catalogue fault for a server-named pair; report "
-                                           "to the administrator"),
-                    "application/json");
                 return;
             }
             if (sent == 0) {

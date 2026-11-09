@@ -21200,14 +21200,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // L1: on the supervised tier, the effect the consumed ticket was bound to. The
                 // core re-reads the definition, and holds that read to it (definition_changed).
                 rq.expected_effect = ticket_bound_effect;
-                // #7110: the post-write recheck (after the `requested` row and the execution row)
-                // re-decides this tool's gate and re-derives the caller (approval_provenance
-                // forced to None, as above). The credentials resolve again to the same principal
-                // and the caller is derived from THAT resolution: the role and the admin bit are
-                // session snapshots, so deriving from `session` would keep an admin bit a demotion
-                // during the writes has removed (the REST twins re-authenticate the same way). A
-                // per-call copy of the shared ports; `auth_fn` / `perm_fn` write a 401 / 403 into
-                // `res` on refusal, which the rendered JSON-RPC answer below replaces.
+                // #7110: the post-write recheck re-authenticates: the admin bit is a session
+                // snapshot (the REST twins do the same). The re-derived caller gets
+                // approval_provenance None again, as above. `auth_fn` / `perm_fn` write a 401 /
+                // 403 into `res` on refusal, which the rendered JSON-RPC answer below replaces.
                 auto exec_ports = instr_exec_ports_;
                 exec_ports.readmit = [&]() -> std::optional<DispatchCaller> {
                     const auto fresh = auth_fn(req, res);

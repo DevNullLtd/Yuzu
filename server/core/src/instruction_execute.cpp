@@ -723,7 +723,6 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                 denial = decision.error();
     } catch (...) { // fail closed: a throwing recheck (or authorizer) is a withdrawn permission
         readmitted = std::nullopt;
-        denial.reset();
     }
     // Both refusals close the rows alike: a `failure` outcome, the execution cancelled.
     const auto refuse_after_rows = [&](Refusal r, const std::string& detail) {
