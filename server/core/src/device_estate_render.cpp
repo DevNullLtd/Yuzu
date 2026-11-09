@@ -42,6 +42,7 @@ std::string render_stored_data_panel(const StoredDataView& v) {
          "generic inventory, installed software, device configuration item, application "
          "performance, detected licences, application usage, the endpoint presence row, "
          "fleet certificates, and Guardian compliance results. "
+         "Guardian event history and DEX observations are kept until they expire. "
          "It cannot be undone.</p>"
          "<p>It does <b>not</b> unenrol the device. If the agent is still connected it will "
          "report again and the data will come back. Tags, custom properties, quarantine records "

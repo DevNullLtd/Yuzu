@@ -266,13 +266,21 @@ lock and no cycle. The method is not a rule mutation: no policy-generation bump,
 The second class, a first delivery whose projection failed while its rule was being deleted, is
 unchanged.
 
-The decommission does NOT erase `guaranteed_state_events` or `guardian_observations`. The event log
-stays an immutable audit-style log and time-based expiry stays its single retention mechanism; the
-retired pending rows expire on that clock like any other event. Widening the decommission to erase
-the events or the DEX observations is a separate decision, needs its own Update to this ADR and the
-store header, and is not made here. A still-running agent re-creates its census row on its next
-census-bearing event, and a journal replay cannot rebuild the census from retired evidence (the
-retained events are redelivered with no repair), so the agent is stopped first.
+Owner ruling D1, 2026-11-08: the decommission does NOT erase `guaranteed_state_events` or
+`guardian_observations`. The event log stays an immutable audit-style log and time-based expiry stays
+its single retention mechanism; the retired pending rows expire on that clock like any other event
+(and with `guardian_event_retention_days` at 0 or below nothing expires, so those rows are kept for
+good). The DEX observations are behavioural data, so retention expiry, not the decommission, is the
+erasure position for them. Widening the decommission to erase the events or the DEX observations is a
+follow-up that needs its own Update to this ADR and the store header; it is not made here and the
+follow-up issue is not yet filed.
+
+Known gap, shared with `delete_rule` (#6829): a pending event committed after `delete_agent` read the
+agent's pending list but before it deleted the census rows is not retired by that transaction. A later
+pending event for a decommissioned agent likewise stays pending and is exempt from the events reaper
+until a rule delete or a later decommission retires it. A still-running agent re-creates its census
+row on its next census-bearing event, and a journal replay cannot rebuild the census from retired
+evidence (the retained events are redelivered with no repair), so the agent is stopped first.
 
 ## Follow-ups
 
