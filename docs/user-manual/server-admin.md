@@ -971,11 +971,15 @@ startup log lines — these are routine, not a fault:
 If instead you see `[HA] leader_elector could not open its coordination
 connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
 reach its Postgres coordination connection: it keeps serving and re-tries every
-election cycle (so a transient blip self-heals within seconds), but while the
+election cycle (so a transient connection blip self-heals within seconds; a
+recorded-migration refusal does not, see below), but while the
 message persists the leader-only background loops (the four above, plus command-outbox
 delivery) do not run. This is fail-closed
 by design — a paused loop never double-dispatches — and a persistent occurrence
-is a Postgres-reachability problem to investigate, not a server bug. (The
+is either a Postgres-reachability problem to investigate or a recorded-migration
+refusal: when the log also shows `PgMigrationRunner: store 'leader_elector' recorded
+migration`, the database is not unreachable, the elector will not recover on its own, and
+the way out is the restore described in [Upgrading](upgrading.md), "Behaviour change: a Postgres store refuses to open when its recorded migration differs from this build (the server stops, except for three stores)". (The
 operator-triggered paths are unaffected: a manual policy remediation or evaluation,
 and an operator CRL revoke, run on whichever replica received the request — and a
 remediation/evaluation is also *completed* on that same replica, so it still reaches
@@ -6233,7 +6237,7 @@ On the main listener, a `/health` or `/api/health` request that carries a `Cooki
 | Path | Use case | Body | Draining-aware |
 |---|---|---|---|
 | `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
-| `/readyz` | Readiness probe for load balancers and orchestrators — "stop routing to me". Covers **runtime Postgres reachability** (the `pg_reachable` row), per-store migration completion at startup, AND graceful-shutdown drain. | `{"status":"ready","enablement":{"regression_pending":false,"anchor_unwitnessed_at_boot":false,"report_ahead":false}}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["pg_reachable", ...],"pg":"unreachable","enablement":{...}}` (503). The `enablement` object is present in both the ready and the not-ready body whenever the enablement store is wired; it is detail, never a gate (see below). `pg` appears only when `pg_reachable` fails and names the reason: `unreachable`, `stale`, `read_only` (connected to a standby), or `not_yet_probed`. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049, and the NVD CVE cache `nvd_db`, whose failure leaves vulnerability matching empty) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. The registered-CRL-source store (`revocation_source_store`, ADR-0070 R1) is **gating**: it holds the operator-registered egress targets and the CA keys revocation is judged against, so a node that cannot open it does not start and `/readyz` names it in `failed_stores` if it is ever not open. | **Yes** |
+| `/readyz` | Readiness probe for load balancers and orchestrators — "stop routing to me". Covers **runtime Postgres reachability** (the `pg_reachable` row), per-store migration completion at startup, AND graceful-shutdown drain. | `{"status":"ready","enablement":{"regression_pending":false,"anchor_unwitnessed_at_boot":false,"report_ahead":false}}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["pg_reachable", ...],"pg":"unreachable","enablement":{...}}` (503). The `enablement` object is present in both the ready and the not-ready body whenever the enablement store is wired; it is detail, never a gate (see below). `pg` appears only when `pg_reachable` fails and names the reason: `unreachable`, `stale`, `read_only` (connected to a standby), or `not_yet_probed`. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049, the NVD CVE cache `nvd_db`, whose failure leaves vulnerability matching empty, and `crypto_dashboard_layout_store`, ADR-0071, whose failure leaves operators with the default `/crypto` layout and no saves) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. The registered-CRL-source store (`revocation_source_store`, ADR-0070 R1) is **gating**: it holds the operator-registered egress targets and the CA keys revocation is judged against, so a node that cannot open it does not start and `/readyz` names it in `failed_stores` if it is ever not open. | **Yes** |
 | `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
 | `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
 
