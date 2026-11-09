@@ -1560,7 +1560,7 @@ flip, with a red-first test each:
     above) and the other rows that call a gauge inert or dormant. Added with #5719: the
     statements that the full_sync rebuild line (`Guardian: full_sync rebuilt N rule(s) ...`)
     prints `path=legacy ... rebuilt 0` while `prefer_spark_` is false, and that the key-health
-    failure counters read zero there (`health_probe_failures` because the attach path is not
+    failure counters are zero in practice there (`health_probe_failures` because the attach path is not
     reached; the two sweep counters because the sweep, which does run on production full pushes
     that carry rules, runs over an empty key registry), in `guaranteed-state.md`'s "What a full
     push does on the agent" paragraph and its "Reading the rebuild line (#5719)" subsection, in
@@ -1691,16 +1691,22 @@ flip, with a red-first test each:
     logged on every production full push but is inactive there: the counts it reports come only
     from the Spark attach path, which is reached only while `prefer_spark_` is true: while it is false the line
     prints `path=legacy` and `rebuilt 0`, and `rebuilt 0` on `path=legacy` does not mean nothing
-    was rebuilt (every carried rule is still stopped and re-armed on each full push).
-    `health_probe_failures` lives on the attach path and so stays zero; the two sweep counters
-    belong to the key-health sweep, which also runs from the scoped detach on every production
-    full push that carries rules, over a key registry that is empty while `prefer_spark_` is
-    false, so `sweep_health_query_failures` is zero because there is no key to query and
-    `sweep_snapshot_failures` could rise only if the sweep's snapshot allocation failed. The
+    was rebuilt (every carried rule that has a legacy guard is still stopped and re-armed on each full push).
+    `health_probe_failures` lives on the attach path and so is zero in production; the two sweep
+    counters belong to the key-health sweep, which also runs from the scoped detach on every
+    production full push that carries rules, over a key registry that is empty while
+    `prefer_spark_` is false, so `sweep_health_query_failures` is zero because there is no key to
+    query and `sweep_snapshot_failures` is zero in practice because the empty-registry snapshot
+    allocates nothing. The
     convergence scheduler's poll backstop (the other sweep caller) starts only under
     `prefer_spark_`. (b) is covered by unit tests on Linux, on fake mechanisms; the emitted text
     is pinned by the golden fixture `tests/unit/fixtures/spark/rebuild_line.json` and by a
-    captured-log test that the line is logged exactly once. It has not been observed on a
+    captured-log test that the line is logged exactly once. That captured-log test SKIPs where
+    its in-band probe line is not captured, so that protection is Linux-only until the macOS and
+    Windows runs. The new cases have run on Linux debug only: ASan/UBSan, TSan, Windows (MSVC) and
+    macOS (Apple Clang) runs of them are outstanding. The Armed return that attach_rule makes
+    after it re-inspects its claim (the race in which the claim resolved before attach_core
+    returned) carries a rebuild reason and has no test. The line has not been observed on a
     flipped fleet; (c) MEASURED, release build (base `45f727420` against branch tip
     `3f8dd8d0d`, uncommitted throwaway harness; counts are exact, wall times are not): Linux
     (shared box; the cells that waited for a 1-minute load of 8 or less recorded it, the box
@@ -1730,7 +1736,7 @@ flip, with a red-first test each:
     limit); (d) an explicit census resync mechanism for
     server-state loss (loss (1); #5718); (e) a per-mechanism deaf-watch test (watched directory
     deleted and recreated, stale handle) proving each shipped mechanism calls `fault()` (loss (6);
-    #5719); (e) is tracked in #5719; (b) is implemented by #5719 PR-A.
+    #5719); (e) is tracked in #5719; (b) is implemented by #5719 PR-A (inactive in production; not yet observed on a flipped fleet).
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then

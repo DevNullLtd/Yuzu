@@ -75,7 +75,8 @@
  *   (g) path=legacy means the Spark attach path was not used for this push, so the tally was not
  *       fed and the line reads `rebuilt 0`. On a legacy-path agent (prefer_spark_ false, the
  *       production default) that does NOT mean nothing was rebuilt: every legacy guard is stopped
- *       and every carried rule is re-armed on each full push. (With prefer_spark_ set but Spark
+ *       and every carried rule that has a legacy guard is armed again on each full push (a
+ *       disabled or invalid rule, or one whose guard cannot start on the host, has none). (With prefer_spark_ set but Spark
  *       Unwired or SparkFailed the carried rules are withdrawn and armed on neither backend, and
  *       the line still reads path=legacy.) The runtime's three failure counters are not all
  *       confined to the Spark attach path: see the accessors in guardian_spark_runtime.hpp.
@@ -123,7 +124,7 @@ enum class GuardianRebuildReason : std::uint8_t {
 /// Which arm path the push took: the Spark path (prefer_spark_ true and Spark Available), where the
 /// skip/rebuild decision applies, or the legacy label for every other case, where the tally is never
 /// fed. In production (prefer_spark_ false) the legacy guards are all stopped and every carried rule
-/// is re-armed on each full_sync; with prefer_spark_ set but Spark Unwired or SparkFailed the carried
+/// that has a legacy guard is armed again on each full_sync; with prefer_spark_ set but Spark Unwired or SparkFailed the carried
 /// rules are armed on neither backend. Printed as `path=legacy|spark`.
 enum class GuardianRebuildPath : std::uint8_t { Legacy = 0, Spark };
 

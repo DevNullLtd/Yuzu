@@ -3520,7 +3520,7 @@ unchanged rules that motivated them runs only on the Spark path, which productio
   except `first_attach` and `content_changed` is followed by `ids=[...]` naming the rules; a group
   with a zero count has no list. Legacy-path agents (every production agent today) always log
   `path=legacy ... rebuilt 0`, and that does not mean nothing was rebuilt: on that path every
-  carried rule is still stopped and re-armed on each full push. The new line matches none of the
+  carried rule that has a legacy guard is still stopped and re-armed on each full push. The new line matches none of the
   patterns the full_sync blackout diagnostic reads. The tokens are explained in [Reading the rebuild line](guaranteed-state.md#reading-the-rebuild-line-5719).
 - **Rows updated in place.** The agent's stored `rule:` rows are no longer cleared and reinserted
   on a full push: only the rows for rules the push omits are deleted, and a row whose bytes are

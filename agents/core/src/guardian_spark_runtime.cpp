@@ -3086,7 +3086,10 @@ void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
             return;
         // TEST-ONLY seam (#5719): consumed inside the try, after the lock_guard and before the
         // allocation it stands in for, so the catch below sees exactly what a real bad_alloc from
-        // the reserve or an emplace_back would give it.
+        // the reserve or an emplace_back would give it. The relaxed load comes first so that a
+        // sweep with the flag clear (every production sweep) performs no read-modify-write; only
+        // when the flag is set does the exchange run, and it lets exactly one concurrent sweeper
+        // consume the flag.
         if (fail_next_sweep_snapshot_.load(std::memory_order_relaxed) &&
             fail_next_sweep_snapshot_.exchange(false, std::memory_order_relaxed))
             throw std::bad_alloc{};
@@ -3773,6 +3776,16 @@ GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<
         // loop, before the withdrawals below have run. Nothing catches it here; it propagates to
         // apply_rules' teardown firewall, which counts a reconcile failure and holds the
         // generation so the server retries the push.
+        // State when such a throw leaves this block: detach_epoch_ has been bumped, the wedge
+        // candidates have been deactivated, and the pending-arm (claimed) withdrawals for the
+        // rules the push omits have run. The withdrawals of the rules_ entries below have NOT run
+        // (this loop only reads rules_, so the retry sees the same rules_), and neither has the
+        // detach_all complete log line. The engine's teardown catch counts the failure and holds
+        // the generation, and the retried push runs this teardown again over that unchanged
+        // rules_. The window is unreachable in production: a push_back happens only for a kept
+        // rule whose key is marked faulted, keys_ is filled only by attach_rule, and the engine
+        // reaches attach_rule only when prefer_spark_ is true, so keys_ is empty while
+        // prefer_spark_ is false (the production configuration).
         for (const auto& [rid, rg] : rules_) {
             // A kept rule on a key the mechanism reported faulted is detached too. Every rule on
             // a key shares its bit, so the key's refcount reaches zero and its deaf watcher is

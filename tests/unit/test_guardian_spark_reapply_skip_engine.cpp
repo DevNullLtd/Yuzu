@@ -3345,10 +3345,12 @@ TEST_CASE("#5719 engine: on the legacy path (prefer_spark=false) the rebuild lin
 }
 
 // (f) THE PATH MARKER. The line says which arm path the push took, so `rebuilt 0` is never read as
-// "nothing was rebuilt" on the legacy path, where every carried rule is stopped and re-armed on each
-// full_sync. The marker is computed with the expression reconcile_rule_locked uses to pick the path.
-// Mutations: hard-code either token; compute the path from prefer_spark_ alone is NOT caught here
-// (availability is Available in this Rig); swap the two tokens (both SECTIONs go red).
+// "nothing was rebuilt" on the legacy path, where every carried rule that has a legacy guard is
+// stopped and re-armed on each full_sync. The marker is computed with the expression
+// reconcile_rule_locked uses to pick the path.
+// Mutations caught here: hard-code either token; swap the two tokens (both SECTIONs go red).
+// Mutation NOT caught here: compute the path from prefer_spark_ alone (availability is Available
+// in this Rig); the case below, with Spark unwired or failed, catches it.
 TEST_CASE("#5719 engine: the rebuild line names the arm path (path=spark with prefer_spark, "
           "path=legacy without)",
           "[spark][guardian][reconcile][4415prA][5719]") {
@@ -3379,6 +3381,53 @@ TEST_CASE("#5719 engine: the rebuild line names the arm path (path=spark with pr
         CHECK(line.find("(rebuild attempted): path=legacy first_attach=0 ") != std::string::npos);
         CHECK(line.find("path=spark") == std::string::npos);
     }
+}
+
+// (f2) THE PATH MARKER WHEN SPARK IS PREFERRED BUT NOT AVAILABLE. With prefer_spark_ true and Spark
+// never wired (Unwired), or wired with a null engine (SparkFailed), reconcile_rule_locked returns
+// Inert for every rule before it reaches the Spark attach path (the SparkFailed/Unwired branch), so
+// the tally is never fed and the line must read `path=legacy` with `rebuilt 0`, although NO rule is
+// armed on either backend. The marker is therefore not a function of prefer_spark_ alone.
+// Mutations: compute the path from prefer_spark_ alone (both SECTIONs read path=spark: red).
+TEST_CASE("#5719 engine: with prefer_spark but Spark unwired or failed, the rebuild line reads "
+          "path=legacy and rebuilt 0",
+          "[spark][guardian][reconcile][4415prA][5719]") {
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    yuzu::test::TempDir dir{"yuzu_test_4415pra_"};
+    fs::create_directories(dir.path);
+    fs::create_directories(db.path.parent_path());
+    auto opened = KvStore::open(db.path);
+    REQUIRE(opened.has_value());
+    KvStore kv = std::move(*opened);
+
+    const fs::path target = dir.path / "pm";
+    {
+        std::ofstream o(target, std::ios::binary | std::ios::trunc);
+        o << "x";
+        REQUIRE(o.good());
+    }
+    const std::string bytes = push_bytes({file_rule("pm", target), file_rule("pn", target)}, kGen);
+
+    GuardianEngine engine{&kv, "agent-4415", /*prefer_spark=*/true};
+    GuardianEngine::SparkAvailability expected = GuardianEngine::SparkAvailability::Unwired;
+    SECTION("Unwired: wire_spark_engine is never called") {
+        // expected stays Unwired
+    }
+    SECTION("SparkFailed: wire_spark_engine is given a null engine") {
+        expected = GuardianEngine::SparkAvailability::SparkFailed;
+        engine.wire_spark_engine(nullptr, /*spark_disabled_by_config=*/false,
+                                 [](const OutboxEntry&) { return SendResult::Sent; });
+    }
+    REQUIRE(engine.start_local().has_value());
+    REQUIRE(engine.spark_availability() == expected); // premise: the state this case names
+
+    const auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, bytes);
+    REQUIRE(dr.exit_code == 0);
+    const auto line = engine.last_full_sync_rebuild_line_for_test();
+    CHECK(line.find("path=legacy") != std::string::npos);
+    CHECK(line.find("rebuilt 0 rule(s)") != std::string::npos);
+    CHECK(line.find("path=spark") == std::string::npos);
+    CHECK(engine.spark_armed_rule_count() == 0); // premise: nothing is armed on the Spark side
 }
 
 // (g) THE EMITTED LINE. Every case above reads the test accessor, which is assigned AFTER the
@@ -3448,8 +3497,8 @@ TEST_CASE("#5719 engine: a rule id with the valid special characters is listed v
 // apply thread, under mtx_), after the push's scoped detach installed its own: no runtime state the
 // Rig can build pairs a forced entry with the retained-wedge pre-check return, so this pins the
 // ENGINE's decision, not the runtime's reachability of that pairing.
-// Mutation: consult forced_rebuilds_ before (or without) checking res->rebuild_reason (h appears
-// under faulted_key in the rebuild line: red).
+// Mutation: consult forced_rebuilds_ before (or without) checking res->rebuild_reason (the rule
+// id h appears under faulted_key in the rebuild line: red).
 TEST_CASE("#5719 engine: a forced-rebuild entry never turns a wedge re-observation into a rebuild",
           "[spark][guardian][reconcile][4415prA][5719]") {
     Rig r;

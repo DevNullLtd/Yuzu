@@ -2577,6 +2577,11 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                 // completed teardown as a failed one). On failure forced_rebuilds_ stays empty
                 // and the affected rules are reported under whichever reason their own attach
                 // observes.
+                // This catch is DELIBERATELY uncounted and unlogged (owner ruling: in-process
+                // counters only, no new counter surface). The record is diagnostic only, and an
+                // allocation failure here changes only the label of the affected kept rules in
+                // the rebuild line, to key_busy or first_attach instead of their faulted/dead
+                // cause. No arm, skip or generation decision depends on the map.
                 try {
                     std::unordered_map<std::string, GuardianRebuildReason> forced_map;
                     forced_map.reserve(forced.size());
@@ -2692,7 +2697,9 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         //    the production default): the only note() site is in the Spark branch of
         //    reconcile_rule_locked, which that agent never reaches. `rebuilt 0` there does NOT
         //    mean nothing was rebuilt: the legacy guards were all stopped and every carried rule
-        //    re-armed. The line itself is NOT gated on prefer_spark_.
+        //    that has a legacy guard was armed again (a disabled or invalid rule, or one whose
+        //    guard cannot start on the host, has none). The line itself is NOT gated on
+        //    prefer_spark_.
         //  - The count includes Pending/Accepted outcomes that may still fail asynchronously
         //    (hence "rebuild attempted"): there is no pending split.
         //  - Only a full_sync logs it. A delta push and the boot re-arm loop populate the tally
@@ -2703,9 +2710,9 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             // The path marker uses the SAME expression reconcile_rule_locked uses to choose the
             // Spark attach path (its try_spark), so `path=spark` is exactly the case in which the
             // tally can have been fed. `path=legacy` means it was not: in production
-            // (prefer_spark_ false) the legacy guards were stopped and every carried rule
-            // re-armed; with prefer_spark_ set but Spark Unwired or SparkFailed the carried rules
-            // are armed on neither backend.
+            // (prefer_spark_ false) the legacy guards were stopped and every carried rule that
+            // has a legacy guard was armed again; with prefer_spark_ set but Spark Unwired or
+            // SparkFailed the carried rules are armed on neither backend.
             const auto path = prefer_spark_ && spark_availability_ == SparkAvailability::Available
                                   ? GuardianRebuildPath::Spark
                                   : GuardianRebuildPath::Legacy;
