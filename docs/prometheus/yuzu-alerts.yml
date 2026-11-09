@@ -7877,8 +7877,11 @@ groups:
       # real rise stays visible to `delta[1h]` for an hour, so the guard only loses a rise
       # inside the first ~5 minutes of a boot. If agents take longer than 5 minutes to
       # reconnect, the tail of the ramp can still leak. An absent uptime series suppresses
-      # nothing. The 1h any-rise threshold is the #5065 starting default, not sized from fleet
-      # data.
+      # nothing. The join is `on (job, instance)` because the guard is about one replica's own
+      # uptime: any label a scrape attaches to only one of the two series would otherwise
+      # defeat the join and silence the guard, and `on (job)` alone would let a young sibling
+      # replica silence an old one (pinned by the two-replica case). The 1h any-rise threshold
+      # is the #5065 starting default, not sized from fleet data.
       - alert: YuzuEchoDbCorruptionDetected
         expr: |
           delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
@@ -7894,15 +7897,16 @@ groups:
             event count: the gauge counts agents once per sweep, so an agent returning from
             offline with an old quarantine raises it, a repeat quarantine on an agent already
             counted does not, and an agent leaving in the same window can mask one arriving. A
-            server restart in the last hour is suppressed; a failover is not. The
-            echo.db.corruption_quarantined audit rows name the affected agents.
+            server restart in the last hour is suppressed; a failover or a rolling upgrade is
+            not: the replica that gains the agents reports a rise and pages once with no new
+            corruption (accepted for a warning). The echo.db.corruption_quarantined audit rows
+            name the affected agents.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
 
       # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the
       # description carries the Echo remedy. The family is absent-not-zero, so a clean fleet
       # returns no series and the rule stays quiet (max_over_time over an absent series is
       # absent too).
-      #
       #
       # Same expression and effects as YuzuDedupStoreDegraded (#3663,
       # docs/observability-conventions.md); do not widen the window.
@@ -7920,10 +7924,10 @@ groups:
             {{ $labels.plugin }} failed init (heartbeat tag yuzu.plugins_failed); it is loaded
             but not running, as distinct from not installed. plugin="other" is the sum over
             plugins past the first 64 names the server labels per sweep; the agent log names
-            them. For plugin="echo" the usual causes are the two cases the agent refuses after
-            the tar.db to echo.db rename (adoption failed, or both databases exist) and a corrupt
-            echo.db that could not be moved aside; the upgrade notes cover the first two, and
-            the corrupt-database case is under Corrupt-database quarantine in the Echo manual.
+            them. For plugin="echo" the usual causes are a failed tar.db adoption after the
+            rename (including a sidecar present under both names) and a corrupt echo.db that
+            could not be moved aside; the upgrade notes cover adoption, and the corrupt-database
+            case is under Corrupt-database quarantine in the Echo manual.
             The value is agent-self-reported.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
 
