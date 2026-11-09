@@ -6947,7 +6947,7 @@ TEST_CASE("migration v12 resets the catalogue freshness stamp to building over a
     CHECK(again.is_open());
 }
 
-TEST_CASE("refresh_component_rollup: grain 0 and 1 counts are exact, devices_unconfirmed counts non-current facets",
+TEST_CASE("refresh_component_rollup: counts are exact, devices_unconfirmed counts non-current facets",
           "[pg][software_inventory][lookup]") {
     SWINV_SHARED(store, pool);
     // dev-a: two rows of libfoo 1.0 (two paths) and one of libfoo 2.0; facet full (current).
@@ -6969,20 +6969,13 @@ TEST_CASE("refresh_component_rollup: grain 0 and 1 counts are exact, devices_unc
     REQUIRE(meta.has_value());
     CHECK(meta->refreshed_at > 0);
 
-    const auto grain1 = sql_rows(pool,
-                                 "SELECT instances, devices, devices_unconfirmed FROM "
-                                 "software_inventory_store.component_rollup WHERE grain = 1");
-    REQUIRE(grain1.size() == 1);
-    CHECK(grain1[0] == std::vector<std::string>{"5", "3", "2"});
-    const auto grain0 = sql_rows(pool,
-                                 "SELECT version, instances, devices, devices_unconfirmed FROM "
-                                 "software_inventory_store.component_rollup WHERE grain = 0 "
-                                 "ORDER BY version");
-    REQUIRE(grain0.size() == 2);
-    CHECK(grain0[0] == std::vector<std::string>{"1.0", "4", "3", "2"});
-    CHECK(grain0[1] == std::vector<std::string>{"2.0", "1", "1", "0"});
+    const auto rows = sql_rows(pool,
+                               "SELECT instances, devices, devices_unconfirmed FROM "
+                               "software_inventory_store.component_rollup");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == std::vector<std::string>{"5", "3", "2"});
 
-    // component_totals without versions IS the grain-1 row; a version set is a live aggregate.
+    // component_totals without versions IS the rollup row; a version set is a live aggregate.
     // The two paths are told apart by a row that lands AFTER the refresh: the rollup answer
     // stays put, the live one moves.
     REQUIRE(sql_ok(pool,
@@ -7028,12 +7021,12 @@ TEST_CASE("refresh_component_rollup: a cancelled refresh keeps the last-good rol
     const auto after = store.component_rollup_meta();
     REQUIRE(after.has_value());
     CHECK(after->refreshed_at == good->refreshed_at);
-    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup WHERE "
-                         "grain = 1")[0][0] == "1");
+    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup")[0][0] ==
+          "1");
     // An idempotent re-run picks the new data up.
     REQUIRE(store.refresh_component_rollup());
-    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup WHERE "
-                         "grain = 1")[0][0] == "2");
+    CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup")[0][0] ==
+          "2");
 }
 
 TEST_CASE("query_components: keyset order, scope push-down, prefix and contains escape LIKE metacharacters",

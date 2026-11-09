@@ -1466,11 +1466,10 @@ polled when, in what state.
   live figure agree on one definition. Application totals come from the hourly catalogue rollup
   (the name-only grain, which gains a `row_count` column) unless a version filter is present, in
   which case they are ONE live aggregate over the version set (never a sum of per-version distinct
-  counts). Component totals come from a new hourly `component_rollup` (grain 0 per version, grain 1
-  per kind and name, refreshed by the existing rollup thread with its own advisory lock and
-  keep-last-good), or are live for a version filter or no kind. Totals are served only to an
-  unfiltered caller for an exact name; ADR-0017 records why a confined caller gets rows and
-  `totals_omitted: "scope"`.
+  counts). Component totals come from a new hourly `component_rollup` (one row per kind and name,
+  refreshed by the existing rollup thread with its own advisory lock and keep-last-good), or are
+  live for a version filter or no kind. Totals are served only to an unfiltered caller for an
+  exact name; ADR-0017 records why a confined caller gets rows and `totals_omitted: "scope"`.
 - **Version range.** `version_min` / `version_max` resolve against the title's fleet-wide distinct
   versions under the catalogue comparator into a version set, for every caller; a title at the
   2000-version read cap is refused. The set is a predicate only. The distinct versions are read

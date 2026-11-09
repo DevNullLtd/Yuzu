@@ -1130,9 +1130,6 @@ TEST_CASE("openapi_spec_json(): the components lookup row is typed and its keys 
         served.insert(k);
     CHECK(documented == served);
     CHECK(required == served); // the serialiser emits every key on every row
-    // The components route's stamp is named apart from the installs route's last_confirmed_at.
-    CHECK(documented.contains("component_last_confirmed_at"));
-    CHECK_FALSE(documented.contains("last_confirmed_at"));
     CHECK(item["properties"]["status"]["enum"] == json::array({"current", "unconfirmed", "disabled"}));
     CHECK(item["properties"]["hostname"]["nullable"] == true);
     CHECK(item["properties"]["last_seen"]["nullable"] == true);

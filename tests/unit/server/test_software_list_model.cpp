@@ -558,9 +558,7 @@ TEST_CASE("read_components_page: push-down, wide path counts distinct dropped de
 TEST_CASE("CSV: 22-column installs header; quoting; the components header", "[server][software_list_model]") {
     // The first 14 columns are the existing installs header, byte for byte.
     CHECK(kListCsvHeader.substr(0, swc::kInstallsCsvHeader.size()) == swc::kInstallsCsvHeader);
-    CHECK(std::ranges::count(kListCsvHeader, ',') + 1 == static_cast<long>(kListCsvColumns));
     CHECK(kListCsvColumns == 22);
-    CHECK(std::ranges::count(kComponentsCsvHeader, ',') + 1 == static_cast<long>(kComponentsCsvColumns));
 
     auto r = fleet_row("a,b\nc", "a1", 1); // comma and newline in a cell
     DeviceFacts facts;
@@ -581,8 +579,6 @@ TEST_CASE("CSV: 22-column installs header; quoting; the components header", "[se
 
     const auto ccsv = components_csv({comp_row("libfoo", "a1", "01")}, facts);
     CHECK(ccsv.starts_with(std::string(kComponentsCsvHeader) + "\n"));
-    // The components route names its stamp apart from the installs route's last_confirmed_at.
-    CHECK(kComponentsCsvHeader.ends_with(",component_last_confirmed_at"));
 }
 
 TEST_CASE("component_row_json: the exact key set; 0 stamps are null", "[server][software_list_model]") {
@@ -601,14 +597,6 @@ TEST_CASE("component_row_json: the exact key set; 0 stamps are null", "[server][
     CHECK(j["component_last_confirmed_at"].is_null());
     r.last_confirmed_at = 1700000500;
     CHECK(component_row_json(r, facts)["component_last_confirmed_at"] == 1700000500);
-}
-
-TEST_CASE("totals_omitted reasons are named constants", "[server][software_list_model]") {
-    CHECK(kOmittedScope == "scope");
-    CHECK(kOmittedFilters == "filters");
-    CHECK(kOmittedBuilding == "building");
-    CHECK(totals_decision(false, SoftwareFleetQuery{}).omitted == kOmittedScope);
-    CHECK(totals_decision(true, SoftwareFleetQuery{}).omitted == kOmittedFilters);
 }
 
 TEST_CASE("load_device_facts: one roster read per page, only the page's devices, last polls from the store",

@@ -737,11 +737,11 @@ public:
     installed_software_version_set_totals(std::string_view name,
                                           const std::vector<std::string>& versions);
 
-    /// Exact component totals. A non-empty `kind` with no `versions` is served by the grain-1
-    /// (kind, name) rollup row (a missing row is a genuine zero; pair with
-    /// component_rollup_meta() for "building"); every other shape (a version set, or no kind:
-    /// distinct devices are not additive across kinds) is ONE live aggregate over
-    /// software_components (5 s bound, name-index driven).
+    /// Exact component totals. A non-empty `kind` with no `versions` is served by the (kind, name)
+    /// rollup row (a missing row is a genuine zero; pair with component_rollup_meta() for
+    /// "building"); every other shape (a version set, or no kind: distinct devices are not
+    /// additive across kinds) is ONE live aggregate over software_components (5 s bound,
+    /// name-index driven).
     [[nodiscard]] std::optional<SoftwareTotals>
     component_totals(std::string_view kind, std::string_view name,
                      const std::optional<std::vector<std::string>>& versions);
@@ -852,9 +852,9 @@ public:
     /// Recompute the components rollup (`component_rollup`, `component_rollup_meta`) from
     /// software_components with the same shape and guarantees as refresh_catalog_rollup: ONE
     /// REPEATABLE READ transaction, a non-blocking cluster-wide advisory lock (a peer holding it
-    /// is a skip, success), KEEP-LAST-GOOD on failure/cancel/budget. Grain 0 = (kind, name,
-    /// version), grain 1 = (kind, name); instances = rows, devices = distinct devices,
-    /// devices_unconfirmed = distinct devices whose row status is not `current`.
+    /// is a skip, success), KEEP-LAST-GOOD on failure/cancel/budget. One row per (kind, name);
+    /// instances = rows, devices = distinct devices, devices_unconfirmed = distinct devices whose
+    /// row status is not `current`.
     bool refresh_component_rollup(const std::function<bool()>& cancelled = {});
 
     /// The components rollup freshness stamp; refreshed_at == 0 = never computed. AUTHORITATIVE:

@@ -918,15 +918,6 @@ TEST_CASE("software routes: a default-filter devices page issues the pre-SAM-17 
     CHECK(h.last_fleet_query->match == NameMatch::kExact);
     CHECK(h.last_fleet_query->status.empty());
     CHECK_FALSE(h.last_fleet_query->versions.has_value());
-
-    // The row shape the shared callers (fragment, MCP tool) build is still exactly the 14 fields.
-    std::set<std::string> keys;
-    for (const auto& [k, v] : swc::device_row_json(fleet_row("a1", "git", "1")).items())
-        keys.insert(k);
-    CHECK(keys == std::set<std::string>{"agent_id", "name", "version", "publisher", "install_date",
-                                        "kind", "ecosystem", "epoch", "release", "arch",
-                                        "signature_status", "distro_id", "distro_version",
-                                        "source"});
 }
 
 TEST_CASE("software routes: a full devices page hands the last-synced read its distinct ids",

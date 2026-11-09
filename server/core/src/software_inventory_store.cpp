@@ -487,9 +487,8 @@ const std::vector<pg::PgMigration>& migrations() {
          // sets catalog_rollup_meta.refreshed_at back to 0 ("building", the v8 precedent): a
          // reader sees `building` for the first refresh interval, never installs = 0 beside a
          // non-zero device count. The background rollup thread runs its first refresh at start.
-         // component_rollup: one row per (kind, name, version) [grain 0] and per (kind, name)
-         // [grain 1] with exact instance (row) and distinct-device counts, replaced whole by
-         // refresh_component_rollup. component_rollup_meta is the singleton freshness stamp,
+         // component_rollup: one row per (kind, name) with exact instance (row) and
+         // distinct-device counts, replaced whole by refresh_component_rollup. component_rollup_meta is the singleton freshness stamp,
          // seeded refreshed_at = 0 ("building"). Two new EMPTY tables: online.
          // software_components_name_idx serves the name-driven component lookups (exact, prefix,
          // and the totals aggregate). software_components is EMPTY in every deployment until the
@@ -502,13 +501,10 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE TABLE IF NOT EXISTS component_rollup ("
          "  kind                TEXT     NOT NULL,"
          "  name                TEXT     NOT NULL,"
-         "  version             TEXT     NOT NULL DEFAULT '',"
-         "  grain               SMALLINT NOT NULL,"
          "  instances           BIGINT   NOT NULL,"
          "  devices             BIGINT   NOT NULL,"
          "  devices_unconfirmed BIGINT   NOT NULL DEFAULT 0,"
-         "  PRIMARY KEY (kind, name, version, grain));"
-         "CREATE INDEX IF NOT EXISTS component_rollup_name_idx ON component_rollup (name);"
+         "  PRIMARY KEY (kind, name));"
          "CREATE TABLE IF NOT EXISTS component_rollup_meta ("
          "  id           INT    PRIMARY KEY,"
          "  refreshed_at BIGINT NOT NULL DEFAULT 0);"
@@ -1398,8 +1394,7 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
         {"catalog_rollup",
          "name, grain, kind, ecosystem, source, publisher, device_count, version_count, "
          "unsigned_count, ecosystems, kinds, sources, newest_version, row_count"},
-        {"component_rollup",
-         "kind, name, version, grain, instances, devices, devices_unconfirmed"},
+        {"component_rollup", "kind, name, instances, devices, devices_unconfirmed"},
         {"component_rollup_meta", "id, refreshed_at"},
         {"version_rollup", "name, version, device_count"},
         {"title_triples", "name, publisher, ecosystem, device_count"},
@@ -3644,7 +3639,7 @@ std::optional<SoftwareTotals> SoftwareInventoryStore::component_totals(
         return bounded_query(pool_, metrics_, "component_totals", samplers,
                              "SELECT instances, devices, devices_unconfirmed FROM "
                              "software_inventory_store.component_rollup "
-                             "WHERE kind = $1 AND name = $2 AND grain = 1 AND version = ''",
+                             "WHERE kind = $1 AND name = $2",
                              std::vector<std::string>{std::string(kind), std::string(name)}, parse);
     }
     // Live exact aggregate: a version set, or no kind (distinct devices do not add across kinds).
@@ -3727,15 +3722,13 @@ bool SoftwareInventoryStore::refresh_component_rollup(const std::function<bool()
 
         if (!cmd("DELETE FROM software_inventory_store.component_rollup"))
             return false;
-        // ONE statement fills both grains. GROUPING(version) = 0 is the per-version row (grain
-        // 0), 1 the (kind, name) row (grain 1; version '' by the column default). Every figure
-        // is an exact distinct count within its own grouping set - nothing is summed.
-        // devices_unconfirmed: distinct devices whose row status is not `current` (the shared
-        // kRowStatusCaseSql; a missing component_inventory state row is unconfirmed).
-        if (!cmd("INSERT INTO software_inventory_store.component_rollup (kind, name, version, "
-                 "grain, instances, devices, devices_unconfirmed) "
-                 "SELECT c.kind, c.name, coalesce(c.version, ''), GROUPING(c.version)::smallint, "
-                 "count(*), count(DISTINCT c.agent_id), "
+        // One row per (kind, name). Every figure is an exact count within its own group -
+        // nothing is summed. devices_unconfirmed: distinct devices whose row status is not
+        // `current` (the shared kRowStatusCaseSql; a missing component_inventory state row is
+        // unconfirmed).
+        if (!cmd("INSERT INTO software_inventory_store.component_rollup (kind, name, "
+                 "instances, devices, devices_unconfirmed) "
+                 "SELECT c.kind, c.name, count(*), count(DISTINCT c.agent_id), "
                  "count(DISTINCT c.agent_id) FILTER (WHERE (" +
                  std::string(kRowStatusCaseSql) +
                  ") <> 'current') "
@@ -3743,7 +3736,7 @@ bool SoftwareInventoryStore::refresh_component_rollup(const std::function<bool()
                  "LEFT JOIN software_inventory_store.software_facet_state fs "
                  "ON fs.agent_id = c.agent_id AND fs.facet = '" +
                  std::string(kComponentInventoryFacet) +
-                 "' GROUP BY GROUPING SETS ((c.kind, c.name, c.version), (c.kind, c.name))"))
+                 "' GROUP BY c.kind, c.name"))
             return false;
         if (abort_requested())
             return false;
