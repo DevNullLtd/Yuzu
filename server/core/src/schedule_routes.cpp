@@ -95,6 +95,23 @@ enum class MissCause {
     return s.find('\0') != std::string::npos;
 }
 
+/// The 503 for a create whose write ran and whose transaction did not report success: the
+/// schedule may or may not exist. Carries NO `retry_after_ms`: the answer tells the client to
+/// look at the stored schedules before it acts again.
+void send_create_outcome_unknown(httplib::Response& res) {
+    res.status = 503;
+    res.set_content(
+        nlohmann::json(
+            {{"error",
+              {{"code", 503},
+               {"message", "schedule create outcome unknown: the schedule may or may not exist; "
+                           "list schedules before creating it again"},
+               {"outcome", "unknown"}}},
+             {"meta", {{"api_version", "v1"}}}})
+            .dump(),
+        "application/json");
+}
+
 /// The 503 for a store fault: the same A4 envelope as `send_error` plus the shared transient-fault
 /// `retry_after_ms` hint.
 void send_store_fault(httplib::Response& res) {
@@ -277,6 +294,12 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
 
             auto result = deps.schedule_engine->create_schedule(sched);
             if (!result) {
+                if (result.error() == kScheduleCreateOutcomeUnknownError) {
+                    (void)deps.audit_fn(req, "schedule.create", "failure", "schedule", "",
+                                        "outcome_unknown");
+                    send_create_outcome_unknown(res);
+                    return;
+                }
                 if (create_error_is_store_fault(result.error())) {
                     (void)deps.audit_fn(req, "schedule.create", "failure", "schedule", "",
                                         "store_error");

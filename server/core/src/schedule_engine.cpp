@@ -363,6 +363,7 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
                     : compute_initial_next_execution(sched.frequency_type, sched.interval_minutes);
 
     std::string failed_sqlstate;
+    bool insert_ran = false; // set once the INSERT reported success inside the transaction
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult res = pg::exec_params(
             conn,
@@ -387,10 +388,18 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
                           PQresultErrorMessage(res.get()));
             return false;
         }
+        insert_ran = true;
         return true;
     });
 
     if (!ok) {
+        // The INSERT ran and the transaction still failed: a failed or unanswered COMMIT does not
+        // tell whether the row landed, so the caller must not be told a retry is safe. The answer
+        // is conservative: a COMMIT the server rejected (rolled back for certain) is reported the
+        // same way. `insert_ran` and `failed_sqlstate` cannot both be set, because
+        // `with_txn_for` runs the callback once; the order of the two checks is defensive only.
+        if (insert_ran)
+            return std::unexpected(kScheduleCreateOutcomeUnknownError);
         if (sqlstate_is_value_refusal(failed_sqlstate))
             return std::unexpected(kScheduleCreateValueRefusedError);
         return std::unexpected(kScheduleCreateInsertFailedError);

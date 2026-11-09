@@ -43,17 +43,21 @@ namespace yuzu::server {
 /// non-route caller cannot store a larger interval than the route would have accepted.
 inline constexpr long long kMaxScheduleIntervalMinutes = 35791394;
 
-/// The three `create_schedule` error texts that come from the store write rather than from the
-/// engine's own request validation. The first two mean the store could not take the write (a
-/// route answers 503); the third means the store refused a field value as invalid text or as
-/// violating a constraint (SQLSTATE class 22 or 23): that is a client error, a route answers 400,
-/// and nothing is wrong with the store. Every other error text `create_schedule` returns is a
-/// request-validation text (also 400).
+/// The four `create_schedule` error texts that come from the store write rather than from the
+/// engine's own request validation. The first two mean the store could not take the write and
+/// nothing was written (a route answers 503 and a retry is safe); the third means the store
+/// refused a field value as invalid text or as violating a constraint (SQLSTATE class 22 or 23):
+/// that is a client error, a route answers 400, and nothing is wrong with the store. The fourth
+/// means the INSERT ran and the transaction then did not report success: the write may or may not
+/// have landed, so a route answers 503 WITHOUT a retry hint. Every other error text
+/// `create_schedule` returns is a request-validation text (also 400).
 inline constexpr const char* kScheduleCreateNotOpenError = "database not open";
 inline constexpr const char* kScheduleCreateInsertFailedError =
     "insert failed (pool degraded or transaction failed)";
 inline constexpr const char* kScheduleCreateValueRefusedError =
     "a field value is not valid text for the schedule store";
+inline constexpr const char* kScheduleCreateOutcomeUnknownError =
+    "the write ran but the transaction did not report success (outcome unknown)";
 
 /// Answer of `ScheduleEngine::owned_schedule_exists_checked`.
 enum class OwnedScheduleLookup {
@@ -102,7 +106,9 @@ public:
 
     /// On a failed insert the error is `kScheduleCreateValueRefusedError` when Postgres reported a
     /// data exception or integrity violation (SQLSTATE class 22 or 23, for example a NUL byte or
-    /// invalid UTF-8 in a text field), `kScheduleCreateInsertFailedError` for any other failure.
+    /// invalid UTF-8 in a text field), `kScheduleCreateInsertFailedError` for any other failure of
+    /// the INSERT or of the connection before it, and `kScheduleCreateOutcomeUnknownError` when the
+    /// INSERT succeeded but the transaction did not (a failed or unanswered COMMIT).
     std::expected<std::string, std::string> create_schedule(const InstructionSchedule& sched);
 
     /// Point read: does `created_by` own a schedule with this id? One owner-filtered

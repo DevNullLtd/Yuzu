@@ -1308,6 +1308,84 @@ TEST_CASE("POST /api/schedules: a value the store refuses (SQLSTATE class 22 or 
     CHECK(h.schedule_engine->query_schedules().empty());
 }
 
+namespace {
+
+/// A DEFERRED constraint trigger that raises when the transaction commits: the INSERT itself
+/// succeeds and then the COMMIT fails. It is the nearest controllable stand-in for a commit whose
+/// answer never arrived: in both cases the caller learns only that the transaction did not report
+/// success after its statement had run.
+void fail_schedule_commits(ScheduleRouteHarness& h) {
+    exec_sql(h, "CREATE FUNCTION schedule_engine.yuzu_test_fail_commit() RETURNS trigger "
+                "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit refused' "
+                "USING ERRCODE = 'P0001'; END $$");
+    exec_sql(h, "CREATE CONSTRAINT TRIGGER yuzu_test_fail_commit AFTER INSERT ON "
+                "schedule_engine.schedules DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+                "EXECUTE FUNCTION schedule_engine.yuzu_test_fail_commit()");
+}
+
+} // namespace
+
+TEST_CASE("POST /api/schedules: a fault after the insert ran answers 503 with an unknown "
+          "outcome and no retry hint; a fault before any write keeps the hint",
+          "[server][routes][schedule_routes][rest][pg][validation]") {
+    ScheduleRouteHarness h;
+    auto headers = h.session_headers_for("sched-op", "ScheduleAndExecute9",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+    const std::string body = R"({"name":"nightly-scan","definition_id":"def-1",)"
+                             R"("frequency_type":"daily"})";
+
+    // The statement ran and the commit failed: the write may or may not have landed, so the
+    // answer must not tell the client to retry.
+    fail_schedule_commits(h);
+    auto unknown = h.sink.dispatch("POST", "/api/schedules", body, "application/json", headers);
+    REQUIRE(unknown);
+    CHECK(unknown->status == 503);
+    auto parsed = json::parse(unknown->body, nullptr, false);
+    REQUIRE_FALSE(parsed.is_discarded());
+    CHECK_FALSE(parsed.contains("id"));
+    REQUIRE(parsed.contains("error"));
+    CHECK(parsed["error"]["code"] == 503);
+    CHECK(parsed["error"]["outcome"] == "unknown");
+    CHECK_FALSE(parsed["error"].contains("retry_after_ms"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "schedule.create");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].target_id.empty());
+    CHECK(h.audits[0].detail == "outcome_unknown");
+
+    // Control: with the table gone no write was attempted, a retry is safe, and the hint stays.
+    h.audits.clear();
+    exec_sql(h, "DROP TRIGGER yuzu_test_fail_commit ON schedule_engine.schedules");
+    drop_schedules_table(h);
+    auto before_write =
+        h.sink.dispatch("POST", "/api/schedules", body, "application/json", headers);
+    REQUIRE(before_write);
+    CHECK(before_write->status == 503);
+    auto control = json::parse(before_write->body, nullptr, false);
+    REQUIRE_FALSE(control.is_discarded());
+    CHECK(control["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(control["error"].contains("outcome"));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].detail == "store_error");
+}
+
+TEST_CASE("schedule engine: create_schedule reports an unknown outcome when the transaction "
+          "fails after the insert ran",
+          "[server][schedule_engine][pg][validation]") {
+    ScheduleRouteHarness h;
+    InstructionSchedule clean;
+    clean.name = "nightly-scan";
+    clean.definition_id = "def-1";
+    clean.frequency_type = "daily";
+
+    fail_schedule_commits(h);
+    auto unknown = h.schedule_engine->create_schedule(clean);
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error() == kScheduleCreateOutcomeUnknownError);
+    CHECK(unknown.error() != kScheduleCreateInsertFailedError);
+    CHECK(h.schedule_engine->query_schedules().empty());
+}
+
 TEST_CASE("schedule engine: create_schedule tells a refused field value from a store failure",
           "[server][schedule_engine][pg][validation]") {
     ScheduleRouteHarness h;
