@@ -7,7 +7,7 @@
 #include "../command_capability.hpp"
 
 /// @file plugin_action_catalogue_virtualization.hpp
-/// One fragment of the command capability catalogue: `virtualization`'s single action
+/// One fragment of the command capability catalogue: `virtualization`'s actions
 /// (`agents/plugins/virtualization/src/virtualization_plugin.cpp`). Classified by READING the
 /// implementation, not the name. `securable`/`operation` reuse an EXISTING `RbacStore`
 /// `types[]`/`ops[]` entry; none is minted here.
@@ -22,11 +22,21 @@
 /// Grouped under `Inventory`: the rows are estate-inventory device facts, not privacy-gated data
 /// (no account, hostname or serial is emitted), so the action is default-on for inventory
 /// readers, like `mgmt_posture` and `shares`.
+///
+/// `wsl` is ReadOnly/None too, but it is PER-USER data: on Windows it lists the WSL distributions
+/// of every local profile (the account name and the distribution name are emitted) and, for a
+/// profile that is not logged on, reads that profile's NTUSER.DAT through the shared
+/// `with_user_hive` offline arm (SeBackup/SeRestore already held, taken inside the helper under
+/// the process-wide offline-hive lock and the default-on hive-file guard). It therefore mirrors
+/// `installed_apps.list_per_user`: `Inventory`:Read, default-on, `ExecuteGate::AdminOrApproval`,
+/// no Forensics securable and no kill-switch seed. Linux and macOS answer one `unsupported` row.
+/// The enforced control is this gate; the definition's `executeRoles` are advisory and follow the
+/// `host` document (`content/definitions/virtualization.yaml`), not `list_per_user`'s narrower list.
 namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 1> kPluginActionCatalogueVirtualization{{
+inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueVirtualization{{
     {
         .plugin = "virtualization",
         .action = "host",
@@ -37,6 +47,17 @@ inline constexpr std::array<CommandCapability, 1> kPluginActionCatalogueVirtuali
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
         .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "virtualization",
+        .action = "wsl",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 }};
 

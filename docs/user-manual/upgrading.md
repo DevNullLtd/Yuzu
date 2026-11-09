@@ -2,6 +2,14 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the DEX Scoring tab edits the score policy from the dashboard
+
+**What changed.** The DEX page gains a **Scoring** tab that shows the score policy in force and edits all of it: tier edges and names, weights, model parameters and per-application overrides, with a pre-save tier-change preview and a reset to the shipped defaults. It writes through the same function as `PUT` and `DELETE /api/v1/dex/score-policy`, so validation, the `If-Match` revision check and the audit rows are the same, and editing needs the same `Infrastructure:Write` grant (viewing needs `GuaranteedState:Read`). See [DEX](dex.md#scoring).
+
+**The rule.** The version 2 rule in [Behaviour change: the DEX score policy document gains model parameters and version 2](#behaviour-change-the-dex-score-policy-document-gains-model-parameters-and-version-2), below, applies to the dashboard too: do not save or reset the policy from the Scoring tab during a rolling upgrade or rollback. The tab does not exist on a server that predates it, so behind a load balancer `GET /fragments/dex/scoring` is a `404` from a replica still on the previous release.
+
+**No action on upgrade.** There is no schema change and no existing setting is reinterpreted.
+
 ## ⚠️ Breaking: Echo reads roll-up tables on the server (a stored result set over a raw capture table is refused)
 
 **What changed.** The server reads Echo as roll-up only. The canned Echo queries (`crossplatform.echo.*`, from `content/definitions/echo_warehouse.yaml`) read the hourly tier and return counts per hour with no pid; `GET /api/v1/settings/data-retention` lists no `live` tier and adds `budget_dependent` per tier and `echo.db_budget_bytes`; the Device page's Capture sources panel and the Echo retention-paused list show a source's hourly row count. Creating a result set from a query over a `$<Source>_Live` name or a `<source>_live` table (`POST /api/v1/result-sets/from-echo-query`, `from-instruction-result` with an `echo.sql` definition, and the MCP twins), and re-evaluating such a set, formerly answered 201 or 202 and now answers 400 (MCP `-32602`) with `RESULT_SET_REEVAL_STALE_SOURCE`; nothing is dispatched, and no audit row is written for the refusal. Result sets filled from agent answers now report `agents_failed` and `partial` (`result_set_store` schema v4 adds the `agents_failed` column).
