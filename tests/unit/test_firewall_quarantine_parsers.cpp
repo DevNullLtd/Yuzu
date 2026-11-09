@@ -2122,6 +2122,7 @@ TEST_CASE("a switched-off Windows profile refuses before anything is touched, an
         const auto again = apply_and_verify(rig.env, rig.request(), dl);
         CHECK(again.status == "degraded");
         CHECK(again.reason == "firewall_disabled");
+        CHECK(contains(again.notes, "firewall_profile=Private")); // the same notes status carries
         CHECK(rig.leg.applies == applies);
     }
     SECTION("a profile that cannot be read is os_unreadable, never a guess") {
@@ -2133,6 +2134,50 @@ TEST_CASE("a switched-off Windows profile refuses before anything is touched, an
         const auto st = report_status(rig.env, dl);
         CHECK(st.status == "degraded");
         CHECK(st.reason == "os_unreadable");
+    }
+}
+
+TEST_CASE("recover_at_init: a failed re-apply keeps what the attempt learned, and says when the put-back fails",
+          "[agent][firewall_quarantine]") {
+    SECTION("a fact the failed attempt set (a pf token) survives in the store and the answer") {
+        ScriptRig rig;
+        Deadline dl;
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        REQUIRE(rig.store.state()->os.pf_token.empty());
+        rig.leg.on_apply = [](OsPayload& os) {
+            os.pf_token = "3665316113424588829"; // the host holds it; the record is the way to release it
+            return StepResult::fail("pf_load_failed");
+        };
+        rig.leg.status.state = OsState::not_enforcing;
+
+        const auto o = recover_at_init(rig.env, dl);
+        CHECK(o.status == "degraded");
+        CHECK(o.reason == "reapply_failed:pf_load_failed");
+        CHECK_FALSE(contains(o.notes, "state_restore_failed=1"));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::active);
+        CHECK(rig.store.state()->os.pf_token == "3665316113424588829");
+        REQUIRE(o.state);
+        CHECK(o.state->os.pf_token == "3665316113424588829");
+    }
+    SECTION("a put-back that cannot be saved is reported and leaves the record in progress") {
+        ScriptRig rig;
+        Deadline dl;
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.leg.on_apply = [](OsPayload&) { return StepResult::fail("firewall_disabled:Domain"); };
+        rig.leg.status.state = OsState::not_enforcing;
+        // the attempt's own `applying` record saves; the put-back after it does not
+        rig.store.fail_save_after = rig.store.saves + 1;
+
+        const auto o = recover_at_init(rig.env, dl);
+        CHECK(o.status == "degraded");
+        CHECK(o.reason == "reapply_failed:firewall_disabled:Domain");
+        CHECK(contains(o.notes, "state_restore_failed=1"));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::applying);
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "partial");
+        CHECK(st.reason == "operation_in_progress");
     }
 }
 
@@ -2174,6 +2219,16 @@ TEST_CASE("a retried quarantine answers what quarantine_status would, never acti
         const auto o = apply_and_verify(rig.env, rig.request(), dl);
         CHECK(o.status == "degraded");
         CHECK(o.reason == "os_unreadable");
+        CHECK_FALSE(contains(o.notes, "already_active=1"));
+        CHECK(agrees(o));
+        CHECK(rig.leg.applies == applies);
+    }
+    SECTION("not enforcing with no reason named falls back to policy_not_blocking") {
+        rig.leg.status.state = OsState::not_enforcing;
+        rig.leg.status.reapply_helps = false; // a re-apply would not help; reason stays empty
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "degraded");
+        CHECK(o.reason == "policy_not_blocking");
         CHECK_FALSE(contains(o.notes, "already_active=1"));
         CHECK(agrees(o));
         CHECK(rig.leg.applies == applies);

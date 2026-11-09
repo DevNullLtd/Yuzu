@@ -66,15 +66,15 @@ def problems(agent_src, hpp_src):
     return out
 
 
-# Each row removes one invariant: (file, pattern, repl, flags, expected substring of the FIRST problem).
+# Each row removes one invariant: (file, pattern, repl, expected substring of the FIRST problem).
 # Applied once (count=1) to the named file's text.
 MUTATIONS = [
-    ("cpp", r"return -5;", "return 0;", 0, "no longer returns -5"),
+    ("cpp", r"return -5;", "return 0;", "no longer returns -5"),
     ("cpp", r"if \(!impl->trigger_engine->register_trigger\(std::move\(\*cfg\)\)\)\s*return -5;",
-     "(void)impl->trigger_engine->register_trigger(std::move(*cfg));", 0, "no longer returns -5"),
-    ("cpp", r"int yuzu_register_trigger\(", "int yuzu_register_trigger_renamed(", 0,
+     "(void)impl->trigger_engine->register_trigger(std::move(*cfg));", "no longer returns -5"),
+    ("cpp", r"int yuzu_register_trigger\(", "int yuzu_register_trigger_renamed(",
      "no longer defines yuzu_register_trigger"),
-    ("hpp", r"bool register_trigger\(TriggerConfig config\);", "void register_trigger(TriggerConfig config);", 0,
+    ("hpp", r"bool register_trigger\(TriggerConfig config\);", "void register_trigger(TriggerConfig config);",
      "trigger_engine.hpp no longer declares"),
 ]
 
@@ -91,10 +91,10 @@ class AgentTriggerRegisterWiringLexical(unittest.TestCase):
         self.assertEqual(p, [])
 
     def test_mutations_are_caught(self):
-        for i, (which, pat, repl, flags, expected) in enumerate(MUTATIONS, 1):
+        for i, (which, pat, repl, expected) in enumerate(MUTATIONS, 1):
             with self.subTest(mutation=i, pattern=pat):
                 raw = self.cpp if which == "cpp" else self.hpp
-                mutated, n = re.subn(pat, repl, raw, count=1, flags=flags)
+                mutated, n = re.subn(pat, repl, raw, count=1)
                 self.assertEqual(n, 1, "mutation changed nothing (stale pattern)")
                 p = problems(mutated, self.hpp) if which == "cpp" else problems(self.cpp, mutated)
                 self.assertTrue(p, "mutation was NOT detected by the gate")

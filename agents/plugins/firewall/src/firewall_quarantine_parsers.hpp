@@ -2291,8 +2291,9 @@ struct LegStatus {
     bool partial = false;
     std::string reason; // policy_not_blocking | pf_disabled | anchor_not_referenced | ...
     /// False when re-applying cannot repair what is wrong (a dangling anchor, a
-    /// sibling that sorts first): `quarantine` then answers `already_active`
-    /// instead of flushing every pf state again on each retry.
+    /// sibling that sorts first): a retried `quarantine` then answers
+    /// `degraded|<reason>` instead of re-applying, which would flush every pf
+    /// state again on each retry.
     bool reapply_helps = true;
     std::vector<std::string> notes;
 };
@@ -3046,10 +3047,11 @@ inline void add_notes(Outcome& o, const std::vector<std::string>& n) {
 }
 
 /// What an `active` record earns against one live read of its leg: the ONE ladder
-/// behind `quarantine_status` and a retried `quarantine`, so the two never answer
-/// differently over the same host. An unreadable host is `degraded`, one that is
-/// not enforcing is `degraded`, recorded residue or a leg-reported gap is
-/// `partial`, and only the rest is `active` (`active_unproven` when the apply
+/// behind `quarantine_status` and a retried `quarantine`, so the two answer alike
+/// over the same host -- except that a retry re-applies (`repaired=1`) a gap a
+/// re-apply can repair instead of reporting it. An unreadable host is `degraded`,
+/// one that is not enforcing is `degraded`, recorded residue or a leg-reported gap
+/// is `partial`, and only the rest is `active` (`active_unproven` when the apply
 /// could not prove the block).
 inline void status_from_record(Outcome& o, const QuarantineState& st, const LegStatus& ls) {
     if (ls.state == OsState::unreadable) {
@@ -3149,8 +3151,9 @@ struct ApplyRequest {
             } else {
                 // Nothing a re-apply would repair: answer what `quarantine_status`
                 // would (residue, an unreadable host and a failed proof included),
-                // never `active` over a known gap.
+                // never `active` over a known gap, notes and all.
                 detail::status_from_record(o, cur, ls);
+                detail::add_notes(o, ls.notes);
                 o.state = cur;
                 if (o.status != "degraded")
                     o.notes.emplace_back("already_active=1");
@@ -3406,7 +3409,10 @@ struct ReleaseRequest {
 /// interrupted release; re-applies an `applying`/`active` record as a generation
 /// update when the OS is not enforcing it (a reboot, a legacy release). It never
 /// rolls back and never releases: an unreachable server at boot must not lift
-/// containment. A re-apply that fails leaves the record as it was.
+/// containment. A re-apply that fails puts the record back as it was (an `active`
+/// one then reads through the leg on every later status; one already `applying`
+/// stays so). A put-back that cannot be saved is `state_restore_failed=1` and
+/// leaves what the attempt last wrote, `applying`.
 [[nodiscard]] inline Outcome recover_at_init(Env& env, Deadline& dl) {
     Outcome o;
     const auto loaded = env.store.load();
