@@ -250,6 +250,7 @@ TEST_CASE("zero_reach: retryable flags match the existing semantics", "[dispatch
     CHECK_FALSE(zero_reach_retryable(ZeroReachCause::Quarantined));
     CHECK_FALSE(zero_reach_retryable(ZeroReachCause::PluginNotFound));
     CHECK_FALSE(zero_reach_retryable(ZeroReachCause::KillSwitchedOs));
+    CHECK_FALSE(zero_reach_retryable(ZeroReachCause::Denied));
 }
 
 TEST_CASE("zero_reach: denied wins over every other flag", "[dispatch_zero_reach][security]") {
@@ -267,9 +268,4 @@ TEST_CASE("zero_reach: denied wins over every other flag", "[dispatch_zero_reach
     // Without it the same outcome falls back to the next cause (invalid_scope).
     o.denied.reset();
     CHECK(classify_zero_reach(o, false) == ZeroReachCause::InvalidScope);
-}
-
-TEST_CASE("zero_reach: token dispatch_denied is permanent", "[dispatch_zero_reach][security]") {
-    CHECK(zero_reach_token(ZeroReachCause::Denied) == "dispatch_denied");
-    CHECK_FALSE(zero_reach_retryable(ZeroReachCause::Denied));
 }

@@ -130,6 +130,21 @@ std::string resolve_cid(const Request& rq) {
                                      : rq.correlation_id;
 }
 
+/// The ONE dispatch-denied refusal, for both authorize runs (the pre-row dry run and the post-row
+/// re-run): counts the denial and carries the denial, plugin and action the renderers dereference
+/// unconditionally for kDispatchDenied. The audit row stays at each site (its result word
+/// differs: `denied` before the `requested` row, `failure` after it) and reads `reason` from here.
+Refusal dispatch_denied_refusal(const Ports& ports, const InstructionDefinition& def,
+                                const detail::DispatchDenial& denial) {
+    std::string reason(detail::to_string(denial.reason));
+    bump(ports, "yuzu_server_dispatch_denied_total", {{"reason", reason}});
+    Refusal r = make_refusal(RefusalKind::kDispatchDenied, std::move(reason), {});
+    r.denial = denial;
+    r.plugin = def.plugin;
+    r.action = def.action;
+    return r;
+}
+
 } // namespace
 
 std::string effect_binding(std::string_view plugin, std::string_view action,
@@ -259,17 +274,12 @@ PrepareOutcome prepare_impl(Ctx& c) {
     }
     if (auto decision = ports.authorize(rq.caller, def.plugin, def.action); !decision) {
         const auto& denial = decision.error();
-        const std::string reason(detail::to_string(denial.reason));
+        Refusal r = dispatch_denied_refusal(ports, def, denial);
         spdlog::warn("dispatch denied: {} reason={} securable={} caller={}", ident_pair(def),
-                     reason, denial.securable.empty() ? "(none)" : denial.securable,
+                     r.reason, denial.securable.empty() ? "(none)" : denial.securable,
                      rq.caller.principal.empty() ? "(anonymous)"
                                                  : ::yuzu::log_token(rq.caller.principal));
-        bump(ports, "yuzu_server_dispatch_denied_total", {{"reason", reason}});
-        c.audit("denied", "reason=" + reason + " definition=" + def_token);
-        Refusal r = make_refusal(RefusalKind::kDispatchDenied, reason, {});
-        r.denial = denial;
-        r.plugin = def.plugin;
-        r.action = def.action;
+        c.audit("denied", "reason=" + r.reason + " definition=" + def_token);
         return refuse(c, std::move(r));
     }
 
@@ -677,14 +687,8 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     }
     const DispatchCaller& caller = *readmitted; // the fresh caller is the one dispatched
     if (auto decision = p.authorize(caller, def.plugin, def.action); !decision) {
-        const auto& denial = decision.error();
-        const std::string reason(detail::to_string(denial.reason));
-        bump(p, "yuzu_server_dispatch_denied_total", {{"reason", reason}});
-        c.audit("failure", "reason=" + reason + " definition=" + def_token);
-        Refusal r = make_refusal(RefusalKind::kDispatchDenied, reason, {});
-        r.denial = denial;
-        r.plugin = def.plugin;
-        r.action = def.action;
+        Refusal r = dispatch_denied_refusal(p, def, decision.error());
+        c.audit("failure", "reason=" + r.reason + " definition=" + def_token);
         return Outcome{std::move(r), c.audit_dropped};
     }
 
