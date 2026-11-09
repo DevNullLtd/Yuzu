@@ -992,7 +992,7 @@ struct OsPayload {
     std::string pf_token;        // macOS: the `pfctl -E` reference token
     std::string boot_time;       // macOS: kern.boottime the token belongs to
     std::uint32_t ipt_gen = 0;   // iptables: the live chain generation
-    bool ipt_v6 = false;         // iptables: ip6tables was part of the apply (an IPv6 stack existed)
+    bool ipt_v6 = false;         // iptables: ip6tables was in the apply (stack present/unknown)
     std::uint32_t rules_not_disabled = 0; // Windows: enabled rules the policy store refused to disable
     std::uint32_t stale_rules_left = 0;   // Windows: a previous generation's rules that would not delete
     bool state_flush_failed = false;      // macOS: the anchor load committed but its state flush did not
@@ -2297,6 +2297,26 @@ struct LegStatus {
     std::vector<std::string> notes;
 };
 
+/// The master-switch part of a Windows status read. A verdict other than `ok`
+/// settles the status and returns true: a switched-off profile makes every rule
+/// and the default block inert, so nothing is enforced and re-applying cannot help
+/// (it refuses the same way); an unreadable switch is unreadable, never a guess
+/// either way. Both name the profile. Returns false when the switch is on
+/// everywhere and the read goes on.
+[[nodiscard]] inline bool win_switch_status(const WinSwitchVerdict& v, LegStatus& st) {
+    if (v.kind == WinSwitchVerdict::Kind::ok)
+        return false;
+    st.notes.push_back(std::format("firewall_profile={}", kWinProfileLabels[v.profile]));
+    if (v.kind == WinSwitchVerdict::Kind::disabled) {
+        st.state = OsState::not_enforcing;
+        st.reason = "firewall_disabled";
+        st.reapply_helps = false;
+    } else {
+        st.state = OsState::unreadable;
+    }
+    return true;
+}
+
 /// What one OS mechanism can do. Windows implements it over COM in the plugin;
 /// the nft, iptables and pf legs are implemented here over Runner.
 class Leg {
@@ -2482,7 +2502,7 @@ private:
 /// so those cells refuse before anything is mutated.
 enum class V6Mode : std::uint8_t {
     cover,                  // build the ip6tables mirror
-    v4_only,                // no IPv6 stack (proven): IPv4 is the whole host
+    v4_only,                // IPv4 only: stack off (apply) or no ip6tables to read (release/status)
     refuse_tool_missing,    // a stack exists but ip6tables does not
     refuse_stack_unknown,   // no ip6tables and the stack could not be read
 };
@@ -2656,7 +2676,7 @@ public:
         LegStatus st;
         detail::Exec ex(run_, dl);
         std::vector<std::string_view> tools{kIptablesPath};
-        // v6 is judged only where the apply covered it (an IPv6 stack existed then).
+        // v6 is read only where the apply covered it (ipt_v6).
         if (cover_v6() && os.ipt_v6)
             tools.push_back(kIp6tablesPath);
         bool all = true;
@@ -3025,6 +3045,29 @@ inline void add_notes(Outcome& o, const std::vector<std::string>& n) {
     o.notes.insert(o.notes.end(), n.begin(), n.end());
 }
 
+/// What an `active` record earns against one live read of its leg: the ONE ladder
+/// behind `quarantine_status` and a retried `quarantine`, so the two never answer
+/// differently over the same host. An unreadable host is `degraded`, one that is
+/// not enforcing is `degraded`, recorded residue or a leg-reported gap is
+/// `partial`, and only the rest is `active` (`active_unproven` when the apply
+/// could not prove the block).
+inline void status_from_record(Outcome& o, const QuarantineState& st, const LegStatus& ls) {
+    if (ls.state == OsState::unreadable) {
+        o.status = "degraded";
+        o.reason = "os_unreadable";
+    } else if (ls.state == OsState::not_enforcing) {
+        o.status = "degraded";
+        o.reason = ls.reason.empty() ? "policy_not_blocking" : ls.reason;
+    } else if (ls.partial || has_residue(st.os)) {
+        o.status = "partial";
+        o.reason = has_residue(st.os) ? std::string{residue_reason(st.os)} : ls.reason;
+        add_notes(o, residue_notes(st.os));
+    } else {
+        o.status = st.last_verify.find("unproven") != std::string::npos ? "active_unproven"
+                                                                        : "active";
+    }
+}
+
 /// Undo an initial apply. The release intent is saved FIRST, exactly as an explicit
 /// release does: a crash after the rules are gone, or an erase that fails, then
 /// leaves `releasing`, which boot recovery finishes -- never `applying`, which it
@@ -3095,22 +3138,22 @@ struct ApplyRequest {
             // actor may have undone it (pf switched off, a table deleted, profile
             // defaults restored). Re-apply the STORED allow set -- a retry never
             // rewrites a contained host's allow list -- instead of answering
-            // `already_active`. A read that fails changes nothing; a defect a
-            // re-apply cannot fix (a dangling anchor, an earlier sibling) is
-            // reported, not re-applied on every retry.
+            // `already_active`. A read that fails changes nothing, and a defect a
+            // re-apply cannot fix (a dangling anchor, an earlier sibling, a
+            // switched-off profile) is reported, not re-applied on every retry.
             const auto ls = env.leg.read_status(cur.os, dl);
             Outcome o;
             if (ls.state == OsState::not_enforcing && ls.reapply_helps) {
                 o = detail::converge(env, cur, cur.allow, dl);
                 o.notes.emplace_back("repaired=1");
-            } else if (ls.state == OsState::not_enforcing) {
-                o.status = "degraded";
-                o.reason = ls.reason;
-                o.state = cur;
             } else {
-                o.status = "active";
+                // Nothing a re-apply would repair: answer what `quarantine_status`
+                // would (residue, an unreadable host and a failed proof included),
+                // never `active` over a known gap.
+                detail::status_from_record(o, cur, ls);
                 o.state = cur;
-                o.notes.emplace_back("already_active=1");
+                if (o.status != "degraded")
+                    o.notes.emplace_back("already_active=1");
             }
             if (!(cur.allow == req.allow))
                 o.notes.emplace_back("allow_set_unchanged_use_quarantine_allow=1");
@@ -3363,7 +3406,7 @@ struct ReleaseRequest {
 /// interrupted release; re-applies an `applying`/`active` record as a generation
 /// update when the OS is not enforcing it (a reboot, a legacy release). It never
 /// rolls back and never releases: an unreachable server at boot must not lift
-/// containment.
+/// containment. A re-apply that fails leaves the record as it was.
 [[nodiscard]] inline Outcome recover_at_init(Env& env, Deadline& dl) {
     Outcome o;
     const auto loaded = env.store.load();
@@ -3399,9 +3442,21 @@ struct ReleaseRequest {
                                return env.store.save(t);
                            });
         if (!ap.ok) {
+            // The failed re-apply FINISHED: nothing of its generation is in force, so
+            // the record goes back to what it was, exactly as a failed convergence
+            // does. An `active` record then reads through the leg on every later
+            // status (degraded|firewall_disabled, policy_not_blocking, os_unreadable)
+            // and the next start re-applies it; a record already `applying` (a crash
+            // mid-operation) stays `applying`, which IS an operation in progress. The
+            // leg's OS facts carry over: a pf token the attempt took is held by the
+            // host and the record is the only way to release it.
+            auto back = st;
+            back.os = cand.os;
+            if (!env.store.save(back))
+                o.notes.emplace_back("state_restore_failed=1");
             o.status = "degraded";
             o.reason = "reapply_failed:" + ap.reason;
-            o.state = cand;
+            o.state = back;
             return o;
         }
         st = cand;
@@ -3499,20 +3554,7 @@ inline void settle_ttl(Outcome& o, TriggerRegistry& triggers) {
         o.reason = "release_incomplete";
         return o;
     }
-    if (ls.state == OsState::unreadable) {
-        o.status = "degraded";
-        o.reason = "os_unreadable";
-    } else if (ls.state == OsState::not_enforcing) {
-        o.status = "degraded";
-        o.reason = ls.reason.empty() ? "policy_not_blocking" : ls.reason;
-    } else if (ls.partial || has_residue(st.os)) {
-        o.status = "partial";
-        o.reason = has_residue(st.os) ? std::string{residue_reason(st.os)} : ls.reason;
-        detail::add_notes(o, residue_notes(st.os));
-    } else {
-        o.status = st.last_verify.find("unproven") != std::string::npos ? "active_unproven"
-                                                                        : "active";
-    }
+    detail::status_from_record(o, st, ls);
     return o;
 }
 

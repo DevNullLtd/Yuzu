@@ -4182,6 +4182,17 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   timeout: 30,
 )
 
+# Static lexical gate pinning that agent.cpp's yuzu_register_trigger still returns -5 when the
+# trigger engine reports a full table (no unit test can call the bridge: PluginContextImpl is
+# TU-local, no seam) and that TriggerEngine::register_trigger keeps its bool return. Carries its
+# own in-memory mutation self-test. No build required; one process, well under a second.
+test('agent trigger-register bridge wiring lexical gate',
+  _python3_test,
+  args: [files('test_agent_trigger_register_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
 # stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
 # page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes

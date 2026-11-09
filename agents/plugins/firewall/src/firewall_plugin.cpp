@@ -2074,10 +2074,9 @@ public:
         std::size_t stale_left = 0;
         if (!plan.remove.empty()) {
             const int failed = remove_rules_by_name(*rules.get(), plan.remove);
-            std::vector<std::string> after;
-            stale_left = collect_our_rule_names(*rules.get(), after)
-                             ? fq::win_update_plan(after, specs).remove.size()
-                             : static_cast<std::size_t>(failed);
+            const auto after = collect_our_rule_names(*rules.get());
+            stale_left = after ? fq::win_update_plan(*after, specs).remove.size()
+                               : static_cast<std::size_t>(failed);
         }
         os.stale_rules_left = static_cast<std::uint32_t>(stale_left);
         if (stale_left > 0) {
@@ -2113,8 +2112,8 @@ public:
         // narrower than the quarantine at any point of the release (the reply to
         // this very command travels the control channel our rules keep open).
         // 1. Which of our rules exist (needed to decide the policy fallback below).
-        std::vector<std::string> ours_at_start;
-        if (!collect_our_rule_names(*rules.get(), ours_at_start))
+        const auto ours_at_start = collect_our_rule_names(*rules.get());
+        if (!ours_at_start)
             return fq::StepResult::fail("rule_enumeration_failed");
         // 2. Re-enable what quarantine disabled. Names are not unique in Windows
         //    Firewall, so a duplicate-named pair is re-enabled together.
@@ -2152,7 +2151,7 @@ public:
         std::optional<fq::WinPriorPolicy> prior;
         if (image_exists)
             prior = fq::parse_prior_policy(pc.storage_get(prior_key));
-        if (prior || !ours_at_start.empty()) {
+        if (prior || !ours_at_start->empty()) {
             for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
                 const auto want = fq::win_release_policy(prior, i);
                 if (policy->put_DefaultInboundAction(kQuarantineProfiles[i],
@@ -2169,18 +2168,18 @@ public:
         //    per call, and a rule added concurrently by a racing apply must not
         //    survive a release).
         for (int pass = 0; pass < 3; ++pass) {
-            std::vector<std::string> ours;
-            if (!collect_our_rule_names(*rules.get(), ours))
+            const auto ours = collect_our_rule_names(*rules.get());
+            if (!ours)
                 return fq::StepResult::fail("rule_enumeration_failed");
-            if (ours.empty())
+            if (ours->empty())
                 break;
-            (void)remove_rules_by_name(*rules.get(), ours);
+            (void)remove_rules_by_name(*rules.get(), *ours);
         }
         {
-            std::vector<std::string> left;
-            if (!collect_our_rule_names(*rules.get(), left))
+            const auto left = collect_our_rule_names(*rules.get());
+            if (!left)
                 return fq::StepResult::fail("rule_enumeration_failed");
-            if (!left.empty())
+            if (!left->empty())
                 ++failures;
         }
 
@@ -2227,18 +2226,8 @@ public:
             st.notes.emplace_back("legacy_quarantine_rules_present=1");
         if (!group)
             st.notes.emplace_back("rules_missing=1");
-        // A switched-off profile makes the rules and the default block inert, so
-        // nothing is enforced; re-applying cannot help (it refuses the same way).
-        // An unreadable switch is unreadable, never a guess either way.
-        if (sw.kind != fq::WinSwitchVerdict::Kind::ok) {
-            st.notes.push_back(std::format("firewall_profile={}", fq::kWinProfileLabels[sw.profile]));
-            if (sw.kind == fq::WinSwitchVerdict::Kind::disabled) {
-                st.state = fq::OsState::not_enforcing;
-                st.reason = "firewall_disabled";
-                st.reapply_helps = false;
-            }
+        if (fq::win_switch_status(sw, st))
             return st;
-        }
         st.state = (group && all_block) ? fq::OsState::enforcing : fq::OsState::not_enforcing;
         if (st.state == fq::OsState::not_enforcing)
             st.reason = "policy_not_blocking";
@@ -2259,16 +2248,19 @@ private:
         return r;
     }
 
-    /// The names of the rules that are ours (group or prefix); false when the
+    /// The names of the rules that are ours (group or prefix); nullopt when the
     /// enumeration itself failed part-way.
-    [[nodiscard]] static bool collect_our_rule_names(INetFwRules& rules,
-                                                     std::vector<std::string>& out) {
-        return for_each_rule(rules, [&](INetFwRule& r) {
-            auto name = rule_name_of(r);
-            if (fq::is_our_win_rule(name, rule_group_of(r)))
-                out.push_back(std::move(name));
-            return true;
-        });
+    [[nodiscard]] static std::optional<std::vector<std::string>> collect_our_rule_names(
+        INetFwRules& rules) {
+        std::vector<std::string> out;
+        if (!for_each_rule(rules, [&](INetFwRule& r) {
+                auto name = rule_name_of(r);
+                if (fq::is_our_win_rule(name, rule_group_of(r)))
+                    out.push_back(std::move(name));
+                return true;
+            }))
+            return std::nullopt;
+        return out;
     }
 
     /// Removes each named rule from the store; returns how many removals failed.

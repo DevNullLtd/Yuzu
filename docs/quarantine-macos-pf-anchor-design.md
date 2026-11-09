@@ -358,7 +358,11 @@ is finished; a record in `applying` or `active` whose OS state is not enforcing
 (after a reboot the kernel holds no anchor and no reference, and pf starts
 disabled; or pf was switched off behind our back) is re-applied as a generation
 update, with the token rule of 2.4 (a new boot always takes a fresh `-E`). A
-re-apply never rolls back and never releases when the server is unreachable.
+re-apply never rolls back and never releases when the server is unreachable. One
+that fails (pf cannot be enabled, the anchor does not load) puts the record back
+as it was, so `quarantine_status` keeps reporting what the host does
+(`degraded|pf_disabled`, `anchor_not_referenced`, ...) and the next start tries
+again; only a record that was already `applying` stays `applying`.
 
 **Residual: the reboot gap.** Between boot and the agent's `init()` the host is
 uncontained, and if the agent never starts it stays uncontained. Nothing in this

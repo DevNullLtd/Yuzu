@@ -1030,6 +1030,35 @@ TEST_CASE("windows: a profile with the firewall switched off, or unreadable, ref
     CHECK(two_unreadable.profile == 1);
 }
 
+TEST_CASE("windows: the switch verdict settles the status read the same way on every host",
+          "[agent][firewall_quarantine]") {
+    // on everywhere: nothing settled, the read goes on and the status is untouched
+    LegStatus on;
+    on.state = OsState::enforcing;
+    CHECK_FALSE(win_switch_status(win_firewall_switch_verdict({true, true, true}), on));
+    CHECK(on.state == OsState::enforcing);
+    CHECK(on.reapply_helps);
+    CHECK(on.reason.empty());
+    CHECK(on.notes.empty());
+
+    // switched off: not enforcing, and a re-apply cannot help (it refuses the same way)
+    LegStatus off;
+    CHECK(win_switch_status(win_firewall_switch_verdict({true, false, true}), off));
+    CHECK(off.state == OsState::not_enforcing);
+    CHECK(off.reason == "firewall_disabled");
+    CHECK_FALSE(off.reapply_helps);
+    CHECK(off.notes == std::vector<std::string>{"firewall_profile=Private"});
+
+    // unreadable: never a guess either way; a note names the profile, nothing is claimed
+    LegStatus unread;
+    unread.state = OsState::enforcing; // a stale optimistic value must not survive
+    CHECK(win_switch_status(win_firewall_switch_verdict({true, true, std::nullopt}), unread));
+    CHECK(unread.state == OsState::unreadable);
+    CHECK(unread.reason.empty());
+    CHECK(unread.reapply_helps);
+    CHECK(unread.notes == std::vector<std::string>{"firewall_profile=Public"});
+}
+
 TEST_CASE("windows: a stale generation's rules that survive removal are residue",
           "[agent][firewall_quarantine]") {
     const auto set = make_set({}, {ex("10.0.0.5:22/tcp/in")});
@@ -1949,19 +1978,29 @@ TEST_CASE("recover_at_init never rolls back or releases on an unreachable server
     CHECK(rig.world.table);
 }
 
-TEST_CASE("recover_at_init: a failed re-apply leaves the record for the next start",
+TEST_CASE("recover_at_init: a failed re-apply puts an active record back and status reads the host",
           "[agent][firewall_quarantine]") {
     NftRig rig;
     auto dl = rig.dl();
     REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    const auto generation = rig.store.state()->generation;
     rig.world.table = false;
     rig.world.fail_load = true;
     const auto o = recover_at_init(rig.env, dl);
     CHECK(o.status == "degraded");
     CHECK(o.reason == "reapply_failed:nft_load_failed");
-    CHECK(rig.store.state()->phase == Phase::applying); // retried at the next start
+    // The attempt finished and nothing of its generation is in force: the record is
+    // what it was, not an operation in progress.
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::active);
+    CHECK(rig.store.state()->generation == generation);
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "degraded");
+    CHECK(st.reason == "policy_not_blocking");
+    // the next start still re-applies
     rig.world.fail_load = false;
     CHECK(recover_at_init(rig.env, dl).status == "active");
+    CHECK(report_status(rig.env, dl).status == "active");
 }
 
 TEST_CASE("recover_at_init with no record does nothing", "[agent][firewall_quarantine]") {
@@ -2025,6 +2064,46 @@ TEST_CASE("a switched-off Windows profile refuses before anything is touched, an
         CHECK(r.status == "degraded");
         CHECK(r.reason == "reapply_failed:firewall_disabled:Domain");
     }
+    SECTION("a failed boot re-apply leaves the record active: status reads the switch") {
+        ScriptRig rig;
+        Deadline dl;
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.leg.on_apply = [](OsPayload&) { return StepResult::fail("firewall_disabled:Domain"); };
+        rig.leg.status.state = OsState::not_enforcing;
+        rig.leg.status.reason = "firewall_disabled";
+        rig.leg.status.reapply_helps = false;
+        rig.leg.status.notes.emplace_back("firewall_profile=Domain");
+
+        const auto r = recover_at_init(rig.env, dl);
+        CHECK(r.status == "degraded");
+        CHECK(r.reason == "reapply_failed:firewall_disabled:Domain");
+        CHECK(rig.store.state()->phase == Phase::active);
+
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "degraded");
+        CHECK(st.reason == "firewall_disabled"); // never operation_in_progress
+        CHECK(contains(st.notes, "firewall_profile=Domain"));
+    }
+    SECTION("a crashed applying record whose boot re-apply fails stays in progress") {
+        ScriptRig rig;
+        Deadline dl;
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        auto crashed = *rig.store.state();
+        crashed.phase = Phase::applying;
+        rig.store.save(crashed);
+        rig.leg.on_apply = [](OsPayload&) { return StepResult::fail("firewall_disabled:Domain"); };
+        rig.leg.status.state = OsState::not_enforcing;
+        rig.leg.status.reason = "firewall_disabled";
+        rig.leg.status.reapply_helps = false;
+
+        const auto r = recover_at_init(rig.env, dl);
+        CHECK(r.status == "degraded");
+        CHECK(rig.store.state()->phase == Phase::applying);
+        CHECK(rig.store.state()->generation == crashed.generation);
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "partial");
+        CHECK(st.reason == "operation_in_progress");
+    }
     SECTION("status reads degraded|firewall_disabled; a retried quarantine reports it and does not re-apply") {
         ScriptRig rig;
         Deadline dl;
@@ -2054,6 +2133,67 @@ TEST_CASE("a switched-off Windows profile refuses before anything is touched, an
         const auto st = report_status(rig.env, dl);
         CHECK(st.status == "degraded");
         CHECK(st.reason == "os_unreadable");
+    }
+}
+
+TEST_CASE("a retried quarantine answers what quarantine_status would, never active over a gap",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    Deadline dl;
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    const auto applies = rig.leg.applies;
+    // one ladder: whatever the retry answers, quarantine_status answers the same
+    const auto agrees = [&](const Outcome& retry) {
+        const auto st = report_status(rig.env, dl);
+        return retry.status == st.status && retry.reason == st.reason;
+    };
+
+    SECTION("recorded residue") {
+        auto st = *rig.store.state();
+        st.os.rules_not_disabled = 4;
+        rig.store.save(st);
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "partial");
+        CHECK(o.reason == "rules_not_disabled");
+        CHECK(contains(o.notes, "rules_not_disabled=4"));
+        CHECK(contains(o.notes, "already_active=1"));
+        CHECK(agrees(o));
+        CHECK(rig.leg.applies == applies); // nothing a re-apply would repair
+    }
+    SECTION("a gap the leg itself reports") {
+        rig.leg.status.partial = true;
+        rig.leg.status.reason = "stale_state_entries";
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "partial");
+        CHECK(o.reason == "stale_state_entries");
+        CHECK(agrees(o));
+        CHECK(rig.leg.applies == applies);
+    }
+    SECTION("an unreadable host is degraded, and nothing is applied over it") {
+        rig.leg.status.state = OsState::unreadable;
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "degraded");
+        CHECK(o.reason == "os_unreadable");
+        CHECK_FALSE(contains(o.notes, "already_active=1"));
+        CHECK(agrees(o));
+        CHECK(rig.leg.applies == applies);
+    }
+    SECTION("an apply that could not prove the block stays active_unproven") {
+        auto st = *rig.store.state();
+        st.last_verify = "unproven control_ok probe_none";
+        rig.store.save(st);
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "active_unproven");
+        CHECK(contains(o.notes, "already_active=1"));
+        CHECK(agrees(o));
+        CHECK(rig.leg.applies == applies);
+    }
+    SECTION("a clean record is still already_active") {
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "active");
+        CHECK(contains(o.notes, "already_active=1"));
+        CHECK(agrees(o));
+        CHECK(rig.leg.applies == applies);
     }
 }
 
