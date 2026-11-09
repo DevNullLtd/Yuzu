@@ -1443,8 +1443,6 @@ echo_test_exe = executable(
   link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: echo_test_deps,
 )
-# The registry live ETW failure message (test_echo_registry_source.cpp) also names the active trace sessions
-# and each Yuzu*Etw-<pid> session's owner liveness, so a CI log alone can diagnose #7173.
 # The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
 # 180s (#7135; was 90s). Unlike agent shard C above this is not an exception to the budget rule in

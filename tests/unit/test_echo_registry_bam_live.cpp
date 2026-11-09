@@ -50,13 +50,12 @@ bool is_elevated() {
 
 std::string salt() { return std::to_string(::GetCurrentProcessId()) + "_" + std::to_string(::GetTickCount64()); }
 
-// A scratch key below HKLM, deleted (with its contents) on destruction. `deny_all` is set on the
-// key through the held handle, which keeps working for writes; the destructor restores access
-// through the same handle first so the delete cannot be refused.
+// A scratch key below HKLM, deleted (with its contents) on destruction. A DACL set on the key
+// through the held handle keeps working for writes; the destructor restores access through the
+// same handle first so the delete cannot be refused.
 struct ScratchKey {
     std::wstring path;
     HKEY h{nullptr};
-    bool denied{false};
     explicit ScratchKey(const std::string& below_hklm) : path(yuzu::win::to_wide(below_hklm)) {}
     ScratchKey(const ScratchKey&) = delete;
     ScratchKey& operator=(const ScratchKey&) = delete;
@@ -64,23 +63,17 @@ struct ScratchKey {
         return RegCreateKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &h,
                                nullptr);
     }
-    void set_dacl(const wchar_t* sddl) {
+    LONG set_dacl(const wchar_t* sddl) {
         PSECURITY_DESCRIPTOR sd = nullptr;
-        REQUIRE(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, nullptr));
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, nullptr))
+            return ERROR_INVALID_PARAMETER;
         const LONG rc = RegSetKeySecurity(h, DACL_SECURITY_INFORMATION, sd);
         LocalFree(sd);
-        REQUIRE(rc == ERROR_SUCCESS);
+        return rc;
     }
     ~ScratchKey() {
         if (h != nullptr) {
-            if (denied) {
-                PSECURITY_DESCRIPTOR sd = nullptr;
-                if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(A;;KA;;;WD)", SDDL_REVISION_1, &sd,
-                                                                         nullptr)) {
-                    RegSetKeySecurity(h, DACL_SECURITY_INFORMATION, sd);
-                    LocalFree(sd);
-                }
-            }
+            set_dacl(L"D:PAI(A;;KA;;;WD)"); // best effort: restore access so the delete cannot be refused
             RegCloseKey(h);
         }
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, path.c_str());
@@ -104,8 +97,7 @@ TEST_CASE("registry live: bam\\State is never read -- a scratch value under bam 
     // Deny read to everyone: if the reader ever opens this key it is reported in `skipped`, which
     // is what makes the exclusion observable (the diff engine drops excluded keys on its own, so
     // a row-only assertion could not tell the reader's skip from the diff's).
-    excluded.set_dacl(L"D:PAI(D;;KR;;;WD)(A;;KA;;;SY)(A;;KA;;;BA)");
-    excluded.denied = true;
+    REQUIRE(excluded.set_dacl(L"D:PAI(D;;KR;;;WD)(A;;KA;;;SY)(A;;KA;;;BA)") == ERROR_SUCCESS);
 
     auto reader = make_windows_registry_reader();
     const std::string root = "HKLM\\" + bam;
