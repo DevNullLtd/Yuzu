@@ -34,6 +34,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -721,21 +722,16 @@ inline ConfigRows parse_info(const nlohmann::json& j) {
     }
     const auto* so =
         typed_member(j, "SecurityOptions", nlohmann::json::value_t::array, out.malformed);
-    bool rootless = false;
-    if (so) {
-        for (const auto& e : *so) {
-            if (!e.is_string()) {
-                out.malformed = true;
-                so = nullptr;
-                break;
-            }
-            const auto& s = e.get_ref<const std::string&>();
-            if (s == "name=rootless" || s.rfind("name=rootless,", 0) == 0)
-                rootless = true;
-        }
-    }
-    if (so)
+    if (so && !std::ranges::all_of(*so, [](const auto& e) { return e.is_string(); })) {
+        out.malformed = true; // `rootless no` over an unreadable element would be a guess
+        so = nullptr;         // and the key contributes no row at all
+    } else if (so) {
+        const bool rootless = std::ranges::any_of(*so, [](const auto& e) {
+            const auto& s = e.template get_ref<const std::string&>();
+            return s == "name=rootless" || s.rfind("name=rootless,", 0) == 0;
+        });
         out.rows.push_back({"rootless", rootless ? "yes" : "no"});
+    }
     if (const auto* cg =
             typed_member(j, "CgroupDriver", nlohmann::json::value_t::string, out.malformed))
         out.rows.push_back({"cgroup_driver", checked_config_string(cg->get_ref<const std::string&>())});
@@ -783,17 +779,10 @@ inline ConfigRows parse_daemon_json(std::string_view text) {
     }
     if (const auto* hosts =
             typed_member(j, "hosts", nlohmann::json::value_t::array, out.malformed)) {
-        bool tcp = false;
-        bool all_strings = true;
-        for (const auto& h : *hosts) {
-            if (!h.is_string()) {
-                all_strings = false;
-                break;
-            }
-            if (h.get_ref<const std::string&>().rfind("tcp://", 0) == 0)
-                tcp = true;
-        }
-        if (all_strings) {
+        if (std::ranges::all_of(*hosts, [](const auto& h) { return h.is_string(); })) {
+            const bool tcp = std::ranges::any_of(*hosts, [](const auto& h) {
+                return h.template get_ref<const std::string&>().rfind("tcp://", 0) == 0;
+            });
             out.rows.push_back({"hosts", std::to_string(hosts->size())});
             out.rows.push_back({"hosts_tcp", tcp ? "yes" : "no"});
         } else {
