@@ -201,7 +201,8 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
 
     // ── DELETE /api/v1/sle/agents/{agent_id} — audited durable-erasure trigger (D-11) ──
     // The agent-decommission cascade's production caller: fans delete_agent across
-    // every registered per-agent store, durably erasing the machine's stored rows
+    // every registered per-agent store, durably erasing the rows each store deletes for the machine
+    // (the Guardian store keeps its event log and DEX observations until retention expiry)
     // (including the Decision-11 user_ref personal data — the reason this route
     // exists). Gate: ONE SCOPED securable, `Decommission:Delete` (ADR-0024 Decision
     // 9, amended Wave 7 PR7.2) — a device-level erasure grant that authorizes for

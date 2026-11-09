@@ -79,8 +79,9 @@ class GuaranteedStateStore;
 /// Per-store outcome of one decommission fan-out.
 enum class DecommissionOutcome {
     Deleted, ///< delete_agent was invoked and reported success (returned true):
-             ///< the delete committed. This is confirmed erasure, not merely
-             ///< "invoked".
+             ///< the delete committed. This is confirmed erasure of the rows that
+             ///< store deletes (see "WHAT `Deleted` MEANS IS PER STORE" above), not
+             ///< merely "invoked".
     Skipped, ///< the store was not configured on this deployment (null pointer).
     Failed,  ///< delete_agent reported failure (returned false — e.g. a transient
              ///< PG outage rolled the DELETE back) OR threw. Either way the delete
@@ -110,8 +111,8 @@ struct DecommissionResult {
     /// reports its commit status, a configured store whose delete did not commit
     /// (a transient PG failure that rolls the DELETE back, or a throw) counts as
     /// `failed` and flips `ok()` to false — so for a decommission that did real
-    /// work (`deleted > 0`), `ok()` means "erasure confirmed across every
-    /// configured store", not merely "no exception".
+    /// work (`deleted > 0`), `ok()` means "erasure confirmed, store by store, of what
+    /// each configured store deletes", not merely "no exception".
     ///
     /// CAVEAT — `ok()` is NOT by itself proof that anything was erased. An
     /// all-`Skipped` result is also `ok()`: an empty `agent_id` short-circuits

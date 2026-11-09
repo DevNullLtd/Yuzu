@@ -162,7 +162,7 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
             r.error = e.what();
             ++result.failed;
             spdlog::error("AgentDecommission: store '{}' delete_agent threw for agent={}: {}",
-                          t.name, ::yuzu::log_id_token(agent_id), e.what());
+                          t.name, ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(e.what()));
         } catch (...) {
             r.outcome = DecommissionOutcome::Failed;
             r.error = "unknown exception";

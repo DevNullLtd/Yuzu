@@ -915,15 +915,20 @@ bool GuaranteedStateStore::delete_agent(std::string_view agent_id) {
     // deletes of this method and of delete_rule's cascade take row locks in heap order, so two
     // transactions that overlap on several census rows could in principle deadlock; Postgres
     // aborts one, this method then returns false and the re-issue is idempotent. A pending event
-    // committed after the list is read is not retired here (the same documented gap as
-    // delete_rule, #6829). Every statement result is checked: a false return rolls the whole
-    // transaction back, so the decommission cascade records Failed and the re-issue is idempotent.
-    // The failure reason is logged at warn level, because the pool's last_error() is set only by
-    // connect and acquire failures and never by a failed statement.
-    const auto log_step_failure = [&](const char* step, const pg::PgResult& res) {
+    // committed after the list is read is not retired here (the gap delete_rule documents too,
+    // #6829; the sweep of stranded pending evidence is tracked in #7147). Every statement result is
+    // checked: a false return rolls the whole transaction back, so the decommission cascade records
+    // Failed and the re-issue is idempotent. The failure reason is logged at warn level, because
+    // the pool's last_error() is set only by connect and acquire failures and never by a failed
+    // statement.
+    const auto log_step_failure = [&](const char* step, PGconn* conn, const pg::PgResult& res) {
+        // A null result (out of memory, a lost connection) carries no message of its own: the
+        // reason is then on the connection.
+        const char* msg = PQresultErrorMessage(res.get());
+        if (msg == nullptr || *msg == '\0')
+            msg = PQerrorMessage(conn);
         spdlog::warn("GuaranteedStateStore: delete_agent failed at step '{}' for agent={}: {}",
-                     step, log_id_token(agent_id),
-                     ::yuzu::log_key_token(PQresultErrorMessage(res.get())));
+                     step, log_id_token(agent_id), ::yuzu::log_key_token(msg ? msg : ""));
     };
     const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult locked =
@@ -933,7 +938,7 @@ bool GuaranteedStateStore::delete_agent(std::string_view agent_id) {
                             "FOR UPDATE",
                             std::vector<std::string>{id});
         if (locked.status() != PGRES_TUPLES_OK) {
-            log_step_failure("pending-event lock", locked);
+            log_step_failure("pending-event lock", conn, locked);
             return false;
         }
         std::vector<std::string> pending_ids;
@@ -950,7 +955,7 @@ bool GuaranteedStateStore::delete_agent(std::string_view agent_id) {
                                 "SET projection_pending = false WHERE event_id = ANY($1::text[])",
                                 std::vector<std::string>{pg::to_text_array(views)});
             if (retired.status() != PGRES_COMMAND_OK) {
-                log_step_failure("pending-event retire", retired);
+                log_step_failure("pending-event retire", conn, retired);
                 return false;
             }
         }
@@ -959,14 +964,14 @@ bool GuaranteedStateStore::delete_agent(std::string_view agent_id) {
             "DELETE FROM guaranteed_state_store.guardian_agent_rule_status WHERE agent_id = $1",
             std::vector<std::string>{id});
         if (census.status() != PGRES_COMMAND_OK) {
-            log_step_failure("census delete", census);
+            log_step_failure("census delete", conn, census);
             return false;
         }
         return true;
     });
     if (!committed)
-        spdlog::debug("GuaranteedStateStore: delete_agent did not commit for agent={} ({})",
-                      log_id_token(agent_id), ::yuzu::log_key_token(pool_.last_error()));
+        spdlog::debug("GuaranteedStateStore: delete_agent did not commit for agent={}",
+                      log_id_token(agent_id));
     return committed;
 }
 
