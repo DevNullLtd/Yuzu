@@ -19,6 +19,7 @@
  * scope expansion that PR 3 wires into /push.
  */
 
+#include "agent_decommission.hpp"
 #include "auth_routes.hpp"
 #include "baseline_store.hpp"
 #include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
@@ -6777,4 +6778,115 @@ TEST_CASE("REST gs.rules: a store fault on delete answers 404 but is audited as 
     CHECK(del->status == 404); // documented: any delete failure answers 404
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].result == "failure");
+}
+
+// -- #5675: a decommission erases the census, and every census read agrees afterwards --
+//
+// The census is read by the fleet rollup, the per-device rollup, the per-device guard list and (for
+// an agent that registers again under the same id) the next projection. Each of those is RE-READ
+// after the cascade ran: asserting only the cascade outcome would pass with an empty-bodied
+// `delete_agent`.
+TEST_CASE("REST gs.status: a decommission erases the device's census and pending evidence, and "
+          "a re-registered device starts clean (#5675)",
+          "[pg][rest][guaranteed_state][decommission]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    h.seed_rule("r2", "rule-2");
+    h.seed_rule("r3", "rule-3");
+    install_fail_marked_trigger(h);
+
+    // WS-1: errored on r1 and r2; a later r1 verdict the trigger refuses (pending evidence on a
+    // represented pair); a first r3 verdict the trigger refuses (pending evidence, no census row).
+    // WS-2: errored on r1 only, and it stays untouched.
+    h.seed_status("a1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:01:00Z");
+    h.seed_status("a2", "WS-1", "r2", "guard.unhealthy", "2026-06-20T10:01:00Z");
+    h.seed_status("a3", "WS-2", "r1", "guard.unhealthy", "2026-06-20T10:01:00Z");
+    h.seed_status("p1", "WS-1", "r1", "guard.unhealthy", kFailMarkedTs);
+    h.seed_status("p2", "WS-1", "r3", "guard.compliant", kFailMarkedTs);
+
+    const auto get = [&](const std::string& path, bool with_headers) {
+        auto res = with_headers ? h.sink.Get(path, h.status_route_headers()) : h.sink.Get(path);
+        REQUIRE(res);
+        INFO(res->body);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    };
+    const auto fleet = [&] {
+        return get("/api/v1/guaranteed-state/status", true);
+    };
+    const auto device = [&](const char* id) {
+        return get(std::string("/api/v1/guaranteed-state/status/") + id, false);
+    };
+    const auto device_guards = [&](const char* id) {
+        return get(std::string("/api/v1/guaranteed-state/agents/") + id + "/rules", false);
+    };
+
+    // Before: the state the cascade has to remove.
+    {
+        const auto f = fleet();
+        CHECK(f["errored_rules"].get<int>() == 2);   // r1 and r2
+        CHECK(f["uncertain_rules"].get<int>() == 1); // r1, through WS-1's pending evidence
+        const auto d = device("WS-1");
+        CHECK(d["total_rules"].get<int>() == 2);
+        CHECK(d["errored_rules"].get<int>() == 2);
+        CHECK(d["uncertain_rules"].get<int>() == 1);
+        const auto g = device_guards("WS-1");
+        CHECK(g["unrepresented_pending_guards"].get<int>() == 1);
+        CHECK(string_array(g["unrepresented_pending_rule_ids"]) == std::vector<std::string>{"r3"});
+        REQUIRE(h.store->pending_projection_count_checked().has_value());
+        CHECK(*h.store->pending_projection_count_checked() == 2);
+    }
+
+    // Decommission through the real cascade, so the registration path (store name, deleter) runs.
+    AgentDecommission cascade{AgentDecommissionStores{.guaranteed_state = h.store.get()}};
+    const DecommissionResult result = cascade.decommission("WS-1");
+    CHECK(result.ok());
+    CHECK(result.deleted == 1);
+    const auto line = std::find_if(result.stores.begin(), result.stores.end(),
+                                   [](const auto& s) { return s.store == "guaranteed_state"; });
+    REQUIRE(line != result.stores.end());
+    CHECK(line->outcome == DecommissionOutcome::Deleted);
+
+    // After: every read agrees that WS-1 is gone and WS-2 is untouched.
+    {
+        const auto f = fleet();
+        CHECK(f["errored_rules"].get<int>() == 1); // WS-2's r1 only
+        CHECK(f["uncertain_rules"].get<int>() == 0);
+        const auto d = device("WS-1");
+        CHECK(d["total_rules"].get<int>() == 0);
+        CHECK(d["errored_rules"].get<int>() == 0);
+        CHECK(d["uncertain_rules"].get<int>() == 0);
+        const auto g = device_guards("WS-1");
+        CHECK(g["guards"].empty());
+        CHECK(g["unrepresented_pending_guards"].get<int>() == 0);
+        CHECK(g["unrepresented_pending_rule_ids"].empty());
+        CHECK(device("WS-2")["errored_rules"].get<int>() == 1);
+        const auto rows = h.store->agent_rule_statuses_for_agent("WS-1");
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+        const auto other = h.store->agent_rule_statuses_for_agent("WS-2");
+        REQUIRE(other.has_value());
+        CHECK(other->size() == 1);
+        REQUIRE(h.store->pending_projection_count_checked().has_value());
+        CHECK(*h.store->pending_projection_count_checked() == 0);
+    }
+
+    // Re-registration under the same id: a verdict that is older than the retired evidence's
+    // ordering key creates a clean row, not one folded together with the erased evidence.
+    h.seed_status("n1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:30Z");
+    {
+        const auto f = fleet();
+        CHECK(f["errored_rules"].get<int>() == 1); // still only WS-2's r1
+        CHECK(f["uncertain_rules"].get<int>() == 0);
+        const auto d = device("WS-1");
+        CHECK(d["total_rules"].get<int>() == 1);
+        CHECK(d["errored_rules"].get<int>() == 0);
+        CHECK(d["uncertain_rules"].get<int>() == 0);
+        const auto g = device_guards("WS-1");
+        REQUIRE(g["guards"].size() == 1);
+        CHECK(g["guards"][0]["state"].get<std::string>() == "compliant");
+        CHECK_FALSE(g["guards"][0]["order_uncertain"].get<bool>());
+        CHECK_FALSE(g["guards"][0]["projection_pending"].get<bool>());
+        CHECK(g["unrepresented_pending_guards"].get<int>() == 0);
+    }
 }

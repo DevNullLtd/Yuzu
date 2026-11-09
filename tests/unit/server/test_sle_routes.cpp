@@ -397,6 +397,44 @@ TEST_CASE("sle erase: all-Deleted → 200 decommissioned, attempt+success audite
     CHECK(h.audited("sle.agent.decommission|success"));
 }
 
+// #5675: the response names every store of the nine-store cascade, the Guardian census included,
+// and reports the Guardian line's outcome as the cascade returned it (a failure is not rolled up
+// into a success).
+TEST_CASE("sle erase: the nine-store result is reported per store, Guardian census included",
+          "[sle_routes]") {
+    SleHarness h;
+    h.allow_scoped_all = true;
+    DecommissionResult r;
+    r.agent_id = "agent-1";
+    for (const char* name : {"inventory", "software_inventory", "app_perf_daily",
+                             "device_inventory", "software_licensing", "app_usage",
+                             "offline_endpoint", "certificate_inventory", "guaranteed_state"}) {
+        r.stores.push_back({name, DecommissionOutcome::Deleted, ""});
+        ++r.deleted;
+    }
+    h.decommission_result = r;
+    {
+        auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto j = json::parse(res->body)["data"];
+        CHECK(j["deleted"] == 9);
+        REQUIRE(j["stores"].size() == 9);
+        CHECK(j["stores"]["guaranteed_state"] == "deleted");
+    }
+    h.decommission_result.stores.back().outcome = DecommissionOutcome::Failed;
+    h.decommission_result.stores.back().error = "txn rolled back";
+    --h.decommission_result.deleted;
+    ++h.decommission_result.failed;
+    {
+        auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(res->body.find("\"guaranteed_state\":\"failed\"") != std::string::npos);
+        CHECK(res->body.find("\"inventory\":\"deleted\"") != std::string::npos);
+    }
+}
+
 // Kills: the outcome row's persist failure being invisible (a (void)try_persist_audit that
 // never sets the header), which left the page client's warning branch dead.
 TEST_CASE("sle erase: a lost OUTCOME audit row sets Sec-Audit-Failed on the 200 and on the partial 500",
