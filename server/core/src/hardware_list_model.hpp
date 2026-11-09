@@ -283,9 +283,9 @@ inline constexpr std::string_view kSectionContentDigestUnverifiableReason =
 [[nodiscard]] std::string_view section_fault_label(SectionFault fault) noexcept;
 
 /// The level and reason a table-backed section is SERVED with: `verify_section_row_count` first,
-/// then the content digest. Serving paths call it through `served_section_verdict`, which adds the
-/// registered/table-backed guard; anything that serves raw `get_device_ci_sections` levels must
-/// call one of the two.
+/// then the content digest. Serving paths MUST go through `served_section_verdict`, which adds the
+/// registered/table-backed guard: called directly on a status-only or unregistered kind that
+/// carries a stored count, this function can report a fault the served body never carries.
 ///
 /// Pure. Rules, on top of the row-count rules above:
 ///  - `content_digest == nullopt` (a status-only kind, or a row written before migration v3):
