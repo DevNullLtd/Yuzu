@@ -446,12 +446,11 @@ agent forwards on every heartbeat as `yuzu.plugin.echo.db_corruption_total` /
 deduplicated against the audit store and bounded to one row per agent per 10
 minutes per server process (intermediate quarantines inside that window collapse
 to the newest identity; another HA node can add a second row for the same
-identity) — see the audit-log reference. Agents are admitted independently, so
-a quarantine that hits many devices in the same moment produces its audit rows
-within the same heartbeat round rather than one device per heartbeat; only a
-repeat report from a device whose lookup is already in flight is deferred to its
-next heartbeat. A plugin that failed to
-initialise (including Echo when the corrupt file cannot be moved aside) is reported
+identity) — see the audit-log reference. Agents are no longer serialised against
+each other, so a quarantine that hits many devices at once produces each device's
+audit row on its own next heartbeat; only a repeat report from a device whose
+lookup is already in flight is deferred. A plugin that failed to initialise
+(including Echo when the corrupt file cannot be moved aside) is reported
 in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
 which distinguishes "failed to load" from "not installed". The plugin keeps its
 count in a private storage record; if that record is present but unreadable the

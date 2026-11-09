@@ -36,6 +36,9 @@
  * is held every other should_log() for THAT agent returns false (retried on a
  * later heartbeat); other agents are admitted, so a burst of distinct agents
  * (a mass quarantine) is not serialised to one row per heartbeat (#5033).
+ * Concurrency is bounded by the heartbeat ingest threads, since the lookup and
+ * the write run synchronously on the calling thread, and a pool-exhaustion
+ * failure still feeds the gate-wide degraded window.
  *
  * Durability choice, stated for a future third case: this gate round-trips
  * the audit store itself so dedup survives a restart/HA switch, unlike the
@@ -212,11 +215,13 @@ public:
     /// Lifetime rule: `agent_id` is referenced, not copied (the constructor stays
     /// noexcept and non-allocating), so it must outlive the Reservation. At the one
     /// production site (the server.cpp corruption sink) it is the sink lambda's
-    /// parameter, which outlives the scoped reservation.
+    /// parameter, which outlives the scoped reservation. A temporary is rejected at
+    /// compile time (the deleted rvalue overload below).
     class Reservation {
     public:
         Reservation(EchoCorruptionAuditGate& gate, const std::string& agent_id) noexcept
             : gate_(&gate), agent_(&agent_id) {}
+        Reservation(EchoCorruptionAuditGate&, std::string&&) = delete;
         Reservation(const Reservation&) = delete;
         Reservation& operator=(const Reservation&) = delete;
         Reservation(Reservation&&) = delete;

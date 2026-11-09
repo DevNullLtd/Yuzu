@@ -2243,6 +2243,37 @@ TEST_CASE("EchoCorruptionAuditGate::Reservation: a throw between reservation and
     CHECK(gate.should_log("c", "3:h"));
 }
 
+TEST_CASE("EchoCorruptionAuditGate: a throwing lookup releases only its own agent's slot and "
+          "opens no degraded window",
+          "[health_store][echo][corruption][gate]") {
+    using yuzu::server::detail::EchoCorruptionAuditGate;
+    int64_t clock = 1000;
+    EchoCorruptionAuditGate* gp = nullptr;
+    bool throw_in_a = true;
+    bool inner_b = true;
+    EchoCorruptionAuditGate gate(
+        [&](const std::string& agent) -> std::optional<std::optional<std::string>> {
+            if (agent == "a" && throw_in_a) {
+                throw_in_a = false;
+                inner_b = gp->should_log("b", "2:g"); // b's slot is held: refused, no lookup
+                throw std::runtime_error("lookup failed");
+            }
+            return std::optional<std::string>{}; // no prior row
+        },
+        [&] { return clock; });
+    gp = &gate;
+
+    REQUIRE(gate.should_log("b", "2:g")); // b holds its slot across a's failing lookup
+    REQUIRE_THROWS_AS(gate.should_log("a", "1:f"), std::runtime_error);
+    CHECK_FALSE(inner_b);
+    CHECK_FALSE(gate.should_log("b", "2:g")); // b's slot is untouched by a's throw
+    // a's slot was released and a throw opens no degraded window: with the clock unchanged a is
+    // admitted again.
+    CHECK(gate.should_log("a", "1:f"));
+    gate.mark_logged("a", "1:f");
+    gate.mark_logged("b", "2:g");
+}
+
 TEST_CASE("EchoCorruptionAuditGate: per-agent map is bounded by fleet, never wiped",
           "[health_store][echo][corruption][gate]") {
     using yuzu::server::detail::EchoCorruptionAuditGate;
