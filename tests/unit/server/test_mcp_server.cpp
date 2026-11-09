@@ -51792,6 +51792,24 @@ TEST_CASE("MCP result-sets: create_result_set audits a NUL name or parent_id as 
     SECTION("NUL in parent_id") {
         expect_refused({{"name", "ok"}, {"parent_id", "rs_" + with_nul}}, "parent_id");
     }
+
+    SECTION("NUL in source_kind") {
+        const auto before = ts.audit_log.size();
+        const std::string kind_with_nul("echo\0query", 10);
+        auto res = ts.call(rs_tool_call_body("create_result_set",
+                                             {{"name", "ok"}, {"source_kind", kind_with_nul}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: source_kind must not contain a NUL byte");
+        // The audit detail carries the neutralised kind, never the raw byte.
+        const auto denied = wf_rows_since(ts, before, "result_set.create|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == "reason=field_contains_nul source_kind=echo_query");
+        CHECK(wf_rows_since(ts, before, "result_set.create|success").empty());
+    }
 }
 
 // Re-evaluation reads the stored source payload; a NUL that JSON decoding produces from a
@@ -51966,7 +51984,7 @@ TEST_CASE("MCP add_management_group_member: a control byte in an id is refused a
     }
 
     // Clean controls (including a space and a multi-byte character) still add the member.
-    for (const std::string agent : {std::string("agent-1"), std::string("agent \xc3\xa9 2")}) {
+    for (const std::string& agent : {std::string("agent-1"), std::string("agent \xc3\xa9 2")}) {
         const auto before = ts.audit_log.size();
         auto res = ts.call(rs_tool_call_body("add_management_group_member",
                                              {{"group_id", gid}, {"agent_id", agent}}));

@@ -792,7 +792,7 @@ TEST_CASE("POST /management-groups/{id}/roles: a role name with a control byte i
         auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
         REQUIRE(res);
         CHECK(res->status == 400);
-        CHECK(res->body.find("role name must not contain control characters") !=
+        CHECK(res->body.find("role name must be valid text without control characters") !=
               std::string::npos);
         CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
 

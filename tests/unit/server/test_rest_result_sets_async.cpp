@@ -5078,8 +5078,9 @@ TEST_CASE("POST /api/v1/result-sets: a NUL in the name, source_kind or parent_id
 
     const auto expect_refused = [&h](int status, const nlohmann::json& j, const std::string& kind) {
         CHECK(status == 400);
+        REQUIRE(j.contains("error"));
         CHECK(j["error"]["message"].get<std::string>() ==
-              "RESULT_SET_BAD_REQUEST: name, parameters and parent_id must not contain a "
+              "RESULT_SET_BAD_REQUEST: name, source_kind and parent_id must not contain a "
               "NUL byte");
         REQUIRE(h.audits.size() == 1);
         CHECK(h.audits[0].action == "result_set.create");
@@ -5115,6 +5116,10 @@ TEST_CASE("POST /api/v1/result-sets: a NUL in the name, source_kind or parent_id
         auto j = h.post("/api/v1/result-sets", body.dump(), status);
         // The audit detail carries the neutralised kind, never the raw byte.
         CHECK(status == 400);
+        REQUIRE(j.contains("error"));
+        CHECK(j["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: name, source_kind and parent_id must not contain a "
+              "NUL byte");
         REQUIRE(h.audits.size() == 1);
         CHECK(h.audits[0].result == "denied");
         CHECK(h.audits[0].detail.find('\0') == std::string::npos);

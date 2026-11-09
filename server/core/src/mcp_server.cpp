@@ -13588,7 +13588,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
                                    audit_token(group_id), "invalid_role_name");
                     res.set_content(a4_error(kInvalidParams,
-                                             "role name must not contain control characters"),
+                                             "invalid role format: role name must be valid text "
+                                             "without control characters"),
                                     "application/json");
                     return;
                 }
@@ -15428,6 +15429,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (rs_has_nul(cr.name)) {
                     rs_refuse_nul("name", cr.source_kind);
+                    return;
+                }
+                if (rs_has_nul(cr.source_kind)) {
+                    rs_refuse_nul("source_kind", cr.source_kind);
                     return;
                 }
                 if (pid && rs_has_nul(*pid)) {
@@ -27517,8 +27522,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                    "EnginePrincipal", principal_id, "invalid_role_name");
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "invalid role format: role name must not contain control "
-                                       "characters"),
+                                       "invalid role format: role name must be valid text "
+                                       "without control characters"),
                         "application/json");
                     return;
                 }
@@ -27646,8 +27651,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                    "EnginePrincipal", principal_id, "invalid_role_name");
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "invalid role format: role name must not contain control "
-                                       "characters"),
+                                       "invalid role format: role name must be valid text "
+                                       "without control characters"),
                         "application/json");
                     return;
                 }
@@ -28112,8 +28117,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                    audit_token(principal_id), "invalid_role_name");
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "invalid role format: role name must not contain control "
-                                       "characters"),
+                                       "invalid role format: role name must be valid text "
+                                       "without control characters"),
                         "application/json");
                     return;
                 }
