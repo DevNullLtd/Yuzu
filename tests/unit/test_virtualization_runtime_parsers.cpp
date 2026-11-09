@@ -13,10 +13,13 @@
 #include "virtualization_runtime_parsers.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
+#include <format>
 #include <regex>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace yuzu::virtualization;
@@ -63,14 +66,29 @@ TEST_CASE("runtime verbs: every index builds a GET on one of exactly four allowl
         const auto req = verb == Verb::container_inspect ? build_request(verb, id('a'))
                                                          : build_request(verb);
         REQUIRE(req.has_value());
-        CHECK(req->method == "GET");
-        CHECK((allowed.count(req->path) == 1 || std::regex_match(req->path, inspect)));
-        CHECK(req->verb == verb);
+        CHECK(req->method() == "GET");
+        CHECK((allowed.count(req->path()) == 1 || std::regex_match(req->path(), inspect)));
+        CHECK(req->verb() == verb);
         ++built;
     }
     CHECK(built == 4);
     CHECK(kVerbs.size() == 4);
     CHECK_FALSE(build_request(Verb::count).has_value());
+}
+
+TEST_CASE("runtime verbs: a Request can only come out of the verb table",
+          "[virtualization][runtime][verbs]") {
+    // `Request{verb, "GET", "/x"}` and `Request{}` do not compile: the constructor is private, so
+    // build_request is the one way to make one. A copy of a built request is still a table row.
+    static_assert(!std::is_aggregate_v<Request>);
+    static_assert(!std::is_default_constructible_v<Request>);
+    static_assert(!std::is_constructible_v<Request, Verb, const char*, const char*>);
+    static_assert(!std::is_constructible_v<Request, Verb, std::string, std::string>);
+    static_assert(std::is_copy_constructible_v<Request>);
+    const auto built = build_request(Verb::version);
+    REQUIRE(built.has_value());
+    const Request copy = *built;
+    CHECK(copy.path() == "/version");
 }
 
 TEST_CASE("runtime verbs: an inspect id must be 12 to 64 lowercase hex and nothing else builds "
@@ -224,12 +242,39 @@ TEST_CASE("runtime endpoint: status tables (decide_endpoint)", "[virtualization]
     for (const auto v : {EndpointVerdict::unset, EndpointVerdict::ok, EndpointVerdict::absent})
         CHECK(endpoint_reason_token(v) == "-");
 
+    // the constraint token: the refusal reason, `unreachable` for ENOENT, nothing for unset and ok
+    CHECK(endpoint_failure_cause(EndpointVerdict::unset).empty());
+    CHECK(endpoint_failure_cause(EndpointVerdict::ok).empty());
+    CHECK(endpoint_failure_cause(EndpointVerdict::absent) == "unreachable");
+    for (const auto v : {EndpointVerdict::relative, EndpointVerdict::dotdot, EndpointVerdict::too_long,
+                         EndpointVerdict::default_socket, EndpointVerdict::same_inode,
+                         EndpointVerdict::not_socket, EndpointVerdict::symlink, EndpointVerdict::owner,
+                         EndpointVerdict::group, EndpointVerdict::mode,
+                         EndpointVerdict::insecure_ancestor, EndpointVerdict::stat_error}) {
+        CHECK(endpoint_failure_cause(v) == endpoint_reason_token(v));
+        CHECK(std::regex_match(rt_token("endpoint:" + endpoint_failure_cause(v)),
+                               std::regex{"^linux:virtualization:runtime_posture(:[a-z0-9_]+)+$"}));
+    }
+
     CHECK(endpoint_status_for(Outcome::ok) == EndpointStatus::ok);
     CHECK(endpoint_status_for(Outcome::eacces) == EndpointStatus::permission_denied);
     for (const auto o : {Outcome::enoent, Outcome::timeout, Outcome::other})
         CHECK(endpoint_status_for(o) == EndpointStatus::unreachable);
     CHECK(endpoint_status_for(Outcome::not_http) == EndpointStatus::not_http);
     CHECK(endpoint_status_for(Outcome::oversized) == EndpointStatus::not_http);
+}
+
+TEST_CASE("runtime status: a read error is a timeout only once its read timer has run out",
+          "[virtualization][runtime][status]") {
+    using std::chrono::milliseconds;
+    const milliseconds read_to{5000};
+    CHECK(classify_read_error(milliseconds{0}, read_to) == Outcome::not_http);
+    CHECK(classify_read_error(milliseconds{4949}, read_to) == Outcome::not_http); // read_to - 51
+    CHECK(classify_read_error(milliseconds{4950}, read_to) == Outcome::timeout);  // read_to - 50
+    CHECK(classify_read_error(milliseconds{5000}, read_to) == Outcome::timeout);
+    CHECK(classify_read_error(milliseconds{9000}, read_to) == Outcome::timeout);
+    // a budget under the slack always reads as a timeout
+    CHECK(classify_read_error(milliseconds{0}, milliseconds{20}) == Outcome::timeout);
 }
 
 TEST_CASE("runtime status: detection is about standard paths and an endpoint failure changes none",
@@ -352,6 +397,15 @@ TEST_CASE("runtime daemon.json: wrong types and bad text never throw and never r
     CHECK(wrong.rows[0].key == "log-driver");
     CHECK(wrong.rows[0].value == "invalid");
 
+    // a value of the wrong kind for ITS key is skipped, not rendered through another kind's path: a
+    // boolean on a string key must not read yes/no, nor a string on a boolean key
+    const auto kinds = parse_daemon_json(R"({"data-root":true,"log-driver":false,"storage-driver":true,
+                                              "userns-remap":false,"icc":true,"tls":"true"})");
+    REQUIRE_FALSE(kinds.malformed);
+    REQUIRE(kinds.rows.size() == 1);
+    CHECK(kinds.rows[0].key == "icc");
+    CHECK(kinds.rows[0].value == "yes");
+
     const auto tcp_no = parse_daemon_json(R"({"hosts":["unix:///var/run/docker.sock"]})");
     REQUIRE(tcp_no.rows.size() == 2);
     CHECK(tcp_no.rows[1].value == "no");
@@ -403,12 +457,14 @@ TEST_CASE("runtime /version: the dialect comes from Components, wrong types are 
     CHECK(parse_version(json::parse(R"({"Version":"1.0\u001b"})")).version == "invalid");
 }
 
-TEST_CASE("runtime /info: exactly three rows, no other key is read", "[virtualization][runtime][info]") {
-    const auto rows = parse_info(json::parse(R"({
+TEST_CASE("runtime /info: at most three rows, no other key is read", "[virtualization][runtime][info]") {
+    const auto info = parse_info(json::parse(R"({
         "CgroupDriver":"systemd",
         "SecurityOptions":["name=seccomp,profile=builtin","name=rootless"],
         "RegistryConfig":{"Auth":"x"}, "Name":"host", "DockerRootDir":"/var/lib/docker",
         "HttpProxy":"http://u:p@h"})"));
+    CHECK_FALSE(info.malformed);
+    const auto& rows = info.rows;
     REQUIRE(rows.size() == 3);
     CHECK(rows[0].key == "rootless");
     CHECK(rows[0].value == "yes");
@@ -417,16 +473,49 @@ TEST_CASE("runtime /info: exactly three rows, no other key is read", "[virtualiz
     CHECK(rows[2].key == "security_options_count");
     CHECK(rows[2].value == "2");
 
-    const auto rootful = parse_info(json::parse(R"({"CgroupDriver":"cgroupfs","SecurityOptions":["name=seccomp"]})"));
-    REQUIRE(rootful.size() == 3);
-    CHECK(rootful[0].value == "no");
+    const auto rootful =
+        parse_info(json::parse(R"({"CgroupDriver":"cgroupfs","SecurityOptions":["name=seccomp"]})"));
+    CHECK_FALSE(rootful.malformed);
+    REQUIRE(rootful.rows.size() == 3);
+    CHECK(rootful.rows[0].value == "no");
 
-    // wrong types: skipped, never thrown on
-    CHECK(parse_info(json::parse(R"({"CgroupDriver":3,"SecurityOptions":"x"})")).empty());
-    CHECK(parse_info(json::parse("[]")).empty());
+    // a missing key omits its row and is not malformed
+    const auto only_driver = parse_info(json::parse(R"({"CgroupDriver":"systemd"})"));
+    CHECK_FALSE(only_driver.malformed);
+    REQUIRE(only_driver.rows.size() == 1);
+    CHECK(only_driver.rows[0].key == "cgroup_driver");
+    const auto empty = parse_info(json::parse("{}"));
+    CHECK_FALSE(empty.malformed);
+    CHECK(empty.rows.empty());
+
+    // a non-object reply and a wrong-typed key are malformed, never thrown on, never rendered
+    for (const char* body : {"[]", "\"s\"", "7", "null"}) {
+        const auto bad = parse_info(json::parse(body));
+        INFO(body);
+        CHECK(bad.malformed);
+        CHECK(bad.rows.empty());
+    }
+    const auto wrong = parse_info(json::parse(R"({"CgroupDriver":3,"SecurityOptions":"x"})"));
+    CHECK(wrong.malformed);
+    CHECK(wrong.rows.empty());
+    const auto wrong_driver = parse_info(json::parse(R"({"CgroupDriver":3})"));
+    CHECK(wrong_driver.malformed);
+    CHECK(wrong_driver.rows.empty());
+    const auto wrong_options = parse_info(json::parse(R"({"SecurityOptions":5})"));
+    CHECK(wrong_options.malformed);
+    CHECK(wrong_options.rows.empty());
+    // a well-typed key still reports beside a wrong-typed one
+    const auto mixed =
+        parse_info(json::parse(R"({"CgroupDriver":"systemd","SecurityOptions":{"a":1}})"));
+    CHECK(mixed.malformed);
+    REQUIRE(mixed.rows.size() == 1);
+    CHECK(mixed.rows[0].key == "cgroup_driver");
+
+    // a string that fails its charset is `invalid`, which is a value and not a wrong type
     const auto bad_driver = parse_info(json::parse(R"({"CgroupDriver":"a\u001b"})"));
-    REQUIRE(bad_driver.size() == 1);
-    CHECK(bad_driver[0].value == "invalid");
+    CHECK_FALSE(bad_driver.malformed);
+    REQUIRE(bad_driver.rows.size() == 1);
+    CHECK(bad_driver.rows[0].value == "invalid");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -468,9 +557,7 @@ TEST_CASE("runtime list: docker-shaped and podman-shaped entries become rows wit
 TEST_CASE("runtime list: caps, skips and wrong types never throw", "[virtualization][runtime][containers]") {
     json big = json::array();
     for (int i = 0; i < 300; ++i) {
-        char hex[17];
-        std::snprintf(hex, sizeof(hex), "%016x", i);
-        big.push_back({{"Id", std::string(hex) + std::string(48, 'a')}, {"Names", {"/n"}},
+        big.push_back({{"Id", std::format("{:016x}", i) + std::string(48, 'a')}, {"Names", {"/n"}},
                        {"Image", "i"}, {"State", "running"}});
     }
     const auto capped = containers_from_list(big);
@@ -633,7 +720,9 @@ TEST_CASE("runtime tokens: every token matches the plugin grammar", "[virtualiza
     const std::regex grammar{"^linux:virtualization:runtime_posture(:[a-z0-9_]+)+$"};
     for (const char* tail : {"busy", "deadline_exhausted", "rows_capped", "inspect_capped",
                              "daemon_json:malformed", "docker:overprivileged", "version:http_403",
-                             "inspect:failed:3", "docker:network_fs_skipped", "mountinfo:unreadable"})
+                             "inspect:failed:3", "docker:network_fs_skipped", "mountinfo:unreadable",
+                             "endpoint:default_socket", "endpoint:unreachable", "version:timeout",
+                             "version:response_oversized", "info:malformed", "list:entries_skipped"})
         CHECK(std::regex_match(rt_token(tail), grammar));
     CHECK(http_cause(403) == "http_403");
     CHECK(http_cause(100) == "http_100");

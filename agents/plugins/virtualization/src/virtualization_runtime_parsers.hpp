@@ -32,9 +32,10 @@
 
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
+#include <format>
 #include <initializer_list>
 #include <optional>
 #include <string>
@@ -92,10 +93,26 @@ inline constexpr std::array<VerbRow, 4> kVerbs{{
 static_assert(kVerbs.size() == static_cast<std::size_t>(Verb::count),
               "every Verb has exactly one row in kVerbs");
 
-struct Request {
-    Verb verb = Verb::version;
-    std::string method;
-    std::string path;
+class Request;
+inline std::optional<Request> build_request(Verb verb, std::string_view container_id = {});
+
+/// One request the plugin may send. There is no way to make one outside the verb table: the
+/// constructor is private and only build_request (below) uses it, so a test or a later change cannot
+/// hand the transport a hand-written method or path.
+class Request {
+public:
+    Verb verb() const { return verb_; }
+    const std::string& method() const { return method_; }
+    const std::string& path() const { return path_; }
+
+private:
+    Request(Verb verb, std::string method, std::string path)
+        : verb_{verb}, method_{std::move(method)}, path_{std::move(path)} {}
+    friend std::optional<Request> build_request(Verb, std::string_view);
+
+    Verb verb_;
+    std::string method_;
+    std::string path_;
 };
 
 /// `^[0-9a-f]{12,64}$`.
@@ -110,24 +127,20 @@ inline bool valid_container_id(std::string_view id) {
 
 /// THE constructor of a Request. An id is accepted only for container_inspect and only when it
 /// matches ^[0-9a-f]{12,64}$; anything else yields no request.
-inline std::optional<Request> build_request(Verb verb, std::string_view container_id = {}) {
+inline std::optional<Request> build_request(Verb verb, std::string_view container_id) {
     const auto index = static_cast<std::size_t>(verb);
     if (index >= kVerbs.size())
         return std::nullopt;
     const VerbRow& row = kVerbs[index];
-    Request r;
-    r.verb = verb;
-    r.method = std::string{row.method};
     if (verb == Verb::container_inspect) {
         if (!valid_container_id(container_id))
             return std::nullopt;
-        r.path = "/containers/" + std::string{container_id} + "/json";
-        return r;
+        return Request{verb, std::string{row.method},
+                       "/containers/" + std::string{container_id} + "/json"};
     }
     if (!container_id.empty())
         return std::nullopt;
-    r.path = std::string{row.path_template};
-    return r;
+    return Request{verb, std::string{row.method}, std::string{row.path_template}};
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +247,21 @@ inline std::string_view endpoint_reason_token(EndpointVerdict v) {
         return "stat_error";
     default:
         return "-";
+    }
+}
+
+/// The cause segment of the `endpoint:<cause>` constraint token for an endpoint that could not be
+/// used: its refusal reason, or `unreachable` for an endpoint path that is not there. Empty for
+/// `unset` (the operator chose no endpoint) and `ok`: neither is a failed read.
+inline std::string endpoint_failure_cause(EndpointVerdict v) {
+    switch (v) {
+    case EndpointVerdict::unset:
+    case EndpointVerdict::ok:
+        return {};
+    case EndpointVerdict::absent:
+        return "unreachable";
+    default:
+        return std::string{endpoint_reason_token(v)};
     }
 }
 
@@ -400,6 +428,17 @@ inline std::string failure_cause(Outcome o) {
     }
 }
 
+/// How long before the read timeout still counts as the timeout having fired.
+inline constexpr std::chrono::milliseconds kReadTimeoutSlack{50};
+
+/// httplib reports an expired read timer as a plain read error, so the elapsed time tells a read that
+/// ran out of time (`timeout`) from a peer that closed or spoke something that is not HTTP
+/// (`not_http`). The shell supplies the two durations; this is the one timing decision.
+inline Outcome classify_read_error(std::chrono::milliseconds elapsed,
+                                   std::chrono::milliseconds read_timeout) {
+    return elapsed >= read_timeout - kReadTimeoutSlack ? Outcome::timeout : Outcome::not_http;
+}
+
 /// The detection column: `served` when the endpoint's /version identified this runtime, else
 /// `detected` when any standard-path artefact exists, else `not_detected`. An endpoint failure
 /// never reaches here.
@@ -439,10 +478,7 @@ inline const std::array<RuntimeSpec, 3>& runtime_specs() {
 
 /// `present:<mode>:<uid>:<gid>` for the socket field of a runtime row.
 inline std::string socket_present_field(const StatResult& s) {
-    char buf[8];
-    std::snprintf(buf, sizeof(buf), "%04o", static_cast<unsigned>(s.perm()));
-    return "present:" + std::string{buf} + ":" + std::to_string(s.uid) + ":" +
-           std::to_string(s.gid);
+    return std::format("present:{:04o}:{}:{}", s.perm(), s.uid, s.gid);
 }
 
 /// `a` is `b` or lies under it, on a '/' boundary (`/ab` is not under `/a`). Callers special-case
@@ -621,7 +657,7 @@ inline VersionInfo parse_version(const nlohmann::json& j) {
 }
 
 // ---------------------------------------------------------------------------
-// /info: exactly three config rows, nothing else read (section 6)
+// /info: at most three config rows, nothing else read (section 6)
 // ---------------------------------------------------------------------------
 
 struct ConfigRow {
@@ -629,10 +665,20 @@ struct ConfigRow {
     std::string value;
 };
 
-inline std::vector<ConfigRow> parse_info(const nlohmann::json& j) {
+struct InfoRows {
     std::vector<ConfigRow> rows;
-    if (!j.is_object())
-        return rows;
+    /// The reply was not an object, or SecurityOptions / CgroupDriver was present with the wrong type.
+    /// A key that is simply absent omits its row and is not malformed (same visibility as a key
+    /// missing from daemon.json).
+    bool malformed = false;
+};
+
+inline InfoRows parse_info(const nlohmann::json& j) {
+    InfoRows out;
+    if (!j.is_object()) {
+        out.malformed = true;
+        return out;
+    }
     const auto* so = member_of_type(j, "SecurityOptions", nlohmann::json::value_t::array);
     if (so) {
         bool rootless = false;
@@ -642,13 +688,17 @@ inline std::vector<ConfigRow> parse_info(const nlohmann::json& j) {
                 if (s == "name=rootless" || s.rfind("name=rootless,", 0) == 0)
                     rootless = true;
             }
-        rows.push_back({"rootless", rootless ? "yes" : "no"});
+        out.rows.push_back({"rootless", rootless ? "yes" : "no"});
+    } else if (member(j, "SecurityOptions")) {
+        out.malformed = true;
     }
     if (const auto* cg = member_of_type(j, "CgroupDriver", nlohmann::json::value_t::string))
-        rows.push_back({"cgroup_driver", checked_config_string(cg->get_ref<const std::string&>())});
+        out.rows.push_back({"cgroup_driver", checked_config_string(cg->get_ref<const std::string&>())});
+    else if (member(j, "CgroupDriver"))
+        out.malformed = true;
     if (so)
-        rows.push_back({"security_options_count", std::to_string(so->size())});
-    return rows;
+        out.rows.push_back({"security_options_count", std::to_string(so->size())});
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -668,21 +718,27 @@ inline DaemonJson parse_daemon_json(std::string_view text) {
         return out;
     }
     const auto& j = p.value;
-    for (const char* key : {"live-restore", "userns-remap", "no-new-privileges", "icc", "iptables",
-                            "tls", "tlsverify", "data-root", "log-driver", "storage-driver",
-                            "selinux-enabled", "userland-proxy"}) {
-        const auto* m = member(j, key);
+    // One list, each key admitted only through its own type: a boolean on a string key (or a string
+    // on a boolean one) is skipped, never rendered. Row order follows this list.
+    struct Key {
+        const char* name;
+        nlohmann::json::value_t type;
+    };
+    constexpr auto kBool = nlohmann::json::value_t::boolean;
+    constexpr auto kString = nlohmann::json::value_t::string;
+    for (const Key& k : {Key{"live-restore", kBool}, Key{"userns-remap", kString},
+                         Key{"no-new-privileges", kBool}, Key{"icc", kBool},
+                         Key{"iptables", kBool}, Key{"tls", kBool}, Key{"tlsverify", kBool},
+                         Key{"data-root", kString}, Key{"log-driver", kString},
+                         Key{"storage-driver", kString}, Key{"selinux-enabled", kBool},
+                         Key{"userland-proxy", kBool}}) {
+        const auto* m = member_of_type(j, k.name, k.type);
         if (!m)
-            continue;
-        if (m->is_boolean())
-            out.rows.push_back({key, m->get<bool>() ? "yes" : "no"});
-        else if (m->is_string()) {
-            const std::string_view k{key};
-            if (k == "userns-remap" || k == "data-root" || k == "log-driver" ||
-                k == "storage-driver")
-                out.rows.push_back({key, checked_config_string(m->get_ref<const std::string&>())});
-        }
-        // a value of any other type is skipped, never rendered
+            continue; // absent, or of another type: skipped, never rendered
+        if (k.type == kBool)
+            out.rows.push_back({k.name, m->get<bool>() ? "yes" : "no"});
+        else
+            out.rows.push_back({k.name, checked_config_string(m->get_ref<const std::string&>())});
     }
     if (const auto* hosts = member_of_type(j, "hosts", nlohmann::json::value_t::array)) {
         bool tcp = false;

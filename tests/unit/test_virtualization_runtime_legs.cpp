@@ -15,7 +15,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
-#include <cstdio>
+#include <format>
 #include <initializer_list>
 #include <map>
 #include <regex>
@@ -152,7 +152,7 @@ struct Fake {
             calls.push_back(req);
             budgets.push_back(budget);
             now += step;
-            const auto it = replies.find(req.path);
+            const auto it = replies.find(req.path());
             return it == replies.end() ? fail(Outcome::other) : it->second;
         };
         const Clock clock = [this] { return now; };
@@ -224,8 +224,11 @@ TEST_CASE("runtime seam: a default socket as the endpoint is refused by path and
         CHECK(p.rows[0] == "endpoint|endpoint_refused|default_socket|-");
         CHECK(std::vector<std::string>(p.rows.begin() + 1, p.rows.end()) ==
               std::vector<std::string>(unset.rows.begin() + 1, unset.rows.end()));
-        CHECK(p.status == StatusState::supported); // a refused endpoint is the endpoint row's story
+        // a configured endpoint that was refused is a failed read: constrained, with its cause named
+        CHECK(p.status == StatusState::constrained);
+        CHECK(has_token(p, "endpoint:default_socket"));
     }
+    CHECK(unset.status == StatusState::supported); // ... while no endpoint at all is not
 
     // an alias: another path whose inode IS the default socket's (bind mount, hard link)
     Fake alias;
@@ -234,13 +237,17 @@ TEST_CASE("runtime seam: a default socket as the endpoint is refused by path and
     const Posture a = alias.run(kEndpoint);
     CHECK(alias.calls.empty());
     CHECK(a.rows[0] == "endpoint|endpoint_refused|same_inode|-");
+    CHECK(a.status == StatusState::constrained);
+    CHECK(has_token(a, "endpoint:same_inode"));
 
     // a symlink leaf is a refusal of its own kind
     Fake link;
     StatResult l;
     l.mode = 0120777u;
     link.endpoint_leaf = l;
-    CHECK(link.run(kEndpoint).rows[0] == "endpoint|endpoint_refused|symlink|-");
+    const Posture l_run = link.run(kEndpoint);
+    CHECK(l_run.rows[0] == "endpoint|endpoint_refused|symlink|-");
+    CHECK(has_token(l_run, "endpoint:symlink"));
     CHECK(link.calls.empty());
 }
 
@@ -251,6 +258,8 @@ TEST_CASE("runtime seam: every endpoint property refuses before the transport", 
         CHECK(f.calls.empty());
         REQUIRE_FALSE(p.rows.empty());
         CHECK(p.rows[0] == std::string{"endpoint|endpoint_refused|"} + reason + "|-");
+        CHECK(p.status == StatusState::constrained);
+        CHECK(has_token(p, std::string{"endpoint:"} + reason));
     };
     {
         Fake f;
@@ -311,7 +320,23 @@ TEST_CASE("runtime seam: every endpoint property refuses before the transport", 
         const Posture p = f.run(kEndpoint);
         CHECK(f.calls.empty());
         CHECK(p.rows[0] == "endpoint|unreachable|-|-");
+        CHECK(p.status == StatusState::constrained); // ... but it is a failed read all the same
+        CHECK(has_token(p, "endpoint:unreachable"));
     }
+}
+
+TEST_CASE("runtime seam: an endpoint whose descriptor cannot be checked is a failed read, not a clean one",
+          "[virtualization][runtime][seam]") {
+    // fstat of the opened descriptor refused (EACCES): refused as stat_error, constrained, no connect
+    Fake f;
+    f.with_docker_socket();
+    f.endpoint_leaf = errno_stat(EACCES);
+    const Posture p = f.run(kEndpoint);
+    CHECK(f.calls.empty());
+    CHECK(p.status == StatusState::constrained);
+    CHECK(p.reason == rt_token("endpoint:stat_error"));
+    CHECK(p.rows[0] == "endpoint|endpoint_refused|stat_error|-");
+    CHECK(p.rows[1] == "runtime|docker|detected|present:0660:0:999|absent|-|-"); // runtimes untouched
 }
 
 TEST_CASE("runtime seam: a configured endpoint answers; every request is a GET on an allowlisted path",
@@ -329,8 +354,8 @@ TEST_CASE("runtime seam: a configured endpoint answers; every request is a GET o
     CHECK(f.opened == std::vector<std::string>{kEndpoint});
     REQUIRE(f.calls.size() == 6); // version, info, list and exactly three inspections
     for (const auto& c : f.calls) {
-        CHECK(c.method == "GET");
-        CHECK(allowed_path(c.path));
+        CHECK(c.method() == "GET");
+        CHECK(allowed_path(c.path()));
     }
     CHECK(p.status == StatusState::supported);
     CHECK(p.reason.empty());
@@ -384,13 +409,17 @@ TEST_CASE("runtime seam: endpoint failures own the endpoint row and change no ru
     struct Case {
         Outcome outcome;
         const char* row;
+        const char* token; // the failed /version read, which constrains the status
     };
-    for (const auto& c : {Case{Outcome::eacces, "endpoint|permission_denied|-|-"},
-                          Case{Outcome::enoent, "endpoint|unreachable|-|-"},
-                          Case{Outcome::timeout, "endpoint|unreachable|-|-"},
-                          Case{Outcome::other, "endpoint|unreachable|-|-"},
-                          Case{Outcome::not_http, "endpoint|not_http|-|-"},
-                          Case{Outcome::oversized, "endpoint|not_http|-|-"}}) {
+    for (const auto& c : {Case{Outcome::eacces, "endpoint|permission_denied|-|-", "version:permission_denied"},
+                          Case{Outcome::enoent, "endpoint|unreachable|-|-", "version:unreachable"},
+                          // a peer that never completes /version inside the budget: unreachable, with
+                          // the cause named so the status cannot read as a clean answer
+                          Case{Outcome::timeout, "endpoint|unreachable|-|-", "version:timeout"},
+                          Case{Outcome::other, "endpoint|unreachable|-|-", "version:unreachable"},
+                          Case{Outcome::not_http, "endpoint|not_http|-|-", "version:not_http"},
+                          Case{Outcome::oversized, "endpoint|not_http|-|-",
+                               "version:response_oversized"}}) {
         Fake f;
         f.with_docker_socket();
         f.reply("/version", fail(c.outcome));
@@ -400,6 +429,8 @@ TEST_CASE("runtime seam: endpoint failures own the endpoint row and change no ru
         CHECK(p.rows[0] == c.row);
         CHECK(std::vector<std::string>(p.rows.begin() + 1, p.rows.begin() + 4) == runtimes);
         CHECK(rows_with(p, "container|").empty());
+        CHECK(p.status == StatusState::constrained);
+        CHECK(p.reason == rt_token(c.token)); // exactly this cause, and nothing else
     }
 
     // a 200 with a body that is not JSON: connected, but not a runtime API (a containerd socket)
@@ -408,6 +439,8 @@ TEST_CASE("runtime seam: endpoint failures own the endpoint row and change no ru
     const Posture p = f.run(kEndpoint);
     CHECK(p.rows[0] == "endpoint|not_http|-|-");
     CHECK(f.calls.size() == 1);
+    CHECK(p.status == StatusState::constrained);
+    CHECK(p.reason == rt_token("version:not_http"));
 }
 
 TEST_CASE("runtime seam: per-response recovery keeps earlier rows and runs later verbs",
@@ -451,6 +484,39 @@ TEST_CASE("runtime seam: per-response recovery keeps earlier rows and runs later
         CHECK(rows_with(p, "config|").empty());
         CHECK(rows_with(p, "container|").size() == 1);
         CHECK(f.calls.size() == 4);
+    }
+    SECTION("an /info that is not an object is malformed and the list still runs") {
+        Fake f;
+        f.happy_version();
+        f.reply("/info", http(200, "[]"));
+        f.reply("/containers/json?all=1", http(200, "[]"));
+        const Posture p = f.run(kEndpoint);
+        CHECK(has_token(p, "info:malformed"));
+        CHECK(p.status == StatusState::constrained);
+        CHECK(rows_with(p, "config|").empty());
+        CHECK(f.calls.size() == 3); // version, info and the list all ran
+    }
+    SECTION("a wrong-typed /info key is malformed; the well-typed key still reports") {
+        Fake f;
+        f.happy_version();
+        f.reply("/info", http(200, R"({"CgroupDriver":"systemd","SecurityOptions":5})"));
+        f.reply("/containers/json?all=1", http(200, "[]"));
+        const Posture p = f.run(kEndpoint);
+        CHECK(has_token(p, "info:malformed"));
+        CHECK(p.status == StatusState::constrained);
+        CHECK(rows_with(p, "config|docker|cgroup_driver|systemd").size() == 1);
+        CHECK(rows_with(p, "config|docker|rootless|").empty()); // unknown is never rendered as no
+    }
+    SECTION("a missing /info key only omits its row") {
+        Fake f;
+        f.happy_version();
+        f.reply("/info", http(200, R"({"CgroupDriver":"systemd"})"));
+        f.reply("/containers/json?all=1", http(200, "[]"));
+        const Posture p = f.run(kEndpoint);
+        CHECK(p.status == StatusState::supported);
+        CHECK(p.reason.empty());
+        CHECK(rows_with(p, "config|docker|cgroup_driver|systemd").size() == 1);
+        CHECK(rows_with(p, "config|docker|security_options_count|").empty());
     }
     SECTION("a wrong-typed list is malformed, not thrown on") {
         Fake f;
@@ -526,9 +592,7 @@ TEST_CASE("runtime seam: the inspection cap leaves the rest unknown and says so"
     f.reply("/info", http(200, kInfo));
     std::string list = "[";
     for (int i = 0; i < 70; ++i) {
-        char hex[17];
-        std::snprintf(hex, sizeof(hex), "%016x", static_cast<unsigned>(i));
-        const std::string cid = std::string(hex) + std::string(48, 'a');
+        const std::string cid = std::format("{:016x}", i) + std::string(48, 'a');
         if (i)
             list += ',';
         list += R"({"Id":")" + cid + R"(","Names":["/c"],"Image":"i","State":"running"})";
@@ -558,11 +622,9 @@ TEST_CASE("runtime seam: the list cap is reported", "[virtualization][runtime][s
     f.reply("/info", http(200, kInfo));
     std::string list = "[";
     for (int i = 0; i < 300; ++i) {
-        char hex[17];
-        std::snprintf(hex, sizeof(hex), "%016x", static_cast<unsigned>(i));
         if (i)
             list += ',';
-        list += R"({"Id":")" + std::string(hex) + std::string(48, 'a') +
+        list += R"({"Id":")" + std::format("{:016x}", i) + std::string(48, 'a') +
                 R"(","Names":["/c"],"Image":"i","State":"running"})";
     }
     list += "]";
@@ -651,6 +713,69 @@ TEST_CASE("runtime seam: daemon.json reads are typed, not guessed", "[virtualiza
         CHECK(has_token(p, "daemon_json:malformed"));
         CHECK(rows_with(p, "config|docker|daemon_json|malformed").size() == 1);
         CHECK(p.status == StatusState::constrained);
+    }
+}
+
+TEST_CASE("runtime seam: detection facts, with and without a refused stat (no endpoint, no connect)",
+          "[virtualization][runtime][detection]") {
+    SECTION("a default socket that cannot be stat'd reads unreadable and constrains, and is no detection") {
+        Fake f;
+        f.stats["/run/podman/podman.sock"] = errno_stat(EACCES);
+        const Posture p = f.run("");
+        CHECK(f.calls.empty());
+        CHECK(p.rows[2] == "runtime|podman|not_detected|unreadable|absent|-|-");
+        CHECK(p.status == StatusState::constrained);
+        CHECK(p.reason == rt_token("podman:socket:permission_denied"));
+    }
+    SECTION("a config file that cannot be stat'd reads unreadable and constrains") {
+        Fake f;
+        f.stats["/etc/containerd/config.toml"] = errno_stat(EACCES);
+        const Posture p = f.run("");
+        CHECK(p.rows[3] == "runtime|containerd|not_detected|absent|unreadable|-|-");
+        CHECK(p.status == StatusState::constrained);
+        CHECK(p.reason == rt_token("containerd:config:permission_denied"));
+    }
+    SECTION("a data root that cannot be stat'd constrains and does not change the detection") {
+        Fake f;
+        f.stats["/var/lib/docker"] = errno_stat(EIO);
+        const Posture p = f.run("");
+        CHECK(p.rows[1] == "runtime|docker|not_detected|absent|absent|-|-");
+        CHECK(p.status == StatusState::constrained);
+        CHECK(p.reason == rt_token("docker:data_root:eio"));
+
+        Fake with_socket; // another artefact still detects the runtime
+        with_socket.with_docker_socket();
+        with_socket.stats["/var/lib/docker"] = errno_stat(EIO);
+        CHECK(with_socket.run("").rows[1] ==
+              "runtime|docker|detected|present:0660:0:999|absent|-|-");
+    }
+    SECTION("a podman config on its own detects podman") {
+        Fake f;
+        f.stats["/etc/containers/storage.conf"] = regular();
+        const Posture p = f.run("");
+        CHECK(p.rows[2] == "runtime|podman|detected|absent|present|-|-");
+        CHECK(p.status == StatusState::supported);
+        CHECK(p.reason.empty());
+    }
+    SECTION("a data root on its own detects the runtime, with the socket and config absent") {
+        Fake f;
+        f.stats["/var/lib/containerd"] = dir();
+        const Posture p = f.run("");
+        CHECK(p.rows[3] == "runtime|containerd|detected|absent|absent|-|-");
+        CHECK(p.status == StatusState::supported);
+    }
+    SECTION("ENOTDIR on a path reads absent, like ENOENT, with no token") {
+        Fake f;
+        f.stats["/run/docker.sock"] = errno_stat(ENOTDIR);
+        f.stats["/var/run/docker.sock"] = errno_stat(ENOTDIR);
+        f.stats["/etc/containers/containers.conf"] = errno_stat(ENOTDIR);
+        f.stats["/var/lib/containerd"] = errno_stat(ENOTDIR);
+        const Posture p = f.run("");
+        CHECK(p.rows[1] == "runtime|docker|not_detected|absent|absent|-|-");
+        CHECK(p.rows[2] == "runtime|podman|not_detected|absent|absent|-|-");
+        CHECK(p.rows[3] == "runtime|containerd|not_detected|absent|absent|-|-");
+        CHECK(p.status == StatusState::supported);
+        CHECK(p.reason.empty());
     }
 }
 

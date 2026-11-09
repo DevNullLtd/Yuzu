@@ -296,9 +296,9 @@ spec:
     #
     #   status|runtime_posture|<supported|constrained|unsupported>|<reason or ->
     #   endpoint|<unset|endpoint_refused|permission_denied|unreachable|not_http|ok>|<reason or ->|<dialect or ->
-    #   runtime|<docker|podman|containerd>|<not_detected|detected|served>|<socket or absent>|<config present|absent>|<version or ->|<api_version or ->
-    #   config|<runtime>|<key>|<value>
-    #   container|<runtime>|<id12>|<name>|<image>|<state>|<privileged>|<network_mode>|<socket_mounted>
+    #   runtime|<docker|podman|containerd>|<not_detected|detected|served>|<socket, absent or unreadable>|<config present|absent|unreadable>|<version or ->|<api_version or ->
+    #   config|<runtime or ->|<key>|<value>
+    #   container|<runtime or ->|<id12>|<name>|<image>|<state>|<privileged>|<network_mode>|<socket_mounted>
     columns:
       - name: row_kind
         type: string
@@ -308,7 +308,7 @@ spec:
         platforms: [linux]
       - name: field_1
         type: string
-        description: 'status: the literal "runtime_posture". endpoint: the endpoint outcome, unset, endpoint_refused, permission_denied, unreachable, not_http or ok. runtime, config and container: the runtime, docker, podman or containerd.'
+        description: 'status: the literal "runtime_posture". endpoint: the endpoint outcome, unset, endpoint_refused, permission_denied, unreachable, not_http or ok. runtime: the runtime, docker, podman or containerd. config: docker for a daemon.json setting, otherwise the runtime that /version identified. container: the runtime that /version identified. For config and container the runtime is docker or podman, or "-" when /version did not identify one.'
         example: docker
         platforms: [linux]
       - name: field_2
@@ -318,12 +318,12 @@ spec:
         platforms: [linux]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, "-" when it did not answer. runtime: the default socket, present:<mode>:<uid>:<gid> or absent. config: the setting value. container: the container name.'
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:virtualization:runtime_posture:endpoint:default_socket, linux:virtualization:runtime_posture:version:timeout, linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, "-" when it did not answer. runtime: the default socket, present:<mode>:<uid>:<gid>, absent or unreadable (its stat failed). config: the setting value. container: the container name.'
         example: present:0660:0:998
         platforms: [linux]
       - name: field_4
         type: string
-        description: 'runtime: whether a config file was found, present or absent. container: the image reference. Not used by the other kinds.'
+        description: 'runtime: whether a config file was found, present, absent or unreadable (its read failed). container: the image reference. Not used by the other kinds.'
         example: present
         platforms: [linux]
       - name: field_5

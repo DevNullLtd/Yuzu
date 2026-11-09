@@ -336,6 +336,10 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
     if (verdict != EndpointVerdict::ok) {
         ep_status = endpoint_status_for(verdict);
         ep_reason = std::string{endpoint_reason_token(verdict)};
+        // A configured endpoint that was refused or is not there is a failed read: the status says
+        // so (`endpoint:<cause>`) and the endpoint row says which. `unset` is not a failure.
+        if (const std::string cause = endpoint_failure_cause(verdict); !cause.empty())
+            acc.add_failure(rt_token("endpoint:" + cause));
     } else {
         // Request budget: remaining time of the action deadline, never zero or negative. A
         // sub-millisecond remainder stops the action rather than reaching the client's "no limit".
@@ -358,7 +362,10 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
             if (!r) {
                 proceed = false;
             } else if (r->outcome != Outcome::ok) {
+                // The endpoint row says what the endpoint is; the token says the read failed (a
+                // trickling peer is `version:timeout`, an oversized reply `version:response_oversized`).
                 ep_status = endpoint_status_for(r->outcome);
+                acc.add_failure(rt_token("version:" + failure_cause(r->outcome)));
                 proceed = false;
             } else if (r->http_status != 200) {
                 acc.add_failure(rt_token("version:" + http_cause(r->http_status)));
@@ -366,6 +373,7 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
                 const ParsedJson pj = parse_limited(r->body);
                 if (!pj.ok && !pj.too_deep) {
                     ep_status = EndpointStatus::not_http; // 200 but no JSON: not a runtime API
+                    acc.add_failure(rt_token("version:not_http"));
                     proceed = false;
                 } else {
                     version = pj.ok ? parse_version(pj.value) : VersionInfo{};
@@ -402,8 +410,12 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
         };
 
         if (proceed) {
-            if (const auto info = fetch(Verb::info, "info"))
-                info_rows = parse_info(info->value);
+            if (const auto info = fetch(Verb::info, "info")) {
+                InfoRows ir = parse_info(info->value);
+                if (ir.malformed)
+                    acc.add_failure(rt_token("info:malformed"));
+                info_rows = std::move(ir.rows);
+            }
             if (const auto list = fetch(Verb::containers_list, "list")) {
                 ContainerList cl = containers_from_list(list->value);
                 if (cl.malformed)

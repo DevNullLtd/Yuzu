@@ -1,12 +1,12 @@
 # `virtualization.runtime_posture`: read-only container-runtime posture
 
-**Status:** design, written before any code. The privilege change it describes was approved by the
-owner on 2026-11-08; the security review (section 11) requires one re-acknowledgement, marked in
-section 1. Nothing below is built yet: where this note says the plugin "does" something it
-describes the code to be written in this PR, and every qualifier is meant to stay true of that code.
-Any difference found in review is fixed in the note or the code, never left standing. The sentences
-marked **binding** in sections 4, 5, 6 and 8 are the statements the code must keep true; section 11
-lists them together so a build can be briefed from them.
+**Status:** design, written before any code and since built. The privilege change it describes was
+approved by the owner on 2026-11-08; the security review (section 11) requires one re-acknowledgement,
+marked in section 1. The code was built from this note and every qualifier is kept true of it: where
+this note says the plugin "does" something, it describes the code in this PR. Any difference found in
+review is fixed in the note or the code, never left standing (section 11 records the ones found so
+far). The sentences marked **binding** in sections 4, 5, 6 and 8 are the statements the code must keep
+true; section 11 lists them together.
 
 Related: [`agent-privilege-model.md`](agent-privilege-model.md) (the privileged-actions row and the
 "Deliberately NOT granted" row for this action), `agents/plugins/virtualization/` (the plugin),
@@ -148,12 +148,14 @@ transport is never invoked):
   connect, so the object that was checked is the object connected to. Whether `connect(2)` resolves a
   `/proc/self/fd` link to an `O_PATH` socket descriptor is measured in section 9 before the code is
   relied on; if it does not, the shell connects by the checked path and this note records the
-  check-to-connect window as a residual.
+  check-to-connect window as a residual. Until that measurement says so the shell never retries by
+  path on its own: a request whose `/proc/self/fd/<N>` connect fails reads `unreachable`.
 
-**binding (`overprivileged`):** for each default socket that is present, the agent compares its `st_gid`
-against the agent's effective and supplementary groups (`getgroups`) and checks its mode for other-write.
-A match means the agent could connect to the real socket (a `SupplementaryGroups=docker` drop-in, or a
-`0666` socket), which the privilege model forbids. The agent emits the token
+**binding (`overprivileged`):** for each default socket that is present, the agent checks its mode and its
+`st_gid`. The socket is `overprivileged` when its mode has the other-write bit, or has the group-write bit
+and its `st_gid` is one of the agent's effective or supplementary groups (`getgroups`). Either way the
+agent could connect to the real socket (a `SupplementaryGroups=docker` drop-in, or a `0666` socket),
+which the privilege model forbids. The agent emits the token
 `linux:virtualization:runtime_posture:<runtime>:overprivileged`, the result is `constrained`, and the
 action otherwise proceeds. It never probes by connecting.
 
@@ -163,6 +165,12 @@ privilege model forbids (pointing the agent at the real socket). It is not the s
 - Inode comparison only sees default sockets that exist when the action runs, and only the four known
   paths. A runtime socket at another path (a second daemon listener, a rootless socket under
   `/run/user/<uid>/`, `/run/containerd/containerd.sock.ttrpc`, a TCP listener) is not known to the agent.
+- A default socket whose `stat` fails with an error other than `ENOENT` (for example an unreadable
+  `/run/podman` on a host that took the `CAP_DAC_READ_SEARCH` opt-out) cannot be compared by inode. The
+  endpoint is not refused for that: the opt-in would be unusable on exactly such a host. The failure is
+  reported as `<runtime>:socket:<errno>` and the status is `constrained`, and the alias must still match
+  the endpoint's owner, group and mode, which a bind mount of the real socket carries from the real
+  socket.
 - The enforcement is the socket's permission bits (root-owned, agent-group `0660`, so only the agent and
   root can connect) and the operator's proxy (only the four `GET` requests get through). If the proxy is
   permissive, a compromised agent reaches whatever it permits. The agent's own verb table limits what an
@@ -173,10 +181,10 @@ privilege model forbids (pointing the agent at the real socket). It is not the s
 | Bound | Value | Behaviour when hit |
 |---|---|---|
 | Action deadline | 20 s total, monotonic clock | No further requests are issued; every completed row is kept; token `deadline_exhausted`; status `constrained`, completeness `partial` |
-| Per-request budget | the time remaining of the 20 s, applied with the HTTP client's per-request total timeout | a request over budget ends as a timeout |
+| Per-request budget | the time remaining of the 20 s, applied with the HTTP client's per-request total timeout | a request over budget ends as a timeout (`version:timeout`, `info:timeout` or `list:timeout`) |
 | Connect timeout | `min(2 s, remaining)` | `unreachable` |
 | Read inactivity timeout | `min(5 s, remaining)` | the request fails |
-| Response body | 1 MiB, enforced by a receiver that stops reading and by the client's payload cap | token `response_oversized`; no rows from that verb |
+| Response body | 1 MiB, enforced by a declared-length check before the body is read and by a receiver that stops reading; the client's own payload cap sits one read buffer above it as a backstop | token `version:response_oversized`, `info:response_oversized` or `list:response_oversized`; no rows from that verb |
 | JSON nesting | 32 levels; a parse callback discards anything deeper as it starts, so it is never built, and records the breach | the whole reply is `malformed` (`<verb>:malformed`); no field of it is read |
 | Container rows | at most 256 | token `rows_capped` |
 | Inspections | at most 64, taken from the first 64 listed | token `inspect_capped`; the rest read `unknown` |
@@ -188,8 +196,10 @@ privilege model forbids (pointing the agent at the real socket). It is not the s
 which the HTTP client reads as "no limit" (its default is zero, and it tests `<= 0`): the plugin stops
 issuing requests when the remaining budget is below 1 ms, so a sub-millisecond remainder cannot round
 to zero. The
-client has redirects off, decompression off and a 1 MiB payload cap, and every request is sent with
-`Connection: close`. Response bodies and parser error text are never logged, at any level.
+client has redirects off, decompression off and a payload cap one read buffer (16 KiB) above the 1 MiB
+body cap, and every request is sent with `Connection: close`. The 1 MiB cap itself is enforced ahead of
+the client's, by a declared-length check and by the receiver, because the client's check runs before the
+receiver and would otherwise report an oversized chunked reply as a plain read error. Response bodies and parser error text are never logged, at any level.
 
 **binding (single-flight):** the agent's dispatch pool has one worker per hardware thread and no
 per-action serialisation, so without a guard repeated dispatch against a trickling peer pins the pool.
@@ -239,11 +249,13 @@ including anything that looks like a credential, is dropped and never emitted. A
 wrong type is skipped. Malformed JSON reports `config|docker|daemon_json|malformed` and a constraint
 token.
 
-**binding (`/info` rows):** when an endpoint is configured, the `/info` reply is reduced to exactly three
+**binding (`/info` rows):** when an endpoint is configured, the `/info` reply is reduced to at most three
 `config` rows and nothing else: `rootless yes|no` (whether any `SecurityOptions` entry is
 `name=rootless`), `cgroup_driver <value>` (`CgroupDriver`, charset-checked), and
-`security_options_count <n>` (the length of `SecurityOptions`). No other `/info` key is read; the reply
-is otherwise dropped. The reviewer judged these three fields safe; the reviewer could not verify how a
+`security_options_count <n>` (the length of `SecurityOptions`). A key that is missing omits its row. A
+`SecurityOptions` or `CgroupDriver` of the wrong type, or a reply that is not an object, is
+`info:malformed` (the well-typed key still reports). No other `/info` key is read; the reply is
+otherwise dropped. The reviewer judged these three fields safe; the reviewer could not verify how a
 runtime masks credentials elsewhere in `/info`, which is why no other key is read.
 
 The TOML files are presence and `stat` only: no hand-written TOML parser is added, so podman's and
@@ -262,9 +274,17 @@ Attribution is split in two so every outcome has exactly one owner.
 | `unset` | no endpoint configured; no socket was opened |
 | `endpoint_refused` | the configured value was refused; `reason` is one of `relative`, `dotdot`, `too_long`, `default_socket`, `same_inode`, `not_socket`, `symlink`, `owner`, `group`, `mode`, `insecure_ancestor`, `stat_error` |
 | `permission_denied` | `connect` failed with `EACCES` or `EPERM` |
-| `unreachable` | `ENOENT` at the endpoint path, `ECONNREFUSED`, or a connect timeout |
-| `not_http` | connected, but `/version` was not a parseable HTTP reply with a JSON body (for example a containerd socket) |
+| `unreachable` | `ENOENT` at the endpoint path, `ECONNREFUSED`, a connect timeout, or no complete `/version` reply within the budget (token `version:timeout`) |
+| `not_http` | connected, but `/version` was not a parseable HTTP reply with a JSON body within 1 MiB (token `version:not_http` or `version:response_oversized`; for example a containerd socket) |
 | `ok` | `/version` answered; `dialect` is `docker` or `podman` (from the `Components[].Name` of the reply; `Podman Engine` means podman) |
+
+Every state other than `unset` and `ok` is also a failed read, so each adds one token to the status as
+well as being named by the endpoint row: `endpoint:<reason>` for a refusal (`endpoint:default_socket`,
+`endpoint:symlink`, ...), `endpoint:unreachable` for an endpoint path that is not there, and
+`version:<cause>` (`permission_denied`, `unreachable`, `timeout`, `response_oversized`, `not_http`) for a
+first request that failed or whose reply was not a runtime API. The result is `constrained`, never a clean
+`OK` with no containers. The row says what the endpoint is, the token says the read failed, and neither
+changes a runtime row.
 
 **Each `runtime` row carries only detection facts:**
 
@@ -280,16 +300,23 @@ Attribution is split in two so every outcome has exactly one owner.
 rootless runtime and a custom-root install can all read `not_detected`, and the contract text in the
 README says so. An endpoint failure never changes any runtime row.
 
-The result status is `OK` and `FULL` unless a read failed (a refused `stat` or `daemon.json` read, an
-oversized or malformed reply, a non-200 reply, a cap, the deadline, `busy`, `overprivileged` or a
-skipped network-mounted data root), in which case it is `CONSTRAINED` and `PARTIAL` through the shared
+The result status is `OK` and `FULL` unless a read failed (a refused `stat` or `daemon.json` read, a
+configured endpoint that was refused, absent, denied, unreachable or not a runtime API
+(`endpoint:<reason>` / `version:<cause>`), an oversized or malformed reply, a non-200 reply, a cap, the
+deadline, `busy`, `overprivileged` or a skipped network-mounted data root), in which case it is `CONSTRAINED` and `PARTIAL` through the shared
 constraint accumulator. An endpoint that is merely unset is not a constraint. Tokens follow the plugin's
 grammar `linux:virtualization:runtime_posture:<source>:<cause>`; an HTTP status inside a token is
 emitted only when it is numeric and in 100-599, otherwise the cause is `http_other`.
 
 **Per-response recovery.** A non-200, malformed or wrong-typed `/version`, `/info` or list reply yields
-unknown fields for that verb plus one token `<verb>:http_<status>` or `<verb>:malformed`; earlier rows are
-kept and later verbs still run while budget remains. A failed inspection keeps the list-derived row with
+unknown fields for that verb plus one token `<verb>:http_<status>` or `<verb>:malformed`, where `<verb>` is
+`version`, `info` or `list`; earlier rows are kept and later verbs still run while budget remains. A list
+entry that is not an object or carries no valid id is skipped and counted in the token
+`list:entries_skipped`. When `/version` answers non-200 or malformed the dialect is not known: the later
+verbs still run and their `config` and `container` rows carry `-` as the runtime, while the runtime rows
+are unchanged. A `/version` request that fails at the transport (refused, timed out, oversized, not HTTP)
+or answers 200 with a body that is not JSON stops the action: the endpoint row says which and the
+`version:<cause>` token says it was a failed read. A failed inspection keeps the list-derived row with
 the three inspect fields `unknown` and continues; the failures are counted in one token
 `inspect:failed:<n>`. An HTTP 404 on inspect (the container was removed between list and inspect) is
 expected churn: fields `unknown`, no token and no constraint.
@@ -305,10 +332,14 @@ body text.
 ```
 status|runtime_posture|<supported|constrained|unsupported>|<reason|->
 endpoint|<state>|<reason|->|<dialect|->
-runtime|<runtime>|<detection>|<present:<mode>:<uid>:<gid>|absent>|<present|absent>|<version|->|<api_version|->
-config|<runtime>|<key>|<value>
-container|<runtime>|<id12>|<name>|<image>|<state>|<privileged yes|no|unknown>|<network_mode|unknown>|<host_runtime_socket_mounted yes|no|unknown>
+runtime|<runtime>|<detection>|<present:<mode>:<uid>:<gid>|absent|unreadable>|<present|absent|unreadable>|<version|->|<api_version|->
+config|<runtime|->|<key>|<value>
+container|<runtime|->|<id12>|<name>|<image>|<state>|<privileged yes|no|unknown>|<network_mode|unknown>|<host_runtime_socket_mounted yes|no|unknown>
 ```
+
+`unreadable` means the `stat` failed with an error other than `ENOENT` or `ENOTDIR` (never read as
+`absent`), and the status carries the token. The runtime of a `config` or `container` row is the dialect
+`/version` identified; it is `-` when `/version` did not identify one (section 7, per-response recovery).
 
 **binding (per-field allow-lists):** the wire escaping (`wire_field`: NUL and malformed UTF-8 to `?`,
 then `\`, CR, LF and `|` handled) is the second layer, not the first. ESC and the other C0/C1 bytes and
@@ -350,8 +381,10 @@ body, with no probe committed:
    `fstat` type check on the `O_PATH | O_NOFOLLOW` descriptor, before the identity check gets a
    chance). A bind mount or hard link of a default socket, which `O_NOFOLLOW` does not catch, gives
    `endpoint_refused` (`same_inode`).
-4. A fake peer that sends one byte every 4 s: the action returns within the 20 s deadline with
-   `deadline_exhausted`; the elapsed time is recorded.
+4. A fake peer that sends one byte every 4 s: the action returns within the 20 s deadline, status
+   `constrained` with `version:timeout` (plus `deadline_exhausted` when a further request was due; with a
+   trickling `/version` the client's total timeout ends the one request and no further request is sent, so
+   `deadline_exhausted` alone is not the expected token); the elapsed time is recorded.
 5. `connect(2)` to a default runtime socket as an account holding only `CAP_DAC_READ_SEARCH` fails with
    `EACCES`. This note and the privilege-model row are amended with the measured fact; until then the
    claim in section 1 is an expectation from `unix(7)`.
@@ -441,10 +474,24 @@ timeout of zero or below as unbounded (its default is zero), so the pin is "neve
 (section 5). (d) The depth limit is a parse callback that discards the over-deep part and marks the
 reply malformed; it does not stop the scan of a body already capped at 1 MiB (sections 1, 5, 6).
 
+**Corrections made against the code during the gate 1 code review.** (e) A failed or slow read could
+answer `OK` and `FULL` with no container rows: a trickling or oversized `/version`, a wrong-typed `/info`,
+and an endpoint that was refused, absent or denied at its stat or open each set the endpoint row and no
+token. The code now adds a token for each (`version:<cause>`, `info:malformed`, `endpoint:<cause>`) and the
+note changed, not the mapping, where it said otherwise: the `unreachable` and `not_http` definitions and
+the result-status list (section 7), the `-` runtime on `config` and `container` rows after a non-200
+`/version` and the `unreadable` field values (section 8), at most three `/info` rows (section 6),
+`list:entries_skipped` and the verb names in tokens (section 7), the `overprivileged` condition including
+the group-write bit (section 4) and section 9 item 4. (f) The 1 MiB cap is enforced by a declared-length
+check and the receiver ahead of the client's own payload cap, which sits one read buffer above it
+(section 5). (g) The shell connects only through the checked descriptor; the earlier per-request retry by
+path is gone (section 4, section 9 item 6). (h) A default-socket `stat` failure does not refuse the
+endpoint; the residual is recorded in section 4.
+
 **Binding statements for the build (every one is marked `binding` above):** the list-reply allow-list
 (section 2); the `O_PATH|O_NOFOLLOW` open, `fstat` properties, ancestor walk, connect through
 `/proc/self/fd/N`, non-`ENOENT` errors refuse, 107-byte limit (section 4); the `overprivileged` check
 without a probe connect (section 4); the transport pins, single-flight `busy`, the 32-level depth limit,
-no body or parse-error logging, and the network-filesystem `stat` guard (section 5); the three `/info`
+no body or parse-error logging, and the network-filesystem `stat` guard (section 5); the at-most-three `/info`
 rows (section 6); the per-field allow-lists and numeric HTTP status in tokens (section 8); the one
 `try/catch(...)` at the ABI seam (section 7). The verb allow-list itself was not weakened.

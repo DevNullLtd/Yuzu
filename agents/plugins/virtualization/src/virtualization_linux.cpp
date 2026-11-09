@@ -94,7 +94,8 @@ int probe(const char* path) { return ::access(path, F_OK) == 0 ? 0 : errno; }
 // ---------------------------------------------------------------------------------------------
 // runtime_posture shell: the POSIX and httplib boundaries over runtime_posture_linux. Every
 // decision (what to refuse, what to ask, what to emit) is in virtualization_runtime_parsers.hpp
-// and virtualization_legs.hpp; nothing below decides.
+// and virtualization_legs.hpp. The one thing mapped here is httplib's own error enum, which the pure
+// header cannot see; the single timing decision in that mapping is runtime::classify_read_error.
 // ---------------------------------------------------------------------------------------------
 
 runtime::StatResult to_stat_result(const struct stat& st) {
@@ -122,11 +123,9 @@ runtime::StatResult stat_path(const std::string& path) {
 /// transport connects through it, so the object that was checked is the object connected to.
 struct EndpointHandle {
     yuzu::agent::ScopedFd fd;
-    std::string checked_path;
 };
 
 runtime::StatResult open_endpoint_checked(EndpointHandle& h, const std::string& path) {
-    h.checked_path = path;
     const int fd = ::open(path.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
     runtime::StatResult r;
     if (fd < 0) {
@@ -157,8 +156,11 @@ runtime::Outcome outcome_for_errno(int e) {
 
 /// One GET over the unix socket at `connect_path`. Transport pins (design note section 5): the total
 /// timeout is the remaining action budget and is never zero (the caller stops below 1 ms), connect
-/// min(2 s, budget), read min(5 s, budget), no redirects, no decompression, a 1 MiB payload cap,
-/// Connection: close. The body is accumulated by a receiver that stops reading at the cap. Bodies
+/// min(2 s, budget), read min(5 s, budget), no redirects, no decompression, Connection: close. The
+/// 1 MiB body cap is enforced twice, both naming the cause: a declared Content-Length over it is
+/// refused before the body is read, and the receiver stops reading at it for a chunked or unframed
+/// reply. httplib's own payload cap sits one read buffer above the receiver's, as a backstop that
+/// cannot fire first (its check precedes the receiver and would read as a plain read error). Bodies
 /// and error text are never logged.
 runtime::TransportResult one_request(const std::string& connect_path, const runtime::Request& req,
                                      std::chrono::milliseconds budget) {
@@ -175,21 +177,29 @@ runtime::TransportResult one_request(const std::string& connect_path, const runt
     cli.set_keep_alive(false);
     cli.set_follow_location(false);
     cli.set_decompress(false);
-    cli.set_payload_max_length(runtime::kMaxBodyBytes);
+    cli.set_payload_max_length(runtime::kMaxBodyBytes + CPPHTTPLIB_RECV_BUFSIZ);
 
     runtime::TransportResult out;
     bool oversized = false;
     const httplib::Headers headers{{"Connection", "close"}};
-    errno = 0;
-    const auto started = steady_clock::now();
-    auto res = cli.Get(req.path, headers, [&](const char* data, size_t n) {
+    const httplib::ResponseHandler on_headers = [&](const httplib::Response& r) {
+        if (r.get_header_value_u64("Content-Length") > runtime::kMaxBodyBytes) {
+            oversized = true;
+            return false;
+        }
+        return true;
+    };
+    const httplib::ContentReceiver on_body = [&](const char* data, size_t n) {
         if (out.body.size() + n > runtime::kMaxBodyBytes) {
             oversized = true;
             return false;
         }
         out.body.append(data, n);
         return true;
-    });
+    };
+    errno = 0;
+    const auto started = steady_clock::now();
+    auto res = cli.Get(req.path(), headers, on_headers, on_body);
     const int saved_errno = errno;
     if (oversized) {
         out.outcome = runtime::Outcome::oversized;
@@ -211,14 +221,10 @@ runtime::TransportResult one_request(const std::string& connect_path, const runt
         out.outcome = runtime::Outcome::timeout;
         break;
     case httplib::Error::Read:
-    case httplib::Error::ConnectionClosed: {
-        // httplib reports an expired read timer as a Read error; elapsed time tells it from a peer
-        // that simply is not speaking HTTP.
-        const bool timed_out = duration_cast<milliseconds>(steady_clock::now() - started) >=
-                               read_to - milliseconds{50};
-        out.outcome = timed_out ? runtime::Outcome::timeout : runtime::Outcome::not_http;
+    case httplib::Error::ConnectionClosed:
+        out.outcome = runtime::classify_read_error(
+            duration_cast<milliseconds>(steady_clock::now() - started), read_to);
         break;
-    }
     default:
         out.outcome = runtime::Outcome::not_http;
         break;
@@ -277,18 +283,14 @@ int run_linux_runtime_posture(yuzu::CommandContext& ctx) {
                        fs.groups.push_back(static_cast<std::uint32_t>(g[static_cast<size_t>(i)]));
                }
 
-               // Connect through the descriptor that was checked; fall back to the checked path
-               // only when that /proc/self/fd form cannot be resolved (the check-to-connect window
-               // is then the residual the design note names).
+               // Every request connects through the descriptor that was checked, so the object
+               // that passed the checks is the object connected to. There is no retry by path: if
+               // /proc/self/fd cannot be resolved the request reads `unreachable`, and design note
+               // section 9 item 6 decides what happens then.
                const runtime::Transport transport = [&handle](const runtime::Request& req,
                                                               std::chrono::milliseconds budget) {
-                   if (handle.fd.valid()) {
-                       const std::string via_fd = "/proc/self/fd/" + std::to_string(handle.fd.get());
-                       auto r = one_request(via_fd, req, budget);
-                       if (r.outcome != runtime::Outcome::enoent)
-                           return r;
-                   }
-                   return one_request(handle.checked_path, req, budget);
+                   return one_request("/proc/self/fd/" + std::to_string(handle.fd.get()), req,
+                                      budget);
                };
                const runtime::Clock clock = [] { return std::chrono::steady_clock::now(); };
                return runtime::runtime_posture_linux(fs, transport, clock, runtime_endpoint());
