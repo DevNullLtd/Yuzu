@@ -726,7 +726,6 @@ struct FacetState {
     bool need_full_persisted{false};
     // What the last collect() put in the blob; committed by on_ack, dropped by the next collect.
     bool pending_rows{false};
-    bool pending_status{false};
     AckedSet pending;
     // A status-only section as the server last acknowledged it. While the facet keeps answering
     // the same {status, token} the section is left out (an unchanged section is omitted, so a
@@ -739,7 +738,9 @@ struct FacetState {
         bool operator==(const StatusKey&) const = default;
     };
     std::optional<StatusKey> last_status;
-    StatusKey pending_status_key; // what this collect put in the blob; set with pending_status
+    // The status-only section this collect put in the blob (engaged = one was sent); committed
+    // into last_status by on_ack, dropped by the next collect.
+    std::optional<StatusKey> pending_status;
     // The cooldown cache (kPassCooldown).
     std::optional<Collected> cache;
     std::chrono::steady_clock::time_point cache_at{};
@@ -777,11 +778,6 @@ struct CollectorState {
             f.need_full = f.need_full_persisted;
         }
         unknown_total = std::strtoull(kv_get(unknown_total_key).c_str(), nullptr, 10);
-    }
-
-    // An UNKNOWN answer is never read as FULL; each one is counted and persisted at once (rare).
-    void count_unknown() {
-        kv_set(unknown_total_key, std::to_string(++unknown_total));
     }
 
     void set_need_full(FacetState& f, bool on) {
@@ -907,13 +903,14 @@ struct CollectorState {
         if (r.result_completeness != YUZU_RESULT_COMPLETENESS_FULL) {
             // Only a plugin that declares FULL is believed to have read everything. PARTIAL
             // overrides rows the plugin did hand over (a partial roster); an answer that declares
-            // nothing (UNKNOWN) is not FULL either, and is counted.
+            // nothing (UNKNOWN) is not FULL either; each one is counted and persisted at once
+            // (rare).
             const bool partial = r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL;
             if (partial) {
                 spdlog::warn("sync: {} typed result completeness PARTIAL — reported constrained",
                              source);
             } else {
-                count_unknown();
+                kv_set(unknown_total_key, std::to_string(++unknown_total));
                 spdlog::warn("sync: {} declared no result completeness — reported constrained "
                              "(unknown), never read as full",
                              source);
@@ -958,7 +955,8 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
                              : CollectorClock{[] { return std::chrono::steady_clock::now(); }};
     st->time_limit_override = tuning.time_limit;
     st->runner = std::move(tuning.runner);
-    st->unknown_total_key = SyncScheduler::kv_key("installed_software", "completeness_unknown_total");
+    st->unknown_total_key =
+        SyncScheduler::kv_key("installed_software", kCompletenessUnknownTotalKey);
     for (const auto& row : kInventoryActions) {
         FacetState f;
         f.source = std::string(row.plugin) + '.' + std::string(row.action);
@@ -1011,10 +1009,10 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
                 f.acked.reset();
                 st->kv_set(f.acked_key, std::string{});
                 st->set_need_full(f, false);
-                f.last_status = f.pending_status_key;
+                f.last_status = f.pending_status;
             }
             f.pending_rows = false;
-            f.pending_status = false;
+            f.pending_status.reset();
             f.pending = AckedSet{};
         }
     };
@@ -1027,7 +1025,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
         for (std::size_t i = 0; i < st->facets.size(); ++i) {
             FacetState& f = st->facets[i];
             f.pending_rows = false;
-            f.pending_status = false;
+            f.pending_status.reset();
             f.pending = AckedSet{};
             // A pass inside the cooldown rebuilds from the rows already collected. Everything
             // else dispatches; a timeout is never cached (it must see the worker's state afresh).
@@ -1071,8 +1069,8 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
                 f.pending = AckedSet{plan.section_hash, plan.row_hashes};
                 held.emplace_back(f.source, plan.section_hash);
             } else if (sent) {
-                f.pending_status = true; // held no longer: the server drops it from its report hash
-                f.pending_status_key = {plan.status, plan.token};
+                // held no longer: the server drops it from its report hash
+                f.pending_status = FacetState::StatusKey{plan.status, plan.token};
             } else if (f.acked) {
                 held.emplace_back(f.source, f.acked->section_hash); // unchanged or deferred
             }

@@ -102,6 +102,17 @@ struct SyncSource {
 /// (64) bytes.
 YUZU_EXPORT std::string sanitize_skip_reason(std::string_view reason);
 
+/// True for a non-empty run of ASCII digits, at most `max_len` long, with a value above zero
+/// (leading zeros allowed). Gates every KV counter that is published as a heartbeat tag.
+inline bool positive_digits(std::string_view s, std::size_t max_len) {
+    return s.size() <= max_len && s.find_first_not_of("0123456789") == std::string_view::npos &&
+           s.find_first_not_of('0') != std::string_view::npos;
+}
+
+/// The installed_software `__sync__` KV field holding the completeness-unknown count: written by
+/// the collector, read by emit_sync_completeness_unknown_tag.
+inline constexpr char kCompletenessUnknownTotalKey[] = "completeness_unknown_total";
+
 class YUZU_EXPORT SyncScheduler {
 public:
     /// Performs one `ReportInventory` RPC. `hashes` is sent for every due source
@@ -294,12 +305,7 @@ void emit_sync_skip_tags(TagMap& tags, const std::vector<std::string>& sources,
         const auto reason = get_fn(SyncScheduler::kv_key(name, "last_skip"));
         if (!streak || !reason || reason->empty() || sanitize_skip_reason(*reason) != *reason)
             continue;
-        if (streak->empty() || streak->size() > 6)
-            continue;
-        bool digits = true;
-        for (char c : *streak)
-            digits = digits && c >= '0' && c <= '9';
-        if (!digits || std::stol(*streak) <= 0)
+        if (!positive_digits(*streak, 6))
             continue;
         tags["yuzu.sync." + name + ".skip_streak"] = *streak;
         tags["yuzu.sync." + name + ".last_skip"] = *reason;
@@ -315,14 +321,9 @@ template <typename TagMap>
 void emit_sync_completeness_unknown_tag(
     TagMap& tags,
     const std::function<std::optional<std::string>(const std::string& key)>& get_fn) {
-    const auto total = get_fn(SyncScheduler::kv_key("installed_software", "completeness_unknown_total"));
-    if (!total || total->empty() || total->size() > 9)
-        return;
-    for (char c : *total) {
-        if (c < '0' || c > '9')
-            return;
-    }
-    if (std::stol(*total) > 0)
+    const auto total =
+        get_fn(SyncScheduler::kv_key("installed_software", kCompletenessUnknownTotalKey));
+    if (total && positive_digits(*total, 9))
         tags["yuzu.sync.installed_software.completeness_unknown_total"] = *total;
 }
 
