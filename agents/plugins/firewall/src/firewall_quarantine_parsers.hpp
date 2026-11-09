@@ -3272,7 +3272,6 @@ public:
     [[nodiscard]] virtual bool unregister_trigger(std::string_view id) = 0;
 };
 
-inline constexpr std::string_view kTtlTriggerType = "interval";
 
 /// The trigger's config: every `kTtlPollSeconds` the agent dispatches
 /// `firewall.release` with `if_ttl_expired=1`, a no-op until the record's TTL has
@@ -3291,7 +3290,7 @@ inline constexpr std::string_view kTtlTriggerType = "interval";
 /// bookkeeping failure) and says so: PARTIAL, retried at the next start.
 inline void settle_ttl(Outcome& o, TriggerRegistry& triggers) {
     if (o.state && o.state->ttl_expires > 0 && o.status != "inactive") {
-        if (!triggers.register_trigger(kTtlTriggerId, kTtlTriggerType, ttl_trigger_config())) {
+        if (!triggers.register_trigger(kTtlTriggerId, "interval", ttl_trigger_config())) {
             o.notes.emplace_back("ttl_trigger_unregistered=1");
             if (o.status == "active" || o.status == "active_unproven")
                 o.status = "partial";
