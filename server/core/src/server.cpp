@@ -20232,14 +20232,14 @@ private:
         // twin (via ToolDeps::ci_detail_fn), so the three can never drift on what
         // "the CI record" means.
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id,
-                                                      bool with_sections) -> HardwareCiDetail {
+                                                      CiRead ci_read) -> HardwareCiDetail {
             HardwareCiDetail detail;
             apply_identity_read(detail, hw_identity_fn(agent_id));
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
             if (!device_inventory_store_) {
                 detail.ci = std::unexpected(CiReadError::kDegraded);
-            } else if (with_sections) {
+            } else if (ci_read == CiRead::WithSections) {
                 // The v2 per-section statuses and rows (H.7): ONLY the REST record route and the
                 // MCP tool ask for them (the dashboard fragment, its sync-now poll and the actions
                 // lens do not render them). The record and its sections come from ONE

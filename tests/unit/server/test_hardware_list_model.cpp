@@ -863,10 +863,38 @@ TEST_CASE("hardware_ci_json: sections_state tells found from absent from degrade
     CHECK_FALSE(hardware_ci_sections_unreadable(untouched));
     CHECK(hardware_ci_json(untouched, 0)["sections_state"] == "degraded");
 
-    // ci readable but no record yet: nothing stored
+    // ci readable but no record yet, sections READ (an answered absence): nothing stored
     HardwareCiDetail none;
     none.ci = std::optional<DeviceCiRecord>{};
+    none.ci_sections = std::vector<DeviceCiSection>{};
     CHECK(hardware_ci_json(none, 0)["sections_state"] == "absent");
+
+    // The same detail with the sections NOT read (#7162): it was a bare default before and read
+    // "absent"; a NotRead state never claims the sections were read, whatever ci says.
+    HardwareCiDetail none_not_read;
+    none_not_read.ci = std::optional<DeviceCiRecord>{};
+    CHECK(hardware_ci_json(none_not_read, 0)["sections_state"] == "degraded");
+}
+
+// #7162: the not-read state is its own value and renders degraded/null, never "absent" and never a
+// new literal (the published enum is found|absent|degraded). `v2_detail({})` is a RecordOnly
+// detail once its sections are reset: a found ci whose sections were never read.
+TEST_CASE(
+    "hardware_ci_json: a RecordOnly detail with a found ci renders degraded with null sections",
+    "[hardware][model][json][sections]") {
+    auto d = v2_detail({});
+    d.ci_sections.reset(); // what CiRead::RecordOnly leaves
+    REQUIRE_FALSE(d.ci_sections.has_value());
+    CHECK_FALSE(hardware_ci_sections_unreadable(d)); // not read is not a failed read
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(j["ci_state"] == "found");
+    CHECK(j["sections_state"] == "degraded");
+    REQUIRE(j["ci"].contains("sections"));
+    CHECK(j["ci"]["sections"].is_null());
+    const auto state = j["sections_state"].get<std::string>();
+    CHECK((state == "found" || state == "absent" || state == "degraded"));
+    // The struct default is NOT READ, not "read and none".
+    CHECK_FALSE(HardwareCiDetail{}.ci_sections.has_value());
 }
 
 // ── #5531: the pure store-to-bit mappings server.cpp's closures delegate to ───
@@ -1200,6 +1228,45 @@ TEST_CASE("classify_hardware_ci_read: found, not found, roster unreadable", "[ha
     }
 }
 
+// #7162: the sections-unreadable decision is the classifier's fourth arm, in one fixed order.
+TEST_CASE("classify_hardware_ci_read: a failed sections read is SectionsUnreadable, after NotFound",
+          "[hardware][model][classify][sections]") {
+    DeviceCiRecord rec;
+    rec.agent_id = "a1";
+    HardwareCiDetail d;
+    d.ci = std::optional<DeviceCiRecord>{rec};
+
+    SECTION("a record whose sections read failed is SectionsUnreadable") {
+        d.ci_sections = std::unexpected(CiReadError::kDegraded);
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::SectionsUnreadable);
+        CHECK(hardware_ci_sections_unreadable(d));
+    }
+    SECTION("sections read, none stored, is Found") {
+        d.ci_sections = std::vector<DeviceCiSection>{};
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::Found);
+    }
+    SECTION("sections NOT READ is Found, never unreadable") {
+        d.ci_sections.reset();
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::Found);
+    }
+    SECTION("precedence: NotFound beats SectionsUnreadable (artificial: nothing else known)") {
+        d.ci = std::optional<DeviceCiRecord>{};
+        d.ci_sections = std::unexpected(CiReadError::kDegraded);
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::NotFound);
+    }
+    SECTION("precedence: RosterUnreadable beats SectionsUnreadable") {
+        d.ci = std::optional<DeviceCiRecord>{};
+        d.identity_degraded = true;
+        d.ci_sections = std::unexpected(CiReadError::kDegraded);
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::RosterUnreadable);
+    }
+    SECTION("an identity row with a failed sections read is still SectionsUnreadable") {
+        d.identity = make_row("a1");
+        d.ci_sections = std::unexpected(CiReadError::kDegraded);
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::SectionsUnreadable);
+    }
+}
+
 // ── hardware_ci_json: section edge cases (H.7 Gate 3) ────────────────────────────────────────
 
 // A row shorter than the registry's column count reads the missing trailing cells as null; a longer
@@ -1299,8 +1366,9 @@ TEST_CASE("apply_ci_with_sections_read: a failed record read is a degraded ci an
     apply_ci_with_sections_read(d, std::unexpected(CiReadError::kDegraded));
     REQUIRE_FALSE(d.ci.has_value());
     CHECK(d.ci.error() == CiReadError::kDegraded);
-    REQUIRE(d.ci_sections.has_value());
-    CHECK(d.ci_sections->empty());
+    // No sections read was made: NOT READ (was an empty list before #7162, which read "none
+    // stored").
+    CHECK_FALSE(d.ci_sections.has_value());
     CHECK_FALSE(hardware_ci_sections_unreadable(d)); // ci degraded, not a sections failure
 }
 
@@ -1311,7 +1379,8 @@ TEST_CASE("apply_ci_with_sections_read: an absent record is an answered nullopt 
     REQUIRE(d.ci.has_value());
     CHECK_FALSE(d.ci->has_value());
     REQUIRE(d.ci_sections.has_value());
-    CHECK(d.ci_sections->empty());
+    REQUIRE(d.ci_sections->has_value());
+    CHECK((*d.ci_sections)->empty());
 }
 
 TEST_CASE("apply_ci_with_sections_read: a v2 record moves its sections into ci_sections",
@@ -1326,9 +1395,10 @@ TEST_CASE("apply_ci_with_sections_read: a v2 record moves its sections into ci_s
     CHECK((*d.ci)->chassis_serial == "CHS1");
     CHECK((*d.ci)->sections.empty()); // one home for the rows
     REQUIRE(d.ci_sections.has_value());
-    REQUIRE(d.ci_sections->size() == 2);
-    CHECK((*d.ci_sections)[0].kind == "cpu");
-    CHECK((*d.ci_sections)[1].level == "unavailable");
+    REQUIRE(d.ci_sections->has_value());
+    REQUIRE((*d.ci_sections)->size() == 2);
+    CHECK((**d.ci_sections)[0].kind == "cpu");
+    CHECK((**d.ci_sections)[1].level == "unavailable");
     CHECK_FALSE(hardware_ci_sections_unreadable(d));
 }
 
@@ -1344,7 +1414,8 @@ TEST_CASE("apply_ci_with_sections_read: a v1 record serves no sections even if s
     REQUIRE(d.ci.has_value());
     REQUIRE(d.ci->has_value());
     REQUIRE(d.ci_sections.has_value());
-    CHECK(d.ci_sections->empty());
+    REQUIRE(d.ci_sections->has_value());
+    CHECK((*d.ci_sections)->empty());
     CHECK(hardware_ci_json(d, 0)["sections_state"] == "absent");
 }
 
@@ -1359,8 +1430,9 @@ TEST_CASE("apply_ci_with_sections_read: a failed sections read keeps the error a
     REQUIRE(d.ci.has_value());
     REQUIRE(d.ci->has_value());
     CHECK((*d.ci)->chassis_serial == "CHS1");
-    REQUIRE_FALSE(d.ci_sections.has_value());
-    CHECK(d.ci_sections.error() == CiReadError::kDegraded);
+    REQUIRE(d.ci_sections.has_value());
+    REQUIRE_FALSE(d.ci_sections->has_value());
+    CHECK(d.ci_sections->error() == CiReadError::kDegraded);
     CHECK(hardware_ci_sections_unreadable(d));
 }
 

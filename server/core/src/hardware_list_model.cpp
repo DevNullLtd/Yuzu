@@ -466,6 +466,10 @@ HardwareCiRead classify_hardware_ci_read(const HardwareCiDetail& detail) {
         return HardwareCiRead::RosterUnreadable; // a failed roster read is never a 404 (#5531)
     if (truly_absent)
         return HardwareCiRead::NotFound;
+    // Fourth arm, after NotFound by design (see the header: a failed sections read implies the
+    // record read returned a record, so it is never "nothing known").
+    if (hardware_ci_sections_unreadable(detail))
+        return HardwareCiRead::SectionsUnreadable;
     return HardwareCiRead::Found;
 }
 
@@ -840,20 +844,26 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
             {"machine_id_hash", ci_json_ph(ci.machine_id_hash)},
             {"machine_id_algorithm", ci_json_ph(ci.machine_id_algorithm)},
             {"machine_id_source", ci_json_ph(ci.machine_id_source)},
-            // [] = nothing stored (or not read). A failed sections read never reaches this
-            // serializer: both surfaces answer their retryable error first
-            // (`hardware_ci_sections_unreadable`), so ci.sections null is not emitted by REST or
-            // MCP today; the null arm only keeps the serializer total.
-            {"sections", detail.ci_sections ? ci_sections_json(ci, *detail.ci_sections) : nlohmann::json(nullptr)},
+            // [] = read and nothing stored. A failed sections read never reaches this serializer:
+            // both surfaces answer their retryable error first (`SectionsUnreadable`), and the
+            // two record-serving surfaces always read the sections, so ci.sections null (a failed
+            // or a not-read state) is not emitted by REST or MCP today; the null arms only keep
+            // the serializer total.
+            {"sections", detail.ci_sections && *detail.ci_sections
+                             ? ci_sections_json(ci, **detail.ci_sections)
+                             : nlohmann::json(nullptr)},
         };
         out["ci_state"] = "found";
     }
 
-    // "degraded": the sections read failed, or `ci` itself could not be read so none was made.
-    // "absent": nothing stored (a v1 agent or no record) - NOT "the device has none".
-    out["sections_state"] = hardware_ci_sections_unreadable(detail) || !detail.ci.has_value() ? "degraded"
-                            : detail.ci_sections->empty()                                      ? "absent"
-                                                                                                : "found";
+    // "degraded": the sections read failed, was never made (`ci_sections` is nullopt: the caller
+    // asked for `CiRead::RecordOnly`), or `ci` itself could not be read. Never "absent" for a
+    // not-read detail: "absent" claims the sections were read and none stored (#7162).
+    // "absent": read, nothing stored (a v1 agent or no record) - NOT "the device has none".
+    out["sections_state"] = !detail.ci.has_value() || !detail.ci_sections || !*detail.ci_sections
+                                ? "degraded"
+                            : (*detail.ci_sections)->empty() ? "absent"
+                                                             : "found";
 
     if (!detail.software) {
         out["software"] = nullptr;
@@ -945,7 +955,7 @@ void apply_ci_with_sections_read(HardwareCiDetail& detail,
     if (!read) {
         // The record read itself failed: `ci` is the error, and no sections read was made.
         detail.ci = std::unexpected(read.error());
-        detail.ci_sections = {};
+        detail.ci_sections.reset(); // NOT READ
         return;
     }
     detail.ci = std::move(read->record);

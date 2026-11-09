@@ -130,7 +130,7 @@ struct Twin {
     std::map<std::string, int> dex_by_id;
     int roster_calls = 0;
     int ci_calls = 0;
-    std::vector<bool> ci_with_sections; // the `with_sections` argument of every ci_detail_fn call
+    std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call
     std::vector<std::string> dex_calls_for;
 
     // Domain-verb audit sink (deps.audit_fn on both transports).
@@ -185,9 +185,9 @@ struct Twin {
             out.tags_degraded = tags_degraded;
             return out;
         };
-        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string& id, bool with_sections) {
+        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string& id, CiRead ci_read) {
             ++ci_calls;
-            ci_with_sections.push_back(with_sections);
+            ci_reads.push_back(ci_read);
             const auto it = ci_by_id.find(id);
             return it != ci_by_id.end() ? it->second : absent_detail();
         };
@@ -949,10 +949,10 @@ TEST_CASE("mcp hardware twins: get_hardware_ci asks for the sections and list_ha
     t.roster_rows = {make_row("a", "host-a", "linux", true)};
     t.ci_by_id["a"] = full_detail("a");
     (void)t.call("get_hardware_ci", {{"agent_id", "a"}});
-    REQUIRE(t.ci_with_sections.size() == 1);
-    CHECK(t.ci_with_sections.back() == true);
+    REQUIRE(t.ci_reads.size() == 1);
+    CHECK(t.ci_reads.back() == CiRead::WithSections);
     (void)t.call("list_hardware_ci");
-    CHECK(t.ci_with_sections.size() == 1);
+    CHECK(t.ci_reads.size() == 1);
 }
 
 // The tool description is machine metadata (A5): it names the retryable error and the meaning of

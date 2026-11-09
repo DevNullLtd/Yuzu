@@ -218,7 +218,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
         return;
     }
 
-    const HardwareCiDetail detail = deps->ci_detail_fn(agent_id, /*with_sections=*/true);
+    const HardwareCiDetail detail = deps->ci_detail_fn(agent_id, CiRead::WithSections);
     const HardwareCiRead read = classify_hardware_ci_read(detail);
     if (read == HardwareCiRead::RosterUnreadable) {
         // A failed roster read is never "not found" (#5531).
@@ -245,7 +245,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
         return;
     }
 
-    if (hardware_ci_sections_unreadable(detail)) {
+    if (read == HardwareCiRead::SectionsUnreadable) {
         // The v2 sections read failed: the REST twin's 503. A store error is never an empty 200,
         // so the record is withheld and the caller gets the same retryable error.
         answer_store_unreadable(ctx, "hardware sections unavailable", "inventory.device.ci", "Agent",
