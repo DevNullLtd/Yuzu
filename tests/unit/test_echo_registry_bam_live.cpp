@@ -9,7 +9,8 @@
  *
  * is_elevated() mirrors the helper in test_echo_registry_source.cpp (anonymous namespace there),
  * but holds the token in the HandlePtr owner where the original uses a manual CloseHandle. The
- * shared header is deferred because that file is edited by other work in flight.
+ * Sharing one copy is deferred to a follow-up (test_helpers.hpp includes no <windows.h> and is included by
+ * every test TU).
  */
 
 #ifdef _WIN32
@@ -25,6 +26,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -94,6 +96,9 @@ struct ScratchKey {
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, path.c_str());
     }
 };
+static_assert(!std::is_copy_constructible_v<ScratchKey> && !std::is_move_constructible_v<ScratchKey> &&
+                  !std::is_copy_assignable_v<ScratchKey> && !std::is_move_assignable_v<ScratchKey>,
+              "ScratchKey owns a registry key: copying or moving it would close and delete the key twice");
 
 } // namespace
 
@@ -116,14 +121,15 @@ TEST_CASE("registry live: bam\\State is never read -- a scratch value under bam 
             skip_or_fail("bam\\State is not readable on this Windows");
         if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings", 0,
                           KEY_READ, present.put()) != ERROR_SUCCESS)
-            skip_or_fail("bam\\State\\UserSettings is not present on this Windows");
+            skip_or_fail("bam\\State\\UserSettings is not present or not readable on this Windows");
     }
     const std::string leaf = yuzu::test::registry_scratch_prefix() + "bam-" +
                              std::to_string(yuzu::test::process_random_salt());
     ScratchKey control(bam + "\\" + leaf);                          // positive control: inside the watched root
     ScratchKey excluded(bam + "\\State\\UserSettings\\" + leaf);    // below the excluded subtree
-    // Both are created before either can throw, so a failure here still unwinds both owners. An
-    // elevated non-SYSTEM token may be refused; CI (LOCAL SYSTEM, the require flag set) FAILs.
+    // Both owners are constructed above, before any create() can throw, so a failure here still unwinds both
+    // (a never-created key closes and deletes nothing). An elevated non-SYSTEM token may be refused; CI (LOCAL SYSTEM,
+    // the require flag set) FAILs.
     for (ScratchKey* k : {&control, &excluded}) {
         if (const LONG rc = k->create(); rc != ERROR_SUCCESS)
             skip_or_fail("cannot create a scratch key under the bam service key (error " + std::to_string(rc) + ")");

@@ -1123,6 +1123,11 @@ progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then cal
 with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
 both follow a registry link and can delete its target.
 
+The Echo bam live case (#6898) sets a deny-read DACL for Everyone on its scratch key under `bam\State\UserSettings`,
+so a leaf it left behind (a killed run) refuses `Get-Item`, `Remove-Item` and `reg delete`, which open the key for read
+first. The recipe above still applies: the deny covers read only, so open the key with `DELETE` access and call
+`NtDeleteKey`; its sibling directly under `bam` carries the default DACL.
+
 **Leaked ETW sessions (#7175).** The echo plugin's registry source starts a system-wide real-time ETW session named
 `YuzuEchoRegistryEtw-<pid>` (`agents/plugins/echo/src/echo_registry_source.cpp`, the session-name function). A
 real-time session outlives its process until something stops it, so a test process that is killed (a meson timeout),

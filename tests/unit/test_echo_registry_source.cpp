@@ -5104,7 +5104,7 @@ struct LinkKey {
 // #7173: name the machine's ETW sessions in a failure message. Total active sessions, plus each
 // session named Yuzu*Etw-<pid> with whether that pid is still alive (a dead owner is a stale
 // session holding one of the machine's session slots; alive=? when the answer could not be had).
-// Read-only (it allocates, so it can throw bad_alloc like any code).
+// Read-only; it allocates (a buffer and strings), so it is not noexcept.
 std::string etw_session_table() {
     constexpr ULONG kMax = 64;
     constexpr ULONG kName = 1024; // wchar_t slots reserved for each logger name

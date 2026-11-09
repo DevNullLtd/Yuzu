@@ -45,6 +45,7 @@ $all = @(foreach ($root in $roots) {
     if (-not (Test-Path -LiteralPath $root)) { continue }   # a root this OS does not have holds nothing
     # Names only, from the parent: listing needs enumerate access on the root, not read access on each child, so one
     # unreadable child (the bam live case denies read on its scratch key while it runs) cannot fail the whole root.
+    # Such a leaf refuses Remove-Item and reg delete too (both open for read): open it with DELETE access only and NtDeleteKey it, see docs/ci-architecture.md "Removing a leftover".
     try { (Get-Item -LiteralPath $root -ErrorAction Stop).GetSubKeyNames() | Where-Object { $_ -like 'YuzuTest-*' } | ForEach-Object { "$root\$_" } }
     catch { $failed += $root; Write-Host "::error::could not list $root so its leftovers are unknown: $($_.Exception.Message)" }
 })

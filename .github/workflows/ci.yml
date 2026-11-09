@@ -2205,11 +2205,12 @@ jobs:
       - name: Test (non-pg suites)
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
-          # #6488: the registry plugin's real-registry cases (tests/unit/test_registry_write_local_dispatcher.cpp
-          # skip_or_fail, tests/unit/test_registry_win_internals.cpp skip_or_fail, and the Echo bam live case's
-          # tests/unit/test_echo_registry_bam_live.cpp skip_or_fail) WARN-or-SKIP when registry.dll is missing or the
-          # process cannot write HKLM, and a skip is green. This job runs as LOCAL SYSTEM (see the shell comment
-          # above), which is elevated, so a skip here is a regression: "1" turns it into a FAIL.
+          # #6488: the registry plugin's real-registry cases (tests/unit/test_registry_write_local_dispatcher.cpp and
+          # tests/unit/test_registry_win_internals.cpp, skip_or_fail) WARN when registry.dll is missing or the process cannot
+          # write HKLM, and the Echo bam live case (tests/unit/test_echo_registry_bam_live.cpp, skip_or_fail) SKIPs when the
+          # process is not elevated, bam\State cannot be opened or a scratch key under bam is refused; both outcomes are green.
+          # This job runs as LOCAL SYSTEM (see the shell comment above), which is elevated, so a skip here is a
+          # regression: "1" turns it into a FAIL.
           YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS: "1"
           # The fixtures' key-name scope (YUZU_TEST_REGISTRY_SCOPE) is the job-level env above.
         run: |
