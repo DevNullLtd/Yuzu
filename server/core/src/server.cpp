@@ -14182,7 +14182,8 @@ private:
                                      /*payload=*/{}, /*stagger_seconds=*/0, /*delay_seconds=*/0,
                                      std::string(dispatch_arm_label(arm)), execution_id);
         if (!classified)
-            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id};
+            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id,
+                                                         .denied = classified.error()};
 
         agent_service_.record_send_time(command_id);
         // PR 2 / UP2-4: command_id -> (plugin, execution_id) was recorded BEFORE any RPC, inside

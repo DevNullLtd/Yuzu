@@ -20,6 +20,7 @@
 // tests `dispatch_outcome.scope_parse_error` first; find it by that symbol, not
 // by line number):
 //
+//   0. dispatch_denied          outcome.denied set (#7114)        permanent
 //   1. invalid_scope            outcome.scope_parse_error set     permanent
 //   2. containment_unreadable   outcome.containment_unreadable    retryable
 //   3. route_unreadable         outcome.route_unreadable          retryable
@@ -28,6 +29,10 @@
 //   6. plugin_not_found         unknown_plugin_count > 0          permanent
 //   7. kill_switched_os         kill_switched_os_count > 0        permanent
 //   8. no_agents_reached        catch-all                         retryable
+//
+// `dispatch_denied` is first because the chokepoint refused the pair before any
+// targeting: no other signal on the outcome can be set alongside it, and the
+// denial (not an unreachable agent) is the true cause of the zero reach.
 //
 // `> 0`, not "== every target": a mixed failure (some quarantined, some
 // offline) is still not "just offline", and understating a permanent cause as
@@ -76,6 +81,7 @@ namespace yuzu::server {
 /// catch-all (unreachable targets, or a residual race); every other value is a
 /// specific, named cause.
 enum class ZeroReachCause {
+    Denied,
     InvalidScope,
     ContainmentUnreadable,
     RouteUnreadable,
@@ -92,6 +98,8 @@ enum class ZeroReachCause {
 /// for the dispatched pair (see the banner for what it suppresses).
 [[nodiscard]] inline ZeroReachCause classify_zero_reach(const ConfinedDispatchOutcome& outcome,
                                                         bool protective_action) noexcept {
+    if (outcome.denied)
+        return ZeroReachCause::Denied;
     if (outcome.scope_parse_error)
         return ZeroReachCause::InvalidScope;
     if (outcome.containment_unreadable)
@@ -113,6 +121,8 @@ enum class ZeroReachCause {
 /// `execute_instruction` and the `reason` string of the REST 503 bodies.
 [[nodiscard]] constexpr std::string_view zero_reach_token(ZeroReachCause cause) noexcept {
     switch (cause) {
+    case ZeroReachCause::Denied:
+        return "dispatch_denied";
     case ZeroReachCause::InvalidScope:
         return "invalid_scope";
     case ZeroReachCause::ContainmentUnreadable:
@@ -145,6 +155,7 @@ enum class ZeroReachCause {
     case ZeroReachCause::OsGateUnreadable:
     case ZeroReachCause::Generic:
         return true;
+    case ZeroReachCause::Denied:
     case ZeroReachCause::InvalidScope:
     case ZeroReachCause::Quarantined:
     case ZeroReachCause::PluginNotFound:

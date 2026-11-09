@@ -56,6 +56,12 @@ struct PurgeHarness {
     std::vector<AuditRow> audits;
     bool scope_allow{true}; // scoped_perm_fn verdict
     bool audit_ok{true};    // AuditFn return (false → fail-closed 503, no dispatch)
+    /// #7110: withdraw the per-device grant INSIDE the `requested` row write, the window in which
+    /// production lets a grant move.
+    bool revoke_on_requested{false};
+    int scoped_calls{0};
+    /// #7114: the chokepoint's refusal, carried on the dispatch outcome (nothing sent).
+    std::optional<yuzu::server::detail::DispatchDenial> dispatch_denied;
     int dispatch_sent{1};   // agents reached per dispatch
     /// #1788: what the route derived and handed to dispatch. The per-device
     /// scoped_perm_fn above remains this route's PRIMARY authorization — the
@@ -87,11 +93,14 @@ struct PurgeHarness {
                                const std::string& tt, const std::string& tid,
                                const std::string& d) -> bool {
             audits.push_back({a, r, tt, tid, d});
+            if (r == "requested" && revoke_on_requested)
+                scope_allow = false;
             return audit_ok;
         };
         RestApiV1::ScopedPermFn scoped =
             [this](const httplib::Request&, httplib::Response& res, const std::string&,
                    const std::string&, const std::string&) -> bool {
+            ++scoped_calls;
             if (!scope_allow) {
                 res.status = 403;
                 res.set_content(
@@ -109,6 +118,12 @@ struct PurgeHarness {
             last_exec_visible = caller.exec_visible;
             last_caller = caller;
             calls.push_back({plugin, action, ids, params});
+            if (dispatch_denied) {
+                yuzu::server::ConfinedDispatchOutcome refused;
+                refused.command_id = "cmd-" + std::to_string(calls.size());
+                refused.denied = dispatch_denied;
+                return refused;
+            }
             // Model what the production seam does to the Ids arm, rather than
             // ignoring the set the route just handed us: a target the caller
             // cannot see is not reached. Without this the fake would report a
@@ -324,4 +339,53 @@ TEST_CASE("REST purge: the route hands dispatch a NON-EMPTY principal (anonymous
     // would route it under system authority — bypassing the system_reserved
     // guard the chokepoint applies only to non-system callers.
     CHECK_FALSE(h.last_caller.system);
+}
+
+TEST_CASE("POST /api/v1/echo/retention-paused/purge: Infrastructure:Delete withdrawn inside the "
+          "requested-row write dispatches nothing and writes failure permission_revoked (#7110)",
+          "[server][echo][purge][rest][security][7110]") {
+    PurgeHarness h;
+    h.revoke_on_requested = true;
+    int st = 0;
+    h.post(R"({"device_id":"dev-A","source":"process"})", st);
+    CHECK(st == 403);
+    CHECK(h.calls.empty());
+    // Admission, then the recheck after the requested row.
+    CHECK(h.scoped_calls == 2);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "requested");
+    CHECK(h.audits[1].action == "echo.source.purge");
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].detail.rfind("permission_revoked device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "denied"}}).value() == 1.0);
+}
+
+TEST_CASE("REST purge: a denied outcome answers 403 reason=<token> and counts it (#7114)",
+          "[server][echo][purge][rest][security][7114]") {
+    PurgeHarness h;
+    h.dispatch_denied = yuzu::server::detail::DispatchDenial{
+        yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+        yuzu::server::authz::Operation::Delete};
+    int st = 0;
+    const auto body = h.post(R"({"device_id":"dev-A","source":"process"})", st);
+    CHECK(st == 403);
+    CHECK(body["error"]["message"] == "dispatch denied: reason=forbidden");
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].detail.rfind("dispatch_denied reason=forbidden device=dev-A source=process cid=", 0) == 0);
+    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "forbidden"}}).value() == 1.0);
+    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "agent_not_connected"}}).value() == 0.0);
+}
+
+TEST_CASE("REST purge: an Unclassified denial answers 500 (server-literal pair), not the 400 "
+          "describe_dispatch_denial gives a caller-named pair (#7114)",
+          "[server][echo][purge][rest][security][7114]") {
+    PurgeHarness h;
+    h.dispatch_denied = yuzu::server::detail::DispatchDenial{
+        yuzu::server::detail::DispatchDenialReason::Unclassified, {},
+        yuzu::server::authz::Operation::Read};
+    int st = 0;
+    h.post(R"({"device_id":"dev-A","source":"process"})", st);
+    CHECK(st == 500);
+    CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "unclassified"}}).value() == 1.0);
 }

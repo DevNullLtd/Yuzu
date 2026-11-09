@@ -538,6 +538,10 @@ namespace {
 
 std::string zero_reach_text(ZeroReachCause cause, const ConfinedDispatchOutcome& o) {
     switch (cause) {
+    case ZeroReachCause::Denied:
+        return std::format("the dispatch chokepoint refused this command ({}): dispatch was withheld, "
+                           "not attempted, and no agent was reached",
+                           o.denied ? detail::to_string(o.denied->reason) : std::string_view{"unknown"});
     case ZeroReachCause::InvalidScope:
         return "invalid scope: " + o.scope_parse_error.value_or("(unparsed)");
     case ZeroReachCause::ContainmentUnreadable:
@@ -634,6 +638,13 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                        c.audit_dropped};
     }
 
+    if (!p.readmit) { // before the row: an unwired recheck is a defect, never "no gate"
+        return Outcome{make_refusal(RefusalKind::kMisconfigured, "readmit_unconfigured",
+                                    "dispatch re-admission not configured",
+                                    std::string(kMisconfiguredRemediation)),
+                       c.audit_dropped};
+    }
+
     // 7. Audit BEFORE the side effect, fail closed (house v1 dispatch pattern).
     if (!c.audit_required(
             "requested",
@@ -645,6 +656,36 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                                     "durable evidence",
                                     "retry the request", kRetryAfterMs),
                        c.audit_dropped};
+    }
+
+    // 7b. #7110: the `requested` row is written, so decide the surface's permission AGAIN and
+    //     re-derive the caller. A refusal here is a `failure` row (the `requested` row exists).
+    std::optional<DispatchCaller> readmitted;
+    try {
+        readmitted = p.readmit();
+    } catch (...) { // fail closed: a throwing recheck is a withdrawn permission
+        readmitted = std::nullopt;
+    }
+    if (!readmitted) {
+        c.audit("failure", "reason=permission_revoked definition=" + def_token);
+        return Outcome{make_refusal(RefusalKind::kPermissionRevoked, "permission_revoked",
+                                    "permission revoked after the request was recorded",
+                                    "this request was not dispatched; the permission it needs was "
+                                    "withdrawn while it was being recorded, and retrying will not "
+                                    "help until it is granted again"),
+                       c.audit_dropped};
+    }
+    const DispatchCaller& caller = *readmitted; // the fresh caller is the one dispatched
+    if (auto decision = p.authorize(caller, def.plugin, def.action); !decision) {
+        const auto& denial = decision.error();
+        const std::string reason(detail::to_string(denial.reason));
+        bump(p, "yuzu_server_dispatch_denied_total", {{"reason", reason}});
+        c.audit("failure", "reason=" + reason + " definition=" + def_token);
+        Refusal r = make_refusal(RefusalKind::kDispatchDenied, reason, {});
+        r.denial = denial;
+        r.plugin = def.plugin;
+        r.action = def.action;
+        return Outcome{std::move(r), c.audit_dropped};
     }
 
     // 8. The execution row BEFORE dispatch, so its id is known when the dispatch registers the
@@ -731,7 +772,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     try {
         const SendProgressScope send_scope(progress);
         o = p.dispatch(def.plugin, def.action, plan.agent_ids, dispatch_scope, plan.params,
-                       execution_id, rq.caller, def.id, def.concurrency_mode);
+                       execution_id, caller, def.id, def.concurrency_mode);
     } catch (const std::exception& e) {
         spdlog::error("instruction execute: dispatch failed for '{}': {}", def_token, e.what());
         threw = true;

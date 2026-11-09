@@ -1,6 +1,7 @@
 #include "dashboard_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
+#include "dispatch_denial_text.hpp" // describe_dispatch_denial: the class behind the denied arm status (#7114)
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
 #include "scope_attribute_guard.hpp" // E-1: unknown-attribute refusal for expression sends
@@ -142,6 +143,33 @@ static std::string refusal_toast_header(const char* message) {
 static constexpr const char* kEchoAuditRefusal =
     "The audit record could not be stored, so nothing was sent. Retry once the audit store "
     "recovers.";
+
+/// #7114: answer an Echo re-enable/purge whose dispatch was REFUSED by the chokepoint (the
+/// outcome's `denied`) instead of reaching nobody. Returns the reason token for the audit detail
+/// and the metric `result`.
+///
+/// 403 for the permission-class reasons (Forbidden, ApprovalRequired, AnonymousOperator,
+/// KillSwitched: `describe_dispatch_denial`'s kPermissionDenied class). 500 for Unclassified /
+/// Ambiguous, DELIBERATELY unlike `describe_dispatch_denial`'s kInvalidParams (REST 400): the
+/// (plugin, action) pair here is a SERVER literal ("echo","configure" / "echo","purge_source"),
+/// so a catalogue miss is a server catalogue fault, not a caller mistake.
+static std::string respond_echo_dispatch_denied(httplib::Response& res,
+                                                const detail::DispatchDenial& denial,
+                                                std::string_view action) {
+    const std::string token(detail::to_string(denial.reason));
+    const auto cls =
+        describe_dispatch_denial(denial.reason, "echo", std::string(action), denial,
+                                 DenialSurface::kRest)
+            .cls;
+    res.status = cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+    const std::string message = "Not permitted: " + token;
+    // The Echo page swaps no 4xx/5xx body: the toast is what the operator sees.
+    res.set_header("HX-Trigger", refusal_toast_header(message.c_str()));
+    res.set_content("<span class=\"echo-row-error\" data-reason=\"" + token + "\">" + message +
+                        "</span>",
+                    "text/html; charset=utf-8");
+    return token;
+}
 
 /// The toast when create_group itself fails (a store error, or a same-name group created
 /// concurrently after the duplicate check). Constant text: no store or caller data.
@@ -373,13 +401,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
             "yuzu_echo_source_reenable_total",
             "Operator-triggered Echo source re-enable attempts by result "
             "(success / scope_violation / agent_not_connected / denied / invalid_input / "
-            "audit_unavailable).",
+            "audit_unavailable, or the chokepoint's refusal reason when the dispatch itself was "
+            "refused: unclassified / ambiguous / anonymous_operator / forbidden / "
+            "approval_required / kill_switched).",
             "counter");
         metrics_->describe(
             "yuzu_echo_source_purge_total",
             "Operator-triggered Echo retention-paused source purge (destructive) attempts by "
             "result (success / scope_violation / agent_not_connected / denied / invalid_input / "
-            "audit_unavailable). "
+            "audit_unavailable, or the chokepoint's refusal reason when the dispatch itself was "
+            "refused: unclassified / ambiguous / anonymous_operator / forbidden / "
+            "approval_required / kill_switched). "
             "Counts DISPATCH outcomes; the agent's rows_deleted / source_not_paused outcome is in "
             "the command response record.",
             "counter");
@@ -2438,6 +2470,21 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
 
+                 // #7114: a chokepoint refusal (e.g. approval_required) is reported as such, not as
+                 // an unreachable agent.
+                 if (dispatch_outcome.denied) {
+                     const std::string token =
+                         respond_echo_dispatch_denied(res, *dispatch_outcome.denied, "configure");
+                     audit_or_flag(req, res, "echo.source.reenable", "failure", "command", "",
+                                   std::format("dispatch_denied reason={} device={} source={}",
+                                               token, device_id, source));
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_reenable_total", {{"result", token}})
+                             .increment();
+                     }
+                     return;
+                 }
+
                  if (sent == 0) {
                      audit_or_flag(req, res, "echo.source.reenable", "failure",
                                    "command", "",
@@ -2641,6 +2688,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                   caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
+
+                 // #7114: see the re-enable arm; the purge pair is a server literal too.
+                 if (dispatch_outcome.denied) {
+                     const std::string token = respond_echo_dispatch_denied(
+                         res, *dispatch_outcome.denied, "purge_source");
+                     audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",
+                                   std::format("dispatch_denied reason={} device={} source={}",
+                                               token, device_id, source));
+                     if (metrics_) {
+                         metrics_->counter("yuzu_echo_source_purge_total", {{"result", token}})
+                             .increment();
+                     }
+                     return;
+                 }
 
                  if (sent == 0) {
                      audit_or_flag(req, res, "echo.source.purge", "failure", "command", "",

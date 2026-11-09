@@ -12,6 +12,7 @@
 #include <yuzu/protective_actions.hpp>
 
 #include "authz_model.hpp"
+#include "dispatch_denial.hpp"
 #include "dispatch_target_shape.hpp"
 
 /// @file dispatch_confined_arms.hpp
@@ -376,6 +377,18 @@ struct ConfinedDispatchOutcome {
     /// branches below (`dispatch_confined_arms` never calls
     /// `prepare_route_fallback` for Broadcast/None).
     bool route_unreadable = false;
+    /// #7114: set ONLY by `ServerImpl::dispatch_confined` when
+    /// `build_classified_command` refused the pair (unclassified, ambiguous,
+    /// anonymous operator, forbidden, approval required, kill switched) BEFORE
+    /// any targeting; a denial never reaches an agent, so `sent` is 0. Carried
+    /// so a surface that reports a zero-reach can name the real cause instead of
+    /// folding it into "the agent is not connected". EVERY zero-reach consumer
+    /// must handle it: the shared `classify_zero_reach` ranks it first
+    /// (`ZeroReachCause::Denied`); the five hand-copied legacy cascades run an
+    /// authorize dry run before dispatching, so a denial there is only a race
+    /// and they are left on their existing order, except the dashboard Echo
+    /// arms, which report it.
+    std::optional<detail::DispatchDenial> denied;
 };
 
 // The closed quarantine-control predicate lives in the shared pure header so the

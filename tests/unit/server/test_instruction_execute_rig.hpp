@@ -164,6 +164,17 @@ struct Rig {
     std::int64_t seq{0};
 
     std::optional<DispatchDenial> force_denial;
+    /// #7110 post-row recheck. By default `readmit` answers the caller the last `request()` was
+    /// built with (the surface re-derives the SAME principal); a test narrows that with
+    /// `readmit_caller`, withdraws the permission with `readmit_withdrawn`, or leaves the port
+    /// unset with `readmit_unwired`. `on_requested` runs inside the `requested` audit write, the
+    /// window in which production lets a grant move.
+    bool readmit_unwired{false};
+    bool readmit_withdrawn{false};
+    std::optional<DispatchCaller> readmit_caller;
+    DispatchCaller last_caller;
+    int readmits{0};
+    std::function<void()> on_requested;
     std::set<std::string> denied_securables; // has_permission() answers false for these
     bool authorize_unwired{false};
     bool classify_unwired{false};
@@ -211,13 +222,13 @@ struct Rig {
                 return has_permission(p, s, o);
             });
         if (!decision)
-            return ConfinedDispatchOutcome{.command_id = command_id};
+            return ConfinedDispatchOutcome{.command_id = command_id, .denied = decision.error()};
         const auto arm = classify_dispatch_arm(!ids.empty(), scope);
         auto classified = yuzu::server::detail::finalize_classified_command(
             *decision, yuzu::server::detail::KillSwitchFn{}, plugin, action, command_id, params, {}, 0, 0,
             std::string(dispatch_arm_label(arm)), execution_id);
         if (!classified)
-            return ConfinedDispatchOutcome{.command_id = command_id};
+            return ConfinedDispatchOutcome{.command_id = command_id, .denied = classified.error()};
         const auto gate = ContainmentGate::enforcing(/*fail_closed_in=*/false, {});
         auto noop = [](const std::string&, const std::string&, const std::string&,
                        const std::string&) {};
@@ -245,6 +256,14 @@ struct Rig {
             };
         }
         p.validators = &validators;
+        if (!readmit_unwired) {
+            p.readmit = [this]() -> std::optional<DispatchCaller> {
+                ++readmits;
+                if (readmit_withdrawn)
+                    return std::nullopt;
+                return readmit_caller ? *readmit_caller : last_caller;
+            };
+        }
         if (!classify_unwired) {
             p.classify = [this](std::string_view pl, std::string_view ac) {
                 return caps.classify(pl, ac);
@@ -349,8 +368,11 @@ struct Rig {
             if (audit_throws)
                 throw std::runtime_error("audit boom");
             audits.push_back({std::string(result), detail_text});
-            if (result == "requested")
+            if (result == "requested") {
+                if (on_requested)
+                    on_requested();
                 return !audit_requested_fails;
+            }
             return !audit_other_fails;
         };
     }
@@ -361,6 +383,7 @@ struct Rig {
         r.surface = s;
         r.definition_id = def_id;
         r.body = std::move(body);
+        last_caller = caller;
         r.caller = std::move(caller);
         return r;
     }

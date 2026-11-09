@@ -21198,8 +21198,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 // L1: on the supervised tier, the effect the consumed ticket was bound to. The
                 // core re-reads the definition, and holds that read to it (definition_changed).
                 rq.expected_effect = ticket_bound_effect;
+                // #7110: the post-row recheck re-decides this tool's gate and re-derives the
+                // caller (approval_provenance forced to None, as above). A per-call copy of the
+                // shared ports; `perm_fn` writes a 403 into `res` on refusal, which the rendered
+                // JSON-RPC answer below replaces.
+                auto exec_ports = instr_exec_ports_;
+                exec_ports.readmit = [&]() -> std::optional<DispatchCaller> {
+                    if (!perm_fn(req, res, "Execution", "Execute") || !caller_fn)
+                        return std::nullopt;
+                    auto fresh = caller_fn(*session);
+                    fresh.approval_provenance = yuzu::server::ApprovalProvenance::None;
+                    return fresh;
+                };
                 const auto out = yuzu::server::instruction_execute::run(
-                    rq, instr_exec_ports_,
+                    rq, exec_ports,
                     [&](std::string_view result_status, const std::string& detail_text) {
                         return mcp_audit(std::string(result_status), detail_text);
                     },

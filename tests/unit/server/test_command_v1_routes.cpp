@@ -139,6 +139,9 @@ struct Rig {
     /// Audit rows and emitted events in the order they happened (one vector, so order is real).
     std::vector<std::string> trace;
     bool emit_throws = false;
+    /// Runs inside the `requested` audit write: the window in which production lets a grant, an
+    /// elevation or a visible set move (#7110).
+    std::function<void()> on_requested_row;
 
     yuzu::server::test::TestRouteSink sink;
 
@@ -190,6 +193,8 @@ struct Rig {
                             const std::string& detail) {
             trace.push_back("audit:" + result);
             audits.push_back({"<re-resolving>", "", action, result, tid, detail});
+            if (result == "requested" && on_requested_row)
+                on_requested_row();
             return true;
         };
         if (opts.session_writer)
@@ -199,6 +204,8 @@ struct Rig {
                                         const std::string& tid, const std::string& detail) {
                 trace.push_back("audit:" + result);
                 audits.push_back({s.username, role, action, result, tid, detail});
+                if (result == "requested" && on_requested_row)
+                    on_requested_row();
                 return result == "requested" ? requested_row_persists : outcome_row_persists;
             };
         d.classify_fn = [this](std::string_view p, std::string_view a) {
@@ -289,13 +296,13 @@ struct Rig {
             caps, caller, plugin, action,
             [](std::string_view, std::string_view, authz::Operation) { return true; });
         if (!decision)
-            return ConfinedDispatchOutcome{.command_id = command_id};
+            return ConfinedDispatchOutcome{.command_id = command_id, .denied = decision.error()};
         const auto arm = classify_dispatch_arm(!ids.empty(), scope);
         auto classified = detail::finalize_classified_command(
             *decision, detail::KillSwitchFn{}, plugin, action, command_id, params, /*payload=*/{}, 0,
             0, std::string(dispatch_arm_label(arm)), exec_id);
         if (!classified)
-            return ConfinedDispatchOutcome{.command_id = command_id};
+            return ConfinedDispatchOutcome{.command_id = command_id, .denied = classified.error()};
         auto noop = [](const std::string&, const std::string&, const std::string&,
                        const std::string&) {};
         return wire_and_dispatch_confined(registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop,
@@ -1409,4 +1416,54 @@ TEST_CASE("command_v1: check_command_v1_request is total over non-objects",
           "[server][command_v1]") {
     for (const auto& v : {json(), json(1), json("x"), json::array(), json(nullptr)})
         CHECK(cv1::check_command_v1_request(v).has_value());
+}
+
+TEST_CASE("POST /api/v1/commands: a destructive pair whose securable is withdrawn inside the "
+          "requested-row write dispatches nothing; failure row reason=permission_revoked (#7110)",
+          "[server][command_v1][dispatch][security][7110]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.visible_agents = Ids{kA};
+    rig.on_requested_row = [&] { rig.perm_denied.insert("Infrastructure:Delete"); };
+    const auto res = rig.post(
+        {{"plugin", "echo"}, {"action", "purge_source"}, {"agent_ids", Ids{kA}}});
+    CHECK(res->status == 403);
+    CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
+    CHECK(rig.dispatch_calls == 0);
+    CHECK(rig.sent().empty());
+    CHECK(rig.exec_created == 0); // refused before the execution row
+    // Admission, then the recheck after the row: the pair's own securable both times.
+    CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), "Infrastructure:Delete") == 2);
+    CHECK(rig.has_audit("requested"));
+    CHECK(rig.has_audit("failure", "reason=permission_revoked"));
+    CHECK_FALSE(rig.has_audit("success"));
+}
+
+TEST_CASE("POST /api/v1/commands: the caller is re-derived after the row (visible set shrunk "
+          "mid-write confines the dispatch)",
+          "[server][command_v1][dispatch][security][7110]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.on_requested_row = [&] {
+        rig.facts = {};
+        rig.facts.scoped_visible = std::unordered_set<std::string>{kC};
+    };
+    const auto res = rig.post(kRead); // omitted target: the whole fleet, as far as the caller sees
+    REQUIRE(res->status == 202);
+    CHECK(rig.sent() == Ids{kC});
+}
+
+TEST_CASE("POST /api/v1/commands: a chokepoint denial on the outcome is zero-reach dispatch_denied "
+          "(403), never no_agents_reached (#7114)",
+          "[server][command_v1][dispatch][security][7114]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.canned = ConfinedDispatchOutcome{
+        .denied = detail::DispatchDenial{detail::DispatchDenialReason::ApprovalRequired,
+                                         "Infrastructure", authz::Operation::Write}};
+    const auto res = rig.post(kRead);
+    CHECK(res->status == 403);
+    CHECK(body_of(res)["error"]["reason"] == "dispatch_denied");
+    CHECK(body_of(res)["error"]["retry_after_ms"].is_null());
+    CHECK(rig.has_audit("failure", "reason=dispatch_denied"));
 }

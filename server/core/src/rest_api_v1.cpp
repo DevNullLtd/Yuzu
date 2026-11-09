@@ -4497,6 +4497,17 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
+            // #7110: the `requested` row is stored, so decide the per-device gate AGAIN: a
+            // grant or a JIT elevation withdrawn while the row was being written dispatches
+            // nothing. The gate has already written its own 403; the row that already exists
+            // gets its outcome.
+            if (!scoped_perm_fn(req, res, "Infrastructure", "Delete", device_id)) {
+                audit_fn(req, "echo.source.purge", "failure", "command", device_id,
+                         "permission_revoked device=" + device_id + " source=" + source +
+                             " cid=" + cid);
+                bump("denied");
+                return;
+            }
             // #1788 defense-in-depth: `scoped_perm_fn` above is the PRIMARY gate
             // and has already authorized this exact device_id, so the seam's
             // intersection is a second, independent check rather than the thing
@@ -4511,6 +4522,26 @@ void RestApiV1::register_routes(
                                     /*execution_id=*/"", *caller);
             const auto& command_id = dispatch_outcome.command_id;
             const auto sent = dispatch_outcome.sent;
+            // #7114: a chokepoint refusal is reported as such, not as an offline device. 403 for
+            // the permission-class reasons; 500 for Unclassified/Ambiguous, DELIBERATELY unlike
+            // describe_dispatch_denial's kInvalidParams (400): ("echo","purge_source") is a SERVER
+            // literal, so a catalogue miss is a server catalogue fault, not a caller mistake.
+            if (dispatch_outcome.denied) {
+                const auto& denial = *dispatch_outcome.denied;
+                const std::string token(detail::to_string(denial.reason));
+                const auto text = describe_dispatch_denial(denial.reason, "echo", "purge_source",
+                                                           denial, DenialSurface::kRest);
+                res.status = text.cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+                audit_fn(req, "echo.source.purge", "failure", "command", device_id,
+                         "dispatch_denied reason=" + token + " device=" + device_id +
+                             " source=" + source + " cid=" + cid);
+                bump(token.c_str());
+                res.set_content(detail::error_json_a4(res.status,
+                                                      "dispatch denied: reason=" + token, cid,
+                                                      text.remediation),
+                                "application/json");
+                return;
+            }
             if (sent == 0) {
                 // NOTE: a confinement drop also lands here and is reported as
                 // "offline" + counted as agent_not_connected. The RESPONSE

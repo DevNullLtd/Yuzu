@@ -67,6 +67,9 @@ void send_refusal(httplib::Response& res, const Refusal& r) {
     case RefusalKind::kApprovalCapReached:
         status = 429;
         break;
+    case RefusalKind::kPermissionRevoked: // no denial to describe: never dereference r.denial
+        status = 403;
+        break;
     case RefusalKind::kDispatchDenied: {
         const auto& d = *r.denial;
         const auto text = describe_dispatch_denial(d.reason, r.plugin, r.action, d, DenialSurface::kRest);
@@ -108,7 +111,11 @@ void send_refusal(httplib::Response& res, const Refusal& r) {
 
 void send_zero_reach(httplib::Response& res, const ZeroReach& z) {
     const bool retry = zero_reach_retryable(z.cause);
-    const int status = z.cause == ZeroReachCause::InvalidScope ? 400 : 503;
+    // A chokepoint denial is a permission-class refusal (403), a bad scope a caller error (400);
+    // everything else is a fleet-state fact (503).
+    const int status = z.cause == ZeroReachCause::InvalidScope  ? 400
+                       : z.cause == ZeroReachCause::Denied      ? 403
+                                                                : 503;
     res.status = status;
     nlohmann::json err{{"code", status},
                        {"message", z.message},
@@ -227,8 +234,17 @@ void register_instruction_execute_routes(HttpRouteSink& sink, RouteDeps deps) {
         // an approval-gated definition must not fill the cap every other principal shares.
         rq.submitter_pending_cap = kSubmitterPendingCap;
 
+        // #7110: the post-row recheck re-decides this route's own gate and re-derives the caller.
+        // `perm_fn` writes its own 403 into `res` on refusal; the refusal render below overwrites
+        // it with the same status. A copy: `deps.ports` is const and shared across requests.
+        Ports ports = deps.ports;
+        ports.readmit = [&]() -> std::optional<DispatchCaller> {
+            if (!deps.perm_fn || !deps.perm_fn(req, res, "Execution", "Execute") || !deps.caller_fn)
+                return std::nullopt;
+            return deps.caller_fn(req);
+        };
         const Outcome out =
-            run(rq, deps.ports, audit, bind_event_emit(deps.emit_event_fn, req, deps.ports.metrics));
+            run(rq, ports, audit, bind_event_emit(deps.emit_event_fn, req, ports.metrics));
         if (out.audit_dropped)
             res.set_header("Sec-Audit-Failed", "true");
 

@@ -260,7 +260,7 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
 
     // The caller: identity AND the real principal_is_admin / exec_visible (service-scoped and
     // engine principals included). approval_provenance stays None: REST has no ticket flow.
-    const DispatchCaller caller = d.derive_caller_fn(session);
+    DispatchCaller caller = d.derive_caller_fn(session); // re-derived after the `requested` row below
 
     // The dispatch chokepoint's dry run (classify + authorize + kill switch), so a denial is a
     // discriminated refusal rather than an ambiguous zero-reach.
@@ -319,6 +319,40 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
                                        {.retry_after_ms = kRetryAfterMs,
                                         .remediation = "retry the request"}),
                             "application/json");
+            return;
+        }
+    }
+
+    // #7110: the `requested` row is stored, so decide the admission AGAIN. A grant, a JIT
+    // elevation or a visible set can change while the row is written; the first decision was
+    // taken before it. Same inputs as the first: a Destructive/Targeted pair re-asks the pair's
+    // own securable (the gate wrote its 403 on refusal), then the caller is re-derived (the one
+    // dispatched) and the chokepoint dry run repeats. The row that exists gets a `failure`
+    // outcome and nothing is dispatched.
+    {
+        const auto revoked = [&](std::string_view how) {
+            (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
+                                                "command", "",
+                                                "reason=permission_revoked " + std::string(how) +
+                                                    " " + what + " correlation_id=" + cid);
+            res.status = 403;
+            res.set_content(
+                error_body(res, 403, "permission revoked after the request was recorded",
+                           "permission_revoked",
+                           {.remediation = "this request was not dispatched; the permission it "
+                                           "needs was withdrawn while it was being recorded"}),
+                "application/json");
+        };
+        if (gate.verdict == DestructiveTargetingVerdict::Targeted && gate.capability &&
+            !d.perm_fn(req, res, std::string(gate.capability->securable),
+                       std::string(authz::to_string(gate.capability->operation)))) {
+            revoked("gate=securable");
+            return;
+        }
+        caller = d.derive_caller_fn(session);
+        if (const auto again = d.authorize_dispatch_fn(caller, plugin, action); !again) {
+            revoked(std::string("gate=dispatch dispatch_reason=") +
+                    std::string(detail::to_string(again.error().reason)));
             return;
         }
     }
@@ -624,6 +658,16 @@ ZeroReachReply zero_reach_reply(ZeroReachCause cause, std::string_view scope_err
     if (zero_reach_retryable(cause))
         r.retry_after_ms = kRetryAfterMs;
     switch (cause) {
+    case ZeroReachCause::Denied:
+        // #7114: the chokepoint refused the pair before targeting (the admission dry run passed, so
+        // this is a race: the caller's grant or the action's gate moved between the two). A
+        // permission-class refusal, never "unreachable".
+        r.status = 403;
+        r.message = "No agents reached: the dispatch chokepoint refused this command for the "
+                    "caller. This is an authorization denial, not unreachability.";
+        r.remediation = "check the caller's permission and the action's execute gate; retrying "
+                        "alone will not help";
+        break;
     case ZeroReachCause::InvalidScope:
         r.status = 400;
         r.message = "No agents reached: the scope expression could not be parsed (" +
