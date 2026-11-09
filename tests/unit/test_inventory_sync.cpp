@@ -3793,8 +3793,9 @@ TEST_CASE("runtimes dotnet and jvm adapters: producer rows round-trip; bad shape
             "dotnet|runtime|8.0.1|/p|Microsoft|extra"}));
     REQUIRE(d.status == Status::ok);
     CHECK(d.entries.empty());
-    // status grammar: a status row for the wrong action fails; constrained is withheld under
-    // drop_source (the adapter still honours it for any caller); unsupported is skipped.
+    // status grammar: a status row for the wrong action fails; constrained contributes no rows
+    // and surfaces its tokens as the reason (the collector sends a status-only section);
+    // unsupported is skipped.
     CHECK(parse_runtimes_dotnet_output(nl({"status|jvm|supported|-"})).status ==
           Status::failed);
     CHECK(show(parse_runtimes_jvm_output(

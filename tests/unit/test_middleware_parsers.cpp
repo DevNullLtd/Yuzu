@@ -999,7 +999,7 @@ TEST_CASE("middleware runner: malformed enumerator text and the row cap", "[midd
 }
 
 // A data-shape fault in ONE stanza is not an access fault: the valid siblings are kept and the answer
-// stays `supported` (the collector withholds only a constrained answer). The runner header holds the
+// stays `supported` (the collector sends a status-only section only for a constrained answer). The runner header holds the
 // table these cases pin.
 TEST_CASE("middleware runner: a stanza dropped beside a valid sibling is logged and the sibling kept",
           "[middleware]") {

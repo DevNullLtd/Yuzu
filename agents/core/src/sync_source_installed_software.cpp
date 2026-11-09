@@ -424,8 +424,7 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
                                   std::vector<SwEntry>& entries) {
         if (tok[0] != "manager" || tok.size() != 7 || tok[2] != "present")
             return false;
-        // A present row is evidence the manager was read even when it maps to
-        // nothing (a Linux dpkg/apt row): it keeps a constrained answer's cycle.
+        // A present row that maps to nothing (a Linux dpkg/apt row) is dropped below.
         const ManagerEcosystem* m = find_manager(tok[1]);
         if (!m || !m->presence_row) {
             spdlog::debug("sync: pkg_inventory manager '{}' has no installed_software mapping — "

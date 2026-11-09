@@ -449,7 +449,11 @@ else the `PACKAGER` tag.
 > `uninstall_string`, stay reserved and empty (#5186). A `constrained`
 > enumeration, or a product-property read that fails for any reason other than
 > the product not having the property, fails the action and skips the whole
-> cycle, like `pkg_inventory.packages`. The same product also appears as an
+> cycle, like `pkg_inventory.packages`. (**Superseded 2026-11-09:** a constrained or
+> failed `msi_packages.list_inventory` read is now a status-only section for that
+> source and no longer skips the cycle: the server keeps the stored `msi` rows, shown
+> as unconfirmed, and every other source is still sent; see the Update of 2026-11-09
+> below.) The same product also appears as an
 > `installed_apps` `app`/`windows` row; the two are not de-duplicated.
 
 > **Update (2026-10-29):** `middleware.ibm_mq` is collected as ecosystem `ibm_mq`,
@@ -464,7 +468,10 @@ else the `PACKAGER` tag.
 > it answers again, and the server sees no signal (`skip_reason` stays empty; the
 > agent logs one warn line). The policy exists for a steady-state constraint that
 > is a permission fact, where skipping the cycle would freeze every other source
-> for ever.
+> for ever. (**Superseded 2026-11-09:** `ConstrainedPolicy` and `drop_source` are
+> retired. A constrained `middleware.ibm_mq` answer is a status-only section: the
+> server keeps the source's stored rows, shown as unconfirmed, instead of removing
+> them, and no other source is affected; see the Update of 2026-11-09 below.)
 
 > **Update (2026-11-04):** the `pkg_inventory` Windows legs are collected as three
 > ecosystems, all machine scope: `appx` (kind `app`; the packages registered for
@@ -481,7 +488,12 @@ else the `PACKAGER` tag.
 > per-item shortfall (an unreadable nuspec, an unparsable package name) degrades its
 > own row to an empty version instead of constraining the action. The three values
 > are appended at the tail of the published ecosystem enumeration. The tail
-> `install_location` slot stays reserved and empty.
+> `install_location` slot stays reserved and empty. (**Superseded 2026-11-09:**
+> `ConstrainedPolicy` is retired, so a constrained `packages` or `store_packages`
+> answer no longer skips the cycle: it is a status-only section for that source, the
+> server keeps the source's stored rows, shown as unconfirmed, and no other source is
+> affected; the per-item shortfall rule above is unchanged. See the Update of
+> 2026-11-09 below.)
 
 Mechanics:
 

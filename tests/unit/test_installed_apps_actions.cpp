@@ -292,7 +292,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     if (result.rc != 0) {
         CHECK(result.rc == 1);
         // The whole point of the degraded path: nothing is published, so the
-        // daily sync skips the cycle rather than committing a partial set.
+        // daily sync sends a status-only section rather than committing a partial set.
         CHECK(result.captured.empty());
         // SKIP, not return. This is the ONLY test of the enrichment + receipt
         // integration, so a degraded run leaves that integration UNVERIFIED --
