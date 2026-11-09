@@ -7369,6 +7369,8 @@ rule classifies a repeat of the key, so the replay says `completed` for a retrie
 
 **Nothing reached `503`:** if the run started but no step reached any agent, the answer is `503`
 with `error.reason` and `error.execution_id` (the run exists and is readable). The reasons are
+`dispatch_denied` (the dispatch chokepoint refused a step for the caller at send time: the pre-send
+check passed, so the caller's grant or the action's gate moved between the two),
 `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached` (offline
 devices, or a per-device concurrency claim), `quarantined`, `plugin_not_found`, `kill_switched_os`,
 `late_denied`, `deadline_exceeded` (the 60 second run budget ended the run before any step reached
@@ -12940,7 +12942,7 @@ carries `Sec-Audit-Failed: true` and the `requested` row remains the evidence. A
 | `400` | `destructive_untargeted`, `forensic_untargeted` | See above. |
 | `400` | `unclassified`, `ambiguous` | The `plugin`/`action` pair is not in the capability catalogue. |
 | `401` | `principal_changed` | The request's credentials resolved to two different principals; retry. |
-| `403` | `permission_revoked` | The caller's permission was withdrawn between the `requested` audit row and the dispatch: the route decides the pair's permission and the dispatch admission a second time after the row is stored, and a refusal writes a `command.dispatch` `failure` row (`reason=permission_revoked`) for the row that already exists and dispatches nothing. Permanent: retrying will not help until the permission is granted again. |
+| `403` | `permission_revoked` | The caller's permission was withdrawn between the `requested` audit row and the dispatch: the route decides its own `Execution:Execute` gate, the pair's permission and the dispatch admission a second time after the row is stored, and a refusal writes a `command.dispatch` `failure` row (`reason=permission_revoked`) for the row that already exists and dispatches nothing. Permanent: retrying will not help until the permission is granted again. |
 | `403` | `forbidden`, `approval_required`, `kill_switched`, `anonymous_operator` | The dispatch check refused the caller; `approval_required` means this route creates no approval ticket and accepts none, so dispatch as an administrator; `POST /api/instructions/{id}/execute` dispatches through the same gate, and an approval created there cannot be redeemed yet (#6064). No `permission` field is returned. |
 | `404` | `destructive_no_visible_target` | See above. |
 | `503` | `audit_unavailable` | The `requested` row could not be stored; nothing was sent. Carries `retry_after_ms`. |
@@ -14353,7 +14355,7 @@ Dispatch a single-device `echo.purge_source` that **permanently drops every ware
 
 **What the agent reports (the response record):** one JSON line, `{"source":"<name>","rows_deleted":<n>,"status":"purged","dictionary_pending":<true|false>}`, or an `error|...` line (`source_not_paused`, `config_unreadable`, an unknown source). `status` `purged` means the source's rows are deleted. The interned strings only those rows referenced are swept afterwards under a 60 s deadline: when the sweep ran out of time or failed, `dictionary_pending` is `true` and the record's result status is `CONSTRAINED` (the status alone reaches the server; the completeness and the status detail, `echo:purge_dictionary_pending`, are in the agent's log). **A pending result is not a complete erasure**: the strings stay on the device until the weekly dictionary sweep, or until the purge is run again (a rerun deletes nothing twice and finishes the sweep). An automation that promises erasure must read `dictionary_pending`, not `status` alone. One further limit: a write-ahead-log checkpoint that finds the file busy right after the purge leaves the deleted pages in the log until the next checkpoint, and the reply still says `purged` (the agent logs a warning).
 
-**Metric:** `yuzu_echo_source_purge_total{result}` (counter) — counts dispatch outcomes.
+**Metric:** `yuzu_echo_source_purge_total{result}` (counter) — counts dispatch outcomes. `result` is one of `success`, `agent_not_connected`, `invalid_input`, `denied` (the route's own gates: the per-device scope gate before and after the `requested` row, unwired dispatch or scope gate, a lost `requested` row, an unresolved caller) or a dispatch chokepoint denial's own reason token (`forbidden`, `approval_required`, `anonymous_operator`, `kill_switched`, `unclassified`, `ambiguous`; #7114).
 
 **Agent version:** requires an agent that implements the `echo.purge_source` action (v0.14.0+). An older agent returns `error|unknown action: purge_source` in its response record (no crash); because dispatch is fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome via **Scan**.
 

@@ -933,6 +933,9 @@ struct McpTestServer {
     // Non-empty: only an audit row whose `result` equals this (e.g. "denied") reports a
     // persistence failure; every other row persists.
     std::string audit_fail_result_;
+    /// Runs inside every audit write, after the row is recorded: the window in which production
+    /// lets a grant or an elevation move between a `requested` row and the dispatch (#7110).
+    std::function<void(const std::string& action, const std::string& result)> on_audit_row_;
     /// Fail only the audit row whose "<action>|<result>" equals this (unlike audit_fail_result_,
     /// which fails every row with that result, including the tool-level mcp.<tool> row).
     std::string audit_fail_action_result_;
@@ -1635,6 +1638,8 @@ private:
             audit_details.push_back(detail);
             audit_target_ids.push_back(target_id);
             audit_target_types.push_back(target_type);
+            if (on_audit_row_)
+                on_audit_row_(action, result);
             if (audit_throws_)
                 throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
             if (!audit_fail_result_.empty() && result == audit_fail_result_)
@@ -47591,6 +47596,33 @@ TEST_CASE("MCP execute_instruction_definition: the audit row is written BEFORE d
     CHECK(rig.rows.empty());
 }
 
+TEST_CASE("MCP execute_instruction_definition: Execution:Execute withdrawn inside the requested-row "
+          "write dispatches nothing and is kPermissionDenied permission_revoked (#7110)",
+          "[mcp][integration][execute][idef][audit][security][7110]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    // The tool-level gate admitted the call; the grant moves while the `requested` row is
+    // written, so only the handler's own post-row recheck (its `readmit` wiring) can catch it.
+    ts.on_audit_row_ = [&](const std::string&, const std::string& result) {
+        if (result == "requested")
+            ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+                return !(sec == "Execution" && op == "Execute");
+            };
+    };
+    idef_start(ts, rig, "operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["data"]["reason"] == "permission_revoked");
+    CHECK(rig.calls.empty());
+    CHECK(rig.rows.empty());
+    CHECK(idef_audited(ts, "requested"));
+    CHECK(idef_audited(ts, "failure"));
+}
+
 TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-std) is -32603 "
           "with NO retry hint and a failure audit row",
           "[mcp][integration][execute][idef][audit][security]") {
@@ -51234,7 +51266,8 @@ TEST_CASE("MCP execute_workflow: a zero-reach status is always one of the closed
         }
         // Every cause the shared classifier can name is in the list, except the one a workflow
         // never produces (its agents are named, so there is no scope to fail to parse).
-        for (const auto cause : {yuzu::server::ZeroReachCause::ContainmentUnreadable,
+        for (const auto cause : {yuzu::server::ZeroReachCause::Denied,
+                                 yuzu::server::ZeroReachCause::ContainmentUnreadable,
                                  yuzu::server::ZeroReachCause::RouteUnreadable,
                                  yuzu::server::ZeroReachCause::OsGateUnreadable,
                                  yuzu::server::ZeroReachCause::Quarantined,

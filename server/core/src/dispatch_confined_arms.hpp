@@ -384,10 +384,12 @@ struct ConfinedDispatchOutcome {
     /// so a surface that reports a zero-reach can name the real cause instead of
     /// folding it into "the agent is not connected". EVERY zero-reach consumer
     /// must handle it: the shared `classify_zero_reach` ranks it first
-    /// (`ZeroReachCause::Denied`); the five hand-copied legacy cascades run an
-    /// authorize dry run before dispatching, so a denial there is only a race
-    /// and they are left on their existing order, except the dashboard Echo
-    /// arms, which report it.
+    /// (`ZeroReachCause::Denied`). Of the five hand-copied legacy cascades,
+    /// four (mcp_server.cpp, command_routes.cpp, server.cpp legacy forward,
+    /// workflow_routes.cpp) run an authorize dry run before dispatching, so a
+    /// denial there is only a race and they are left on their existing order;
+    /// dashboard_routes.cpp runs no dry run, so its Echo re-enable/purge arms
+    /// and its execute console check this field before their cascade.
     std::optional<detail::DispatchDenial> denied;
 };
 

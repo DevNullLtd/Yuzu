@@ -462,7 +462,10 @@ Per `docs/observability-conventions.md`:
 > otherwise only ever writes `requested`. The fragment counts an audit-store refusal
 > (the `attempted` row could not be stored, `503`, #3619) as `audit_unavailable`, a
 > value REST never writes; `yuzu_echo_source_reenable_total`
-> uses the same value. `success` and `agent_not_connected` are comparable; nothing else
+> uses the same value. Both surfaces write a dispatch chokepoint denial's own reason
+> token (`forbidden`, `approval_required`, `anonymous_operator`, `kill_switched`,
+> `unclassified`, `ambiguous`; #7114) when the seam refuses the pair before targeting;
+> those six are comparable. `success` and `agent_not_connected` are comparable; nothing else
 > is, and there is no `surface` label to split them.
 
 > The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).

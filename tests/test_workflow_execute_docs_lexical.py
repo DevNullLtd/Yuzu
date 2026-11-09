@@ -42,8 +42,8 @@ def mcp_row(text):
 def problems(hpp_text, rest_text, mcp_text, swept):
     out = []
     toks = statuses(hpp_text)
-    if len(toks) < 11:
-        out.append("kWorkflowZeroReachStatuses not parsed or shorter than the 11 known statuses")
+    if len(toks) < 12:
+        out.append("kWorkflowZeroReachStatuses not parsed or shorter than the 12 known statuses")
     block, row = rest_block(rest_text), mcp_row(mcp_text)
     if not block:
         out.append("rest-api.md: the 'Nothing reached `503`' block is missing")

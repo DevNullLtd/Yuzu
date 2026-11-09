@@ -3064,6 +3064,27 @@ TEST_CASE("instruction execute: readmit returning nullopt after the requested ro
     CHECK(r.audits[1].detail.find("reason=permission_revoked") != std::string::npos);
 }
 
+TEST_CASE("instruction execute: a readmit that throws after the requested row reads as withdrawn "
+          "(fail closed): nothing dispatched, failure permission_revoked",
+          "[instruction_execute][security]") {
+    Rig r;
+    r.defs["d"] = make_def("d");
+    r.on_requested = [&] { r.readmit_throws = true; }; // the store faults INSIDE the row write
+    auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+    const auto* ref = as_refusal(out);
+    REQUIRE(ref);
+    CHECK(ref->kind == RefusalKind::kPermissionRevoked);
+    CHECK(ref->reason == "permission_revoked");
+    CHECK_FALSE(ref->denial);
+    CHECK(r.readmits == 1);
+    CHECK(r.calls.empty());
+    CHECK(r.rows.empty());
+    REQUIRE(r.audits.size() == 2);
+    CHECK(r.audits[0].result == "requested");
+    CHECK(r.audits[1].result == "failure");
+    CHECK(r.audits[1].detail.find("reason=permission_revoked") != std::string::npos);
+}
+
 TEST_CASE("instruction execute: an unset readmit port is Misconfigured (fail closed)",
           "[instruction_execute][security]") {
     Rig r;

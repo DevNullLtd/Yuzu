@@ -27,6 +27,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -171,6 +172,7 @@ struct Rig {
     /// window in which production lets a grant move.
     bool readmit_unwired{false};
     bool readmit_withdrawn{false};
+    bool readmit_throws{false}; ///< the recheck throws (a store fault): must read as withdrawn
     std::optional<DispatchCaller> readmit_caller;
     DispatchCaller last_caller;
     int readmits{0};
@@ -259,6 +261,8 @@ struct Rig {
         if (!readmit_unwired) {
             p.readmit = [this]() -> std::optional<DispatchCaller> {
                 ++readmits;
+                if (readmit_throws)
+                    throw std::runtime_error("readmit: rbac store unavailable");
                 if (readmit_withdrawn)
                     return std::nullopt;
                 return readmit_caller ? *readmit_caller : last_caller;

@@ -106,6 +106,9 @@ struct Rig {
     // ---- the seam ----
     ContainmentGate gate = ContainmentGate::exempt_control_plugin();
     std::optional<ConfinedDispatchOutcome> canned; // overrides the real seam for one outcome
+    /// When set, the chokepoint dry run (`authorize_dispatch_fn`) refuses with this denial; a
+    /// test sets it inside `on_requested_row` to move the gate between the two runs (#7110).
+    std::optional<detail::DispatchDenial> authorize_denial;
     bool dispatch_throws = false;
     bool dispatch_throws_nonstd = false;
     /// >0: the dispatch runs the REAL arms and the REAL instrumented sink, and send number N
@@ -212,7 +215,10 @@ struct Rig {
             return caps.classify(p, a);
         };
         d.authorize_dispatch_fn = [this](const DispatchCaller& caller, std::string_view plugin,
-                                         std::string_view action) {
+                                         std::string_view action)
+            -> std::expected<CommandCapability, detail::DispatchDenial> {
+            if (authorize_denial)
+                return std::unexpected(*authorize_denial);
             return detail::classify_and_authorize_dispatch(
                 caps, caller, plugin, action,
                 [](std::string_view, std::string_view, authz::Operation) { return true; });
@@ -1466,4 +1472,41 @@ TEST_CASE("POST /api/v1/commands: a chokepoint denial on the outcome is zero-rea
     CHECK(body_of(res)["error"]["reason"] == "dispatch_denied");
     CHECK(body_of(res)["error"]["retry_after_ms"].is_null());
     CHECK(rig.has_audit("failure", "reason=dispatch_denied"));
+}
+
+TEST_CASE("POST /api/v1/commands: Execution:Execute withdrawn inside the requested-row write "
+          "dispatches nothing for a non-destructive pair; failure row reason=permission_revoked "
+          "(#7110)",
+          "[server][command_v1][dispatch][security][7110]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.on_requested_row = [&] { rig.perm_denied.insert("Execution:Execute"); };
+    const auto res = rig.post(kRead);
+    CHECK(res->status == 403);
+    CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
+    CHECK(rig.dispatch_calls == 0);
+    CHECK(rig.exec_created == 0);
+    // Admission, then the recheck after the row: the route's own gate both times.
+    CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), "Execution:Execute") == 2);
+    CHECK(rig.has_audit("requested"));
+    CHECK(rig.has_audit("failure", "reason=permission_revoked gate=route"));
+    CHECK_FALSE(rig.has_audit("success"));
+}
+
+TEST_CASE("POST /api/v1/commands: a chokepoint dry run that refuses after the row answers 403 "
+          "permission_revoked naming the dispatch reason; nothing is dispatched (#7110)",
+          "[server][command_v1][dispatch][security][7110]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.on_requested_row = [&] {
+        rig.authorize_denial = detail::DispatchDenial{
+            detail::DispatchDenialReason::ApprovalRequired, "Infrastructure",
+            authz::Operation::Write};
+    };
+    const auto res = rig.post(kRead);
+    CHECK(res->status == 403);
+    CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
+    CHECK(rig.dispatch_calls == 0);
+    CHECK(rig.exec_created == 0);
+    CHECK(rig.has_audit("failure", "gate=dispatch dispatch_reason=approval_required"));
 }

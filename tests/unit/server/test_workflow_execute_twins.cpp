@@ -3803,12 +3803,13 @@ TEST_CASE("workflow execute: a KEYED run that reached nobody because of the dead
 TEST_CASE("workflow execute: the zero-reach status list is closed, matches what the code emits, and "
           "the never-sent claim is gone from the remediations",
           "[workflow][twin][zeroreach][docs]") {
-    // Every cause the shared classifier names is a member of the list, except the one a workflow
-    // cannot produce (it names its agents, so there is no scope to fail to parse).
-    for (const auto cause : {ZeroReachCause::ContainmentUnreadable, ZeroReachCause::RouteUnreadable,
-                             ZeroReachCause::OsGateUnreadable, ZeroReachCause::Quarantined,
-                             ZeroReachCause::PluginNotFound, ZeroReachCause::KillSwitchedOs,
-                             ZeroReachCause::Generic}) {
+    // Every cause the shared classifier names is a member of the list (the chokepoint denial
+    // included, #7114), except the one a workflow cannot produce (it names its agents, so there
+    // is no scope to fail to parse).
+    for (const auto cause : {ZeroReachCause::Denied, ZeroReachCause::ContainmentUnreadable,
+                             ZeroReachCause::RouteUnreadable, ZeroReachCause::OsGateUnreadable,
+                             ZeroReachCause::Quarantined, ZeroReachCause::PluginNotFound,
+                             ZeroReachCause::KillSwitchedOs, ZeroReachCause::Generic}) {
         const auto token = zero_reach_token(cause);
         INFO(token);
         CHECK(std::find(kWorkflowZeroReachStatuses.begin(), kWorkflowZeroReachStatuses.end(),
@@ -3821,7 +3822,7 @@ TEST_CASE("workflow execute: the zero-reach status list is closed, matches what 
     for (const char* own : {"late_denied", "definition_changed", "deadline_exceeded", "run_failed"})
         CHECK(std::count(kWorkflowZeroReachStatuses.begin(), kWorkflowZeroReachStatuses.end(),
                          std::string_view(own)) == 1);
-    CHECK(kWorkflowZeroReachStatuses.size() == 11);
+    CHECK(kWorkflowZeroReachStatuses.size() == 12);
 
     // The three remediation texts that used to say a step with no command_id was never sent.
     CHECK(std::string(kStepNotProvenUnsentText).find("may still have been sent") !=

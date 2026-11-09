@@ -1657,6 +1657,26 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
+                 // #7114: a chokepoint refusal is a permission-class fact, never "no agents
+                 // connected". This console runs no pre-send dry run, so a non-admin
+                 // Execution:Execute holder running an AdminOrApproval pair lands here every
+                 // time, not only on a race. The token is a closed constexpr set, safe in markup.
+                 if (dispatch_outcome.denied) {
+                     const std::string token(detail::to_string(dispatch_outcome.denied->reason));
+                     audit_or_flag(req, res, "command.dispatch", "failure", "command", command_id,
+                                   "reason=dispatch_denied dispatch_reason=" + token + " " +
+                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128));
+                     res.set_content(
+                         "<span id=\"result-context\" hx-swap-oob=\"true\""
+                         " class=\"result-context is-error\" data-reason=\"" + token + "\">" +
+                             html_escape("Not permitted: " + token +
+                                         ". The dispatch chokepoint refused this command for "
+                                         "you; nothing was sent.") +
+                             "</span>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
                  if (sent == 0) {
                      // Every send now has an `attempted` row (#3619), so every zero-reach send
                      // records its outcome, not only an expression-targeted one.

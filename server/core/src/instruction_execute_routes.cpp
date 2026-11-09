@@ -112,10 +112,25 @@ void send_refusal(httplib::Response& res, const Refusal& r) {
 void send_zero_reach(httplib::Response& res, const ZeroReach& z) {
     const bool retry = zero_reach_retryable(z.cause);
     // A chokepoint denial is a permission-class refusal (403), a bad scope a caller error (400);
-    // everything else is a fleet-state fact (503).
-    const int status = z.cause == ZeroReachCause::InvalidScope  ? 400
-                       : z.cause == ZeroReachCause::Denied      ? 403
-                                                                : 503;
+    // everything else is a fleet-state fact (503). No `default:`: a new cause is a build
+    // failure here, not a silent 503.
+    int status = 503;
+    switch (z.cause) {
+    case ZeroReachCause::InvalidScope:
+        status = 400;
+        break;
+    case ZeroReachCause::Denied:
+        status = 403;
+        break;
+    case ZeroReachCause::ContainmentUnreadable:
+    case ZeroReachCause::RouteUnreadable:
+    case ZeroReachCause::OsGateUnreadable:
+    case ZeroReachCause::Quarantined:
+    case ZeroReachCause::PluginNotFound:
+    case ZeroReachCause::KillSwitchedOs:
+    case ZeroReachCause::Generic:
+        break;
+    }
     res.status = status;
     nlohmann::json err{{"code", status},
                        {"message", z.message},

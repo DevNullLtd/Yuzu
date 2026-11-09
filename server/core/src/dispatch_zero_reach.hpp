@@ -70,6 +70,12 @@
 //     workflow_routes.cpp answer with no `reason`; command_routes.cpp and
 //     server.cpp also carry no `retry_after_ms`; dashboard_routes.cpp keeps a
 //     plain message. The retryable flag below follows the MCP site.
+//   - denied (#7114, first here): absent from all five cascades, none of which
+//     reads `outcome.denied`. mcp_server.cpp, command_routes.cpp, server.cpp
+//     and workflow_routes.cpp run an authorize dry run before the dispatch, so
+//     a denial there is a race that lands in their catch-all; dashboard_routes.cpp
+//     runs no dry run and checks `denied` BEFORE its cascade on the Echo
+//     re-enable/purge arms and the execute console.
 
 #include "dispatch_confined_arms.hpp"
 

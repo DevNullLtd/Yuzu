@@ -325,10 +325,10 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
 
     // #7110: the `requested` row is stored, so decide the admission AGAIN. A grant, a JIT
     // elevation or a visible set can change while the row is written; the first decision was
-    // taken before it. Same inputs as the first: a Destructive/Targeted pair re-asks the pair's
-    // own securable (the gate wrote its 403 on refusal), then the caller is re-derived (the one
-    // dispatched) and the chokepoint dry run repeats. The row that exists gets a `failure`
-    // outcome and nothing is dispatched.
+    // taken before it. Same inputs as the first: the route's own Execution:Execute gate, then
+    // for a Destructive/Targeted pair the pair's own securable (each gate wrote its 403 on
+    // refusal), then the caller is re-derived (the one dispatched) and the chokepoint dry run
+    // repeats. The row that exists gets a `failure` outcome and nothing is dispatched.
     {
         const auto revoked = [&](std::string_view how) {
             (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
@@ -343,6 +343,12 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
                                            "needs was withdrawn while it was being recorded"}),
                 "application/json");
         };
+        // The route's own gate first: with RBAC off the dry run below admits every human
+        // principal, so a JIT elevation that lapsed during the row write is caught only here.
+        if (!d.perm_fn(req, res, "Execution", "Execute")) {
+            revoked("gate=route");
+            return;
+        }
         if (gate.verdict == DestructiveTargetingVerdict::Targeted && gate.capability &&
             !d.perm_fn(req, res, std::string(gate.capability->securable),
                        std::string(authz::to_string(gate.capability->operation)))) {
