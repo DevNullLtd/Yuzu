@@ -459,6 +459,10 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
 using HandlePtr = std::unique_ptr<void, decltype(&::CloseHandle)>;
 
+constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+constexpr SECURITY_INFORMATION kDaclInfo =
+    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+
 class EchoDbDacl {
 public:
     EchoDbDacl() { build(); }
@@ -538,7 +542,6 @@ DWORD delete_planted_file(const std::filesystem::path& file) {
     };
     constexpr auto kFileDispositionInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(21);
     constexpr DWORD kDispositionFlags = 0x1 | 0x2 | 0x10;
-    constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     HANDLE raw = ::CreateFileW(file.c_str(), DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
                                kShareAll, nullptr, OPEN_EXISTING,
                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
@@ -564,7 +567,6 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
     // access, so share arbitration never weighs the open: no holder's share mode can refuse it.
     constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES;
     constexpr DWORD kLookOnly = READ_CONTROL | FILE_READ_ATTRIBUTES; // no WRITE_DAC
-    constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     constexpr DWORD kFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
     const yuzu::win::EchoDbOwnerProbe& probe = dacl.owner_probe();
     for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
@@ -650,8 +652,6 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
         }
         // Owner read failed (no ACL on this filesystem) or the owner is ours: re-secure in
         // place. Best-effort -- availability of a diagnostics DB over confidentiality.
-        constexpr SECURITY_INFORMATION kDaclInfo =
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
         if (const DWORD rc = ::SetSecurityInfo(h.get(), SE_FILE_OBJECT, kDaclInfo, nullptr,
                                                nullptr, dacl.acl(), nullptr);
             rc != ERROR_SUCCESS) {
@@ -675,9 +675,6 @@ void secure_quarantined_sidecars(const std::filesystem::path& quarantined,
                                  const EchoDbDacl& dacl) {
     if (!dacl.ok())
         return; // open() warned once, when it built the DACL
-    constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-    constexpr SECURITY_INFORMATION kDaclInfo =
-        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
     for (const char* suffix : {"-wal", "-shm", "-journal"}) {
         std::filesystem::path file = quarantined;
         file += suffix;

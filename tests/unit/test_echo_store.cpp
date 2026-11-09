@@ -3837,6 +3837,18 @@ bool symlink_unavailable(const std::error_code& ec) {
 #endif
 }
 
+// Call with the error code a create_symlink / create_directory_symlink filled: nothing when it
+// succeeded, SKIP when only a missing privilege stopped it, FAIL for anything else. `file_exists`
+// is what a seam moved before the quarantine would hit (the name still exists), and it must fail
+// the case.
+void skip_unless_symlink_capable(const std::error_code& ec) {
+    if (!ec)
+        return;
+    if (symlink_unavailable(ec))
+        SKIP("cannot create a symlink here: " << ec.message());
+    FAIL("symlink creation failed for another reason: " << ec.message());
+}
+
 } // namespace
 
 // #7286. echo.db is WAL-mode, so a plain BEGIN IMMEDIATE writer would NOT block a reader and this
@@ -4034,13 +4046,7 @@ TEST_CASE("EchoDatabase: a link planted after a quarantine is refused before the
 
         auto refused = EchoDatabase::open(db, seams);
         REQUIRE(fired); // a seam that never ran would leave every check below vacuous
-        if (planted) {
-            // Only a missing privilege skips. `file_exists` is what a seam moved before the
-            // quarantine would hit (the name still exists), and it must fail the case.
-            if (symlink_unavailable(planted))
-                SKIP("cannot create a symlink here: " << planted.message());
-            FAIL("create_symlink failed for another reason: " << planted.message());
-        }
+        skip_unless_symlink_capable(planted);
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().find("symbolic link or reparse point") != std::string::npos);
         CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").size() == 1); // the quarantine stood
@@ -4133,11 +4139,7 @@ TEST_CASE("EchoDatabase: a link swapped in at echo.db right before SQLite opens 
 
         auto opened = EchoDatabase::open(db, seams);
         REQUIRE(fired);
-        if (planted) {
-            if (symlink_unavailable(planted))
-                SKIP("cannot create a symlink here: " << planted.message());
-            FAIL("create_symlink failed for another reason: " << planted.message());
-        }
+        skip_unless_symlink_capable(planted);
         CHECK(fs::is_symlink(db)); // not replaced
         if (!read_only_open) {
             REQUIRE_FALSE(opened.has_value());
@@ -4168,11 +4170,7 @@ TEST_CASE("EchoDatabase: a data directory behind a symlink opens and reopens (#1
     REQUIRE(fs::create_directories(real));
     std::error_code ec;
     fs::create_directory_symlink(real, linked, ec);
-    if (ec) {
-        if (symlink_unavailable(ec))
-            SKIP("cannot create a symlink here: " << ec.message());
-        FAIL("create_directory_symlink failed for another reason: " << ec.message());
-    }
+    skip_unless_symlink_capable(ec);
 
     {
         auto first = EchoDatabase::open(linked / "echo.db");
