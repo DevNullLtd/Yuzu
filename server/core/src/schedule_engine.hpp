@@ -43,11 +43,12 @@ namespace yuzu::server {
 /// non-route caller cannot store a larger interval than the route would have accepted.
 inline constexpr long long kMaxScheduleIntervalMinutes = 35791394;
 
-/// The three `create_schedule` error texts that are not a validation answer about the request.
-/// The first two mean the store could not take the write (a route answers 503); the third means
-/// the store refused a field value as invalid text or as violating a constraint (SQLSTATE class
-/// 22 or 23: a route answers 400, nothing is wrong with the store). Every other error text
-/// `create_schedule` returns is a request-validation text.
+/// The three `create_schedule` error texts that come from the store write rather than from the
+/// engine's own request validation. The first two mean the store could not take the write (a
+/// route answers 503); the third means the store refused a field value as invalid text or as
+/// violating a constraint (SQLSTATE class 22 or 23): that is a client error, a route answers 400,
+/// and nothing is wrong with the store. Every other error text `create_schedule` returns is a
+/// request-validation text (also 400).
 inline constexpr const char* kScheduleCreateNotOpenError = "database not open";
 inline constexpr const char* kScheduleCreateInsertFailedError =
     "insert failed (pool degraded or transaction failed)";

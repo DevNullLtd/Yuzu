@@ -1438,7 +1438,7 @@
         { json: { enabled: want } }).then(function (r) {
         if (!r.ok) {
           if (r.status === 404) {
-            showToast('The schedule was not changed. Only its creator can enable or disable it.', 'warning');
+            showToast('The schedule was not changed. It no longer exists, or only its creator can enable or disable it.', 'warning');
             return;
           }
           showToast(r.status === 403 ? 'You do not have permission to change this schedule.'
@@ -1472,7 +1472,7 @@
             { json: { enabled: true } }).then(function (r) {
             if (r.ok) return null;
             if (r.status === 403) return 'You do not have permission to enable schedules.';
-            if (r.status === 404) return 'The schedule was not changed. Only its creator can enable or disable it.';
+            if (r.status === 404) return 'The schedule was not changed. It no longer exists, or only its creator can enable or disable it.';
             return errText(r, 'Could not enable the schedule (HTTP ' + r.status + ').');
           });
         }

@@ -7,6 +7,7 @@
 #include "rbac_text.hpp" // rbac_text_is_clean: the shared clean-identifier predicate
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
+#include "utf8_sanitize.hpp" // sanitize_utf8_strict: keeps error bodies serialisable
 
 #include <nlohmann/json.hpp>
 
@@ -282,6 +283,9 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
                     send_store_fault(res);
                     return;
                 }
+                if (result.error() == kScheduleCreateValueRefusedError)
+                    (void)deps.audit_fn(req, "schedule.create", "denied", "schedule", "",
+                                        "invalid_field_value");
                 res.status = 400;
                 res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                 "application/json");
@@ -292,9 +296,18 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Schedule created","level":"success"}})");
             res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
-        } catch (const std::exception& e) {
+        } catch (const nlohmann::json::parse_error&) {
+            // A fixed text: the parser's own message can quote the offending input, including a
+            // byte that is not valid UTF-8, which `dump()` would then refuse to serialise.
             res.status = 400;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+            res.set_content(nlohmann::json({{"error", "invalid JSON in request body"}}).dump(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            // Scrubbed to valid UTF-8 so the error body can always be serialised.
+            res.status = 400;
+            res.set_content(
+                nlohmann::json({{"error", sanitize_utf8_strict(e.what())}}).dump(),
+                "application/json");
         }
     });
 

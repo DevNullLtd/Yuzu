@@ -61,6 +61,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -1219,9 +1220,91 @@ TEST_CASE("POST /api/schedules: invalid UTF-8 in a text field answers 400 with n
     auto res = h.sink.dispatch("POST", "/api/schedules", body, "application/json", headers);
     REQUIRE(res);
     CHECK(res->status == 400);
-    CHECK_FALSE(json::parse(res->body, nullptr, false).contains("id"));
+    // The error body is serialisable and carries a text, never the offending byte.
+    auto parsed = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(parsed.is_discarded());
+    CHECK_FALSE(parsed.contains("id"));
+    REQUIRE(parsed.contains("error"));
+    CHECK(parsed["error"].is_string());
     for (const auto& a : h.audits)
         CHECK(a.result != "failure");
+    CHECK(h.schedule_engine->query_schedules().empty());
+}
+
+TEST_CASE("POST /api/schedules: a body that is not valid JSON answers 400 with a fixed error "
+          "text, writes no audit row and stores nothing",
+          "[server][routes][schedule_routes][rest][pg][validation]") {
+    ScheduleRouteHarness h;
+    auto headers = h.session_headers_for("sched-op", "ScheduleAndExecute7",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+
+    const std::string invalid_utf8 = std::string(R"({"name":"a)") + "\xff" + R"(b"})";
+    for (const std::string& body : {std::string(R"({"name":)"), std::string("not json"),
+                                    invalid_utf8}) {
+        INFO(body);
+        h.audits.clear();
+        auto res = h.sink.dispatch("POST", "/api/schedules", body, "application/json", headers);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto parsed = json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(parsed.is_discarded());
+        REQUIRE(parsed.contains("error"));
+        CHECK(parsed["error"] == "invalid JSON in request body");
+        CHECK(h.audits.empty());
+    }
+    CHECK(h.schedule_engine->query_schedules().empty());
+}
+
+namespace {
+
+/// A BEFORE INSERT trigger on `schedule_engine.schedules` that raises with the given SQLSTATE
+/// ("23514" check_violation, "22003" numeric_value_out_of_range, "P0001" plain RAISE), so the
+/// insert is refused by the store with a controlled error class.
+void refuse_schedule_inserts(ScheduleRouteHarness& h, const std::string& sqlstate) {
+    exec_sql(h, "CREATE FUNCTION schedule_engine.yuzu_test_refuse() RETURNS trigger "
+                "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'insert refused' "
+                "USING ERRCODE = TG_ARGV[0]; END $$");
+    const std::string trg = "CREATE TRIGGER yuzu_test_refuse BEFORE INSERT ON "
+                            "schedule_engine.schedules FOR EACH ROW EXECUTE FUNCTION "
+                            "schedule_engine.yuzu_test_refuse('" +
+                            sqlstate + "')";
+    exec_sql(h, trg.c_str());
+}
+
+} // namespace
+
+TEST_CASE("POST /api/schedules: a value the store refuses (SQLSTATE class 22 or 23) answers "
+          "400 with one denied invalid_field_value row; any other store error stays 503 with a "
+          "failure row",
+          "[server][routes][schedule_routes][rest][pg][validation]") {
+    const std::string sqlstate = GENERATE(as<std::string>{}, "23514", "22003", "P0001");
+    INFO(sqlstate);
+    ScheduleRouteHarness h;
+    auto headers = h.session_headers_for("sched-op", "ScheduleAndExecute8",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+    refuse_schedule_inserts(h, sqlstate);
+
+    auto res = h.sink.dispatch("POST", "/api/schedules",
+                               R"({"name":"nightly-scan","definition_id":"def-1",)"
+                               R"("frequency_type":"daily"})",
+                               "application/json", headers);
+    REQUIRE(res);
+    auto parsed = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(parsed.is_discarded());
+    CHECK_FALSE(parsed.contains("id"));
+
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "schedule.create");
+    CHECK(h.audits[0].target_id.empty());
+    if (sqlstate == "P0001") {
+        CHECK(res->status == 503);
+        CHECK(h.audits[0].result == "failure");
+        CHECK(h.audits[0].detail == "store_error");
+    } else {
+        CHECK(res->status == 400);
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].detail == "invalid_field_value");
+    }
     CHECK(h.schedule_engine->query_schedules().empty());
 }
 
@@ -1244,9 +1327,23 @@ TEST_CASE("schedule engine: create_schedule tells a refused field value from a s
     CHECK(utf8.error() == kScheduleCreateValueRefusedError);
     CHECK(h.schedule_engine->query_schedules().empty());
 
-    // With the table gone the same clean request fails as a store failure, not a refusal.
+    // An integrity violation (class 23) is a refusal of the request's values too; an error of
+    // any other class is a store failure.
     InstructionSchedule clean = nul_name;
     clean.name = "nightly-scan";
+    refuse_schedule_inserts(h, "23514");
+    auto integrity = h.schedule_engine->create_schedule(clean);
+    REQUIRE_FALSE(integrity.has_value());
+    CHECK(integrity.error() == kScheduleCreateValueRefusedError);
+    exec_sql(h, "DROP TRIGGER yuzu_test_refuse ON schedule_engine.schedules");
+    exec_sql(h, "CREATE TRIGGER yuzu_test_refuse BEFORE INSERT ON schedule_engine.schedules "
+                "FOR EACH ROW EXECUTE FUNCTION schedule_engine.yuzu_test_refuse('P0001')");
+    auto other = h.schedule_engine->create_schedule(clean);
+    REQUIRE_FALSE(other.has_value());
+    CHECK(other.error() == kScheduleCreateInsertFailedError);
+    exec_sql(h, "DROP TRIGGER yuzu_test_refuse ON schedule_engine.schedules");
+
+    // With the table gone the same clean request fails as a store failure, not a refusal.
     drop_schedules_table(h);
     auto failed = h.schedule_engine->create_schedule(clean);
     REQUIRE_FALSE(failed.has_value());
