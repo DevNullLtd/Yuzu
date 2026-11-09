@@ -2439,8 +2439,9 @@ TEST_CASE("a v2 database upgrades to v3 in place and existing sections have no c
     CHECK(served_section(store, "agent-up", "dimm")["reason"] == "server:row_count_mismatch");
 }
 
-// Kills: migration 3 without IF NOT EXISTS. The runner is gated on the recorded version number
-// only, so a database that already has the columns but is rewound to version 2 (the fix for a
+// Kills: migration 3 without IF NOT EXISTS. The runner's apply decision is the recorded version
+// number (its hash check, #7158, only refuses edited text), so a database that already has the
+// columns but is rewound to version 2 (the fix for a
 // database that ran an earlier build of v3) must run migration 3 again without failing.
 TEST_CASE("migration 3 is re-runnable over a database that already has its columns",
           "[pg][device_ci][migration][v3][digest]") {

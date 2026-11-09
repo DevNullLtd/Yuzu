@@ -3699,6 +3699,16 @@ test('ensure install helpers',
   timeout: 120,
 )
 
+# The migration-drift log line's doc pointer (kDriftDocHeading in pg_migration_runner.cpp) names exactly
+# one `## Behaviour change: ...` heading in docs/user-manual/upgrading.md (#7158); the negative cases
+# run on in-memory mutated copies.
+test('migration drift doc heading',
+  _python3_test,
+  args: [files('test_migration_drift_doc_heading.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
