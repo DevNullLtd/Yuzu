@@ -1523,8 +1523,8 @@ TEST_CASE("verify_section_row_count: unavailable and permission_denied and unkno
     }
 }
 
-// Kills: a mismatch that reaches the model but not the wire, or one that drops the rows that were read.
-TEST_CASE("hardware_ci_json: a row-count mismatch is served constrained and incomplete with its rows",
+// Kills: a mismatch that reaches the model but not the wire, or one that still serves the rows read (#7165).
+TEST_CASE("hardware_ci_json: a row-count mismatch is served constrained and incomplete with NO rows",
           "[hardware][model][json][sections][row_count]") {
     auto d = v2_detail({counted_section("cpu", "ok", "", 3, 1), counted_section("dimm", "ok", "", 2, 0),
                         counted_section("disk", "ok", "", std::nullopt, 0)});
@@ -1533,7 +1533,8 @@ TEST_CASE("hardware_ci_json: a row-count mismatch is served constrained and inco
     CHECK(cpu["status"] == "constrained");
     CHECK(cpu["complete"] == false);
     CHECK(cpu["reason"] == "server:row_count_mismatch");
-    CHECK(cpu["rows"].size() == 1); // the rows that WERE read are still served
+    CHECK(cpu["rows"].is_array());
+    CHECK(cpu["rows"].empty()); // the one row that remains is WITHHELD (#7165)
     const auto& dimm = section_of(j, "dimm");
     CHECK(dimm["status"] == "constrained");
     CHECK(dimm["complete"] == false);
@@ -2176,8 +2177,8 @@ TEST_CASE("verify_section_content: a status-only or unregistered kind never take
     CHECK(verify_section_content(u).level == "ok");
 }
 
-// Kills: a mismatch that reaches the model but not the wire, or one that drops the rows read.
-TEST_CASE("hardware_ci_json: a content-digest mismatch is served constrained and incomplete with its rows",
+// Kills: a mismatch that reaches the model but not the wire, or one that still serves the rows (#7165).
+TEST_CASE("hardware_ci_json: a content-digest mismatch is served constrained and incomplete with NO rows",
           "[hardware][model][json][sections][digest]") {
     auto cpu = digested_section("cpu", "ok", "", cpu_rows(2));
     cpu.rows[0][1] = "Edited";
@@ -2187,8 +2188,35 @@ TEST_CASE("hardware_ci_json: a content-digest mismatch is served constrained and
     CHECK(c["status"] == "constrained");
     CHECK(c["complete"] == false);
     CHECK(c["reason"] == "server:content_digest_mismatch");
-    CHECK(c["rows"].size() == 2); // served, but NOT the reported generation: see the verdict doc
+    CHECK(c["rows"].is_array());
+    CHECK(c["rows"].empty()); // NOT the reported generation: withheld (#7165)
     CHECK(section_of(j, "disk")["complete"] == true);
+}
+
+// Kills: withholding only for a section the agent reported `ok`. An agent-reported `constrained`
+// section (here a server cap) with edited rows is just as unreliable, so it is withheld too.
+TEST_CASE("hardware_ci_json: an agent-constrained section with a content mismatch also loses its rows",
+          "[hardware][model][json][sections][digest]") {
+    auto cpu = digested_section("cpu", "constrained", "server_cap:32", cpu_rows(2));
+    cpu.rows[0][1] = "Edited";
+    auto d = v2_detail({std::move(cpu), digested_section("disk", "constrained", "server_cap:32", cpu_rows(0))});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& c = section_of(j, "cpu");
+    CHECK(c["status"] == "constrained");
+    CHECK(c["complete"] == false);
+    CHECK(c["reason"] == "server_cap:32;server:content_digest_mismatch");
+    CHECK(c["rows"].empty());
+}
+
+// The decision is a function of the fault ENUM, not of token text, and every enumerator is pinned:
+// the two mismatches withhold; `unverifiable` (the server could not compare) and `None` serve.
+// Kills: withholding on Unverifiable (rows hidden for a server fault) or on None (all rows hidden).
+TEST_CASE("section_rows_withheld: only the two mismatch faults withhold rows",
+          "[hardware][model][sections][digest]") {
+    CHECK(section_rows_withheld(SectionFault::RowCount));
+    CHECK(section_rows_withheld(SectionFault::Content));
+    CHECK_FALSE(section_rows_withheld(SectionFault::Unverifiable));
+    CHECK_FALSE(section_rows_withheld(SectionFault::None));
 }
 
 // The digest binds n_fields; the INSERT and SELECT use the parsed column list. They must agree for

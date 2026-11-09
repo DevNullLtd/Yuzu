@@ -245,7 +245,8 @@ inline constexpr std::string_view kSectionRowCountMismatchReason = "server:row_c
 ///    appended to the reason (`;`-joined, the same convention as `server_cap:<n>`). An already
 ///    `constrained` section keeps its level and its existing reason tokens (the agent's or
 ///    `server_cap:<n>`); the mismatch token is appended after them so the loss is not hidden.
-///    The rows that WERE read are still served (a constrained section serves its rows).
+///    The rows that WERE read are WITHHELD (`rows: []`, #7165): they are a partial or extended
+///    set, not what the device reported (see `section_rows_withheld`).
 ///  - `unavailable`, `permission_denied`, an unknown level and a blank level are never touched:
 ///    by contract they serve no rows, so there is nothing to reconcile.
 ///
@@ -270,10 +271,28 @@ inline constexpr std::string_view kSectionContentDigestMismatchReason = "server:
 
 /// The reason token a section carries when the server could NOT compute the digest to compare
 /// (the digest provider failed - `EVP_Digest` returned an error - which is a fault of THIS SERVER,
-/// not of the device or its stored rows). Served with level `constrained`, rows served, exactly as
-/// the two mismatch tokens; it is a distinct token so an operator does not chase the device.
+/// not of the device or its stored rows). Served with level `constrained` and its rows STILL SERVED
+/// (unlike the two mismatch tokens, which withhold them: nothing shows the rows are wrong); it is a
+/// distinct token so an operator does not chase the device.
 inline constexpr std::string_view kSectionContentDigestUnverifiableReason =
     "server:content_digest_unverifiable";
+
+/// Whether a section with this fault is served with `rows: []` (#7165, option (c)): the two
+/// MISMATCH faults withhold, because the rows read are known not to be what the agent reported.
+/// `Unverifiable` does not (the server could not compare, which says nothing about the rows) and
+/// `None` does not. A `switch` with no `default`, so -Wswitch flags a new enumerator here. Status,
+/// reason and `complete: false` are served unchanged either way.
+[[nodiscard]] constexpr bool section_rows_withheld(SectionFault fault) noexcept {
+    switch (fault) {
+    case SectionFault::RowCount:
+    case SectionFault::Content:
+        return true;
+    case SectionFault::Unverifiable:
+    case SectionFault::None:
+        return false;
+    }
+    return false;
+}
 
 /// The reason token a downgrade of kind `fault` is served with; empty for `SectionFault::None`.
 [[nodiscard]] std::string_view section_fault_token(SectionFault fault) noexcept;
@@ -307,9 +326,10 @@ inline constexpr std::string_view kSectionContentDigestUnverifiableReason =
 ///    `server:content_digest_unverifiable` instead: that is a fault of this server, not of the
 ///    stored rows (owner ruling 2026-11-09). An already `constrained` section keeps its level
 ///    and tokens.
-///  - The rows that were read are STILL SERVED (as for the count mismatch). On a digest mismatch
-///    they are NOT the generation the agent reported: they may be edited or swapped values, so a
-///    consumer must not treat them as the device's reported hardware.
+///  - The rows that were read are WITHHELD on a digest mismatch, as on a count mismatch (#7165,
+///    owner ruling 2026-11-09): they are NOT the generation the agent reported (edited or swapped
+///    values), and a consumer that reads `constrained` as "partial but true" would consume them
+///    as the device's hardware. See `section_rows_withheld`. `unverifiable` keeps its rows.
 /// Scope: an integrity check against accident and non-malicious drift. Anyone who can write the
 /// child tables can also rewrite the digest, so this is not tamper resistance. The digest covers
 /// the rows only, not the level or reason columns.

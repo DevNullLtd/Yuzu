@@ -1508,12 +1508,20 @@ TEST_CASE("mcp hardware twins: a served integrity fault is counted once per read
     // REST reads the same record: counted again (served reads, not distinct defects).
     const json rest_rc = t.rest_data("/api/v1/hardware/rc");
     CHECK(served_reason(rest_rc) == served_reason(rc)); // the transports agree byte for byte
+    // The rows of a faulted section are withheld on BOTH transports, identically (#7165).
+    CHECK(rc["ci"]["sections"][0]["rows"].empty());
+    CHECK(rest_rc["ci"]["sections"][0] == rc["ci"]["sections"][0]);
     CHECK(integrity(t, "row_count_mismatch") == 2.0);
 
     // Content fault, both transports.
     const json cd = t.call("get_hardware_ci", {{"agent_id", "cd"}})["result"]["structuredContent"];
     CHECK(served_reason(cd) == section_fault_token(SectionFault::Content));
-    CHECK(t.rest_data("/api/v1/hardware/cd")["ci"]["sections"][0]["reason"] == served_reason(cd));
+    const json rest_cd = t.rest_data("/api/v1/hardware/cd"); // one read: each composed read is counted
+    CHECK(rest_cd["ci"]["sections"][0]["reason"] == served_reason(cd));
+    CHECK(cd["ci"]["sections"][0]["rows"].empty());
+    CHECK(rest_cd["ci"]["sections"][0] == cd["ci"]["sections"][0]);
+    // An intact section keeps its rows (the withholding is per fault, not per read).
+    CHECK(t.call("get_hardware_ci", {{"agent_id", "ok"}})["result"]["structuredContent"]["ci"]["sections"][0]["rows"].size() == 2);
     CHECK(integrity(t, "content_digest_mismatch") == 2.0);
     CHECK(integrity(t, "row_count_mismatch") == 2.0);
     CHECK(integrity(t, "digest_unverifiable") == 0.0);
