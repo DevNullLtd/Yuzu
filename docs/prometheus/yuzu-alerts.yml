@@ -7862,13 +7862,32 @@ groups:
     # docs/observability-conventions.md (#6521).
     rules:
       # The gauge counts agents once per sweep, so a rise is a lower bound on new quarantines
-      # (limits spelled out in the description). It is a gauge, so `delta`, not `increase`.
-      # `for: 0m`: a rise is an event, a sustained condition would never clear. Warning, not
-      # critical: the value is agent-self-reported inside the heartbeat trust boundary, so one
-      # forged or buggy agent can raise it.
+      # (limits spelled out in the description). It is a gauge, so `delta`, not `increase`: an
+      # agent that leaves and returns takes the count down and back up, and `increase` would
+      # read the return as a rise. `for: 0m`: a rise is an event, a sustained condition would
+      # never clear. Warning, not critical: the value is agent-self-reported inside the
+      # heartbeat trust boundary, so one forged or buggy agent can raise it.
+      #
+      # THE RESTART GUARD. The server publishes the gauge every sweep, 0 included, over agents
+      # with a live heartbeat, so a restarted replica starts at 0 and ramps back to N as agents
+      # reconnect. About an hour later the 1h window start slides into that ramp and
+      # `delta(...[1h]) > 0` fires with no new corruption (the same happens on a series younger
+      # than 1h). `unless ... (yuzu_server_uptime_seconds < 3900)` suppresses the rule for the
+      # first 65 minutes of a replica's life: the 1h window plus a 5 minute reconnect ramp. A
+      # real rise stays visible to `delta[1h]` for an hour, so the guard only loses a rise
+      # inside the first ~5 minutes of a boot. If agents take longer than 5 minutes to
+      # reconnect, the tail of the ramp can still leak. An absent uptime series suppresses
+      # nothing. Unlike the retired young-server grace on the audit-retention rule, a restart
+      # cadence cannot hide a dead component here: the rule is about agent state, not a reaper.
+      #
+      # Residuals the guard does not cover, both already lower-bound limits: a replica failover
+      # raises the gaining replica's series, and an agent returning from offline with an old
+      # quarantine raises it. The 1h any-rise threshold is the #5065 starting default, not sized
+      # from fleet data.
       - alert: YuzuEchoDbCorruptionDetected
         expr: |
           delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
+            unless on (job, instance) (yuzu_server_uptime_seconds < 3900)
         for: 0m
         labels:
           severity: warning
@@ -7879,28 +7898,44 @@ groups:
             integrity check and was quarantined. This is a lower bound on new quarantines, not an
             event count: the gauge counts agents once per sweep, so an agent returning from
             offline with an old quarantine raises it, a repeat quarantine on an agent already
-            counted does not, and an agent leaving in the same window can mask one arriving. The
+            counted does not, and an agent leaving in the same window can mask one arriving. A
+            server restart in the last hour is suppressed; a failover is not. The
             echo.db.corruption_quarantined audit rows name the affected agents.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
 
       # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the
       # description carries the Echo remedy. The family is absent-not-zero, so a clean fleet
-      # returns no series and the rule stays quiet.
+      # returns no series and the rule stays quiet (max_over_time over an absent series is
+      # absent too).
+      #
+      # THE EXPRESSION. `sum by (job, plugin) (max_over_time(...[5m]))`, not the bare gauge, for
+      # the reason spelled out on YuzuDedupStoreDegraded: the gauge is per core replica and
+      # recomputed from a 90 s staleness window, and `for:` restarts whenever the series
+      # breaks, so a replica restart, an agent moving replicas (a new `instance`) or a slow
+      # heartbeat would each reset the 15 m clock (docs/observability-conventions.md, #3663).
+      # max_over_time[5m] bridges gaps shorter than the window and sum drops `instance` from
+      # the alert identity. Same effects as that rule: a failure spanning more than 10 minutes
+      # fires, 10 or fewer never does, and a failover counts one agent on two replicas for a
+      # few minutes, hence "about N". Do not widen the window: it adds to the effective `for:`.
       - alert: YuzuPluginInitFailed
         expr: |
-          yuzu_fleet_plugin_init_failed > 0
+          sum by (job, plugin) (max_over_time(yuzu_fleet_plugin_init_failed[5m])) > 0
         for: 15m
         labels:
           severity: warning
         annotations:
-          summary: "{{ $value }} agent(s) report plugin {{ $labels.plugin }} failed to initialise"
+          summary: "About {{ $value }} agent(s) report plugin {{ $labels.plugin }} failed to initialise"
           description: >-
-            For more than 15 minutes, {{ $value }} agent(s) have reported that plugin
-            {{ $labels.plugin }} failed init (heartbeat tag yuzu.plugins_failed); it is loaded but
-            not running, as distinct from not installed. For plugin="echo" the usual causes are
-            the two cases the agent refuses after the tar.db to echo.db rename (adoption failed,
-            or both databases exist) and a corrupt echo.db that could not be moved aside; the
-            remedies are in the upgrade notes. The value is agent-self-reported.
+            For more than 10 minutes, about {{ $value }} agent(s) (summed across core replicas,
+            so a failover can count one twice for a few minutes) have reported that plugin
+            {{ $labels.plugin }} failed init (heartbeat tag yuzu.plugins_failed); it is loaded
+            but not running, as distinct from not installed. plugin="other" is the sum over
+            plugins past the first 64 names the server labels per sweep; the agent log names
+            them. For plugin="echo" the usual causes are the two cases the agent refuses after
+            the tar.db to echo.db rename (adoption failed, or both databases exist) and a corrupt
+            echo.db that could not be moved aside; the upgrade notes cover the first two, and
+            the corrupt-database case is under Corrupt-database quarantine in the Echo manual.
+            The value is agent-self-reported.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
 
   - name: yuzu-web-writes
