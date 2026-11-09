@@ -5,9 +5,10 @@
 .DESCRIPTION
   The registry plugin's tests create scratch keys under HKLM\SOFTWARE (and Wow6432Node) and HKCU\Software
   (HKU\.DEFAULT for LOCAL SYSTEM), and the Echo bam-exclusion live case (#6898) creates two under
-  HKLM\SYSTEM\CurrentControlSet\Services\bam and ...\bam\State\UserSettings; each fixture removes its own; this is the tripwire that notices one that did
-  not. It scans only the direct children named YuzuTest-* of those roots (the local dispatcher's
-  Software\YuzuTest\RegistryPr17Ld_<salt> keys, test_registry_local_dispatcher.cpp:228,248, are outside it). The
+  HKLM\SYSTEM\CurrentControlSet\Services\bam and ...\bam\State\UserSettings; each fixture removes its
+  own; this is the tripwire that notices one that did not. It scans only the direct children named
+  YuzuTest-* of those roots (the local dispatcher's Software\YuzuTest\RegistryPr17Ld_<salt> keys,
+  test_registry_local_dispatcher.cpp:228,248, are outside it). The
   fixtures name their keys YuzuTest-<Scope>-<salt>... (tests/unit/test_helpers.hpp,
   registry_scratch_prefix), so the scan judges ONE job: with-test-slot.sh lets two test phases share a box at once and
   the runner agents share one OS identity, so a machine-wide YuzuTest-* scan would call a concurrent job's live keys
@@ -38,7 +39,7 @@ param(
 
 $prefix = "YuzuTest-$Scope-"
 $roots = 'HKLM:\SOFTWARE', 'HKLM:\SOFTWARE\Wow6432Node', 'HKCU:\Software',
-          'HKLM:\SYSTEM\CurrentControlSet\Services\bam', 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings'
+         'HKLM:\SYSTEM\CurrentControlSet\Services\bam', 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings'
 $failed = @()
 $all = @(foreach ($root in $roots) {
     if (-not (Test-Path -LiteralPath $root)) { continue }   # a root this OS does not have holds nothing

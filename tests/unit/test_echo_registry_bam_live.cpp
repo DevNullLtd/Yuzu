@@ -89,6 +89,12 @@ TEST_CASE("registry live: bam\\State is never read -- a scratch value under bam 
         SKIP("cannot write HKLM\\SYSTEM (not elevated)");
 
     const std::string bam = "SYSTEM\\CurrentControlSet\\Services\\bam";
+    // ScratchKey::create would otherwise create (and orphan) bam\State\UserSettings on a Windows without it.
+    HKEY present = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\bam\\State\\UserSettings", 0,
+                      KEY_READ, &present) != ERROR_SUCCESS)
+        SKIP("bam\\State\\UserSettings is not present on this Windows");
+    RegCloseKey(present);
     const std::string leaf = yuzu::test::registry_scratch_prefix() + "bam-" + salt();
     ScratchKey control(bam + "\\" + leaf);                          // positive control: inside the watched root
     ScratchKey excluded(bam + "\\State\\UserSettings\\" + leaf);    // below the excluded subtree
@@ -113,19 +119,20 @@ TEST_CASE("registry live: bam\\State is never read -- a scratch value under bam 
     REQUIRE(after.status == RegistryReadStatus::Complete);
 
     const auto mentions_leaf = [&](const std::string& s) { return s.find(leaf) != std::string::npos; };
+    const auto under_state = [](const std::string& s) { return s.find("\\State\\") != std::string::npos; };
     const auto d = diff_registry_snapshot(baseline_from_read(before), after, root, "notify", {0, 1}, 1);
     std::size_t control_rows = 0, excluded_rows = 0;
     for (const auto& c : d.candidates) {
         if (!mentions_leaf(c.key))
             continue;
-        (c.key.find("\\State\\") != std::string::npos ? excluded_rows : control_rows)++;
+        (under_state(c.key) ? excluded_rows : control_rows)++;
     }
     CHECK(control_rows == 1);  // the write inside the root is seen
     CHECK(excluded_rows == 0); // the write below bam\State is not
     // No gap: the denied key was never opened, so it is not reported as skipped, and not read.
     CHECK(std::none_of(after.skipped.begin(), after.skipped.end(), mentions_leaf));
     CHECK(std::none_of(after.keys.begin(), after.keys.end(),
-                       [&](const auto& kv) { return mentions_leaf(kv.first) && kv.first.find("\\State\\") != std::string::npos; }));
+                       [&](const auto& kv) { return mentions_leaf(kv.first) && under_state(kv.first); }));
 }
 
 #endif // _WIN32

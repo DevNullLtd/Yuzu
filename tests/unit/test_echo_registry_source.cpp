@@ -5113,6 +5113,7 @@ std::string etw_session_table() {
         auto* p = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buf.data() + i * stride);
         p->Wnode.BufferSize = static_cast<ULONG>(stride);
         p->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        p->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + kName * sizeof(wchar_t);
         ptrs[i] = p;
     }
     ULONG count = 0;
