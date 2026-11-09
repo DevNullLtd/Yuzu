@@ -174,15 +174,17 @@ constexpr FloorPair kExpectedFloorPairs[] = {
     {"Forensics", "Read"},
     // #5771 — the audit trail (evidence-grade data).
     {"AuditLog", "Read"},
+    // ADR-0070 R1 (slice 2b-1a) - registered CRL sources: operator-registered egress targets.
+    {"RevocationSource", "Read"},
 };
 
 } // namespace
 
 // ── 1. Lock the set ──────────────────────────────────────────────────────
 
-TEST_CASE("topology_floor_applies: exactly the eleven documented pairs are floored",
+TEST_CASE("topology_floor_applies: exactly the twelve documented pairs are floored",
           "[authz][floor]") {
-    // Positive: the eleven floored pairs (a change to kTopologyFloor's
+    // Positive: the twelve floored pairs (a change to kTopologyFloor's
     // MEMBERSHIP must break these). #4028 (api-parity programme #2146)
     // added the four Settings read-twin securables to the original three;
     // #4031 added Enrollment/OidcConfig; Wave 7 PR7.2 added Forensics; #5771
@@ -200,6 +202,10 @@ TEST_CASE("topology_floor_applies: exactly the eleven documented pairs are floor
     CHECK(topology_floor_applies("OidcConfig", "Read"));
     CHECK(topology_floor_applies("Forensics", "Read"));
     CHECK(topology_floor_applies("AuditLog", "Read"));
+    // ADR-0070 R1: the registered-egress-target class. Read only - Write is admin-only in the
+    // legacy branch already.
+    CHECK(topology_floor_applies("RevocationSource", "Read"));
+    CHECK_FALSE(topology_floor_applies("RevocationSource", "Write"));
 
     // Negative: a representative spread of pairs that must NOT be floored —
     // proves the set is narrow, not "every Read" or "every op on these
@@ -218,7 +224,7 @@ TEST_CASE("topology_floor_applies: exactly the eleven documented pairs are floor
     // Cardinality lock: a twelfth pair silently added to kTopologyFloor
     // without updating this file's positive/negative lists must still break
     // this test even though every entry it DOES check still round-trips.
-    CHECK(std::size(kTopologyFloor) == 11);
+    CHECK(std::size(kTopologyFloor) == 12);
 }
 
 // ── 1b. Every floored securable must actually EXIST in the catalogue ─────
