@@ -51,6 +51,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <regex>
 #include <evntrace.h> // ControlTraceW QUERY: no session may outlive stop()
 #include <sddl.h>
 #include <win_profiles.hpp> // enumerate_hku_subkeys, PrivilegeScope: the offline-hive cases
@@ -5127,15 +5128,12 @@ std::string etw_session_table() {
         const auto* name = reinterpret_cast<const wchar_t*>(reinterpret_cast<const BYTE*>(ptrs[i]) +
                                                             ptrs[i]->LoggerNameOffset);
         const std::wstring n(name, wcsnlen(name, kName));
-        // The reaper's name rule, hand-coded: ^Yuzu[A-Za-z]*Etw-[0-9]+\z
-        const auto is_letter = [](wchar_t c) { return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z'); };
-        const auto is_digit = [](wchar_t c) { return c >= L'0' && c <= L'9'; };
-        const auto dash = n.find(L'-');
-        if (n.rfind(L"Yuzu", 0) != 0 || dash == std::wstring::npos || dash < 7 || n.compare(dash - 3, 3, L"Etw") != 0 ||
-            !std::all_of(n.begin() + 4, n.begin() + (dash - 3), is_letter) || dash + 1 >= n.size() ||
-            !std::all_of(n.begin() + dash + 1, n.end(), is_digit))
+        // The reaper's name rule: ^Yuzu[A-Za-z]*Etw-[0-9]+\z
+        static const std::wregex re(LR"(Yuzu[A-Za-z]*Etw-([0-9]+))");
+        std::wsmatch m;
+        if (!std::regex_match(n, m, re))
             continue;
-        const DWORD pid = static_cast<DWORD>(std::wcstoul(n.c_str() + dash + 1, nullptr, 10));
+        const DWORD pid = static_cast<DWORD>(std::wcstoul(m[1].str().c_str(), nullptr, 10));
         const char* alive = "?"; // refused, or an unparsed pid: not evidence of a dead owner
         if (pid != 0) {
             const HANDLE raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);

@@ -7,9 +7,9 @@
  * the real bam key and writes only scratch keys named with registry_scratch_prefix(), which
  * scripts/ci/check-registry-test-leftovers.ps1 scans under both bam roots.
  *
- * is_elevated() and salt() are copies of the helpers in test_echo_registry_source.cpp (anonymous
- * namespace there; not shared because that file is edited by other work in flight). Keep the
- * two in step.
+ * is_elevated() mirrors the helper in test_echo_registry_source.cpp (anonymous namespace there),
+ * but holds the token in the HandlePtr owner where the original uses a manual CloseHandle. The
+ * shared header is deferred because that file is edited by other work in flight.
  */
 
 #ifdef _WIN32
@@ -66,8 +66,6 @@ void skip_or_fail(const std::string& why) {
     SKIP(why);
 }
 
-std::string salt() { return std::to_string(::GetCurrentProcessId()) + "_" + std::to_string(::GetTickCount64()); }
-
 // A scratch key below HKLM, deleted (with its contents) on destruction. A DACL set on the key
 // through the held handle keeps working for writes; the destructor restores access through the
 // same handle first so the delete cannot be refused.
@@ -120,7 +118,8 @@ TEST_CASE("registry live: bam\\State is never read -- a scratch value under bam 
                           KEY_READ, present.put()) != ERROR_SUCCESS)
             skip_or_fail("bam\\State\\UserSettings is not present on this Windows");
     }
-    const std::string leaf = yuzu::test::registry_scratch_prefix() + "bam-" + salt();
+    const std::string leaf = yuzu::test::registry_scratch_prefix() + "bam-" +
+                             std::to_string(yuzu::test::process_random_salt());
     ScratchKey control(bam + "\\" + leaf);                          // positive control: inside the watched root
     ScratchKey excluded(bam + "\\State\\UserSettings\\" + leaf);    // below the excluded subtree
     // Both are created before either can throw, so a failure here still unwinds both owners. An
