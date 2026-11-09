@@ -2003,37 +2003,6 @@ TEST_CASE("REST inventory/software: a confined caller's range is resolved over i
     CHECK(get_lookup(h, "?name=git&version_min=1", 400).contains("error"));
 }
 
-TEST_CASE("REST inventory/software: a catalogue rollup row whose row_count was never computed reads building, never zero",
-          "[pg][rest][inventory_software]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    SoftwareInventoryStore store{pool};
-    REQUIRE(store.is_open());
-    seed_v3(store, "dev-a", V3Status::kFull, {lookup_entry("git", "1.0")});
-    seed_v3(store, "dev-b", V3Status::kFull, {lookup_entry("git", "1.0")});
-    REQUIRE(store.refresh_catalog_rollup());
-    InvHarness h{&store};
-    CHECK(get_lookup(h, "?name=git").at("data").at("totals").at("installs") == 2);
-    { // The shape an older-ladder replica's refresh leaves (its INSERT names no row_count).
-        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
-        REQUIRE(lease);
-        pg::PgResult r = pg::exec_params(
-            lease.get(), "UPDATE software_inventory_store.catalog_rollup SET row_count = NULL",
-            std::vector<std::string>{});
-        REQUIRE(r.status() == PGRES_COMMAND_OK);
-    }
-    const auto body = get_lookup(h, "?name=git").at("data");
-    CHECK(body.at("software").size() == 2); // rows are live and unaffected
-    CHECK(body.at("totals").is_null());
-    CHECK(body.at("totals_omitted") == "building");
-    // A version filter is a live aggregate and never reads the rollup row.
-    CHECK(get_lookup(h, "?name=git&version=1.0").at("data").at("totals").at("devices") == 2);
-    // The next refresh computes the figure and the totals return.
-    REQUIRE(store.refresh_catalog_rollup());
-    CHECK(get_lookup(h, "?name=git").at("data").at("totals").at("installs") == 2);
-}
-
 TEST_CASE("REST inventory/software: a failed version read for a range is a 503 with retry_after_ms and one failure audit row",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);

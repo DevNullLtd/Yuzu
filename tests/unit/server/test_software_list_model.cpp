@@ -278,7 +278,6 @@ namespace {
 struct FakeTotals {
     std::int64_t refreshed_at{1700000000};
     bool ok{true};
-    bool computed{true}; ///< false: the rollup row's row_count is NULL (never computed)
     int moves_left{0}; ///< rollup refreshes that commit under the next rollup row reads
     // The rollup-served counts vary with the generation (one more install per refresh), so a
     // read that paired an older row with a newer as_of is visible as a wrong count.
@@ -307,9 +306,7 @@ struct FakeTotals {
             move();
             if (!ok)
                 return std::nullopt;
-            SoftwareTotals t{10 + gen_offset(), 4, 0};
-            t.computed = computed;
-            return t;
+            return SoftwareTotals{10 + gen_offset(), 4, 0};
         };
         io.version_set_totals = [this](std::string_view,
                                        const std::vector<std::string>& v) -> std::optional<SoftwareTotals> {
@@ -387,16 +384,6 @@ TEST_CASE("read_application_totals: building before the first refresh; a failed 
     CHECK(read_application_totals(f.reads(), q).status == TotalsStatus::kDegraded);
     q.version = "1";
     CHECK(read_application_totals(f.reads(), q).status == TotalsStatus::kDegraded);
-
-    // A fresh stamp but a rollup row whose figure was never computed (row_count NULL, schema
-    // v12: a row an older-ladder refresh wrote): building, never the zero the row would read as.
-    FakeTotals stale;
-    stale.computed = false;
-    q.version.reset();
-    const auto t2 = read_application_totals(stale.reads(), q);
-    CHECK(t2.status == TotalsStatus::kBuilding);
-    CHECK_FALSE(t2.as_of.has_value());
-    CHECK(stale.title_reads == 1);
 }
 
 TEST_CASE("rollup totals: a refresh under the row read is re-read against the new epoch once; a "

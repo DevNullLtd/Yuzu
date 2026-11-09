@@ -1482,12 +1482,9 @@ polled when, in what state.
   same reason the totals are withheld (ADR-0017): a fleet-wide cut would make the refusal a fact
   about devices the caller cannot see, so a confined caller is answered for a title with 2000
   versions outside its scope exactly as for an unknown title.
-- **Schema v12.** `catalog_rollup.row_count` (nullable, no default, metadata-only: a row whose
-  value is NULL was written by a refresh that did not compute it, a row older than v12 or one an
-  older-ladder replica's refresh wrote, and the title-totals read reports it as `building`, never
-  as `installs: 0` beside a non-zero device count; the catalogue's freshness stamp is not reset,
-  so its other readers keep their last-good rollup), the two component rollup tables, and
-  `software_components_name_idx`. The index is a plain `CREATE INDEX` in the ladder transaction:
+- **Schema v12.** `catalog_rollup.row_count` (constant default, metadata-only; the migration also
+  sets the catalogue stamp back to `building` so no reader sees a zero row count beside a non-zero
+  device count), the two component rollup tables, and `software_components_name_idx`. The index is a plain `CREATE INDEX` in the ladder transaction:
   `software_components` is empty in every deployment until an agent emits component rows (the
   server apply path is live, the producer ships later), so the build holds its lock for no
   measurable time.

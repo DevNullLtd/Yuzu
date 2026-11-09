@@ -482,13 +482,11 @@ const std::vector<pg::PgMigration>& migrations() {
          // rollup, and the components name index.
          // catalog_rollup.row_count: install ROWS of the group (count(*)), beside device_count
          // (distinct devices), so a title's totals report the SAME `installs` (rows) rollup-served
-         // and live. NULLABLE with NO default (a metadata-only ADD COLUMN): a row whose row_count
-         // is NULL was written by a refresh that did not compute it (a row that predates v12, or
-         // a refresh by an older-ladder replica, whose INSERT names no row_count), and
-         // catalog_title_totals reads NULL as "building" (SoftwareTotals::computed = false).
-         // That is the data's own marker, so no freshness-stamp reset is needed: a reader never
-         // sees installs = 0 beside a non-zero device count, and the catalogue's other readers
-         // (KPIs, export, versions drill) keep the last-good rollup through the migration.
+         // and live. A constant-default ADD COLUMN is metadata-only (the v5 precedent). The rows
+         // already there carry 0 until the next refresh recomputes them, so the same statement
+         // sets catalog_rollup_meta.refreshed_at back to 0 ("building", the v8 precedent): a
+         // reader sees `building` for the first refresh interval, never installs = 0 beside a
+         // non-zero device count. The background rollup thread runs its first refresh at start.
          // component_rollup: one row per (kind, name) with exact instance (row) and
          // distinct-device counts, replaced whole by refresh_component_rollup. component_rollup_meta is the singleton freshness stamp,
          // seeded refreshed_at = 0 ("building"). Two new EMPTY tables: online.
@@ -498,7 +496,8 @@ const std::vector<pg::PgMigration>& migrations() {
          // path is live, so a v3 fixture can fill it), so this plain CREATE INDEX inside the ladder
          // transaction holds ACCESS EXCLUSIVE on an empty table for no measurable time and needs no
          // CONCURRENTLY, exactly like software_components_row_hash_idx in v11.
-         "ALTER TABLE catalog_rollup ADD COLUMN IF NOT EXISTS row_count BIGINT;"
+         "ALTER TABLE catalog_rollup ADD COLUMN IF NOT EXISTS row_count BIGINT NOT NULL DEFAULT 0;"
+         "UPDATE catalog_rollup_meta SET refreshed_at = 0 WHERE id = 1;"
          "CREATE TABLE IF NOT EXISTS component_rollup ("
          "  kind                TEXT     NOT NULL,"
          "  name                TEXT     NOT NULL,"
@@ -3607,12 +3606,6 @@ std::optional<SoftwareTotals> SoftwareInventoryStore::catalog_title_totals(std::
         std::vector<std::string>{std::string(name)}, [](const pg::PgResult& res) {
             SoftwareTotals t; // a title absent from the rollup is a genuine zero
             if (PQntuples(res.get()) == 1) {
-                // A NULL row_count is a row no v12 refresh has recomputed (see migration v12):
-                // not computed, never zero.
-                if (PQgetisnull(res.get(), 0, 0)) {
-                    t.computed = false;
-                    return t;
-                }
                 t.installs = result_i64(res, 0, 0);
                 t.devices = result_i64(res, 0, 1);
             }

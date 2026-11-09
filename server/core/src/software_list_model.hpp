@@ -127,11 +127,7 @@ resolve_version_range(const std::vector<std::string>& distinct_versions, std::st
                       std::string_view version_max);
 
 /// The gate's scope as the store's `agent_ids` push-down for the distinct-version reads: nullopt
-/// (unfiltered) stays nullopt; an engaged set, empty included, is passed whole (the store's
-/// present-empty rule returns an empty value with no SQL). Unlike the page read there is no
-/// post-filter alternative for a scope wider than kScopePushdownMaxIds: a distinct-version set
-/// cannot be filtered after the fact (a cut read would leak the fleet property), so the whole
-/// set is pushed into the one bounded statement.
+/// stays nullopt; an engaged set, empty included, is passed whole (no post-filter alternative).
 [[nodiscard]] std::optional<std::vector<std::string>> scope_ids(const authz::VisibleSet& scope);
 
 // ── Fingerprints, audit targets, cursors ─────────────────────────────────────

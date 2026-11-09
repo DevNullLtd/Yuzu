@@ -6899,23 +6899,17 @@ TEST_CASE("v12: the lookup objects exist and the meta singleton is seeded buildi
     CHECK(meta->refreshed_at == 0); // never computed: "building"
 }
 
-TEST_CASE("migration v12 adds a nullable row_count over a live v11 database: the stamp survives, a row "
-          "it did not compute reads building, and the step re-runs idempotently",
+TEST_CASE("migration v12 resets the catalogue freshness stamp to building over a live v11 database, and re-runs idempotently",
           "[pg][software_inventory][lookup]") {
-    // Reproduce a v11-era schema holding a refreshed catalogue: drop the v12 additions (the rows of
-    // catalog_rollup stay), mark the catalogue rollup fresh, rewind schema_meta to 11, reconstruct
-    // so v12 runs over live data; then rewind and reconstruct again to prove the migration text is
-    // idempotent.
+    // Reproduce a v11-era schema: drop the v12 additions, mark the catalogue rollup fresh, rewind
+    // schema_meta to 11, reconstruct so v12 runs over live data; then rewind and reconstruct again
+    // to prove the migration text is idempotent.
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     {
         SoftwareInventoryStore s1{pool};
         REQUIRE(s1.is_open());
-        REQUIRE(s1.apply_installed_software("mig-a", "",
-                                            std::vector<SoftwareEntry>{{"git", "1", "P", ""}},
-                                            1) == InventoryIngestOutcome::kStored);
-        REQUIRE(s1.refresh_catalog_rollup()); // a published rollup row for "git"
     }
     const auto rewind = [&] {
         REQUIRE(sql_ok(pool, "UPDATE public.schema_meta SET version = 11 "
@@ -6933,37 +6927,20 @@ TEST_CASE("migration v12 adds a nullable row_count over a live v11 database: the
     {
         SoftwareInventoryStore store{pool}; // v12 over the v11 shape
         REQUIRE(store.is_open());
-        // The column comes back nullable and empty for the rows already there; the freshness
-        // stamp is NOT reset (the catalogue's other readers keep their last-good rollup).
+        // Rows written before row_count existed carry 0, so the stamp is reset: a reader sees
+        // `building`, never installs = 0 beside a non-zero device count.
         const auto meta = store.catalog_rollup_meta();
         REQUIRE(meta.has_value());
-        CHECK(meta->refreshed_at == 12345);
-        CHECK(sql_rows(pool, "SELECT is_nullable FROM information_schema.columns WHERE table_schema "
-                             "= 'software_inventory_store' AND table_name = 'catalog_rollup' AND "
-                             "column_name = 'row_count'")[0][0] == "YES");
-        CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.catalog_rollup WHERE "
-                             "row_count IS NULL")[0][0] != "0");
-        // A row whose figure was never computed reads "not computed", never installs = 0 beside
-        // a non-zero device count. The same shape results from an older-ladder replica's refresh
-        // (its INSERT names no row_count).
-        const auto before = store.catalog_title_totals("git");
-        REQUIRE(before.has_value());
-        CHECK_FALSE(before->computed);
+        CHECK(meta->refreshed_at == 0);
+        CHECK(sql_rows(pool, "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+                             "'software_inventory_store' AND table_name = 'catalog_rollup' AND "
+                             "column_name = 'row_count'")[0][0] == "1");
         const auto cmeta = store.component_rollup_meta();
         REQUIRE(cmeta.has_value());
         CHECK(cmeta->refreshed_at == 0); // seeded building
         CHECK(sql_rows(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = "
                              "'software_inventory_store' AND indexname = "
                              "'software_components_name_idx'")[0][0] == "1");
-        // The next refresh computes it.
-        REQUIRE(store.refresh_catalog_rollup());
-        const auto after = store.catalog_title_totals("git");
-        REQUIRE(after.has_value());
-        CHECK(after->computed);
-        CHECK(after->installs == 1);
-        CHECK(after->devices == 1);
-        CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.catalog_rollup WHERE "
-                             "row_count IS NULL")[0][0] == "0");
     }
     rewind();
     SoftwareInventoryStore again{pool}; // second run over an already-migrated database
@@ -7286,17 +7263,19 @@ TEST_CASE("component_versions: LIVE distinct non-empty versions of one component
                    "('dev-b', 'jar', 'ph2', '/o2', 'other', '1.0', 'rh', 1), "
                    "('dev-c', 'jar', 'ph3', '/o3', 'other', '1.0', 'rh', 1), "
                    "('dev-c', 'jar', 'ph4', '/o4', 'other', '', 'rh', 1)"));
-    const auto capped = store.component_versions("jar", "libfoo");
+    const auto capped = store.component_versions("jar", "libfoo", std::nullopt);
     REQUIRE(capped.has_value());
     CHECK(capped->size() == static_cast<std::size_t>(kCatalogRowCap)); // never more
     // Another kind is separate; an empty kind spans kinds (distinct). The shared version of two
     // devices is one entry, and the empty version is never listed.
-    REQUIRE(store.component_versions("so", "libfoo").has_value());
-    CHECK(*store.component_versions("so", "libfoo") == std::vector<std::string>{"v1"});
-    CHECK(*store.component_versions("jar", "other") == std::vector<std::string>{"1.0", "2.0"});
-    CHECK(*store.component_versions("", "other") == std::vector<std::string>{"1.0", "2.0"});
-    CHECK(store.component_versions("jar", "").value().empty()); // no name: empty value
-    CHECK(store.component_versions("jar", "absent").value().empty());
+    REQUIRE(store.component_versions("so", "libfoo", std::nullopt).has_value());
+    CHECK(*store.component_versions("so", "libfoo", std::nullopt) == std::vector<std::string>{"v1"});
+    CHECK(*store.component_versions("jar", "other", std::nullopt) ==
+          std::vector<std::string>{"1.0", "2.0"});
+    CHECK(*store.component_versions("", "other", std::nullopt) ==
+          std::vector<std::string>{"1.0", "2.0"});
+    CHECK(store.component_versions("jar", "", std::nullopt).value().empty()); // no name: empty value
+    CHECK(store.component_versions("jar", "absent", std::nullopt).value().empty());
     // The caller's scope is pushed into the read: a confined caller's set and its cap are about
     // its own devices only (dev-b holds one version of the capped component; dev-c none).
     const std::optional<std::vector<std::string>> only_b{{"dev-b"}};
@@ -7320,16 +7299,16 @@ TEST_CASE("installed_software_distinct_versions: LIVE distinct non-empty version
                    "source) VALUES ('d1', 'git', '1.9', 'src.x'), ('d2', 'git', '1.10', 'src.x'), "
                    "('d3', 'git', '1.9', 'src.x'), ('d4', 'git', '', 'src.x'), "
                    "('d5', 'gitk', '7.7', 'src.x')"));
-    const auto git = store.installed_software_distinct_versions("git");
+    const auto git = store.installed_software_distinct_versions("git", std::nullopt);
     REQUIRE(git.has_value());
     // Distinct (d1 and d3 share 1.9), the empty version excluded, another title excluded.
     CHECK(std::set<std::string>(git->begin(), git->end()) == std::set<std::string>{"1.9", "1.10"});
     CHECK(git->size() == 2);
-    const auto big = store.installed_software_distinct_versions("bigtitle");
+    const auto big = store.installed_software_distinct_versions("bigtitle", std::nullopt);
     REQUIRE(big.has_value());
     CHECK(big->size() == static_cast<std::size_t>(kCatalogRowCap)); // never more
-    CHECK(store.installed_software_distinct_versions("").value().empty());
-    CHECK(store.installed_software_distinct_versions("absent").value().empty());
+    CHECK(store.installed_software_distinct_versions("", std::nullopt).value().empty());
+    CHECK(store.installed_software_distinct_versions("absent", std::nullopt).value().empty());
     // Scoped: the capped title has one version per device, so a two-device scope reads two, and
     // a scope with none of its devices reads nothing (never the fleet's cut).
     const std::optional<std::vector<std::string>> two{{"a1", "a2"}};

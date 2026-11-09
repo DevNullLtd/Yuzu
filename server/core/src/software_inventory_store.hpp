@@ -296,11 +296,6 @@ struct SoftwareTotals {
     std::int64_t installs{0};
     std::int64_t devices{0};
     std::int64_t devices_unconfirmed{0};
-    /// false when the rollup row exists but its figure was never computed (`catalog_rollup.row_count`
-    /// IS NULL: a row written before schema v12, or by an older-ladder replica's refresh). The
-    /// counts above are then meaningless and the caller reports "building", never a zero. Always
-    /// true for a live aggregate and for a row the current refresh wrote.
-    bool computed{true};
 };
 
 /// Freshness stamp of the components rollup (refreshed_at == 0: never computed, "building").
@@ -724,9 +719,8 @@ public:
     /// value with no SQL), so the cap and the set a confined caller's range resolves against are
     /// about its own rows only. 5 s bound; nullopt on degrade. Empty name -> empty value.
     [[nodiscard]] std::optional<std::vector<std::string>>
-    installed_software_distinct_versions(
-        std::string_view name,
-        const std::optional<std::vector<std::string>>& agent_ids = std::nullopt);
+    installed_software_distinct_versions(std::string_view name,
+                                         const std::optional<std::vector<std::string>>& agent_ids);
 
     /// Distinct non-empty versions of one component (kind may be empty = any kind), LIVE from
     /// `software_components` (served by software_components_name_idx), ordered, at most
@@ -735,7 +729,7 @@ public:
     /// value.
     [[nodiscard]] std::optional<std::vector<std::string>>
     component_versions(std::string_view kind, std::string_view name,
-                       const std::optional<std::vector<std::string>>& agent_ids = std::nullopt);
+                       const std::optional<std::vector<std::string>>& agent_ids);
 
     /// Exact application totals for one title (name-only grain of the catalogue rollup):
     /// installs = install rows, devices = distinct devices. nullopt on degrade; a title absent
