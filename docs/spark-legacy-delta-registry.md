@@ -121,9 +121,9 @@ never invent a rationale for what isn't ruled yet.
 | **Legacy** | N/A — this state only exists when `prefer_spark=true` |
 | **Spark** | Every rule is withdrawn from legacy and left unarmed. Nothing enforces, nothing detects, for the whole agent, until the operator intervenes. |
 | **Why deliberate** | "SparkFailed and Unwired NEVER fall back to legacy - a failure must be visible (errored), never silently absorbed (mutual exclusion)." Ruling R1 (design doc, backend-selection table + correlated-outage note). |
-| **Operator symptom** | `yuzu.guardian_backend` heartbeat tag reads `spark_failed` or `unwired` for the affected agent. **No fleet-level Prometheus gauge exists for this today** — `yuzu_fleet_spark_failed{os}` is adjacent but not identical (it tracks SparkEngine boot failure only, not a post-boot wiring failure or `Unwired`). A fleet-wide SparkEngine boot throw is a correlated-outage tail: every agent in the cohort loses enforcement simultaneously until `--spark-disable` is set. |
+| **Operator symptom** | `yuzu.guardian_backend` heartbeat tag reads `spark_failed` or `unwired` for the affected agent. The tag is rolled up fleet-wide as `yuzu_fleet_guardian_backend{os,backend}` and served per device as the `guardian_backend` field on `GET /api/v1/devices[/{id}]`, `list_agents` and `get_agent_details` (#2240); no alert rule ships for it. `yuzu_fleet_spark_failed{os}` is adjacent but not identical (it tracks SparkEngine boot failure only, not a post-boot wiring failure or `Unwired`). A fleet-wide SparkEngine boot throw is a correlated-outage tail: every agent in the cohort loses enforcement simultaneously until `--spark-disable` is set. |
 | **Verify at** | `GuardianEngine::reconcile_rule_locked`'s `SparkFailed`/`Unwired` guard (withdraws legacy, `unsupported_rules_.erase`, returns false); `GuardianEngine::wire_spark_engine()`'s `!engine` branch ("spark path unavailable... never silently substituted"); `guardian_backend_from_state()` / `guardian_backend_label()` in `guardian_backend.hpp`. |
-| **Epistemic** | verified b16e5836d |
+| **Epistemic** | verified b16e5836d; the Operator symptom cell was updated for #2240 and checked against `guardian_backend_fleet_tags.hpp` and the REST and MCP device handlers (#2240) |
 
 ### A2 — Mutual exclusion is per-rule; a spark arm failure never falls through
 

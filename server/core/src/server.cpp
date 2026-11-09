@@ -99,6 +99,7 @@
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet gauge names + HELP (rung 9c PR-3)
+#include "guardian_backend_fleet_tags.hpp" // yuzu.guardian_backend fleet gauge names + HELP (#2240)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
@@ -221,6 +222,10 @@
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
 #include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
 #include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
+#include "bounded_resolver.hpp" // CRL source registration's resolver pool (its in-flight gauge)
+#include "revocation_source_admin_gate.hpp" // ADR-0070 R1: decide_admin + the service
+#include "revocation_source_routes.hpp"      // ADR-0070 R1: /api/v1/crypto/revocation-sources
+#include "revocation_source_store.hpp"       // ADR-0070 R1: registered CRL sources (born-on-PG)
 #include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
@@ -672,6 +677,22 @@ public:
                                                  .burst = 2.0 * cfg_.principal_rate_limit}) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_server_revocation_source_degrade_total",
+                          "CRL source registrations refused for a retryable reason, by reason "
+                          "(own_addresses_unavailable/dns_unavailable/dns_timeout/dns_busy/"
+                          "dns_budget_exhausted/validation_busy)",
+                          "counter");
+        metrics_.describe("yuzu_server_revocation_source_resolver_in_flight",
+                          "Name lookups outstanding in the resolver pool CRL source registration "
+                          "resolves hosts in, published every 15 s; a value at the pool's cap means "
+                          "registrations are refused until lookups return",
+                          "gauge");
+        metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight").set(0.0);
+        // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".
+        for (const char* reason :
+             {"own_addresses_unavailable", "dns_unavailable", "dns_timeout", "dns_busy",
+              "dns_budget_exhausted", "validation_busy"})
+            metrics_.counter("yuzu_server_revocation_source_degrade_total", {{"reason", reason}});
         metrics_.describe("yuzu_nvd_total_cves", "Distinct CVEs in the local NVD catalog", "gauge");
         metrics_.describe("yuzu_nvd_backfill_complete",
                           "1 when the newest-first NVD backfill has reached its floor, else 0",
@@ -3100,6 +3121,15 @@ public:
                           detail::kGuardianIoCeilingReportingHelp, "gauge");
         metrics_.describe(detail::kGuardianIoCeilingTagRejectedGauge,
                           detail::kGuardianIoCeilingTagRejectedHelp, "gauge");
+        // #2240: yuzu.guardian_backend. A categorical {os,backend} partition count plus the two
+        // unlabelled meta gauges, all registered from the SAME constants
+        // AgentHealthStore::recompute_metrics clears and publishes with
+        // (guardian_backend_fleet_tags.hpp), so a name or HELP cannot drift between the two.
+        metrics_.describe(detail::kGuardianBackendGauge, detail::kGuardianBackendHelp, "gauge");
+        metrics_.describe(detail::kGuardianBackendReportingGauge,
+                          detail::kGuardianBackendReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianBackendTagRejectedGauge,
+                          detail::kGuardianBackendTagRejectedHelp, "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -8291,6 +8321,50 @@ public:
             }
         }
 
+        // RevocationSourceStore - born-on-Postgres registered CRL sources (ADR-0070 R1, schema
+        // revocation_source_store). CONSTRUCTION is fail-CLOSED per ADR-0012 section 1 and the store is
+        // in the /readyz conjunction: unlike a layout, a registered source is operator-authored
+        // security configuration (an egress target and the CA keys a CRL is judged against), so a
+        // node that cannot open it must not serve. It never touches ca_store.
+        if (pg_pool_ && !startup_failed_) {
+            revocation_source_store_ = std::make_unique<RevocationSourceStore>(*pg_pool_);
+            if (!revocation_source_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: revocation-source store migration/open "
+                              "failed (database reachable but the revocation_source_store schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                // The service owns the registration-time address check: the listener addresses
+                // are the server's own, which a registered CRL URL may never name.
+                // NAT64 prefixes the operator declared (--oidc-nat64-prefix) are decoded, so
+                // Pref64 + 169.254.169.254 classifies as metadata, not as "public IPv6".
+                std::vector<oidc::egress::Nat64Prefix> nat64;
+                if (auto prefixes = oidc::egress::parse_nat64_prefix_list(cfg_.oidc_nat64_prefixes)) {
+                    nat64 = std::move(*prefixes);
+                } else {
+                    // Fail loudly: wiring the service with the operator's declared prefixes
+                    // dropped would make the metadata refusal silently weaker than configured.
+                    spdlog::error("Refusing to start: --oidc-nat64-prefix does not parse, so the "
+                                  "CRL source address check cannot apply it");
+                    startup_failed_ = true;
+                }
+                auto egress_env = revocation_source::make_system_egress_env(
+                    {cfg_.listen_address, cfg_.management_address, cfg_.web_address,
+                     cfg_.gateway_upstream_address},
+                    std::move(nat64));
+                egress_env.note_degrade = [this](std::string_view reason) {
+                    metrics_
+                        .counter("yuzu_server_revocation_source_degrade_total",
+                                 {{"reason", std::string(reason)}})
+                        .increment();
+                };
+                revocation_source_service_ =
+                    std::make_unique<revocation_source::RevocationSourceService>(
+                        *revocation_source_store_, std::move(egress_env));
+                spdlog::info("RevocationSourceStore initialized (schema revocation_source_store)");
+            }
+        }
+
         // Typed per-device app-perf daily projection — born-on-Postgres (DEX
         // app-perf-over-time B1). Independent of the software store above (its own
         // schema, its own fail-closed). Wires BOTH server entry points (direct
@@ -9692,7 +9766,7 @@ public:
                 // delays revoked-agent teardown by the same amount. Make it
                 // visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
-                health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
+                health_store_.recompute_metrics(metrics_, detail::kAgentHealthStaleness);
                 // PostgreSQL pool gauges (#1368): sampled on the same cadence as
                 // the fleet families. Counters/histogram are fed live by the
                 // pool's observer hooks, so only the level gauges are polled here.
@@ -9709,6 +9783,10 @@ public:
                         .set(static_cast<double>(stream_budget_->active_for_surface(
                             yuzu::server::detail::SseSurface::kWorkflowRun)));
                 }
+                // The CRL source registration resolver pool, published from this 15 s tick (never
+                // from a request path), so the in-flight gauge cannot sit stale after a lookup ends.
+                metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight")
+                    .set(static_cast<double>(::yuzu::server::net::process_resolver_in_flight()));
                 // Workflow run table size: one catalog row, 250 ms to lease plus a 250 ms
                 // statement (roughly 250 ms plus connect_timeout_s if the pool must open a
                 // connection), noexcept (a failed sample keeps the previous gauge values).
@@ -11561,6 +11639,11 @@ public:
         // The /crypto layout store: borrowed only by crypto_api_, whose callers (the web worker
         // pool) were joined above. Before the pool (ADR-0012 destruct-before-pool).
         crypto_dashboard_layout_store_.reset();
+        // The revocation-source seam and its store: borrowed only by the REST routes and the MCP
+        // tools, whose callers (the web worker pool) were joined above. Service before store,
+        // before the pool (ADR-0012 destruct-before-pool).
+        revocation_source_service_.reset();
+        revocation_source_store_.reset();
         agent_service_.set_app_perf_daily_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
@@ -17443,6 +17526,7 @@ private:
                              .analytics_store = analytics_store_.get(),
                              .crypto_dashboard_layout_store =
                                  crypto_dashboard_layout_store_.get(),
+                             .revocation_source_store = revocation_source_store_.get(),
                              .nvd_db = nvd_db_.get(),
                              .nvd_sync = nvd_sync_.get(),
                          });
@@ -18350,6 +18434,39 @@ private:
                         spdlog::error("deployment prune threw ({}) — thread continuing", e.what());
                     } catch (...) {
                         spdlog::error("deployment prune threw unknown exception — continuing");
+                    }
+                }
+                // SAM-14: clock-guarded, single-writer prune of the installed-software change
+                // ledger (400 days), beside the deployment prune above. Hourly, like the
+                // offline_endpoint prune below (its own constant, so that prune's lexical gate keeps
+                // seeing exactly one use of its tick condition): a pass that hit the cap re-arms immediately (bounded to 12
+                // passes), any other result stops the drain until the next hour. ReplicaSafe, no
+                // leader_gate call: the guard's advisory lock lets one replica win a tick.
+                constexpr int kSoftwareLedgerPruneEveryNTicks = 60; // ~1h at 60s/tick
+                if (software_inventory_store_ && software_inventory_store_->is_open() &&
+                    !stop_requested_.load(std::memory_order_acquire) &&
+                    tick % kSoftwareLedgerPruneEveryNTicks == 1) {
+                    try {
+                        YUZU_ASSERT_BACKGROUND_JOB(
+                            "software_inventory_store.run_retention_prune_changes");
+                        for (int drain = 0;
+                             drain < 12 && !stop_requested_.load(std::memory_order_acquire);
+                             ++drain) {
+                            const int pruned =
+                                software_inventory_store_->run_retention_prune_changes();
+                            if (pruned < 0)
+                                spdlog::warn("software change ledger prune did not run (store not "
+                                             "open or no connection/transaction); retrying next "
+                                             "hour");
+                            if (pruned != SoftwareInventoryStore::kChangesPruneCapPerPass)
+                                break;
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::error("software change ledger prune threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("software change ledger prune threw unknown exception — "
+                                      "continuing");
                     }
                 }
                 // #5678 / #1545 UP-4: hourly clock-guarded prune of endpoint_state rows
@@ -19432,7 +19549,7 @@ private:
             // the yuzu_fleet_perf_* gauges see the same population. perf_snapshot
             // copies ONLY the perf tags (G3 performance S1 — the copy runs under
             // the heartbeat-upsert mutex).
-            const auto health = health_store_.perf_snapshot(std::chrono::seconds{90});
+            const auto health = health_store_.perf_snapshot(detail::kAgentHealthStaleness);
             std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;
             by_id.reserve(health.size());
             for (const auto& h : health)
@@ -19804,7 +19921,7 @@ private:
         // by this rewire — they are shared infrastructure with other live consumers
         // (PreflightRoutes, DeploymentRoutes, EchoTreeRoutes, and McpServer's/
         // EchoTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
-        auto device_api = make_local_device_api(registry_, tag_store_.get());
+        auto device_api = make_local_device_api(registry_, tag_store_.get(), health_store_);
         // The customer score policy is one stored document read through a
         // bounded-refresh provider, so every instance converges within
         // kDexPolicyRefreshMs. It depends only on the runtime config store, so it exists
@@ -20244,12 +20361,12 @@ private:
                         software_catalogue::kStaleWindowSecs;
                     return software_inventory_store_->count_stale_agents(cutoff);
                 },
-                // ponytail: O(fleet) registry walk per full-page render (the REST twin does the
-                // same); an O(1) connected-count when the 2M-endpoint target bites.
+                // O(1) count of connected devices (DeviceApi::connected_count): no per-device
+                // rows are built for a number the page shows.
                 .connected_fn = [device_api]() -> std::optional<std::int64_t> {
                     if (!device_api)
                         return std::nullopt;
-                    return static_cast<std::int64_t>(device_api->list_devices().size());
+                    return static_cast<std::int64_t>(device_api->connected_count());
                 },
                 // agent_id -> hostname for the host type-ahead / devices tables. One bulk read
                 // per render; endpoint_state's hostname is written on every heartbeat whether
@@ -20309,6 +20426,28 @@ private:
                                    },
                                .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
                                .tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});
+
+        // RevocationSourceRoutes - /api/v1/crypto/revocation-sources (ADR-0070 R1). Admin-only in
+        // BOTH RBAC states: perm_fn gates the RevocationSource securable (seeded to Administrator
+        // only, Read floored under RBAC off) and admin_fn is the durable-administrator predicate
+        // (is_rbac_administrator, kRest, plus the regime re-check on a write), so a custom role
+        // holding the securable is still refused. The MCP twins are wired to the SAME service.
+        revocation_source_routes_ = std::make_unique<RevocationSourceRoutes>();
+        revocation_source_routes_->register_routes(
+            *web_server_,
+            RevocationSourceRoutes::Deps{
+                .auth_fn = auth_fn,
+                .audit_fn = audit_fn,
+                .perm_fn = perm_fn,
+                .admin_fn =
+                    [this](const auth::Session& session, bool is_write) {
+                        return revocation_source::decide_admin(session, auth_db_.get(),
+                                                               rbac_store_.get(),
+                                                               RbacAdminSurface::kRest, is_write);
+                    },
+                .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
+                .step_up_fn = step_up_fn,
+                .service = revocation_source_service_.get()});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
@@ -22413,12 +22552,33 @@ private:
         // store the three routes answer 503. MUST run BEFORE register_routes().
         if (dex_score_policy_provider_) {
             auto policy_writes = dex_score_policy_store_writer(*runtime_config_store_);
-            rest_api_v1_->set_dex_score_policy_writer(
-                {.read_stored = dex_score_policy_store_reader(*runtime_config_store_),
-                 .compare_and_set = std::move(policy_writes.compare_and_set),
-                 .compare_and_remove = std::move(policy_writes.compare_and_remove),
-                 .provider = dex_score_policy_provider_,
-                 .audit = {}});
+            DexScorePolicyWriteDeps policy_deps{
+                .read_stored = dex_score_policy_store_reader(*runtime_config_store_),
+                .compare_and_set = std::move(policy_writes.compare_and_set),
+                .compare_and_remove = std::move(policy_writes.compare_and_remove),
+                .provider = dex_score_policy_provider_,
+                .audit = {}};
+            // AP-3.12: the Scoring tab shares these deps; its setters read per request, so only
+            // the REST setter below must precede register_routes.
+            settings_routes_->set_dex_score_policy_writer(policy_deps);
+            rest_api_v1_->set_dex_score_policy_writer(std::move(policy_deps));
+            // The suggestions and the pre-save tier-change preview score the Apps model through
+            // the production scorer with a substituted policy. Deliberately absent where the
+            // signals store is (a runtime-config store without one is a shipped configuration):
+            // the tab then edits without suggestions and the preview answers "unavailable".
+            if (dex_api)
+                settings_routes_->set_dex_apps_fn(
+                    [dex_api, store = guaranteed_state_store_.get(),
+                     dex_fleet_fn](const std::optional<DexPolicyInForce>& p) {
+                        if (!p)
+                            return dex_api->apps("7d", kDexAppsScopeAll);
+                        return make_local_dex_api(
+                                   store, dex_fleet_fn,
+                                   [v = *p]() -> std::expected<DexPolicyInForce, std::string> {
+                                       return v;
+                                   })
+                            ->apps("7d", kDexAppsScopeAll);
+                    });
         }
         // REST and MCP name this type separately; they must stay the SAME type, or the
         // copies handed to each could silently drift behind a std::function conversion.
@@ -23204,6 +23364,8 @@ private:
             mcp_server_->set_tool_deps(std::move(tool_deps));
             mcp_server_->set_crypto_api(crypto_api_);
             mcp_server_->set_crypto_access_fn(crypto_access_cb);
+            // ADR-0070 R1: the SAME RevocationSourceService the REST routes use.
+            mcp_server_->set_revocation_source_service(revocation_source_service_.get());
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -24018,6 +24180,17 @@ private:
     std::unique_ptr<pg::PgPool> pg_pool_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
+    /// Fleet health aggregation (heartbeat status_tags -> yuzu_fleet_* gauges, and the per-device
+    /// guardian_backend read). DECLARED HERE, beside `registry_` and BEFORE every borrower: the
+    /// holders of the device API (`rest_api_v1_`, `mcp_server_`, `device_routes_`,
+    /// `crypto_device_api_`) and the direct borrowers (`agent_service_`, `gateway_service_`,
+    /// `network_routes_`, `heartbeat_ingestion_`; tests/test_guardian_backend_wiring_lexical.py
+    /// pins the order), on purpose (#2240): `LocalDeviceApi` holds a `const AgentHealthStore&`, and members destruct
+    /// in reverse declaration order, so this store must outlive all of them by construction
+    /// instead of relying only on stop() having quiesced their callers. `heartbeat_ingestion_`
+    /// (declared far below) borrows it and must stay below this line. It has no constructor
+    /// arguments, so moving it earlier changes no initialisation dependency.
+    detail::AgentHealthStore health_store_;
     /// D3 fleet-incident detector — fed by the shared Guardian ingest (both the
     /// direct Subscribe path via agent_service_ and the gateway path via
     /// gateway_service_). Its on_incident sink fans out to notification +
@@ -24690,6 +24863,12 @@ private:
     std::unique_ptr<CryptoDashboardLayoutStore> crypto_dashboard_layout_store_;
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;
+    // Registered CRL sources - born-on-Postgres (ADR-0070 R1). Declared after pg_pool_ so they
+    // destruct before the pool; the service BORROWS the store, so it is declared after it (and
+    // stop() resets them in that order once the web workers are joined).
+    std::unique_ptr<RevocationSourceStore> revocation_source_store_;
+    std::unique_ptr<revocation_source::RevocationSourceService> revocation_source_service_;
+    std::unique_ptr<RevocationSourceRoutes> revocation_source_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;
@@ -24729,8 +24908,8 @@ private:
     std::unique_ptr<DeploymentStore> deployment_store_;
     std::unique_ptr<DiscoveryStore> discovery_store_;
 
-    // Fleet health aggregation
-    detail::AgentHealthStore health_store_;
+    // Fleet health aggregation: `health_store_` is declared right after `registry_` (above), not
+    // here (#2240). See the comment there.
     /// #881: the containment-read concurrency bound, spelled ONCE. It appears
     /// in the member's type, at both acquire sites and in the guard, and three
     /// literal 4s would drift the moment one of them was tuned.

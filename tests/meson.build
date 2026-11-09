@@ -1642,6 +1642,7 @@ if build_server
       'unit/server/test_rbac_enforcement_read.cpp', # #6033: GET /api/v1/rbac/enforcement (REST twin of the enforcement fragment)
       'unit/server/test_rbac_enforcement_read_mcp.cpp', # #6033: MCP get_rbac_enforcement
       'unit/server/test_guardian_generation_raise.cpp', # POST .../guaranteed-state/policy-generation/raise + MCP twin raise_guardian_policy_generation
+      'unit/server/test_revocation_source_surface.cpp', # ADR-0070 R1: /api/v1/crypto/revocation-sources + MCP twins + service validation
       'unit/server/test_rbac_account_lifecycle_guard.cpp', # #4966: last-Administrator guard for account lifecycle (deactivate_account / set_local_role / would_strand)
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
@@ -1654,6 +1655,7 @@ if build_server
       'unit/server/test_oidc_https.cpp', # #5692: discovery + JWKS over TLS, incl. the handler-thread leg
       'unit/server/test_oidc_egress_policy.cpp', # #5692: pure address-class policy for OIDC fetches
       'unit/server/test_oidc_egress.cpp', # #5692: the policy applied to real fetches (pin, refusal, cross-host)
+      'unit/server/test_bounded_resolver.cpp', # bounded resolver + resolver error classifier
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',
@@ -1809,6 +1811,8 @@ if build_server
       'unit/server/test_dex_score_policy_writer.cpp',
       # GET/PUT/DELETE /api/v1/dex/score-policy route shell through TestRouteSink - no store, no [pg]
       'unit/server/test_dex_score_policy_routes.cpp',
+      # pure form <-> document, renderer, tier preview (dex_score_policy_form.hpp) - no store, no I/O, no [pg]
+      'unit/server/test_dex_score_policy_form.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -1830,6 +1834,7 @@ if build_server
       'unit/server/test_guardian_rule_scope_preflight.cpp', # #5610: the fan-out resolves every rule scope before sending and aborts on a transient failure
       'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513: single-agent scope evaluator
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
+      'unit/server/test_guardian_backend_fleet_tags.cpp', # #2240: yuzu.guardian_backend writer/reader pin
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',
@@ -1967,6 +1972,8 @@ if build_server
       'unit/server/test_enrollment_cfg_import.cpp', # WS-6 6.2 one-time legacy enrollment .cfg -> Postgres import
       'unit/server/test_settings_routes_enrollment.cpp', # WS-6 6.2 enrollment mutations: audit rows, atomic bulk, fail-closed
       'unit/server/test_settings_routes_dex_alerts.cpp',
+      # Scoring tab routes over TestRouteSink with fake writer deps and apps fn; REST-vs-fragment equivalence - no store, no [pg]
+      'unit/server/test_settings_routes_dex_scoring.cpp',
       'unit/server/test_settings_routes_ota_audit.cpp',
       'unit/server/test_settings_routes_cert_upload.cpp', # TLS server key created 0600 / dir 0700, symlink replaced not followed
       'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
@@ -2034,6 +2041,7 @@ if build_server
       'unit/server/test_crypto_routes.cpp',              # /crypto slice 1: CryptoRoutes over a fake seam + gate
       'unit/server/test_crypto_widget_catalogue.cpp',    # /crypto widgets: pure catalogue, D13 windows, parsers
       'unit/server/test_crypto_dashboard_layout_store.cpp', # /crypto widgets: layout store (born-on-PG)
+      'unit/server/test_revocation_source_store.cpp',   # ADR-0070 R1: registered CRL sources (born-on-PG)
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
@@ -2086,6 +2094,15 @@ if build_server
       # matching server-side *_fleet_tags.hpp table - a full writer↔reader compile/run
       # bind, no silent zero-reporting drift. Header-only templates - no link to
       # yuzu_agent_core, just the include path.
+      #
+      # #2240: test_guardian_backend_fleet_tags.cpp includes guardian_backend.hpp
+      # (emit_guardian_backend_heartbeat_tag), the first server test TU to pull in
+      # guardian_engine.hpp. Its include chain is <yuzu/plugin.h>, kv_store.hpp,
+      # guard.hpp and guardian_preserved_tally.hpp (-> common/include/yuzu/log_token.hpp)
+      # and spark.hpp: all header-only, found through this block plus the common/include
+      # root that yuzu_server_core_dep already carries (server/core/meson.build,
+      # its include_directories('include') and '../../common/include'); no link to
+      # yuzu_agent_core.
       #
       # CONSTRAINT (governance Gate-3 architect). This puts 47 PRIVATE agent headers on
       # the include path of every server test TU. It is safe TODAY only because there is
@@ -4228,6 +4245,21 @@ test('agent command-dedup fleet telemetry drift gate (#3663)',
   args: [files('test_dedup_fleet_tags_lexical.py')],
   suite: 'agent',
   timeout: 30,
+)
+
+# guardian_backend reader wiring (#2240): lexical pins for what no unit test can see. Every
+# health-store freshness read (sweep, perf/net snapshot, both device accessors) passes the ONE
+# kAgentHealthStaleness constant (the tests only ever use windows of 0 and 300 s); the field is
+# absent from AgentRegistry::to_json_obj(), server.cpp, the legacy /api/agents routes and the
+# dashboard row (HARD RULE); and ServerImpl::health_store_ is declared before every DeviceApi
+# holder (destruction order). Carries its own in-memory mutation self-test. No build required.
+# Suite 'docs', like the other server-source lexical gates: a 'server'-only label is covered by
+# neither the Windows --suite list nor its --exclude-suite list (assert-suite-cover.py).
+test('guardian_backend reader wiring lexical gate (#2240)',
+  _python3_test,
+  args: [files('test_guardian_backend_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # Echo rename upgrade window: static lexical gate pinning that agent.cpp still CALLS the tested
