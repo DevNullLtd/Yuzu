@@ -2427,3 +2427,284 @@ TEST_CASE("census ordering: an empty-string rule id is an id, not a wildcard",
     CHECK(all->count == 2);
     CHECK(all->rule_ids == std::vector<std::string>{"", "r1"});
 }
+
+// -- #5675: GuaranteedStateStore::delete_agent (decommission erasure) ----------------------------------------
+
+namespace {
+
+// How many census rows the store reports for one agent (a degraded read fails the test).
+std::size_t census_rows_for(const GuaranteedStateStore& store, const std::string& agent) {
+    const auto rows = store.agent_rule_statuses_for_agent(agent);
+    REQUIRE(rows.has_value());
+    return rows->size();
+}
+
+// Count of stored events (pending or not) for one agent, read raw.
+std::string events_for(const std::string& dsn, const std::string& agent) {
+    return query_scalar(dsn, std::string("SELECT count(*) FROM ") + kSchema +
+                                 ".guaranteed_state_events WHERE agent_id = '" + agent + "'");
+}
+
+std::string pending_for(const std::string& dsn, const std::string& agent) {
+    return query_scalar(dsn, std::string("SELECT count(*) FROM ") + kSchema +
+                                 ".guaranteed_state_events WHERE projection_pending AND "
+                                 "agent_id = '" +
+                                 agent + "'");
+}
+
+// A pending (failed projection) event for `agent` through the real ingest path: every census write
+// fails while it is inserted, so the event is stored with projection_pending set.
+void insert_pending_event(GuaranteedStateStore& store, const std::string& dsn,
+                          const std::string& event_id, const std::string& rule,
+                          const std::string& agent, std::int64_t agent_ns) {
+    install_census_fail(dsn, "true");
+    REQUIRE(store.insert_event_classified(ev(event_id, rule, agent, kDrifted, agent_ns)).outcome ==
+            EventInsertOutcome::Inserted);
+    remove_census_fail(dsn);
+    // remove_census_fail drops only the trigger; drop the function too so a case can seed pending
+    // events for more than one agent.
+    exec_sql(dsn, std::string("DROP FUNCTION ") + kSchema + ".yuzu_test_ord_fail()");
+}
+
+} // namespace
+
+TEST_CASE("census ordering: delete_agent refuses an empty id without leasing a connection",
+          "[pg][guaranteed_state_store][db][census][ordering][delete_agent]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    // Hold the pool's only connection: a delete_agent that reached the pool would wait out its
+    // 4 s lease budget, so a prompt false proves it returned before leasing.
+    auto lease = pool.try_acquire_for(std::chrono::seconds(2));
+    REQUIRE(lease);
+
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_FALSE(store.delete_agent(""));
+    const auto took = std::chrono::steady_clock::now() - t0;
+    cap.stop();
+    CHECK(took < std::chrono::seconds(1));
+    CHECK(cap.text().find("empty agent_id") != std::string::npos);
+}
+
+TEST_CASE("census ordering: delete_agent on a store that never opened returns false",
+          "[guaranteed_state_store][census][ordering][delete_agent]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 dbname=nope connect_timeout=1", .size = 1}};
+    GuaranteedStateStore store(pool);
+    REQUIRE_FALSE(store.is_open());
+    CHECK_FALSE(store.delete_agent("A"));
+}
+
+TEST_CASE("census ordering: delete_agent removes one agent's census rows and leaves the others",
+          "[pg][guaranteed_state_store][db][census][ordering][delete_agent]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.create_rule(make_rule("r2", "guard-two")));
+    REQUIRE(store.insert_event_classified(ev("a1", "r1", "A", kErrored, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    REQUIRE(store.insert_event_classified(ev("a2", "r2", "A", kErrored, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    REQUIRE(store.insert_event_classified(ev("b1", "r1", "B", kCompliant, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    REQUIRE(census_rows_for(store, "A") == 2);
+    REQUIRE(census_rows_for(store, "B") == 1);
+    const auto before = store.errored_rule_count(std::nullopt);
+    REQUIRE(before.has_value());
+    REQUIRE(*before == 2);
+
+    REQUIRE(store.delete_agent("A"));
+
+    // Re-read the table: an outcome-only check would pass an empty-bodied method.
+    CHECK(census_rows_for(store, "A") == 0);
+    CHECK(census_rows_for(store, "B") == 1);
+    CHECK(census(db.dsn(), "B", "r1") ==
+          "compliant|" + key_str(kBase) + "|" + key_str(kBase) + "|false");
+    const auto after = store.errored_rule_count(std::nullopt);
+    REQUIRE(after.has_value());
+    CHECK(*after == 0);
+    // The event log is not erased (D1): A's two events are still stored.
+    CHECK(events_for(db.dsn(), "A") == "2");
+}
+
+TEST_CASE("census ordering: delete_agent retires the agent's pending evidence and keeps the events",
+          "[pg][guaranteed_state_store][db][census][ordering][delete_agent]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    insert_pending_event(store, db.dsn(), "pa", "r1", "A", kBase);
+    insert_pending_event(store, db.dsn(), "pb", "r1", "B", kBase);
+    REQUIRE(pending_count(db.dsn()) == "2");
+    const auto un_a = store.unrepresented_pending_for_agent("A", PendingScope{});
+    REQUIRE(un_a.has_value());
+    REQUIRE(un_a->count == 1);
+
+    REQUIRE(store.delete_agent("A"));
+
+    const auto gauge = store.pending_projection_count_checked();
+    REQUIRE(gauge.has_value());
+    CHECK(*gauge == 1); // only B's evidence is still pending
+    const auto un_a_after = store.unrepresented_pending_for_agent("A", PendingScope{});
+    REQUIRE(un_a_after.has_value());
+    CHECK(un_a_after->count == 0);
+    const auto un_b = store.unrepresented_pending_for_agent("B", PendingScope{});
+    REQUIRE(un_b.has_value());
+    CHECK(un_b->count == 1); // the bystander is untouched
+    // The retired event row still exists; only its pending flag is cleared.
+    CHECK(events_for(db.dsn(), "A") == "1");
+    CHECK(pending_for(db.dsn(), "A") == "0");
+    CHECK(pending_for(db.dsn(), "B") == "1");
+}
+
+TEST_CASE("census ordering: delete_agent is idempotent",
+          "[pg][guaranteed_state_store][db][census][ordering][delete_agent]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.insert_event_classified(ev("a1", "r1", "A", kErrored, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    REQUIRE(store.delete_agent("A"));
+    CHECK(store.delete_agent("A")); // nothing left to erase is still success
+    CHECK(store.delete_agent("never-seen"));
+    CHECK(census_rows_for(store, "A") == 0);
+}
+
+TEST_CASE("census ordering: a re-registered agent inherits nothing from its decommissioned self",
+          "[pg][guaranteed_state_store][db][census][ordering][delete_agent]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    // The dead device: a census row, then a pending event whose key sits ahead of the receipt
+    // instant (inside the 300 s bound), the shape a stepped-back clock leaves behind.
+    REQUIRE(store.insert_event_classified(ev("old1", "r1", "A", kCompliant, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    insert_pending_event(store, db.dsn(), "old2", "r1", "A", kBase + 200'000'000'000LL);
+    REQUIRE(pending_for(db.dsn(), "A") == "1");
+
+    REQUIRE(store.delete_agent("A"));
+
+    // The same agent_id registers again and reports a verdict with a lower key than the dead
+    // pending event. With the dead evidence still pending, the first projection would fold its key
+    // into the new row's high-water mark and flag the row; retired, nothing carries over.
+    REQUIRE(store.insert_event_classified(ev("new1", "r1", "A", kCompliant, kBase + 10)).outcome ==
+            EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "A", "r1") ==
+          "compliant|" + key_str(kBase + 10) + "|" + key_str(kBase + 10) + "|false");
+    CHECK(pending_for(db.dsn(), "A") == "0");
+}
+
+TEST_CASE("census ordering: delete_agent and a projection holding the pair's rows never deadlock",
+          "[pg][guaranteed_state_store][db][census][ordering][lockorder][delete_agent]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.insert_event_classified(ev("e0", "r1", "A", kCompliant, kBase + 100)).outcome ==
+            EventInsertOutcome::Inserted);
+    const auto p = ev("p1", "r1", "A", kDrifted, kBase + 200);
+    insert_pending_event(store, db.dsn(), "p1", "r1", "A", kBase + 200);
+    const auto failures_before = store.census_proj_failures_total();
+
+    SECTION("a repair parked on the pair's pending rows, then delete_agent") {
+        EventInsertResult repair_res;
+        bool deleted = false;
+        BarrierHold hold;
+        store.set_census_lock_barrier_for_test([&] { hold.hit(); });
+        WriterThreads writers(store, &hold);
+        writers.start([&] { repair_res = store.insert_event_classified(p); });
+        REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+        writers.start([&] { deleted = store.delete_agent("A"); });
+        // delete_agent must PARK on the pending row the repair holds.
+        REQUIRE(wait_for_lock_waiters(db.dsn(), 1));
+        writers.join_all();
+
+        CHECK(repair_res.outcome == EventInsertOutcome::Redelivered);
+        CHECK(deleted);
+        CHECK(store.census_proj_failures_total() == failures_before); // no 40P01
+        CHECK(pending_for(db.dsn(), "A") == "0");
+        CHECK(census_rows_for(store, "A") == 0); // the delete ran over the repair's committed row
+    }
+
+    SECTION("delete_agent parked behind a raw row lock, then a new event for the same pair") {
+        EventInsertResult ingest_res;
+        bool deleted = false;
+        WriterThreads writers(store, nullptr);
+        // Declared after the owner: destroyed first, so the held lock is released before the
+        // owner joins the parked writers on a failed REQUIRE.
+        pg::PgConn holder{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+        {
+            pg::PgResult b{PQexec(holder.get(), "BEGIN")};
+            REQUIRE(b.ok());
+            pg::PgResult l{
+                PQexec(holder.get(), (std::string("SELECT event_id FROM ") + kSchema +
+                                      ".guaranteed_state_events WHERE agent_id = 'A' AND "
+                                      "projection_pending ORDER BY ingest_seq FOR UPDATE")
+                                         .c_str())};
+            REQUIRE(l.ok());
+        }
+        writers.start([&] { deleted = store.delete_agent("A"); });
+        REQUIRE(wait_for_lock_waiters(db.dsn(), 1));
+        writers.start([&] {
+            ingest_res =
+                store.insert_event_classified(ev("n1", "r1", "A", kCompliant, kBase + 300));
+        });
+        REQUIRE(wait_for_lock_waiters(db.dsn(), 2));
+        {
+            pg::PgResult c{PQexec(holder.get(), "COMMIT")};
+            REQUIRE(c.ok());
+        }
+        writers.join_all();
+
+        CHECK(deleted);
+        CHECK(ingest_res.outcome == EventInsertOutcome::Inserted);
+        CHECK(store.census_proj_failures_total() == failures_before); // no 40P01
+        CHECK(pending_for(db.dsn(), "A") == "0");
+        // Either order is legal: the delete ran last (no row) or the in-flight event re-created it.
+        const auto rows = store.agent_rule_statuses_for_agent("A");
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() <= 1);
+        if (!rows->empty())
+            CHECK((*rows)[0].state == "compliant");
+    }
+}
+
+TEST_CASE("census ordering: a failed census delete rolls the pending retire back with it",
+          "[pg][guaranteed_state_store][db][census][ordering][delete_agent]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.insert_event_classified(ev("e0", "r1", "A", kCompliant, kBase)).outcome ==
+            EventInsertOutcome::Inserted);
+    insert_pending_event(store, db.dsn(), "p1", "r1", "A", kBase + 50);
+    exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                           ".yuzu_test_del_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                           "RAISE EXCEPTION 'forced census delete failure' USING ERRCODE = "
+                           "'XX000'; END $$");
+    exec_sql(db.dsn(), std::string("CREATE TRIGGER yuzu_test_del_fail BEFORE DELETE ON ") +
+                           kSchema + ".guardian_agent_rule_status FOR EACH ROW EXECUTE FUNCTION " +
+                           kSchema + ".yuzu_test_del_fail()");
+
+    CHECK_FALSE(store.delete_agent("A"));
+    // One unit: the retire UPDATE that preceded the failed DELETE is undone.
+    CHECK(pending_for(db.dsn(), "A") == "1");
+    CHECK(census_rows_for(store, "A") == 1);
+
+    exec_sql(db.dsn(), std::string("DROP TRIGGER yuzu_test_del_fail ON ") + kSchema +
+                           ".guardian_agent_rule_status");
+    CHECK(store.delete_agent("A")); // the re-issue completes the erasure
+    CHECK(pending_for(db.dsn(), "A") == "0");
+    CHECK(census_rows_for(store, "A") == 0);
+}

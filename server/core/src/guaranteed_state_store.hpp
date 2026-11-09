@@ -27,7 +27,9 @@
 /// Events are an **immutable audit-style log** — intentionally no foreign key
 /// from `guaranteed_state_events.rule_id` to `guaranteed_state_rules(rule_id)`.
 /// When a rule is deleted, its historical events remain for forensic review.
-/// Time-based expiry is the single retention mechanism.
+/// Time-based expiry is the single retention mechanism. The one exception is an agent
+/// decommission (`delete_agent`): it retires the agent's pending census evidence and deletes its
+/// census rows; the event log itself is untouched.
 ///
 /// ── Posture (ADR-0012 §1 / ADR-0038), split by table family ─────────────────
 ///  - **Rules + meta reads — AUTHORITATIVE, type-distinguishable** (the
@@ -99,6 +101,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -323,6 +326,16 @@ public:
     std::expected<void, std::string> create_rule(const GuaranteedStateRuleRow& row);
     std::expected<void, std::string> update_rule(const GuaranteedStateRuleRow& row);
     std::expected<void, std::string> delete_rule(const std::string& rule_id);
+    /// Decommission erasure (ADR-0024 Decision 11 cascade member, #5675). One transaction in the
+    /// census writers' lock order: the agent's pending events are locked in `ingest_seq` order and
+    /// retired (`projection_pending = false`), then the agent's census rows are deleted. No rule
+    /// row is locked. True iff the transaction committed; zero rows is still true (idempotent).
+    /// False on an empty id, a store that is not open, a lease timeout, a failed statement or a
+    /// failed COMMIT (the whole transaction is rolled back). The event log and the DEX
+    /// observations are NOT erased (they expire by retention). This is not a rule mutation: no
+    /// policy-generation bump, no `on_rule_mutation_` hook, no push. A still-running agent's next
+    /// census-bearing event re-creates its row (stop the agent first).
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
     /// Three-state read (ADR-0038 catastrophic-read set): found / genuinely
     /// absent (`std::nullopt`) / degraded (`std::unexpected`). Callers MUST
     /// treat a degrade as "cannot verify" (503), never as "not found" (404).
