@@ -116,9 +116,11 @@ struct Fake {
     std::vector<std::string> stat_calls;
     std::vector<std::string> opened;
 
-    // clock
+    // clock: each transport call advances it by `step`, or by `path_step[path]` when that has an entry
+    // (a fake peer that took that long to answer, whatever budget it was given)
     std::chrono::steady_clock::time_point now{std::chrono::steady_clock::time_point{} + seconds{1000}};
     milliseconds step{0};
+    std::map<std::string, milliseconds> path_step;
 
     Fake() {
         for (const char* d : {"/run/yuzu-agent", "/run", "/"})
@@ -151,7 +153,8 @@ struct Fake {
         const Transport transport = [this](const Request& req, milliseconds budget) {
             calls.push_back(req);
             budgets.push_back(budget);
-            now += step;
+            const auto slow = path_step.find(req.path());
+            now += slow == path_step.end() ? step : slow->second;
             const auto it = replies.find(req.path());
             return it == replies.end() ? fail(Outcome::other) : it->second;
         };
@@ -732,31 +735,32 @@ TEST_CASE("runtime seam: the action deadline is checked before every request",
         f.reply("/containers/" + id('a') + "/json", http(200, inspect_body(true)));
         const Posture p = f.run(kEndpoint);
 
-        // 20 s deadline: budgets are 20 s, 14 s, 8 s, 2 s, then 0 s is left
+        // 20 s deadline: budgets are 20 s, 14 s, 8 s, 2 s, then nothing is left
         REQUIRE(f.calls.size() == 4);
         CHECK(f.budgets == std::vector<milliseconds>{milliseconds{20000}, milliseconds{14000},
                                                      milliseconds{8000}, milliseconds{2000}});
         CHECK(has_token(p, "deadline_exhausted"));
         CHECK(p.status == StatusState::constrained);
-        // every completed row survives; the inspections never reached stay unknown
+        // every completed row survives; the first inspection took 6 s of a 2 s budget, so its
+        // answer is not read and no inspection stays anything but unknown
         CHECK(p.rows[0] == "endpoint|ok|-|docker");
+        CHECK(has_token(p, "inspect:failed:1"));
         const auto c = rows_with(p, "container|");
         REQUIRE(c.size() == 3);
-        CHECK(c[0].find("|yes|bridge|no") != std::string::npos);
-        CHECK(c[1].find("|unknown|unknown|unknown") != std::string::npos);
-        CHECK(c[2].find("|unknown|unknown|unknown") != std::string::npos);
+        for (const auto& row : c)
+            CHECK(row.find("|unknown|unknown|unknown") != std::string::npos);
         CHECK(rows_with(p, "config|docker|cgroup_driver|systemd").size() == 1);
     }
-    SECTION("a call that consumes exactly the 20 s leaves zero further calls") {
+    SECTION("a call that consumes exactly its budget is a timeout, not an answer") {
         Fake f;
         f.step = seconds{20};
         f.happy_version();
         f.reply("/info", http(200, kInfo));
         const Posture p = f.run(kEndpoint);
-        CHECK(f.calls.size() == 1);
-        CHECK(has_token(p, "deadline_exhausted"));
+        CHECK(f.calls.size() == 1); // the failed /version stops the action
+        CHECK(has_token(p, "version:timeout"));
+        CHECK(p.rows[0] == "endpoint|unreachable|-|-");
         CHECK(p.status == StatusState::constrained);
-        CHECK(p.rows[0] == "endpoint|ok|-|docker");
     }
     SECTION("under one millisecond left is not passed on as a zero (unbounded) budget") {
         Fake f;
@@ -769,7 +773,59 @@ TEST_CASE("runtime seam: the action deadline is checked before every request",
         for (const auto b : f.budgets)
             CHECK(b.count() >= 1);
         CHECK(f.calls.size() == 2); // the second request still fits in 1 ms ...
-        CHECK(has_token(p, "deadline_exhausted")); // ... the third does not
+        CHECK(has_token(p, "info:timeout")); // ... and takes 19.999 s of it ...
+        CHECK(has_token(p, "deadline_exhausted")); // ... so the third does not go out
+    }
+}
+
+TEST_CASE("runtime seam: a reply that arrives after its budget is never read, whatever the transport did",
+          "[virtualization][runtime][deadline]") {
+    // The fake answers 200 with valid JSON, as a peer that streams `100 Continue` until the last
+    // moment and then answers would make the HTTP client do past its own total timeout.
+    SECTION("/version answering after 25 s: one call, version:timeout, no endpoint answer") {
+        Fake f;
+        f.path_step["/version"] = seconds{25};
+        f.happy_version();
+        f.reply("/info", http(200, kInfo));
+        const Posture p = f.run(kEndpoint);
+        REQUIRE(f.calls.size() == 1);
+        CHECK(has_token(p, "version:timeout"));
+        CHECK(p.status == StatusState::constrained);
+        CHECK(p.rows[0] == "endpoint|unreachable|-|-"); // not ok, and the dialect is not read
+        CHECK(rows_with(p, "container|").empty());
+        CHECK(rows_with(p, "config|").empty());
+    }
+    SECTION("the last inspection answering 200 after 25 s never reads supported") {
+        Fake f;
+        f.happy_version();
+        f.reply("/info", http(200, kInfo));
+        f.reply("/containers/json?all=1", http(200, list_of({'a', 'b', 'c'})));
+        f.reply("/containers/" + id('a') + "/json", http(200, inspect_body(true)));
+        f.reply("/containers/" + id('b') + "/json", http(200, inspect_body(false)));
+        f.reply("/containers/" + id('c') + "/json", http(200, inspect_body(true)));
+        f.path_step["/containers/" + id('c') + "/json"] = seconds{25};
+        const Posture p = f.run(kEndpoint);
+        CHECK(f.calls.size() == 6);
+        CHECK(p.status == StatusState::constrained);
+        CHECK(has_token(p, "inspect:failed:1"));
+        CHECK(p.rows[0] == "endpoint|ok|-|docker");
+        const auto c = rows_with(p, "container|");
+        REQUIRE(c.size() == 3);
+        CHECK(c[0].find("|yes|bridge|no") != std::string::npos);
+        CHECK(c[1].find("|no|bridge|no") != std::string::npos);
+        CHECK(c[2].find("|unknown|unknown|unknown") != std::string::npos); // the late answer is dropped
+    }
+    SECTION("a late list is a timeout and the container rows are empty") {
+        Fake f;
+        f.happy_version();
+        f.reply("/info", http(200, kInfo));
+        f.reply("/containers/json?all=1", http(200, list_of({'a'})));
+        f.path_step["/containers/json?all=1"] = seconds{21};
+        const Posture p = f.run(kEndpoint);
+        CHECK(has_token(p, "list:timeout"));
+        CHECK(rows_with(p, "container|").empty());
+        CHECK(p.status == StatusState::constrained);
+        CHECK(f.calls.size() == 3); // no list, so no inspection is ever built
     }
 }
 

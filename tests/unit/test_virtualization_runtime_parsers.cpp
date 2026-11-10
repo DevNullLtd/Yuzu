@@ -277,6 +277,29 @@ TEST_CASE("runtime status: a read error is a timeout only once its read timer ha
     CHECK(classify_read_error(milliseconds{0}, milliseconds{20}) == Outcome::timeout);
 }
 
+TEST_CASE("runtime status: a request back at or past its budget is a timeout whatever it reported",
+          "[virtualization][runtime][status][deadline]") {
+    using std::chrono::milliseconds;
+    const milliseconds budget{20000};
+    // inside the budget the transport's own outcome stands
+    for (const auto o : {Outcome::ok, Outcome::eacces, Outcome::enoent, Outcome::timeout,
+                         Outcome::oversized, Outcome::not_http, Outcome::other}) {
+        CHECK(budget_outcome(o, milliseconds{0}, budget) == o);
+        CHECK(budget_outcome(o, milliseconds{19999}, budget) == o);
+    }
+    // at the budget and past it nothing is ok, and nothing else survives either: a reply that came
+    // back late is not read, and a read error at the cut is the timeout that caused it
+    for (const auto o : {Outcome::ok, Outcome::eacces, Outcome::enoent, Outcome::timeout,
+                         Outcome::oversized, Outcome::not_http, Outcome::other}) {
+        CHECK(budget_outcome(o, budget, budget) == Outcome::timeout);
+        CHECK(budget_outcome(o, milliseconds{20001}, budget) == Outcome::timeout);
+        CHECK(budget_outcome(o, milliseconds{25000}, budget) == Outcome::timeout);
+    }
+    // the smallest budget the seam passes on (1 ms)
+    CHECK(budget_outcome(Outcome::ok, milliseconds{0}, milliseconds{1}) == Outcome::ok);
+    CHECK(budget_outcome(Outcome::ok, milliseconds{1}, milliseconds{1}) == Outcome::timeout);
+}
+
 TEST_CASE("runtime status: detection is about standard paths and an endpoint failure changes none",
           "[virtualization][runtime][status]") {
     CHECK(decide_runtime(false, false) == "not_detected");

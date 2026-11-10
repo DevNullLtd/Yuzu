@@ -181,7 +181,7 @@ privilege model forbids (pointing the agent at the real socket). It is not the s
 | Bound | Value | Behaviour when hit |
 |---|---|---|
 | Action deadline | 20 s total, monotonic clock | No further requests are issued; every completed row is kept; token `deadline_exhausted`; status `constrained`, completeness `partial` |
-| Per-request budget | the time remaining of the 20 s, applied with the HTTP client's per-request total timeout | a request over budget ends as a timeout (`version:timeout`, `info:timeout` or `list:timeout`) |
+| Per-request budget | the time remaining of the 20 s, enforced by a watchdog that shuts the in-flight socket at the budget and by a clock check when the request returns, independent of socket readiness; the HTTP client's own per-request total timeout is set to it as well | a request over budget, or back at or past it, ends as a timeout (`version:timeout`, `info:timeout` or `list:timeout`), never as an answer |
 | Connect timeout | `min(2 s, remaining)` | `unreachable` |
 | Read inactivity timeout | `min(5 s, remaining)` | the request fails |
 | Response body | 1 MiB, enforced by a declared-length check before the body is read and by a receiver that stops reading; the client's own payload cap sits one read buffer above it as a backstop | token `version:response_oversized`, `info:response_oversized` or `list:response_oversized`; no rows from that verb |
@@ -201,6 +201,22 @@ body cap, and every request is sent with `Connection: close`. The 1 MiB cap itse
 the client's, by a declared-length check and by the receiver, because the client's check runs before the
 receiver and would otherwise report an oversized chunked reply as a plain read error. Response bodies and parser error text are never logged, at any level.
 
+**binding (the deadline is absolute):** the HTTP client's own total timeout is only consulted when it
+next has to wait for data, and once the budget is spent it clamps to a zero-time poll that still reads
+whatever is ready. A peer that is always readable (an endless stream of `100 Continue` lines, which the
+client skips with no count bound and no clock check) is therefore never made to wait, and would hold the
+request, and the agent worker, for as long as it keeps writing. The deadline is enforced independently
+of socket readiness, twice. (1) In the Linux shell a watchdog thread, owned and joined by an RAII guard
+declared after the client (so it is joined before the client is destroyed on every exit path, with no
+detached thread), waits out the request's budget and then calls the client's `stop()`, which shuts the
+in-flight socket down; it repeats the call every 100 ms until the request returns, because a call that
+lands before the request has marked its socket in flight does nothing. (2) Whatever a request reported,
+one that returns at or past its budget is a `timeout` (`budget_outcome`, one pure function): the shell
+applies it to the request, and the seam applies it again to every result of any transport, so a late
+reply is never read and an overrun can never end `supported`. A failure to start the thread is an
+exception like any other and reaches the one ABI `try/catch`. A peer that is not readable (a trickle) is
+unaffected: the client's own timeouts end it first.
+
 **binding (single-flight):** the agent's dispatch pool has one worker per hardware thread and no
 per-action serialisation, so without a guard repeated dispatch against a trickling peer pins the pool.
 The action holds a process-wide flag for its whole run; a concurrent dispatch returns `busy` without
@@ -216,7 +232,8 @@ purposes with the token `<runtime>:network_fs_skipped`; an unreadable mount tabl
 
 The read timeout alone does not bound a peer that sends one byte just inside each window, which is why
 the overall deadline exists: before each request the plugin computes the remaining budget from an
-injected clock, passes it to the transport, and stops issuing requests at zero. **The request ceiling is
+injected clock, passes it to the transport, checks the clock again when the request returns, and stops
+issuing requests at zero. **The request ceiling is
 67:** three fixed requests plus 64 inspections, inside 20 s; a healthy local socket answers all of them
 in well under a second. The action holds one agent worker for at most 20 s plus the unguarded `stat`
 calls. The deadline logic is unit tested with a fake clock (no sleeps); the real transport's behaviour
@@ -411,6 +428,12 @@ body, with no probe committed:
    `POST /containers/create` after an admitted `GET /version`.
 8. A default socket made group-connectable for the agent (a throwaway `SupplementaryGroups=` drop-in
    on a test copy of the unit) reports the `overprivileged` token.
+9. **A continuously readable peer, at the real 20 s budget.** A fake peer that passes the endpoint
+   contract and writes `HTTP/1.1 100 Continue\r\n\r\n` in a tight loop forever: the action returns within
+   20 s plus 1 s, status `constrained`, `version:timeout`, endpoint `unreachable`; a dispatch made while it
+   runs reads `busy` and one made after it returns runs normally. This is the case the client's own total
+   timeout does not bound (section 5). The item 4 trickle peer is re-run alongside it to show no
+   regression, and the elapsed times of both are recorded.
 
 ## 10. Recipes, packaging impact and the defer clause
 

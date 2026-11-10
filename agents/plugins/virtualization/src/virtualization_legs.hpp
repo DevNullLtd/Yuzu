@@ -342,14 +342,21 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
     } else {
         // Request budget: remaining time of the action deadline, never zero or negative. A
         // sub-millisecond remainder stops the action rather than reaching the client's "no limit".
+        // The budget is also enforced HERE, whatever the Transport does with it: a request that
+        // comes back at or past its budget reads `timeout`, so an overrun can never end `supported`
+        // (a peer that is always readable defeats the HTTP client's own total timeout).
         const auto send = [&](const Request& req) -> std::optional<TransportResult> {
-            const auto remaining = deadline - clock();
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+            const auto t0 = clock();
+            const auto ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - t0);
             if (ms.count() < 1) {
                 acc.add_failure(rt_token("deadline_exhausted")); // deduped by the accumulator
                 return std::nullopt;
             }
-            return transport(req, ms);
+            TransportResult r = transport(req, ms);
+            r.outcome = budget_outcome(
+                r.outcome, std::chrono::duration_cast<std::chrono::milliseconds>(clock() - t0), ms);
+            return r;
         };
 
         ep_status = EndpointStatus::ok;

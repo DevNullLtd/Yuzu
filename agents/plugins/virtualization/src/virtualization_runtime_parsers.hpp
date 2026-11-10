@@ -444,6 +444,16 @@ inline Outcome classify_read_error(std::chrono::milliseconds elapsed,
     return elapsed >= read_timeout - kReadTimeoutSlack ? Outcome::timeout : Outcome::not_http;
 }
 
+/// The one rule that makes the action deadline absolute. The HTTP client's own total timeout is
+/// only consulted when it next waits for data, so a peer that always has data ready (a stream of
+/// `100 Continue` lines) is never made to wait and can hold a request past it. Whatever a request
+/// reported, one that came back at or past its budget is a `timeout`: it can never be `ok`, and a
+/// reply that arrived late is not read. Applied by the transport shell and, again, by the seam.
+inline Outcome budget_outcome(Outcome o, std::chrono::milliseconds elapsed,
+                              std::chrono::milliseconds budget) {
+    return elapsed >= budget ? Outcome::timeout : o;
+}
+
 /// The detection column: `served` when the endpoint's /version identified this runtime, else
 /// `detected` when any standard-path artefact exists, else `not_detected`. An endpoint failure
 /// never reaches here.

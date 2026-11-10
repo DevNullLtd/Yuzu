@@ -37,7 +37,10 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -150,9 +153,57 @@ runtime::Outcome outcome_for_errno(int e) {
     }
 }
 
+/// Carries the absolute deadline of one request, independent of socket readiness. httplib's total
+/// timeout (`set_max_timeout`) is only consulted when it next has to WAIT for data and, once the
+/// budget is spent, clamps to a zero-time poll that still reads whatever is ready: a peer that is
+/// always readable (an endless stream of `100 Continue` lines, which the client skips without bound
+/// or a clock check) is never made to wait, so it can hold the request, and the agent worker, for as
+/// long as it keeps writing. This thread shuts the in-flight socket down at the budget. `stop()` is
+/// the client's one cross-thread-safe call (it only shuts the socket down while a request is in
+/// flight), it is re-issued every 100 ms because a call that lands before the request has marked its
+/// socket in flight does nothing, and it returns the request's reads as end of stream. The thread
+/// is owned here and joined in the destructor on every exit path. Declare an instance AFTER the
+/// client so it is joined before the client is destroyed. A failure to start the thread propagates
+/// to the one ABI catch like any other.
+class DeadlineWatchdog {
+public:
+    DeadlineWatchdog(httplib::Client& cli, std::chrono::milliseconds budget)
+        : thread_([this, &cli, budget] { run(cli, budget); }) {}
+    DeadlineWatchdog(const DeadlineWatchdog&) = delete;
+    DeadlineWatchdog& operator=(const DeadlineWatchdog&) = delete;
+    ~DeadlineWatchdog() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            done_ = true;
+        }
+        cv_.notify_one();
+        thread_.join();
+    }
+
+private:
+    void run(httplib::Client& cli, std::chrono::milliseconds budget) {
+        std::unique_lock<std::mutex> lk(m_);
+        if (cv_.wait_for(lk, budget, [this] { return done_; }))
+            return; // the request ended inside its budget
+        while (!done_) {
+            lk.unlock();
+            cli.stop();
+            lk.lock();
+            cv_.wait_for(lk, std::chrono::milliseconds{100}, [this] { return done_; });
+        }
+    }
+
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool done_ = false;
+    std::thread thread_; // last: starts only once the members above exist
+};
+
 /// One GET over the unix socket at `connect_path`. Transport pins (design note section 5): the total
 /// timeout is the remaining action budget and is never zero (the caller stops below 1 ms), connect
 /// min(2 s, budget), read min(5 s, budget), no redirects, no decompression, Connection: close. The
+/// budget is ABSOLUTE: DeadlineWatchdog shuts the socket at it, and whatever the request reported,
+/// one that returns at or past the budget is a `timeout` (runtime::budget_outcome), never `ok`. The
 /// 1 MiB body cap is enforced twice, both naming the cause: a declared Content-Length over it is
 /// refused before the body is read, and the receiver stops reading at it for a chunked or unframed
 /// reply. httplib's own payload cap sits one read buffer above the receiver's, as a backstop that
@@ -193,38 +244,39 @@ runtime::TransportResult one_request(const std::string& connect_path, const runt
         out.body.append(data, n);
         return true;
     };
+    const auto started = steady_clock::now(); // before the watchdog's own timer starts
+    DeadlineWatchdog watchdog(cli, budget);   // after `cli`: joined first on every exit path
     errno = 0;
-    const auto started = steady_clock::now();
     auto res = cli.Get(req.path(), headers, on_headers, on_body);
     const int saved_errno = errno;
     if (oversized) {
         out.outcome = runtime::Outcome::oversized;
         out.body.clear();
-        return out;
-    }
-    if (res) {
+    } else if (res) {
         out.outcome = runtime::Outcome::ok;
         out.http_status = res->status;
-        return out;
+    } else {
+        out.body.clear();
+        switch (res.error()) {
+        case httplib::Error::Connection:
+            out.outcome = outcome_for_errno(saved_errno);
+            break;
+        case httplib::Error::ConnectionTimeout:
+        case httplib::Error::Timeout:
+            out.outcome = runtime::Outcome::timeout;
+            break;
+        case httplib::Error::Read:
+        case httplib::Error::ConnectionClosed:
+            out.outcome = runtime::classify_read_error(
+                duration_cast<milliseconds>(steady_clock::now() - started), read_to);
+            break;
+        default:
+            out.outcome = runtime::Outcome::not_http;
+            break;
+        }
     }
-    out.body.clear();
-    switch (res.error()) {
-    case httplib::Error::Connection:
-        out.outcome = outcome_for_errno(saved_errno);
-        break;
-    case httplib::Error::ConnectionTimeout:
-    case httplib::Error::Timeout:
-        out.outcome = runtime::Outcome::timeout;
-        break;
-    case httplib::Error::Read:
-    case httplib::Error::ConnectionClosed:
-        out.outcome = runtime::classify_read_error(
-            duration_cast<milliseconds>(steady_clock::now() - started), read_to);
-        break;
-    default:
-        out.outcome = runtime::Outcome::not_http;
-        break;
-    }
+    out.outcome = runtime::budget_outcome(
+        out.outcome, duration_cast<milliseconds>(steady_clock::now() - started), budget);
     return out;
 }
 

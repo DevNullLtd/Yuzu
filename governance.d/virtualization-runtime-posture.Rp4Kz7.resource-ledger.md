@@ -6,8 +6,9 @@ Range: `origin/dev..HEAD` (branch `feat/virtualization-runtime-posture`)
 
 This diff adds one **socket** (an `httplib::Client` over a unix domain socket, call-scoped, opened per
 request) and one **file descriptor** (the `O_PATH` endpoint descriptor), both RAII-owned and both
-opened only when the operator sets `agent.runtime_endpoint`. It adds no thread, subprocess, `FILE*`,
-`sqlite3*`, OpenSSL object, mapped library or temp path. The nlohmann values are value types.
+opened only when the operator sets `agent.runtime_endpoint`, and, per request, one **thread** (the
+deadline watchdog, R9), owned and joined by an RAII guard. It adds no detached thread, subprocess,
+`FILE*`, `sqlite3*`, OpenSSL object, mapped library or temp path. The nlohmann values are value types.
 
 ## Table 1 — new owned state
 
@@ -21,13 +22,18 @@ opened only when the operator sets `agent.runtime_endpoint`. It adds no thread, 
 | R6 | `std::atomic<bool>` single-flight flag (`runtime_posture_flight`) | function-local static, process lifetime | `compare_exchange_strong` at the top of the leg | the `Release` guard's destructor on every exit path, an exception included | none | RAII guard; a concurrent dispatch returns `busy` without touching the filesystem or the socket |
 | R7 | Operator endpoint string (`g_runtime_endpoint`) | namespace-scope `inline` `std::string` behind an `inline` `std::mutex` (both constant-initialised) | `init()` copies `agent.runtime_endpoint` | process lifetime | read by copy | none; written once in `init()`, read under the mutex |
 | R8 | `static constexpr Legs kLegs` (now three leg pointers) | static storage, constant-initialised | none | none | none | none |
+| R9 | Deadline watchdog thread (`DeadlineWatchdog`: one `std::thread`, a `std::mutex`, a `std::condition_variable`, a `bool`) | local of `one_request`, declared AFTER the `httplib::Client` it holds a reference to | per request, immediately before `Client::Get`; a failed thread start is a `std::system_error` that propagates to the one ABI `catch(...)` with nothing to release | the guard's destructor sets `done` under the mutex, notifies and JOINS, on every exit path (return and exception alike); it runs before the client's destructor, so the thread never outlives the client it calls `stop()` on | none; never detached, never moved | RAII; the thread only waits on the condition variable and, once the budget has passed, calls `Client::stop()` (the client's cross-thread-safe call: it shuts the in-flight socket down under the client's own mutex) every 100 ms until `done`, so it takes no other lock and holds its own only while checking `done` |
 
 ## Deadlines
 
 The HTTP transport is bounded: one 20 s monotonic action deadline whose remaining time is passed as the
 per-request total timeout (`set_max_timeout`, never zero: the seam stops issuing requests below 1 ms),
 connect `min(2 s, remaining)`, read `min(5 s, remaining)`, a 1 MiB body cap, redirects and decompression
-off. The deadline logic is unit-tested over an injected clock. The `stat` calls are not covered by it:
+off. The client's total timeout alone does not hold against a peer that is always readable (a stream of
+`100 Continue` lines: the client's zero-time poll still reads ready data and the loop has no clock), so the
+deadline is also enforced independently of socket readiness: the watchdog (R9) shuts the in-flight socket
+at the budget, and a request that returns at or past its budget is a `timeout` (`budget_outcome`) in the
+shell and again in the seam. The deadline logic is unit-tested over an injected clock. The `stat` calls are not covered by it:
 `stat` of a data root on a network mount is skipped through the shared `network_fstype.hpp` guard
 (`<runtime>:network_fs_skipped`); sockets and config files live under `/run` and `/etc` and are not guarded.
 
