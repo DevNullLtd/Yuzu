@@ -598,6 +598,14 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
         CHECK(status_value("db_budget_bytes") == std::optional<std::string>{"33554432"});
     }
 
+    SECTION("the retired retention_days parameter is not a recognised setting") {
+        const YuzuParam params[] = {{"retention_days", "30"}};
+        const auto r = d.run(desc, "configure", params);
+        CHECK(r.rc == 1);
+        CHECK(r.captured.find("error|no valid configuration parameters provided") != std::string::npos);
+        CHECK_FALSE(status_value("retention_days").has_value());
+    }
+
     SECTION("an invalid budget in a request with a valid change rejects the whole request") {
         const YuzuParam params[] = {{"process_enabled", "false"}, {"db_budget_bytes", "5"}};
         const auto r = d.run(desc, "configure", params);
@@ -988,8 +996,9 @@ TEST_CASE("echo plugin: status counts each source's finest tier and query and ex
         // The retired spelling of the row count, and the retired settings and counters, are gone.
         CHECK_FALSE(plugin_status_value(d, desc, "config|process_live_rows").has_value());
         CHECK_FALSE(plugin_status_value(d, desc, "retention_days").has_value());
-        CHECK_FALSE(plugin_status_value(d, desc, "config|usage_gap_count").has_value());
-        CHECK_FALSE(plugin_status_value(d, desc, "config|usage_lag_events").has_value());
+        for (const char* key : {"config|usage_gap_count", "config|usage_gap_lost_events",
+                                "config|usage_gap_last_ts", "config|usage_lag_events"})
+            CHECK_FALSE(plugin_status_value(d, desc, key).has_value());
         CHECK(plugin_status_value(d, desc, "config|process_oldest_ts") ==
               std::optional<std::string>{"360000"});
         // A source with nothing folded reports 0 / 0, and the plain baseline table has its own key.
