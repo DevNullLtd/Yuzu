@@ -420,6 +420,46 @@ TEST_CASE("ProxyRegister: an inventory reporting the pre-rename plugin tar write
     }
 }
 
+TEST_CASE("ProxyRegister: re-announcing a known session whose plugin list changed from tar to "
+          "echo refreshes legacy_echo_wire_name on the adopted route row",
+          "[pg][gateway_route_wiring][grpc]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    auto register_with_plugin = [&](const std::string& agent_id, const std::string& plugin,
+                                    const std::string& presented_session) {
+        auto req = make_gw_register(h.auth_mgr, agent_id);
+        req.mutable_info()->add_plugins()->set_name(plugin);
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        if (!presented_session.empty())
+            ctx.AddMetadata(std::string(AgentServiceImpl::kSessionMetadataKey), presented_session);
+        apb::RegisterResponse resp;
+        REQUIRE(h.stub_->ProxyRegister(&ctx, req, &resp).ok());
+        REQUIRE(resp.accepted());
+        return resp.session_id();
+    };
+    auto legacy_flag = [&](const std::string& agent_id) {
+        auto row = store.lookup_route(agent_id);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        return (*row)->legacy_echo_wire_name;
+    };
+
+    const std::string agent = "agent-adopt-legacy-flag";
+    const std::string session = register_with_plugin(agent, "tar", {});
+    REQUIRE(legacy_flag(agent));
+    REQUIRE(store.announce_connected(agent, session, "zone-a", "node-a", 90).has_value());
+
+    // Same session id presented again, now reporting the post-rename plugin name: the adopted
+    // branch skips register_fresh, so only set_legacy_echo_wire_name can flip the row.
+    CHECK(register_with_plugin(agent, "echo", session) == session);
+    CHECK_FALSE(legacy_flag(agent));
+}
+
 // ── ProxyRegister: the NEW re-announce-vs-fresh decision branch ─────────────
 
 TEST_CASE("ProxyRegister: presenting a KNOWN x-yuzu-session-id re-announces (renew_leases) "
@@ -4255,4 +4295,24 @@ TEST_CASE("GatewayUpstreamServiceImpl: the #5686 series and HELP lines exist bef
     CHECK(has("yuzu_server_gateway_batch_heartbeat_duration_seconds_count{outcome=\"degraded\"} "
               "0"));
     CHECK(has("\nyuzu_server_agent_presence_upsert_skipped_total 0\n"));
+}
+
+// The adopted-session refresh adds a new (op, reason) series to
+// yuzu_server_gateway_route_write_failed_total; it must read 0 before any traffic.
+TEST_CASE("GatewayUpstreamServiceImpl: the set_legacy_echo_wire_name write-failure series exist "
+          "before any traffic",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    // No metrics.counter() for these series before serialising: that call would create them
+    // and make the assertion vacuous.
+    const std::string text = f.metrics.serialize();
+    for (const char* reason : {"store_unavailable", "db_error"}) {
+        const std::string series =
+            std::string("yuzu_server_gateway_route_write_failed_total{op=\"set_legacy_echo_wire_name\","
+                        "reason=\"") +
+            reason + "\"} 0";
+        INFO(series);
+        CHECK(text.find(series) != std::string::npos);
+    }
 }

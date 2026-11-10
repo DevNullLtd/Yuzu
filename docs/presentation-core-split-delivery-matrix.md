@@ -489,8 +489,10 @@ MCP file is picked up by the lane; the MCP tool count is measured (not "—") an
   tests for the family keep running unchanged as the before/after net, by having the test fixture forward its seam hook
   into `ToolDeps` (see `test_mcp_server.cpp`); (5) a WRITE-capable closure is admitted only under the criterion in
   `mcp_tool_deps.hpp` (a pure forward of the REST twin's own `*Api` method, the gate stays central, the handler writes
-  its "attempted" audit row first and refuses to run without a sink): guardian, rbac and tags will each need one, so
-  copy that shape and do not widen it; (6) one closure per `*Api` method suits a composed or small seam (crypto: five),
+  its "attempted" audit row first and refuses to run without a sink; **amended 2026-11-09 (#6087):** `mcp_tool_deps.hpp`
+  now admits a second shape, (ii) a pure forward of the REST twin's shared audit-first apply function, with the audit sink
+  injected per request and the handler refusing to call the closure without one): guardian, rbac and tags will each need
+  one, so copy one of the two shapes and do not widen them; (6) one closure per `*Api` method suits a composed or small seam (crypto: five),
   but a large family (dex has about 12 methods, guardian 8) should weigh a const seam handle instead, whose cost is
   that every handler can then reach the write method. Follow-up not yet tracked: `list_issued_certs` (a `ca`-family
   tool, `Security:Read`) is the last reader of `McpServer::crypto_api_` / `crypto_access_fn_`; carving it is what
