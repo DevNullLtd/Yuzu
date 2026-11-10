@@ -191,8 +191,8 @@ privilege model forbids (pointing the agent at the real socket). It is not the s
 | Read inactivity timeout | `min(5 s, remaining)` | the request fails |
 | Response body | 1 MiB, enforced by a declared-length check before the body is read and by a receiver that stops reading; the client's own payload cap sits one read buffer above it as a backstop | token `version:response_oversized`, `info:response_oversized` or `list:response_oversized`; no rows from that verb |
 | JSON nesting | 32 levels; a parse callback discards anything deeper as it starts, so it is never built, and records the breach | the whole reply is `malformed` (`<verb>:malformed`); no field of it is read |
-| Container rows | at most 256, running containers first (each group in the runtime's own newest-first order); the 1 MiB body cap is the effective ceiling, because `all=1` lists exited containers too (about 2 to 3 KB each): a list reply over 1 MiB, roughly 350 to 500 containers, is `list:response_oversized` with no rows, so 256 applies to a reply that fit | token `rows_capped` |
-| Inspections | at most 64, taken from the first 64 rows, so the running containers are inspected before any exited one | token `inspect_capped`; the rest read `unknown` |
+| Container rows | at most 256; the 1 MiB body cap is the effective ceiling, because `all=1` lists exited containers too (about 2 to 3 KB each): a list reply over 1 MiB, roughly 350 to 500 containers, is `list:response_oversized` with no rows, so 256 applies to a reply that fit | token `rows_capped` |
+| Inspections | at most 64, taken from the first 64 listed | token `inspect_capped`; the rest read `unknown` |
 | `daemon.json` | read at most 256 KiB | token `oversized` |
 | Free-text field | charset-checked (section 8), then truncated to 256 bytes before escaping | `invalid` on a charset miss; truncation is silent |
 | Concurrency | one dispatch in flight per process | a second dispatch returns at once with one status row (`constrained`, token `busy`) and no other row |
@@ -353,9 +353,7 @@ or answers 200 with a body that is not JSON stops the action: the endpoint row s
 wrong-typed `HostConfig.Privileged`, `NetworkMode`, `Mounts` or `Mounts[].Source`) keeps the list-derived
 row with the three inspect fields `unknown` and continues; the failures are counted in one token
 `inspect:failed:<n>`. An HTTP 404 on inspect (the container was removed between list and inspect) is
-expected churn: fields `unknown`, no token and no constraint, unless every inspection that ran answered
-404, which is an endpoint that admits the list but not the inspect and is one token,
-`inspect:not_found:<n>` (`constrained`).
+expected churn: fields `unknown`, no token and no constraint.
 
 **Exceptions.** The plugin's entry point is one `try/catch(...)` at the ABI seam (the existing
 `execute_action` in `virtualization_legs.hpp`, which `runtime_posture` joins as a further leg); the

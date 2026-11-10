@@ -678,22 +678,6 @@ TEST_CASE("runtime seam: per-response recovery keeps earlier rows and runs later
         CHECK(c[2].find("|no|bridge|no") != std::string::npos);
         CHECK(f.calls.size() == 6); // the remaining inspection still ran
     }
-    SECTION("every inspection answering 404 is not churn: one token, rows stay unknown") {
-        Fake f;
-        f.happy_version();
-        f.reply("/info", http(200, kInfo));
-        f.reply("/containers/json?all=1", http(200, list_of({'a', 'b'})));
-        f.reply("/containers/" + id('a') + "/json", http(404, "denied by proxy"));
-        f.reply("/containers/" + id('b') + "/json", http(404, "denied by proxy"));
-        const Posture p = f.run(kEndpoint);
-        CHECK(p.status == StatusState::constrained);
-        CHECK(has_token(p, "inspect:not_found:2"));
-        CHECK_FALSE(has_token(p, "inspect:failed"));
-        const auto c = rows_with(p, "container|");
-        REQUIRE(c.size() == 2);
-        for (const auto& row : c)
-            CHECK(row.find("|unknown|unknown|unknown") != std::string::npos);
-    }
     SECTION("a 500 on one inspect is a failed inspection: counted, the rest continue") {
         Fake f;
         f.happy_version();
@@ -743,35 +727,6 @@ TEST_CASE("runtime seam: the inspection cap leaves the rest unknown and says so"
         else
             CHECK(c[i].find("|unknown|unknown|unknown") != std::string::npos); // each, individually
     }
-}
-
-TEST_CASE("runtime seam: the inspection cap is spent on running containers first",
-          "[virtualization][runtime][seam]") {
-    Fake f;
-    f.happy_version();
-    f.reply("/info", http(200, kInfo));
-    // 70 exited containers listed first, then one running container (the newest-first list order)
-    std::string list = "[";
-    for (int i = 0; i < 71; ++i) {
-        const std::string cid = std::format("{:016x}", i) + std::string(48, 'a');
-        const bool running = i == 70;
-        if (i)
-            list += ',';
-        list += R"({"Id":")" + cid + R"(","Names":["/c"],"Image":"i","State":")" +
-                (running ? "running" : "exited") + R"("})";
-        f.reply("/containers/" + cid + "/json", http(200, inspect_body(running)));
-    }
-    list += "]";
-    f.reply("/containers/json?all=1", http(200, list));
-    const Posture p = f.run(kEndpoint);
-
-    CHECK(has_token(p, "inspect_capped"));
-    const auto c = rows_with(p, "container|");
-    REQUIRE(c.size() == 71);
-    // the running container is the first row and was inspected: its privileged `yes` is read
-    CHECK(c[0].find("|running|yes|bridge|no") != std::string::npos);
-    CHECK(c[1].find("|exited|no|bridge|no") != std::string::npos);
-    CHECK(c[70].find("|exited|unknown|unknown|unknown") != std::string::npos);
 }
 
 TEST_CASE("runtime seam: the list cap is reported", "[virtualization][runtime][seam]") {

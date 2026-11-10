@@ -847,41 +847,25 @@ struct ContainerList {
 };
 
 /// Reads Id, Names, Image and State of each entry and nothing else (Command, Labels, Mounts and
-/// Ports are never read). Running containers come first, each group in the runtime's own
-/// (newest-first) order, so the row cap here and the inspection cap after it keep the live
-/// containers rather than the newest exited ones. At most kMaxContainerRows rows are kept; an entry
-/// past the cap had only its Id checked (it is counted as skipped if invalid) and is never read.
+/// Ports are never read). At most kMaxContainerRows rows are kept.
 inline ContainerList containers_from_list(const nlohmann::json& j) {
     ContainerList out;
     if (!j.is_array()) {
         out.malformed = true;
         return out;
     }
-    struct Entry {
-        const nlohmann::json* json;
-        const std::string* id;
-    };
-    std::vector<Entry> entries; // running first
-    std::vector<Entry> others;
     for (const auto& e : j) {
         const auto* id = member_of_type(e, "Id", nlohmann::json::value_t::string);
         if (!id || !valid_container_id(id->get_ref<const std::string&>())) {
             ++out.skipped;
             continue;
         }
-        const auto* st = member_of_type(e, "State", nlohmann::json::value_t::string);
-        const bool running = st && st->get_ref<const std::string&>() == "running";
-        (running ? entries : others).push_back({&e, &id->get_ref<const std::string&>()});
-    }
-    entries.insert(entries.end(), others.begin(), others.end());
-    if (entries.size() > kMaxContainerRows) {
-        out.rows_capped = true;
-        entries.resize(kMaxContainerRows);
-    }
-    for (const auto& [ep, id] : entries) {
-        const auto& e = *ep;
+        if (out.rows.size() >= kMaxContainerRows) {
+            out.rows_capped = true;
+            break;
+        }
         ContainerRow r;
-        r.id = *id;
+        r.id = id->get_ref<const std::string&>();
         r.id12 = r.id.substr(0, 12);
         if (const auto* names =
                 typed_member(e, "Names", nlohmann::json::value_t::array, out.malformed);
