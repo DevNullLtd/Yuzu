@@ -1058,14 +1058,15 @@ TEST_CASE("windows: a profile with the firewall switched off, or unreadable, ref
           "[agent][firewall_quarantine]") {
     using K = WinSwitchVerdict::Kind;
     const WinSwitchReading on{true, true, true};
-    CHECK(win_firewall_switch_verdict(on).kind == K::ok);
-    CHECK(win_firewall_switch_token(win_firewall_switch_verdict(on)).empty());
+    const WinGpoReading none{false, false, false}; // no Group Policy on any profile
+    CHECK(win_firewall_switch_verdict(on, none, false).kind == K::ok);
+    CHECK(win_firewall_switch_token(win_firewall_switch_verdict(on, none, false)).empty());
 
     for (std::size_t i = 0; i < on.size(); ++i) {
         INFO("profile " << kWinProfileLabels[i]);
         auto off = on;
         off[i] = false;
-        const auto d = win_firewall_switch_verdict(off);
+        const auto d = win_firewall_switch_verdict(off, none, false);
         CHECK(d.kind == K::disabled);
         CHECK(d.profile == i);
         const auto dt = win_firewall_switch_token(d);
@@ -1074,7 +1075,7 @@ TEST_CASE("windows: a profile with the firewall switched off, or unreadable, ref
 
         auto unreadable = on;
         unreadable[i] = std::nullopt; // S_FALSE or an error: never a guess
-        const auto u = win_firewall_switch_verdict(unreadable);
+        const auto u = win_firewall_switch_verdict(unreadable, none, false);
         CHECK(u.kind == K::unreadable);
         CHECK(u.profile == i);
         const auto ut = win_firewall_switch_token(u);
@@ -1084,21 +1085,22 @@ TEST_CASE("windows: a profile with the firewall switched off, or unreadable, ref
 
     // every shape: the first disabled profile wins, and a definite "off" outranks
     // an unreadable profile that sorts before it
-    CHECK(win_firewall_switch_verdict({false, false, false}).profile == 0);
-    const auto mixed = win_firewall_switch_verdict({std::nullopt, true, false});
+    CHECK(win_firewall_switch_verdict({false, false, false}, none, false).profile == 0);
+    const auto mixed = win_firewall_switch_verdict({std::nullopt, true, false}, none, false);
     CHECK(mixed.kind == K::disabled);
     CHECK(mixed.profile == 2);
-    const auto two_unreadable = win_firewall_switch_verdict({true, std::nullopt, std::nullopt});
+    const auto two_unreadable = win_firewall_switch_verdict({true, std::nullopt, std::nullopt}, none, false);
     CHECK(two_unreadable.kind == K::unreadable);
     CHECK(two_unreadable.profile == 1);
 }
 
 TEST_CASE("windows: the switch verdict settles the status read the same way on every host",
           "[agent][firewall_quarantine]") {
+    const WinGpoReading none{false, false, false};
     // on everywhere: nothing settled, the read goes on and the status is untouched
     LegStatus on;
     on.state = OsState::enforcing;
-    CHECK_FALSE(win_switch_status(win_firewall_switch_verdict({true, true, true}), on));
+    CHECK_FALSE(win_switch_status(win_firewall_switch_verdict({true, true, true}, none, false), on));
     CHECK(on.state == OsState::enforcing);
     CHECK(on.reapply_helps);
     CHECK(on.reason.empty());
@@ -1106,7 +1108,7 @@ TEST_CASE("windows: the switch verdict settles the status read the same way on e
 
     // switched off: not enforcing, and a re-apply cannot help (it refuses the same way)
     LegStatus off;
-    CHECK(win_switch_status(win_firewall_switch_verdict({true, false, true}), off));
+    CHECK(win_switch_status(win_firewall_switch_verdict({true, false, true}, none, false), off));
     CHECK(off.state == OsState::not_enforcing);
     CHECK(off.reason == "firewall_disabled");
     CHECK_FALSE(off.reapply_helps);
@@ -1115,7 +1117,7 @@ TEST_CASE("windows: the switch verdict settles the status read the same way on e
     // unreadable: never a guess either way; a note names the profile, nothing is claimed
     LegStatus unread;
     unread.state = OsState::enforcing; // a stale optimistic value must not survive
-    CHECK(win_switch_status(win_firewall_switch_verdict({true, true, std::nullopt}), unread));
+    CHECK(win_switch_status(win_firewall_switch_verdict({true, true, std::nullopt}, none, false), unread));
     CHECK(unread.state == OsState::unreadable);
     CHECK(unread.reason.empty());
     CHECK(unread.reapply_helps);
@@ -1798,7 +1800,8 @@ TEST_CASE("quarantine_allow: update keeps the previous generation on failure",
         const auto o = update(rig.env, false, {ex("10.9.9.9")}, dl);
         CHECK(o.status == "active");
         CHECK(contains(o.notes, "exceptions_unchanged=1"));
-        // no mutation: the one runner call is the live read the answer is built from (K1)
+        // no mutation: a no-op quarantine_allow answers what quarantine_status would, so the one
+        // runner call is the live read the answer is built from
         CHECK(rig.world.crash.calls == calls + 1);
         CHECK(rig.world.log.back()[1] == "list");
         CHECK(rig.store.state()->generation == 1);
@@ -5367,37 +5370,109 @@ TEST_CASE("log: what is logged for an outcome, at which level; the ticks stay qu
 
 // ── Windows hosts under Group Policy: refused, never contained in part ──────
 //
-// Owner decision 2026-11-10: where LocalPolicyModifyState is GP_OVERRIDE a rule or default
-// written locally takes no effect, so the leg REFUSES (`gpo_override`, nothing written) and
-// reads `degraded|gpo_override` if the policy arrives mid-quarantine. Never partial, never
-// active, and no repair loop.
+// Owner decision 2026-11-10: where Group Policy controls ANY profile the quarantine relies on
+// (all three: it writes default-block on each) a rule or default written locally takes no
+// effect there, so the leg REFUSES (`gpo_override:<Profile>`, nothing written) and reads
+// `degraded|gpo_override` if the policy arrives mid-quarantine. Never partial, never active,
+// and no repair loop. The per-profile reading comes from the policy store (a profile that is
+// not the current one is invisible to INetFwPolicy2::LocalPolicyModifyState); the COM state
+// stays as a second signal that names no profile.
+
+TEST_CASE("gpo_override: what the policy store holds for one profile decides whether it is controlled",
+          "[agent][firewall_quarantine]") {
+    // nothing set: no Group Policy on this profile
+    CHECK_FALSE(win_gpo_profile_overridden({}));
+    // local rules merge (AllowLocalPolicyMerge=1) and no default is set by policy: not controlled
+    CHECK_FALSE(win_gpo_profile_overridden({1u, std::nullopt, std::nullopt}));
+    // local rules do NOT merge: our allowances would never apply, the host would be block/block
+    CHECK(win_gpo_profile_overridden({0u, std::nullopt, std::nullopt}));
+    // a default action set by policy, whatever its value (allow or block), makes ours inert
+    for (const std::uint32_t v : {0u, 1u}) {
+        INFO("value " << v);
+        CHECK(win_gpo_profile_overridden({std::nullopt, v, std::nullopt}));
+        CHECK(win_gpo_profile_overridden({std::nullopt, std::nullopt, v}));
+        CHECK(win_gpo_profile_overridden({1u, v, v}));
+    }
+}
 
 TEST_CASE("gpo_override: the verdict, its token and the status read are one decision",
           "[agent][firewall_quarantine]") {
     using K = WinSwitchVerdict::Kind;
     const WinSwitchReading on{true, true, true};
+    const WinGpoReading none{false, false, false};
 
-    // a definite GP_OVERRIDE reading refuses whatever the per-profile switch says...
-    const auto v = win_firewall_switch_verdict(on, true);
-    CHECK(v.kind == K::gpo_override);
-    const auto token = win_firewall_switch_token(v);
-    CHECK(token == "gpo_override");
-    CHECK(is_safe_token(token));
-    // ...and outranks a switched-off or unreadable profile (it is what no local action
-    // can change); without the reading nothing about the other kinds moves
-    CHECK(win_firewall_switch_verdict({false, true, true}, true).kind == K::gpo_override);
-    CHECK(win_firewall_switch_verdict({std::nullopt, true, true}, true).kind == K::gpo_override);
-    CHECK(win_firewall_switch_verdict(on, false).kind == K::ok);
-    CHECK(win_firewall_switch_verdict({true, false, true}, false).kind == K::disabled);
+    // Group Policy on ONE profile refuses and names it, whichever profile it is and
+    // whatever the COM (current-profile) state says: a non-current profile is the case the
+    // COM state cannot see
+    for (std::size_t i = 0; i < none.size(); ++i) {
+        INFO("profile " << kWinProfileLabels[i]);
+        auto gpo = none;
+        gpo[i] = true;
+        for (const bool com : {false, true}) {
+            const auto v = win_firewall_switch_verdict(on, gpo, com);
+            CHECK(v.kind == K::gpo_override);
+            CHECK(v.profile == i);
+            CHECK(v.profile_named);
+            const auto token = win_firewall_switch_token(v);
+            CHECK(token == "gpo_override:" + std::string{kWinProfileLabels[i]});
+            CHECK(is_safe_token(token));
+        }
+    }
+    // the first controlled profile is the one named
+    CHECK(win_firewall_switch_verdict(on, {false, true, true}, false).profile == 1);
 
-    // the status read: not enforcing, a re-apply cannot help, no profile is named
+    // the COM reading on its own refuses too, and names no profile
+    const auto com_only = win_firewall_switch_verdict(on, none, true);
+    CHECK(com_only.kind == K::gpo_override);
+    CHECK_FALSE(com_only.profile_named);
+    const auto bare = win_firewall_switch_token(com_only);
+    CHECK(bare == "gpo_override");
+    CHECK(is_safe_token(bare));
+
+    // override outranks a switched-off or unreadable profile (it is what no local action
+    // can change), from either signal
+    CHECK(win_firewall_switch_verdict({false, true, true}, {false, false, true}, false).kind == K::gpo_override);
+    CHECK(win_firewall_switch_verdict({std::nullopt, true, true}, none, true).kind == K::gpo_override);
+    CHECK(win_firewall_switch_verdict({true, true, true}, {std::nullopt, true, false}, false).profile == 1);
+
+    // absent everywhere is no override: the other kinds are unchanged
+    CHECK(win_firewall_switch_verdict(on, none, false).kind == K::ok);
+    CHECK(win_firewall_switch_verdict({true, false, true}, none, false).kind == K::disabled);
+
+    // a policy-store reading that FAILED is unreadable and names the profile, never "no policy"
+    for (std::size_t i = 0; i < none.size(); ++i) {
+        INFO("profile " << kWinProfileLabels[i]);
+        auto gpo = none;
+        gpo[i] = std::nullopt;
+        const auto u = win_firewall_switch_verdict(on, gpo, false);
+        CHECK(u.kind == K::unreadable);
+        CHECK(u.profile == i);
+        CHECK(u.profile_named);
+        const auto ut = win_firewall_switch_token(u);
+        CHECK(ut == "firewall_state_unreadable:" + std::string{kWinProfileLabels[i]});
+        CHECK(is_safe_token(ut));
+    }
+    // a definite "off" still outranks an unreadable policy store, as it does an unreadable switch
+    const auto off_beats_unread = win_firewall_switch_verdict({true, true, false}, {std::nullopt, false, false}, false);
+    CHECK(off_beats_unread.kind == K::disabled);
+    CHECK(off_beats_unread.profile == 2);
+
+    // the status read: not enforcing, a re-apply cannot help, and a named profile is a note
+    const auto named = win_firewall_switch_verdict(on, {true, false, false}, false);
     LegStatus ls;
     ls.state = OsState::enforcing; // a stale optimistic value must not survive
-    CHECK(win_switch_status(v, ls));
+    CHECK(win_switch_status(named, ls));
     CHECK(ls.state == OsState::not_enforcing);
     CHECK(ls.reason == "gpo_override");
     CHECK_FALSE(ls.reapply_helps);
-    CHECK(ls.notes.empty());
+    CHECK(ls.notes == std::vector<std::string>{"firewall_profile=Domain"});
+
+    LegStatus com_ls;
+    CHECK(win_switch_status(com_only, com_ls));
+    CHECK(com_ls.state == OsState::not_enforcing);
+    CHECK(com_ls.reason == "gpo_override");
+    CHECK_FALSE(com_ls.reapply_helps);
+    CHECK(com_ls.notes.empty());
 
     // over an active record the ladder answers degraded|gpo_override, never partial or active
     const auto rec = make_record();
@@ -5427,12 +5502,12 @@ TEST_CASE("gpo_override: a Group Policy host is refused before anything is touch
           "[agent][firewall_quarantine]") {
     SECTION("the initial quarantine is refused: no record, no apply") {
         ScriptRig rig;
-        rig.leg.refuse = "gpo_override"; // preflight's token for the verdict
+        rig.leg.refuse = "gpo_override:Domain"; // preflight's token for a profile that is not the current one
         Deadline dl;
         const auto o = apply_and_verify(rig.env, rig.request(), dl);
         CHECK(o.status == "refused");
-        CHECK(o.reason == "gpo_override");
-        CHECK(render_rows(o)[1] == "refused|gpo_override");
+        CHECK(o.reason == "gpo_override:Domain");
+        CHECK(render_rows(o)[1] == "refused|gpo_override:Domain");
         CHECK(rig.leg.applies == 0);
         CHECK(rig.store.raw.empty());
     }
@@ -5445,10 +5520,12 @@ TEST_CASE("gpo_override: a Group Policy host is refused before anything is touch
         rig.leg.status.state = OsState::not_enforcing;
         rig.leg.status.reason = "gpo_override";
         rig.leg.status.reapply_helps = false;
+        rig.leg.status.notes = {"firewall_profile=Domain"};
 
         const auto st = report_status(rig.env, dl);
         CHECK(st.status == "degraded");
         CHECK(st.reason == "gpo_override");
+        CHECK(contains(st.notes, "firewall_profile=Domain"));
 
         // a retried quarantine answers what status would, and never re-applies
         const auto again = apply_and_verify(rig.env, rig.request(), dl);
@@ -5456,7 +5533,8 @@ TEST_CASE("gpo_override: a Group Policy host is refused before anything is touch
         CHECK(again.reason == "gpo_override");
         CHECK(rig.leg.applies == applies);
 
-        // a no-op quarantine_allow reads the leg too (K1): never `active` over the gap
+        // a no-op quarantine_allow answers what quarantine_status would: it reads the leg too,
+        // so it is never `active` over the gap
         const auto noop = update(rig.env, false, {ex("10.9.9.9")}, dl);
         CHECK(noop.status == "degraded");
         CHECK(noop.reason == "gpo_override");
@@ -5465,17 +5543,17 @@ TEST_CASE("gpo_override: a Group Policy host is refused before anything is touch
 
         // a quarantine_allow that changes the set reaches the leg, whose step 0 refuses:
         // update_failed with the token, the previous generation stays in the record
-        rig.leg.on_apply = [](OsPayload&) { return StepResult::fail("gpo_override"); };
+        rig.leg.on_apply = [](OsPayload&) { return StepResult::fail("gpo_override:Domain"); };
         const auto u = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
         CHECK(u.status == "update_failed");
-        CHECK(u.reason == "gpo_override");
+        CHECK(u.reason == "gpo_override:Domain");
         CHECK(rig.store.state()->allow == before->allow);
         CHECK(rig.store.state()->generation == before->generation);
 
         // the boot re-apply takes the same failed path and leaves the record active
         const auto boot = recover_at_init(rig.env, dl);
         CHECK(boot.status == "degraded");
-        CHECK(boot.reason == "reapply_failed:gpo_override");
+        CHECK(boot.reason == "reapply_failed:gpo_override:Domain");
         CHECK(rig.store.state()->phase == Phase::active);
     }
 }
@@ -6169,6 +6247,39 @@ TEST_CASE("repair: a live control peer missing from the stored set is admitted, 
     CHECK(again.status == "active");
     CHECK_FALSE(contains(again.notes, "control_live_peer=203.0.113.200:50051"));
     CHECK(rig.store.state()->allow.control == rec->allow.control);
+}
+
+TEST_CASE("repair: a retried quarantine over a host that stopped enforcing admits the live peer too",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    PeerProbe net;
+    net.world = &rig.world;
+    net.up = {"198.51.100.7:50051", "203.0.113.200:50051"};
+    rig.env.probe = net.fn();
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    const auto stored = rig.store.state()->allow;
+
+    // the server moved after the quarantine and the agent learned the new address over another
+    // path; the table is flushed. The retried `quarantine` takes the same converge as the tick:
+    // it re-applies the STORED set and admits the live peer, which the proof connects to.
+    rig.env.live_control = parse_live_peer("203.0.113.200:50051");
+    rig.world.table = false;
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "active");
+    CHECK(contains(o.notes, "repaired=1"));
+    CHECK(contains(o.notes, "control_live_peer=203.0.113.200:50051"));
+    CHECK(contains(o.notes, "control_proved=live"));
+    const auto rec = rig.store.state();
+    REQUIRE(rec);
+    CHECK(rec->phase == Phase::active);
+    CHECK(rec->repairs == 1);
+    CHECK(rec->generation == 2); // one convergence, no revert generation
+    REQUIRE(rec->allow.control.size() == stored.control.size() + 1);
+    CHECK(rec->allow.control.front() == *rig.env.live_control);
+    CHECK(rec->allow.resolvers == stored.resolvers); // nothing else is rewritten
+    CHECK(rec->allow.exceptions == stored.exceptions);
+    CHECK(rig.world.text.find("203.0.113.200") != std::string::npos); // the host's table admits it
 }
 
 TEST_CASE("repair: a live peer that would push the control set past the cap is left out, and said",

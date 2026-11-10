@@ -4222,6 +4222,18 @@ test('firewall privilege-refusal call-site wiring lexical gate',
   timeout: 30,
 )
 
+# Firewall containment (Windows release guard): static lexical gate pinning that WinLeg::remove()
+# returns release_incomplete when a profile's default action did not restore BEFORE it deletes the
+# allowance rules (a host left block/block with no allowance otherwise). The guard sits in the
+# `_WIN32` COM leg, so no macOS or Linux build observes it deleted or moved below the removal loop.
+# Carries its own in-memory mutation self-test. No build required; well under a second.
+test('firewall Windows release-guard wiring lexical gate',
+  _python3_test,
+  args: [files('test_firewall_release_guard_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
 # stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
 # page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes

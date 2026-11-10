@@ -1773,9 +1773,36 @@ using WinSwitchReading = std::array<std::optional<bool>, 3>;
 // kWinProfileLabels[profile] lookups below and in read_status in range.
 static_assert(std::tuple_size_v<WinSwitchReading> == kWinProfileLabels.size());
 
+/// The Group Policy side of the same question, per profile (same order again): `true`
+/// = that profile's local rules or default actions take no effect because policy owns
+/// them, `false` = no policy there, nullopt = the policy store could not be read (never
+/// a guess in either direction).
+using WinGpoReading = std::array<std::optional<bool>, 3>;
+static_assert(std::tuple_size_v<WinGpoReading> == kWinProfileLabels.size());
+
+/// What the policy store holds for ONE profile
+/// (HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\<Profile>Profile); nullopt = the
+/// value is absent. The shell reads the three DWORDs; the decision lives here.
+struct WinGpoProfile {
+    std::optional<std::uint32_t> allow_local_policy_merge;
+    std::optional<std::uint32_t> default_inbound_action;
+    std::optional<std::uint32_t> default_outbound_action;
+};
+
+/// A profile is policy-controlled for our purposes when (a) `AllowLocalPolicyMerge` is
+/// present and 0: the locally written allowances never merge, so the host would be
+/// block/block with no allowance at all; or (b) a default action is set by policy (its
+/// VALUE does not matter): our local default-block, and its restore on release, is inert
+/// there. A policy that sets block/block itself is over-refused on purpose (README).
+[[nodiscard]] constexpr bool win_gpo_profile_overridden(const WinGpoProfile& p) noexcept {
+    return (p.allow_local_policy_merge && *p.allow_local_policy_merge == 0) ||
+           p.default_inbound_action.has_value() || p.default_outbound_action.has_value();
+}
+
 struct WinSwitchVerdict {
     enum class Kind : std::uint8_t { ok, disabled, unreadable, gpo_override } kind = Kind::ok;
-    std::size_t profile = 0; // index into kWinProfileLabels; meaningful for disabled / unreadable
+    std::size_t profile = 0;    // index into kWinProfileLabels; meaningful when profile_named
+    bool profile_named = false; // false for ok, and for a gpo_override only the COM state saw
 };
 
 /// A profile whose firewall is switched off makes every rule and the default
@@ -1785,30 +1812,37 @@ struct WinSwitchVerdict {
 /// another product turned off is not ours to undo on release. A definite "off"
 /// outranks an unreadable profile: it is the actionable fact.
 ///
-/// A host under Group Policy is refused the same way (`policy_overridden`: the
-/// firewall's `LocalPolicyModifyState` is `GP_OVERRIDE`, read as a definite S_OK
-/// only). Microsoft documents that a rule or default written locally "will not take
-/// effect because the firewall is controlled by Group Policy", so containment there
-/// would be a lie too (owner decision 2026-11-10: refuse, never apply and report
-/// partial). The state is policy-wide, one reading covers every profile, and the
-/// refusal names no profile. It outranks both other kinds: it is what no local
-/// action can change.
+/// A host under Group Policy is refused the same way. Microsoft documents that a rule
+/// or default written locally "will not take effect because the firewall is controlled
+/// by Group Policy", so containment there would be a lie too (owner decision
+/// 2026-11-10: refuse, never apply and report partial; any of the three profiles, since
+/// the quarantine writes default-block on every one). Two signals, both of which refuse:
+/// `gpo` is the per-profile policy-store reading (win_gpo_profile_overridden) and names the
+/// profile; `com_policy_overridden` is `INetFwPolicy2::LocalPolicyModifyState` ==
+/// `GP_OVERRIDE`, a definite S_OK reading about the CURRENT profile only, so on its own it
+/// names none. A policy-store reading that failed (as opposed to found nothing) is
+/// unreadable, never "no policy". Override outranks both other kinds: it is what no local
+/// action can change. There is deliberately no default for either argument.
 [[nodiscard]] constexpr WinSwitchVerdict win_firewall_switch_verdict(const WinSwitchReading& enabled,
-                                                                     bool policy_overridden = false) noexcept {
-    if (policy_overridden)
-        return {WinSwitchVerdict::Kind::gpo_override, 0};
+                                                                     const WinGpoReading& gpo,
+                                                                     bool com_policy_overridden) noexcept {
+    for (std::size_t i = 0; i < gpo.size(); ++i)
+        if (gpo[i] && *gpo[i])
+            return {WinSwitchVerdict::Kind::gpo_override, i, true};
+    if (com_policy_overridden)
+        return {WinSwitchVerdict::Kind::gpo_override, 0, false};
     for (std::size_t i = 0; i < enabled.size(); ++i)
         if (enabled[i] && !*enabled[i])
-            return {WinSwitchVerdict::Kind::disabled, i};
+            return {WinSwitchVerdict::Kind::disabled, i, true};
     for (std::size_t i = 0; i < enabled.size(); ++i)
-        if (!enabled[i])
-            return {WinSwitchVerdict::Kind::unreadable, i};
+        if (!enabled[i] || !gpo[i])
+            return {WinSwitchVerdict::Kind::unreadable, i, true};
     return {};
 }
 
-/// The refusal / failure token for a verdict (empty when the switch is on
-/// everywhere): `firewall_disabled:<Profile>`, `firewall_state_unreadable:<Profile>`
-/// or `gpo_override`.
+/// The refusal / failure token for a verdict (empty when the switch is on and no policy
+/// controls any profile): `firewall_disabled:<Profile>`, `firewall_state_unreadable:<Profile>`,
+/// `gpo_override:<Profile>`, or the bare `gpo_override` when only the COM state said so.
 [[nodiscard]] inline std::string win_firewall_switch_token(const WinSwitchVerdict& v) {
     switch (v.kind) {
     case WinSwitchVerdict::Kind::ok:
@@ -1818,7 +1852,8 @@ struct WinSwitchVerdict {
     case WinSwitchVerdict::Kind::unreadable:
         return std::format("firewall_state_unreadable:{}", kWinProfileLabels[v.profile]);
     case WinSwitchVerdict::Kind::gpo_override:
-        return "gpo_override";
+        return v.profile_named ? std::format("gpo_override:{}", kWinProfileLabels[v.profile])
+                               : std::string{"gpo_override"};
     }
     return {};
 }
@@ -2607,28 +2642,24 @@ struct LegStatus {
 /// settles the status and returns true: a switched-off profile makes every rule
 /// and the default block inert, so nothing is enforced and re-applying cannot help
 /// (it refuses the same way); a host under Group Policy enforces nothing of ours
-/// and re-applying cannot help either (`gpo_override`, no profile named: the state
-/// is policy-wide, and `reapply_helps=false` keeps the repair tick from looping);
-/// an unreadable switch is unreadable, never a guess either way. The first and
-/// last name the profile. Returns false when the switch is on everywhere and the
-/// read goes on.
+/// and re-applying cannot help either (`gpo_override`, `reapply_helps=false` keeps
+/// the repair tick from looping); an unreadable switch or policy store is
+/// unreadable, never a guess either way. Every verdict that names a profile adds
+/// `note|firewall_profile=<Profile>`; a `gpo_override` only the COM state saw names none.
+/// Returns false when the switch is on everywhere, no policy controls a profile, and
+/// the read goes on.
 [[nodiscard]] inline bool win_switch_status(const WinSwitchVerdict& v, LegStatus& st) {
     if (v.kind == WinSwitchVerdict::Kind::ok)
         return false;
-    if (v.kind == WinSwitchVerdict::Kind::gpo_override) {
-        st.state = OsState::not_enforcing;
-        st.reason = "gpo_override";
-        st.reapply_helps = false;
+    if (v.profile_named)
+        st.notes.push_back(std::format("firewall_profile={}", kWinProfileLabels[v.profile]));
+    if (v.kind == WinSwitchVerdict::Kind::unreadable) {
+        st.state = OsState::unreadable;
         return true;
     }
-    st.notes.push_back(std::format("firewall_profile={}", kWinProfileLabels[v.profile]));
-    if (v.kind == WinSwitchVerdict::Kind::disabled) {
-        st.state = OsState::not_enforcing;
-        st.reason = "firewall_disabled";
-        st.reapply_helps = false;
-    } else {
-        st.state = OsState::unreadable;
-    }
+    st.state = OsState::not_enforcing;
+    st.reason = v.kind == WinSwitchVerdict::Kind::gpo_override ? "gpo_override" : "firewall_disabled";
+    st.reapply_helps = false;
     return true;
 }
 
@@ -3727,7 +3758,7 @@ namespace detail {
         if (target.control.size() > kMaxControlIps) {
             target.control = next.control;
             o.notes.emplace_back("control_live_peer_over_cap=1");
-        } else if (!(target.control == next.control)) {
+        } else if (target.control != next.control) {
             o.notes.push_back(live_peer_note(*env.live_control));
         }
     }

@@ -1968,8 +1968,9 @@ public:
         if (legacy)
             return std::string{"legacy_quarantine_active"};
         // A profile whose firewall is switched off (or cannot be read) would make every
-        // rule below inert, and a Group Policy-managed firewall ignores local rules and
-        // defaults altogether (`gpo_override`): refuse before anything is touched.
+        // rule below inert, and a profile Group Policy controls (any of the three)
+        // ignores local rules and defaults altogether (`gpo_override:<Profile>`): refuse
+        // before anything is touched.
         if (auto why = fq::win_firewall_switch_token(read_verdict(*policy.get())); !why.empty())
             return why;
         return std::nullopt;
@@ -1991,7 +1992,7 @@ public:
             return fq::StepResult::fail(hr_token("rules_create", hr));
         yuzu::PluginContext pc{raw_};
 
-        // 0. The master switch, per profile, and the Group Policy override. An init
+        // 0. The master switch and the Group Policy override, per profile. An init
         //    re-apply and an update do not pass through preflight, and nothing has
         //    been written yet.
         if (const auto why = fq::win_firewall_switch_token(read_verdict(*policy.get()));
@@ -2327,8 +2328,8 @@ public:
             st.notes.emplace_back("legacy_quarantine_rules_present=1");
         if (!group && all_block)
             st.notes.emplace_back("rules_missing=1"); // block/block with no rules of ours
-        // A switched-off profile, an unreadable switch and a Group Policy-managed firewall
-        // (`gpo_override`: local rules and defaults take no effect, whatever
+        // A switched-off profile, an unreadable switch or policy store and a profile Group
+        // Policy controls (`gpo_override`: local rules and defaults take no effect, whatever
         // get_Default*Action says, so a policy that arrived mid-quarantine reads
         // not_enforcing here and a re-apply cannot help) all settle the status.
         if (fq::win_switch_status(sw, st))
@@ -2342,12 +2343,47 @@ public:
 private:
     /// LocalPolicyModifyState == GP_OVERRIDE: the firewall is controlled by Group
     /// Policy, so a rule or default written here takes no effect. Only a definite S_OK
-    /// reading says yes; an unreadable state is not an override (the default reads
-    /// decide the rest). Policy-wide: one reading covers every profile.
+    /// reading says yes. It describes the CURRENT profile only, so it is the second
+    /// signal: read_gpo is the one that sees a profile the host is not on right now.
     [[nodiscard]] static bool policy_overridden(INetFwPolicy2& policy) {
         NET_FW_MODIFY_STATE state = NET_FW_MODIFY_STATE_OK;
         return policy.get_LocalPolicyModifyState(&state) == S_OK &&
                state == NET_FW_MODIFY_STATE_GP_OVERRIDE;
+    }
+
+    /// One Group Policy DWORD. `readable` is false for any failure but "not there": a
+    /// missing key or value (ERROR_FILE_NOT_FOUND) means no policy, anything else (access
+    /// denied, a value of the wrong type) is a reading we do not have.
+    struct PolicyDword {
+        bool readable = false;
+        std::optional<std::uint32_t> value;
+    };
+    [[nodiscard]] static PolicyDword read_policy_dword(const wchar_t* key, const wchar_t* name) {
+        DWORD v = 0, size = sizeof(v);
+        const LONG rc = RegGetValueW(HKEY_LOCAL_MACHINE, key, name, RRF_RT_REG_DWORD, nullptr, &v, &size);
+        if (rc == ERROR_SUCCESS)
+            return {true, static_cast<std::uint32_t>(v)};
+        return {rc == ERROR_FILE_NOT_FOUND, std::nullopt};
+    }
+
+    /// The Group Policy firewall store per profile, in kQuarantineProfiles order. nullopt =
+    /// any of the three values could not be read; the pure rule (win_gpo_profile_overridden)
+    /// decides the rest.
+    [[nodiscard]] static fq::WinGpoReading read_gpo() {
+        static constexpr const wchar_t* kKeys[] = {
+            L"SOFTWARE\\Policies\\Microsoft\\WindowsFirewall\\DomainProfile",
+            L"SOFTWARE\\Policies\\Microsoft\\WindowsFirewall\\PrivateProfile",
+            L"SOFTWARE\\Policies\\Microsoft\\WindowsFirewall\\PublicProfile"};
+        static_assert(std::size(kKeys) == std::size(kQuarantineProfiles));
+        fq::WinGpoReading r{};
+        for (std::size_t i = 0; i < std::size(kKeys); ++i) {
+            const auto merge = read_policy_dword(kKeys[i], L"AllowLocalPolicyMerge");
+            const auto in = read_policy_dword(kKeys[i], L"DefaultInboundAction");
+            const auto out = read_policy_dword(kKeys[i], L"DefaultOutboundAction");
+            if (merge.readable && in.readable && out.readable)
+                r[i] = fq::win_gpo_profile_overridden({merge.value, in.value, out.value});
+        }
+        return r;
     }
 
     /// The master switch per profile, through classify_fw_hr: only S_OK is a
@@ -2363,11 +2399,12 @@ private:
         return r;
     }
 
-    /// The master switch and the Group Policy override as ONE verdict: the single
-    /// pure decision (fq::win_firewall_switch_verdict) that preflight, apply step 0 and
-    /// read_status all route through, so the three can never disagree.
+    /// The master switch and the Group Policy override (per profile, plus the COM state)
+    /// as ONE verdict: the single pure decision (fq::win_firewall_switch_verdict) that
+    /// preflight, apply step 0 and read_status all route through, so the three can never
+    /// disagree.
     [[nodiscard]] static fq::WinSwitchVerdict read_verdict(INetFwPolicy2& policy) {
-        return fq::win_firewall_switch_verdict(read_switch(policy), policy_overridden(policy));
+        return fq::win_firewall_switch_verdict(read_switch(policy), read_gpo(), policy_overridden(policy));
     }
 
     /// `release_incomplete`: what a release that could not finish reports, with the
@@ -2959,10 +2996,12 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "INetFwPolicy2 COM rule group + per-profile default-block; other enabled rules "
          "disabled for the duration",
-         "rules the policy store refuses to disable (GPO) leave the result partial; a host whose "
-         "firewall policy is Group Policy-managed (LocalPolicyModifyState GP_OVERRIDE) is refused "
-         "gpo_override and changes nothing (a rule or default written locally takes no effect "
-         "there), and reads degraded|gpo_override if the policy arrives mid-quarantine; contains "
+         "rules the policy store refuses to disable (GPO) leave the result partial; a host where "
+         "Group Policy controls any of the three profiles (a policy-set default action, or local "
+         "rules that do not merge; also LocalPolicyModifyState GP_OVERRIDE) is refused "
+         "gpo_override:<Profile> and changes nothing (a rule or default written locally takes no "
+         "effect there; a policy that sets block/block itself is refused too), and reads "
+         "degraded|gpo_override if the policy arrives mid-quarantine; contains "
          "the host's own IP traffic and traffic the host "
          "routes (Hyper-V external-switch guests are not contained); a ttl_seconds limit rides the host "
          "wall clock (NTP is blocked while contained) and its expiry release is logged on the "

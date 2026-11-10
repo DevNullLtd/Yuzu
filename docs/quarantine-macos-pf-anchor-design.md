@@ -276,6 +276,15 @@ record whose leg reads *not enforcing* converges (re-applies the **stored** allo
 set, `note|repaired=1`) instead of answering `already_active`. That driver rule
 also closes the analogous Windows `degraded|policy_not_blocking` case.
 
+The converge also admits the agent's live control peer when the stored set lacks it
+(`note|control_live_peer=<ip:port>`): the address the agent daemon publishes from the
+authenticated stream, never one the caller or the host chose, admitted the way
+`build_allow_set` admits it at quarantine time. That is the agent-side twin of the
+server's stored-whitelist-only re-dispatch rule (the server reconciler and a retried
+device quarantine re-dispatch the stored whitelist alone), not an exception to it: the
+rule guards what a *caller* can write into a contained device's allow set, and the live
+peer is not caller-supplied.
+
 ### 2.5 Dangling-anchor detection
 
 The anchor does nothing unless the main ruleset references it. The leg runs
