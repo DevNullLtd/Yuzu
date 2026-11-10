@@ -94,8 +94,8 @@ enum class V3Status { full, delta, constrained, timeout, oversize, not_collected
 [[nodiscard]] YUZU_EXPORT std::string canonical_release(std::string_view release);
 
 /// The most canonicalisation passes machine_install_location runs before it gives up and blanks
-/// the value (fail closed). Installer junk settles in two or three; a value still moving after
-/// this many is nested quote-and-dot padding, which would otherwise cost one pass over the whole
+/// the value (fail closed). Installer junk settles in two or three; a value that has not settled by
+/// the last pass (one that settles exactly on it included) is nested quote-and-dot padding, which would otherwise cost one pass over the whole
 /// string per layer (quadratic on a hostile registry value, on the sync thread).
 inline constexpr int kV3MaxCanonicalPasses = 8;
 

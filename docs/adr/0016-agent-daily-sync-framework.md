@@ -1636,7 +1636,7 @@ fail-open, an allowlist is not. The blanking is part of the stored form, so it a
 under two accounts one row, and a kept location is written in one spelling, so quoting or separator variants
 of one folder are one row too. The rule is lexical: a kept path is not checked below its root, nor for links or
 junctions, and a path under a machine root is accepted as machine-scope whatever it names (`/opt/users/alice/app`
-is kept). The mount-point redaction above (`mount_entry_is_personal`) stays a personal-roots
+is kept; so is a POSIX-shaped value that carries a literal `\` after a machine root, such as `/opt/x\..\..\Users\a`: it is the installer's own text, `\` is a filename byte on that shape and does not climb, and only a Windows host would read it as a rooted path). The mount-point redaction above (`mount_entry_is_personal`) stays a personal-roots
 rule (it redacts, it does not select); a shared canonical form for both is a follow-up. Customer-configurable
 extra roots are a follow-up. `tests/unit/test_installed_software_v3.cpp` pins every probed spelling and the
 kept machine paths through both `v3_record` and `plan_section`.

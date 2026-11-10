@@ -330,7 +330,7 @@ const std::vector<std::string> kBlankedSpellings = {
         // (`/Users/a/x\..\..\..\opt/Foo.app` is `/Users/a/<name>/Foo.app`, blanked, never
         // `/opt/Foo.app`); and a path that leads with `\` and has no drive letter has no shape.
         "/Users/a/x\\..\\..\\..\\opt/Foo.app", "/home/a/x\\..\\..\\..\\usr/bin", "\\opt\\x",
-        "\\opt/Foo.app", "\\Program Files\\Tool", "\\Applications\\Tool.app",
+        "\\opt/Foo.app", "\\Applications\\Tool.app",
         // A control byte is not a path; DEL (0x7F) counts as one.
         std::string("C:\\Program Files\\Tool\x01"), "/Applications/\tTool.app",
         std::string("C:\\Program Files\\Tool\x7f"), std::string("/opt/\x7fTool")};

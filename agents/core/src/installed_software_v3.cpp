@@ -366,8 +366,8 @@ std::string machine_install_location(std::string_view raw) {
     // anything other than case or separators shortens the string, and the pass after one that
     // changed only those changes nothing. It is also capped: nested quote-and-dot padding
     // (`/opt/x"/."/."/.`...) sheds one layer per pass, so a hostile value would otherwise cost
-    // a pass over the whole string per layer; a value still moving at the cap is blanked, fail
-    // closed (blank is itself a fixed point).
+    // a pass over the whole string per layer; a value not settled by the last pass (one that
+    // settles exactly on it included) is blanked, fail closed (blank is itself a fixed point).
     std::string cur(raw);
     for (int pass = 0; pass < kV3MaxCanonicalPasses; ++pass) {
         std::string next = canonical_location_once(cur);
