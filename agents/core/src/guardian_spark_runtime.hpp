@@ -986,6 +986,14 @@ public:
     /// Dispatching-window race deterministically. Set before triggering the
     /// dispatch; consumed (moved out, resetting to empty) under registry_mu_.
     void set_dispatch_entry_hook_for_test(std::function<void()> hook);
+    /// #5719 test seam: fires exactly once, in attach_rule(NonWaiting), after attach_core()
+    /// returned Pending and before that function re-inspects its claim. The hook runs with
+    /// registry_mu_ RELEASED (the one acquisition the re-inspection needs is dropped and retaken
+    /// around it, so an empty hook costs production nothing). A hook that waits for the claim to
+    /// settle makes the re-inspection deterministically take its Armed return, the "completion
+    /// preceded resumption" case that no timing-free test could otherwise force. Set before the
+    /// attach; consumed (moved out) under registry_mu_.
+    void set_attach_resume_hook_for_test(std::function<void()> hook);
     /// R5.2 drain fault seam (C2/K5): a point is consumed once, the next time execution
     /// reaches its call site; it is not tied to one entry point. Points 1, 2, 4, 5, 8 and
     /// 12 are in on_arm_complete. Points 3, 6 and 7 are in publish_arm_verdicts_locked,
@@ -3090,6 +3098,7 @@ private:
     std::atomic<std::uint64_t> detach_sweep_left_residue_{0}; ///< PR-5a #4221 cs-103: last-on-key sweep left the fifo non-empty (a retained owner tombstone; see detach_sweep_left_residue())
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::function<void()> dispatch_entry_hook_for_test_; ///< registry_mu_-guarded; see the setter
+    std::function<void()> attach_resume_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
     std::atomic<std::uint64_t> tombstones_released_by_reaper_{0}; ///< #5322: runtime-only, incremented by reap_stranded_claims_locked

@@ -1425,9 +1425,10 @@ TEST_CASE("#5719 reason R1: a healthy identical attach is skipped and carries no
 // Mutation (caught here): leave `.rebuild_reason` off the Pending return (the parked io-class
 // SECTION), off the inline Armed return (the Startup SECTION) or off the join return (the
 // shared-key SECTION) in attach_core.
-// Not caught here: the Armed return attach_rule makes after it re-inspects its claim (the
-// claim resolved before attach_core returned). The unparked io-class SECTION asserts the reason
-// on whichever post-check return is taken; no test forces the race or asserts `out.kind`.
+// Mutation (caught here): leave `.rebuild_reason` off the Armed return attach_rule makes after it
+// re-inspects its claim (the claim settled before attach_rule resumed): the forced-resume SECTION
+// parks the caller in set_attach_resume_hook_for_test until the arm has settled, which takes that
+// return deterministically (a free-running loop of 400 attaches never took it).
 // ---------------------------------------------------------------------------------------
 TEST_CASE("#5719 reason R2: a first attach reports first_attach on every success return",
           "[spark][runtime][4415prA][5719]") {
@@ -1441,10 +1442,26 @@ TEST_CASE("#5719 reason R2: a first attach reports first_attach on every success
         CHECK_FALSE(out.skipped);
         CHECK(why_tok(out.rebuild_reason) == "first_attach");
     }
+    SECTION("io-class key, caller held until the arm settled: the post-check Armed return") {
+        // attach_rule(NonWaiting) re-inspects its claim after attach_core returns Pending. With
+        // the caller held in the resume hook until the claim has settled, that re-inspection
+        // finds a committed outcome and must return Armed carrying the reason.
+        const auto spec = file_spec("/a");
+        const auto key = spark_key(spec);
+        auto* const rt = rig.rt.get();
+        rt->set_attach_resume_hook_for_test([rt, key] {
+            REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; },
+                                           10s));
+        });
+        const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+        CHECK(out.kind == RT::ArmOutcomeKind::Armed);
+        CHECK_FALSE(out.skipped);
+        CHECK(out.generation != 0);
+        CHECK(why_tok(out.rebuild_reason) == "first_attach");
+    }
     SECTION("io-class key, not parked: whichever post-check return attach_rule takes") {
-        // The claim may already be terminal when attach_rule re-checks it (Armed) or still
-        // unresolved (Accepted); both ArmOutcome constructions must carry the reason. Which one
-        // is taken is a race this test deliberately does not force.
+        // Free-running: the claim is usually still unresolved when attach_rule re-checks it
+        // (Accepted). The Armed return is pinned by the SECTION above, not by this one.
         const auto spec = file_spec("/a");
         const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
         CHECK_FALSE(out.skipped);

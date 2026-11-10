@@ -2521,6 +2521,16 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
     // reported Pending a moment ago may already be terminal. Mirrors wait_for_claim's
     // own terminal check exactly, minus the cv wait itself - this never blocks.
     std::unique_lock<std::mutex> lk{registry_mu_};
+    // #5719 test seam (default empty, one-shot): lets a test hold this caller here until the
+    // claim has settled, which forces the Armed return below. The same single lock acquisition
+    // serves the empty (production) case; the hook runs with the lock released.
+    if (attach_resume_hook_for_test_) {
+        auto resume_hook = std::move(attach_resume_hook_for_test_);
+        attach_resume_hook_for_test_ = nullptr;
+        lk.unlock();
+        resume_hook();
+        lk.lock();
+    }
     if (arm_claim->commit_exception) {
         const std::exception_ptr e = arm_claim->commit_exception;
         claim_rollback.committed = true; // terminal result observed
@@ -5678,6 +5688,11 @@ void GuardianSparkRuntime::set_drain_gap_hook_for_test(std::function<void()> hoo
 void GuardianSparkRuntime::set_dispatch_entry_hook_for_test(std::function<void()> hook) {
     std::lock_guard<std::mutex> lk{registry_mu_};
     dispatch_entry_hook_for_test_ = std::move(hook);
+}
+
+void GuardianSparkRuntime::set_attach_resume_hook_for_test(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    attach_resume_hook_for_test_ = std::move(hook);
 }
 
 void GuardianSparkRuntime::set_pending_initial_waker(std::function<void()> waker) {
