@@ -48,41 +48,77 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `legs=release`, which expands to the four release legs only (Linux gcc-15
   release LTO, Linux clang-21 release, Windows MSVC release LTO, macOS release
   LTO); the debug legs normally already ran on that commit's push. It skips
-  when dev's tip already has a dispatch run that succeeded or is in flight. No
-  release leg is a required check, so moving them off the per-push path costs
-  no gating; it saves 9–23 min of self-hosted runner time per leg per dev push.
-  These legs are the only place the test suite runs in release/NDEBUG mode
-  between promotions (`release.yml` builds with `-Dbuild_tests=false`), so a
-  release-only defect now surfaces within about a day instead of on the push
+  when dev's tip already has a dispatch run that succeeded or is in flight; a
+  failed or cancelled run does not count, so a red tip is retried the next day.
+  No release leg is a required check, so moving them off the per-push path
+  costs no gating; it saves 9–23 min of self-hosted runner time per leg per dev
+  push. These legs are the only place the test suite runs in release/NDEBUG
+  mode between promotions (`release.yml` builds with `-Dbuild_tests=false`), so
+  a release-only defect now surfaces within about a day instead of on the push
   that caused it; `main` pushes still build release, so nothing tags untested
   in release mode.
   - **Failure signal.** A dispatched run is started by `github-actions[bot]`,
-    which emails nobody, so `ci.yml`'s `release-legs-alert` job opens (or
-    comments on) a `release-legs-broken` issue when a direct dispatch fails,
-    and `release-legs-close-on-green` closes it on the next fully green one.
-    There is no merge discipline attached, unlike `nightly-broken`.
+    which emails nobody, so `release-legs-alert.yml` (a `workflow_run`
+    listener on CI, dev only, dispatch runs only) opens or comments on a
+    `release-legs-broken` issue when a dispatch fails or times out, and closes
+    it when a later one is green with every dispatch build leg passing. A
+    failure of the dispatcher itself opens the same issue from
+    `release-legs-daily.yml`'s `alert` job. A cancelled run opens nothing. Only
+    open issues authored by `github-actions[bot]` are matched, so a hand-added
+    label is never commented on or closed. There is no merge discipline
+    attached, unlike `nightly-broken`, but the release skill checks the label
+    before tagging.
+  - **When `release-legs-broken` opens (triage).**
+    1. Read the issue's cause line. If only the preflight jobs failed, it is
+       infrastructure: a runner pool, a runner-health check or a source gate.
+       Fix that, then re-run the failed jobs.
+    2. Otherwise, open the failed leg. A timeout, a test-slot wait or a
+       Postgres restart mid-run is a flake: re-run the failed jobs.
+    3. A real test or link failure in release mode is a release-only
+       regression. Take the commit from the leg's "Record built commit
+       (dispatch)" step and bisect back to the last green dispatch (below).
+    4. The issue closes itself on the next fully green dispatch. Re-dispatch
+       with `gh workflow run ci.yml --ref dev -f legs=release` rather than
+       waiting a day.
+  - **Required contexts.** On a direct dispatch, every job that carries a
+    ruleset-required context name (Preflight (runner health), Proto
+    backward-compat and the Linux/Windows/macOS legs) is renamed with a
+    ` [dispatch]` suffix. So a dispatch never posts, satisfies or shadows a
+    required check on any SHA, including the dev tip that a dev → main
+    promotion PR uses as its head. A SKIPPED required context counts as
+    satisfied, which is why renaming is the control rather than failing the
+    jobs. As defence in depth, `trusted_inputs` refuses a direct dispatch on
+    any ref but `dev` or `main`.
   - **Mechanism.**
     - **Concurrency.** The dispatched run uses its own `-dispatch` concurrency
       group. GitHub keeps one pending run per group, so sharing the dev push
-      group would let a dispatch evict a queued push run and strip that
-      commit of its required contexts.
+      group would let a dispatch evict a queued push run.
     - **Matrix.** The `include:` lists are conditional on a `legs=release`
-      dispatch, since GitHub applies `include:` after `exclude:`.
-    - **Refs.** A direct dispatch is accepted on `dev` and `main` only:
-      `trusted_inputs` fails it closed on any other ref. A dispatch posts the
-      ruleset's required job names built from the bare branch head, and on a
-      PR branch that could shadow the merge-result checks. A refused dispatch
-      turns "Preflight (runner health)" red, so it blocks rather than
-      unblocks.
+      dispatch, because GitHub applies `include:` after `exclude:` and would
+      re-add an excluded debug leg.
     - **Trusted-fork path.** A direct dispatch is told apart from the
       trusted-fork `workflow_call` path by `inputs.head_sha`, because a
       reusable workflow inherits its caller's `workflow_dispatch` event name.
-      Trusted-fork runs still expand the full debug + release matrix.
-  - **Go-live.** The cron fires only from `main`, so it goes live at the first
-    dev → main promotion carrying the file. Until then, run
-    `gh workflow run release-legs-daily.yml --ref dev` (or
-    `gh workflow run ci.yml --ref dev -f legs=release`) by hand.
-    `-f legs=all` runs the full matrix on `dev` or `main`.
+      Trusted-fork runs keep the full matrix and their names.
+    - **Permissions.** `ci.yml` requests no write permission. Its jobs are
+      checked against the trusted-fork caller's read-only token when the
+      workflow loads, so the alert's `issues: write` lives in the separate
+      listener. `scripts/ci/test_runner_health_check.py` pins this, the
+      matrix lockstep and the dispatch name suffix;
+      `tests/shell/test_trusted_inputs_validate.sh` pins the ref refusal.
+    - **Telemetry.** Dispatch runs record `event_name=workflow_dispatch`, so
+      release-leg history moves from `push` to `workflow_dispatch` events.
+  - **Go-live and interim gap.** `schedule:` and `workflow_run:` both fire
+    only from `main`, so the cron and the alert go live at the first dev →
+    `main` promotion that carries them. Until then dev gets no automatic
+    release coverage except the promotion push itself; dispatch by hand with
+    `gh workflow run ci.yml --ref dev -f legs=release`. That works once the
+    `workflow_dispatch:` trigger itself is on `main`, which is unverified
+    before then. `gh workflow run release-legs-daily.yml` needs that file on
+    `main`. `-f legs=all` runs the full matrix on `dev` or `main`.
+  - **Dead-man.** Nothing detects a cron that never fires. If no
+    `release-legs-daily` run appears in the Actions tab for two days, check
+    that the workflow is enabled.
   - **Bisecting a red day.** A direct dispatch is accepted on `dev`/`main`
     only, and PR runs never build release, so CI cannot bisect it. Bisect
     locally instead: check out each candidate commit and build the release
@@ -1921,7 +1957,7 @@ time. (Push 2c later widened it to 4 on its own axis; box-wide that is
 
 Not starvation-proof: `with-test-slot.sh` has no FIFO or PR-aware
 admission — a freed slot goes to whichever waiter's 5s poll tick happens
-to fire next, not to whichever waiter arrived first. If 3 dev-push legs
+to fire next, not to whichever waiter arrived first. If 3 push or dispatch legs
 hold all 3 slots, a 4th job still waits the full 30 minutes, same as
 before. Raising the count reduces how often that happens; it does not
 eliminate it. Also unenforced: `nightly.yml`'s and `sanitizer-tests.yml`'s
@@ -2119,8 +2155,9 @@ step runs a similar set (it adds the server non-pg entries and drops docs) at 4
 behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported; the probe
 measurement above is still pending) and no per-runner memory limit is documented.
 This was measured on one leg (`gcc-15`/`debug`) but ships on all four: the
-clang-21 and release legs run only on a push (release: a `main` push or the
-Tier 2b dispatch), where up to four non-pg steps can overlap at four wide on the box, so the 10-push-run check above is the only
+clang-21 and release legs never run on a PR (clang-21 debug on any push; release
+on a `main` push or the Tier 2b dispatch), where up to four non-pg steps can
+overlap at four wide on the box, so the 10-push-run check above is the only
 coverage for them.
 
 *Samples (measured, 2026-10-24).* Two same-SHA np=4 samples on the PR #6436
@@ -2847,7 +2884,7 @@ value sets it itself.
 | Platform | pg shards | Migration-DDL tests | Notes |
 |---|---|---|---|
 | Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
-| Linux (other push legs) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
+| Linux (other legs: clang-21 debug on a push; release legs on a `main` push or Tier 2b dispatch) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
 | Windows (debug, every PR + push) | full (14 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
 | Windows (release, `main` push or Tier 2b dispatch) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR or `dev` push |
 | macOS | none (ADR-0035) | n/a | server is Linux-only |
@@ -3032,10 +3069,10 @@ per meson entry. Next to it, `scripts/ci/test-durations-summary.py` appends a
 "Test durations — <label>" block to the job summary after each
 `flake-retry.py` invocation in the Linux (three), Windows (two) and macOS (one)
 Test steps: every entry's wall seconds, meson timeout and share of it, then the
-25 slowest Catch2 cases (entry, case, seconds, runs). The push-only `Test (pg smoke)`
+25 slowest Catch2 cases (entry, case, seconds, runs). The non-PR `Test (pg smoke)`
 steps are deliberately not summarised: each runs one ~3 s entry. The case data is Catch2's
 own `--durations=yes`, now on every Catch2 entry except the two pinned exemptions
-(the push-only pg smoke entry and the `[tsan-heavy]` checkpoints entry; the `=`
+(the non-PR pg smoke entry and the `[tsan-heavy]` checkpoints entry; the `=`
 form is required: a space would add a positional
 `yes` that `check-pg-shard-partition.py` rejects as a second spec). It is
 parsed from `meson-logs/testlog.json`, which meson overwrites on every

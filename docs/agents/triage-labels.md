@@ -71,7 +71,7 @@ carries it, which makes agent inflow countable without any extra machinery.
 | `automation-broken` | close-on-merge alert job (PR 2) | The tracker automation itself failed; opened by the `if: failure()` alert job. |
 | `triage-sweep` | tracker report (PR 4) | Marks the rolling tracking issue the weekly report posts to. |
 | `nightly-broken` | nightly.yml | Nightly failed; no merge to `main` while open. |
-| `release-legs-broken` | ci.yml `release-legs-alert` (Tier 2b daily dispatch) | The daily release/LTO legs on `dev` failed; closed by the next green dispatch. No merge discipline attached. |
+| `release-legs-broken` | release-legs-alert.yml / release-legs-daily.yml (Tier 2b daily dispatch) | The daily release/LTO legs on `dev` failed, or their dispatcher did; closed by the next green dispatch. No merge discipline, but the release skill checks it before tagging. |
 | `runner-inventory-drift` | runner-inventory-sentinel.yml | Self-hosted runner drift detected. |
 
 `duplicate` and `invalid` are GitHub defaults applied by humans at close time.

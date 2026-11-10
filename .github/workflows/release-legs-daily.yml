@@ -14,28 +14,36 @@ name: Release legs (daily dispatch)
 # matrix, so every release candidate is built in release mode before it tags.
 #
 # It skips when dev's tip already has a ci.yml dispatch run (legs=release or
-# all) that succeeded or is still in flight, so a quiet day costs nothing. Two
-# known limits of that check, both accepted: a dispatch run counts as covered
-# even if a pool was unhealthy (that run fails preflight-gate, so it is not a
-# `success` and is retried); and the run checks out `refs/heads/dev` when its
-# jobs start, so if dev moves in between it builds a newer commit than the one
-# recorded here — the next day's check then sees an uncovered tip and runs.
+# all) that succeeded or is still in flight, so a quiet day costs nothing; a
+# failed or cancelled run does not count, so a red tip is retried the next day.
+# The covered check keys on the DISPATCHED commit. The legs check out the dev
+# branch when they start (not a pinned SHA: see ci.yml's trusted_inputs), so
+# if dev moves while they queue they build a later commit; each leg's
+# "Record built commit (dispatch)" step names the commit it really built.
 #
-# A red dispatch opens (or comments on) a `release-legs-broken` issue and the
-# next green one closes it — ci.yml's release-legs-alert / -close-on-green
-# jobs — because a run started by github-actions[bot] emails nobody.
+# Failure signal, because a run started by github-actions[bot] emails nobody:
+#   - a failing dispatched CI run opens (or comments on) a
+#     `release-legs-broken` issue, and the next green one closes it
+#     (release-legs-alert.yml, a workflow_run listener);
+#   - a failure of THIS workflow (gh API error, dispatch refused) opens the
+#     same issue from the `alert` job below.
+# A cron that never fires at all is not detected (no dead-man signal); the
+# Tier 2b runbook says how to check.
 #
-# LIVE ONLY FROM `main`: a `schedule:` trigger fires from the default branch
-# alone, so this cron starts at the first dev -> main promotion carrying this
-# file. Until then, run it by hand:
-#   gh workflow run release-legs-daily.yml --ref dev
-# or dispatch ci.yml directly:
+# LIVE ONLY FROM `main`: `schedule:` and `workflow_run:` triggers are read from
+# the default branch alone, and `gh workflow run <file>` needs the file there,
+# so this cron (and the alert listener) start at the first dev -> main
+# promotion carrying them. Until then, dispatch ci.yml directly:
 #   gh workflow run ci.yml --ref dev -f legs=release
+# (ci.yml is already on main; that works once the `workflow_dispatch:` trigger
+# itself has reached main too — unverified before this change merges).
 #
 # 02:30 UTC is NOMINAL: GitHub starts scheduled runs late under load (hours,
-# per codeql.yml's notes), so it can overlap the nightly/CodeQL window; a delay
-# cannot pull it back before Big Tam's 01:00 Postgres restart. The dispatched run lands in ci.yml's own `-dispatch` concurrency
-# group, so it never displaces a queued dev push run.
+# per codeql.yml's notes), so a run can overlap the nightly/CodeQL window, or
+# with a long queue even reach the next day's 01:00 Big Tam Postgres restart
+# (a false red, reported by the alert). The dispatched run lands in ci.yml's
+# own `-dispatch` concurrency group, so it never displaces a queued dev push
+# run.
 #
 # The dispatch uses GITHUB_TOKEN: a workflow_dispatch event is one of the two
 # events a GITHUB_TOKEN may create that DOES start a new run.
@@ -81,3 +89,35 @@ jobs:
           fi
           gh workflow run ci.yml -R "$REPO" --ref dev -f legs=release
           echo "Dispatched ci.yml legs=release on dev ($sha)." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Dispatcher failure → the same alert issue (gh API error, refused dispatch,
+  # a dev-side ci.yml that no longer accepts `legs`). Only open issues authored
+  # by github-actions[bot] are matched, never a PR or a hand-labelled issue.
+  alert:
+    name: "Open release-legs-broken on dispatcher failure"
+    needs: [dispatch]
+    if: ${{ failure() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write   # open/comment the release-legs-broken issue
+    steps:
+      - name: Open or update release-legs-broken issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          label=release-legs-broken
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            "The daily release-legs **dispatcher** failed, so no release-legs run was started on \`dev\` today: $RUN_URL" \
+            "This is a workflow or API problem, not a code regression. Triage: docs/ci-architecture.md, Tier 2b." \
+            "(auto-posted by .github/workflows/release-legs-daily.yml; closed by the next green release-legs dispatch.)")
+          first=$(gh issue list -R "$REPO" --label "$label" --state open \
+                    --author "app/github-actions" --json number --jq '.[0].number // empty')
+          if [[ -n "$first" ]]; then
+            gh issue comment "$first" -R "$REPO" --body "$body"
+          else
+            gh issue create -R "$REPO" --title "Release legs broken on dev: dispatcher failed" --label "$label" --body "$body"
+          fi

@@ -54,7 +54,15 @@ on:
   # workflow inherits its caller's `github.event_name` — and that caller is
   # itself a workflow_dispatch. The trusted-fork path is unchanged: it still
   # expands the full debug + release matrix. A direct dispatch is accepted on
-  # `dev` and `main` only; trusted_inputs refuses any other ref (see there).
+  # `dev` and `main` only (trusted_inputs refuses any other ref), and on it
+  # every job that carries a ruleset-required context name — Preflight
+  # (runner health), Proto backward-compat, and the Linux/Windows/macOS legs —
+  # gets a ` [dispatch]` name suffix, so a dispatch can never post, satisfy or
+  # shadow a required check (a SKIPPED required context counts as satisfied).
+  # ci.yml requests no permission beyond the trusted-fork caller's ceiling
+  # (contents/pull-requests/actions: read): a called workflow's jobs are
+  # permission-checked against the caller at load time, before any `if:`, so
+  # the dispatch failure alert lives in release-legs-alert.yml instead.
   workflow_dispatch:
     inputs:
       legs:
@@ -176,21 +184,20 @@ jobs:
           if [[ -z "$APPROVED_SHA" ]]; then
             # A DIRECT workflow_dispatch (no head_sha: not the trusted-fork
             # call) is accepted on `dev` and `main` only, and FAILS CLOSED on
-            # any other ref. A dispatch builds the bare branch head and posts
-            # the same job names the branch-protection ruleset requires
-            # ("Preflight (runner health)", "Linux gcc-15 debug", ...). On a
-            # same-repo PR branch that would let an Actions-write user put a
-            # green required context, computed from the head rather than the
-            # refs/pull/N/merge result the PR gate builds, onto the PR's head
-            # SHA with nothing reviewable in the diff (governance Gate 2,
-            # 2026-11-10). The daily release-legs dispatch targets dev, and a
-            # by-hand dispatch on main is the only other use this trigger has.
+            # any other ref. Defence in depth: the primary control is that on a
+            # direct dispatch every job carrying a ruleset-required context
+            # name is renamed with a ` [dispatch]` suffix, so a dispatch never
+            # posts (or shadows, with a red, green or SKIPPED run) a required
+            # check on any SHA — including the dev tip a dev->main promotion
+            # PR uses as its head (governance 2026-11-10). This guard keeps the
+            # trigger to the two refs it exists for: the daily release-legs
+            # dispatch on dev and a by-hand run on main.
             # Same github.event_name expression form as the two checks below; this
             # is already inside the not-a-trusted-call branch, so the event
             # name is safe to read here (the discriminator above is head_sha).
             if [[ "${{ github.event_name }}" == "workflow_dispatch" \
                   && "$GITHUB_REF" != "refs/heads/dev" && "$GITHUB_REF" != "refs/heads/main" ]]; then
-              echo "::error::ci.yml may be dispatched directly only on refs/heads/dev or refs/heads/main (got '$GITHUB_REF'). A dispatch posts the ruleset's required check names; on any other ref it could shadow a PR's merge-result checks. Open a PR, or use trusted-fork-ci.yml for a fork."
+              echo "::error::ci.yml may be dispatched directly only on refs/heads/dev or refs/heads/main (got '$GITHUB_REF'). Open a PR to run CI on a branch, or use trusted-fork-ci.yml for a fork."
               exit 1
             fi
             echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
@@ -542,7 +549,9 @@ jobs:
           --require-pool bigtam --require-pool weetam --require-pool bigmags
 
   preflight:
-    name: "Preflight (runner health)"
+    # ` [dispatch]` suffix on a direct dispatch: see the `workflow_dispatch:`
+    # trigger comment — no dispatch may post a ruleset-required context name.
+    name: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && 'Preflight (runner health) [dispatch]' || 'Preflight (runner health)' }}
     needs: [trusted_inputs, preflight-gate]
     # Always run, even when preflight-gate failed or trusted_inputs did not
     # succeed: the required-check name lives on THIS job, and a skipped
@@ -715,7 +724,7 @@ jobs:
 
   # ── Proto backward-compatibility ───────────────────────────────────────
   proto-compat:
-    name: "Proto backward-compat"
+    name: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && 'Proto backward-compat [dispatch]' || 'Proto backward-compat' }}
     needs: [preflight-gate]
     # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
     # (yuzu-bigtam-*). Fail-closed `== 'true'`.
@@ -750,7 +759,7 @@ jobs:
 
   # ── Linux (GCC + Clang, self-hosted yuzu-bigtam-linux) ────────────────
   linux:
-    name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+    name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && ' [dispatch]' || '' }}"
     needs: [preflight-gate]
     # Pinned to the Big Tam sub-pool: the GCC 15 / Clang 21 toolchain is
     # 26.04-only (the retired Shulgi runners were 24.04), so gate on
@@ -904,6 +913,23 @@ jobs:
           # runner-reset.sh.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      # Direct dispatch only: a dispatched run's legs check out the BRANCH
+      # (refs/heads/dev), not github.sha — pinning a SHA would detach HEAD and
+      # disarm the branch-switch wipe sentinel (trusted_inputs comment). Legs
+      # queue for a while, so dev can move first. Record the commit actually
+      # built, and warn when it is not the dispatched one, so an alert or a
+      # bisect starts from the right commit (governance UP-1, 2026-11-10).
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Built commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: this leg built $built, not the dispatched $DISPATCHED_SHA"
+          fi
 
       - name: Isolate trusted-fork build caches
         if: needs.preflight-gate.outputs.trusted_execution == 'true'
@@ -1344,7 +1370,7 @@ jobs:
         if: matrix.pg_mode == 'full'
         # #3443 Phase 2: this step now runs ONLY on the leg(s) whose pg_mode
         # resolved to 'full' (today: gcc-15/debug, every PR and its matching
-        # push leg) — the other 3 push legs run 'Test (pg smoke)' below
+        # push leg) — every other leg runs 'Test (pg smoke)' below
         # instead. Everything from here down is the pre-Phase-2 concurrency-
         # tuning history for THIS invocation (with-test-slot.sh, --num-
         # processes, shard timeouts) — unchanged by Phase 2, kept in full.
@@ -1560,7 +1586,7 @@ jobs:
         # NOT starvation-proof: this script has no FIFO or PR-aware admission
         # — a freed slot goes to whichever waiter's 5s poll tick (see
         # scripts/ci/with-test-slot.sh) happens to fire next, not to
-        # whichever waiter arrived first. If 3 dev-push legs hold all 3
+        # whichever waiter arrived first. If 3 push/dispatch legs hold all 3
         # slots, a 4th job (a PR's or otherwise) still waits the full 30
         # minutes, same as before. Raising the count reduces how OFTEN that
         # happens, it doesn't eliminate it. Also unenforced: nightly.yml's
@@ -1847,7 +1873,7 @@ jobs:
 
   # ── Windows (MSVC, self-hosted Wee Tam pool) ────────────────────────────
   windows:
-    name: "Windows MSVC ${{ matrix.build_type }}"
+    name: "Windows MSVC ${{ matrix.build_type }}${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && ' [dispatch]' || '' }}"
     needs: [preflight-gate]
     # Skip if the exact Wee Tam job pool is unhealthy/empty. Fail-closed
     # `== 'true'`; the generic Shulgi testbed label cannot satisfy this job.
@@ -1945,6 +1971,23 @@ jobs:
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      # Direct dispatch only: a dispatched run's legs check out the BRANCH
+      # (refs/heads/dev), not github.sha — pinning a SHA would detach HEAD and
+      # disarm the branch-switch wipe sentinel (trusted_inputs comment). Legs
+      # queue for a while, so dev can move first. Record the commit actually
+      # built, and warn when it is not the dispatched one, so an alert or a
+      # bisect starts from the right commit (governance UP-1, 2026-11-10).
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Built commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: this leg built $built, not the dispatched $DISPATCHED_SHA"
+          fi
 
       - name: Isolate trusted-fork build caches
         if: needs.preflight-gate.outputs.trusted_execution == 'true'
@@ -2535,7 +2578,7 @@ jobs:
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
-    name: "macOS ${{ matrix.build_type }}"
+    name: "macOS ${{ matrix.build_type }}${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && ' [dispatch]' || '' }}"
     needs: [preflight-gate]
     # Pinned to the BigMags macOS pool: the Apple-Silicon toolchain exists only
     # on the BigMags Mac Minis; no GitHub-hosted or Shulgi fallback can satisfy
@@ -2571,6 +2614,23 @@ jobs:
           # ported to macOS (cross-run incrementality is deferred). See the
           # vcpkg-section comment below and docs/ci-architecture.md.
           persist-credentials: false
+
+      # Direct dispatch only: a dispatched run's legs check out the BRANCH
+      # (refs/heads/dev), not github.sha — pinning a SHA would detach HEAD and
+      # disarm the branch-switch wipe sentinel (trusted_inputs comment). Legs
+      # queue for a while, so dev can move first. Record the commit actually
+      # built, and warn when it is not the dispatched one, so an alert or a
+      # bisect starts from the right commit (governance UP-1, 2026-11-10).
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Built commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: this leg built $built, not the dispatched $DISPATCHED_SHA"
+          fi
 
       - name: Isolate trusted-fork build caches
         if: needs.preflight-gate.outputs.trusted_execution == 'true'
@@ -3481,142 +3541,3 @@ jobs:
         with:
           path: ~/.cache/ccache
           key: ${{ steps.cache-ccache-canary.outputs.cache-primary-key }}
-
-  # ── Daily release-legs dispatch: failure signal ─────────────────────────
-  # The daily dispatch (release-legs-daily.yml) runs as github-actions[bot],
-  # so a red run notifies nobody — unlike a red release leg on a dev push,
-  # which emailed the pusher. These two jobs restore the signal with the
-  # nightly-broken pattern (nightly.yml `alert:` / `close-on-green:`): open or
-  # comment on a `release-legs-broken` issue when the dispatch fails, close it
-  # when a later dispatch is green. Unlike nightly-broken it carries no merge
-  # discipline of its own; it exists so a release-only regression is seen
-  # within a day. Direct dispatches only (`!inputs.head_sha` excludes the
-  # trusted-fork call, which inherits workflow_dispatch as its event name).
-  # `!cancelled()` keeps an operator's whole-run cancel from opening an issue;
-  # a job that ended cancelled while the run went on (a timeout or a lost
-  # runner) still counts, as in nightly.yml. preflight-gate is in `needs` so
-  # an unhealthy runner pool, which fails it and skips every leg, also alerts.
-  release-legs-alert:
-    name: "Open release-legs-broken on failure"
-    needs: [preflight-gate, linux, windows, macos]
-    # The ref clause keeps a dispatch REFUSED by trusted_inputs (any ref but
-    # dev/main; it fails, so failure() is true) from opening an alert.
-    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && !inputs.head_sha && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && (failure() || contains(needs.*.result, 'cancelled')) }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      issues: write  # open/comment the release-legs-broken alert issue
-    steps:
-      - name: Open or update release-legs-broken issue
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          REF_NAME: ${{ github.ref_name }}
-          NEEDS_JSON: ${{ toJSON(needs) }}
-          LEGS: ${{ inputs.legs }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SHA: ${{ github.sha }}
-        with:
-          script: |
-            const label = 'release-legs-broken';
-            const failedJobs = [];
-            const ctx = JSON.parse(process.env.NEEDS_JSON);
-            for (const [name, job] of Object.entries(ctx)) {
-              if (job.result === 'failure') failedJobs.push(name);
-              else if (job.result === 'cancelled') failedJobs.push(`${name} (timed out/cancelled)`);
-            }
-            const summary = failedJobs.length
-              ? failedJobs.join(', ')
-              : 'unknown (alert fired without specific job failures)';
-            const body = [
-              `Release-legs dispatch (\`legs=${process.env.LEGS}\`) failed on \`${process.env.REF_NAME}\` @ \`${process.env.SHA.substring(0, 7)}\`.`,
-              ``,
-              `**Failed jobs:** ${summary}`,
-              ``,
-              `**Run:** ${process.env.RUN_URL}`,
-              ``,
-              `A release-only regression landed on dev since the last green dispatch. Bisect recipe: docs/ci-architecture.md, Tier 2b.`,
-              ``,
-              `(auto-posted by .github/workflows/ci.yml — closed automatically by the next green dispatch.)`,
-            ].join('\n');
-            const existing = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              labels: label,
-              state: 'open',
-              per_page: 5,
-            });
-            if (existing.data.length > 0) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existing.data[0].number,
-                body,
-              });
-              core.notice(`Commented on existing release-legs-broken issue #${existing.data[0].number}`);
-            } else {
-              const created = await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title: `Release legs broken on ${process.env.REF_NAME}: ${summary}`,
-                labels: [label],
-                body,
-              });
-              core.notice(`Opened release-legs-broken issue #${created.data.number}`);
-            }
-
-  # Symmetric counterpart: a fully green direct dispatch closes every open
-  # release-legs-broken issue. `success()` with these needs means every leg job
-  # ran and passed — a leg skipped by an unhealthy pool keeps the job skipped,
-  # so a run that built nothing in release never closes the alert.
-  release-legs-close-on-green:
-    name: "Close release-legs-broken on green"
-    needs: [preflight-gate, linux, windows, macos]
-    if: ${{ success() && github.event_name == 'workflow_dispatch' && !inputs.head_sha && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      issues: write  # comment on and close the release-legs-broken alert issue
-    steps:
-      - name: Close any open release-legs-broken issue
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          REF_NAME: ${{ github.ref_name }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          SHA: ${{ github.sha }}
-        with:
-          script: |
-            const label = 'release-legs-broken';
-            const body = [
-              `Release-legs dispatch on \`${process.env.REF_NAME}\` @ \`${process.env.SHA.substring(0, 7)}\` is **green**.`,
-              ``,
-              `**Run:** ${process.env.RUN_URL}`,
-              ``,
-              `(auto-closed by .github/workflows/ci.yml — re-opened by the alert job if a later dispatch fails.)`,
-            ].join('\n');
-            const open = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              labels: label,
-              state: 'open',
-              per_page: 100,
-            });
-            if (open.data.length === 0) {
-              core.notice('No open release-legs-broken issues to close.');
-              return;
-            }
-            for (const issue of open.data) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                body,
-              });
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                state: 'closed',
-                state_reason: 'completed',
-              });
-              core.notice(`Closed release-legs-broken issue #${issue.number}`);
-            }
