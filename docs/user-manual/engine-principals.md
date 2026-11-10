@@ -63,6 +63,12 @@ still opens for effective administrators only. The panel differs from the REST r
 listed once in [upgrading](upgrading.md) (the "Breaking: the Settings Engine
 Principals panel" section); none admits a caller the route refuses.
 
+When the audit record of a roster read could not be saved, the list is still shown and a note
+above it says "An audit record for this read could not be saved. The data shown is still
+current." The note stays until the page is reloaded. It is the same sentence the Access page
+shows for the same condition, and it appears only after a successful read: a refused read shows
+the permission note instead.
+
 A revoked row's **Detail (earliest retained record)** cell is the audit trail's text
 for that principal, shown to a caller who also holds `AuditLog:Read`. It is
 best-effort: the oldest committed revoke record the panel's read of the newest 200

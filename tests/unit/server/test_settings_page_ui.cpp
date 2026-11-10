@@ -17,6 +17,10 @@
 // Page HTML constant (its own TU at global scope, like kVizFleetPageHtml).
 extern const char* const kSettingsHtml;
 
+namespace yuzu::server {
+extern const std::string kYuzuTokensJs; // the AUDIT_FAILED sentence's home (#6749)
+}
+
 namespace {
 
 struct Panel {
@@ -166,4 +170,60 @@ TEST_CASE("Settings page tells a caller the Engine Principals panel refused why,
     // No element on the page carries an hx-on attribute (CSP has no 'unsafe-eval'; htmx compiles
     // hx-on:* with new Function() and the handler silently does nothing). Comments may name it.
     CHECK_FALSE(std::regex_search(html, std::regex{R"(<[a-zA-Z][^<>]*\shx-on[:\-])"}));
+}
+
+TEST_CASE("Settings page says so, once, when the Engine Principals roster read's audit row was not "
+          "saved (#6749)",
+          "[settings][settings_page][engine_principal]") {
+    // The roster read answers 200 with `Sec-Audit-Failed: true` when its audit write failed: the
+    // data is current, the evidence is missing. A body listener shows the same sentence the
+    // Access page shows. CSP-safe: no hx-on, no eval, text only.
+    const std::string html = kSettingsHtml;
+    constexpr std::string_view kSentence =
+        "An audit record for this read could not be saved. The data shown is still current.";
+
+    // The notice target is a sibling placed BEFORE the refreshing section and after the reveal
+    // element, so neither the section's innerHTML swap nor the reveal's content touches it.
+    const std::string target = "<div id=\"engine-principals-notices\"></div>";
+    REQUIRE(count_of(html, target) == 1);
+    const auto reveal = html.find("<div id=\"engine-principal-reveal\"></div>");
+    const auto notices = html.find(target);
+    const auto section = html.find("<div id=\"engine-principals-section\"");
+    REQUIRE(reveal != std::string::npos);
+    REQUIRE(section != std::string::npos);
+    CHECK(reveal < notices);
+    CHECK(notices < section);
+
+    // Keyed on the REQUEST PATH (the section is the only requester of it), not on an element id,
+    // and only on a 200: a 403 never claims "the data shown is still current".
+    CHECK(count_of(html, "d.pathInfo.requestPath") == 1);
+    CHECK(count_of(html, "d.pathInfo.requestPath !== '/fragments/settings/engine-principals'") == 1);
+
+    // The listener's slice: from its addEventListener to its own close.
+    const auto at = html.find("document.getElementById('engine-principals-notices')");
+    REQUIRE(at != std::string::npos);
+    const auto start = html.rfind("addEventListener('htmx:afterRequest'", at);
+    REQUIRE(start != std::string::npos);
+    const auto end = html.find("\n    });", at);
+    REQUIRE(end != std::string::npos);
+    const auto body = html.substr(start, end - start);
+    CHECK(count_of(body, "x.status !== 200") == 1);
+    CHECK(count_of(body, "getResponseHeader('Sec-Audit-Failed') !== 'true'") == 1);
+    CHECK(count_of(body, "notices.firstChild") == 1); // insert-once: repeated failures, one note
+    CHECK(count_of(body, "className = 'failbox'") == 1);
+    CHECK(count_of(body, "setAttribute('role', 'alert')") == 1);
+    CHECK(count_of(body, "box.textContent = ") == 1);
+    // Text only; never markup, never the secret-reveal element, never eval.
+    CHECK(count_of(body, "innerHTML") == 0);
+    CHECK(count_of(body, "engine-principal-reveal") == 0);
+    CHECK(count_of(body, "hx-on") == 0);
+    CHECK(count_of(body, "new Function") == 0);
+    CHECK(count_of(body, "eval(") == 0);
+    // getElementById is how the notices div is found (insert-once needs the lookup).
+    CHECK(count_of(body, "getElementById('engine-principals-notices')") == 1);
+
+    // The sentence is the Access page's AUDIT_FAILED, byte for byte (a hand copy, pinned).
+    CHECK(count_of(body, std::string("'") + std::string(kSentence) + "'") == 1);
+    CHECK(count_of(yuzu::server::kYuzuTokensJs,
+                   std::string("var AUDIT_FAILED = '") + std::string(kSentence) + "';") == 1);
 }
