@@ -1940,6 +1940,7 @@ if build_server
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_software_catalogue.cpp',   # GET /api/v1/inventory/software/catalogue[/versions]
+      'unit/server/test_rest_software_components.cpp',  # GET /api/v1/inventory/software/components (SAM-17)
       'unit/server/test_rest_software_curation.cpp',    # software normalisation curation REST routes
       'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
@@ -2037,6 +2038,7 @@ if build_server
       'unit/server/test_purl_compose.cpp',               # pure purl composer (purl-spec vectors)
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
+      'unit/server/test_software_list_model.cpp',        # pure SAM-17 lookup list model (totals, status, range)
       'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
       'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
       'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
@@ -4762,6 +4764,14 @@ test('forensics tier wiring lexical',
 test('collection settings wiring lexical',
   _python3_test,
   args: [files('test_collection_settings_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# SAM-17: the software lookup routes' hostname roster must be handed to RestApiV1 before
+# register_routes(); an unset function leaves every hostname null with no other signal.
+test('software lookup wiring lexical',
+  _python3_test,
+  args: [files('test_software_lookup_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

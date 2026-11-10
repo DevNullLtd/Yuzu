@@ -850,6 +850,7 @@ yuzu_server_core_lib = static_library(
     'src/software_normalization_job.cpp',
     'src/software_title_dimension.cpp',
     'src/software_catalogue_model.cpp',
+    'src/software_list_model.cpp',
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
