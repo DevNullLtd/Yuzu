@@ -44,6 +44,35 @@ on:
     # a docs-only PR skips them, and a *skipped* required check is satisfied
     # whereas an *absent* one is not. The `push:` trigger above now does the
     # same (#5320).
+  # Release-leg schedule (docs/ci-architecture.md, Tier 2b). A push to `dev` no longer
+  # builds the release/LTO legs (see the matrix excludes below); they run
+  # instead from a daily dispatch, `release-legs-daily.yml`, against dev's
+  # tip, and on every push to `main` (release promotion) as before. The input
+  # picks which build_type legs a direct dispatch expands to. A dispatch is
+  # told apart from the trusted-fork `workflow_call` path by `inputs.head_sha`
+  # (empty here, always set by trusted-fork-ci.yml), because a reusable
+  # workflow inherits its caller's `github.event_name` — and that caller is
+  # itself a workflow_dispatch. The trusted-fork path is unchanged: it still
+  # expands the full debug + release matrix. A direct dispatch is accepted on
+  # `dev` and `main` only (trusted_inputs refuses any other ref), and on it
+  # the jobs that carry a ruleset-required context name are handled so a
+  # dispatch never posts a SKIPPED (= satisfied) required check. Preflight
+  # (runner health) and the Linux/Windows/macOS legs get a ` [dispatch]` name
+  # suffix. Proto backward-compat keeps its literal name (a skipped job's name
+  # expression is not evaluated) and is never skipped on a dispatch: it posts
+  # its real result or a fail-closed red — see that job.
+  # ci.yml requests no permission beyond the trusted-fork caller's ceiling
+  # (contents/pull-requests/actions: read): a called workflow's jobs are
+  # permission-checked against the caller at load time, before any `if:`, so
+  # the dispatch failure alert lives in release-legs-alert.yml instead.
+  workflow_dispatch:
+    inputs:
+      legs:
+        description: "Which build_type legs to run: 'release' (release/LTO legs only, the scheduled default) or 'all'"
+        required: false
+        default: release
+        type: choice
+        options: [release, all]
   workflow_call:
     inputs:
       pr_number:
@@ -70,7 +99,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # The `-dispatch` suffix keeps a scheduled release-legs dispatch on dev
+  # (release-legs-daily.yml) out of the dev PUSH group. GitHub keeps at most
+  # one PENDING run per group and a newer one replaces it, so sharing the group
+  # would let a dispatch evict a queued push run — that push commit would then
+  # carry no required contexts, and the next push's codegate (which needs the
+  # predecessor's push run to have succeeded) would build unconditionally.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'workflow_dispatch' && !inputs.head_sha && '-dispatch' || '' }}
   # PRs cancel-in-progress (rapid iteration — every push obsoletes the last).
   # Pushes to dev / main do NOT cancel — they queue. Mid-flight pushes were
   # killing 10+ min of compile work on rapid landings, and the
@@ -149,6 +184,24 @@ jobs:
           # inputs.head_sha — which only the trusted wrapper supplies — is the
           # call-boundary discriminator. Do not use github.event_name here.
           if [[ -z "$APPROVED_SHA" ]]; then
+            # A DIRECT workflow_dispatch (no head_sha: not the trusted-fork
+            # call) is accepted on `dev` and `main` only, and FAILS CLOSED on
+            # any other ref. Defence in depth: the primary control is that on a
+            # direct dispatch every job carrying a ruleset-required context
+            # name is renamed with a ` [dispatch]` suffix or (proto-compat)
+            # never skipped, so a dispatch never posts a misleading required
+            # check on any SHA — including the dev tip a dev->main promotion
+            # PR uses as its head (governance 2026-11-10). This guard keeps the
+            # trigger to the two refs it exists for: the daily release-legs
+            # dispatch on dev and a by-hand run on main.
+            # Same github.event_name expression form as the two checks below; this
+            # is already inside the not-a-trusted-call branch, so the event
+            # name is safe to read here (the discriminator above is head_sha).
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" \
+                  && "$GITHUB_REF" != "refs/heads/dev" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "::error::ci.yml may be dispatched directly only on refs/heads/dev or refs/heads/main (got '$GITHUB_REF'). Open a PR to run CI on a branch, or use trusted-fork-ci.yml for a fork."
+              exit 1
+            fi
             echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
             # PIN the checkout to the event's own commit, exactly as the trusted
             # path below does with $head_sha. NOT ${GITHUB_REF}: on a
@@ -498,7 +551,9 @@ jobs:
           --require-pool bigtam --require-pool weetam --require-pool bigmags
 
   preflight:
-    name: "Preflight (runner health)"
+    # ` [dispatch]` suffix on a direct dispatch: see the `workflow_dispatch:`
+    # trigger comment — no dispatch may post a ruleset-required context name.
+    name: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && 'Preflight (runner health) [dispatch]' || 'Preflight (runner health)' }}
     needs: [trusted_inputs, preflight-gate]
     # Always run, even when preflight-gate failed or trusted_inputs did not
     # succeed: the required-check name lives on THIS job, and a skipped
@@ -582,6 +637,7 @@ jobs:
           python3 scripts/ci/test_runner_health_check.py
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
+          bash tests/shell/test_release_legs_issue.sh         # release-legs-broken open/comment/close decision (Tier 2b)
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
@@ -671,16 +727,54 @@ jobs:
 
   # ── Proto backward-compatibility ───────────────────────────────────────
   proto-compat:
+    # LITERAL name, unlike the other required-context jobs: this job is
+    # routinely SKIPPED (docs-only PRs, #1978), and GitHub does not evaluate a
+    # skipped job's `name:` expression — it would post the raw template and the
+    # required "Proto backward-compat" context would be absent on every
+    # docs-only PR (github.com/orgs/community/discussions/13261). So on a
+    # direct dispatch this job is never skipped instead: it RUNS the real
+    # `buf breaking` check on the branch it checks out (dev, or main on a
+    # by-hand dispatch; the same thing
+    # every dev push posts; if dev moved since the dispatch, its "Record built
+    # commit" step names the commit actually checked), or, when preflight-gate
+    # did not succeed or the
+    # Linux pool reads unhealthy, FAILS red on a hosted runner (a real red
+    # "Proto backward-compat" on that commit: fail-closed, re-run once the
+    # infrastructure is back). A dispatch can therefore never post a SKIPPED
+    # (= satisfied) "Proto backward-compat" (governance 2026-11-10).
     name: "Proto backward-compat"
     needs: [preflight-gate]
     # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
     # (yuzu-bigtam-*). Fail-closed `== 'true'`.
     # `&& code_changed` (issue #1978): a docs-only PR skips this required job
     # (skipped == satisfied), so it no longer blocks the merge on an absent check.
-    if: needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true'
-    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
+    # The explicit success() keeps the non-dispatch arm exactly as before: the
+    # status function in the dispatch arm would otherwise drop the implicit one.
+    # The dispatch arm is `always()`, not `!cancelled()`: a dispatch cancelled
+    # while preflight runs must still not leave a SKIPPED literal required
+    # context; with the gate cancelled it takes the hosted fail-closed arm
+    # (ends red). If the run is cancelled while this job runs, its final
+    # check step (`always() && cancelled()`, just before the trusted-fork
+    # purge) fails it red, so no cancel path can end it
+    # green-without-checking; a force-cancel ends it `cancelled`, which never
+    # satisfies a required check.
+    if: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && always()) || (success() && needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true') }}
+    # The pool clause is defence in depth: today a successful gate implies the
+    # Big Tam (= Linux) pool is healthy (--require-pool bigtam), so it only
+    # matters if that coupling ever changes. A pool that dies AFTER the probe
+    # still leaves this job queued on the self-hosted label.
+    runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')) && 'ubuntu-24.04' || fromJSON('["self-hosted","Linux","X64","yuzu-bigtam-linux"]') }}
     timeout-minutes: 5
     steps:
+      - name: Fail closed when preflight-gate did not succeed (dispatch)
+        # always(): never skipped by an implicit success() after a run cancel.
+        if: always() && (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')
+        env:
+          GATE_RESULT: ${{ needs.preflight-gate.result }}
+          LINUX_POOL: ${{ needs.preflight-gate.outputs.linux_pool_healthy }}
+        run: |
+          echo "::error::preflight-gate result '$GATE_RESULT', Linux pool healthy '$LINUX_POOL' on a direct dispatch — failing closed rather than posting a skipped (= satisfied) Proto backward-compat"
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ needs.preflight-gate.outputs.checkout_repository }}
@@ -690,6 +784,18 @@ jobs:
           # A trusted fork never reuses a prior self-hosted workspace.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+      # Direct dispatch only: proto-compat checks out the dev BRANCH, which may
+      # have moved since the dispatch; record the commit actually checked.
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Checked commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: proto-compat checked $built, not the dispatched $DISPATCHED_SHA"
+          fi
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           version: "1.50.0"
@@ -697,6 +803,17 @@ jobs:
         run: buf lint proto
       - name: Check backward compatibility
         run: buf breaking proto --against '.git#subdir=proto,ref=origin/main'
+
+      # Direct dispatch only: if the run was cancelled at any point, end RED
+      # whatever happened above. Whether GitHub runs or skips implicit-success()
+      # steps after a run cancel must not decide this: a skipped lint/breaking
+      # with no failed step would otherwise conclude this job green without
+      # checking anything, on a literal required context.
+      - name: Fail closed if the dispatch was cancelled
+        if: always() && (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && cancelled()
+        run: |
+          echo "::error::the dispatch was cancelled — failing closed rather than posting an unchecked Proto backward-compat"
+          exit 1
 
       - name: Purge trusted-fork workspace
         if: ${{ always() && needs.preflight-gate.outputs.trusted_execution == 'true' }}
@@ -706,7 +823,7 @@ jobs:
 
   # ── Linux (GCC + Clang, self-hosted yuzu-bigtam-linux) ────────────────
   linux:
-    name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+    name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && ' [dispatch]' || '' }}"
     needs: [preflight-gate]
     # Pinned to the Big Tam sub-pool: the GCC 15 / Clang 21 toolchain is
     # 26.04-only (the retired Shulgi runners were 24.04), so gate on
@@ -748,10 +865,13 @@ jobs:
     strategy:
       fail-fast: false
       # max-parallel: 4 (raised from 3 on 2026-10-21, owner's call) — Big Tam has
-      # exactly 4 yuzu-bigtam-linux runner agents on one box, so a `dev`/`main`
-      # push's whole 2x2 matrix now runs in one wave instead of two, which cuts
-      # the push's wall time. The price: that push claims all 4 runners at once,
-      # so a concurrently-queued PR's single Linux leg waits at the
+      # exactly 4 yuzu-bigtam-linux runner agents on one box, so a `main` push's
+      # (or a `legs=all` dispatch's) whole 2x2 matrix runs in one wave instead of
+      # two; a `dev` push expands to the 2 debug legs only, and the daily
+      # release-legs dispatch to the 2 release legs only. Running a whole
+      # matrix in one wave cuts the push's wall time. The price: that push
+      # claims all 4 runners at once, so a concurrently-queued PR's single
+      # Linux leg waits at the
       # RUNNER-ACQUISITION level — below with-test-slot.sh, which only gates
       # contention *inside* a job that already has a runner (docs/ci-architecture.md
       # "Cross-job"). That is the case the former cap of 3 was added for: with all 4
@@ -769,8 +889,15 @@ jobs:
         compiler: [gcc-15, clang-21]
         build_type: [debug, release]
         exclude:
-          # PRs: only gcc-15 debug (fast feedback)
-          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          # PRs: only gcc-15 debug (fast feedback).
+          # Release/LTO legs: not on a PR and not on a push to dev; they run on a
+          # push to main and from the daily dispatch (release-legs-daily.yml).
+          # A direct dispatch with legs=release (the default) drops the debug
+          # legs, which every dev push normally already ran. The two build_type
+          # excludes are repeated in the windows and macos matrices below —
+          # keep all three in lockstep.
+          - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
+          - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-21' || 'NONE' }}
         # pg_mode (#3443 Phase 2) is a DERIVED per-leg key via include:, never a
         # third axis (2x matrix, breaks max-parallel's 4-runner arithmetic) and
@@ -787,9 +914,11 @@ jobs:
         # then the gcc-15/debug override to full. On a PR the exclude above has
         # already trimmed the matrix to the single gcc-15/debug leg, so both
         # include entries match that one leg and the net result is pg_mode=full
-        # — PR coverage is unaffected. On a push, gcc-15/debug ends up full and
-        # the other three legs (clang-21/debug, gcc-15/release, clang-21/release)
-        # stay smoke. Item 4 of the original plan (a periodic full clang-release
+        # — PR coverage is unaffected. Wherever gcc-15/debug expands, it ends up
+        # full and the other three legs (clang-21/debug, gcc-15/release,
+        # clang-21/release) stay smoke; a dev push now expands only the two debug
+        # legs, the release legs come from main pushes and the daily dispatch.
+        # Item 4 of the original plan (a periodic full clang-release
         # PG run to cover the optimizer/NDEBUG-sensitive residual smoke can't
         # reach) is deliberately DEFERRED — Phase 6A (the nightly slot-gate
         # narrowing this would need to join) is shelved and nightly.yml only
@@ -797,11 +926,16 @@ jobs:
         # now; landing an ungated periodic leg would reintroduce exactly the
         # uncoordinated-contention problem Phase 6A exists to close. Tracked on
         # #3443, not silently dropped.
-        include:
-          - pg_mode: smoke
-          - compiler: gcc-15
-            build_type: debug
-            pg_mode: full
+        #
+        # The include list is CONDITIONAL. GitHub applies include: after
+        # exclude:, and an include entry that matches no surviving combination
+        # is ADDED as a new one — so on a `legs=release` dispatch, where the
+        # exclude above has removed both debug legs, a static gcc-15/debug entry
+        # would silently add the most expensive leg (full PG shards) back. On
+        # that dispatch the list is just the smoke default; everywhere else it
+        # is the two entries described above. The Resolve-pg_mode step asserts
+        # that a `legs=release` dispatch never expands a debug leg.
+        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && '[{"pg_mode":"smoke"}]' || '[{"pg_mode":"smoke"},{"compiler":"gcc-15","build_type":"debug","pg_mode":"full"}]') }}
 
     steps:
       # PR-5 of the CI overhaul plan: normal CI keeps clean:false to preserve
@@ -843,6 +977,23 @@ jobs:
           # runner-reset.sh.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      # Direct dispatch only: a dispatched run's legs check out the BRANCH
+      # (refs/heads/dev), not github.sha — pinning a SHA would detach HEAD and
+      # disarm the branch-switch wipe sentinel (trusted_inputs comment). Legs
+      # queue for a while, so dev can move first. Record the commit actually
+      # built, and warn when it is not the dispatched one, so an alert or a
+      # bisect starts from the right commit (governance UP-1, 2026-11-10).
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Built commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: this leg built $built, not the dispatched $DISPATCHED_SHA"
+          fi
 
       - name: Isolate trusted-fork build caches
         if: needs.preflight-gate.outputs.trusted_execution == 'true'
@@ -1120,6 +1271,7 @@ jobs:
           PG_MODE: ${{ matrix.pg_mode }}
           MATRIX_COMPILER: ${{ matrix.compiler }}
           MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
+          DISPATCH_RELEASE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'true' || 'false' }}
         run: |
           case "$PG_MODE" in
             full|smoke) ;;
@@ -1143,8 +1295,16 @@ jobs:
           # 4-leg PG-shard contention this change exists to fix silently
           # returns. GITHUB_EVENT_NAME is one of GitHub Actions' own default
           # step env vars, set on every run - no extra wiring needed.
-          if [[ "$GITHUB_EVENT_NAME" == "push" && ! ( "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" ) && "$PG_MODE" != "smoke" ]]; then
-            echo "::error::$MATRIX_COMPILER/$MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces the 4-leg full-PG-shard contention #3443 Phase 2 exists to fix"
+          # Since the daily release-legs dispatch (release-legs-daily.yml) the
+          # release legs mostly run from a workflow_dispatch, so the guard
+          # covers that event too; and a `legs=release` dispatch must never
+          # expand a debug leg at all (the conditional include: above).
+          if [[ "$DISPATCH_RELEASE_ONLY" == "true" && "$MATRIX_BUILD_TYPE" == "debug" ]]; then
+            echo "::error::$MATRIX_COMPILER/debug expanded on a legs=release dispatch — the conditional matrix include: is broken; this re-runs a debug leg the dispatch exists to skip"
+            exit 1
+          fi
+          if [[ ( "$GITHUB_EVENT_NAME" == "push" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ) && ! ( "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" ) && "$PG_MODE" != "smoke" ]]; then
+            echo "::error::$MATRIX_COMPILER/$MATRIX_BUILD_TYPE on a $GITHUB_EVENT_NAME resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces the 4-leg full-PG-shard contention #3443 Phase 2 exists to fix"
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
@@ -1274,7 +1434,7 @@ jobs:
         if: matrix.pg_mode == 'full'
         # #3443 Phase 2: this step now runs ONLY on the leg(s) whose pg_mode
         # resolved to 'full' (today: gcc-15/debug, every PR and its matching
-        # push leg) — the other 3 push legs run 'Test (pg smoke)' below
+        # push leg) — every other leg runs 'Test (pg smoke)' below
         # instead. Everything from here down is the pre-Phase-2 concurrency-
         # tuning history for THIS invocation (with-test-slot.sh, --num-
         # processes, shard timeouts) — unchanged by Phase 2, kept in full.
@@ -1490,7 +1650,7 @@ jobs:
         # NOT starvation-proof: this script has no FIFO or PR-aware admission
         # — a freed slot goes to whichever waiter's 5s poll tick (see
         # scripts/ci/with-test-slot.sh) happens to fire next, not to
-        # whichever waiter arrived first. If 3 dev-push legs hold all 3
+        # whichever waiter arrived first. If 3 push/dispatch legs hold all 3
         # slots, a 4th job (a PR's or otherwise) still waits the full 30
         # minutes, same as before. Raising the count reduces how OFTEN that
         # happens, it doesn't eliminate it. Also unenforced: nightly.yml's
@@ -1777,7 +1937,7 @@ jobs:
 
   # ── Windows (MSVC, self-hosted Wee Tam pool) ────────────────────────────
   windows:
-    name: "Windows MSVC ${{ matrix.build_type }}"
+    name: "Windows MSVC ${{ matrix.build_type }}${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && ' [dispatch]' || '' }}"
     needs: [preflight-gate]
     # Skip if the exact Wee Tam job pool is unhealthy/empty. Fail-closed
     # `== 'true'`; the generic Shulgi testbed label cannot satisfy this job.
@@ -1811,7 +1971,10 @@ jobs:
       matrix:
         build_type: [debug, release]
         exclude:
-          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          # Release legs: push to main + daily dispatch only (see the linux
+          # matrix for the full rule; keep the three matrices in lockstep).
+          - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
+          - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
         # pg_mode mirrors the Linux job's own matrix shape (#3443): an
         # include:-derived key, never a real axis (would double this
         # matrix and break the runner-pool arithmetic) and never in
@@ -1819,12 +1982,12 @@ jobs:
         # docs-required-checks). debug keeps full pg-shard coverage on
         # every PR and push (PRs are debug-only via the exclude: above, so
         # PR coverage is unchanged by this); release runs the pg smoke
-        # subset on a push instead (the only event that builds release on
-        # Windows).
-        include:
-          - pg_mode: smoke
-          - build_type: debug
-            pg_mode: full
+        # subset instead, on a push to main or the daily release-legs
+        # dispatch (the only events that build release on Windows).
+        # Conditional for the same reason as the linux include (a static
+        # debug entry would re-add the excluded debug leg on a `legs=release`
+        # dispatch); keep the two in lockstep.
+        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && '[{"pg_mode":"smoke"}]' || '[{"pg_mode":"smoke"},{"build_type":"debug","pg_mode":"full"}]') }}
 
     steps:
       # PR-5 of the CI overhaul plan: normal CI keeps clean:false on the persistent
@@ -1872,6 +2035,23 @@ jobs:
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      # Direct dispatch only: a dispatched run's legs check out the BRANCH
+      # (refs/heads/dev), not github.sha — pinning a SHA would detach HEAD and
+      # disarm the branch-switch wipe sentinel (trusted_inputs comment). Legs
+      # queue for a while, so dev can move first. Record the commit actually
+      # built, and warn when it is not the dispatched one, so an alert or a
+      # bisect starts from the right commit (governance UP-1, 2026-11-10).
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Built commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: this leg built $built, not the dispatched $DISPATCHED_SHA"
+          fi
 
       - name: Isolate trusted-fork build caches
         if: needs.preflight-gate.outputs.trusted_execution == 'true'
@@ -2079,6 +2259,7 @@ jobs:
         env:
           PG_MODE: ${{ matrix.pg_mode }}
           MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
+          DISPATCH_RELEASE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'true' || 'false' }}
         run: |
           case "$PG_MODE" in
             full|smoke) ;;
@@ -2100,8 +2281,14 @@ jobs:
           # resolve to smoke, or a future include: edit could silently send
           # every leg back to full and reintroduce full-PG-shard contention
           # on every push.
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$MATRIX_BUILD_TYPE" != "debug" && "$PG_MODE" != "smoke" ]]; then
-            echo "::error::Windows $MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces full-PG-shard contention on every Windows push"
+          # Dispatch-aware, as in the Linux step (the daily release-legs
+          # dispatch is now where the release leg usually runs).
+          if [[ "$DISPATCH_RELEASE_ONLY" == "true" && "$MATRIX_BUILD_TYPE" == "debug" ]]; then
+            echo "::error::Windows debug expanded on a legs=release dispatch — the conditional matrix include: is broken"
+            exit 1
+          fi
+          if [[ ( "$GITHUB_EVENT_NAME" == "push" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ) && "$MATRIX_BUILD_TYPE" != "debug" && "$PG_MODE" != "smoke" ]]; then
+            echo "::error::Windows $MATRIX_BUILD_TYPE on a $GITHUB_EVENT_NAME resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces full-PG-shard contention on every Windows push"
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
@@ -2326,9 +2513,10 @@ jobs:
               "${suites[@]}"
           python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows pg shards"
 
-      # if: matrix.pg_mode == 'smoke' — only the release leg on a push (PRs
-      # are debug-only, so this step never runs on a PR; verified post-merge
-      # by the first dev push, not pre-merge). Deliberately UNGATED, mirroring
+      # if: matrix.pg_mode == 'smoke' — only the release leg, which runs on a
+      # `main` push or the daily release-legs dispatch (PRs and `dev` pushes
+      # are debug-only, so this step never runs on either; it was verified
+      # post-merge by the first push that built release, not pre-merge). Deliberately UNGATED, mirroring
       # the Linux smoke step: the smoke set costs seconds, far cheaper than
       # the slot-wait it would otherwise pay.
       - name: Test (pg smoke)
@@ -2454,7 +2642,7 @@ jobs:
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
-    name: "macOS ${{ matrix.build_type }}"
+    name: "macOS ${{ matrix.build_type }}${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && ' [dispatch]' || '' }}"
     needs: [preflight-gate]
     # Pinned to the BigMags macOS pool: the Apple-Silicon toolchain exists only
     # on the BigMags Mac Minis; no GitHub-hosted or Shulgi fallback can satisfy
@@ -2471,7 +2659,10 @@ jobs:
       matrix:
         build_type: [debug, release]
         exclude:
-          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          # Release legs: push to main + daily dispatch only (see the linux
+          # matrix for the full rule; keep the three matrices in lockstep).
+          - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
+          - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2487,6 +2678,23 @@ jobs:
           # ported to macOS (cross-run incrementality is deferred). See the
           # vcpkg-section comment below and docs/ci-architecture.md.
           persist-credentials: false
+
+      # Direct dispatch only: a dispatched run's legs check out the BRANCH
+      # (refs/heads/dev), not github.sha — pinning a SHA would detach HEAD and
+      # disarm the branch-switch wipe sentinel (trusted_inputs comment). Legs
+      # queue for a while, so dev can move first. Record the commit actually
+      # built, and warn when it is not the dispatched one, so an alert or a
+      # bisect starts from the right commit (governance UP-1, 2026-11-10).
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Built commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: this leg built $built, not the dispatched $DISPATCHED_SHA"
+          fi
 
       - name: Isolate trusted-fork build caches
         if: needs.preflight-gate.outputs.trusted_execution == 'true'
@@ -2851,9 +3059,9 @@ jobs:
   #
   # Since #5320 the same holds for a docs-only PUSH to main/dev, so the commit a
   # release tags carries every required context even when it changed only
-  # CHANGELOG.md. On a push the real matrix has more legs (release builds,
-  # clang-21); only the three required names are stubbed, because only they
-  # gate anything.
+  # CHANGELOG.md. On a push the real matrix has more legs (clang-21, and
+  # release builds on main); only the three required names are stubbed,
+  # because only they gate anything.
   docs-required-checks:
     name: ${{ matrix.check }}
     needs: [preflight-gate]
