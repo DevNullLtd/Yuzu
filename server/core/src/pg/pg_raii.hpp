@@ -155,9 +155,9 @@ public:
         return *this;
     }
 
-    /// Run `COMMIT`; on success disarm the rollback. On failure the guard
-    /// stays armed and the destructor rolls back. Calling again after a
-    /// successful commit is a no-op returning true.
+    /// Run `COMMIT`; on success disarm the rollback. If the COMMIT itself
+    /// fails the guard stays armed and the destructor rolls back. Calling
+    /// again after a successful commit is a no-op returning true.
     ///
     /// An ABORTED transaction (a prior statement failed, including a bound
     /// parameter `exec_params` refused for a NUL byte) is rolled back here and
@@ -179,7 +179,10 @@ public:
             return false;
         if (PQtransactionStatus(conn_) == PQTRANS_INERROR) {
             PgResult rollback{PQexec(conn_, "ROLLBACK")};
-            rolled_back_ = true;
+            // Disarm the destructor once the transaction has ended (or the connection is
+            // gone). If the ROLLBACK did not take effect the connection is still aborted,
+            // no later transaction can have started on it, and the destructor retries.
+            rolled_back_ = PQtransactionStatus(conn_) != PQTRANS_INERROR;
             return false;
         }
         PgResult res{PQexec(conn_, "COMMIT")};

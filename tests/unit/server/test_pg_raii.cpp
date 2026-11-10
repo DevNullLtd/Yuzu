@@ -162,7 +162,7 @@ TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii][pg-smoke]") {
         CHECK(count_rows(conn.get()) == 0);
     }
 
-    SECTION("commit failure leaves the guard armed") {
+    SECTION("an aborted transaction is rolled back by commit(), which returns false") {
         begin(conn.get());
         PgTxn txn{conn.get()};
         // Poison the transaction: a failed statement puts it in
@@ -232,6 +232,45 @@ TEST_CASE("PgTxn commit() and an aborted transaction", "[pg][raii][pg-smoke]") {
             CHECK(txn.commit());
         }
         CHECK(count_rows(conn.get()) == 2);
+    }
+
+    SECTION("after a refused commit the guard is disarmed: a transaction started later survives") {
+        begin(conn.get());
+        {
+            PgTxn txn{conn.get()};
+            insert_row(conn.get(), 1);
+            PgResult bad{PQexec(conn.get(), "SELECT no_such_column FROM t")};
+            CHECK(bad.status() == PGRES_FATAL_ERROR);
+            CHECK_FALSE(txn.commit()); // rolled back here; the guard must not roll back again
+            // The caller starts and commits its own transaction on the same connection while the
+            // guard is still in scope. A destructor that still rolled back would not touch it
+            // (it runs after COMMIT), so open a second one that is still open at destruction.
+            begin(conn.get());
+            insert_row(conn.get(), 2);
+        } // ~PgTxn runs with the caller's second transaction open: it must NOT roll it back
+        CHECK(PQtransactionStatus(conn.get()) == PQTRANS_INTRANS);
+        PgResult commit2{PQexec(conn.get(), "COMMIT")};
+        CHECK(commit2.status() == PGRES_COMMAND_OK);
+        CHECK(count_rows(conn.get()) == 1); // the second transaction's row, not the first's
+    }
+
+    SECTION("a guard moved after its refused commit stays disarmed") {
+        begin(conn.get());
+        {
+            PgTxn first{conn.get()};
+            insert_row(conn.get(), 1);
+            PgResult bad{PQexec(conn.get(), "SELECT no_such_column FROM t")};
+            CHECK(bad.status() == PGRES_FATAL_ERROR);
+            CHECK_FALSE(first.commit());
+            PgTxn second{std::move(first)};
+            CHECK_FALSE(second.commit()); // the flag travelled with the move
+            begin(conn.get());
+            insert_row(conn.get(), 2);
+        } // both guards leave scope with the caller's transaction open
+        CHECK(PQtransactionStatus(conn.get()) == PQTRANS_INTRANS);
+        PgResult commit2{PQexec(conn.get(), "COMMIT")};
+        CHECK(commit2.status() == PGRES_COMMAND_OK);
+        CHECK(count_rows(conn.get()) == 1);
     }
 
     SECTION("plain success is unchanged") {
