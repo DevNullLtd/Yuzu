@@ -590,6 +590,35 @@ class WorkflowWiringTests(unittest.TestCase):
                     self.assertTrue(runs)
                     self.assertEqual(runs[-1], m.group(1))
 
+    def test_linux_concurrent_halves_isolate_their_logs(self) -> None:
+        """The Linux test step runs its non-pg and pg halves concurrently in one
+        build dir. Every flake-retry invocation there must carry --no-rebuild
+        (one serial meson-test-prereq build precedes them) and its own
+        --logbase, each summary must read the logbase of the invocation it
+        follows, and the telemetry import must name exactly those logbases."""
+        job = self.job("ci.yml", "linux")
+        self.assertIn("meson-test-prereq", job)
+        runs = re.findall(r"flake-retry\.py --builddir \S+ -- (.*)", job)
+        self.assertEqual(4, len(runs))  # cheap, server shards, pg full, pg smoke
+        bases = []
+        for args in runs:
+            with self.subTest(args=args[:60]):
+                self.assertIn("--no-rebuild", args)
+                m = re.search(r"--logbase (\S+)", args)
+                self.assertIsNotNone(m)
+                bases.append(m.group(1))
+        # full and smoke are exclusive branches of the pg half, so they share one.
+        self.assertEqual(
+            ["testlog-nonpg-cheap", "testlog-nonpg-server", "testlog-pg", "testlog-pg"], bases
+        )
+        summary_bases = re.findall(
+            r'test-durations-summary\.py --builddir \S+ --label "[^"]+" --logbase (\S+)', job
+        )
+        self.assertEqual(bases[:3], summary_bases)
+        self.assertEqual(
+            sorted(set(bases)), sorted(re.findall(r"^\s*--logbase (\S+)\s*$", job, re.M))
+        )
+
     def test_every_catch2_entry_carries_durations(self) -> None:
         """The per-case summary reads Catch2's `--durations=yes` (the `=` form is
         required, see docs/ci-architecture.md). Every `*_exe` test() entry is a

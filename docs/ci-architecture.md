@@ -1533,7 +1533,10 @@ overwrites meson's single `testlog.junit.xml`, so only the pg-gated call's
 (last) per-suite telemetry survives the default import — and separately,
 `flake-retry.py` writes `meson-logs/flake-retry.json` unconditionally on every
 clean invocation, so a clean pg-shard pass can silently overwrite recovered-
-flake evidence the cheap-suite calls found earlier. And groups 1/2 now run
+flake evidence the cheap-suite calls found earlier. (Both telemetry losses are
+closed on Linux since 2026-11-10: each invocation has its own `--logbase` and
+all three are imported; see "Linux test step: concurrent non-pg and pg
+halves". Windows still has them.) And groups 1/2 now run
 entirely outside `with-test-slot.sh` — before this split, one gated invocation
 covered all 32 tests; up to 4 concurrent Linux jobs' cheap-suite phases can now
 overlap unrestrained. Judged low-risk (cheap suites measured ~1-2 min combined,
@@ -2098,6 +2101,60 @@ is still short, so the within-job cap ships first per this section's "one axis
 at a time" practice; #4580's outcome may argue for cross-job gating here too,
 once the actual mechanism is understood.
 
+### Linux test step: concurrent non-pg and pg halves (2026-11-10)
+
+The Linux job used to run three test steps one after another: `Test (non-pg
+suites)` (two `flake-retry.py` invocations, about 6.6 to 7 min), then either
+`Test (pg shards, full)` (about 10 min, `gcc-15`/`debug`) or `Test (pg smoke)`
+(the other push legs). They share nothing but the build directory, so they are
+now one step, `Test (non-pg + pg halves, concurrent)`, that starts two
+background halves and waits on both:
+
+| Half | What it runs | Slot gate |
+|---|---|---|
+| non-pg | `--num-processes 4` over `agent docs proto echo gateway platform`, then `--num-processes 2` over server shards A to D plus the four named checks (cheap first; the second does not start if the first fails) | none, as before |
+| pg, `pg_mode=full` | `--num-processes 4 --suite server-pg` | `with-test-slot.sh 3`, as before |
+| pg, `pg_mode=smoke` | `"server pg smoke"` by name | none, as before |
+
+Selections, widths, the slot gate and the `Resolve pg_mode + assert Postgres DSN`
+step are unchanged; the step also rejects a `pg_mode` other than `full` or
+`smoke`. Both halves always run to the end, and the step fails if either half
+exits non-zero, printing both exit codes and the failing half's last 60 lines
+(prefixed, so its `::error::` lines are not annotated twice).
+
+Running two `meson test` processes in one build directory needs four kinds of
+isolation, all in the step:
+
+1. **Log names.** Every invocation passes its own meson `--logbase`
+   (`testlog-nonpg-cheap`, `testlog-nonpg-server`, `testlog-pg`), so none
+   overwrites another's `testlog.{txt,json,junit.xml}`. `flake-retry.py` reads
+   the `--logbase` back from its passthrough arguments and uses it for the junit
+   it classifies, its retry report (`<logbase>-flake-retry.json`) and its
+   preserved enumeration junit and stale-file sweep
+   (`<logbase>-flake-retry-enum-*`). Without `--logbase` (Windows, macOS) every
+   path keeps its old name. `test-durations-summary.py` and the telemetry
+   finalizer (`ci-telemetry.py finish --logbase`, three times) take the same names.
+2. **ninja.** `meson test` runs `ninja` before testing; two of those at once in
+   one build directory race on `.ninja_log`. The step builds
+   `meson-test-prereq` once, serially, and every invocation passes
+   `--no-rebuild`.
+3. **Job summary.** Each half writes its own summary file in `meson-logs/`;
+   both are appended to the job summary after the wait.
+4. **Step log.** Each half's output goes to `meson-logs/ci-half-{nonpg,pg}.log`
+   and is printed in full, one collapsed group per half, after the wait. A
+   heartbeat prints each half's latest line every two minutes. If the job times
+   out or is cancelled the logs are not printed, but the `meson-logs` artifact
+   upload (which runs on failure or cancel) carries them.
+
+**Expected effect, not yet measured.** The step should take about as long as
+the longer half (the pg half on `gcc-15`/`debug`), roughly 7 min less than the
+sum. Both halves now share the job's 16 CPUs (4 non-pg workers and 4 pg shards
+at once, where it used to be one or the other), so watch the step's wall time,
+the #2093 per-shard watchdog and the timing-assertion flakes the non-pg width
+history warns about. This is a topology change; measure it with two same-SHA
+samples on its own, as for the ladder below, before bundling it with a width
+push. Reverting it is restoring the three sequential steps.
+
 ### Staged widening — Linux (2026-10-21)
 
 Until Push 2a (below), and for the pg-shards step until Push 2c, Linux ran
@@ -2612,8 +2669,11 @@ by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
 that prevents post-steps intentionally leaves an `in_progress` row, which is
 itself evidence of runner/job termination rather than a fabricated result.
 
-**Linux AND Windows gap, since the "Suite isolation" split above:** the
-finalizer imports one `meson-logs/testlog.junit.xml`, and both platforms'
+**Windows gap (Linux closed 2026-11-10), since the "Suite isolation" split
+above:** on Linux each invocation now has its own meson `--logbase` and the
+finalizer imports all three (`ci-telemetry.py finish --logbase ...`), so the
+rest of this paragraph is history for Linux and current for Windows. Before
+that, the finalizer imported one `meson-logs/testlog.junit.xml`, and both platforms'
 Test steps now run multiple separate `meson test` invocations against the
 same builddir (Linux: 3; Windows: always 2 — the non-pg step plus
 exactly one of pg-full/pg-smoke, `matrix.pg_mode` resolves to exactly
@@ -2865,6 +2925,18 @@ Resolution order inside the script:
    if the pg step's two samples show a gain; reverting is dropping the flag and
    bumping the label again. Docker Linux path only. Probe output and the
    decision: pending — filled by the push that applies or declines it.
+
+   **Clone-strategy A/B knob (2026-11-10, pending measurement).** Every
+   template-cloned `[pg]` case runs `CREATE DATABASE ... TEMPLATE ...`
+   (`PostgresTestDb`, `tests/unit/test_helpers.hpp`). Setting
+   `YUZU_TEST_PG_CLONE_STRATEGY` to `wal_log` or `file_copy` (any case) appends
+   `STRATEGY WAL_LOG` or `STRATEGY FILE_COPY` to that statement; unset leaves the
+   SQL unchanged (the server default, `WAL_LOG` on PostgreSQL 15+), and any other
+   value fails the fixture with a message naming the variable. No CI job sets it.
+   It exists so the two strategies can be compared on the pg step's wall time,
+   on the same terms as the tmpfs experiment above (two same-SHA samples, kept
+   only on a gain); if `FILE_COPY` wins, wiring it into CI is a separate change.
+   Result: pending. Contract: `docs/testing/unit-test-conventions.md`.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
@@ -3124,7 +3196,8 @@ combined with an OS. Expiry uses the UTC calendar date; the validator's clock is
 injectable for hermetic tests.
 
 The job summary + annotations remain the immediate signal. In addition,
-`flake-retry.py` writes `meson-logs/flake-retry.json`; the job finalizer imports
+`flake-retry.py` writes `meson-logs/flake-retry.json` (`<logbase>-flake-retry.json`
+when its meson arguments carry `--logbase`, as on Linux); the job finalizer imports
 recovered listed cases into the runner's `ci_flake_events` table alongside the
 suite timings. `tests/known-flaky.json` remains the reviewed source of truth —
 the database is observation history, never an implicit allowlist. This is
@@ -3135,13 +3208,15 @@ per meson entry. Next to it, `scripts/ci/test-durations-summary.py` appends a
 "Test durations — <label>" block to the job summary after each
 `flake-retry.py` invocation in the Linux (three), Windows (two) and macOS (one)
 Test steps: every entry's wall seconds, meson timeout and share of it, then the
-25 slowest Catch2 cases (entry, case, seconds, runs). The non-PR `Test (pg smoke)`
-steps are deliberately not summarised: each runs one ~3 s entry. The case data is Catch2's
+25 slowest Catch2 cases (entry, case, seconds, runs). The non-PR pg smoke
+runs (the Windows `Test (pg smoke)` step, the Linux step's smoke branch) are
+deliberately not summarised: each runs one ~3 s entry. The case data is Catch2's
 own `--durations=yes`, now on every Catch2 entry except the two pinned exemptions
 (the non-PR pg smoke entry and the `[tsan-heavy]` checkpoints entry; the `=`
 form is required: a space would add a positional
 `yes` that `check-pg-shard-partition.py` rejects as a second spec). It is
-parsed from `meson-logs/testlog.json`, which meson overwrites on every
+parsed from `meson-logs/testlog.json` (on Linux `meson-logs/<logbase>.json`, via
+`--logbase`, because its invocations run concurrently), which meson overwrites on every
 invocation, hence one call per invocation rather than one at the end of the
 job (each step removes the file first, so a run that selects no tests warns and
 skips instead of re-reporting the previous log); on a red invocation `bash -e` stops before the summary and the uploaded

@@ -201,6 +201,33 @@ TEST_CASE("test_db_is_stale: name-embedded epoch + staleness window", "[template
     }
 }
 
+TEST_CASE("parse_pg_clone_strategy: A/B knob accepts exactly two strategies", "[template]") {
+    using yuzu::test::parse_pg_clone_strategy;
+    SECTION("unset or empty adds nothing (SQL byte-identical to no knob)") {
+        for (const char* raw : {static_cast<const char*>(nullptr), ""}) {
+            const auto s = parse_pg_clone_strategy(raw);
+            CHECK(s.ok);
+            CHECK(s.clause.empty());
+            CHECK(s.error.empty());
+        }
+    }
+    SECTION("both strategies, any case") {
+        CHECK(parse_pg_clone_strategy("wal_log").clause == " STRATEGY WAL_LOG");
+        CHECK(parse_pg_clone_strategy("WAL_LOG").clause == " STRATEGY WAL_LOG");
+        CHECK(parse_pg_clone_strategy("file_copy").clause == " STRATEGY FILE_COPY");
+        CHECK(parse_pg_clone_strategy("File_Copy").clause == " STRATEGY FILE_COPY");
+    }
+    SECTION("anything else fails loudly, naming the variable and the value") {
+        for (const char* raw : {"filecopy", "wal-log", " wal_log", "file_copy;DROP", "1"}) {
+            const auto s = parse_pg_clone_strategy(raw);
+            CHECK_FALSE(s.ok);
+            CHECK(s.clause.empty());
+            CHECK(s.error.find("YUZU_TEST_PG_CLONE_STRATEGY") != std::string::npos);
+            CHECK(s.error.find(raw) != std::string::npos);
+        }
+    }
+}
+
 TEST_CASE("PgTestTemplate: build, shared-key replay verification, scoped drop", "[pg][template]") {
     if (yuzu::test::pg_admin_dsn_env() == nullptr) {
         SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
