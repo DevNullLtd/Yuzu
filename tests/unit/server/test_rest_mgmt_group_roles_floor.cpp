@@ -942,11 +942,23 @@ TEST_CASE("POST /management-groups/{id}/roles: a principal_type containing 'fail
         auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
         REQUIRE(res);
         CHECK(res->status == 400);
+        // The route's own closed-set check answered, not the store's echo of the value.
+        CHECK(res->body.find("principal_type must be user or group") != std::string::npos);
+        CHECK(res->body.find(type) == std::string::npos);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+        CHECK(h.audits.empty());
+    }
+
+    SECTION("engine passes the route's check and is refused by the store with a 400") {
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_type":"engine","principal_id":"engine:x",)"
+                               R"("role_name":"Viewer"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("engine principals cannot hold scoped role assignments") !=
+              std::string::npos);
         CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
         CHECK(h.audit_count("management_group.assign_role", "failure") == 0);
-        CHECK(h.audit_count("management_group.assign_role", "success") == 0);
-        for (const auto& a : h.audits)
-            CHECK(a.detail != "store_error");
     }
 }
 
@@ -958,7 +970,7 @@ TEST_CASE("mgmt_group_error: store faults are the fixed messages, matched at the
     SECTION("every store fault message is a fault") {
         for (const char* msg : {"database not open", "pool acquire timed out",
                                 "failed to resolve ancestor chain (store degraded)",
-                                "failed to create group: duplicate key", "query failed: boom",
+                                "failed to create group: connection lost", "query failed: boom",
                                 "update failed: boom", "delete failed: boom",
                                 "add_member failed: boom", "remove_member failed: boom",
                                 "assign_role failed: boom", "unassign_role failed: boom"}) {
@@ -987,11 +999,14 @@ TEST_CASE("mgmt_group_error: store faults are the fixed messages, matched at the
     }
 }
 
-// Tripwire: a new store-fault message in management_group_store.cpp that this classifier does
-// not know would be answered 400 instead of a retryable 503. Every string literal handed to
-// std::unexpected that says "failed" or is one of the two exact fault messages must classify
-// as a fault.
-TEST_CASE("mgmt_group_error: every store fault literal in management_group_store.cpp is classified",
+// Tripwire, closed-world: every string literal handed to std::unexpected in
+// management_group_store.cpp is either classified as a store fault by the shared classifier or is
+// named below as a validation message / a read-path fault no classifier call site reaches. A new
+// message of ANY wording therefore forces a decision here. (A message built another way,
+// std::format or a named constant, is not seen by the scan; the floors below fail the test if
+// the literal shapes change enough to drop the scan's coverage.)
+TEST_CASE("mgmt_group_error: every std::unexpected literal in management_group_store.cpp is "
+          "classified or named",
           "[rest][mcp][mgmt_group][validation][mgmt_group_error]") {
     namespace fs = std::filesystem;
     std::ifstream in(fs::path(YUZU_SERVER_SRC_DIR) / "management_group_store.cpp",
@@ -1001,19 +1016,45 @@ TEST_CASE("mgmt_group_error: every store fault literal in management_group_store
     ss << in.rdbuf();
     const std::string src = ss.str();
 
+    // Validation answers: the caller's mistake, never retryable.
+    const std::set<std::string> validation = {
+        "group name cannot be empty",
+        "group cannot be its own parent",
+        "parent group not found",
+        "maximum hierarchy depth (5) exceeded",
+        "re-parenting would create a cycle",
+        "group not found",
+        "cannot delete root group",
+        "engine principals cannot hold scoped role assignments in this release",
+    };
+    // Faults of the read paths (get_assignments_for_principal, get_member_agents_in_subtrees),
+    // which count their own degrade metric and never reach the REST/MCP write classifier.
+    const std::set<std::string> read_path_faults = {
+        "management group store not open",
+        "management group store: pool acquire timed out",
+    };
+
     const std::regex re(R"re(std::unexpected\(\s*(?:std::string\()?\s*"((?:[^"\\]|\\.)*)")re");
-    std::size_t seen = 0, faults = 0;
+    std::size_t seen = 0, faults = 0, validations = 0, reads = 0;
     for (std::sregex_iterator it(src.begin(), src.end(), re), end; it != end; ++it) {
         const std::string lit = (*it)[1].str();
         ++seen;
-        const bool says_fault = lit.find("failed") != std::string::npos ||
-                                lit == "database not open" || lit == "pool acquire timed out";
-        if (!says_fault)
-            continue;
-        ++faults;
         INFO("literal: " << lit);
-        CHECK(yuzu::server::mgmt_group_error_is_store_fault(lit));
+        if (yuzu::server::mgmt_group_error_is_store_fault(lit)) {
+            ++faults;
+        } else if (validation.count(lit) != 0) {
+            ++validations;
+        } else if (read_path_faults.count(lit) != 0) {
+            ++reads;
+        } else {
+            FAIL_CHECK("an unclassified store message: add its prefix to mgmt_group_error.hpp "
+                       "or name it in this test");
+        }
     }
-    CHECK(seen >= 20);  // the scan found the store's messages (the file has about 30)
-    CHECK(faults >= 10); // and the fault ones among them
+    // The file holds 44 literals today (28 faults, 12 validation, 4 read-path). Exact floors so
+    // a change in literal shape cannot silently shrink what the scan sees.
+    CHECK(seen >= 44);
+    CHECK(faults >= 28);
+    CHECK(validations >= 8);
+    CHECK(reads >= 4);
 }

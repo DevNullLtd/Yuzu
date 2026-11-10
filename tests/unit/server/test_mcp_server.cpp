@@ -52312,11 +52312,16 @@ TEST_CASE("MCP assign_management_group_role: a caller value that contains the wo
         const auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == kInvalidParams);
+        REQUIRE(body["error"].contains("data"));
+        REQUIRE(body["error"]["data"].contains("retry_after_ms"));
         CHECK(body["error"]["data"]["retry_after_ms"].is_null());
         CHECK(store.get_group_roles(gid).empty());
         CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").empty());
-        for (const auto& detail : wf_rows_since(ts, before, "management_group.assign_role|failure"))
-            CHECK(detail != "store_error");
+        // The refusal is recorded as the store's validation message, never as a store fault.
+        const auto failures = wf_rows_since(ts, before, "management_group.assign_role|failure");
+        REQUIRE(failures.size() == 1);
+        CHECK(failures.front() != "store_error");
+        CHECK(failures.front().rfind("unrecognized principal_type", 0) == 0);
     }
 }
 

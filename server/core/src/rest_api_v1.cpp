@@ -5100,9 +5100,11 @@ void RestApiV1::register_routes(
                       return;
                   }
 
-                  // The permission gate comes first: a caller with no rights on the group gets
-                  // 403 whatever the body holds and adds no audit row for it. The audit rows
-                  // for a refused value below are written only for a caller who passed it.
+                  // The permission gate comes first (after the body-shape answers above): a
+                  // caller with no rights on the group gets 403 whatever the field values hold
+                  // and adds no management_group.* audit row for it (the gate writes its own
+                  // denied row). The rows for a refused value below are written only for a
+                  // caller who passed it.
                   // guardian-confinement-2298 PR3 §3e: was a direct
                   // rbac_store->check_permission call, bypassing
                   // require_permission (and therefore the §3a flip) entirely —
@@ -5165,12 +5167,12 @@ void RestApiV1::register_routes(
                   }
 
                   // The store's own check echoes the value in its message, so the closed set is
-                  // checked here and the caller gets a plain 400.
+                  // checked here and the caller gets a plain 400. "engine" is let through so the
+                  // store gives its own refusal (scoped engine grants are not offered here).
                   if (principal_type != "user" && principal_type != "group" &&
                       principal_type != "engine") {
                       res.status = 400;
-                      res.set_content(detail::a4_error(res, "principal_type must be user, group "
-                                                            "or engine"),
+                      res.set_content(detail::a4_error(res, "principal_type must be user or group"),
                                       "application/json");
                       return;
                   }

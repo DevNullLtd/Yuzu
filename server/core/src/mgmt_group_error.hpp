@@ -2,7 +2,10 @@
 
 /// @file mgmt_group_error.hpp
 /// The one answer to "is this ManagementGroupStore error message a store fault?", shared by the
-/// REST routes (rest_api_v1.cpp) and the MCP tools (mcp_server.cpp) so the two cannot drift.
+/// REST assign-role route (rest_api_v1.cpp) and the four MCP management-group write tools
+/// (mcp_server.cpp: create, update, add member, assign role) so those two cannot drift. The other
+/// REST group routes (create, update, delete, add and remove member) map store errors on their
+/// own and are NOT routed through it.
 ///
 /// The store returns `std::expected<..., std::string>`. A fault of the store itself (not open, no
 /// pool connection, a failed query) carries one of the FIXED messages below, always at the START
@@ -12,10 +15,12 @@
 /// error into a retryable 503 with a failure audit row, so the match is on the fixed prefix only
 /// and caller text can never be at the start of a message.
 ///
-/// A NEW store-fault message in management_group_store.cpp needs its prefix added here; the test
-/// `mgmt_group_error` (tests/unit/server/test_rest_mgmt_group_roles_floor.cpp) scans the store
-/// source for every message that says "failed" or names the pool or an open store and fails when
-/// this function does not classify it as a fault.
+/// A NEW message in management_group_store.cpp forces a decision: the tests tagged
+/// `[mgmt_group_error]` (tests/unit/server/test_rest_mgmt_group_roles_floor.cpp) scan the store
+/// source for every string literal passed to `std::unexpected` and fail unless it is either
+/// classified as a fault here or named in the test's own list of validation messages (or of the
+/// read-path faults that never reach a classifier). A message built any other way (`std::format`,
+/// a named constant) is not seen by the scan.
 
 #include <array>
 #include <string_view>

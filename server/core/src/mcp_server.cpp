@@ -6924,7 +6924,7 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 // still giving the MCP twins an HONEST retry_after_ms on the genuinely
 // transient subset, per A5 (docs/agentic-first-principle.md).
 //
-// Every store write failure the mutating methods this PR twins
+// Every store write failure the mutating methods
 // (create_group/update_group/add_member/assign_role) can return is either:
 //   - a store-open/pool/query fault, one of the FIXED messages listed in
 //     mgmt_group_error.hpp ("database not open", "pool acquire timed out", the
@@ -6935,8 +6935,6 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 //     "engine principals cannot hold scoped role assignments in this release", or a
 //     RbacStore::validate_assignment message, some of which echo caller text such as
 //     "unrecognized principal_type '<value>'"). Client error: not retryable, matches REST's 400.
-// The earlier test was the word "failed" anywhere in the message, which let a caller value
-// holding that word read as a store fault.
 struct MgmtGroupErrorInfo {
     int code;
     long retry_after_ms; // -1 => no retry hint (not blindly retryable)
