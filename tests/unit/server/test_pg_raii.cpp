@@ -197,7 +197,7 @@ TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii][pg-smoke]") {
 // Dave's review of #7376, item 3: PgTxn::commit() must not report success for a transaction a
 // refused or failed statement aborted. COMMIT in PQTRANS_INERROR completes as ROLLBACK yet
 // answers PGRES_COMMAND_OK, so commit() checks the transaction state first.
-TEST_CASE("PgTxn commit() and an aborted transaction", "[pg][raii][pg-smoke]") {
+TEST_CASE("PgTxn commit() and an aborted transaction", "[pg][raii]") {
     YUZU_REQUIRE_PG_DB(db);
     PgConn conn = connect_with_table(db.dsn());
 
