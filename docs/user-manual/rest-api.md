@@ -1011,7 +1011,7 @@ Assign a role to a principal within this management group. Only the `Operator` a
 }
 ```
 
-**Other errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte (audited `management_group.assign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`), or if any of the three is not valid UTF-8; `404` if the group does not exist (no audit row, no retry hint); `503` if the store could not apply the assignment (audited `result=failure`, `detail=store_error`, with a retry hint). `assigned: true` and the success audit row are only produced after the store reports the assignment.
+**Other errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte (audited `management_group.assign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`), or if any of the three is not valid UTF-8; `400` (no audit row) if `principal_type` is not `user`, `group` or `engine`, or is `engine` (engine principals cannot hold scoped role assignments); the permission check comes first, so a caller without rights on the group gets `403` and no audit row whatever the body holds; `404` if the group does not exist (no audit row, no retry hint); `503` if the store could not apply the assignment (audited `result=failure`, `detail=store_error`, with a retry hint). `assigned: true` and the success audit row are only produced after the store reports the assignment.
 
 ---
 

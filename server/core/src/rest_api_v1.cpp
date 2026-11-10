@@ -18,6 +18,7 @@
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
 #include "rbac_admin_predicate.hpp" // A2: is_rbac_administrator / is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 7-role set
+#include "mgmt_group_error.hpp" // mgmt_group_error_is_store_fault: one classifier for REST and MCP
 #include "rbac_text.hpp" // rbac_text_is_clean - the one clean-text predicate for RBAC identifiers
 #include "rbac_enforcement_read.hpp" // GET /api/v1/rbac/enforcement: the builder shared with MCP get_rbac_enforcement
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
@@ -4889,12 +4890,12 @@ void RestApiV1::register_routes(
         return g.has_value() && !g->has_value();
     };
 
-    // The store reports a fault as "database not open", "pool acquire timed out"
-    // or "<verb> failed: ..."; every other message is a validation answer.
-    // Twin: classify_mgmt_group_error in mcp_server.cpp.
+    // The store reports a fault with one of the fixed messages in mgmt_group_error.hpp (matched
+    // on the prefix, never on a word anywhere in the message, because a validation message can
+    // echo caller text); every other message is a validation answer.
+    // Twin: classify_mgmt_group_error in mcp_server.cpp, the same function.
     const auto mgmt_error_is_store_fault = [](const std::string& msg) {
-        return msg == "database not open" || msg == "pool acquire timed out" ||
-               msg.find("failed") != std::string::npos;
+        return mgmt_group_error_is_store_fault(msg);
     };
 
     const auto mgmt_group_not_found = [](httplib::Response& res) {
@@ -5099,27 +5100,9 @@ void RestApiV1::register_routes(
                       return;
                   }
 
-                  // Checked before the closed role list so a role name holding a control byte
-                  // or invalid UTF-8 is a 400 with its own denied row, not a generic 403.
-                  if (!mgmt_text_ok(role_name)) {
-                      audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
-                               group_id, "invalid_role_name");
-                      res.status = 400;
-                      res.set_content(
-                          detail::a4_error(res,
-                                           "role name must be valid text without control "
-                                           "characters"),
-                          "application/json");
-                      return;
-                  }
-
-                  if (role_name != "Operator" && role_name != "Viewer") {
-                      res.status = 403;
-                      res.set_content(detail::a4_error(res, "only Operator and Viewer roles can be delegated"),
-                                      "application/json");
-                      return;
-                  }
-
+                  // The permission gate comes first: a caller with no rights on the group gets
+                  // 403 whatever the body holds and adds no audit row for it. The audit rows
+                  // for a refused value below are written only for a caller who passed it.
                   // guardian-confinement-2298 PR3 §3e: was a direct
                   // rbac_store->check_permission call, bypassing
                   // require_permission (and therefore the §3a flip) entirely —
@@ -5147,6 +5130,27 @@ void RestApiV1::register_routes(
                       return;
                   }
 
+                  // Checked before the closed role list so a role name holding a control byte
+                  // or invalid UTF-8 is a 400 with its own denied row, not a generic 403.
+                  if (!mgmt_text_ok(role_name)) {
+                      audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
+                               group_id, "invalid_role_name");
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res,
+                                           "role name must be valid text without control "
+                                           "characters"),
+                          "application/json");
+                      return;
+                  }
+
+                  if (role_name != "Operator" && role_name != "Viewer") {
+                      res.status = 403;
+                      res.set_content(detail::a4_error(res, "only Operator and Viewer roles can be delegated"),
+                                      "application/json");
+                      return;
+                  }
+
                   if (!mgmt_text_ok(principal_type) || !mgmt_text_ok(principal_id)) {
                       const char* detail_token = !mgmt_text_ok(principal_id)
                                                      ? "invalid_principal_id"
@@ -5156,6 +5160,17 @@ void RestApiV1::register_routes(
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "principal_id and principal_type must "
                                                             "not contain control characters"),
+                                      "application/json");
+                      return;
+                  }
+
+                  // The store's own check echoes the value in its message, so the closed set is
+                  // checked here and the caller gets a plain 400.
+                  if (principal_type != "user" && principal_type != "group" &&
+                      principal_type != "engine") {
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "principal_type must be user, group "
+                                                            "or engine"),
                                       "application/json");
                       return;
                   }

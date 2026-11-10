@@ -25,6 +25,7 @@
  * SKIPs when YUZU_TEST_POSTGRES_DSN is unset and FAILs when it is set but broken.
  */
 
+#include "mgmt_group_error.hpp"
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
@@ -43,7 +44,11 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <regex>
+#include <sstream>
 #include <optional>
 #include <set>
 #include <string>
@@ -848,4 +853,167 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: an agent id that is n
         CHECK(h.audits[0].target_id == gid);
         CHECK(h.audits[0].detail == "invalid_agent_id");
     }
+}
+
+// Dave's review of #7376, item 1: the audit write for a refused value comes AFTER the permission
+// gate on every management-group mutation, so a caller with no rights on the group adds no
+// audit rows for it. Each case sends a value the handler would otherwise refuse and audit.
+TEST_CASE("management-group mutations: a caller without ManagementGroup:Write gets 403 and no "
+          "audit row, whatever the body holds",
+          "[pg][rest][mgmt_group][validation][authz]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-gate-before-audit");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+    REQUIRE(h.mgmt_bundle->assign_role(GroupRoleAssignment{gid, "user", "someone", "Viewer"})
+                .has_value());
+    h.perm_override = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+
+    SECTION("assign role: a role name with a control byte") {
+        for (const char* body : {R"({"principal_id":"someone","role_name":"View\u0000er"})",
+                                 R"({"principal_id":"some\u0000one","role_name":"Viewer"})",
+                                 R"({"principal_type":"us\u0000er","principal_id":"someone",)"
+                                 R"("role_name":"Viewer"})"}) {
+            INFO(body);
+            auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(h.audits.empty());
+        }
+    }
+
+    SECTION("unassign role: a field with a control byte") {
+        for (const char* body : {R"({"principal_id":"someone","role_name":"View\u0000er"})",
+                                 R"({"principal_id":"some\u0000one","role_name":"Viewer"})"}) {
+            INFO(body);
+            auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/roles",
+                                       body, "application/json");
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(h.audits.empty());
+        }
+        CHECK(h.mgmt_bundle->get_group_roles(gid).size() == 1);
+    }
+
+    SECTION("add member: an agent id with a control byte") {
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/members",
+                               R"({"agent_id":"a\u0000b"})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.audits.empty());
+    }
+
+    SECTION("remove member: an agent id that is not valid UTF-8") {
+        auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/members/agent" +
+                                                 std::string("\xff") + "1");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.audits.empty());
+        CHECK(h.mgmt_bundle->get_members(gid).size() == 1);
+    }
+
+    SECTION("an ITServiceOwner of the group still gets the 400 and the denied row") {
+        REQUIRE(h.mgmt_bundle->assign_role(GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"})
+                    .has_value());
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_id":"someone","role_name":"View\u0000er"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].detail == "invalid_role_name");
+    }
+}
+
+// Dave's review of #7376, item 2: RbacStore::validate_assignment echoes the caller's
+// principal_type, so a value holding the word "failed" must be a 400 with no store-fault row.
+TEST_CASE("POST /management-groups/{id}/roles: a principal_type containing 'failed' is a 400, "
+          "never a retryable 503 with a failure row",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-classifier");
+
+    for (const char* type : {"failed", "unfailed", "login failed"}) {
+        INFO(type);
+        h.audits.clear();
+        const std::string body = std::string(R"({"principal_type":")") + type +
+                                 R"(","principal_id":"someone","role_name":"Viewer"})";
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+        CHECK(h.audit_count("management_group.assign_role", "failure") == 0);
+        CHECK(h.audit_count("management_group.assign_role", "success") == 0);
+        for (const auto& a : h.audits)
+            CHECK(a.detail != "store_error");
+    }
+}
+
+// The classifier REST and MCP share. Pure (no database).
+TEST_CASE("mgmt_group_error: store faults are the fixed messages, matched at the start",
+          "[rest][mcp][mgmt_group][validation][mgmt_group_error]") {
+    using yuzu::server::mgmt_group_error_is_store_fault;
+
+    SECTION("every store fault message is a fault") {
+        for (const char* msg : {"database not open", "pool acquire timed out",
+                                "failed to resolve ancestor chain (store degraded)",
+                                "failed to create group: duplicate key", "query failed: boom",
+                                "update failed: boom", "delete failed: boom",
+                                "add_member failed: boom", "remove_member failed: boom",
+                                "assign_role failed: boom", "unassign_role failed: boom"}) {
+            INFO(msg);
+            CHECK(mgmt_group_error_is_store_fault(msg));
+        }
+    }
+
+    SECTION("a validation message is not, even when it echoes the word failed") {
+        for (const char* msg : {"unrecognized principal_type 'failed'",
+                                "unrecognized principal_type 'assign_role failed: x'",
+                                "unrecognized principal_type 'database not open'",
+                                "group name cannot be empty", "parent group not found",
+                                "maximum hierarchy depth (5) exceeded",
+                                "re-parenting would create a cycle",
+                                "engine principals cannot hold scoped role assignments in this "
+                                "release",
+                                "principal_id in the reserved 'engine:' namespace may only be "
+                                "assigned under principal_type=\"engine\"",
+                                "engine principals cannot be granted the admin/full-access role "
+                                "'failed' — no admin, ever (design §4.2)",
+                                "group not found", ""}) {
+            INFO(msg);
+            CHECK_FALSE(mgmt_group_error_is_store_fault(msg));
+        }
+    }
+}
+
+// Tripwire: a new store-fault message in management_group_store.cpp that this classifier does
+// not know would be answered 400 instead of a retryable 503. Every string literal handed to
+// std::unexpected that says "failed" or is one of the two exact fault messages must classify
+// as a fault.
+TEST_CASE("mgmt_group_error: every store fault literal in management_group_store.cpp is classified",
+          "[rest][mcp][mgmt_group][validation][mgmt_group_error]") {
+    namespace fs = std::filesystem;
+    std::ifstream in(fs::path(YUZU_SERVER_SRC_DIR) / "management_group_store.cpp",
+                     std::ios::binary);
+    REQUIRE(in);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+
+    const std::regex re(R"re(std::unexpected\(\s*(?:std::string\()?\s*"((?:[^"\\]|\\.)*)")re");
+    std::size_t seen = 0, faults = 0;
+    for (std::sregex_iterator it(src.begin(), src.end(), re), end; it != end; ++it) {
+        const std::string lit = (*it)[1].str();
+        ++seen;
+        const bool says_fault = lit.find("failed") != std::string::npos ||
+                                lit == "database not open" || lit == "pool acquire timed out";
+        if (!says_fault)
+            continue;
+        ++faults;
+        INFO("literal: " << lit);
+        CHECK(yuzu::server::mgmt_group_error_is_store_fault(lit));
+    }
+    CHECK(seen >= 20);  // the scan found the store's messages (the file has about 30)
+    CHECK(faults >= 10); // and the fault ones among them
 }

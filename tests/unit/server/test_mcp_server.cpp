@@ -52274,6 +52274,52 @@ TEST_CASE("MCP assign_management_group_role: a control byte in a field is refuse
     CHECK(store.get_group_roles(gid).size() == 1);
 }
 
+TEST_CASE("MCP assign_management_group_role: a caller value that contains the word failed is "
+          "invalid params, not a retryable store fault",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Classifier";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start();
+
+    // RbacStore::validate_assignment echoes the caller's principal_type in its message, so a
+    // value holding "failed" must not be read as a store fault.
+    for (const char* type : {"failed", "unfailed", "login failed"}) {
+        INFO("principal_type " << type);
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", gid},
+                                              {"principal_type", type},
+                                              {"principal_id", "alice"},
+                                              {"role_name", "Operator"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(store.get_group_roles(gid).empty());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").empty());
+        for (const auto& detail : wf_rows_since(ts, before, "management_group.assign_role|failure"))
+            CHECK(detail != "store_error");
+    }
+}
+
 TEST_CASE("MCP management-group member and role tools: a group id naming no group is the "
           "not-found answer with no failure row and no retry hint",
           "[mcp][pg][management_group][validation]") {

@@ -61,6 +61,7 @@
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
 #include "app_usage_store.hpp"            // get_agent_app_usage (wave 7 PR7.2 projection)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+#include "mgmt_group_error.hpp"            // mgmt_group_error_is_store_fault: one classifier for REST and MCP
 #include "rbac_text.hpp"                  // rbac_text_is_clean — identifier check shared with the owner
 #include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
 // ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
@@ -6923,29 +6924,26 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 // still giving the MCP twins an HONEST retry_after_ms on the genuinely
 // transient subset, per A5 (docs/agentic-first-principle.md).
 //
-// Every store write failure the six mutating methods this PR twins
+// Every store write failure the mutating methods this PR twins
 // (create_group/update_group/add_member/assign_role) can return is either:
-//   - a store-open/pool/query fault: "database not open", "pool acquire timed
-//     out", "failed to resolve ancestor chain (store degraded)", or one of the
-//     "<verb> failed: <pg error>" writes (create/update/add_member/assign_role) —
-//     ALL and ONLY of these contain the substring "failed" somewhere (the
-//     verb-prefixed writes literally say "... failed: ..."; the two exact-match
-//     strings are covered explicitly). Genuinely transient — retryable.
-//   - a validation/business-rule rejection ("group name cannot be empty",
-//     "parent group not found", "maximum hierarchy depth (5) exceeded",
-//     "re-parenting would create a cycle", "engine principals cannot hold
-//     scoped role assignments in this release", or a
-//     RbacStore::validate_assignment message) — none of these contain
-//     "failed". Client error — not retryable, matches REST's 400.
+//   - a store-open/pool/query fault, one of the FIXED messages listed in
+//     mgmt_group_error.hpp ("database not open", "pool acquire timed out", the
+//     "<verb> failed: <pg error>" writes, ...), matched on the message PREFIX only. Genuinely
+//     transient: retryable.
+//   - a validation/business-rule rejection ("group name cannot be empty", "parent group not
+//     found", "maximum hierarchy depth (5) exceeded", "re-parenting would create a cycle",
+//     "engine principals cannot hold scoped role assignments in this release", or a
+//     RbacStore::validate_assignment message, some of which echo caller text such as
+//     "unrecognized principal_type '<value>'"). Client error: not retryable, matches REST's 400.
+// The earlier test was the word "failed" anywhere in the message, which let a caller value
+// holding that word read as a store fault.
 struct MgmtGroupErrorInfo {
     int code;
     long retry_after_ms; // -1 => no retry hint (not blindly retryable)
 };
 MgmtGroupErrorInfo classify_mgmt_group_error(const std::string& msg) {
-    if (msg == "database not open" || msg == "pool acquire timed out" ||
-        msg.find("failed") != std::string::npos) {
+    if (mgmt_group_error_is_store_fault(msg))
         return {kInternalError, mcp::kMcpStoreFaultRetryMs};
-    }
     return {kInvalidParams, -1};
 }
 
