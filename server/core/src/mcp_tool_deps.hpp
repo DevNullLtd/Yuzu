@@ -92,7 +92,7 @@ struct ToolDeps {
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
     using RosterFn = std::function<InventoryDevicesResult()>;
-    using CiDetailFn = std::function<HardwareCiDetail(const std::string& agent_id, bool with_sections)>;
+    using CiDetailFn = std::function<HardwareCiDetail(const std::string& agent_id, CiRead read)>;
     using DexScoreFn = std::function<int(const std::string& agent_id)>;
 
     FleetReadFn fleet_read_fn;

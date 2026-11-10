@@ -51,6 +51,11 @@ constexpr int kListRowCap = 100000;
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// A failed read of the v2 per-section statements (the section status SELECT or a per-kind row
+// SELECT) after - or, for the standalone `get_device_ci_sections`, instead of - the record read:
+// kept apart from `query_error` (the record read failed) because the two are answered differently
+// (REST 503 / MCP retryable error versus `ci: null`, HTTP 200) and fixed differently.
+constexpr const char* kReasonSectionsQueryError = "sections_query_error";
 // Sample the per-site degrade WARN (leading edge of an episode, then every Nth)
 // so a sustained PG outage during a roster poll cannot flood the log — the counter
 // is the continuous signal, the log a sampled breadcrumb. Values match the
@@ -589,7 +594,8 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             const std::size_t ncol = cols.size();
             // Computed from exactly what is about to be stored (short rows pad, long rows
             // truncate to the registry's columns - the same rule the INSERT applies below).
-            const auto digest = section_content_digest(def, sec.rows);
+            const auto digest =
+                section_content_digest(def, sec.rows, digest_fn_ ? digest_fn_ : &sha256_hex);
             if (!digest) {
                 const bool failed = fail("digest");
                 fail_err = "digest_provider_failed"; // no libpq statement failed: name the cause
@@ -853,7 +859,7 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
     if (!ok) {
         // Never an empty success on a failed read: a degrade the caller can surface.
         static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+        if (note_read_degrade(metrics_, kReasonSectionsQueryError, s).should_log)
             spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
                          pool_.last_error());
         return std::unexpected(CiReadError::kDegraded);
@@ -926,7 +932,7 @@ DeviceInventoryStore::get_device_ci_with_sections(std::string_view agent_id) {
         // The record read answered; only a section statement failed. Say so - never an
         // empty-sections success - and keep the record the caller may still need.
         static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+        if (note_read_degrade(metrics_, kReasonSectionsQueryError, s).should_log)
             spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
                          pool_.last_error());
         result.record->sections.clear();

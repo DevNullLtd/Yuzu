@@ -14,11 +14,15 @@
 #include "authz_model.hpp"
 #include "secure_random.hpp"
 #include "echo_tree_routes.hpp"
+#include "source_scan.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <nlohmann/json.hpp>
 
+#include <cctype>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -27,6 +31,7 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::test::source_scan::count_occurrences;
 
 namespace {
 
@@ -38,17 +43,32 @@ DexAgentResponse resp(const std::string& agent_id, const std::string& output) {
     return r;
 }
 
-// A canned $Process_Live body: systemd(1) -> bash(100). node 0 is systemd.
-const char* kProcOut =
-    "__schema__|ts|action|pid|ppid|name|cmdline|user\n"
-    "100|started|1|0|systemd||root\n"
-    "110|started|100|1|bash||alice\n";
+// An empty $TCP_Hourly answer (schema and trailer only), what an agent sends for a quiet hour.
+const char* kEmptyTcp =
+    "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|disconnect_count|"
+    "failed_count\n__total__|0\n";
 
-// The two canned command ids the result route polls (must start with "echo-").
+// A canned $Process_Hourly body for hour 7200: systemd -> bash. node 0 is systemd, node 1
+// bash. (parent_name and abnormal_exit_count are agent-folded; fixture-only until then.)
+const char* kProcOut =
+    "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count\n"
+    "7200|systemd||root|1|0|0\n"
+    "7200|bash|systemd|alice|3|3|1\n";
+// Two hours: 7200 (systemd -> bash) is the newest, 3600 holds only cron.
+const char* kProcTwoHours =
+    "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count\n"
+    "7200|systemd||root|1|0|0\n"
+    "7200|bash|systemd|alice|3|3|1\n"
+    "3600|cron||root|2|2|0\n";
+
+// The three canned command ids the result route polls (must start with "echo-").
 const std::string kProcCmd = "echo-p";
 const std::string kTcpCmd = "echo-t";
+const std::string kHoursCmd = "echo-h";
 // Canned ids for the capture-sources frame's two dispatches (`echo status` and
 // `echo compatibility`), which the route polls by the scmd/ccmd query params.
+const std::string kDnsCmd = "echo-d";
+const std::string kArpCmd = "echo-a";
 const std::string kStatusCmd = "echo-s";
 const std::string kCompatCmd = "echo-c";
 
@@ -67,6 +87,7 @@ struct EchoHarness {
     // (nullopt = unfiltered/TOP, matching a global grant or RBAC-off).
     std::optional<std::vector<std::string>> fleet_scope;
     bool allow_execute = true;
+    int dispatch_sent = 1; // agents a dispatch reaches; 0 models an offline device
     // #4027: operator-scoped device list the /fragments/echo/... HTML frames
     // (still on devices_fn_/perm_fn_ this round) render.
     std::vector<DeviceRow> devices_list;
@@ -82,7 +103,13 @@ struct EchoHarness {
     std::string scope_device; // empty = unrestricted; else scoped Read denied elsewhere
     std::string os = "linux";
     std::string proc_output = kProcOut;
-    std::string tcp_output;    // empty → tree renders without conns (best-effort TCP)
+    // The window's hour list (the `SELECT DISTINCT hour_ts` answer) and an empty $TCP_Hourly
+    // answer: a real agent always writes the schema line and the trailer.
+    std::string hours_output = "__schema__|hour_ts\n7200\n3600\n__total__|2\n";
+    std::string tcp_output = kEmptyTcp;
+    std::string dns_output;    // canned $DNS_Hourly / $ARP_Hourly replies for the device-net poll
+    std::string arp_output;
+    std::vector<std::string> sql_log; // every echo.sql string a dispatch carried, in order
     // Capture-sources frame: canned `echo status` / `echo compatibility` replies.
     std::string status_output;
     std::string compat_output = "config|dummy|1";
@@ -96,6 +123,9 @@ struct EchoHarness {
     std::vector<AuditRow> audit_log;
     DispatchCaller last_dispatch_caller; // #3133: observes what dispatch actually received
     std::unordered_map<std::string, std::string> last_dispatch_params; // what the last dispatch carried
+    // Per command id, the exact frames the store answers (newest first, as the real store does):
+    // a long answer is several frames. Overrides the one-frame replies below.
+    std::unordered_map<std::string, std::vector<DexAgentResponse>> frames_override;
 
     EchoHarness() {
         auto auth = [this](const httplib::Request&,
@@ -173,9 +203,15 @@ struct EchoHarness {
             last_dispatch_caller = caller;
             last_dispatch_params = params;
             const auto it = params.find("sql");
-            const bool is_proc =
-                it != params.end() && it->second.find("$Process_Live") != std::string::npos;
-            return {.sent = 1, .command_id = is_proc ? kProcCmd : kTcpCmd};
+            const std::string sql = it != params.end() ? it->second : std::string{};
+            sql_log.push_back(sql);
+            const auto has = [&](const char* t) { return sql.find(t) != std::string::npos; };
+            return {.sent = dispatch_sent,
+                    .command_id = has("DISTINCT hour_ts") ? kHoursCmd
+                                  : has("$Process_Hourly") ? kProcCmd
+                                  : has("$DNS_Hourly")     ? kDnsCmd
+                                  : has("$ARP_Hourly")     ? kArpCmd
+                                                           : kTcpCmd};
         };
         // #3133 review fix: mirrors the production idiom (resolve the session,
         // derive a real caller) closely enough for this harness's simplified
@@ -189,10 +225,18 @@ struct EchoHarness {
         };
         auto responses = [this](const std::string& cmd,
                                  const std::string& /*agent_id*/) -> std::vector<DexAgentResponse> {
+            if (const auto f = frames_override.find(cmd); f != frames_override.end())
+                return f->second;
             if (cmd == kProcCmd)
                 return {resp(device, proc_output)};
             if (cmd == kTcpCmd)
                 return {resp(device, tcp_output)};
+            if (cmd == kHoursCmd)
+                return {resp(device, hours_output)};
+            if (cmd == kDnsCmd)
+                return {resp(device, dns_output)};
+            if (cmd == kArpCmd)
+                return {resp(device, arp_output)};
             if (cmd == kStatusCmd)
                 return {resp(device, status_output)};
             if (cmd == kCompatCmd)
@@ -215,11 +259,14 @@ struct EchoHarness {
         routes.set_all_devices_fn(all_devices); // #4143 review fix — REST twins' sole row source
     }
 
-    // Drive /result directly (skips /run; the result route reads pcmd/tcmd from the
-    // query, and we control the canned command ids). Returns the response.
-    std::unique_ptr<httplib::Response> run_result(const std::string& extra = "") {
+    // Drive /result directly (skips /run; the result route reads pcmd/tcmd/hcmd and the resolved
+    // hour from the query, and we control the canned command ids). `hour` defaults to the hour
+    // the canned process rows are for; "" sends none. Returns the response.
+    std::unique_ptr<httplib::Response> run_result(const std::string& hour = "7200",
+                                                  const std::string& extra = "") {
         return sink.Get("/fragments/echo/process-tree/result?device=" + device +
-                        "&preset=10m&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&n=1" + extra);
+                        "&preset=24h&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&hcmd=" + kHoursCmd +
+                        "&n=1" + (hour.empty() ? "" : "&hour=" + hour) + extra);
     }
 
     // Drive the capture-sources frame past the pending poll, the same way
@@ -381,12 +428,12 @@ TEST_CASE("echo routes: /detail audit normalizes the agent-controlled os",
 
 TEST_CASE("echo routes: /run audit neutralizes an injected preset", "[echo][routes][audit]") {
     EchoHarness h;
-    // preset carries an audit-field-forgery attempt; canonicalization maps it to 10m.
+    // preset carries an audit-field-forgery attempt; canonicalization maps it to 24h.
     auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=x%20command_id%3Dforged");
     REQUIRE(r);
     const auto* row = h.find_audit("echo.process_tree.read", "dispatched");
     REQUIRE(row != nullptr);
-    CHECK(row->detail.find("preset=10m") != std::string::npos);
+    CHECK(row->detail.find("preset=24h") != std::string::npos);
     CHECK(row->detail.find("forged") == std::string::npos); // injection neutralized
 }
 
@@ -438,14 +485,15 @@ TEST_CASE("echo routes: /result refuses an invalid custom window and renders a v
     for (const char* window : {"&from=garbage&to=", "&from=2026-02-31T00:00&to=2026-03-01T00:00"}) {
         EchoHarness h;
         auto r = h.sink.Get("/fragments/echo/process-tree/result?device=" + h.device +
-                            "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&n=1" + window);
+                            "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&hcmd=" + kHoursCmd +
+                            "&n=1" + window);
         REQUIRE(r);
         CHECK(r->body.find("not a valid time") != std::string::npos);
         CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
     }
     EchoHarness h;
     auto r = h.sink.Get("/fragments/echo/process-tree/result?device=" + h.device +
-                        "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd +
+                        "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&hcmd=" + kHoursCmd +
                         "&n=1&from=2026-06-18T12:00&to=2026-06-18T13:00");
     REQUIRE(r);
     CHECK(r->body.find("not a valid time") == std::string::npos);
@@ -700,10 +748,10 @@ TEST_CASE("Echo capture-sources: an offline device shows the agent's reason, not
     // The `error|` prefix itself is stripped, not echoed raw.
     CHECK(res->body.find("error|") == std::string::npos);
     // And it must NOT have rendered the sources grid for a dead store. Assert
-    // the id the renderer actually emits (`capTable`, echo_process_tree.cpp:1235)
+    // the id the renderer actually emits (`capCards`, echo_process_tree.cpp)
     // -- an earlier version of this checked for "capture-source-row", a string
     // that exists nowhere in the codebase and so passed vacuously.
-    CHECK(res->body.find("capTable") == std::string::npos);
+    CHECK(res->body.find("capCards") == std::string::npos);
 }
 
 TEST_CASE("Echo capture-sources: a healthy device still renders the sources grid",
@@ -719,10 +767,789 @@ TEST_CASE("Echo capture-sources: a healthy device still renders the sources grid
     auto res = h.run_capture_sources();
     REQUIRE(res != nullptr);
     REQUIRE(res->status == 200);
-    // Positively assert the grid: `capTable` is what the renderer emits.
-    CHECK(res->body.find("capTable") != std::string::npos);
+    // Positively assert the grid: `capCards` is what the renderer emits.
+    CHECK(res->body.find("capCards") != std::string::npos);
     CHECK(res->body.find("Echo storage is offline") == std::string::npos);
     CHECK(res->body.find("failed the status query") == std::string::npos);
+}
+
+// =============================================================================
+// Roll-up only: the hourly SQL, whole-hour windows, the Hour selector, the cards
+// =============================================================================
+
+namespace {
+
+// The number following `key` in `sql` (digits only), or -1.
+std::int64_t number_after(const std::string& sql, const std::string& key) {
+    const auto p = sql.find(key);
+    if (p == std::string::npos)
+        return -1;
+    std::int64_t v = 0;
+    std::size_t i = p + key.size();
+    if (i >= sql.size() || !std::isdigit(static_cast<unsigned char>(sql[i])))
+        return -1;
+    for (; i < sql.size() && std::isdigit(static_cast<unsigned char>(sql[i])); ++i)
+        v = v * 10 + (sql[i] - '0');
+    return v;
+}
+
+} // namespace
+
+TEST_CASE("echo routes: /run reads ONE hour of the process and tcp tables plus the window's hour list",
+          "[echo][routes][sql]") {
+    EchoHarness h;
+    auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
+    REQUIRE(r);
+    REQUIRE(h.sql_log.size() == 3);
+    const std::string& psql = h.sql_log[0];
+    const std::string& tsql = h.sql_log[1];
+    const std::string& hsql = h.sql_log[2];
+    // No hour asked for: the window's last complete bucket, as a single int64 equality.
+    const auto hour = number_after(hsql, "hour_ts <= ");
+    REQUIRE(hour > 0);
+    CHECK(hour % 3600 == 0);
+    CHECK(psql == "SELECT hour_ts, name, parent_name, user, start_count, stop_count, "
+                  "abnormal_exit_count FROM $Process_Hourly WHERE hour_ts = " +
+                      std::to_string(hour) + " LIMIT 10000");
+    CHECK(tsql == "SELECT hour_ts, remote_addr, remote_port, proto, process_name, connect_count, "
+                  "disconnect_count, failed_count FROM $TCP_Hourly WHERE hour_ts = " +
+                      std::to_string(hour) + " LIMIT 10000");
+    // The hour list: the 24 whole buckets of the window, distinct, newest first, bounded.
+    const auto from = number_after(hsql, "hour_ts >= ");
+    REQUIRE(from > 0);
+    CHECK(from % 3600 == 0);
+    CHECK((hour - from) / 3600 == 23);
+    CHECK(hsql == "SELECT DISTINCT hour_ts FROM $Process_Hourly WHERE hour_ts >= " +
+                      std::to_string(from) + " AND hour_ts <= " + std::to_string(hour) +
+                      " ORDER BY hour_ts DESC LIMIT 168");
+    for (const auto& sql : h.sql_log)
+        CHECK(sql.find("_Live") == std::string::npos); // no raw capture rows are read
+    // The poll URL carries the window, the RESOLVED hour and all three command ids.
+    CHECK(r->body.find("process-tree/result") != std::string::npos);
+    CHECK(r->body.find("preset=24h") != std::string::npos);
+    CHECK(r->body.find("hour=" + std::to_string(hour)) != std::string::npos);
+    CHECK(r->body.find("pcmd=echo-p") != std::string::npos);
+    CHECK(r->body.find("tcmd=echo-t") != std::string::npos);
+    CHECK(r->body.find("hcmd=echo-h") != std::string::npos);
+
+    SECTION("an asked-for hour is the one read; the hour list still covers the window") {
+        EchoHarness one;
+        auto res = one.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h&hour=3600");
+        REQUIRE(res);
+        REQUIRE(one.sql_log.size() == 3);
+        CHECK(one.sql_log[0].find("FROM $Process_Hourly WHERE hour_ts = 3600 LIMIT 10000") !=
+              std::string::npos);
+        CHECK(one.sql_log[1].find("FROM $TCP_Hourly WHERE hour_ts = 3600 LIMIT 10000") !=
+              std::string::npos);
+        CHECK(number_after(one.sql_log[2], "hour_ts <= ") != 3600);
+        CHECK(res->body.find("hour=3600") != std::string::npos);
+    }
+    SECTION("1h is one bucket; a reversed custom range collapses to one") {
+        EchoHarness one;
+        (void)one.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=1h");
+        REQUIRE(one.sql_log.size() == 3);
+        CHECK(number_after(one.sql_log[2], "hour_ts >= ") == number_after(one.sql_log[2], "hour_ts <= "));
+
+        EchoHarness rev;
+        (void)rev.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=custom"
+                           "&from=2026-06-18T13:00&to=2026-06-18T12:00");
+        REQUIRE(rev.sql_log.size() == 3);
+        CHECK(number_after(rev.sql_log[2], "hour_ts >= ") == number_after(rev.sql_log[2], "hour_ts <= "));
+    }
+}
+
+TEST_CASE("echo routes: the frame offers 1h / 24h / 7d / custom and no retired anchors",
+          "[echo][routes][presets]") {
+    EchoHarness h;
+    auto r = h.sink.Get("/fragments/echo/process-tree");
+    REQUIRE(r);
+    for (const char* tok : {"preset=1h", "preset=24h", "preset=7d", "preset=custom"})
+        CHECK(r->body.find(tok) != std::string::npos);
+    for (const char* gone : {"on_boot", "on_install", "preset=1m", "preset=10m", "preset=1d",
+                             "On boot", "On agent install", "data-statechip", "Running", "Exited"})
+        CHECK(r->body.find(gone) == std::string::npos);
+    // The device DNS / ARP placeholder is filled by the tree result, not by a host-change poll.
+    CHECK(r->body.find("id=\"echo-devnet\"></div>") != std::string::npos);
+}
+
+TEST_CASE("echo routes: /result shows the resolved hour and an Hour selector for this device",
+          "[echo][routes][hour]") {
+    EchoHarness h;
+    h.proc_output = kProcTwoHours; // the agent answers ONE hour; the extra rows are not trusted
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    // Hour 7200 was asked for: systemd + bash, and cron (another hour's row) is not shown.
+    CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+    CHECK(r->body.find("<span class=\"tt-name\">cron</span>") == std::string::npos);
+    // The selector lists the hours the device reported, the shown one selected. Its URL names
+    // THIS device and carries no host-picker include, so a later hour change cannot ask another.
+    CHECK(r->body.find("<option value=\"7200\" selected>") != std::string::npos);
+    CHECK(r->body.find("<option value=\"3600\">") != std::string::npos);
+    CHECK(r->body.find("id=\"echo-tree-hour\" name=\"hour\"") != std::string::npos);
+    CHECK(r->body.find("process-tree/run?device=dev-A&amp;preset=24h") != std::string::npos);
+    CHECK(r->body.find("hx-include") == std::string::npos);
+    // Out-of-band: the device DNS / ARP panels follow the shown hour, for this device.
+    CHECK(r->body.find("id=\"echo-devnet\" hx-swap-oob=\"true\"") != std::string::npos);
+    CHECK(r->body.find("device-net?device=dev-A&amp;hour=7200") != std::string::npos);
+
+    SECTION("an explicit hour picks that hour's tree") {
+        h.proc_output = "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|"
+                        "abnormal_exit_count\n3600|cron||root|2|2|0\n__total__|1\n";
+        auto older = h.run_result("3600");
+        REQUIRE(older);
+        CHECK(older->body.find("<span class=\"tt-name\">cron</span>") != std::string::npos);
+        CHECK(older->body.find("<span class=\"tt-name\">bash</span>") == std::string::npos);
+        CHECK(older->body.find("<option value=\"3600\" selected>") != std::string::npos);
+        CHECK(older->body.find("device-net?device=dev-A&amp;hour=3600") != std::string::npos);
+    }
+    SECTION("an hour the device did not report is offered and selected, so the box and banner agree") {
+        h.hours_output = "__schema__|hour_ts\n7200\n__total__|1\n";
+        auto other = h.run_result("10800");
+        REQUIRE(other);
+        CHECK(other->body.find("<option value=\"10800\" selected>") != std::string::npos);
+        CHECK(other->body.find("<option value=\"7200\">") != std::string::npos);
+        CHECK(other->body.find("1970-01-01T03:00:00Z") != std::string::npos); // the banner's hour
+        CHECK(other->body.find("No process activity recorded for this hour") != std::string::npos);
+    }
+    SECTION("no hour at all is the window's last complete bucket") {
+        auto none = h.run_result("");
+        REQUIRE(none);
+        // Hour 7200's rows are not that bucket, so the tree is empty for it, and says so.
+        CHECK(none->body.find("No process activity recorded for this hour") != std::string::npos);
+        CHECK(none->body.find("<span class=\"tt-name\">bash</span>") == std::string::npos);
+        CHECK(none->body.find(" selected>") != std::string::npos);
+    }
+    SECTION("an unparseable hour is refused") {
+        EchoHarness bad;
+        bad.proc_output = kProcTwoHours;
+        auto res = bad.run_result("yesterday");
+        REQUIRE(res);
+        CHECK(res->body.find("not a valid time") != std::string::npos);
+        CHECK(bad.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+    SECTION("a device that could not list the hours still shows the tree and says so") {
+        h.hours_output = "error|no such column: hour_ts";
+        auto res = h.run_result();
+        REQUIRE(res);
+        CHECK(res->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(res->body.find("The list of other hours was unavailable") != std::string::npos);
+        CHECK(res->body.find("<option value=\"7200\" selected>") != std::string::npos);
+    }
+}
+
+TEST_CASE("echo routes: an agent without the roll-up store gets the upgrade note for the tree",
+          "[echo][routes][skew]") {
+    EchoHarness h;
+    h.proc_output = "error|no such column: parent_name";
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->body.find("This device runs an agent without the roll-up store: upgrade the agent") !=
+          std::string::npos);
+    CHECK(r->body.find("parent_name") == std::string::npos); // the raw SQLite text is not the message
+    CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
+
+    SECTION("any other agent error keeps its reason") {
+        h.proc_output = "error|database is locked";
+        auto other = h.run_result();
+        REQUIRE(other);
+        CHECK(other->body.find("The device reported an error: database is locked") != std::string::npos);
+    }
+    SECTION("a failed command reads the same way") {
+        DexAgentResponse f;
+        f.agent_id = "dev-A";
+        f.status = 2;
+        f.error_detail = "no such table: process_hourly";
+        h.frames_override[kProcCmd] = {f};
+        auto failed = h.run_result();
+        REQUIRE(failed);
+        CHECK(failed->body.find("upgrade the agent") != std::string::npos);
+    }
+    SECTION("an answer with no schema is unreadable and never an empty tree") {
+        h.proc_output = "7200|bash|systemd|alice|3|3|1\n";
+        auto bare = h.run_result();
+        REQUIRE(bare);
+        CHECK(bare->body.find("could not be read as process activity") != std::string::npos);
+        CHECK(bare->body.find("No process activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+}
+
+TEST_CASE("echo routes: the tree names why connections are missing", "[echo][routes][skew]") {
+    EchoHarness h;
+    SECTION("an old agent") {
+        h.tcp_output = "error|no such column: failed_count";
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos); // tree kept
+        CHECK(r->body.find("Connection data was unavailable for this host") != std::string::npos);
+        CHECK(r->body.find("upgrade the agent") != std::string::npos);
+    }
+    SECTION("an answer with no schema") {
+        h.tcp_output = "";
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("its answer could not be read") != std::string::npos);
+    }
+    SECTION("a healthy empty answer says nothing is wrong") {
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("Connection data was unavailable") == std::string::npos);
+    }
+}
+
+// B1: the agent flushes a long answer as several frames and the store answers newest first.
+// Reading only one frame showed a torn tree; every frame of the command is merged.
+namespace {
+DexAgentResponse frame(const std::string& body, int status = 1) {
+    DexAgentResponse f;
+    f.agent_id = "dev-A";
+    f.status = status;
+    f.output = body;
+    return f;
+}
+const char* kProcSchema =
+    "__schema__|hour_ts|name|parent_name|user|start_count|stop_count|abnormal_exit_count";
+} // namespace
+
+TEST_CASE("echo routes: a process answer in two frames reconstructs the whole tree",
+          "[echo][routes][frames]") {
+    EchoHarness h;
+    // Newest first, as the store answers: the data-only frame ahead of the schema frame.
+    h.frames_override[kProcCmd] = {frame("7200|bash|systemd|alice|3|3|1\n__total__|2"),
+                                   frame(std::string(kProcSchema) + "\n7200|systemd||root|1|0|0")};
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->body.find("<span class=\"tt-name\">systemd</span>") != std::string::npos);
+    CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+    CHECK(r->body.find("2 process names") != std::string::npos);
+    CHECK(r->body.find("unreadable") == std::string::npos);
+    CHECK(h.find_audit("echo.process_tree.read", "success") != nullptr);
+
+    SECTION("the same frames in the other order read the same") {
+        h.frames_override[kProcCmd] = {frame(std::string(kProcSchema) + "\n7200|systemd||root|1|0|0"),
+                                       frame("7200|bash|systemd|alice|3|3|1\n__total__|2")};
+        auto swapped = h.run_result();
+        REQUIRE(swapped);
+        CHECK(swapped->body.find("2 process names") != std::string::npos);
+    }
+    SECTION("an answer that is still streaming is not rendered as the whole") {
+        EchoHarness s;
+        s.frames_override[kProcCmd] = {frame(std::string(kProcSchema) + "\n7200|systemd||root|1|0|0", 0)};
+        auto streaming = s.run_result();
+        REQUIRE(streaming);
+        CHECK(streaming->body.find("process-tree/result") != std::string::npos); // keeps polling
+        CHECK(streaming->body.find("tt-name") == std::string::npos);
+        CHECK(s.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+}
+
+TEST_CASE("echo routes: an answer at the agent's row cap is said to be cut", "[echo][routes][frames]") {
+    const auto rows_for = [](std::size_t n) {
+        std::string out = std::string(kProcSchema) + "\n";
+        for (std::size_t i = 0; i < n; ++i)
+            out += "7200|p" + std::to_string(i) + "||u|1|0|0\n";
+        return out + "__total__|" + std::to_string(n);
+    };
+    EchoHarness h;
+    h.proc_output = rows_for(kEchoAgentRowCap);
+    auto cut = h.run_result();
+    REQUIRE(cut);
+    CHECK(cut->status == 200);
+    CHECK(cut->body.find("Results were cut at 10,000 rows for this hour") != std::string::npos);
+    CHECK(cut->body.find("echo-tree-banner") != std::string::npos); // the rows that came are shown
+    // One row under the cap is complete: no note.
+    EchoHarness under;
+    under.proc_output = rows_for(kEchoAgentRowCap - 1);
+    auto whole = under.run_result();
+    REQUIRE(whole);
+    CHECK(whole->body.find("were cut at") == std::string::npos);
+
+    SECTION("the connection list is held to the same rule") {
+        std::string tcp =
+            "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|"
+            "disconnect_count|failed_count\n";
+        for (std::size_t i = 0; i < kEchoAgentRowCap; ++i)
+            tcp += "7200|10.0.0.1|" + std::to_string(1 + i % 60000) + "|tcp|bash|1|1|0\n";
+        EchoHarness c;
+        c.tcp_output = tcp;
+        auto r = c.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("Connection results were cut at 10,000 rows for this hour") != std::string::npos);
+        CHECK(r->body.find(">Results were cut") == std::string::npos); // the process list was whole
+    }
+}
+
+// B6: rows the parser cannot place are counted and shown, never silently absent.
+TEST_CASE("echo routes: rows that could not be read are counted on the page", "[echo][routes][security]") {
+    EchoHarness h;
+    h.proc_output = std::string(kProcSchema) +
+                    "\n7200|systemd||root|1|0|0\n"
+                    "7200|x|winword.exe|SYSTEM|5|5|0|9|9\n" // a forged name carrying pipes
+                    "7200|torn||u|1\n__total__|3";
+    auto r = h.run_result();
+    REQUIRE(r);
+    CHECK(r->body.find("2 rows unreadable") != std::string::npos);
+    CHECK(r->body.find("1 process names") != std::string::npos);
+    CHECK(r->body.find("tt-name\">x<") == std::string::npos); // the forged row is not in the tree
+}
+
+// B3: the DNS / ARP panels live outside the tree, so every answer that is not a finished tree
+// for this device clears them. One host's tables must never sit under another host's view.
+TEST_CASE("echo routes: every answer that is not a finished tree clears the DNS and ARP panels",
+          "[echo][routes][devnet]") {
+    const std::string reset = "<div id=\"echo-devnet\" hx-swap-oob=\"true\"></div>";
+    SECTION("a blank host") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/run?device=&preset=24h");
+        REQUIRE(r);
+        CHECK(r->body.find("Select a host") != std::string::npos);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("the poll fragment /run answers while the tree is rebuilt") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
+        REQUIRE(r);
+        CHECK(r->body.find("process-tree/result") != std::string::npos);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("an offline device") {
+        EchoHarness h;
+        h.dispatch_sent = 0;
+        auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
+        REQUIRE(r);
+        CHECK(r->body.find("Device offline") != std::string::npos);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("an operator without Execute") {
+        EchoHarness h;
+        h.allow_execute = false;
+        auto run = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h");
+        REQUIRE(run);
+        CHECK(run->body.find(reset) != std::string::npos);
+        auto result = h.run_result();
+        REQUIRE(result);
+        CHECK(result->body.find("Execute") != std::string::npos);
+        CHECK(result->body.find(reset) != std::string::npos);
+    }
+    SECTION("an invalid window or hour") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=custom&from=garbage");
+        REQUIRE(r);
+        CHECK(r->body.find("not a valid time") != std::string::npos);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("a result still being collected, and one that timed out") {
+        EchoHarness h;
+        h.frames_override[kProcCmd] = {}; // nothing stored yet
+        auto pending = h.run_result();
+        REQUIRE(pending);
+        CHECK(pending->body.find("hx-trigger=\"load delay:700ms\"") != std::string::npos);
+        CHECK(pending->body.find(reset) != std::string::npos);
+        auto late = h.sink.Get("/fragments/echo/process-tree/result?device=dev-A&preset=24h&hour=7200&pcmd=" +
+                               kProcCmd + "&tcmd=" + kTcpCmd + "&hcmd=" + kHoursCmd + "&n=40");
+        REQUIRE(late);
+        CHECK(late->body.find("timed out") != std::string::npos);
+        CHECK(late->body.find(reset) != std::string::npos);
+    }
+    SECTION("an agent error") {
+        EchoHarness h;
+        h.proc_output = "error|boom";
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find(reset) != std::string::npos);
+    }
+    SECTION("a finished tree replaces the panel once, for this device") {
+        EchoHarness h;
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find(reset) == std::string::npos);
+        CHECK(count_occurrences(r->body, "id=\"echo-devnet\"") == 1);
+        CHECK(r->body.find("hx-get=\"/fragments/echo/process-tree/device-net?device=dev-A&amp;hour=7200\"") !=
+              std::string::npos);
+        CHECK(r->body.find("hx-include") == std::string::npos); // the picker's current value is not asked
+    }
+}
+
+// B8: dispatch details name the window and the hour; the success detail names the hour.
+TEST_CASE("echo routes: the tree audit rows name the window and the hour", "[echo][routes][audit]") {
+    EchoHarness h;
+    (void)h.sink.Get("/fragments/echo/process-tree/run?device=dev-A&preset=24h&hour=3600");
+    const auto* run = h.find_audit("echo.process_tree.read", "dispatched");
+    REQUIRE(run != nullptr);
+    CHECK(run->detail.starts_with("dispatch preset=24h from="));
+    CHECK(run->detail.find(" to=") != std::string::npos);
+    CHECK(run->detail.find(" hour=3600 command_id=echo-p") != std::string::npos);
+
+    EchoHarness r;
+    (void)r.run_result();
+    const auto* ok = r.find_audit("echo.process_tree.read", "success");
+    REQUIRE(ok != nullptr);
+    CHECK(ok->detail.find(" hour=7200 ") != std::string::npos);
+    CHECK(ok->detail.find("from=") != std::string::npos);
+    CHECK(ok->detail.find("to=") != std::string::npos);
+}
+
+TEST_CASE("echo routes: /detail joins connections by process name", "[echo][routes][detail]") {
+    EchoHarness h;
+    h.tcp_output =
+        "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|"
+        "disconnect_count|failed_count\n"
+        "7200|1.2.3.4|443|tcp|bash|5|4|1\n"
+        "3600|9.9.9.9|80|tcp|bash|1|1|0\n"; // another hour: not shown
+    const std::string token = extract_token(h.run_result()->body);
+    REQUIRE(is_32_hex(token));
+    auto bash = h.get_detail(token, 1);
+    REQUIRE(bash);
+    CHECK(bash->body.find("1.2.3.4:443") != std::string::npos);
+    CHECK(bash->body.find("9.9.9.9") == std::string::npos);
+    auto systemd = h.get_detail(token, 0);
+    REQUIRE(systemd);
+    CHECK(systemd->body.find("1.2.3.4") == std::string::npos);
+    CHECK(systemd->body.find("No TCP connections recorded under this name") != std::string::npos);
+}
+
+TEST_CASE("echo routes: /device-net dispatches only the hourly tables for the chosen hour",
+          "[echo][routes][sql]") {
+    SECTION("with an hour: that single bucket, only the counts the agent measures") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A&hour=7200");
+        REQUIRE(r);
+        REQUIRE(h.sql_log.size() == 2);
+        CHECK(h.sql_log[0] ==
+              "SELECT hour_ts, name, record_type, data, appear_count, remove_count "
+              "FROM $DNS_Hourly WHERE hour_ts >= 7200 AND hour_ts <= 7200 "
+              "ORDER BY hour_ts DESC LIMIT 10000");
+        CHECK(h.sql_log[1] ==
+              "SELECT hour_ts, interface, ip_address, mac_address, appear_count, remove_count "
+              "FROM $ARP_Hourly WHERE hour_ts >= 7200 AND hour_ts <= 7200 "
+              "ORDER BY hour_ts DESC LIMIT 10000");
+        for (const char* unmeasured : {"negative_count", "is_router", "rebind_count"})
+            for (const auto& sql : h.sql_log)
+                CHECK(sql.find(unmeasured) == std::string::npos);
+        CHECK(r->body.find("hour=7200") != std::string::npos); // the poll keeps the hour
+        // The dispatch audit names the hour it read.
+        const auto* dns = h.find_audit("echo.dns.read", "dispatched");
+        REQUIRE(dns != nullptr);
+        CHECK(dns->detail == "hour=7200 command_id=echo-d");
+        const auto* arp = h.find_audit("echo.arp.read", "dispatched");
+        REQUIRE(arp != nullptr);
+        CHECK(arp->detail == "hour=7200 command_id=echo-a");
+    }
+    SECTION("without one: the default 24-hour window") {
+        EchoHarness h;
+        (void)h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A");
+        REQUIRE(h.sql_log.size() == 2);
+        for (const auto& sql : h.sql_log) {
+            CHECK(sql.find("_Live") == std::string::npos);
+            CHECK((number_after(sql, "hour_ts <= ") - number_after(sql, "hour_ts >= ")) / 3600 == 23);
+        }
+    }
+    SECTION("a bad hour is refused before any dispatch") {
+        EchoHarness h;
+        auto r = h.sink.Get("/fragments/echo/process-tree/device-net?device=dev-A&hour=soon");
+        REQUIRE(r);
+        CHECK(r->body.find("not a valid time") != std::string::npos);
+        CHECK(h.sql_log.empty());
+    }
+}
+
+namespace {
+const char* kDnsSchema = "__schema__|hour_ts|name|record_type|data|appear_count|remove_count\n";
+const char* kArpSchema =
+    "__schema__|hour_ts|interface|ip_address|mac_address|appear_count|remove_count\n";
+} // namespace
+
+TEST_CASE("echo routes: /device-net renders the chosen hour's DNS and ARP activity",
+          "[echo][routes][devnet]") {
+    EchoHarness h;
+    h.dns_output = std::string(kDnsSchema) +
+                   "7200|new.test|A|1.1.1.1|4|3\n"
+                   "3600|old.test|A|2.2.2.2|1|1\n__total__|2\n";
+    h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n";
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1";
+    auto chosen = h.sink.Get(poll + "&hour=3600");
+    REQUIRE(chosen);
+    CHECK(chosen->body.find("old.test") != std::string::npos);
+    CHECK(chosen->body.find("new.test") == std::string::npos);
+    CHECK(chosen->body.find("No ARP activity recorded for this hour") != std::string::npos);
+    // No hour given: the newest hour present in either answer.
+    auto newest = h.sink.Get(poll);
+    REQUIRE(newest);
+    CHECK(newest->body.find("new.test") != std::string::npos);
+    CHECK(newest->body.find("old.test") == std::string::npos);
+    // Nothing the agent does not write is shown as a measure.
+    for (const char* gone : {"No such name", "Rebinds", "<th>Role</th>"})
+        CHECK(newest->body.find(gone) == std::string::npos);
+}
+
+// B8: the poll that renders the rows is the audited read, as on the device pages; the
+// dispatch row alone recorded only a command id.
+TEST_CASE("echo routes: /device-net audits the DNS and ARP rows it renders", "[echo][routes][audit]") {
+    EchoHarness h;
+    h.dns_output = std::string(kDnsSchema) +
+                   "7200|a.test|A|1.1.1.1|1|0\n7200|b.test|A|1.1.1.2|1|0\n3600|old.test|A|2.2.2.2|1|1\n"
+                   "__total__|3\n";
+    h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n";
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+    auto r = h.sink.Get(poll);
+    REQUIRE(r);
+    const auto* dns = h.find_audit("echo.dns.read", "success");
+    REQUIRE(dns != nullptr);
+    CHECK(dns->detail == "hour=7200 rows=2"); // the hour's rows only, as an int64 count
+    CHECK(dns->target_id == "dev-A");
+    const auto* arp = h.find_audit("echo.arp.read", "success");
+    REQUIRE(arp != nullptr);
+    CHECK(arp->detail == "hour=7200 rows=1");
+
+    SECTION("a failed read is a failure row with no free text") {
+        EchoHarness f;
+        f.dns_output = "error|query failed: no such column: negative_count\nsecret detail";
+        f.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto res = f.sink.Get(poll);
+        REQUIRE(res);
+        const auto* fail = f.find_audit("echo.dns.read", "failure");
+        REQUIRE(fail != nullptr);
+        CHECK(fail->detail == "hour=7200");
+        CHECK(f.find_audit("echo.dns.read", "success") == nullptr);
+        const auto* ok = f.find_audit("echo.arp.read", "success");
+        REQUIRE(ok != nullptr);
+        CHECK(ok->detail == "hour=7200 rows=0");
+    }
+    SECTION("a poll that is not ready yet audits nothing") {
+        EchoHarness pending;
+        DexAgentResponse running;
+        running.agent_id = "dev-A";
+        running.status = 0;
+        running.output = std::string(kDnsSchema);
+        pending.frames_override[kDnsCmd] = {running};
+        auto res = pending.sink.Get(poll);
+        REQUIRE(res);
+        CHECK(res->body.find("device-net?device=dev-A") != std::string::npos); // keeps polling
+        CHECK(pending.find_audit("echo.dns.read", "success") == nullptr);
+        CHECK(pending.find_audit("echo.arp.read", "success") == nullptr);
+    }
+}
+
+TEST_CASE("echo routes: a DNS or ARP failure is an error in the panel and never an empty note",
+          "[echo][routes][skew]") {
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+    const std::string upgrade = "This device runs an agent without the roll-up store: upgrade the agent";
+    SECTION("an old agent, both panels") {
+        EchoHarness h;
+        h.dns_output = "error|query failed: no such column: negative_count";
+        h.arp_output = "error|unknown table: $ARP_Hourly";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(count_occurrences(r->body, upgrade) == 2);
+        CHECK(r->body.find("recorded for this hour") == std::string::npos);
+        CHECK(r->body.find("may be disabled") == std::string::npos);
+    }
+    SECTION("a failed command") {
+        EchoHarness h;
+        DexAgentResponse f;
+        f.agent_id = "dev-A";
+        f.status = 2;
+        f.error_detail = "plugin crashed";
+        h.frames_override[kDnsCmd] = {f};
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("The device reported an error: plugin crashed") != std::string::npos);
+        CHECK(r->body.find("No ARP activity recorded for this hour") != std::string::npos); // ARP is fine and empty
+    }
+    SECTION("an answer with no schema and an oversize answer") {
+        EchoHarness h;
+        h.dns_output = "7200|a.test|A|1.1.1.1|1|0\n";
+        h.arp_output = std::string(kMaxEchoDeviceNetOutputBytes + 1, 'x');
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("answer could not be read") != std::string::npos);
+        CHECK(r->body.find("unexpectedly large") != std::string::npos);
+        CHECK(r->body.find("a.test") == std::string::npos);
+    }
+    SECTION("a quiet host is still said to be quiet") {
+        EchoHarness h;
+        h.dns_output = std::string(kDnsSchema) + "__total__|0\n";
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("No DNS cache activity recorded for this hour") != std::string::npos);
+        CHECK(r->body.find("upgrade the agent") == std::string::npos);
+    }
+    SECTION("cut and unreadable rows are flagged") {
+        EchoHarness h;
+        std::string dns = kDnsSchema;
+        for (std::size_t i = 0; i < kEchoAgentRowCap; ++i)
+            dns += "7200|n" + std::to_string(i) + ".test|A|1.1.1.1|1|0\n";
+        h.dns_output = dns;
+        h.arp_output = std::string(kArpSchema) + "7200|eth0|10.0.0.1|aa:bb|1|0|9|9\n__total__|1\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("Results were cut at 10,000 rows for this hour") != std::string::npos);
+        CHECK(r->body.find("1 row unreadable") != std::string::npos);
+    }
+}
+
+// G8-1: the agent flushes a long answer as several frames, so a failure status can sit beside the
+// frames that came before it. Any failure fails the whole answer, whichever way the store orders
+// the rows: the head of a failed answer must never read as a finished one.
+namespace {
+DexAgentResponse failure_frame(const std::string& why) {
+    DexAgentResponse f;
+    f.agent_id = "dev-A";
+    f.status = 2;
+    f.error_detail = why;
+    return f;
+}
+const char* kTcpFrameBody =
+    "__schema__|hour_ts|remote_addr|remote_port|proto|process_name|connect_count|"
+    "disconnect_count|failed_count\n7200|10.0.0.1|443|tcp|bash|1|1|0\n__total__|1\n";
+} // namespace
+
+TEST_CASE("echo routes: a failure beside output frames fails the whole answer in either store order",
+          "[echo][routes][frames]") {
+    const bool failure_first = GENERATE(true, false);
+    CAPTURE(failure_first);
+    // The store answers newest first: the frames this test hands back, in the order under test.
+    const auto beside = [&](const std::string& body) {
+        std::vector<DexAgentResponse> v{frame(body), failure_frame("plugin crashed")};
+        if (failure_first)
+            std::swap(v[0], v[1]);
+        return v;
+    };
+    const std::string crashed = "The device reported an error: plugin crashed";
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+
+    SECTION("the process tree") {
+        EchoHarness h;
+        h.frames_override[kProcCmd] = beside(kProcOut);
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find(crashed) != std::string::npos);
+        CHECK(r->body.find("tt-name") == std::string::npos);
+        CHECK(h.find_audit("echo.process_tree.read", "success") == nullptr);
+    }
+    SECTION("the connection list keeps the tree and says why it is missing") {
+        EchoHarness h;
+        h.frames_override[kTcpCmd] = beside(kTcpFrameBody);
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(r->body.find("Connection data was unavailable for this host") != std::string::npos);
+        CHECK(r->body.find(crashed) != std::string::npos);
+    }
+    SECTION("the hour list keeps the tree and the shown hour") {
+        EchoHarness h;
+        h.frames_override[kHoursCmd] = beside("__schema__|hour_ts\n7200\n3600\n__total__|2\n");
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(r->body.find("The list of other hours was unavailable") != std::string::npos);
+        CHECK(r->body.find("<option value=\"7200\" selected>") != std::string::npos);
+        CHECK(r->body.find("<option value=\"3600\">") == std::string::npos); // the torn list is not used
+    }
+    SECTION("the DNS panel shows the error and never a quiet hour") {
+        EchoHarness h;
+        h.frames_override[kDnsCmd] = beside(std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n__total__|1\n");
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find(crashed) != std::string::npos);
+        CHECK(r->body.find("a.test") == std::string::npos);
+        CHECK(r->body.find("No DNS cache activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.dns.read", "failure") != nullptr);
+        CHECK(h.find_audit("echo.dns.read", "success") == nullptr);
+    }
+    SECTION("the ARP panel shows the error and never a quiet hour") {
+        EchoHarness h;
+        h.dns_output = std::string(kDnsSchema) + "__total__|0\n";
+        h.frames_override[kArpCmd] = beside(std::string(kArpSchema) +
+                                            "7200|eth0|10.0.0.1|aa:bb:cc:dd:ee:ff|1|0\n__total__|1\n");
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find(crashed) != std::string::npos);
+        CHECK(r->body.find("10.0.0.1") == std::string::npos);
+        CHECK(r->body.find("No ARP activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.arp.read", "failure") != nullptr);
+        CHECK(h.find_audit("echo.arp.read", "success") == nullptr);
+    }
+}
+
+// G8-2: the frames are merged only up to the answer's own byte cap, then the caller's over-cap
+// branch refuses the answer as it would a single oversize frame.
+TEST_CASE("echo routes: frames that together pass a payload cap take the over-cap path",
+          "[echo][routes][frames]") {
+    const std::string poll = "/fragments/echo/process-tree/device-net?device=dev-A&dcmd=" + kDnsCmd +
+                             "&acmd=" + kArpCmd + "&n=1&hour=7200";
+    SECTION("DNS frames over the device-net cap") {
+        EchoHarness h;
+        const std::string filler(kMaxEchoDeviceNetOutputBytes / 2 + 1, 'x');
+        h.frames_override[kDnsCmd] = {frame(filler), frame(filler), frame(filler),
+                                      frame(std::string(kDnsSchema) + "7200|a.test|A|1.1.1.1|1|0\n")};
+        h.arp_output = std::string(kArpSchema) + "__total__|0\n";
+        auto r = h.sink.Get(poll);
+        REQUIRE(r);
+        CHECK(r->body.find("The device returned an unexpectedly large dataset") != std::string::npos);
+        CHECK(r->body.find("a.test") == std::string::npos);
+        CHECK(r->body.find("No DNS cache activity recorded") == std::string::npos);
+        CHECK(h.find_audit("echo.dns.read", "failure") != nullptr);
+    }
+    SECTION("an hour list over its cap keeps the tree and the shown hour") {
+        EchoHarness h;
+        const std::string filler(256 * 1024 + 1, 'x');
+        h.frames_override[kHoursCmd] = {frame(filler),
+                                        frame("__schema__|hour_ts\n7200\n3600\n__total__|2\n")};
+        auto r = h.run_result();
+        REQUIRE(r);
+        CHECK(r->body.find("<span class=\"tt-name\">bash</span>") != std::string::npos);
+        CHECK(r->body.find("The list of other hours was unavailable") != std::string::npos);
+        CHECK(r->body.find("<option value=\"7200\" selected>") != std::string::npos);
+        CHECK(r->body.find("<option value=\"3600\">") == std::string::npos);
+    }
+}
+
+TEST_CASE("echo routes: capture-source cards never relabel the old live count",
+          "[echo][routes][capture-sources]") {
+    SECTION("<src>_rows alone") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\nconfig|process_rows|1234\n";
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find(">1234<") != std::string::npos);
+        CHECK(res->body.find("$Process_Hourly") != std::string::npos);
+        CHECK(res->body.find("upgrade the agent") == std::string::npos);
+    }
+    SECTION("<src>_live_rows alone is a dash and one upgrade note") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\nconfig|process_live_rows|5678\n";
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find("5678") == std::string::npos);
+        CHECK(res->body.find("This device runs an agent without the roll-up tables; upgrade the agent") !=
+              std::string::npos);
+        CHECK(res->body.find("&mdash;") != std::string::npos);
+    }
+    SECTION("neither key: a dash, not zero") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\n";
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find("&mdash;") != std::string::npos);
+        CHECK(res->body.find("upgrade the agent") == std::string::npos);
+    }
+    SECTION("an oversize status reply is refused with a note") {
+        EchoHarness h;
+        h.status_output = "config|process_enabled|true\n" + std::string(kMaxEchoStatusOutputBytes, 'x');
+        auto res = h.run_capture_sources();
+        REQUIRE(res);
+        CHECK(res->body.find("unexpectedly large status reply") != std::string::npos);
+        CHECK(res->body.find("capCards") == std::string::npos);
+    }
 }
 
 // SEC-2/SEC-3 confinement-gap class (found during a docs sweep): devices_fn_
