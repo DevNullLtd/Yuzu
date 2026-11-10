@@ -194,7 +194,7 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
 
 // ── Echo rename (upgrade window) ─────────────────────────────────────────────
 
-// The token chain the rename script applies to the builtin Echo definitions' prose, as
+// The token chain applied to the builtin Echo definitions' prose, as
 // regexp_replace calls over one column expression. Word boundaries are Postgres ARE `\m` / `\M`.
 std::string echo_rename_text_chain(const std::string& col) {
     std::string e = col;

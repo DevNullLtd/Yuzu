@@ -407,8 +407,8 @@ collection actions share one line shape, `echo\|collect_<leg>\|<events_recorded>
 `<token>` is one of `source_disabled`, `unsupported_platform`, `baseline`, `sample_recorded`,
 `apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete`, `counters_unavailable`, `state_unreadable` (the `kCollectStatus*` tokens in `echo_collectors.hpp`; `state_unreadable` is emitted by `skip_token()` in `echo_plugin.cpp`). Cursor sources (`power`, `removable`, `registry`) add their own `echo|collect_<source>|<n>|<token>` line to the `collect_slow` stream.
 `status`'s wire format is line-oriented `key\|value` pairs (`storage_state\|ok`,
-`record_count\|<n>`, `config\|<key>\|<value>`, ...), not one positional row — the five YAML columns
-below correspond to five of those lines; the rest (`config\|*`, `retention_guard\|*`,
+`record_count\|<n>`, `config\|<key>\|<value>`, ...), not one positional row — the four YAML columns
+below correspond to four of those lines; the rest (`config\|*`, `retention_guard\|*`,
 `retention_guard_failed\|*`) are operational fields the YAML schema does not model. `query`'s rows
 match its five columns exactly, followed by an un-modelled `total\|<n>` summary line. `sql` (and
 every canned query in `echo_warehouse.yaml`) emits a leading `__schema__\|<col>\|<col>...` line,
