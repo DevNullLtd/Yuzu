@@ -638,6 +638,7 @@ jobs:
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
           bash tests/shell/test_release_legs_issue.sh         # release-legs-broken open/comment/close decision (Tier 2b)
+          bash tests/shell/test_linux_concurrent_step.sh      # Linux test step: both halves' verdicts, kill switch, cancel/EXIT traps (~45 s)
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
@@ -1325,16 +1326,94 @@ jobs:
           echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
           echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
 
-      # Verified NOT to select the #3443 Phase 2 'server pg smoke' entry: the
-      # --suite list below omits server-pg-smoke, and the by-name line
-      # matches none of its six names against it — meson's positional
+      # Verified NOT to select the #3443 Phase 2 'server pg smoke' entry in the
+      # NON-PG half: its --suite list omits server-pg-smoke, and the by-name
+      # line matches none of its six names against it — meson's positional
       # test-name matching is an EXACT match (fnmatch with no glob characters
       # in a literal name, mtest.py's tests_from_args), not a substring one.
-      # See 'Test (pg shards, full)' below for the full #3443 concurrency-
-      # tuning history (with-test-slot.sh slot counts, --num-processes,
-      # shard timeouts) — kept there since it's about the PG-shard
-      # invocation specifically, not this non-PG one.
-      - name: Test (non-pg suites)
+      # The pg half (below, in the same step) selects it by name on smoke legs.
+      - name: Test (non-pg + pg halves, concurrent)
+        # ═══ CONCURRENCY (this step's shape) ═══
+        # Until this change the Linux leg ran three steps back to back:
+        # 'Test (non-pg suites)' (~6.6-7 min), then 'Test (pg shards, full)' (~10
+        # min, gcc-15/debug only) or 'Test (pg smoke)' (the other push legs).
+        # They share no state but the build dir, so they now run as two
+        # background halves of ONE step and the step `wait`s on both:
+        #   - NON-PG half: the two cheap-first flake-retry.py invocations,
+        #     unchanged in selection and width, still OUTSIDE with-test-slot.sh;
+        #   - PG half: pg_mode=full -> with-test-slot.sh 3 + --suite server-pg at
+        #     --num-processes 4 (unchanged); pg_mode=smoke -> 'server pg smoke' by
+        #     name, ungated (unchanged). pg_mode was asserted by 'Resolve pg_mode
+        #     + assert Postgres DSN' above; an unexpected value fails here too.
+        # Expected saving is roughly the shorter half, on the pg_mode=full leg only
+        # (smoke legs' pg half takes seconds) — an estimate, not yet measured; the
+        # measurement plan and the revert triggers are in docs/ci-architecture.md
+        # "Linux test step: concurrent non-pg and pg halves". Both halves now
+        # share the job's 16 CPUs: up to 4 non-pg workers (the cheap suites; the
+        # server-shard invocation runs 2) alongside up to 4 pg shards, where it
+        # used to be one or the other — watch the #2093 per-shard watchdog and
+        # the spin_until timing flakes.
+        #
+        # Kill switch: repository variable YUZU_CI_SEQUENTIAL_HALVES=1 runs the
+        # non-pg half, then the pg half, skipping the pg half when the non-pg
+        # half failed (the old back-to-back behaviour) — same logs, same files.
+        # Only the exact value 1 does; any other non-empty value prints a
+        # ::warning:: and the halves stay concurrent.
+        #
+        # Failure semantics (concurrent mode): BOTH halves always run to
+        # completion (a red non-pg half does not cancel the pg half — the extra
+        # signal is worth the minutes on a run that is red anyway). Within the
+        # non-pg half the cheap-first fail-fast still holds (each half runs under
+        # bash -e). Each half's output is printed, in its own ::group::, the
+        # moment that half ends (a failing half gets an ::error:: line naming it
+        # first), so a red half is visible while the other is still running. The
+        # step fails if EITHER half exits non-zero; both exit codes and wall
+        # seconds are printed and written to the job summary.
+        #
+        # Cancel / timeout: each half runs in its own process group (set -m), so
+        # the runner's SIGINT/SIGTERM to this shell does not reach the halves by
+        # itself; the trap below sends SIGTERM to the group of every half bash
+        # still tracks as a running job (never a reaped PID), waits up to ~5 s
+        # for those groups to empty so meson can write its logs, then exits 1
+        # (meson test stops its own per-test sessions on SIGTERM). An EXIT trap
+        # does the same SIGTERM (no wait) if this shell exits non-zero any other
+        # way while a half runs. When a half ends, its group is also sent SIGTERM,
+        # so children that outlive a killed half's shell do not keep running. The
+        # runner's final SIGKILL cannot be trapped — if it lands first, its
+        # end-of-job orphan sweep is the backstop.
+        #
+        # Isolation of the two halves inside one build dir (each is load-bearing):
+        #   1. meson-logs/testlog.* — two concurrent `meson test` runs would
+        #      overwrite each other's testlog.{txt,json,junit.xml}; each
+        #      invocation passes its own --logbase (testlog-nonpg-cheap,
+        #      testlog-nonpg-server, testlog-pg). flake-retry.py reads --logbase
+        #      back from its passthrough args and keys its junit classification,
+        #      its retry report (<logbase>-flake-retry.json) and its preserved
+        #      enumeration junit + stale-file sweep (<logbase>-flake-retry-enum-*)
+        #      on it; the duration summary and the 'Finish persistent CI telemetry'
+        #      import take the same names (--logbase). Giving the two non-pg
+        #      invocations distinct bases also ends the old loss where only the
+        #      LAST invocation's junit/flake report reached the telemetry DB.
+        #      All three bases' files (and the legacy default testlog.*) from an
+        #      earlier run in this persistent build dir are removed first thing in
+        #      the step, so a half (or an invocation) that never ran cannot
+        #      upload or import stale ones.
+        #   2. ninja — `meson test` runs `ninja` (regen check + meson-test-prereq)
+        #      before testing; two of those at once in one build dir race on
+        #      .ninja_log/.ninja_deps. The step builds meson-test-prereq ONCE,
+        #      serially, then every invocation passes --no-rebuild.
+        #   3. Job summary — each half writes its own summary file in meson-logs/
+        #      (GITHUB_STEP_SUMMARY redirected per half); both are appended to the
+        #      real job summary as each half ends, so the tables never interleave.
+        #   4. Step log — each half's output goes to meson-logs/ci-half-{nonpg,pg}.log
+        #      and is printed in full (one ::group:: per half) when that half
+        #      ends; a heartbeat prints each running half's latest line every 2
+        #      min meanwhile. The runner's per-line timestamps therefore show
+        #      print time, not when a test line was written. On a job
+        #      timeout/cancel those logs are NOT printed, but they ride the
+        #      'Upload meson-logs on test failure or cancel' artifact.
+        #
+        # ═══ NON-PG half: history (carried over from 'Test (non-pg suites)') ═══
         # Split into 2 invocations, cheap-first (fail-fast — bash -e aborts
         # the remaining lines on the first non-zero exit): the cheap suites
         # (agent/docs/proto/echo/gateway/platform) run first, then the 6
@@ -1398,9 +1477,11 @@ jobs:
         # still short, so the within-job cap is the single-axis fix shipped
         # first, per this file's own "ship and measure one axis at a time"
         # practice - watch ci-suite-stats for this leg before adding the
-        # cross-job gate too. The pg-tagged invocations (full shards or
-        # smoke, #3443 Phase 2) still separately go through with-test-slot.sh
-        # below; this step does not.
+        # cross-job gate too. Only the pg half's full branch (--suite
+        # server-pg) goes through with-test-slot.sh; the non-pg half does not,
+        # and neither does the smoke branch (see its own note below). Since the
+        # halves became concurrent, the non-pg half also runs while the pg half
+        # is still WAITING for a slot, so a slot wait no longer delays it.
         # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): previously only
         # enabled on the nightly windows-asan leg, so a hang in this leg's agent
         # suite - the exact class #2345/#4018 recurred as - had no per-test
@@ -1411,31 +1492,13 @@ jobs:
         # default test workdir is the build directory itself. flake-retry.py's
         # subprocess calls inherit the full parent environment (verified against
         # its source), so this reaches every invocation including isolated retries.
-        run: |
-          export YUZU_TEST_PROGRESS=1
-          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/progress.log"
-          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
-          rm -f "$YUZU_TEST_PROGRESS_FILE"
-          # docs suite is OS-independent and runs on the Linux leg only; OS-contract
-          # entries carry suite platform (tests/meson.build) and run on every leg.
-          # Duration summary per invocation, not end-of-job: meson overwrites
-          # meson-logs/testlog.json on every run, so it is removed first (a run
-          # that selects no tests then warns and skips instead of re-reporting a
-          # stale log). On a red run bash -e stops before the summary; use the
-          # uploaded meson-logs artifact locally (#4884).
-          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite echo --suite gateway --suite platform
-          python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (cheap suites)"
-          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
-          python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (server shards)"
-
-      - name: Test (pg shards, full)
-        if: matrix.pg_mode == 'full'
-        # #3443 Phase 2: this step now runs ONLY on the leg(s) whose pg_mode
+        #
+        # ═══ PG half, pg_mode=full: history (carried over from 'Test (pg shards, full)') ═══
+        # #3443 Phase 2: this branch runs ONLY on the leg(s) whose pg_mode
         # resolved to 'full' (today: gcc-15/debug, every PR and its matching
-        # push leg) — every other leg runs 'Test (pg smoke)' below
-        # instead. Everything from here down is the pre-Phase-2 concurrency-
+        # push leg) — every other leg takes the smoke branch (formerly the
+        # separate 'Test (pg smoke)' step, note below) instead. Everything
+        # from here down is the pre-Phase-2 concurrency-
         # tuning history for THIS invocation (with-test-slot.sh, --num-
         # processes, shard timeouts) — unchanged by Phase 2, kept in full.
         #
@@ -1514,9 +1577,10 @@ jobs:
         # whole registered test set as of the 2026-08-25 E->E+I / G->G+J split
         # below — re-verified as an exact partition (meson test --list,
         # diffed against the unfiltered full list) at that split, not assumed
-        # carried over from the prior 32. Phase 2 moved the first two
-        # invocations into their own "Test (non-pg suites)" step above; only
-        # the third (this one, now with-test-slot.sh-gated) remains here.
+        # carried over from the prior 32. Phase 2 then moved the first two
+        # invocations into a separate "Test (non-pg suites)" step, leaving the
+        # third (with-test-slot.sh-gated) in "Test (pg shards, full)"; since the
+        # concurrency change those are the non-pg and pg halves of this one step.
         #
         # Root cause, corrected after Gate 3 governance re-derived it from the
         # actual failing run's timestamps rather than the first-draft guess this
@@ -1584,7 +1648,11 @@ jobs:
         # pairing variance, margin against the 90-min job ceiling under 2 minutes
         # worst-case).
         #
-        # Telemetry note: each invocation overwrites meson's single
+        # Telemetry note — SUPERSEDED by the concurrency change: every
+        # invocation now has its own --logbase, so each one's junit AND its
+        # flake-retry report survive and all three are imported by 'Finish
+        # persistent CI telemetry' (--logbase, once per base). Kept for the record
+        # (Linux, before this change) — each invocation overwrote meson's single
         # testlog.junit.xml, so only the LAST one's per-suite ci_test_suites
         # rows survive the "Finish persistent CI telemetry" step's unmodified
         # default import — the pg-gated call runs last on purpose, since that's
@@ -1686,16 +1754,224 @@ jobs:
         # not assumed done here. Response to either trigger is
         # rebalancing/splitting the affected shard(s) or reverting to
         # slots=2, never another timeout increase. Tracked: #3443.
+        #
+        # ═══ PG half, pg_mode=smoke (carried over from 'Test (pg smoke)') ═══
+        # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
+        # this small tagged subset INSTEAD of the 14-shard server-pg suite
+        # above — see tests/meson.build's 'server pg smoke' entry for the full
+        # rationale (tag membership, why --allow-running-no-tests is REQUIRED
+        # here unlike Correction 1's original "no flag" wording, why it's a
+        # separate suite from server-pg, why by-name invocation). Deliberately
+        # UNGATED by with-test-slot.sh: ~11 cases / ~2.8s measured locally
+        # (280 assertions, all passed) is far cheaper than the up-to-30-minute
+        # slot wait the gate exists to bound — gating it would make the wait
+        # dominate the work. The DSN/pg_mode correctness this depends on was
+        # already asserted above, before any PG invocation ran.
         env:
+          BUILDDIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          PG_MODE: ${{ matrix.pg_mode }}
           YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+          # Kill switch (repository variable): exactly "1" runs the halves back to back.
+          YUZU_CI_SEQUENTIAL_HALVES: ${{ vars.YUZU_CI_SEQUENTIAL_HALVES }}
         run: |
-          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
-          bash scripts/ci/with-test-slot.sh 3 -- \
-            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite server-pg
-          # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
-          python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux pg shards"
+          LOGS="$BUILDDIR/meson-logs"
+          mkdir -p "$LOGS"
+          # Isolation 1: no file of an earlier run in this persistent build dir may
+          # be read back as this run's (a half or invocation that never ran, or a
+          # step that fails before either half starts). First, before anything
+          # here can fail. The default-base testlog.* (written by this leg before
+          # the per-invocation --logbase names existed) goes too, so the uploaded
+          # meson-logs artifact never carries a months-old run's log.
+          for base in testlog-nonpg-cheap testlog-nonpg-server testlog-pg testlog; do
+            rm -f "$LOGS/$base.txt" "$LOGS/$base.json" "$LOGS/$base.junit.xml" "$LOGS/$base"-flake-retry*
+          done
+          case "$PG_MODE" in
+            full|smoke) ;;
+            *) echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke'"; exit 1 ;;
+          esac
+          # A measurement-only knob (docs/testing/unit-test-conventions.md); if the
+          # runner's environment leaks it in, every [pg] template clone uses it.
+          if [[ -n "${YUZU_TEST_PG_CLONE_STRATEGY:-}" ]]; then
+            echo "::warning::YUZU_TEST_PG_CLONE_STRATEGY='${YUZU_TEST_PG_CLONE_STRATEGY//[^A-Za-z0-9_]/?}' is set in this step's environment; [pg] template clones use it (a measurement knob, not a CI setting)"
+          fi
+          # Isolation 2: build every test prerequisite once, serially, so the
+          # concurrent invocations below can all run with --no-rebuild.
+          ninja -C "$BUILDDIR" ${YUZU_BUILD_JOBS:+-j "$YUZU_BUILD_JOBS"} meson-test-prereq
+          REAL_SUMMARY="${GITHUB_STEP_SUMMARY:-}"
+
+          nonpg_half() {
+            set -e
+            export GITHUB_STEP_SUMMARY="$LOGS/ci-half-nonpg.summary.md"
+            export YUZU_TEST_PROGRESS=1
+            export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/$LOGS/progress.log"
+            rm -f "$YUZU_TEST_PROGRESS_FILE"
+            # docs suite is OS-independent and runs on the Linux leg only; OS-contract
+            # entries carry suite platform (tests/meson.build) and run on every leg.
+            # Duration summary per invocation, not end-of-job (its <logbase>.json was
+            # removed above, so a run that selects no tests warns and skips instead of
+            # re-reporting a stale log). On a red invocation bash -e stops before its
+            # summary; use the uploaded meson-logs artifact locally (#4884).
+            python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-nonpg-cheap --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite echo --suite gateway --suite platform
+            python3 scripts/ci/test-durations-summary.py --builddir "$BUILDDIR" --label "Linux non-pg (cheap suites)" --logbase testlog-nonpg-cheap
+            python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-nonpg-server --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
+            python3 scripts/ci/test-durations-summary.py --builddir "$BUILDDIR" --label "Linux non-pg (server shards)" --logbase testlog-nonpg-server
+          }
+
+          pg_half() {
+            set -e
+            export GITHUB_STEP_SUMMARY="$LOGS/ci-half-pg.summary.md"
+            if [[ "$PG_MODE" == "full" ]]; then
+              bash scripts/ci/with-test-slot.sh 3 -- \
+                python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-pg --print-errorlogs --num-processes 4 --suite server-pg
+              # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
+              python3 scripts/ci/test-durations-summary.py --builddir "$BUILDDIR" --label "Linux pg shards" --logbase testlog-pg
+            else
+              python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-pg --print-errorlogs "server pg smoke"
+            fi
+          }
+
+          declare -A pid=([nonpg]="" [pg]="") rc=() secs=() t0=()
+          label() { if [[ "$1" == pg ]]; then echo "pg half (pg_mode=$PG_MODE)"; else echo "non-pg half"; fi; }
+          for h in nonpg pg; do rm -f "$LOGS/ci-half-$h.log" "$LOGS/ci-half-$h.summary.md"; done
+          tick=""
+          # Cancel / timeout (see the step comment): the halves are in their own
+          # process groups, so forward the signal to them, then fail.
+          # live_groups: the groups of the halves (and the poll sleep) that bash
+          # still tracks as RUNNING jobs (`jobs -rp`). A reaped PID is never
+          # signalled: it may already belong to an unrelated process. `jobs` is
+          # read here, never through `$(live_groups)` (a function run inside a
+          # command substitution sees an empty job table).
+          live=()
+          live_groups() {
+            local running p
+            running=" $(jobs -rp | tr '\n' ' ') "
+            live=()
+            for p in "${pid[nonpg]}" "${pid[pg]}" "$tick"; do
+              if [[ -n "$p" && "$running" == *" $p "* ]]; then live+=("$p"); fi
+            done
+          }
+          on_signal() {
+            trap - INT TERM
+            echo "::error::test step interrupted; sending SIGTERM to the running halves' process groups"
+            live_groups
+            local p alive
+            for p in "${live[@]}"; do kill -TERM -- "-$p" 2>/dev/null || true; done
+            # Bounded wait (~5 s, inside the runner's 7.5 s SIGINT-to-SIGTERM
+            # grace) so meson can stop its tests and write its logs before the
+            # upload and telemetry steps read them. Never longer: exit 1 regardless.
+            for _ in $(seq 1 25); do
+              alive=""
+              for p in "${live[@]}"; do
+                if kill -0 -- "-$p" 2>/dev/null; then alive=1; fi
+              done
+              if [[ -z "$alive" ]]; then break; fi
+              sleep 0.2
+            done
+            exit 1
+          }
+          # Any other abnormal exit of this shell (a failing command under -e)
+          # must not leave a half running either.
+          on_exit() {
+            local r=$? p
+            if [[ "$r" -ne 0 ]]; then
+              live_groups
+              for p in "${live[@]}"; do kill -TERM -- "-$p" 2>/dev/null || true; done
+            fi
+          }
+          trap on_signal INT TERM
+          trap on_exit EXIT
+          set -m   # every background job below gets its own process group (pgid = its pid)
+          launch() {
+            t0[$1]=$SECONDS
+            "$1_half" >"$LOGS/ci-half-$1.log" 2>&1 &
+            pid[$1]=$!
+            echo "started $(label "$1") (pid ${pid[$1]})"
+          }
+          finish() {  # reap a half that has ended, record it, print its whole log now
+            local h=$1 r=0
+            wait "${pid[$h]}" || r=$?
+            # A half's shell can end (killed, say) while its children still run in
+            # its process group; stop them now. Linux does not hand out a PID that
+            # is still some process's group id, so while leftovers exist this
+            # reaches only them; with none it is ESRCH (ignored), barring the PID
+            # being reissued to a new group leader in the instant since the reap.
+            kill -TERM -- "-${pid[$h]}" 2>/dev/null || true
+            pid[$h]=""
+            rc[$h]=$r
+            secs[$h]=$(( SECONDS - t0[$h] ))
+            if [[ "$r" -ne 0 ]]; then
+              echo "::error::$(label "$h") failed (exit $r, ${secs[$h]}s); its full output is the next group"
+              echo "::group::$(label "$h") FAILED (exit $r, ${secs[$h]}s) — full output"
+            else
+              echo "::group::$(label "$h") passed (${secs[$h]}s) — full output"
+            fi
+            cat "$LOGS/ci-half-$h.log" || true
+            echo "::endgroup::"
+            if [[ -n "$REAL_SUMMARY" && -f "$LOGS/ci-half-$h.summary.md" ]]; then
+              cat "$LOGS/ci-half-$h.summary.md" >> "$REAL_SUMMARY" || true
+            fi
+          }
+
+          sequential=0
+          if [[ "${YUZU_CI_SEQUENTIAL_HALVES:-}" == 1 ]]; then
+            sequential=1
+            echo "::notice::YUZU_CI_SEQUENTIAL_HALVES=1: running the non-pg half, then the pg half (kill switch)"
+          elif [[ -n "${YUZU_CI_SEQUENTIAL_HALVES:-}" ]]; then
+            echo "::warning::YUZU_CI_SEQUENTIAL_HALVES='${YUZU_CI_SEQUENTIAL_HALVES//[^A-Za-z0-9_]/?}' is not '1'; only the exact value 1 enables sequential mode, so the halves run concurrently"
+          fi
+          launch nonpg
+          if [[ "$sequential" -eq 0 ]]; then launch pg; fi
+          next_beat=$(( SECONDS + 120 ))
+          while [[ -n "${pid[nonpg]}${pid[pg]}" ]]; do
+            sleep 2 &
+            tick=$!
+            wait "$tick" || true
+            tick=""
+            for h in nonpg pg; do
+              if [[ -n "${pid[$h]}" ]] && ! kill -0 "${pid[$h]}" 2>/dev/null; then
+                finish "$h"
+                if [[ "$h" == nonpg && "$sequential" -eq 1 ]]; then
+                  if [[ "${rc[nonpg]}" -eq 0 ]]; then
+                    launch pg
+                  else
+                    echo "pg half skipped: the non-pg half failed (sequential mode)"
+                  fi
+                fi
+              fi
+            done
+            if (( SECONDS >= next_beat )); then
+              next_beat=$(( SECONDS + 120 ))
+              for h in nonpg pg; do
+                if [[ -n "${pid[$h]}" ]]; then
+                  echo "[heartbeat $(date -u +%H:%M:%S)] $h: $(tail -n 1 "$LOGS/ci-half-$h.log" 2>/dev/null | cut -c1-200)"
+                fi
+              done
+            fi
+          done
+          set +m
+          trap - INT TERM
+
+          show() { if [[ -n "${rc[$1]:-}" ]]; then echo "exit ${rc[$1]} in ${secs[$1]}s"; else echo "skipped"; fi; }
+          echo "non-pg half: $(show nonpg); pg half (pg_mode=$PG_MODE): $(show pg)"
+          if [[ -n "$REAL_SUMMARY" ]]; then
+            {
+              echo ""
+              echo "| Linux test half | result | wall s |"
+              echo "|---|---|---|"
+              for h in nonpg pg; do
+                if [[ -n "${rc[$h]:-}" ]]; then
+                  echo "| $(label "$h") | exit ${rc[$h]} | ${secs[$h]} |"
+                else
+                  echo "| $(label "$h") | skipped | - |"
+                fi
+              done
+            } >> "$REAL_SUMMARY" || true
+          fi
+          if [[ "${rc[nonpg]:-1}" -ne 0 || "${rc[pg]:-1}" -ne 0 ]]; then
+            exit 1
+          fi
 
       # Sizes the tmpfs PGDATA cap (#4884): host RAM and the
       # persistent cluster's on-disk size after a full pg run, printed to the
@@ -1710,20 +1986,6 @@ jobs:
             timeout 60 docker exec "$c" du -sm /var/lib/postgresql || true
           done
 
-      # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
-      # this small tagged subset INSTEAD of the 14-shard server-pg suite
-      # above — see tests/meson.build's 'server pg smoke' entry for the full
-      # rationale (tag membership, why --allow-running-no-tests is REQUIRED
-      # here unlike Correction 1's original "no flag" wording, why it's a
-      # separate suite from server-pg, why by-name invocation). Deliberately
-      # UNGATED by with-test-slot.sh: ~11 cases / ~2.8s measured locally
-      # (280 assertions, all passed) is far cheaper than the up-to-30-minute
-      # slot wait the gate exists to bound — gating it would make the wait
-      # dominate the work. The DSN/pg_mode correctness this depends on was
-      # already asserted above, before any PG invocation ran.
-      - name: Test (pg smoke)
-        if: matrix.pg_mode == 'smoke'
-        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server pg smoke"
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
@@ -1871,6 +2133,9 @@ jobs:
       # the failing test name when an Erlang eunit run reports
       # `Failed: 1. Passed: 144.` with no surviving `*failed*` marker.
       # Without this artifact we cannot identify which gateway test failed.
+      # Carries the per-invocation testlog-{nonpg-cheap,nonpg-server,pg}.* files
+      # and each concurrent half's full output (ci-half-{nonpg,pg}.log), which
+      # is the only copy of that output when the job is cancelled or times out.
       - name: Upload meson-logs on test failure or cancel
         if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1914,6 +2179,9 @@ jobs:
           fi
           exit 0
 
+      # --logbase, once per base: the Linux test step's three meson test
+      # invocations each run under their own --logbase (see 'Test (non-pg + pg
+      # halves, concurrent)'); each base's junit + flake-retry report is imported.
       - name: Finish persistent CI telemetry
         if: always()
         continue-on-error: true
@@ -1925,6 +2193,9 @@ jobs:
           --job-name "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
           --triplet x64-linux
           --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          --logbase testlog-nonpg-cheap
+          --logbase testlog-nonpg-server
+          --logbase testlog-pg
           --conclusion "$YUZU_CI_CONCLUSION"
 
       - name: Purge trusted-fork workspace

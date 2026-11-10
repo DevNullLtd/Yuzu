@@ -941,7 +941,8 @@ v2 canonical hash is unchanged. Slot 14 (`uninstall_string`) stays reserved on b
 operator-tier: machine-scope roots only (ADR-0028), but a root can still name an account's home
 directory, so it is classified like the `list` column above. It is erased on decommission
 (`delete_agent` deletes the rows), and nothing in this change reads it back (no route, tool, page
-or log line carries it). The server stores it as sent after the field step, without minimisation,
+or log line carries it; the first read-back is the 2026-11-09 lookup surface below, which
+re-opens §8 again). The server stores it as sent after the field step, without minimisation,
 so **the agent writer must not send per-user paths**: that precondition is owned by the change
 that starts sending slot 13, which must also test that no profile path is emitted.
 The change ledger (the 2026-11-04 Update, schema v11) keeps a copy for its retention window:
@@ -1443,3 +1444,101 @@ build sends no settings to agents.
   a window only at a whole-day interval of 24 hours or more in whole days, apply the IANA zone, honour
   the per-collector switch, and reject any setting it cannot honour, then report the effective version
   it applied. Until the push lands the settings have no effect on any agent.
+
+### 2026-11-09 — the lookup read surface: v3 columns, components, and totals (SAM-17, schema v12)
+
+**Decision.** The first read surface that returns the v3 columns. `GET /api/v1/inventory/software`
+rows gain `hostname`, `last_seen`, `status`, `last_confirmed_at`, `install_type`, `install_scope`,
+`install_location` and `instance_key`, and a new `GET /api/v1/inventory/software/components`
+reads the component store (`software_components`, schema v11) the same way. One call answers
+the lookup question for an application or a component: how many installs, on which devices,
+polled when, in what state.
+
+- **Row status.** `status` is derived from the row's own collection facet (`software_facet_state`
+  for the row's `source`; `component_inventory` for a component) by ONE rule: `disabled` when the
+  facet is switched off, `current` when it last reported a `full` or `delta` section, `unconfirmed`
+  otherwise, including a device with no facet record. The rule is one SQL fragment
+  (`kRowStatusCaseSql`) used by the reads, the status filter, the rollup and the live totals, and
+  its C++ twin is pinned equal to it by a test over every (status, enabled) pair. An unconfirmed
+  row may be stale or missing and is never proof of absence; it is returned by default.
+- **Totals.** `totals` is `{installs, devices, as_of}` (components: `{instances, devices,
+  devices_unconfirmed, as_of}`). `installs` and `instances` count install ROWS everywhere (a
+  device with two architectures counts twice), `devices` distinct devices, so a rollup-served and a
+  live figure agree on one definition. Application totals come from the hourly catalogue rollup
+  (the name-only grain, which gains a `row_count` column) unless a version filter is present, in
+  which case they are ONE live aggregate over the version set (never a sum of per-version distinct
+  counts). Component totals come from a new hourly `component_rollup` (one row per kind and name,
+  refreshed by the existing rollup thread with its own advisory lock and keep-last-good), or are
+  live for a version filter or no kind. Totals are served only to an unfiltered caller for an
+  exact name; ADR-0017 records why a confined caller gets rows and `totals_omitted: "scope"`.
+- **Version range.** `version_min` / `version_max` resolve against the title's distinct versions
+  within the caller's scope (the gate's `VisibleSet` pushed into the read; an unfiltered caller
+  reads the fleet) under the catalogue comparator into a version set, for every caller; a title
+  at the 2000-version read cap in that scope is refused. The set is a predicate only. The distinct
+  versions are read LIVE (`installed_software` for a title, `software_components` for a component,
+  5 s bounded, the name indexes), never from the hourly rollups: a rollup lacks a version first
+  reported since its last refresh, which would drop that version from the set and serve a live,
+  exact-looking zero for software that is installed. The scope is pushed into this read for the
+  same reason the totals are withheld (ADR-0017): a fleet-wide cut would make the refusal a fact
+  about devices the caller cannot see, so a confined caller is answered for a title with 2000
+  versions outside its scope exactly as for an unknown title.
+- **Schema v12.** `catalog_rollup.row_count` (constant default, metadata-only; the migration also
+  sets the catalogue stamp back to `building` so no reader sees a zero row count beside a non-zero
+  device count), the two component rollup tables, and `software_components_name_idx`. The index is a plain `CREATE INDEX` in the ladder transaction:
+  `software_components` is empty in every deployment until an agent emits component rows (the
+  server apply path is live, the producer ships later), so the build holds its lock for no
+  measurable time.
+- **Component rollup ceiling (recorded, not fixed here).** `refresh_component_rollup` is one
+  `GROUP BY kind, name` with a `count(DISTINCT agent_id)` over `software_components`: measured at
+  44-47 s for 8.8M component rows (en_US collation, 4 MB and 64 MB `work_mem` alike), so it meets
+  the flat 60 s statement limit near 11M rows (about 1M devices with 10 components each); past
+  that the first refresh never completes and the kind-and-name totals stay `building`
+  (keep-last-good; rows and live totals are unaffected). Latent today: the table is empty until
+  the component producer ships (SAM-40). A per-(kind, name, agent) pre-aggregate ran the same
+  refresh in 8.2 s and is the recorded upgrade path.
+- **Recorded limits of the lookup surface (recorded, not fixed here).** (1) The live
+  version-set totals and the version-range reads (`installed_software_version_set_totals`,
+  `installed_software_distinct_versions`, `component_versions`) run under the 5 s statement
+  bound with no in-flight bound of their own (`/crypto` has one): about 3 requests per second
+  of 5-second reads can pin a 16-connection pool, which audit and revocation share; the figure
+  is 5 s divided by 16 leases, not measured. On a title above about 5M rows the live read times
+  out every time, so that `503` is deterministic and retrying does not clear it (the rows are
+  still served by paging or export). (2) The range read pushes the caller's whole scope as one
+  array with no `kScopePushdownMaxIds` cut (a cut distinct set cannot be post-filtered without
+  re-leaking the fleet property), so a confined caller with 100k or more devices sends a
+  multi-MB parameter per range request and the same 5 s bound caps it; cost at 100k and 500k
+  ids is unmeasured. (3) Rollup alerting shares the catalogue rollup's pattern: a peer holding
+  the advisory lock makes a replica's refresh a skip that counts as success and stamps the
+  liveness gauge, so replicas whose tick offsets alternate the lock winner, each timing out,
+  keep both `YuzuInventoryComponentRollup*` rules quiet while the totals age; a worker that
+  never started exports no series at all, and a throw in the catalogue leg (none expected, the
+  store returns bool) skips the components leg with no `error` increment. (4) The wide-scope
+  cursor's `skip` reaches `OFFSET` on the unbounded installs page read and a forged value can
+  hold a pool lease to the 30 s statement timeout; this is the pre-existing `read_devices_page`
+  behaviour moved verbatim into `read_scoped_page` (base `software_catalogue_model.cpp:865` and
+  `software_inventory_store.cpp:2268`), not introduced here. (5) A maximum-width CSV export
+  (1024-byte fields in 22 columns, 10,000 rows) can reach about 200 MB per request by cap
+  arithmetic; the measured exports used typical rows. Each is a candidate issue; none changes a
+  served figure.
+- **§8 re-opened for the first read-back of slot 13 and the component path.** `install_location`
+  (and a component's `path` and `anchor_app`) is served by both routes and their CSV exports to
+  every caller the gate admits with `Inventory:Read`; a confined caller sees only the paths of its
+  own rows, and a service-scoped token only those of its service's devices. Classification is
+  unchanged (operator-tier, a machine-scope path that can still name an account's directory, the
+  `list` column's class); retention is unchanged (erased with the device by `delete_agent`, kept
+  lower-cased in `software_changes.identity_key` for 400 days). The server cannot minimise the
+  value at read or store time without breaking the v3 hash agreement, so the control for
+  `install_location` is the agent writer's allowlist: the agent-side blob-v3 writer
+  (`installed_software_v3.cpp`, delivered by the sibling SAM-15 change, which lands before this
+  surface is read) keeps a location only under a machine root (`kMachineRoots`) and blanks every
+  other path, fail closed, and tests that no profile path is emitted. A component's `path` and
+  `anchor_app` carry NO allowlist yet: the component writer only clamps them
+  (`component_normal_form`), and the SAM-40 producer must apply the same machine-root allowlist
+  with a no-profile-path test before it populates them. This read surface therefore depends on
+  the SAM-15 writer shipping alongside it; until it does, no agent sends slot 13 or component
+  rows and both fields are empty. An agent that does not apply the allowlist (older, forked or
+  hostile) can place a per-user path here; the row is still served as sent, which the manual
+  states beside the field.
+- **Not changed.** The MCP `query_installed_software` rows keep their 14 fields; the twin is a
+  later change (recorded in `docs/api-parity-ledger.md` and as the 2026-11-09 entry of the
+  ADR-1005 exception ledger, revisit by 2026-12-31).

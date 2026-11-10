@@ -314,6 +314,13 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "pg_try_advisory_xact_lock (skip-if-held) before its one-txn DELETE+INSERT atomic replace of "
      "the catalogue rollup tables, and is keep-last-good on failure — so concurrent replicas "
      "serialize on the lock (a loser skips), never racing the unique-key replace"},
+    {"software_catalog_rollup.refresh_component_rollup", "SoftwareCatalogRollup::thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "SHARED-PG, SINGLE-WRITER (SAM-17): the components rollup leg of the same tick, one "
+     "REPEATABLE READ txn that first takes its OWN transaction-scoped pg_try_advisory_xact_lock "
+     "(software_inventory_store:component_rollup, skip-if-held) then DELETE+INSERT replaces "
+     "component_rollup whole and stamps component_rollup_meta; keep-last-good on failure, cancel "
+     "or budget (rollback), so concurrent replicas serialize on the lock and a loser skips"},
     {"software_normalization_job.run_tick", "SoftwareNormalizationJob::thread_",
      BackgroundJobClass::ReplicaSafe,
      "SHARED-PG, SINGLE-WRITER: every pass runs in its own transaction and, after its SET LOCAL "

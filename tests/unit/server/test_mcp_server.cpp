@@ -28219,7 +28219,28 @@ TEST_CASE("query_installed_software: a cursor minted by the REST route or the MC
     const auto rest1 = rest_page("?limit=2");
     const auto mcp1 = mcp_page(ts, R"({"limit":2})");
     REQUIRE(rest1.at("next_cursor").is_string());
-    CHECK(rest1.at("software") == mcp1.at("software"));
+    // The MCP twin returns device_row_json's keys; a REST row carries those plus the lookup-only
+    // fields (hostname, status, ...) until SAM-21 brings the twin level (docs/api-parity-ledger.md).
+    // The cursor binds the shared identity and order only, so rows are compared on the MCP key
+    // set: project() keeps exactly those keys, which makes the equality below the superset check
+    // (a REST row missing a shared key, or holding a different value, fails it).
+    REQUIRE(mcp1.at("software").size() == 2);
+    std::vector<std::string> shared_keys;
+    for (const auto& [key, value] : mcp1.at("software")[0].items())
+        shared_keys.push_back(key);
+    REQUIRE_FALSE(shared_keys.empty());
+    auto project = [&](const nlohmann::json& rows) {
+        auto out = nlohmann::json::array();
+        for (const auto& row : rows) {
+            auto kept = nlohmann::json::object();
+            for (const auto& key : shared_keys)
+                if (row.contains(key))
+                    kept[key] = row.at(key);
+            out.push_back(std::move(kept));
+        }
+        return out;
+    };
+    CHECK(project(rest1.at("software")) == mcp1.at("software"));
     CHECK(rest1.at("next_cursor") == mcp1.at("next_cursor"));
     CHECK(rest1.at("software").size() == 2);
 
@@ -28231,15 +28252,15 @@ TEST_CASE("query_installed_software: a cursor minted by the REST route or the MC
     CHECK(rest3.at("next_cursor").is_null());
     nlohmann::json walked = nlohmann::json::array();
     for (const auto* page : {&rest1, &mcp2, &rest3})
-        for (const auto& row : page->at("software"))
+        for (const auto& row : project(page->at("software")))
             walked.push_back(row);
-    CHECK(walked == rest_page("?limit=50").at("software"));
+    CHECK(walked == project(rest_page("?limit=50").at("software")));
     CHECK(walked.size() == 5);
     // ... and the mirror walk: MCP p1 -> REST p2 (MCP's cursor) -> MCP p3 (REST's cursor)
     const auto rest2 = rest_page("?limit=2&cursor=" + mcp1.at("next_cursor").get<std::string>());
-    CHECK(rest2.at("software") == mcp2.at("software"));
+    CHECK(project(rest2.at("software")) == mcp2.at("software"));
     const auto mcp3 = mcp_page(ts, cursor_arg(rest2, R"("limit":2,)"));
-    CHECK(mcp3.at("software") == rest3.at("software"));
+    CHECK(mcp3.at("software") == project(rest3.at("software")));
 
     // 3. the filter set is part of the binding, in both directions
     const auto rest_a = rest_page("?name=A&limit=1");
@@ -28248,7 +28269,7 @@ TEST_CASE("query_installed_software: a cursor minted by the REST route or the MC
     const auto mcp_a2 = mcp_page(ts, cursor_arg(rest_a, R"("name":"A","limit":1,)"));
     const auto rest_a2 =
         rest_page("?name=A&limit=1&cursor=" + mcp_a.at("next_cursor").get<std::string>());
-    CHECK(mcp_a2.at("software") == rest_a2.at("software"));
+    CHECK(mcp_a2.at("software") == project(rest_a2.at("software")));
     CHECK(mcp_a2.at("software").size() == 1);
     auto mcp_wrong =
         mcp_tool_call(ts, "query_installed_software", cursor_arg(rest_a, R"("limit":1,)"));
@@ -28274,8 +28295,8 @@ TEST_CASE("query_installed_software: a cursor minted by the REST route or the MC
     const auto mcp_scoped1 = mcp_page(scoped, R"({"limit":2})");
     CHECK(mcp_scoped1.at("next_cursor") == mcp1.at("next_cursor"));
     rest.scope.reset();
-    CHECK(rest_page("?limit=2&cursor=" + mcp_scoped1.at("next_cursor").get<std::string>())
-              .at("software") == mcp2.at("software"));
+    CHECK(project(rest_page("?limit=2&cursor=" + mcp_scoped1.at("next_cursor").get<std::string>())
+                      .at("software")) == mcp2.at("software"));
     rest.scope = std::unordered_set<std::string>{"agent-2"};
     const auto narrow = rest_page("?limit=5&cursor=" + mcp1.at("next_cursor").get<std::string>());
     for (const auto& row : narrow.at("software"))

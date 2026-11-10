@@ -617,12 +617,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `GET /api/v1/inventory/software?format=csv|json` has no MCP tool: an
        agent pages the same rows through the cursor on `query_installed_software`,
        and a bulk file is a human/automation convenience. **Revisit by
-       2026-11-07.**
+       2026-11-07** (lapsed; absorbed by the 2026-11-09 SAM-17 entry below, whose
+       revisit date now governs).
      - **The raw route's `q`, `kind`, `ecosystem` and `source` filters are
        REST-only (`#5699`).** `query_installed_software` takes `name`,
        `agent_id`, `version`, `limit` and `cursor` only; the parity ledger row
        stays `twinned` on the paged shape and the gap is recorded in
-       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07.**
+       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07** (lapsed; absorbed
+       by the 2026-11-09 SAM-17 entry below, whose revisit date now governs).
      - **The exception relaxes no control.** The fleet view is gated on a
        global `Inventory:Read` (the per-device view is admitted in scope),
        denies service-scoped tokens on the catalogue fleet view (the raw route
@@ -1543,6 +1545,45 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        "Software collection settings".
      - Recorded by the change author; ADR-owner acceptance pending.
 
+   - **2026-11-09 - the software lookup read surface (SAM-17; REST only, the MCP
+     twin is a recorded exception).** `GET /api/v1/inventory/software` gains eight
+     lookup fields (`hostname`, `last_seen`, `status`, `last_confirmed_at`,
+     `install_type`, `install_scope`, `install_location`, `instance_key`), the
+     `match`, `version_min`, `version_max` and `status` filters and a `totals`
+     block, and the new route `GET /api/v1/inventory/software/components` serves
+     the component inventory the same way. None of this is reachable over MCP:
+     `query_installed_software` keeps its 14 fields and five arguments, and the
+     components route has no tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked as
+       delivery row **SAM-21** of the software estate roadmap (the MCP twin of
+       the lookup fields, filters, totals and the components route); the
+       tracking issue is **#7396**. **Revisit by
+       2026-12-31.** The twin takes the same pure model (`software_list_model.hpp`:
+       one parser, one totals rule, one status derivation, one version-range
+       resolver) and the same store reads, so no second copy of any rule is
+       created. This entry retires when the twin merges. It also absorbs the
+       2026-10-07 entry's `#5699` field/filter asymmetry on the raw pair, whose
+       revisit date (2026-11-07) has passed: the widened gap is this entry's, with
+       this entry's date. No parity-ledger row is added: v1 routes are held to the
+       OpenAPI check, and `docs/api-parity-ledger.md` points here.
+     - **What an MCP-only caller can and cannot reach.** The 14-field rows of
+       `query_installed_software` (name, agent_id, version, limit, cursor), scoped
+       by the same `require_fleet_read` gate; not the lookup fields, the status or
+       range filters, any `totals` figure, or any component row. The OpenAPI
+       document is readable as the `yuzu://openapi` resource.
+     - **The exception relaxes no control.** Both routes gate SOLELY on
+       `require_fleet_read` (`Inventory:Read`, admit-then-filter, ADR-0017) with the
+       composed management-group and service scope pushed into every page read
+       and into the version-range read; `totals` is served only to an unfiltered
+       caller for an exact name (ADR-0017 Update 2026-11-09), never to a confined
+       one; every served call is audited (`inventory.software.query|export`,
+       `inventory.components.view|export`, continuation pages tagged); a
+       degraded store, facts, totals or version read is an audited `503` with the
+       A4 envelope and `retry_after_ms`, never an empty `200`; both operations are
+       in `paths` with typed responses. Wire reference:
+       `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
+       "GET /api/v1/inventory/software/components".
+     - Recorded by the change author; ADR-owner acceptance pending.
    - **2026-11-09 - MCP twins of the DEX score policy routes (#6087):
      `get_dex_score_policy`, `set_dex_score_policy`, `reset_dex_score_policy`.**
      This entry retires the 2026-10-23 and 2026-11-02 #6087 exceptions above.
