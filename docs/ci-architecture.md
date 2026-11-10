@@ -58,37 +58,70 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   that caused it; `main` pushes still build release, so nothing tags untested
   in release mode.
   - **Failure signal.** A dispatched run is started by `github-actions[bot]`,
-    which emails nobody, so `release-legs-alert.yml` (a `workflow_run`
-    listener on CI, dev only, dispatch runs only) opens or comments on a
-    `release-legs-broken` issue when a dispatch fails or times out, and closes
-    it when a later one is green with every dispatch build leg passing. A
-    failure of the dispatcher itself opens the same issue from
-    `release-legs-daily.yml`'s `alert` job. A cancelled run opens nothing. Only
-    open issues authored by `github-actions[bot]` are matched, so a hand-added
-    label is never commented on or closed. There is no merge discipline
-    attached, unlike `nightly-broken`, but the release skill checks the label
-    before tagging.
+    which emails nobody. Whether to open, comment on or close a
+    `release-legs-broken` issue is decided in one place,
+    `scripts/ci/release-legs-issue.sh` (tested by
+    `tests/shell/test_release_legs_issue.sh`), which two paths call:
+    - **Listener (fast path).** `release-legs-alert.yml` is a `workflow_run`
+      listener on CI runs, dev only, dispatch runs only. It fires as each run
+      completes.
+    - **Reconcile (backstop).** `release-legs-daily.yml`'s `reconcile` job
+      re-judges the last completed, non-cancelled dispatch run every day
+      before dispatching. A listener run that was dropped, failed or never
+      fired is still reported within a day, and an issue opened by a
+      dispatcher failure is cleared once dev is known green.
+
+    What the script does:
+    - **Opens or comments** on any failing conclusion, including a run that
+      never started (`startup_failure`), and words it by cause: a code
+      failure, infrastructure (only the preflight jobs failed), or a run that
+      started no job.
+    - **Closes** only when every OS (Linux, Windows MSVC, macOS) had at least
+      one `[dispatch]` build leg and all of them passed.
+    - **Does nothing** on a cancelled run.
+    - **Matches** only open issues authored by `github-actions[bot]`, so a
+      hand-added label is never commented on or closed.
+
+    A failure of the dispatcher itself opens the same issue from the daily
+    workflow's `alert` job. There is no merge discipline attached, unlike
+    `nightly-broken`, but the release skill checks the label before tagging.
   - **When `release-legs-broken` opens (triage).**
-    1. Read the issue's cause line. If only the preflight jobs failed, it is
+    1. Read the issue's cause line. A "dispatcher failed" issue means
+       `release-legs-daily.yml` itself failed: read that run's log, fix it,
+       then re-dispatch (step 4). If only the preflight jobs failed, it is
        infrastructure: a runner pool, a runner-health check or a source gate.
-       Fix that, then re-run the failed jobs.
+       Fix that, then re-run the failed jobs. If the run started no job, dev's
+       `ci.yml` failed to load, and every dev push is likely red too.
     2. Otherwise, open the failed leg. A timeout, a test-slot wait or a
        Postgres restart mid-run is a flake: re-run the failed jobs.
     3. A real test or link failure in release mode is a release-only
        regression. Take the commit from the leg's "Record built commit
        (dispatch)" step and bisect back to the last green dispatch (below).
-    4. The issue closes itself on the next fully green dispatch. Re-dispatch
-       with `gh workflow run ci.yml --ref dev -f legs=release` rather than
-       waiting a day.
-  - **Required contexts.** On a direct dispatch, every job that carries a
-    ruleset-required context name (Preflight (runner health), Proto
-    backward-compat and the Linux/Windows/macOS legs) is renamed with a
-    ` [dispatch]` suffix. So a dispatch never posts, satisfies or shadows a
+    4. The issue closes itself on the next fully green dispatch: a re-run of
+       the failed jobs counts, as does a fresh
+       `gh workflow run ci.yml --ref dev -f legs=release`; no need to wait a
+       day. A green run in which a dispatch build leg was skipped does NOT
+       close it, and a CANCELLED run neither opens nor closes one.
+    Each dev push also shows a skipped "Release legs (alert)" run in the
+    Actions tab; that is the listener filtering out non-dispatch runs.
+  - **Required contexts.** A dispatch must never post, satisfy or shadow a
     required check on any SHA, including the dev tip that a dev → main
     promotion PR uses as its head. A SKIPPED required context counts as
-    satisfied, which is why renaming is the control rather than failing the
-    jobs. As defence in depth, `trusted_inputs` refuses a direct dispatch on
-    any ref but `dev` or `main`.
+    satisfied. Two mechanisms, because GitHub does not evaluate a skipped
+    job's `name:` expression (it posts the raw template,
+    [community #13261](https://github.com/orgs/community/discussions/13261)):
+    - **Renamed.** On a direct dispatch, Preflight (runner health) and the
+      Linux/Windows/macOS legs get a ` [dispatch]` suffix. Preflight always
+      runs, and a skipped matrix leg already posts an unexpanded name, so the
+      suffix is always rendered or harmless.
+    - **Never skipped.** Proto backward-compat is routinely skipped (every
+      docs-only PR, #1978), so it keeps its literal name. On a dispatch it
+      always runs, giving an honest `buf breaking` result for that commit (the
+      same thing every dev push already posts). If `preflight-gate` did not
+      succeed, it fails red on a hosted runner instead of skipping.
+
+    As defence in depth, `trusted_inputs` refuses a direct dispatch on any ref
+    but `dev` or `main`.
   - **Mechanism.**
     - **Concurrency.** The dispatched run uses its own `-dispatch` concurrency
       group. GitHub keeps one pending run per group, so sharing the dev push
@@ -104,7 +137,8 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
       checked against the trusted-fork caller's read-only token when the
       workflow loads, so the alert's `issues: write` lives in the separate
       listener. `scripts/ci/test_runner_health_check.py` pins this, the
-      matrix lockstep and the dispatch name suffix;
+      matrix lockstep, the dispatch name suffix and proto-compat's literal
+      name and never-skip rule;
       `tests/shell/test_trusted_inputs_validate.sh` pins the ref refusal.
     - **Telemetry.** Dispatch runs record `event_name=workflow_dispatch`, so
       release-leg history moves from `push` to `workflow_dispatch` events.
@@ -116,9 +150,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
     `workflow_dispatch:` trigger itself is on `main`, which is unverified
     before then. `gh workflow run release-legs-daily.yml` needs that file on
     `main`. `-f legs=all` runs the full matrix on `dev` or `main`.
-  - **Dead-man.** Nothing detects a cron that never fires. If no
-    `release-legs-daily` run appears in the Actions tab for two days, check
-    that the workflow is enabled.
+  - **Dead-man.** Nothing detects a cron that never fires (the reconcile job
+    runs inside it). If no `release-legs-daily` run appears in the Actions tab
+    for two days, check that the workflow is enabled.
   - **Bisecting a red day.** A direct dispatch is accepted on `dev`/`main`
     only, and PR runs never build release, so CI cannot bisect it. Bisect
     locally instead: check out each candidate commit and build the release

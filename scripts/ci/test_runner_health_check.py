@@ -353,13 +353,25 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_direct_dispatch_never_posts_a_required_context_name(self) -> None:
         """Every job carrying a ruleset-required context name is suffixed on a
-        direct dispatch, so a dispatch cannot post, satisfy or shadow it."""
-        for job in ("preflight", "proto-compat", "linux", "windows", "macos"):
+        direct dispatch, so a dispatch cannot post, satisfy or shadow it —
+        except proto-compat (next test)."""
+        for job in ("preflight", "linux", "windows", "macos"):
             with self.subTest(job=job):
                 name_line = next(l for l in self.job("ci.yml", job).splitlines()
                                  if l.startswith("    name:"))
                 self.assertIn(self.DIRECT_DISPATCH, name_line)
                 self.assertIn("[dispatch]", name_line)
+
+    def test_proto_compat_keeps_its_literal_name_and_never_skips_on_dispatch(self) -> None:
+        """proto-compat is routinely skipped (docs-only PRs) and GitHub does not
+        evaluate a skipped job's name expression, so its name must stay the
+        literal required context. On a direct dispatch it must instead never be
+        skipped: it runs, or fails red when preflight-gate did not succeed."""
+        body = self.job("ci.yml", "proto-compat")
+        self.assertIn('    name: "Proto backward-compat"\n', body)
+        self.assertIn(f"if: ${{{{ ({self.DIRECT_DISPATCH} && !cancelled()) || (success() && ", body)
+        self.assertIn(f"if: {self.DIRECT_DISPATCH} && needs.preflight-gate.result != 'success'", body)
+        self.assertIn("exit 1", body)
 
     def test_ci_yml_stays_within_the_trusted_fork_token_ceiling(self) -> None:
         """trusted-fork-ci.yml calls ci.yml as a reusable workflow with a

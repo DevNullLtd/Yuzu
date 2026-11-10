@@ -55,10 +55,12 @@ on:
   # itself a workflow_dispatch. The trusted-fork path is unchanged: it still
   # expands the full debug + release matrix. A direct dispatch is accepted on
   # `dev` and `main` only (trusted_inputs refuses any other ref), and on it
-  # every job that carries a ruleset-required context name — Preflight
-  # (runner health), Proto backward-compat, and the Linux/Windows/macOS legs —
-  # gets a ` [dispatch]` name suffix, so a dispatch can never post, satisfy or
-  # shadow a required check (a SKIPPED required context counts as satisfied).
+  # the jobs that carry a ruleset-required context name are handled so a
+  # dispatch can never post, satisfy or shadow a required check (a SKIPPED
+  # required context counts as satisfied): Preflight (runner health) and the
+  # Linux/Windows/macOS legs get a ` [dispatch]` name suffix; Proto
+  # backward-compat keeps its literal name (a skipped job's name expression is
+  # not evaluated) and is never skipped on a dispatch — see that job.
   # ci.yml requests no permission beyond the trusted-fork caller's ceiling
   # (contents/pull-requests/actions: read): a called workflow's jobs are
   # permission-checked against the caller at load time, before any `if:`, so
@@ -186,8 +188,8 @@ jobs:
             # call) is accepted on `dev` and `main` only, and FAILS CLOSED on
             # any other ref. Defence in depth: the primary control is that on a
             # direct dispatch every job carrying a ruleset-required context
-            # name is renamed with a ` [dispatch]` suffix, so a dispatch never
-            # posts (or shadows, with a red, green or SKIPPED run) a required
+            # name is renamed with a ` [dispatch]` suffix or (proto-compat)
+            # never skipped, so a dispatch never posts a misleading required
             # check on any SHA — including the dev tip a dev->main promotion
             # PR uses as its head (governance 2026-11-10). This guard keeps the
             # trigger to the two refs it exists for: the daily release-legs
@@ -635,6 +637,7 @@ jobs:
           python3 scripts/ci/test_runner_health_check.py
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
+          bash tests/shell/test_release_legs_issue.sh         # release-legs-broken open/comment/close decision (Tier 2b)
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
@@ -724,16 +727,35 @@ jobs:
 
   # ── Proto backward-compatibility ───────────────────────────────────────
   proto-compat:
-    name: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && 'Proto backward-compat [dispatch]' || 'Proto backward-compat' }}
+    # LITERAL name, unlike the other required-context jobs: this job is
+    # routinely SKIPPED (docs-only PRs, #1978), and GitHub does not evaluate a
+    # skipped job's `name:` expression — it would post the raw template and the
+    # required "Proto backward-compat" context would be absent on every
+    # docs-only PR (github.com/orgs/community/discussions/13261). So on a
+    # direct dispatch this job is never skipped instead: it RUNS the real
+    # `buf breaking` check (an honest result for that commit, the same thing
+    # every dev push posts), or, when preflight-gate did not succeed, FAILS red
+    # on a hosted runner. A dispatch can therefore never post a SKIPPED
+    # (= satisfied) "Proto backward-compat" (governance 2026-11-10).
+    name: "Proto backward-compat"
     needs: [preflight-gate]
     # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
     # (yuzu-bigtam-*). Fail-closed `== 'true'`.
     # `&& code_changed` (issue #1978): a docs-only PR skips this required job
     # (skipped == satisfied), so it no longer blocks the merge on an absent check.
-    if: needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true'
-    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
+    # The explicit success() keeps the non-dispatch arm exactly as before: the
+    # `!cancelled()` in the dispatch arm would otherwise drop the implicit one.
+    if: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && !cancelled()) || (success() && needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true') }}
+    runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && needs.preflight-gate.result != 'success') && 'ubuntu-24.04' || fromJSON('["self-hosted","Linux","X64","yuzu-bigtam-linux"]') }}
     timeout-minutes: 5
     steps:
+      - name: Fail closed when preflight-gate did not succeed (dispatch)
+        if: (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && needs.preflight-gate.result != 'success'
+        env:
+          GATE_RESULT: ${{ needs.preflight-gate.result }}
+        run: |
+          echo "::error::preflight-gate did not succeed ($GATE_RESULT) on a direct dispatch — failing closed rather than posting a skipped (= satisfied) Proto backward-compat"
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ needs.preflight-gate.outputs.checkout_repository }}

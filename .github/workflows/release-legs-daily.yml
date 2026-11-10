@@ -4,7 +4,7 @@ name: Release legs (daily dispatch)
 #
 # A push to `dev` no longer builds ci.yml's release legs (Linux gcc-15 release
 # LTO, Linux clang-21 release, Windows MSVC release LTO, macOS release LTO):
-# they cost 9-23 min of self-hosted runner time per push and gate nothing (no
+# they cost 9-23 min of self-hosted runner time per leg per push and gate nothing (no
 # release leg is a required check). This workflow puts them back on a daily
 # cadence instead: it dispatches ci.yml against dev's tip with `legs=release`,
 # which expands to the release legs only (the debug legs normally already ran
@@ -23,8 +23,10 @@ name: Release legs (daily dispatch)
 #
 # Failure signal, because a run started by github-actions[bot] emails nobody:
 #   - a failing dispatched CI run opens (or comments on) a
-#     `release-legs-broken` issue, and the next green one closes it
-#     (release-legs-alert.yml, a workflow_run listener);
+#     `release-legs-broken` issue, and the next fully green one closes it
+#     (release-legs-alert.yml, a workflow_run listener — the fast path);
+#   - the `reconcile` job below re-judges the last completed dispatch run with
+#     the same script every day, before dispatching (the backstop);
 #   - a failure of THIS workflow (gh API error, dispatch refused) opens the
 #     same issue from the `alert` job below.
 # A cron that never fires at all is not detected (no dead-man signal); the
@@ -36,7 +38,7 @@ name: Release legs (daily dispatch)
 # promotion carrying them. Until then, dispatch ci.yml directly:
 #   gh workflow run ci.yml --ref dev -f legs=release
 # (ci.yml is already on main; that works once the `workflow_dispatch:` trigger
-# itself has reached main too — unverified before this change merges).
+# itself has reached main too — unverified until the first dev -> main promotion).
 #
 # 02:30 UTC is NOMINAL: GitHub starts scheduled runs late under load (hours,
 # per codeql.yml's notes), so a run can overlap the nightly/CodeQL window, or
@@ -61,6 +63,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Backstop for the workflow_run listener (release-legs-alert.yml): judge the
+  # most recent completed, non-cancelled dispatch run on dev with the same
+  # script, opening the issue if it failed and none is open, or closing open
+  # issues if it was fully green. Catches a dropped/failed/never-fired listener
+  # run and a run that never started, and clears an issue a dispatcher failure
+  # opened once dev is known green.
+  reconcile:
+    name: "Reconcile release-legs-broken with the last dispatch"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read    # list CI runs and read one
+      contents: read   # check out the script
+      issues: write    # open/close the release-legs-broken issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci/release-legs-issue.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Reconcile
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch --branch dev \
+                     --status completed --limit 20 --json databaseId,conclusion \
+                     --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0].databaseId // empty')
+          if [[ -z "$run_id" ]]; then echo "no completed dispatch run on dev yet"; exit 0; fi
+          bash scripts/ci/release-legs-issue.sh reconcile "$run_id"
+
   dispatch:
     name: "Dispatch release legs on dev"
     runs-on: ubuntu-24.04
@@ -95,7 +129,7 @@ jobs:
   # by github-actions[bot] are matched, never a PR or a hand-labelled issue.
   alert:
     name: "Open release-legs-broken on dispatcher failure"
-    needs: [dispatch]
+    needs: [reconcile, dispatch]
     if: ${{ failure() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -119,5 +153,9 @@ jobs:
           if [[ -n "$first" ]]; then
             gh issue comment "$first" -R "$REPO" --body "$body"
           else
+            # gh resolves --label by name and refuses an absent one, so make
+            # sure it exists (idempotent; --force only refreshes its metadata).
+            gh label create "$label" -R "$REPO" --color ededed --force \
+              --description "Daily release/LTO legs on dev failed (docs/ci-architecture.md Tier 2b)"
             gh issue create -R "$REPO" --title "Release legs broken on dev: dispatcher failed" --label "$label" --body "$body"
           fi

@@ -14,24 +14,20 @@ name: Release legs (alert)
 # instead, and `workflow_run` sees only CI runs, never the trusted-fork caller's.
 #
 # Scope: CI runs whose event is workflow_dispatch, on dev only. A trusted-fork
-# run is a run of trusted-fork-ci.yml, not of CI, so it never reaches here. A
-# CANCELLED run opens nothing: an operator cancel, or a pending dispatch that a
-# newer dispatch replaced; release-legs-daily.yml re-dispatches an uncovered
-# tip the next day. A run whose only failures are the preflight jobs is
-# reported as infrastructure, not as a code regression.
-#
-# Issue matching is restricted to OPEN ISSUES (gh issue list never returns pull
-# requests) carrying the label AND authored by github-actions[bot], so a label
-# a person adds to an unrelated issue is never commented on or closed.
+# run is a run of trusted-fork-ci.yml, not of CI, so it never reaches here. The
+# decision (open / comment / close / nothing) and the issue text live in ONE
+# place, scripts/ci/release-legs-issue.sh, which release-legs-daily.yml also
+# runs every day in `reconcile` mode as a backstop: a listener run that was
+# dropped, failed, or never fired is still reported within a day.
 #
 # LIVE ONLY FROM `main`: like `schedule:`, a `workflow_run` trigger is read
 # from the default branch, so this goes live with release-legs-daily.yml.
 
 on:
   # workflow_run is safe HERE: this workflow never checks out or executes
-  # anything from the triggering run; it reads run metadata through the API
-  # (ids/SHA validated, every value passed via env, never interpolated into a
-  # script), the trigger is filtered to the protected `dev` branch, and only
+  # anything from the triggering run (it checks out the default branch's own
+  # script); it reads run metadata through the API (ids/SHA validated, every
+  # value passed via env, never interpolated into a script), the trigger is filtered to the protected `dev` branch, and only
   # CI runs whose event is workflow_dispatch (dev/main-only by ci.yml's
   # trusted_inputs) act. Same trigger as pre-release.yml.
   workflow_run:  # zizmor: ignore[dangerous-triggers]
@@ -42,76 +38,37 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: release-legs-alert
-  cancel-in-progress: false
-
 jobs:
   alert-or-close:
     name: "Open or close release-legs-broken"
-    if: github.event.workflow_run.event == 'workflow_dispatch' && contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion)
+    # Every conclusion but cancelled/skipped acts (a startup_failure included);
+    # the script decides open/comment/close.
+    if: github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.conclusion != 'cancelled' && github.event.workflow_run.conclusion != 'skipped'
+    # Job-level, not workflow-level: a workflow-level group is entered BEFORE
+    # the job `if:`, so every dev push completion (skipped here) would queue in
+    # it, and GitHub's one-pending-per-group rule could evict a pending dispatch
+    # completion. At job level only acting runs serialise (so two
+    # near-simultaneous failures cannot open two issues).
+    concurrency:
+      group: release-legs-alert
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
-      actions: read   # read the CI run's job list
-      issues: write   # open/comment/close the release-legs-broken issue
+      actions: read    # read the CI run and its job list
+      contents: read   # check out the default branch's script
+      issues: write    # open/comment/close the release-legs-broken issue
     steps:
+      # The DEFAULT branch's copy of the script (workflow_run runs there), never
+      # anything from the triggering run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci/release-legs-issue.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - name: Open, update or close the release-legs-broken issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-        run: |
-          set -euo pipefail
-          label=release-legs-broken
-          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::bad run id"; exit 1; }
-          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad head sha"; exit 1; }
-          jobs_json=$(gh run view "$RUN_ID" -R "$REPO" --json jobs)
-          open=$(gh issue list -R "$REPO" --label "$label" --state open \
-                   --author "app/github-actions" --json number --jq '.[].number')
-
-          if [[ "$CONCLUSION" == "success" ]]; then
-            # Close only when the release legs actually ran and passed: at
-            # least one `... [dispatch]` build leg, none skipped or failed.
-            legs_ok=$(jq '[.jobs[] | select(.name | test("^(Linux|Windows MSVC|macOS) .*\\[dispatch\\]$"))]
-                          | (length > 0) and all(.conclusion == "success")' <<<"$jobs_json")
-            if [[ "$legs_ok" != "true" ]]; then
-              echo "Run succeeded but no complete set of dispatch build legs ran — leaving any issue open."
-              exit 0
-            fi
-            for n in $open; do
-              close_body=$(printf '%s\n\n%s\n' \
-                "Release-legs dispatch on \`dev\` @ \`$HEAD_SHA\` is **green**: $RUN_URL" \
-                "(auto-closed by .github/workflows/release-legs-alert.yml; a later failing dispatch opens a new issue.)")
-              gh issue comment "$n" -R "$REPO" --body "$close_body"
-              gh issue close "$n" -R "$REPO" --reason completed
-              echo "Closed #$n"
-            done
-            exit 0
-          fi
-
-          failed=$(jq -r '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | .name] | join(", ")' <<<"$jobs_json")
-          infra_only=$(jq '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | .name]
-                          | (length > 0) and all(test("^(Validate trusted CI inputs|Preflight \\(gate\\)|Preflight \\(runner health\\)( \\[dispatch\\])?)$"))' <<<"$jobs_json")
-          if [[ "$infra_only" == "true" ]]; then
-            cause="Only the preflight jobs failed, so this is most likely **infrastructure** (an unhealthy runner pool, or a runner-health / source gate), not a code regression. Check the Preflight (gate) log first."
-          else
-            cause="A build or test leg failed. If it is a real failure rather than a flake or an infrastructure timeout, a release-only regression landed on dev since the last green dispatch."
-          fi
-          body=$(printf '%s\n\n%s\n\n%s\n\n%s\n\n%s\n\n%s\n' \
-            "Release-legs dispatch failed on \`dev\` (dispatched at \`$HEAD_SHA\`, conclusion \`$CONCLUSION\`)." \
-            "**Failed jobs:** ${failed:-unknown}" \
-            "$cause" \
-            "**Run:** $RUN_URL" \
-            "Each build leg checks out the dev BRANCH when it starts, so it may have built a later commit than the dispatched one; its \"Record built commit (dispatch)\" step names the exact commit. Triage and bisect recipe: docs/ci-architecture.md, Tier 2b." \
-            "(auto-posted by .github/workflows/release-legs-alert.yml; closed automatically by the next green dispatch.)")
-          first=$(head -n1 <<<"$open")
-          if [[ -n "$first" ]]; then
-            gh issue comment "$first" -R "$REPO" --body "$body"
-            echo "Commented on #$first"
-          else
-            gh issue create -R "$REPO" --title "Release legs broken on dev: ${failed:-unknown}" --label "$label" --body "$body"
-          fi
+        run: bash scripts/ci/release-legs-issue.sh event "$RUN_ID"

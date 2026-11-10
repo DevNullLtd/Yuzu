@@ -4,5 +4,6 @@
   (`release-legs-daily.yml`). A failing dispatch opens a `release-legs-broken` issue
   (`release-legs-alert.yml`), and the release skill checks for one before tagging. Contributor-facing:
   `ci.yml` gains a `workflow_dispatch` trigger (`legs=release|all`), accepted on `dev` and `main` only;
-  its job names carry a ` [dispatch]` suffix so a dispatch never posts a required check. The cron and
+  its required-check jobs are renamed (` [dispatch]`) or never skipped so a dispatch never posts a misleading
+  required check. The cron and
   the alert go live once the files reach `main`. Details: `docs/ci-architecture.md`, Tier 2b.
