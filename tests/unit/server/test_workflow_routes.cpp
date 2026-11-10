@@ -4039,6 +4039,8 @@ TEST_CASE("legacy instruction execute: Execution:Execute withdrawn inside the ex
     auto res = h.sink.Post("/api/instructions/def-RECHECK-ROUTE/execute", R"({"agent_ids":["a1"]})");
     REQUIRE(res);
     CHECK(res->status == 403);
+    // The body is the route's own refusal (rest-api.md documents the message), not the gate's.
+    CHECK(res->body.find("permission revoked after the request was recorded") != std::string::npos);
     CHECK(h.dispatch_calls == 0);
     REQUIRE_FALSE(h.audit_calls.empty());
     const auto& row = h.audit_calls.back();
@@ -4075,6 +4077,7 @@ TEST_CASE("legacy instruction execute: the administrator standing a role-gated d
     auto res = h.sink.Post("/api/instructions/def-RECHECK-MODE/execute", R"({"agent_ids":["a1"]})");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(res->body.find("permission revoked after the request was recorded") != std::string::npos);
     CHECK(h.dispatch_calls == 0);
     CHECK(h.approvals->pending_count() == pending_before); // a refusal, never a pending approval
     REQUIRE_FALSE(h.audit_calls.empty());
@@ -4114,6 +4117,7 @@ TEST_CASE("legacy instruction execute: a recheck that throws after the execution
     auto res = h.sink.Post("/api/instructions/def-RECHECK-THROW/execute", R"({"agent_ids":["a1"]})");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(res->body.find("permission revoked after the request was recorded") != std::string::npos);
     CHECK(h.dispatch_calls == 0);
     REQUIRE_FALSE(h.audit_calls.empty());
     const auto& row = h.audit_calls.back();

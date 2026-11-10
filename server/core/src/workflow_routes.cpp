@@ -34,6 +34,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_token (the post-row recheck's audit detail and log lines)
 
 #include <algorithm>
 #include <cctype>
@@ -3881,10 +3882,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         // Closes the row above for a command that was never sent (a recheck refusal, a
         // dispatch that threw, a dispatch that reached nobody); a failed cancel is logged and
-        // counted like every other mark_cancelled failure (#4982 Fix 5).
+        // counted like every other mark_cancelled failure (#4982 Fix 5). A throwing cancel is a
+        // failed cancel, as on the v1 twins: this lambda also runs inside the dispatch catch
+        // below, where a second throw would escape the handler and leave the row `running`.
         const auto cancel_execution_row = [&] {
-            if (!execution_tracker || execution_id.empty() ||
-                execution_tracker->mark_cancelled(execution_id, session->username))
+            if (!execution_tracker || execution_id.empty())
+                return;
+            bool cancelled = false;
+            try {
+                cancelled = execution_tracker->mark_cancelled(execution_id, session->username);
+            } catch (...) {
+                cancelled = false;
+            }
+            if (cancelled)
                 return;
             spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
                           execution_id);
