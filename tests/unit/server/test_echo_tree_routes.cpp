@@ -1513,7 +1513,7 @@ TEST_CASE("echo routes: frames that together pass a payload cap take the over-ca
     }
 }
 
-TEST_CASE("echo routes: capture-source cards never relabel the old live count",
+TEST_CASE("echo routes: capture-source cards read the row count from <src>_rows only",
           "[echo][routes][capture-sources]") {
     SECTION("<src>_rows alone") {
         EchoHarness h;
@@ -1524,14 +1524,13 @@ TEST_CASE("echo routes: capture-source cards never relabel the old live count",
         CHECK(res->body.find("$Process_Hourly") != std::string::npos);
         CHECK(res->body.find("upgrade the agent") == std::string::npos);
     }
-    SECTION("<src>_live_rows alone is a dash and one upgrade note") {
+    SECTION("<src>_live_rows alone is not read: a dash") {
         EchoHarness h;
         h.status_output = "config|process_enabled|true\nconfig|process_live_rows|5678\n";
         auto res = h.run_capture_sources();
         REQUIRE(res);
         CHECK(res->body.find("5678") == std::string::npos);
-        CHECK(res->body.find("This device runs an agent without the roll-up tables; upgrade the agent") !=
-              std::string::npos);
+        CHECK(res->body.find("without the roll-up tables") == std::string::npos);
         CHECK(res->body.find("&mdash;") != std::string::npos);
     }
     SECTION("neither key: a dash, not zero") {
