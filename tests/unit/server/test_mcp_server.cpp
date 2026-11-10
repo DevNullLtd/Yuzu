@@ -6767,13 +6767,9 @@ TEST_CASE("MCP list_echo_retention_paused: tools/list names the hourly roll-up r
     const auto& row = (*tool)["outputSchema"]["properties"]["rows"]["items"];
     CHECK(row["properties"].contains("hourly_rows"));
     CHECK_FALSE(row["properties"].contains("live_rows"));
-    bool hourly_required = false;
-    for (const auto& name : row["required"]) {
-        CHECK(name != "live_rows");
-        if (name == "hourly_rows")
-            hourly_required = true;
-    }
-    CHECK(hourly_required);
+    const auto required = row["required"].dump();
+    CHECK(required.find("\"hourly_rows\"") != std::string::npos);
+    CHECK(required.find("live_rows") == std::string::npos);
 }
 
 // ── Guardian schema discovery on the MCP plane (contract §4 dec.3 / §9 G9) ───
