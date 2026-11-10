@@ -1705,9 +1705,9 @@ flip, with a red-first test each:
     its in-band probe line is not captured, so that protection is Linux-only until the macOS and
     Windows runs. The new cases have run on Linux debug only: ASan/UBSan, TSan, Windows (MSVC) and
     macOS (Apple Clang) runs of them are outstanding. The Armed return that attach_rule makes
-    after it re-inspects its claim (the case in which the claim resolved before attach_core
-    returned) carries a rebuild reason, and the io-class case in
-    `test_guardian_spark_reapply_skip_runtime.cpp` forces it through a test-only resume hook
+    after it re-inspects its claim (the case in which the claim settled before attach_rule
+    re-inspected it) carries a rebuild reason, and the io-class forced-resume SECTION of the R2
+    case in `test_guardian_spark_reapply_skip_runtime.cpp` forces it through a test-only resume hook
     (`set_attach_resume_hook_for_test`) and asserts `Armed` and the reason. The line has not been
     observed on a flipped fleet; (c) MEASURED, release build (base `45f727420` against branch tip
     `3f8dd8d0d`, uncommitted throwaway harness; counts are exact, wall times are not): Linux

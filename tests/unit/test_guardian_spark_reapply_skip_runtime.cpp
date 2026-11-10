@@ -1428,7 +1428,7 @@ TEST_CASE("#5719 reason R1: a healthy identical attach is skipped and carries no
 // Mutation (caught here): leave `.rebuild_reason` off the Armed return attach_rule makes after it
 // re-inspects its claim (the claim settled before attach_rule resumed): the forced-resume SECTION
 // parks the caller in set_attach_resume_hook_for_test until the arm has settled, which takes that
-// return deterministically (a free-running loop of 400 attaches never took it).
+// return deterministically.
 // ---------------------------------------------------------------------------------------
 TEST_CASE("#5719 reason R2: a first attach reports first_attach on every success return",
           "[spark][runtime][4415prA][5719]") {
@@ -1449,11 +1449,14 @@ TEST_CASE("#5719 reason R2: a first attach reports first_attach on every success
         const auto spec = file_spec("/a");
         const auto key = spark_key(spec);
         auto* const rt = rig.rt.get();
-        rt->set_attach_resume_hook_for_test([rt, key] {
+        bool fired = false; // the hook runs on this thread, inside attach_rule
+        rt->set_attach_resume_hook_for_test([rt, key, &fired] {
+            fired = true;
             REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; },
                                            10s));
         });
         const auto out = attach_nw(rig, "r1", spec, file_exists_rule("r1"));
+        CHECK(fired); // else the Armed asserts below would not have exercised the post-check return
         CHECK(out.kind == RT::ArmOutcomeKind::Armed);
         CHECK_FALSE(out.skipped);
         CHECK(out.generation != 0);

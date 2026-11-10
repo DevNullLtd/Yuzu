@@ -986,8 +986,9 @@ public:
     /// Dispatching-window race deterministically. Set before triggering the
     /// dispatch; consumed (moved out, resetting to empty) under registry_mu_.
     void set_dispatch_entry_hook_for_test(std::function<void()> hook);
-    /// #5719 test seam: fires exactly once, in attach_rule(NonWaiting), after attach_core()
-    /// returned Pending and before that function re-inspects its claim. The hook runs with
+    /// #5719 test seam: fires at most once, in attach_rule(NonWaiting), after attach_core()
+    /// returned Pending and before that function re-inspects its claim (an attach that returns
+    /// Armed, Failed or Reobserved earlier leaves it set). The hook runs with
     /// registry_mu_ RELEASED (the one acquisition the re-inspection needs is dropped and retaken
     /// around it, so an empty hook costs production nothing). A hook that waits for the claim to
     /// settle makes the re-inspection deterministically take its Armed return, the "completion
