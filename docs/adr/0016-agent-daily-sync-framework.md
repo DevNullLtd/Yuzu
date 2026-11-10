@@ -1607,7 +1607,7 @@ only on a 32-bit OS.
 padding trimmed; the Win32 `\\?\` and `\\.\` prefixes dropped; `\` and `/` both separators, runs collapsed;
 `.` dropped and `..` resolved, an escape past the root refused; trailing dots and spaces stripped per
 Windows segment; the macOS `/System/Volumes/Data` firmlink folded; compared without regard to case) and
-then KEEPS it, in one spelling, only when it sits under a root of the one table `kMachineRoots`: Windows
+then KEEPS it, in one spelling (the segments' own case is kept), only when it sits under a root of the one table `kMachineRoots`: Windows
 `Program Files`, `Program Files (x86)`, `ProgramData` and `Windows` under any drive letter; macOS
 `/Applications`, `/Library`, `/System/Applications`, `/Developer`; `/opt` and `/usr` (macOS and Linux);
 Linux `/snap`, `/var/lib/flatpak`, `/nix`, `/app`. Everything else is blanked, fail closed: a home under
@@ -1621,7 +1621,9 @@ of home roots, which a probe showed leaking through quoting, padding, doubled se
 names, NT prefixes, relocated profile roots and `/Volumes`; a blacklist on installer-authored text is
 fail-open, an allowlist is not. The blanking is part of the stored form, so it also keeps one app installed
 under two accounts one row, and a kept location is written in one spelling, so quoting or separator variants
-of one folder are one row too. The mount-point redaction above (`mount_entry_is_personal`) stays a personal-roots
+of one folder are one row too. The rule is lexical: a kept path is not checked below its root, nor for links or
+junctions, and a path under a machine root is accepted as machine-scope whatever it names (`/opt/users/alice/app`
+is kept). The mount-point redaction above (`mount_entry_is_personal`) stays a personal-roots
 rule (it redacts, it does not select); a shared canonical form for both is a follow-up. Customer-configurable
 extra roots are a follow-up. `tests/unit/test_installed_software_v3.cpp` pins every probed spelling and the
 kept machine paths through both `v3_record` and `plan_section`.
@@ -1642,5 +1644,6 @@ about 14 MB for eleven facets in the worst case; typical hosts hold 100 to 300 K
 later change if a measurement asks for it.
 
 **Not in this change.** The component facet (no plugin produces it), the settings push of the 2026-11-05
-Update, the binary-evidence plugin and its two-at-once pairing, and the `disabled` status (nothing in the agent
-turns a facet off yet).
+Update, the binary-evidence plugin and its two-at-once pairing, the `software_evidence.list_inventory` source row
+1.3a names (no such plugin exists; it is deferred with the component facet), and the `disabled` status (nothing in
+the agent turns a facet off yet).

@@ -5249,6 +5249,25 @@ TEST_CASE("collector: acknowledgement commits sections; nacks mark a facet or th
     CHECK(full_sections(all_again->first) == 11);
 }
 
+TEST_CASE("collector: a token that is only the source prefix, or a lookalike without the colon, "
+          "nacks nothing and the acknowledgement commits",
+          "[sync][collector][v3]") {
+    fake_all_supported();
+    Collector c(every_plugin());
+    REQUIRE(c.collect_forced().has_value());
+    // The scheduler never passes either (it matches the name or `name:`), but the hook is public:
+    // a bare `installed_software:` names no facet, and a lookalike whose 19th byte is not `:`
+    // must not be read as `installed_software:<facet>` from byte 20 on.
+    c.ack({"installed_software:",
+           std::string("installed_softwareX") + kFacetApps});
+    REQUIRE(c.kv.count(acked_key(kFacetApps)) == 1);
+    for (const auto& [key, value] : c.kv) {
+        CAPTURE(key);
+        if (key.ends_with(".need_full"))
+            CHECK(value != "1");
+    }
+}
+
 TEST_CASE("collector: a status-only acknowledgement erases the acked set", "[sync][collector][v3]") {
     fake_all_supported();
     Collector c(every_plugin());
@@ -5568,12 +5587,11 @@ TEST_CASE("collector: a hung plugin leaves the other plugins' sections reporting
     reset_fakes();
     g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\n";
     g_fake[3].out["list_inventory"] = "status|list_inventory|supported|-\n";
-    CollectorTuning tuning;
     // Real-clock wait is the contract under test (a hung worker is abandoned at its limit). This
-    // pass mixes the blocking leg with two that must complete (apps and msi answer at once), so
-    // the one limit is 250 ms: short enough for the hang, wide enough that a scheduling stall on
-    // a loaded runner does not turn an instant answer into a false `timeout`.
-    tuning.time_limit = std::chrono::milliseconds{250};
+    // pass mixes the blocking leg with two that must COMPLETE (apps and msi answer at once), so it
+    // runs under the must-complete limit: the hang costs that long once, and a scheduling stall on
+    // a loaded runner cannot turn an instant answer into a false `timeout`.
+    CollectorTuning tuning = must_complete_tuning();
     // pkg_inventory sits BETWEEN the two responders in the action table: a flag shared by every
     // plugin would hold msi_packages out, one keyed by plugin does not.
     Collector c({{"installed_apps", &kFakeIa},

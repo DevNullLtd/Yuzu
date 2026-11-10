@@ -380,14 +380,16 @@ cadences.
   `InstallLocation`, the macOS `.app` path) and never `uninstall_string`; since a path under a
   user's profile names an account, the location is an allowlist: the agent canonicalises the
   value (quotes, padding, doubled separators, `.` and `..` segments, the `\\?\` prefix and the
-  macOS `/System/Volumes/Data` spelling) and keeps it, in one spelling, only when it sits under a
+  macOS `/System/Volumes/Data` spelling) and keeps it, in one spelling (case is kept), only when it sits under a
   known machine root (Windows `Program Files`, `Program Files (x86)`, `ProgramData` and `Windows`
   on any drive; macOS `/Applications`, `/Library`, `/System/Applications`, `/Developer`; `/opt` and
   `/usr`; Linux `/snap`, `/var/lib/flatpak`, `/nix`, `/app`). A location outside those roots, and
   any spelling the agent cannot resolve (a UNC path, an unexpanded `%ProgramFiles%`, an 8.3 name,
   a drive-relative or NT-namespace path), is blanked before it is hashed or sent; the row's name,
   version, publisher and hash are still reported. So the stored value and the change
-  history name machine-scope roots only (ADR-0016 §8, #5186). (The only `HKCU`
+  history name paths under a machine-scope root only (ADR-0016 §8, #5186); the rule is lexical,
+  so a kept path is not checked below its root, nor for links or junctions, and is accepted as
+  machine-scope whatever it names. (The only `HKCU`
   read is the agent's own service-account hive, which is benign: the agent runs outside any
   interactive login session, so `HKCU` is that service account's profile. Note
   the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`

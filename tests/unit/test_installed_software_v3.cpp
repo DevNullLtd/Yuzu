@@ -298,6 +298,9 @@ TEST_CASE("install_location is an allowlist: every spelling outside a machine ro
         "\"C:\\Users\\alice\\AppData\\Local\\Foo\"", " C:\\Users\\alice", "C:\\\\Users\\\\alice\\\\Foo",
         "C:\\.\\Users\\alice", "C:\\Users.\\alice", "C:\\Program Files\\..\\Users\\alice",
         "C:\\Program Files\\..\\..\\Users", "/Applications/../Users/alice/App",
+        // `..` resolved BEFORE the allowlist: a machine root climbed out of is not a machine root,
+        // and the firmlink is folded only when it survives the climb.
+        "/opt/../home/x", "/usr/../root", "/System/Volumes/Data/../../Users/alex",
         // 8.3 names, NT object spellings, drive-relative, unexpanded variables: not resolvable.
         "C:\\DOCUME~1\\alice", "C:\\PROGRA~1\\Tool", "\\??\\C:\\Users\\alice",
         "\\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\Users\\alice",
@@ -363,6 +366,11 @@ TEST_CASE("install_location is an allowlist: every spelling outside a machine ro
         {"/nix/store/abc-foo", "/nix/store/abc-foo"},
         {"/app/bin", "/app/bin"},
         {"/opt//x/./y/../z", "/opt/x/z"},
+        // The rule is lexical (ADR-0016 section 8): under a machine root a segment that merely
+        // looks like a profile folder is kept; nothing below the root is inspected.
+        {"/opt/users/alice/app", "/opt/users/alice/app"},
+        {"/Library/Users", "/Library/Users"},
+        {"/opt/homedir", "/opt/homedir"},
         {"C:\\Program Files", "C:\\Program Files"}};
     for (const auto& [path, canonical] : kept) {
         CAPTURE(path);
@@ -610,6 +618,21 @@ TEST_CASE("write_v3_blob: a row-bearing section that would cross a call cap but 
     CHECK(two.sent == std::vector<std::string>{kApps});
     CHECK(two.deferred == std::vector<std::string>{kPkgs});
     CHECK(two.blob.size() <= kV3MaxBlobBytes);
+}
+
+TEST_CASE("write_v3_blob: the section count is capped at kV3MaxSections; the one past it is deferred",
+          "[v3][writer][blob]") {
+    // Unreachable from the eleven-row table, pinned so the server's section cap stays mirrored.
+    std::vector<SectionPlan> plans;
+    std::vector<std::string> facets;
+    for (std::size_t i = 0; i <= kV3MaxSections; ++i) {
+        facets.push_back("facet." + std::to_string(i));
+        plans.push_back(plan_section(facets.back(), {row("r", "1", facets.back())}, std::nullopt, false));
+    }
+    const auto out = write_v3_blob(plans);
+    CHECK(out.sent.size() == kV3MaxSections);
+    CHECK(out.deferred == std::vector<std::string>{facets.back()});
+    CHECK(parse_like_server(out.blob).sections.size() == kV3MaxSections);
 }
 
 TEST_CASE("the acked value round-trips and anything torn reads as no acked set", "[v3][kv]") {

@@ -3,6 +3,8 @@
 #include "sync_canonical.hpp" // clamp_field / sha256_hex
 #include "sync_scheduler.hpp" // sanitize_skip_reason
 
+#include <user_profile_model.hpp> // iequals_ascii
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -28,16 +30,6 @@ std::string clamp(std::string_view s) {
 
 char ascii_lower(char c) {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
-bool starts_with_ci(std::string_view s, std::string_view prefix) {
-    if (s.size() < prefix.size())
-        return false;
-    for (std::size_t i = 0; i < prefix.size(); ++i) {
-        if (ascii_lower(s[i]) != ascii_lower(prefix[i]))
-            return false;
-    }
-    return true;
 }
 
 bool is_sep(char c) {
@@ -312,16 +304,18 @@ std::string machine_install_location(std::string_view p) {
         segs.push_back(seg);
     }
     // 5. The macOS firmlink: `/System/Volumes/Data/<x>` is `/<x>`.
-    if (!drive && segs.size() >= 3 && starts_with_ci(segs[0], kDataVolumeSegments[0]) &&
-        segs[0].size() == kDataVolumeSegments[0].size() &&
-        starts_with_ci(segs[1], kDataVolumeSegments[1]) &&
-        segs[1].size() == kDataVolumeSegments[1].size() &&
-        starts_with_ci(segs[2], kDataVolumeSegments[2]) &&
-        segs[2].size() == kDataVolumeSegments[2].size())
+    if (!drive && segs.size() >= 3 &&
+        yuzu::profiles::iequals_ascii(segs[0], kDataVolumeSegments[0]) &&
+        yuzu::profiles::iequals_ascii(segs[1], kDataVolumeSegments[1]) &&
+        yuzu::profiles::iequals_ascii(segs[2], kDataVolumeSegments[2]))
         segs.erase(segs.begin(), segs.begin() + 3);
     if (segs.empty())
         return {};
-    // 6. The allowlist, on the lower-cased '/'-joined segments, at a segment boundary.
+    // 6. The allowlist, on the lower-cased '/'-joined segments, at a segment boundary. The
+    //    POSIX roots match without regard to case as the Windows ones do (`/OPT/x` on a
+    //    case-sensitive filesystem is a different tree from `/opt/x`, but still one under a
+    //    machine root), and step 7 writes the segments in their own case. The rule is lexical:
+    //    a kept path is not checked below its root, nor for links or junctions.
     std::string key;
     for (const auto seg : segs) {
         if (!key.empty())

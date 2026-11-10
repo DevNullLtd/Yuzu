@@ -98,8 +98,8 @@ enum class V3Status { full, delta, constrained, timeout, oversize, not_collected
 /// keeps a copy in the change ledger for 400 days): the value is canonicalised first (quotes
 /// and padding trimmed, the Win32 `\\?\` and `\\.\` prefixes dropped, separator runs collapsed,
 /// `.` and `..` resolved, trailing dots and spaces stripped per Windows segment, the macOS
-/// `/System/Volumes/Data` firmlink folded) and KEPT, in one spelling (`C:\Program Files\X`,
-/// `/Applications/X.app`), only when it sits under a root of `kMachineRoots` in
+/// `/System/Volumes/Data` firmlink folded) and KEPT, in one spelling with the segments' own
+/// case (`C:\Program Files\X`, `/Applications/X.app`), only when it sits under a root of `kMachineRoots` in
 /// installed_software_v3.cpp: Windows `Program Files`, `Program Files (x86)`, `ProgramData`
 /// and `Windows` under any drive letter; macOS `/Applications`, `/Library`,
 /// `/System/Applications`, `/Developer`; `/opt` and `/usr`; Linux `/snap`, `/var/lib/flatpak`,

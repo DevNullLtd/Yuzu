@@ -1018,7 +1018,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
             // `installed_software:<facet>`.
             if (t == kName)
                 whole = true;
-            else if (t.size() > kName.size() + 1) // `installed_software:<facet>`; the hook is public
+            else if (t.size() > kName.size() + 1 && t[kName.size()] == ':') // the hook is public
                 nacked.insert(t.substr(kName.size() + 1));
         }
         for (auto& f : st->facets) {
