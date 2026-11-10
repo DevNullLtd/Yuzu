@@ -2516,6 +2516,8 @@ TEST_CASE(
     REQUIRE(rest->status == 200);
     CHECK(nlohmann::json::parse(rest->body)["data"]["ci"]["sections"][0]["reason"] ==
           std::string(section_fault_token(SectionFault::RowCount)));
+    // The one row that remains is withheld from the body (#7165).
+    CHECK(nlohmann::json::parse(rest->body)["data"]["ci"]["sections"][0]["rows"].empty());
     CHECK(count() == 1.0);
 }
 

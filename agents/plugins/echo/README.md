@@ -37,8 +37,8 @@ failure of either rolls back both. Raw capture rows are not kept: what an event 
 keys and measures its tier declares, so a per-event pid, command line or timestamp cannot be read
 back. `echo.sql` reads the tiers directly; `echo.query` and `echo.export` return the hourly buckets
 as rows of the old shape. The retired raw names (`$Process_Live`
-and the other fifteen `<source>_live`) do not exist: a query that names one fails as an unknown
-table, so a stored query that still reads one has to move to a tier. A database written by an earlier build is migrated
+and the other fifteen `<source>_live`) stay answerable as empty views with their old columns, so a
+stored query returns no rows instead of an error. A database written by an earlier build is migrated
 once, in a single transaction, on the first open (schema v10; see "Upgrading an existing
 database"): the volume must hold twice the database file plus its write-ahead log free, or the open is refused with the
 retired tables intact and Echo stays offline (`status` reports `storage_state|offline|free_space`)
@@ -72,7 +72,7 @@ no events, so a quiet first tick is not evidence about the past.
 | Who talked to this address, and what is listening? | `connections_to_ip`, `tcp_by_process`, `listening_ports`, `daily_connection_summary` | Polled connection tables on every OS; a connection that opens and closes inside one interval is not seen. macOS sees every flow only with root. |
 | Did a service change state, who logged on? | `service_state_changes`, `user_sessions` | Windows is complete. Linux and macOS are constrained: no start type, and `utmp` or `utmpx` can miss GUI logins and containers without them. |
 | Which software was installed or removed? | `query type=software` | Windows only (machine-wide Uninstall keys). Empty on Linux and macOS means not collected. |
-| Did a persistence or policy registry value change? | `sql` over `$Registry_Hourly` | Windows only. The newest data of each changed value (up to 512 bytes, unmasked, as `last_data`), its type and the image of the writing process when attributed (`last_actor_image`); the old value is not kept. A logged-off user's change is counted in the same tiers and never names a writer. |
+| Did a persistence or policy registry value change? | `sql` over `$Registry_Hourly` (`$Registry_Live` answers no rows) | Windows only. The newest data of each changed value (up to 512 bytes, unmasked, as `last_data`), its type and the image of the writing process when attributed (`last_actor_image`); the old value is not kept. A logged-off user's change is counted in the same tiers and never names a writer. |
 | Did the device sleep, wake, change power source, or have media attached? | `sql` over `$Power_Hourly`, `$Removable_Hourly` | `capture_gap` rows mark any stretch the agent could not see. |
 | Who is on the network segment, what did it resolve, which shares are mapped? | `recent_arp`, `recent_dns`, `recent_mapdrive`, or `query` with type arp, dns or mapdrive | `dns` is Windows only; `mapdrive` outbound live only on macOS. These are device-state sources: they are never part of the default `query` feed. |
 | Anything else in the warehouse | `sql` | A single SELECT against `$`-prefixed tables, validated by `validate_and_translate_sql` and run through the read-only `execute_user_query`. The `usage` tables are not queryable here. |
@@ -407,8 +407,8 @@ collection actions share one line shape, `echo\|collect_<leg>\|<events_recorded>
 `<token>` is one of `source_disabled`, `unsupported_platform`, `baseline`, `sample_recorded`,
 `apps_recorded`, `cursor_advanced`, `cursor_lost`, `capture_incomplete`, `counters_unavailable`, `state_unreadable` (the `kCollectStatus*` tokens in `echo_collectors.hpp`; `state_unreadable` is emitted by `skip_token()` in `echo_plugin.cpp`). Cursor sources (`power`, `removable`, `registry`) add their own `echo|collect_<source>|<n>|<token>` line to the `collect_slow` stream.
 `status`'s wire format is line-oriented `key\|value` pairs (`storage_state\|ok`,
-`record_count\|<n>`, `config\|<key>\|<value>`, ...), not one positional row — the four YAML columns
-below correspond to four of those lines; the rest (`config\|*`, `retention_guard\|*`,
+`record_count\|<n>`, `config\|<key>\|<value>`, ...), not one positional row — the five YAML columns
+below correspond to five of those lines; the rest (`config\|*`, `retention_guard\|*`,
 `retention_guard_failed\|*`) are operational fields the YAML schema does not model. `query`'s rows
 match its five columns exactly, followed by an un-modelled `total\|<n>` summary line. `sql` (and
 every canned query in `echo_warehouse.yaml`) emits a leading `__schema__\|<col>\|<col>...` line,
@@ -580,7 +580,7 @@ their declared columns at all; see Caveats.
 
 **Actions without a definition.** `collect_perf` writes `echo\|collect_perf\|<n>\|<token>`, the same
 shape as `collect_fast`/`collect_slow` (see `do_collect_perf` in `echo_plugin.cpp`). `collect_software` follows the
-same convention. A failed perf/procperf counter read reports `counters_unavailable` where the registry lists the OS as supported and `unsupported_platform` where it has no perf collector. `status` additionally emits `db_budget_bytes|<n|unknown>` (`unknown`: the setting could not be read, so that pass is skipped and retried), `budget_over_bytes|<n|unknown>` (measured when `status` runs, not cached from the last pass; `unknown` when the size or the setting cannot be read), `budget_evicted_hourly_rows_total|<n>`, `db_auto_vacuum|<incremental|none|deferred>`, `module_dedup_overflow_total|<n>`, `tcp_closing_dedup_overflow_total|<n>`, `db_health|<ok|quarantined>|<epoch>`, `config|perf_capture_method|<m>`, `config|procperf_procs_seen|<n>` and, per capture source, `config|<src>_last_status|<token>`, `config|<src>_consecutive_failures|<n>` and `config|<src>_last_status_at|<epoch>` (process memory only; see the user manual). A failed baseline-only save emits `error|<source> state_save_failed`. `retention_guard|__budget__|<n>` is not a table: the byte-budget pass was skipped because the retention clock guard refused this pass's clock; it is counted in neither `retention_guard_declines_total` nor `retention_guard_failures_total`. An exception inside any action ends the reply with a fixed `error|internal` line and exit code 1; it can follow lines already written, so a consumer must not assume `error|` is first on that path; the cause is in the agent log. `purge_source` writes a single JSON line,
+same convention. A failed perf/procperf counter read reports `counters_unavailable` where the registry lists the OS as supported and `unsupported_platform` where it has no perf collector. `status` additionally emits `db_budget_bytes|<n|unknown>` (`unknown`: the setting could not be read, so that pass is skipped and retried), `budget_over_bytes|<n|unknown>` (measured when `status` runs, not cached from the last pass; `unknown` when the size or the setting cannot be read), `budget_evicted_raw_rows_total|<n>`, `budget_evicted_hourly_rows_total|<n>`, `db_auto_vacuum|<incremental|none|deferred>`, `module_dedup_overflow_total|<n>`, `tcp_closing_dedup_overflow_total|<n>`, `db_health|<ok|quarantined>|<epoch>`, `config|perf_capture_method|<m>`, `config|procperf_procs_seen|<n>` and, per capture source, `config|<src>_last_status|<token>`, `config|<src>_consecutive_failures|<n>` and `config|<src>_last_status_at|<epoch>` (process memory only; see the user manual). A failed baseline-only save emits `error|<source> state_save_failed`. `retention_guard|__budget__|<n>` is not a table: the byte-budget pass was skipped because the retention clock guard refused this pass's clock; it is counted in neither `retention_guard_declines_total` nor `retention_guard_failures_total`. An exception inside any action ends the reply with a fixed `error|internal` line and exit code 1; it can follow lines already written, so a consumer must not assume `error|` is first on that path; the cause is in the agent log. `purge_source` writes a single JSON line,
 `{"source":"<name>","rows_deleted":<n>,"status":"purged","dictionary_pending":<true|false>}` (see `do_purge_source` in `echo_plugin.cpp`), or an
 `error|` line if the named source is unknown, still enabled, or its enable flag cannot be read (`config_unreadable`).
 `dictionary_pending` is `true` when the dictionary sweep that follows the row delete (the interned strings only the
@@ -591,8 +591,9 @@ incremented, so the response record never claims a complete erasure the dictiona
 result is not a complete erasure. Two limits: the server's `echo.source.purge` audit row is written at dispatch and
 carries no agent reply (the reply is in the command's response record), and a write-ahead-log checkpoint that finds
 the file busy after the purge still replies `purged` while the deleted pages stay in the log until the next
-checkpoint (a warning is logged). A query over a retired `$<Source>_Live` name (`sql`) fails with
-`error|unknown table: $<Source>_Live`, never an empty answer that could be mistaken for "nothing happened".
+checkpoint (a warning is logged). A query over a retired `$<Source>_Live` name (`sql`) answers no rows with a
+`constrained` result status, so an empty answer is not mistaken for "nothing happened"; only the status enum reaches
+the server, and the retired table's name (`retired_table:<name>`) is in the agent's command log line.
 
 **Empty-result / not-yet-collected convention.** A `planned` leg (see Capture sources by OS) ships
 its schema and config key with no collector, so its `$..._*` tables stay queryable and empty,
@@ -602,12 +603,13 @@ the Windows registry does not exist there, so it records nothing and `compatibil
 
 ### Result status
 
-Echo sets a typed `plugin_result_status` in two places: `do_snapshot` calls
+Echo sets a typed `plugin_result_status` in three places: `do_snapshot` calls
 `ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
 "echo:snapshot_skipped_sources")` when any capture source retained a stale baseline instead of
-collecting during a forced snapshot, and `do_purge_source` sets the same status with
+collecting during a forced snapshot; `do_purge_source` sets the same status with
 `echo:purge_dictionary_pending` when the rows are gone but the dictionary sweep after them did not
-finish. No other
+finish; and `do_sql` sets it with `retired_table:<name>` (several names comma-joined) when the
+translated query mentions a retired `<source>_live` shim view, whose answer is always empty. No other
 action — including `status`, `query`, `rollup`, `collect_fast`/`collect_slow`, and the early `db_`
 guard that every action shares — ever calls the setter, so the agent records the default
 `UNDECLARED` / `UNKNOWN` for everything else, exactly as every sample below shows.
@@ -616,6 +618,7 @@ guard that every action shares — ever calls the setter, so the agent records t
 |---|---|---|---|
 | `CONSTRAINED` | `PARTIAL` | `echo:snapshot_skipped_sources` | `snapshot` only, when `collect_or_retain` skipped at least one enabled source this pass. |
 | `CONSTRAINED` | `PARTIAL` | `echo:purge_dictionary_pending` | `purge_source` only, when the dictionary sweep after the row delete ran out of its deadline or failed: the rows are deleted, the strings of the purged rows stay until the weekly sweep, `dictionary_pending` is `true` in the JSON line and `dict_gc_starved_total` is incremented. |
+| `CONSTRAINED` | `PARTIAL` | `retired_table:<name>` | `sql` only, when the translated query names a retired `<source>_live` shim view in any spelling SQLite accepts (an empty relation kept so a stored query does not error): the rows and the `__total__\|0` line are unchanged; the status is what tells a schedule or result set that the table is retired rather than empty. Only the status enum reaches the server; the name is in the agent's command log line. |
 | `UNDECLARED` (default) | `UNKNOWN` | *(empty)* | Every other action and every early-return path, including the `db_`-not-open guard. |
 | *(not a `set_result_status` call)* | *(n/a)* | `linux:netlink:remove:` | Not an action-level result status — the literal prefix of the per-row `evidence` column the Linux `removable` cursor-source writes on a normal `detached` device event (udev netlink), followed by the device name; the event itself is a successful capture, not a degraded read (`echo_removable_collector.cpp`). |
 | *(not a `set_result_status` call)* | *(n/a)* | `macos:diskarbitration:` | Same, on macOS: the literal prefix of `evidence` the DiskArbitration `removable` cursor-source writes on a normal `attached`/`detached` device event, followed by the BSD device name (`echo_removable_collector.cpp`). |
@@ -876,12 +879,16 @@ three broken legs; it is one chokepoint. See Caveats item 1.
    aggregated any more), so the declared `status` column is never
    populated, and `snapshot` has the same gap (`echo|snapshot|complete` or `partial|<sources>`
    carries no event count).
-3. **Several legs are declared but have no collector.** `perf` and `procperf` on macOS,
+3. **`retention_days` does not set how long data is kept.** The setting is validated, stored and
+   echoed by `status`, but `run_retention` prunes each tier against the window in the schema
+   registry (90 days for hourly, 180 days for daily and a year for monthly; row-count caps on
+   `netqual_boot` and `usage_live`). Changing it alters nothing that is deleted.
+4. **Several legs are declared but have no collector.** `perf` and `procperf` on macOS,
    `software` on Linux and macOS, `module` on Linux and macOS, and `dns` and `netconn` on Linux and
    macOS are `planned`: no code path exists for them (confirmed absent in `echo_perf.cpp`,
    `echo_proc_perf.cpp` and the non-Windows branch of `echo_software_collector.cpp`). A `planned`
    leg's table is queryable and empty, which means "not yet collecting", never "nothing happened".
-4. **Registry capture stores new values unmasked, and a writer is a lead, not proof.** The
+5. **Registry capture stores new values unmasked, and a writer is a lead, not proof.** The
    new data of every added or changed watched value is readable through `sql` (up to 512 bytes, for
    example a Winlogon autologon `DefaultPassword` when it changes); the per-key baseline in
    `echo_state` holds only each value's type, size and an unsalted hash, and the old value is not
@@ -927,5 +934,5 @@ three broken legs; it is one chokepoint. See Caveats item 1.
 - Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/test_echo_adoption_wiring_lexical.py` · `tests/test_echo_mapdrive_pin_lexical.py` · `tests/test_echo_timeline_script_behaviour.py` · `tests/unit/server/test_echo_process_tree.cpp` · `tests/unit/server/test_echo_rename_migration_pg.cpp` · `tests/unit/server/test_echo_retention_tiers.cpp` · `tests/unit/server/test_echo_timeline_page.cpp` · `tests/unit/server/test_echo_timeline_render.cpp` · `tests/unit/server/test_echo_tree_routes.cpp` · `tests/unit/test_echo_aggregator.cpp` · `tests/unit/test_echo_arp.cpp` · `tests/unit/test_echo_capability_table.cpp` · `tests/unit/test_echo_capture_status.cpp` · `tests/unit/test_echo_cursor.cpp` · `tests/unit/test_echo_diff.cpp` · `tests/unit/test_echo_fold.cpp` · `tests/unit/test_echo_fold_sizing.cpp` · `tests/unit/test_echo_local_dispatcher.cpp` · `tests/unit/test_echo_mapdrive.cpp` · `tests/unit/test_echo_module_etw.cpp` · `tests/unit/test_echo_module_stream.cpp` · `tests/unit/test_echo_netconn.cpp` · `tests/unit/test_echo_netqual_nstat.cpp` · `tests/unit/test_echo_perf.cpp` · `tests/unit/test_echo_power.cpp` · `tests/unit/test_echo_proc_es.cpp` · `tests/unit/test_echo_proc_etw.cpp` · `tests/unit/test_echo_proc_perf.cpp` · `tests/unit/test_echo_registry_source.cpp` · `tests/unit/test_echo_removable.cpp` · `tests/unit/test_echo_retention_tiers_table.cpp` · `tests/unit/test_echo_schema_registry.cpp` · `tests/unit/test_echo_service.cpp` · `tests/unit/test_echo_software.cpp` · `tests/unit/test_echo_source_health.cpp` · `tests/unit/test_echo_store.cpp` · `tests/unit/test_echo_usage.cpp` · `tests/unit/test_echo_v10_migration.cpp` · `tests/unit/test_echo_warehouse.cpp` · `tests/unit/test_echo_win_raii_guards.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-30-echo-db-budget.added.md` · `changelog.d/2026-10-30-echo-db-budget.changed.md` · `changelog.d/2026-10-30-echo-db-budget.fixed.md` · `changelog.d/2026-11-02-echo-fold-substrate.added.md` · `changelog.d/2026-11-02-echo-fold-substrate.changed.md` · `changelog.d/2026-11-02-echo-offline-hive-baselines.added.md` · `changelog.d/6694-echo-drop-live-shims.removed.md` · `changelog.d/7037-echo-rollup-only-v10.changed.md` · `changelog.d/7318-echo-rollup-only-server.changed.md` · `changelog.d/7371-echo-rollup-only-ui.changed.md` · `changelog.d/7371-echo-rollup-only-ui.removed.md`
+- Changelog: `changelog.d/2026-10-30-echo-db-budget.added.md` · `changelog.d/2026-10-30-echo-db-budget.changed.md` · `changelog.d/2026-10-30-echo-db-budget.fixed.md` · `changelog.d/2026-11-02-echo-fold-substrate.added.md` · `changelog.d/2026-11-02-echo-fold-substrate.changed.md` · `changelog.d/2026-11-02-echo-offline-hive-baselines.added.md` · `changelog.d/6694-echo-drop-live-shims.removed.md` · `changelog.d/7037-echo-rollup-only-v10.changed.md` · `changelog.d/7318-echo-rollup-only-server.changed.md` · `changelog.d/7371-echo-rollup-only-ui.changed.md` · `changelog.d/7371-echo-rollup-only-ui.removed.md` · `changelog.d/7420-echo-followups-mixed.changed.md` · `changelog.d/7420-echo-followups-mixed.fixed.md`
 <!-- END GENERATED -->

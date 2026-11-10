@@ -3445,6 +3445,14 @@ struct ScratchDir {
     [[nodiscard]] const fs::path& path() const { return dir.path; }
 };
 
+// Write the adoption-intent marker exactly as an interrupted adoption would have left it: the
+// current size and mtime of tar.db.
+void write_adoption_marker(const fs::path& dir) {
+    const auto fp = yuzu::agent::detail::legacy_echo_fingerprint(dir / "tar.db");
+    REQUIRE(fp.has_value());
+    spit_file(dir / "echo.db.adopting", *fp);
+}
+
 } // namespace
 
 TEST_CASE("adopt_legacy_echo_db: a crash-shaped tar.db + un-checkpointed WAL opens as echo.db",
@@ -3478,9 +3486,11 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store
     SECTION("sidecar already moved, main file not") {
         ScratchDir d;
         make_legacy_tar_db_with_wal(d.path());
+        write_adoption_marker(d.path()); // what the interrupted run wrote before its first move
         fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal");
         REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
         CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+        CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting")); // spent once the main file moved
         auto db = EchoDatabase::open(d.path() / "echo.db");
         REQUIRE(db.has_value());
         CHECK(db->get_config("wal_marker", "") == "x");
@@ -3495,6 +3505,149 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store
         CHECK(slurp_file(d.path() / "echo.db") == before);
         CHECK(slurp_file(d.path() / "echo.db-wal") == wal_before);
     }
+}
+
+TEST_CASE("adopt_legacy_echo_db: the adoption marker is written before the first sidecar move "
+          "and survives an interruption",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    // -wal moves (so the marker must already exist), then -shm collides and adoption stops.
+    spit_file(d.path() / "tar.db-shm", "legacy shm");
+    spit_file(d.path() / "echo.db-shm", "foreign shm");
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(fs::exists(d.path() / "echo.db-wal"));       // the first move happened
+    CHECK(fs::exists(d.path() / "echo.db.adopting"));  // and the marker preceded it
+    CHECK(slurp_file(d.path() / "echo.db.adopting") ==
+          *yuzu::agent::detail::legacy_echo_fingerprint(d.path() / "tar.db"));
+
+    // The documented remedy resumes under the surviving marker and spends it.
+    fs::remove(d.path() / "echo.db-shm");
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: an echo.db sidecar beside tar.db without the marker refuses",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db(d.path());
+    spit_file(d.path() / "echo.db-wal", "a log of unknown origin");
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("tar.db") != std::string::npos);
+    CHECK(adopted.error().find("echo.db-wal") != std::string::npos);
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+    CHECK(slurp_file(d.path() / "echo.db-wal") == "a log of unknown origin");
+}
+
+TEST_CASE("adopt_legacy_echo_db: an older agent running between interruption and resume is "
+          "refused and never replayed over",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    // Back-date tar.db so the older agent's write below is distinguishable by mtime on any
+    // filesystem timestamp granularity.
+    fs::last_write_time(d.path() / "tar.db",
+                        fs::last_write_time(d.path() / "tar.db") - std::chrono::hours(1));
+    // Steps 1-2: the marker and the WAL move happen, the power fails before the main rename.
+    write_adoption_marker(d.path());
+    fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal");
+    const auto stale_wal = slurp_file(d.path() / "echo.db-wal");
+    // Step 3: an older agent opens tar.db, writes, and closes cleanly (checkpoint, WAL deleted).
+    {
+        SqliteOwner o;
+        REQUIRE(sqlite3_open((d.path() / "tar.db").string().c_str(), &o.db) == SQLITE_OK);
+        exec_sql(o.db, "PRAGMA journal_mode=WAL");
+        exec_sql(o.db, "INSERT INTO tar_config(key, value) VALUES ('newer', 'yes')");
+    }
+    REQUIRE_FALSE(fs::exists(d.path() / "tar.db-wal"));
+    const auto newer_main = slurp_file(d.path() / "tar.db");
+
+    // Step 4: the re-upgrade must not pair the newer tar.db with the older log.
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("echo.db-wal") != std::string::npos);
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+    CHECK(slurp_file(d.path() / "tar.db") == newer_main);
+    CHECK(slurp_file(d.path() / "echo.db-wal") == stale_wal);
+
+    auto refused = EchoDatabase::open(d.path() / "echo.db");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("not adopted - refusing") != std::string::npos);
+}
+
+TEST_CASE("adopt_legacy_echo_db: an oversized marker reads as a mismatch and refuses",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db(d.path());
+    spit_file(d.path() / "echo.db-wal", "a log of unknown origin");
+    spit_file(d.path() / "echo.db.adopting", std::string(300, 'x'));
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("records a different") != std::string::npos);
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: a stale marker with no echo.db sidecar is rewritten before the "
+          "first move",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    // A marker from an earlier, fully undone attempt (no echo.db sidecar is left) records a
+    // tar.db that no longer exists in that shape: it must not be trusted as this adoption's own.
+    spit_file(d.path() / "echo.db.adopting", "1 2\n");
+    // -wal moves, then -shm collides: the interrupted state shows which marker preceded the move.
+    spit_file(d.path() / "tar.db-shm", "legacy shm");
+    spit_file(d.path() / "echo.db-shm", "foreign shm");
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(fs::exists(d.path() / "echo.db-wal"));
+    CHECK(slurp_file(d.path() / "echo.db.adopting") ==
+          *yuzu::agent::detail::legacy_echo_fingerprint(d.path() / "tar.db"));
+
+    fs::remove(d.path() / "echo.db-shm");
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: a marker that cannot be written refuses before anything moves",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    const auto wal = slurp_file(d.path() / "tar.db-wal");
+    // A directory at the marker path: the atomic writer cannot rename its temp file over it.
+    REQUIRE(fs::create_directory(d.path() / "echo.db.adopting"));
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("cannot record the adoption marker") != std::string::npos);
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK(slurp_file(d.path() / "tar.db-wal") == wal);
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db-wal"));
+    CHECK(fs::is_directory(d.path() / "echo.db.adopting"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: a spent marker left behind without a tar.db is deleted at boot",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    {
+        auto db = EchoDatabase::open(d.path() / "echo.db");
+        REQUIRE(db.has_value());
+    }
+    spit_file(d.path() / "echo.db.adopting", "12345 67890\n");
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+    CHECK(fs::exists(d.path() / "echo.db"));
 }
 
 TEST_CASE("adopt_legacy_echo_db: a leftover legacy sidecar without a tar.db is warned about and left",

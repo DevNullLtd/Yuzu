@@ -873,13 +873,15 @@ groups:
       # READS: op="session_lookup" (HA WS-5 batched session_id resolution) and
       # op="cluster_affinity_check" (#4669). Same counter, same pool-health
       # root cause, so one rule covers reads and writes.
-      # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
-      # fresh-registration branch returns UNAVAILABLE on this); the other
-      # five writer SITES (announce_connected, both ProxyRegister renew
-      # branches, BatchHeartbeat's renew, deregister) — which collapse to
-      # three fail-OPEN `op` label values (announce_connected, renew_leases,
-      # deregister; see the label set in docs/user-manual/metrics.md) — are
-      # deliberately fail-OPEN, so a rate here can mean silent directory drift even with
+      # The fail-CLOSED sites (the RPC returns UNAVAILABLE) are ProxyRegister's
+      # fresh-registration branch (`op="register_fresh"`) and both of its
+      # replay-adopt branches (`op="renew_leases"` and
+      # `op="reclaim_tombstoned_session"`). The three writer SITES —
+      # announce_connected, BatchHeartbeat's renew_leases and deregister — are
+      # deliberately fail-OPEN and use the `op` label values announce_connected,
+      # renew_leases and deregister (see the label
+      # set in docs/user-manual/metrics.md), so a rate here can mean silent
+      # directory drift even with
       # no visible RPC failure. INITIAL / conservative threshold — no fleet
       # background-rate data exists yet to tune against (same lesson as the
       # #913 OTA-bounds alert thresholds, the single largest source of

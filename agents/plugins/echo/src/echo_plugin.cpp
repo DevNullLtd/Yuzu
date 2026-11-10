@@ -1510,9 +1510,10 @@ private:
     // kPidNameCap, cleared when the process source is confirmed disabled.
     std::unordered_map<std::uint32_t, yuzu::echo::PidName> pid_name_;
     static constexpr std::size_t kPidNameCap = 65536;
-    // Hourly de-duplication sets (echo_hour_dedup.hpp). Each tick filters against a COPY and
-    // keeps it only once the rows are committed, so a rolled-back tick re-derives the same
-    // rows. Guarded by collect_mu_. The overflow counters mirror the committed sets for status.
+    // Hourly de-duplication sets (echo_hour_dedup.hpp). Each tick filters IN PLACE inside a
+    // BatchScope and keeps the admitted keys only once the rows are committed, so a rolled-back
+    // tick re-derives the same rows. Guarded by collect_mu_. The overflow counters mirror the
+    // committed sets for status.
     yuzu::echo::HourlySeenSet tcp_closing_seen_;
     yuzu::echo::HourlySeenSet module_seen_;
     std::atomic<std::uint64_t> tcp_closing_overflows_{0};
@@ -1840,6 +1841,9 @@ private:
                     // remote_host stays empty: nstat is a lifecycle event stream, not the
                     // DNS-resolving poll (resolve_hostnames), the same simplification the ES
                     // process stream makes for cmdline.
+                    // Closing-state opens follow the poll leg's once-per-hour rule (#6899).
+                    flow_events = yuzu::echo::nstat_dedupe_closing_opens(std::move(flow_events),
+                                                                         tcp_closing_seen_);
                     for (const auto& e : flow_events)
                         typed.push_back(yuzu::echo::network_event_from_nstat_flow(e, snap_id));
                     if (!pending_nstat_evs_.empty()) {
@@ -1858,9 +1862,15 @@ private:
                         pending_nstat_evs_ = std::move(typed);
                         if (pending_nstat_evs_.size() > kPendingStreamCap) {
                             const auto excess = pending_nstat_evs_.size() - kPendingStreamCap;
-                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(),
-                                                     pending_nstat_evs_.begin() +
-                                                         static_cast<std::ptrdiff_t>(excess));
+                            const auto cut = pending_nstat_evs_.begin() +
+                                             static_cast<std::ptrdiff_t>(excess);
+                            // The rows cut here are never stored: give their hourly keys back
+                            // so the next closing-state sighting this hour is not read as a
+                            // repeat of a row that was lost (the drain admitted them above).
+                            yuzu::echo::nstat_release_closing_keys(
+                                pending_nstat_evs_.data(), pending_nstat_evs_.data() + excess,
+                                tcp_closing_seen_);
+                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(), cut);
                         }
                     } else {
                         total_events += static_cast<int>(typed.size());
@@ -1901,6 +1911,9 @@ private:
                     // already-typed pending_nstat_evs_ from an earlier failed
                     // insert rather than let it sit stuck-forever bounded.
                     nstat_client_->drain(); // discard — untrustworthy bytes
+                    yuzu::echo::nstat_release_closing_keys(
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                     spdlog::warn("ECHO: nstat layout mismatch on stream death — discarding "
                                  "the buffered tcp lifecycle ring");
@@ -1952,11 +1965,13 @@ private:
             // back fallback tick must re-prime next tick, not diff a udp-only
             // baseline against the full snapshot (#1654).
 
-            // Filter against a COPY of the closing-socket seen set and keep it only once the rows
-            // commit below, so a rolled-back tick re-derives the same rows.
-            yuzu::echo::HourlySeenSet closing_seen = tcp_closing_seen_;
+            // Filter in place inside a batch: the keys it admits are kept once the rows commit
+            // below and erased if they do not (the scope rolls back on any exit without a
+            // commit, an exception included), so a rolled-back tick re-derives the same rows
+            // without copying the whole set every tick.
+            yuzu::echo::BatchScope tcp_batch{tcp_closing_seen_};
             auto typed = yuzu::echo::compute_network_events(*diff_previous, *diff_current, ts,
-                                                            snap_id, closing_seen);
+                                                            snap_id, tcp_closing_seen_);
 
             // While nstat is primary, persist the udp-only view so the next
             // tick's poll diff stays apples-to-apples (never mistakes
@@ -1970,6 +1985,7 @@ private:
                                 : db_->fold_network_events(
                                       typed, yuzu::echo::StateWrite{net_key, state_json});
             if (!ok) {
+                tcp_batch.rollback();
                 const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
                 spdlog::error("ECHO: network {} — nothing persisted, next tick re-diffs", tok);
                 ctx.write_output(typed.empty() ? "error|network state_save_failed"
@@ -1981,7 +1997,7 @@ private:
                 return 1;
             }
             nstat_tcp_primary_prev_ = nstat_primary;
-            tcp_closing_seen_ = std::move(closing_seen);
+            tcp_batch.commit();
             tcp_closing_overflows_.store(tcp_closing_seen_.overflows(), std::memory_order_relaxed);
             total_events += static_cast<int>(typed.size());
             note_health("tcp", yuzu::echo::tcp_tick_status(nstat_insert_failed, "events_recorded"));
@@ -2002,6 +2018,9 @@ private:
             // an unreadable flag skips the tick via the plain branch below and
             // leaves the ring buffering rather than discarding live lifecycle events.
             nstat_client_->drain();
+            yuzu::echo::nstat_release_closing_keys(
+                pending_nstat_evs_.data(), pending_nstat_evs_.data() + pending_nstat_evs_.size(),
+                tcp_closing_seen_);
             pending_nstat_evs_.clear();
         } else {
             note_health("tcp", skip_token(tcp_state));
@@ -2173,10 +2192,11 @@ private:
                     e.process_name = yuzu::echo::pid_name_lookup(pid_name_, e.pid, e.ts_unix);
             }
             // §5 edge filter: unloads dropped, every risky load kept, other loads once per hour
-            // per (action, loader, module, folder). Filter against a COPY of the seen set and
-            // keep it only once the rows commit, so a failed insert re-filters identically.
-            yuzu::echo::HourlySeenSet module_seen = module_seen_;
-            mevs = yuzu::echo::apply_module_risk_filter(std::move(mevs), module_seen);
+            // per (action, loader, module, folder). Filter in place inside a batch and keep the
+            // admitted keys only once the rows commit, so a failed insert re-filters identically
+            // (the scope rolls back on any exit without a commit, an exception included).
+            yuzu::echo::BatchScope module_batch{module_seen_};
+            mevs = yuzu::echo::apply_module_risk_filter(std::move(mevs), module_seen_);
             std::vector<yuzu::echo::ModuleRow> mrows;
             mrows.reserve(mevs.size());
             for (const auto& e : mevs) {
@@ -2199,6 +2219,7 @@ private:
                     // other legs already committed). Re-queue the filtered
                     // batch for the next tick, bounded, and log.
                     module_tok = "insert_failed";
+                    module_batch.rollback();
                     spdlog::error("ECHO: module stream insert failed — re-queuing {} events",
                                   mevs.size());
                     pending_module_evs_ = std::move(mevs);
@@ -2210,9 +2231,11 @@ private:
                     }
                 } else {
                     total_events += static_cast<int>(mrows.size());
-                    module_seen_ = std::move(module_seen);
                 }
             }
+            // Keeps the admitted keys on success or an empty batch; after the rollback above the
+            // scope is already closed, so this is a no-op there.
+            module_batch.commit();
             module_overflows_.store(module_seen_.overflows(), std::memory_order_relaxed);
             if (auto d = module_stream_->dropped(); d > last_module_dropped_) {
                 spdlog::warn("ECHO: module stream ring overflow — {} dropped (+{} since last drain)",
@@ -4324,6 +4347,11 @@ private:
                 if (transition_ok && src_name == "tcp" && nstat_client_ &&
                     (v == "true") != tcp_prev_enabled) {
                     nstat_client_->drain();
+                    // The backlog rows are dropped unstored: give their hourly keys
+                    // back (the drain's own events were never admitted).
+                    yuzu::echo::nstat_release_closing_keys(
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                 }
                 // Cursor-model sources (echo_cursor.hpp, P-002): forward the
