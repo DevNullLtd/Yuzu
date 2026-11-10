@@ -15,9 +15,10 @@ name: Release legs (daily dispatch)
 # The exception is the Windows and macOS SERVER: since ADR-0035 ladder step 1
 # no ci.yml leg builds or tests it, but release.yml still builds it, untested,
 # at tag time until ladder step 2 removes it, so step 2 merges before the next
-# release tag, or a changelog.d fragment merged before tagging records the
-# acceptance in that release's notes (ADR-0035 release ordering; the /release
-# skill has the exact form).
+# release tag, or a caveat changelog.d fragment, merged through a reviewed PR
+# that records the acceptance, is promoted before tagging so the caveat is in
+# that release's notes (ADR-0035 release ordering; the /release skill has the
+# exact form).
 #
 # It skips when dev's tip already has a ci.yml dispatch run (legs=release or
 # all) that succeeded or is still in flight, so a quiet day costs nothing; a
