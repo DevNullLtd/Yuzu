@@ -2836,7 +2836,6 @@
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
     "changelog": [
-      "changelog.d/0000-echo-mcp-hourly-rows.changed.md",
       "changelog.d/2026-10-30-echo-db-budget.added.md",
       "changelog.d/2026-10-30-echo-db-budget.changed.md",
       "changelog.d/2026-10-30-echo-db-budget.fixed.md",
@@ -2849,7 +2848,8 @@
       "changelog.d/7371-echo-rollup-only-ui.changed.md",
       "changelog.d/7371-echo-rollup-only-ui.removed.md",
       "changelog.d/7420-echo-followups-mixed.changed.md",
-      "changelog.d/7420-echo-followups-mixed.fixed.md"
+      "changelog.d/7420-echo-followups-mixed.fixed.md",
+      "changelog.d/7466-echo-mcp-hourly-rows.changed.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",
