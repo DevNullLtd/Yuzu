@@ -5089,6 +5089,23 @@ void RestApiV1::register_routes(
                       return;
                   }
 
+                  // A body that is not an object, or a field of the wrong JSON type, is a 400
+                  // here, before the accessor below can throw (a bare 500). It is not defaulted
+                  // either: a numeric principal_type must not read as "user".
+                  const auto is_string_or_absent = [&body](const char* key) {
+                      return !body.contains(key) || body[key].is_string();
+                  };
+                  if (!body.is_object() || !is_string_or_absent("principal_type") ||
+                      !is_string_or_absent("principal_id") || !is_string_or_absent("role_name")) {
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, "the body must be a JSON object whose "
+                                                "principal_type, principal_id and role_name are "
+                                                "strings"),
+                          "application/json");
+                      return;
+                  }
+
                   auto principal_type = body.value("principal_type", "user");
                   auto principal_id = body.value("principal_id", "");
                   auto role_name = body.value("role_name", "");

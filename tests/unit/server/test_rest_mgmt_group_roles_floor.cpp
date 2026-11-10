@@ -992,7 +992,7 @@ TEST_CASE("mgmt_group_error: store faults are the fixed messages, matched at the
                                 "assigned under principal_type=\"engine\"",
                                 "engine principals cannot be granted the admin/full-access role "
                                 "'failed' — no admin, ever (design §4.2)",
-                                "group not found", ""}) {
+                                "group not found", "a group with that name already exists", ""}) {
             INFO(msg);
             CHECK_FALSE(mgmt_group_error_is_store_fault(msg));
         }
@@ -1026,6 +1026,7 @@ TEST_CASE("mgmt_group_error: every std::unexpected literal in management_group_s
         "group not found",
         "cannot delete root group",
         "engine principals cannot hold scoped role assignments in this release",
+        "a group with that name already exists",
     };
     // Faults of the read paths (get_assignments_for_principal, get_member_agents_in_subtrees),
     // which count their own degrade metric and never reach the REST/MCP write classifier.
@@ -1051,12 +1052,56 @@ TEST_CASE("mgmt_group_error: every std::unexpected literal in management_group_s
                        "or name it in this test");
         }
     }
-    // The file holds 44 literals today (28 faults, 12 validation occurrences of 8 distinct
+    // The file holds 46 literals today (28 faults, 14 validation occurrences of 9 distinct
     // messages, 4 read-path). Minimum floors equal to those counts, so a change in literal shape
     // cannot silently shrink what the scan sees. Messages RbacStore::validate_assignment returns
     // through `v.error()` are not literals in this file and are outside the scan.
-    CHECK(seen >= 44);
+    CHECK(seen >= 46);
     CHECK(faults >= 28);
-    CHECK(validations >= 12);
+    CHECK(validations >= 14);
     CHECK(reads >= 4);
+}
+
+// Dave's review of #7376, item 2 (the REST pre-validation of principal_type): a body field of
+// the wrong JSON type must answer 400 before the gate, never throw out of the accessor as a 500,
+// and never degrade to the default (a numeric principal_type must not become "user").
+TEST_CASE("POST /management-groups/{id}/roles: a wrong-typed or non-object body is a 400 with no "
+          "audit row and nothing assigned",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-body-types");
+
+    for (const char* body : {R"({"principal_type":5,"principal_id":"someone","role_name":"Viewer"})",
+                             R"({"principal_type":null,"principal_id":"someone","role_name":"Viewer"})",
+                             R"({"principal_type":["user"],"principal_id":"someone",)"
+                             R"("role_name":"Viewer"})",
+                             R"({"principal_id":7,"role_name":"Viewer"})",
+                             R"({"principal_id":"someone","role_name":{"a":1}})",
+                             R"(["user"])", R"("user")", "5", "null"}) {
+        INFO(body);
+        h.audits.clear();
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+        CHECK(h.audits.empty());
+    }
+
+    SECTION("a caller without rights gets the same 400 for a body that is not an object") {
+        h.perm_override = [](const std::string& securable, const std::string& op) {
+            return !(securable == "ManagementGroup" && op == "Write");
+        };
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", R"(["user"])");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.audits.empty());
+    }
+
+    SECTION("a well-typed body is unchanged") {
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_id":"someone","role_name":"Viewer"})");
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).size() == 1);
+    }
 }

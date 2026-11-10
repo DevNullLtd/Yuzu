@@ -14198,8 +14198,27 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Checked before the closed role list so a role name holding a control byte
-                // or invalid UTF-8 is invalid params with its own denied row, not a
+                httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+                if (!authorized && session->token_scope_service.empty()) {
+                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
+                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                            gr.role_name == "ITServiceOwner") {
+                            authorized = true;
+                            break;
+                        }
+                    }
+                }
+                if (!authorized) {
+                    mcp_audit("denied", "forbidden");
+                    res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
+                    return;
+                }
+
+                // After the permission gate, like the REST twin (Dave's review of #7376, item
+                // 1): a caller with no rights gets the permission answer and no row for a
+                // value. Checked before the closed role list so a role name holding a control
+                // byte or invalid UTF-8 is invalid params with its own denied row, not a
                 // permission error.
                 if (!mgmt_text_ok(role_name)) {
                     (void)audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
@@ -14215,23 +14234,6 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kPermissionDenied, "only Operator and Viewer roles can be delegated"),
                         "application/json");
-                    return;
-                }
-
-                httplib::Response probe; // throwaway: the fleet-wide arm, never sent
-                bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-                if (!authorized && session->token_scope_service.empty()) {
-                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                            gr.role_name == "ITServiceOwner") {
-                            authorized = true;
-                            break;
-                        }
-                    }
-                }
-                if (!authorized) {
-                    mcp_audit("denied", "forbidden");
-                    res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
                     return;
                 }
 

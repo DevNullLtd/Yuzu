@@ -52442,3 +52442,110 @@ TEST_CASE("MCP management-group member and role tools: a store fault on an exist
         CHECK(mcp_failure.front() == "store_error");
     }
 }
+
+// Dave's review of #7376, item 1, MCP twin: the tool wrote its role-name rows before it asked
+// whether the caller may write at all. A caller with no rights now gets the permission answer
+// and no management_group.assign_role row, whatever the role argument holds.
+TEST_CASE("MCP assign_management_group_role: a caller without ManagementGroup:Write is refused "
+          "before any role-name row is written",
+          "[mcp][pg][management_group][validation][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Gate Before Audit";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+
+    // A control byte, a name outside the closed list, and a clean allowed name.
+    for (const std::string& role : {std::string("Oper\0ator", 9), std::string("Oper\tator"),
+                                    std::string("ITServiceOwner"), std::string("Operator")}) {
+        INFO("role length " << role.size());
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", gid},
+                                              {"principal_id", "alice"},
+                                              {"role_name", role}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"] == "forbidden");
+        CHECK(store.get_group_roles(gid).empty());
+
+        // No row for the value; the tool's own denial row carries the fixed gate detail.
+        for (const char* result : {"denied", "failure", "success"})
+            CHECK(wf_rows_since(ts, before,
+                                std::string("management_group.assign_role|") + result)
+                      .empty());
+        const auto tool_denied = wf_rows_since(ts, before, "mcp.assign_management_group_role|denied");
+        REQUIRE(tool_denied.size() == 1);
+        CHECK(tool_denied.front() == "forbidden");
+    }
+}
+
+// Dave's review of #7376, item 2, MCP twin: a duplicate group name is the caller's conflict, not
+// a store fault, so it is invalid params with no retry hint.
+TEST_CASE("MCP create and update management group: a duplicate name is invalid params, not a "
+          "retryable store fault",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Taken Name";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    REQUIRE(store.create_group(g).has_value());
+    g.name = "Other Name";
+    auto other = store.create_group(g);
+    REQUIRE(other.has_value());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+
+    auto check_conflict = [&](const nlohmann::json& body) {
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "a group with that name already exists");
+        REQUIRE(body["error"].contains("data"));
+        REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    };
+
+    SECTION("create_management_group") {
+        const auto groups_before = store.list_groups().size();
+        auto res = ts.call(rs_tool_call_body("create_management_group", {{"name", "Taken Name"}}));
+        REQUIRE(res);
+        check_conflict(nlohmann::json::parse(res->body));
+        CHECK(store.list_groups().size() == groups_before);
+    }
+
+    SECTION("update_management_group renaming onto an existing name") {
+        auto res = ts.call(rs_tool_call_body("update_management_group",
+                                             {{"group_id", *other}, {"name", "Taken Name"}}));
+        REQUIRE(res);
+        check_conflict(nlohmann::json::parse(res->body));
+        auto still = store.get_group(*other);
+        REQUIRE(still.has_value());
+        CHECK(still->name == "Other Name");
+    }
+}
