@@ -7313,7 +7313,7 @@ void SettingsRoutes::register_routes(
     // auth_routes — Gate 4 consistency B1+B2 picks the spec lane.
     //
     // `Cache-Control: no-store, private` and `Vary: Cookie` are set on every
-    // MFA response: the one-time secrets (init's otpauth URI / base32 secret,
+    // MFA response that renders data: the one-time secrets (init's otpauth URI / base32 secret,
     // verify's recovery codes, recovery-codes regenerate) and the MFA state of
     // the account (the fragment and its re-renders), so the browser/proxy/CDN
     // cannot retain the material past the response lifetime (Gate 4

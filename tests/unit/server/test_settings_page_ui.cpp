@@ -215,7 +215,7 @@ TEST_CASE("Settings page says so, once, when the Engine Principals roster read's
     CHECK(count_of(body, "setAttribute('role', 'alert')") == 1);
     CHECK(count_of(body, "box.textContent = ") == 1);
     CHECK(count_of(body, "notices.appendChild(box)") == 1);
-    // Each guard ends in `return;`, so a failed guard never reaches the insert.
+    // Exactly four guards, each ending in `return;` (their order is covered by ui-smoke).
     CHECK(count_of(body, ") return;") == 4);
     // Text only; never markup, never the secret-reveal element, never eval.
     CHECK(count_of(body, "innerHTML") == 0);

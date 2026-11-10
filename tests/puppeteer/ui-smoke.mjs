@@ -301,7 +301,7 @@ async function scenarioEngineAudit(page) {
   const reveal = await page.$eval('#engine-principal-reveal', (e) => e.textContent);
   const nested = await page.$eval('#engine-principals-notices',
     (e) => !e.closest('#engine-principals-section') && !e.closest('#engine-principal-reveal'));
-  check('#6749 a dropped roster audit row shows one alert banner with the Access page sentence, '
+  check('#6749 a dropped roster audit row shows one alert banner with the Tokens and principals page sentence, '
     + 'after three failed reads', shown.length === 1 && shown[0].role === 'alert' &&
     shown[0].text === SENTENCE && rule.calls.length >= 3, JSON.stringify({ shown, calls: rule.calls.length }));
   check('#6749 the banner sits outside the refreshing section and the reveal survives refreshes',
