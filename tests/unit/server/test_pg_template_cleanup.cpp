@@ -229,7 +229,8 @@ TEST_CASE("parse_pg_clone_strategy: A/B knob accepts exactly two strategies", "[
     }
 }
 
-TEST_CASE("PostgresTestDb: YUZU_TEST_PG_CLONE_STRATEGY reaches the template clone",
+TEST_CASE("PostgresTestDb: each YUZU_TEST_PG_CLONE_STRATEGY value is accepted by the "
+          "server; an invalid value fails the fixture",
           "[pg][template]") {
     if (yuzu::test::pg_admin_dsn_env() == nullptr) {
         SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");

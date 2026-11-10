@@ -2137,9 +2137,12 @@ isolation, all in the step:
    (`<logbase>-flake-retry-enum-*`). Without `--logbase` (Windows, macOS) every
    path keeps its old name. `test-durations-summary.py` and the telemetry
    finalizer (`ci-telemetry.py finish`, one `--logbase` per base) take the same
-   names. Before either half starts, the step deletes all three bases' files
-   left by an earlier run in the persistent build directory, so an invocation
-   that never ran this time cannot upload or import a stale file.
+   names. First thing in the step, before the `pg_mode` check and the
+   `meson-test-prereq` build, it deletes all three bases' files left by an
+   earlier run in the persistent build directory, and the legacy default
+   `testlog.{txt,json,junit.xml}` from before the per-invocation names, so an
+   invocation that never ran this time (or a step that failed before either half
+   started) cannot upload or import a stale file.
 2. **ninja.** `meson test` runs `ninja` before testing; two of those at once in
    one build directory race on `.ninja_log`. The step builds
    `meson-test-prereq` once, serially, and every invocation passes
@@ -2156,11 +2159,20 @@ isolation, all in the step:
 
 **Cancel and timeout.** Each half runs in its own process group, so the
 runner's SIGINT/SIGTERM to the step's shell does not reach the halves on its
-own; the step traps both, sends SIGTERM to both halves' process groups, and
-exits 1 (`meson test` then stops its per-test sessions). The runner's final
-SIGKILL cannot be trapped; if it lands first, the runner's end-of-job orphan
-sweep is what reaps the halves, and until then a pg half can still hold its
-`with-test-slot.sh` slot.
+own. The step traps both: it sends SIGTERM to the process group of each half
+that bash still tracks as a running job (`jobs -rp`; a PID already reaped is
+never signalled, since it may belong to another process by then), waits up to
+about 5 s for those groups to empty so `meson test` can stop its per-test
+sessions and write its logs before the upload and telemetry steps read them,
+then exits 1 whether or not they have. On a cancel the runner sends SIGINT and
+waits 7.5 s before SIGTERM, so the wait fits inside that grace. If the step's
+shell exits non-zero any other way while a half is running, an EXIT trap sends
+the same SIGTERM (without the wait). When a half ends, its process group is
+also sent SIGTERM, so children that outlive a half whose own shell was killed
+do not keep running. The runner's final SIGKILL cannot be trapped; if it lands
+first, the runner's end-of-job orphan sweep is what reaps the halves, and until
+then a pg half can still hold its `with-test-slot.sh` slot. All of this is
+exercised by `tests/shell/test_linux_concurrent_step.sh` against stubs.
 
 **Windows stays sequential, deliberately.** The Windows job keeps its separate
 `Test (non-pg suites)`, `Test (pg shards, full)` and `Test (pg smoke)` steps.
@@ -2173,8 +2185,12 @@ Windows version would be its own change with its own same-SHA samples.
 **Kill switch.** Setting the repository variable `YUZU_CI_SEQUENTIAL_HALVES`
 to `1` makes the step run the non-pg half, then the pg half, and skip the pg
 half if the non-pg half failed: the old back-to-back behaviour, with the same
-log names and outputs. It needs no code change, so use it first; a revert of
-the change is the fallback.
+log names and outputs. Set it under Settings, Secrets and variables, Actions,
+Variables tab, as a repository variable (not a secret). Only the exact value
+`1` enables it; any other non-empty value prints a `::warning::` and the halves
+stay concurrent. It is read when a job starts, so it applies to runs that start
+after it is set, not to runs already in progress. It needs no code change, so
+use it first; a revert of the change is the fallback.
 
 **Revert triggers.** Set `YUZU_CI_SEQUENTIAL_HALVES=1` on any of these on the
 `gcc-15`/`debug` leg after the change: a spark or guardian `spin_until` (or
@@ -2205,8 +2221,13 @@ saving is an estimate until measured:
 - Candidate: two or more same-SHA runs of the change (the PR run plus a re-run).
 - Per entry: in each candidate, no entry of the non-pg half or pg shard
   reaches 80% of its meson timeout, and no entry of 5 s or more takes more
-  than 1.5x its baseline mean. Read the halves' wall seconds from the
-  "Linux test half" summary table.
+  than 1.5x its baseline mean. Each entry's baseline mean comes from the meson
+  lines in the step logs of those same 12 or more baseline runs. Read the
+  halves' wall seconds from the "Linux test half" summary table.
+- Acceptance: keep the concurrency only if the median candidate
+  `gcc-15`/`debug` job wall time is at least 10% below the baseline median (the
+  same ≥10% bar as the widening rule) and the per-entry checks hold; otherwise
+  set `YUZU_CI_SEQUENTIAL_HALVES=1`, record why here, and revisit.
 - Record the samples, run and job ids, SHAs, runner names and slot waits here.
 
 This is a topology change; measure it on its own, as for the ladder below,
@@ -3285,9 +3306,13 @@ form is required: a space would add a positional
 parsed from `meson-logs/testlog.json` (on Linux `meson-logs/<logbase>.json`, via
 `--logbase`, because its invocations run concurrently), which meson overwrites on every
 invocation, hence one call per invocation rather than one at the end of the
-job (each step removes the file first, so a run that selects no tests warns and
-skips instead of re-reporting the previous log); on a red invocation `bash -e` stops before the summary and the uploaded
-`meson-logs` artifact carries `testlog.json` for running the script locally.
+job. The stale file is removed first, so a run that selects no tests warns and
+skips instead of re-reporting the previous log: on Windows and macOS each
+step removes `testlog.json` before its run; on Linux the step deletes every
+base's files once, up front, before either half starts. On a red invocation
+`bash -e` stops before the summary, and the uploaded `meson-logs` artifact
+carries the log for running the script locally (`testlog.json`; on Linux
+`<logbase>.json`).
 
 Catch2 prints a duration line at the end of every *section*, with the test
 case's own line last on each re-entry, so the script keeps a line only when its

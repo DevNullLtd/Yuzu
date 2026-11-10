@@ -638,7 +638,7 @@ jobs:
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
           bash tests/shell/test_release_legs_issue.sh         # release-legs-broken open/comment/close decision (Tier 2b)
-          bash tests/shell/test_linux_concurrent_step.sh      # Linux test step: both halves' verdicts, kill switch, cancel trap (~30 s)
+          bash tests/shell/test_linux_concurrent_step.sh      # Linux test step: both halves' verdicts, kill switch, cancel/EXIT traps (~45 s)
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
@@ -1357,6 +1357,8 @@ jobs:
         # Kill switch: repository variable YUZU_CI_SEQUENTIAL_HALVES=1 runs the
         # non-pg half, then the pg half, skipping the pg half when the non-pg
         # half failed (the old back-to-back behaviour) — same logs, same files.
+        # Only the exact value 1 does; any other non-empty value prints a
+        # ::warning:: and the halves stay concurrent.
         #
         # Failure semantics (concurrent mode): BOTH halves always run to
         # completion (a red non-pg half does not cancel the pg half — the extra
@@ -1370,10 +1372,15 @@ jobs:
         #
         # Cancel / timeout: each half runs in its own process group (set -m), so
         # the runner's SIGINT/SIGTERM to this shell does not reach the halves by
-        # itself; the trap below forwards SIGTERM to both groups and exits 1
-        # (meson test then stops its own per-test sessions). The runner's final
-        # SIGKILL cannot be trapped — if it lands first, its end-of-job orphan
-        # sweep is the backstop.
+        # itself; the trap below sends SIGTERM to the group of every half bash
+        # still tracks as a running job (never a reaped PID), waits up to ~5 s
+        # for those groups to empty so meson can write its logs, then exits 1
+        # (meson test stops its own per-test sessions on SIGTERM). An EXIT trap
+        # does the same SIGTERM (no wait) if this shell exits non-zero any other
+        # way while a half runs. When a half ends, its group is also sent SIGTERM,
+        # so children that outlive a killed half's shell do not keep running. The
+        # runner's final SIGKILL cannot be trapped — if it lands first, its
+        # end-of-job orphan sweep is the backstop.
         #
         # Isolation of the two halves inside one build dir (each is load-bearing):
         #   1. meson-logs/testlog.* — two concurrent `meson test` runs would
@@ -1387,9 +1394,10 @@ jobs:
         #      import take the same names (--logbase). Giving the two non-pg
         #      invocations distinct bases also ends the old loss where only the
         #      LAST invocation's junit/flake report reached the telemetry DB.
-        #      All three bases' files from an earlier run in this persistent
-        #      build dir are removed before either half starts, so a half (or an
-        #      invocation) that never ran cannot upload or import stale ones.
+        #      All three bases' files (and the legacy default testlog.*) from an
+        #      earlier run in this persistent build dir are removed first thing in
+        #      the step, so a half (or an invocation) that never ran cannot
+        #      upload or import stale ones.
         #   2. ninja — `meson test` runs `ninja` (regen check + meson-test-prereq)
         #      before testing; two of those at once in one build dir race on
         #      .ninja_log/.ninja_deps. The step builds meson-test-prereq ONCE,
@@ -1765,11 +1773,20 @@ jobs:
           YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
-          # Kill switch (repository variable): "1" runs the halves back to back.
+          # Kill switch (repository variable): exactly "1" runs the halves back to back.
           YUZU_CI_SEQUENTIAL_HALVES: ${{ vars.YUZU_CI_SEQUENTIAL_HALVES }}
         run: |
           LOGS="$BUILDDIR/meson-logs"
           mkdir -p "$LOGS"
+          # Isolation 1: no file of an earlier run in this persistent build dir may
+          # be read back as this run's (a half or invocation that never ran, or a
+          # step that fails before either half starts). First, before anything
+          # here can fail. The default-base testlog.* (written by this leg before
+          # the per-invocation --logbase names existed) goes too, so the uploaded
+          # meson-logs artifact never carries a months-old run's log.
+          for base in testlog-nonpg-cheap testlog-nonpg-server testlog-pg testlog; do
+            rm -f "$LOGS/$base.txt" "$LOGS/$base.json" "$LOGS/$base.junit.xml" "$LOGS/$base"-flake-retry*
+          done
           case "$PG_MODE" in
             full|smoke) ;;
             *) echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke'"; exit 1 ;;
@@ -1783,11 +1800,6 @@ jobs:
           # concurrent invocations below can all run with --no-rebuild.
           ninja -C "$BUILDDIR" ${YUZU_BUILD_JOBS:+-j "$YUZU_BUILD_JOBS"} meson-test-prereq
           REAL_SUMMARY="${GITHUB_STEP_SUMMARY:-}"
-          # Isolation 1: no file of an earlier run in this persistent build dir may
-          # be read back as this run's (a half or invocation that never ran).
-          for base in testlog-nonpg-cheap testlog-nonpg-server testlog-pg; do
-            rm -f "$LOGS/$base.txt" "$LOGS/$base.json" "$LOGS/$base.junit.xml" "$LOGS/$base"-flake-retry*
-          done
 
           nonpg_half() {
             set -e
@@ -1825,16 +1837,51 @@ jobs:
           for h in nonpg pg; do rm -f "$LOGS/ci-half-$h.log" "$LOGS/ci-half-$h.summary.md"; done
           tick=""
           # Cancel / timeout (see the step comment): the halves are in their own
-          # process groups, so forward the signal to both groups, then fail.
+          # process groups, so forward the signal to them, then fail.
+          # live_groups: the groups of the halves (and the poll sleep) that bash
+          # still tracks as RUNNING jobs (`jobs -rp`). A reaped PID is never
+          # signalled: it may already belong to an unrelated process. `jobs` is
+          # read here, never through `$(live_groups)` (a function run inside a
+          # command substitution sees an empty job table).
+          live=()
+          live_groups() {
+            local running p
+            running=" $(jobs -rp | tr '\n' ' ') "
+            live=()
+            for p in "${pid[nonpg]}" "${pid[pg]}" "$tick"; do
+              if [[ -n "$p" && "$running" == *" $p "* ]]; then live+=("$p"); fi
+            done
+          }
           on_signal() {
             trap - INT TERM
-            echo "::error::test step interrupted; sending SIGTERM to both halves' process groups"
-            for p in "${pid[nonpg]}" "${pid[pg]}" "$tick"; do
-              if [[ -n "$p" ]]; then kill -TERM -- "-$p" 2>/dev/null || true; fi
+            echo "::error::test step interrupted; sending SIGTERM to the running halves' process groups"
+            live_groups
+            local p alive
+            for p in "${live[@]}"; do kill -TERM -- "-$p" 2>/dev/null || true; done
+            # Bounded wait (~5 s, inside the runner's 7.5 s SIGINT-to-SIGTERM
+            # grace) so meson can stop its tests and write its logs before the
+            # upload and telemetry steps read them. Never longer: exit 1 regardless.
+            for _ in $(seq 1 25); do
+              alive=""
+              for p in "${live[@]}"; do
+                if kill -0 -- "-$p" 2>/dev/null; then alive=1; fi
+              done
+              if [[ -z "$alive" ]]; then break; fi
+              sleep 0.2
             done
             exit 1
           }
+          # Any other abnormal exit of this shell (a failing command under -e)
+          # must not leave a half running either.
+          on_exit() {
+            local r=$? p
+            if [[ "$r" -ne 0 ]]; then
+              live_groups
+              for p in "${live[@]}"; do kill -TERM -- "-$p" 2>/dev/null || true; done
+            fi
+          }
           trap on_signal INT TERM
+          trap on_exit EXIT
           set -m   # every background job below gets its own process group (pgid = its pid)
           launch() {
             t0[$1]=$SECONDS
@@ -1845,6 +1892,12 @@ jobs:
           finish() {  # reap a half that has ended, record it, print its whole log now
             local h=$1 r=0
             wait "${pid[$h]}" || r=$?
+            # A half's shell can end (killed, say) while its children still run in
+            # its process group; stop them now. Linux does not hand out a PID that
+            # is still some process's group id, so while leftovers exist this
+            # reaches only them; with none it is ESRCH (ignored), barring the PID
+            # being reissued to a new group leader in the instant since the reap.
+            kill -TERM -- "-${pid[$h]}" 2>/dev/null || true
             pid[$h]=""
             rc[$h]=$r
             secs[$h]=$(( SECONDS - t0[$h] ))
@@ -1865,6 +1918,8 @@ jobs:
           if [[ "${YUZU_CI_SEQUENTIAL_HALVES:-}" == 1 ]]; then
             sequential=1
             echo "::notice::YUZU_CI_SEQUENTIAL_HALVES=1: running the non-pg half, then the pg half (kill switch)"
+          elif [[ -n "${YUZU_CI_SEQUENTIAL_HALVES:-}" ]]; then
+            echo "::warning::YUZU_CI_SEQUENTIAL_HALVES='${YUZU_CI_SEQUENTIAL_HALVES//[^A-Za-z0-9_]/?}' is not '1'; only the exact value 1 enables sequential mode, so the halves run concurrently"
           fi
           launch nonpg
           if [[ "$sequential" -eq 0 ]]; then launch pg; fi

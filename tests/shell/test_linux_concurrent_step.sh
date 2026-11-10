@@ -19,15 +19,27 @@
 #   YUZU_CI_SEQUENTIAL_HALVES=1      -> non-pg runs first, then pg; pg skipped
 #                                       after a non-pg failure (rc 1)
 #   stale logbase files              -> removed before the halves start
-#   SIGTERM to the step shell        -> rc non-zero, and no process of either
-#                                       half survives (checked by the PIDs the
-#                                       stubs record, never by pattern)
+#   YUZU_CI_SEQUENTIAL_HALVES=true   -> ::warning:: (only 1 enables it); the
+#                                       halves still run concurrently
+#   stale logbase files              -> removed even when the step fails before
+#                                       any half starts (legacy testlog.* too)
+#   a half's own shell SIGKILLed     -> that half's stub children are stopped
+#                                       when the step reaps it
+#   SIGTERM to the step shell        -> rc non-zero; the step waits (bounded) for
+#                                       the halves to exit, so none survives the
+#                                       step's exit, and it exits within ~6 s even
+#                                       when a half ignores SIGTERM for longer
+#   the step shell exits non-zero    -> the EXIT trap stops the running halves
+#   any other way (injected `false`)
+#   (PIDs are always the ones the stubs record, never matched by pattern)
 #
 # The step body is extracted from ci.yml (tests/shell/extract_run_block.py), not
 # copied. python3 (flake-retry.py / test-durations-summary.py), ninja and
 # scripts/ci/with-test-slot.sh are hermetic stubs: the step runs from a scratch
 # work dir whose scripts/ci/ holds the slot stub, with the stub bin dir first on
-# PATH. It runs under the shell GitHub uses for `run:` (bash -eo pipefail).
+# PATH. It runs under the shell GitHub uses for a `run:` with no `shell:` key
+# (`bash -e {0}`: no pipefail; ci.yml's linux job sets no defaults.run.shell),
+# with the two knob variables unset unless a scenario sets them.
 #
 # Run:  bash tests/shell/test_linux_concurrent_step.sh
 set -uo pipefail
@@ -36,6 +48,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CI_YML="${CI_YML:-$ROOT/.github/workflows/ci.yml}"
 [ -f "$CI_YML" ] || { echo "missing $CI_YML" >&2; exit 2; }
 
+REAL_PYTHON3="$(command -v python3)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/yuzu-linux-step.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -71,11 +84,14 @@ base=""; prev=""
 for a in "$@"; do [ "$prev" = "--logbase" ] && base="$a"; prev="$a"; done
 [ -n "$base" ] || { echo "python3 stub: no --logbase" >&2; exit 98; }
 var="STUB_SLEEP_${base//-/_}"
-echo "$$" >> "$STUB_DIR/pids"
+# STUB_TERM_DELAY: on SIGTERM, become a sleep of that many seconds (same PID)
+# before exiting — a test runner that takes a while to write its logs.
+if [ -n "${STUB_TERM_DELAY:-}" ]; then trap 'exec sleep "$STUB_TERM_DELAY"' TERM; fi
+echo "$$" | tee -a "$STUB_DIR/pids" >> "$STUB_DIR/pids-$base"
 echo "start $base" >> "$STUB_DIR/order"
 echo "flake-retry stub running $base"
 sleep "${!var:-0}" &
-echo "$!" >> "$STUB_DIR/pids"
+echo "$!" | tee -a "$STUB_DIR/pids" >> "$STUB_DIR/pids-$base"
 wait "$!"
 if [ "$base" = testlog-pg ]; then
   if grep -q '::error::non-pg half failed' "$STUB_DIR/stdout" 2>/dev/null; then
@@ -95,16 +111,45 @@ shift
 exec "$@"
 STUB
 
+# step_cmd [ENV=VAL ...] — the step, as the runner launches it. SIGINT is reset
+# to its default first: a background job of this non-interactive script inherits
+# SIGINT ignored, and bash cannot trap a signal ignored at entry.
+step_cmd() { # always called in a subshell, which it replaces (so $! is the step)
+  exec "$REAL_PYTHON3" -I -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])' \
+    env -u YUZU_CI_SEQUENTIAL_HALVES -u YUZU_TEST_PG_CLONE_STRATEGY \
+        PATH="$TMP/bin:$PATH" BUILDDIR=build PG_MODE=full GITHUB_WORKSPACE="$TMP/work" \
+        STUB_DIR="$TMP/stub" "$@" \
+        bash --noprofile --norc -e "${STEP_SH:-$TMP/step.sh}"
+}
+fresh() { rm -rf "$TMP/work/build" "$TMP/stub"; mkdir -p "$TMP/stub"; : > "$TMP/stub/order"; }
 # run_step [ENV=VAL ...] — runs the step synchronously; sets $rc.
 run_step() {
-  rm -rf "$TMP/work/build" "$TMP/stub"; mkdir -p "$TMP/stub"; : > "$TMP/stub/order"
+  fresh
   : > "$TMP/summary.md"
   ( cd "$TMP/work" || exit 97
-    env PATH="$TMP/bin:$PATH" BUILDDIR=build PG_MODE=full GITHUB_WORKSPACE="$TMP/work" \
-        GITHUB_STEP_SUMMARY="$TMP/summary.md" STUB_DIR="$TMP/stub" "$@" \
-        bash --noprofile --norc -eo pipefail "$TMP/step.sh" >"$TMP/stub/stdout" 2>&1 )
+    step_cmd GITHUB_STEP_SUMMARY="$TMP/summary.md" "$@" >"$TMP/stub/stdout" 2>&1 )
   rc=$?
 }
+# start_step [ENV=VAL ...] — runs the step in the background; sets $step_pid.
+start_step() {
+  fresh
+  ( cd "$TMP/work" || exit 97; step_cmd "$@" >"$TMP/stub/stdout" 2>&1 ) &
+  step_pid=$!
+}
+# survivors <pid-file> — the recorded PIDs still alive.
+survivors() { local p s=""; while read -r p; do kill -0 "$p" 2>/dev/null && s="$s $p"; done < "$1"; echo "$s"; }
+# reap_ours <pid-file> — never leave our own stubs behind (recorded PIDs only).
+reap_ours() { local p; for p in $(survivors "$1"); do kill -KILL "$p" 2>/dev/null; done; }
+wait_lines() { # wait_lines <file> <n>: up to 10 s for <file> to reach <n> lines
+  for _ in $(seq 1 100); do
+    [ "$(grep -c . "$1" 2>/dev/null || echo 0)" -ge "$2" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+now_ms() { date +%s%3N; }
 out_has() { grep -qF -- "$1" "$TMP/stub/stdout"; }
 
 echo "-- both halves green --"
@@ -142,23 +187,26 @@ check "rc 1" 1 "$rc"
 check "no half started" "0" "$(grep -c '^start ' "$TMP/stub/order")"
 
 echo "-- stale logbase files are removed before the halves start --"
-mkdir -p "$TMP/work/build/meson-logs"
-run_step_with_stale() {
+run_step_with_stale() { # run_step_with_stale [ENV=VAL ...]
   rm -rf "$TMP/stub"; mkdir -p "$TMP/stub"; : > "$TMP/stub/order"
-  mkdir -p "$TMP/work/build/meson-logs"
+  rm -rf "$TMP/work/build"; mkdir -p "$TMP/work/build/meson-logs"
   touch "$TMP/work/build/meson-logs/testlog-nonpg-server.junit.xml" \
         "$TMP/work/build/meson-logs/testlog-pg-flake-retry.json" \
-        "$TMP/work/build/meson-logs/testlog-pg-flake-retry-enum-x.junit.xml"
+        "$TMP/work/build/meson-logs/testlog-pg-flake-retry-enum-x.junit.xml" \
+        "$TMP/work/build/meson-logs/testlog.junit.xml" \
+        "$TMP/work/build/meson-logs/testlog.txt"
   ( cd "$TMP/work" || exit 97
-    env PATH="$TMP/bin:$PATH" BUILDDIR=build PG_MODE=full GITHUB_WORKSPACE="$TMP/work" \
-        STUB_DIR="$TMP/stub" STUB_FAIL=testlog-nonpg-cheap \
-        bash --noprofile --norc -eo pipefail "$TMP/step.sh" >"$TMP/stub/stdout" 2>&1 )
+    step_cmd "$@" >"$TMP/stub/stdout" 2>&1 )
   rc=$?
 }
-run_step_with_stale
+run_step_with_stale STUB_FAIL=testlog-nonpg-cheap
 check "rc 1" 1 "$rc"
 check "never-run invocation's stale junit removed" no "$(yes_no test -e "$TMP/work/build/meson-logs/testlog-nonpg-server.junit.xml")"
 check "stale flake-retry files removed" "0" "$(ls "$TMP/work/build/meson-logs" | grep -c '^testlog-pg-flake-retry')"
+check "legacy default testlog.* removed" "0" "$(ls "$TMP/work/build/meson-logs" | grep -c '^testlog\.')"
+run_step_with_stale PG_MODE=bogus
+check "rc 1 (bad pg_mode)" 1 "$rc"
+check "stale files removed even when the step fails before any half" "0" "$(ls "$TMP/work/build/meson-logs" | grep -c '^testlog')"
 
 echo "-- kill switch: YUZU_CI_SEQUENTIAL_HALVES=1 --"
 run_step YUZU_CI_SEQUENTIAL_HALVES=1 STUB_SLEEP_testlog_nonpg_server=1
@@ -171,36 +219,65 @@ check "rc 1 after a non-pg failure" 1 "$rc"
 check "pg half skipped" no "$(yes_no grep -q 'start testlog-pg' "$TMP/stub/order")"
 check "skip reported" yes "$(yes_no out_has 'pg half (pg_mode=full): skipped')"
 
+echo "-- kill switch set to something other than 1 --"
+run_step YUZU_CI_SEQUENTIAL_HALVES=true STUB_SLEEP_testlog_nonpg_cheap=2
+check "rc 0" 0 "$rc"
+check "warning says only 1 enables it" yes "$(yes_no out_has "::warning::YUZU_CI_SEQUENTIAL_HALVES='true' is not '1'")"
+check "halves still concurrent (pg started before non-pg ended)" yes \
+  "$(yes_no awk '/^start testlog-pg$/{s=NR} /^end testlog-nonpg-cheap$/{e=NR} END{exit !(s && e && s < e)}' "$TMP/stub/order")"
+run_step
+check "no kill-switch warning when unset" no "$(yes_no out_has "::warning::YUZU_CI_SEQUENTIAL_HALVES")"
+
 echo "-- clone-strategy leak is warned --"
 run_step YUZU_TEST_PG_CLONE_STRATEGY=file_copy
 check "rc 0" 0 "$rc"
 check "warning names the value" yes "$(yes_no out_has "::warning::YUZU_TEST_PG_CLONE_STRATEGY='file_copy'")"
 
-echo "-- SIGTERM to the step shell stops both halves --"
-rm -rf "$TMP/work/build" "$TMP/stub"; mkdir -p "$TMP/stub"; : > "$TMP/stub/order"
-( cd "$TMP/work" || exit 97
-  exec env PATH="$TMP/bin:$PATH" BUILDDIR=build PG_MODE=full GITHUB_WORKSPACE="$TMP/work" \
-      STUB_DIR="$TMP/stub" STUB_SLEEP_testlog_nonpg_cheap=60 STUB_SLEEP_testlog_pg=60 \
-      bash --noprofile --norc -eo pipefail "$TMP/step.sh" >"$TMP/stub/stdout" 2>&1 ) &
-step_pid=$!
-for _ in $(seq 1 100); do
-  [ "$(grep -c . "$TMP/stub/pids" 2>/dev/null || echo 0)" -ge 4 ] && break
-  sleep 0.1
-done
-check "both halves were running (4 stub PIDs recorded)" 4 "$(grep -c . "$TMP/stub/pids" 2>/dev/null || echo 0)"
-kill -TERM "$step_pid"
+echo "-- a half's own shell is SIGKILLed: its children are stopped --"
+start_step STUB_SLEEP_testlog_nonpg_cheap=60 STUB_SLEEP_testlog_pg=4
+wait_lines "$TMP/stub/pids-testlog-nonpg-cheap" 2
+half_pid="$(sed -n 's/^started non-pg half (pid \([0-9][0-9]*\))$/\1/p' "$TMP/stub/stdout")"
+check "non-pg half shell PID read from the step output" yes "$( [ -n "$half_pid" ] && echo yes || echo no)"
+[ -n "$half_pid" ] && kill -KILL "$half_pid"
 wait "$step_pid"; rc=$?
+check "rc 1" 1 "$rc"
+check "killed half reported" yes "$(yes_no out_has '::error::non-pg half failed (exit 137')"
+left=""
+for _ in $(seq 1 30); do left="$(survivors "$TMP/stub/pids-testlog-nonpg-cheap")"; [ -z "$left" ] && break; sleep 0.1; done
+check "the killed half's stub children are gone" "" "$left"
+reap_ours "$TMP/stub/pids"
+
+echo "-- SIGTERM to the step shell stops both halves --"
+start_step STUB_SLEEP_testlog_nonpg_cheap=60 STUB_SLEEP_testlog_pg=60 STUB_TERM_DELAY=1
+wait_lines "$TMP/stub/pids" 4
+check "both halves were running (4 stub PIDs recorded)" 4 "$(grep -c . "$TMP/stub/pids" 2>/dev/null || echo 0)"
+t0=$(now_ms); kill -TERM "$step_pid"; wait "$step_pid"; rc=$?; dt=$(( $(now_ms) - t0 ))
+left="$(survivors "$TMP/stub/pids")"
 check "step exits non-zero" yes "$( [ "$rc" -ne 0 ] && echo yes || echo no)"
-survivors=""
-for _ in $(seq 1 50); do
-  survivors=""
-  while read -r p; do kill -0 "$p" 2>/dev/null && survivors="$survivors $p"; done < "$TMP/stub/pids"
-  [ -z "$survivors" ] && break
-  sleep 0.1
-done
-check "no stub process survives" "" "$survivors"
-# Never leave our own stubs behind, even when the check failed (PIDs we started only).
-for p in $survivors; do kill -KILL "$p" 2>/dev/null; done
+check "no stub process survives the step's exit (it waited for them)" "" "$left"
+check "step exited within 6 s (took ${dt} ms)" yes "$( [ "$dt" -le 6000 ] && echo yes || echo no)"
+reap_ours "$TMP/stub/pids"
+
+echo "-- SIGTERM: the wait is bounded when a half outlives it --"
+start_step STUB_SLEEP_testlog_nonpg_cheap=60 STUB_SLEEP_testlog_pg=60 STUB_TERM_DELAY=20
+wait_lines "$TMP/stub/pids" 4
+t0=$(now_ms); kill -TERM "$step_pid"; wait "$step_pid"; rc=$?; dt=$(( $(now_ms) - t0 ))
+check "step exits non-zero" yes "$( [ "$rc" -ne 0 ] && echo yes || echo no)"
+check "step exited within 6 s although the halves had not (took ${dt} ms)" yes "$( [ "$dt" -le 6000 ] && echo yes || echo no)"
+check "and it did wait for them first (>= 4 s)" yes "$( [ "$dt" -ge 4000 ] && echo yes || echo no)"
+reap_ours "$TMP/stub/pids"
+
+echo "-- abnormal exit of the step shell (injected failure) stops both halves --"
+# The only edit to the extracted step: a failing command right after the launches.
+awk '{print} /^ *if \[\[ "\$sequential" -eq 0 \]\]; then launch pg; fi$/{print "sleep 1; false"; n++} END{exit n != 1}' \
+  "$TMP/step.sh" > "$TMP/step-false.sh" || { echo "injection point not found" >&2; exit 2; }
+STEP_SH="$TMP/step-false.sh" start_step STUB_SLEEP_testlog_nonpg_cheap=60 STUB_SLEEP_testlog_pg=60
+wait "$step_pid"; rc=$?
+check "rc 1" 1 "$rc"
+left=""
+for _ in $(seq 1 30); do left="$(survivors "$TMP/stub/pids")"; [ -z "$left" ] && break; sleep 0.1; done
+check "no stub process survives" "" "$left"
+reap_ours "$TMP/stub/pids"
 
 echo "  ---"
 echo "  ${pass} passed, ${fail} failed"
