@@ -873,13 +873,16 @@ groups:
       # READS: op="session_lookup" (HA WS-5 batched session_id resolution) and
       # op="cluster_affinity_check" (#4669). Same counter, same pool-health
       # root cause, so one rule covers reads and writes.
-      # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
-      # fresh-registration branch returns UNAVAILABLE on this); the other
-      # five writer SITES (announce_connected, both ProxyRegister renew
-      # branches, BatchHeartbeat's renew, deregister) — which collapse to
-      # three fail-OPEN `op` label values (announce_connected, renew_leases,
-      # deregister; see the label set in docs/user-manual/metrics.md) — are
-      # deliberately fail-OPEN, so a rate here can mean silent directory drift even with
+      # The fail-CLOSED sites (the RPC returns UNAVAILABLE) are ProxyRegister's
+      # fresh-registration branch (`op="register_fresh"`) and both of its
+      # replay-adopt branches (`op="renew_leases"` and
+      # `op="reclaim_tombstoned_session"`). The four writer SITES —
+      # announce_connected, BatchHeartbeat's renew_leases, deregister and the
+      # adopted-session set_legacy_echo_wire_name flag refresh — are
+      # deliberately fail-OPEN and use the `op` label values announce_connected,
+      # renew_leases, deregister and set_legacy_echo_wire_name (see the label
+      # set in docs/user-manual/metrics.md), so a rate here can mean silent
+      # directory drift even with
       # no visible RPC failure. INITIAL / conservative threshold — no fleet
       # background-rate data exists yet to tune against (same lesson as the
       # #913 OTA-bounds alert thresholds, the single largest source of
@@ -919,7 +922,12 @@ groups:
             announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
             NULL) — lease renewal does NOT repopulate placement, so it does NOT
             self-heal on the lease TTL and needs another CONNECTED / agent
-            re-registration to restore routing. op="session_lookup" is the
+            re-registration to restore routing. op="set_legacy_echo_wire_name"
+            (an upgrade-window shim) leaves the row's legacy plugin-name flag
+            stale: nothing repairs it until that agent registers fresh or is
+            adopted again, and until then a directory-routed Echo dispatch to
+            it is written under the wrong plugin name and the agent answers
+            plugin_not_found. op="session_lookup" is the
             batched READ that resolves gateway session ids (HA WS-5): while it
             fails, BatchHeartbeat is fail-SOFT (locally hinted pairs are still
             acked and renewed, unreadable ids with no local hint are neither
@@ -6005,8 +6013,10 @@ groups:
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
         # reason = store_not_open | pool_acquire_timeout | query_error, plus
-        # admission_full (source=installed_software or ca_issued): a /crypto read
-        # refused by its per-process in-flight bound BEFORE any store call. The
+        # sections_query_error (source=device_ci: the hardware record read answered but its
+        # sections did not) and admission_full (source=installed_software or ca_issued):
+        # a /crypto read refused by its per-process in-flight bound BEFORE any store call.
+        # The
         # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)
         # reads count here too; ca_issued has its own longer-held alert below. Sustained for 5m
         # that is saturation of the bound (a poll storm or slow summary reads), which
@@ -6033,7 +6043,11 @@ groups:
             fleet vulnerability query ("which devices run <CVE>") reads as degraded,
             NOT "installed nowhere" - do not trust a zero-result inventory answer while
             one of those fires. admission_full is a shed: a refused /crypto read is an
-            error response, never a zero-result answer. A source=installed_software
+            error response, never a zero-result answer. sections_query_error
+            (source=device_ci) means the hardware record read answered but its v2
+            sections did not, so the REST record route answered 503 (the MCP tool, a
+            retryable error): check yuzu_pg_* and the DeviceInventoryStore warning in
+            the server log. A source=installed_software
             query_error that fires together with YuzuInventoryCatalogRollupStale or
             YuzuInventoryCatalogRollupFailing is the /crypto live name scan exceeding
             its 5s bound (too many distinct package names): retrying will not help, fix

@@ -696,7 +696,7 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 248 REST rows: 41 `kRequired`, 3 `kOwnGate`, 131 `kExempt` and 73
+  table has 251 REST rows: 41 `kRequired`, 3 `kOwnGate`, 134 `kExempt` and 73
   `kPendingRuling`.
 - **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
   body of the post-read stage `server.cpp` installs through
@@ -896,7 +896,7 @@ by each handler.
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (73 rows: 23 `kExempt`, 50
+  a second table, `step_up_mcp_policy.hpp` (75 rows: 25 `kExempt`, 50
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
   plus a separate list of tools added after it (today six), legal only for a tool

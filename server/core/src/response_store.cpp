@@ -407,8 +407,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // Landed as a NEW migration, not folded into v1's CREATE TABLE:
         // PgMigrationRunner stamps schema_meta(store, version) once per
         // numbered migration and never replays a modified one, so editing
-        // v1 in place would silently no-op on any database that already
-        // ran this store's migrations (#2691, Sol plan review).
+        // v1 in place would not run on any database that already ran this
+        // store's migrations (#2691, Sol plan review); since #7158 the runner
+        // also refuses such a database at start, because the recorded hash of
+        // v1 no longer matches.
         {2, R"(
             ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT NULL DEFAULT 0;
         )"},

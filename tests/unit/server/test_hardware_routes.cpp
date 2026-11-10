@@ -11,6 +11,7 @@
 /// null-vs-value contract for the new fields, and the POST .../sync route matrix.
 
 #include "hardware_routes.hpp"
+#include "hardware_section_integrity.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_forensics_tier_fixture.hpp"
@@ -20,6 +21,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <cstdio>
@@ -77,7 +79,8 @@ struct HwHarness {
     bool roster_degraded = false; // #5531: the durable roster read failed
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
-    std::vector<bool> ci_with_sections; // the `with_sections` argument of every ci_detail_fn call, in order
+    std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call, in order
+    yuzu::MetricsRegistry metrics; // the integrity counter the fake ci_detail_fn below feeds
 
     int dex_calls = 0;
     std::vector<std::string> dex_calls_for; // agent_ids scored, in call order
@@ -185,9 +188,15 @@ struct HwHarness {
             out.roster_degraded = roster_degraded;
             return out;
         };
-        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&, bool with_sections) {
-            ci_with_sections.push_back(with_sections);
-            return ci_detail;
+        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string& id, CiRead ci_read) {
+            ci_reads.push_back(ci_read);
+            HardwareCiDetail detail = ci_detail;
+            // Mirrors the hw_ci_detail_fn closure in server.cpp (the real one is pinned lexically
+            // by test_hw_ci_detail_wiring_lexical.cpp): count after the sections read, for
+            // WithSections only, and only for a READ list.
+            if (ci_read == CiRead::WithSections && detail.ci_sections && *detail.ci_sections)
+                record_section_integrity(**detail.ci_sections, id, &metrics);
+            return detail;
         };
         HardwareRoutes::ScopedProbeFn probe = [this](const httplib::Request&, const std::string& type,
                                                      const std::string& op, const std::string&) {
@@ -1941,8 +1950,8 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — scope 404 precedes the sections 
 
 // Only the REST record route asks for the sections: the dashboard fragment, its sync-now poll and
 // the actions lens never render them and must not pay for the extra read. A counting fake records
-// the `with_sections` argument of every call. Kills: passing true from a dashboard call site, or
-// false from the REST route.
+// the `CiRead` argument of every call. Kills: passing WithSections from a dashboard call site, or
+// RecordOnly from the REST route.
 TEST_CASE("route: only the REST record asks for sections - the dashboard and actions lens do not",
           "[hardware][route][rest][sections]") {
     HwHarness h;
@@ -1950,23 +1959,23 @@ TEST_CASE("route: only the REST record asks for sections - the dashboard and act
     h.actions_plugins = {{.name = "firewall", .version = "1", .actions = {"rules"}}};
 
     REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview"));
-    REQUIRE(h.ci_with_sections.size() == 1);
-    CHECK(h.ci_with_sections.back() == false);
+    REQUIRE(h.ci_reads.size() == 1);
+    CHECK(h.ci_reads.back() == CiRead::RecordOnly);
 
     // the 1-2 s sync-now poll is the same fragment route
     REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview&lens_only=1&await_since=1000"));
-    REQUIRE(h.ci_with_sections.size() == 2);
-    CHECK(h.ci_with_sections.back() == false);
+    REQUIRE(h.ci_reads.size() == 2);
+    CHECK(h.ci_reads.back() == CiRead::RecordOnly);
 
     auto actions = h.sink.Get("/fragments/hardware/ci/actions?id=agent-x");
     REQUIRE(actions);
-    REQUIRE(h.ci_with_sections.size() == 3);
-    CHECK(h.ci_with_sections.back() == false);
+    REQUIRE(h.ci_reads.size() == 3);
+    CHECK(h.ci_reads.back() == CiRead::RecordOnly);
 
     auto rest = h.sink.Get("/api/v1/hardware/agent-x");
     REQUIRE(rest);
-    REQUIRE(h.ci_with_sections.size() == 4);
-    CHECK(h.ci_with_sections.back() == true);
+    REQUIRE(h.ci_reads.size() == 4);
+    CHECK(h.ci_reads.back() == CiRead::WithSections);
 }
 
 // Section rows are agent-supplied bytes. A byte that is not valid UTF-8 must not throw out of the
@@ -1976,7 +1985,7 @@ TEST_CASE("route: GET /api/v1/hardware/{id} - an invalid UTF-8 byte in a section
           "[hardware][route][rest][sections]") {
     HwHarness h;
     h.ci_detail = v2_record_detail();
-    (*h.ci_detail.ci_sections)[1].rows[0][1] = std::string("Xe\xffon");
+    (**h.ci_detail.ci_sections)[1].rows[0][1] = std::string("Xe\xffon");
     auto res = h.sink.Get("/api/v1/hardware/agent-x");
     REQUIRE(res);
     REQUIRE(res->status == 200);
@@ -2514,4 +2523,71 @@ TEST_CASE("software lens header: count and last synced, never-synced told apart 
                    "last synced time unavailable"));
     // Click-to-load hosts ride the same lens and nothing is fetched on render.
     CHECK(contains(synced, "hx-trigger=\"click\""));
+}
+
+// #7159: only the sections-reading record route moves the integrity counter. The dashboard
+// fragment, the sync-now poll and the actions lens ask for the record only, so they never reach the
+// count even for a record whose sections are faulted. What this proves: the routes pass the right
+// `CiRead` (WithSections only for the REST record, RecordOnly for the three dashboard surfaces).
+// It does NOT prove the real closure counts only on WithSections - the fake ci_detail_fn below
+// mirrors that rule; the real one is pinned lexically (test_hw_ci_detail_wiring_lexical.cpp).
+// Kills: a dashboard route asking for CiRead::WithSections, or the REST record asking for
+// RecordOnly.
+TEST_CASE(
+    "route: only the REST record moves the section integrity counter; the dashboard never does",
+    "[hardware][route][rest][sections][metrics]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    // A cpu section stored with 2 rows but served with 1: the row-count rule faults it.
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "ok";
+    cpu.row_count = 2;
+    cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+    h.ci_detail.ci_sections = std::vector<DeviceCiSection>{cpu};
+    h.actions_plugins = {{.name = "firewall", .version = "1", .actions = {"rules"}}};
+    const auto count = [&] {
+        return h.metrics
+            .counter("yuzu_hardware_section_integrity_total", {{"reason", "row_count_mismatch"}})
+            .value();
+    };
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview"));
+    REQUIRE(
+        h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview&lens_only=1&await_since=1000"));
+    REQUIRE(h.sink.Get("/fragments/hardware/ci/actions?id=agent-x"));
+    CHECK(count() == 0.0);
+
+    auto rest = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(rest);
+    REQUIRE(rest->status == 200);
+    CHECK(nlohmann::json::parse(rest->body)["data"]["ci"]["sections"][0]["reason"] ==
+          std::string(section_fault_token(SectionFault::RowCount)));
+    // The one row that remains is withheld from the body (#7165).
+    CHECK(nlohmann::json::parse(rest->body)["data"]["ci"]["sections"][0]["rows"].empty());
+    CHECK(count() == 1.0);
+}
+
+// Kills: a route that reaches its ci_detail_fn before the scope check: the fake records every
+// call, so a fetch for an out-of-scope id shows in `ci_reads` (and would move a fleet-wide
+// counter).
+TEST_CASE(
+    "route: an out-of-scope REST read neither fetches the record nor moves the integrity counter",
+    "[hardware][route][rest][sections][metrics][security]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "ok";
+    cpu.row_count = 2;
+    cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+    h.ci_detail.ci_sections = std::vector<DeviceCiSection>{cpu};
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(h.ci_reads.empty());
+    CHECK(h.metrics
+              .counter("yuzu_hardware_section_integrity_total", {{"reason", "row_count_mismatch"}})
+              .value() == 0.0);
 }
