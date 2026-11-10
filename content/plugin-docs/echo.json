@@ -2806,6 +2806,7 @@
       "server/core/src/capability_decls/plugin_action_catalogue_a.hpp"
     ],
     "changelog": [
+      "changelog.d/0000-echo-drop-live-shims.removed.md",
       "changelog.d/2026-10-30-echo-db-budget.added.md",
       "changelog.d/2026-10-30-echo-db-budget.changed.md",
       "changelog.d/2026-10-30-echo-db-budget.fixed.md",
