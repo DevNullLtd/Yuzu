@@ -163,9 +163,11 @@ public:
     /// parameter `exec_params` refused for a NUL byte) is rolled back here and
     /// commit() returns false: Postgres would complete `COMMIT` as a rollback
     /// and still answer `PGRES_COMMAND_OK`, which used to read as success for
-    /// work that did not persist. The rollback is issued at once and the guard
-    /// is disarmed, so the connection is idle when commit() returns and the
-    /// destructor cannot roll back a transaction the caller started later.
+    /// work that did not persist. The rollback is issued at once and, once it
+    /// takes effect, the guard is disarmed: the connection is idle when
+    /// commit() returns and the destructor cannot roll back a transaction the
+    /// caller started later. (If the ROLLBACK itself did not take effect the
+    /// guard stays armed and the destructor retries it.)
     /// A failed statement the caller recovered from with `ROLLBACK TO
     /// SAVEPOINT` leaves the transaction usable and still commits. A
     /// transaction that is already idle (the caller ended it) takes the
@@ -194,7 +196,7 @@ public:
 private:
     PGconn* conn_{nullptr};
     bool committed_{false};
-    bool rolled_back_{false}; // commit() found the transaction aborted and rolled it back
+    bool rolled_back_{false}; // commit() rolled back an aborted transaction and the ROLLBACK took effect
 };
 
 } // namespace yuzu::server::pg

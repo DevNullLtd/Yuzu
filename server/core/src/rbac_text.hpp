@@ -11,7 +11,8 @@
 /// The name is kept on purpose (it began as the RBAC rule and renaming it touches every caller);
 /// read "identifier" for "RBAC identifier" wherever the predicate is used outside RBAC.
 ///
-/// EXTEND this, never fork it: this is the single clean-text predicate for identifiers.
+/// EXTEND this, never fork it: this is the single clean-text predicate for identifiers that
+/// reach an RBAC or management-group store.
 /// Near-duplicates exist in outbound_url_policy.hpp and instruction_execute.hpp for other
 /// fields; do not add another copy for an RBAC identifier.
 

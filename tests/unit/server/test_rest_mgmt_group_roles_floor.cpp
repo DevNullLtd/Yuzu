@@ -1002,7 +1002,7 @@ TEST_CASE("mgmt_group_error: store faults are the fixed messages, matched at the
 // Tripwire, closed-world: every string literal handed to std::unexpected in
 // management_group_store.cpp is either classified as a store fault by the shared classifier or is
 // named below as a validation message / a read-path fault no classifier call site reaches. A new
-// message of ANY wording therefore forces a decision here. (A message built another way,
+// message of ANY wording written as a literal here therefore forces a decision. (A message built another way,
 // std::format or a named constant, is not seen by the scan; the floors below fail the test if
 // the literal shapes change enough to drop the scan's coverage.)
 TEST_CASE("mgmt_group_error: every std::unexpected literal in management_group_store.cpp is "
@@ -1051,10 +1051,12 @@ TEST_CASE("mgmt_group_error: every std::unexpected literal in management_group_s
                        "or name it in this test");
         }
     }
-    // The file holds 44 literals today (28 faults, 12 validation, 4 read-path). Exact floors so
-    // a change in literal shape cannot silently shrink what the scan sees.
+    // The file holds 44 literals today (28 faults, 12 validation occurrences of 8 distinct
+    // messages, 4 read-path). Minimum floors equal to those counts, so a change in literal shape
+    // cannot silently shrink what the scan sees. Messages RbacStore::validate_assignment returns
+    // through `v.error()` are not literals in this file and are outside the scan.
     CHECK(seen >= 44);
     CHECK(faults >= 28);
-    CHECK(validations >= 8);
+    CHECK(validations >= 12);
     CHECK(reads >= 4);
 }
