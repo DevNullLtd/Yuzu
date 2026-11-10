@@ -1545,8 +1545,7 @@ polled when, in what state.
   lower-cased in `software_changes.identity_key` for 400 days). The server cannot minimise the
   value at read or store time without breaking the v3 hash agreement, so the control for
   `install_location` is the agent writer's allowlist: the agent-side blob-v3 writer
-  (`installed_software_v3.cpp`, delivered by the sibling SAM-15 change, which lands before this
-  surface is read) keeps a location only under a machine root (`kMachineRoots`) and blanks every
+  (`installed_software_v3.cpp`) keeps a location only under a machine root (`kMachineRoots`) and blanks every
   other path, fail closed, and tests that no profile path is emitted. A component's `path` and
   `anchor_app` carry NO allowlist yet: the component writer only clamps them
   (`component_normal_form`), and the SAM-40 producer must apply the same machine-root allowlist
