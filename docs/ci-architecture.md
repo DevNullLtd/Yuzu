@@ -62,7 +62,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   in release mode — except the Windows and macOS **server**: since ADR-0035
   ladder step 1 no CI leg builds or tests it, yet `release.yml` still builds it
   at tag time until ladder step 2 removes it (step 2 must merge before the next
-  release tag, ADR-0035).
+  release tag, or that release must record in its GitHub Release notes who
+  accepted shipping the untested Windows/macOS server, and when: ADR-0035 and
+  the `/release` skill's preflight).
   - **Failure signal.** A dispatched run is started by `github-actions[bot]`,
     which emails nobody. Whether to open, comment on or close a
     `release-legs-broken` issue is decided in one place,
@@ -1135,7 +1137,7 @@ and hardening them for the shared-identity runner pools, is #6116.
 | Runner | Host | Jobs |
 |---|---|---|
 | `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) — 4 L3/CCD-pinned runners (`0-7,32-39`; `8-15,40-47`; `16-23,48-55`; `24-31,56-63`), Ninja capped at `-j16` | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. Provisioned from [`deploy/linux/`](../deploy/linux/README.md). |
-| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, cache-prune-windows (the dispatch-only `instructions-windows-validate.yml` server smoke rig was deleted by ADR-0035 step 1). Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
+| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg (since ADR-0035 step 1 the Windows CodeQL row analyses the agent only; server code is CodeQL-scanned on Linux only), release `build-windows`, cache-prune-windows (the dispatch-only `instructions-windows-validate.yml` server smoke rig was deleted by ADR-0035 step 1). Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix + `release.yml` build-macos. Only pre-release `install-macos` stays GitHub-hosted (`macos-14`, an install-to-root smoke test). Release **signing/notarization is deferred** — macOS releases currently ship UNSIGNED (Phase B = on-token `rcodesign`). Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
 **Retired 2026-06-21** (removed from the inventory afterwards): `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
@@ -1232,6 +1234,17 @@ longer run. The build dirs were renamed so that a branch cut before this change
 `build_server` value; the job deletes the old `build-windows-{debug,release}`
 dirs on every run, so an unrebased branch rebuilds cold (ccache-warm) until it
 is rebased onto `dev` (see `docs/ci-troubleshooting.md`).
+
+**Measuring the saving.** Baseline: the Windows MSVC debug job on `dev`
+pushes took 25.4–28.6 min wall time over 5 runs on 2026-11-10 (runs
+42908124262, 42902526001, 42895515198, 42879744786, 42865414562), of
+which `Test (pg shards, full)` was 14.3–17.0 min. Compare against the
+median wall time of 5 post-cutover warm runs of the same job, excluding
+each runner's first (cold) run after the cutover and any docs-only stub
+run. Record the cold-run wall time and the ccache hit rate separately
+(the MSVC `/Zi` hit rate is unverified). Leave the Windows job's
+`timeout-minutes: 120` unchanged until at least 10 post-cutover samples
+exist.
 
 Wee Tam's 4 runners are CCD-pinned, but affinity partitions only **cores** — not
 DRAM bandwidth, the disk, or the Defender minifilter. So when several Windows jobs

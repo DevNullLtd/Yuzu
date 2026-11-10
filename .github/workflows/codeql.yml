@@ -42,6 +42,9 @@ name: "CodeQL"
 #     + build_tests=true + languages c-cpp,actions, and the workflow
 #     matrixed across Linux + Windows runners to close the #ifdef _WIN32
 #     gap that a Linux-only analysis physically cannot reach.
+#   ADR-0035 ladder step 1: the Windows row is configured with
+#     -Dbuild_server=false, so it analyses the agent only; server code
+#     (Linux-only under ADR-0035) is CodeQL-scanned on the Linux row only.
 #   2026-10-21 → 2026-11-02: the dev→main promotion (first-party .cpp/.cc files 1157 → 1437)
 #     pushed both legs past the 90-min ceiling; scheduled runs were
 #     cancelled daily from 2026-10-22. Timeout raised to 180 — see the
@@ -54,6 +57,8 @@ name: "CodeQL"
 #     handling — not style noise like it would be for JS/Python)
 #   - languages: c-cpp,actions on Linux; c-cpp only on Windows (no need
 #     to double-scan the same .github/workflows/*.yml)
+#   - Windows row: agent code only (-Dbuild_server=false, ADR-0035 step 1);
+#     server code is scanned on the Linux row only
 #   - -Dbuild_tests=true so the CodeQL tracer observes tests/unit/*.cpp
 #   - Dedicated per-OS build dirs (build-linux-codeql/ + build-windows-codeql/)
 #     isolated from operator's interactive builds and from

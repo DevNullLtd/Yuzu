@@ -78,7 +78,7 @@ Preflight checks:
 7. `docker-compose.full-uat.yml` includes `--data-dir`
 8. `origin/dev` and `origin/main` are reconciled (no divergence either direction)
 
-Also check by hand (the script does not): **ADR-0035 ladder step 2 has merged.** If `release.yml` still builds `yuzu-server.exe`, `YuzuServerSetup` or the macOS server (`grep -nE 'yuzu-server.exe|YuzuServerSetup|install-server-postgres' .github/workflows/release.yml`), **stop**: CI no longer compiles or tests that server. Land step 2 first, or record the operator's explicit acceptance of shipping an untested Windows/macOS server in the release record (owner decision 2026-11-10).
+Also check by hand (the script does not): **ADR-0035 ladder step 2 merges first, OR the release explicitly accepts shipping an untested Windows/macOS server** (owner decision 2026-11-10). Since ladder step 1, no CI leg compiles or tests the Windows or macOS server. Run `grep -nE 'build-(windows|macos)/server/core/yuzu-server|yuzu-server\.iss' .github/workflows/release.yml` — it matches only the Windows server build smoke test, staging and installer script, and the macOS server smoke test and staging, never the Linux job or the release-notes text. Empty output means step 2 has merged; proceed. Any hit means **stop**: either land step 2 first, or the release operator adds this line to the GitHub Release notes before publishing: `Windows/macOS server artefacts in <tag> were not compiled or tested in CI before tagging (ADR-0035 ladder step 1–2 gap); shipping accepted by <approver> on <YYYY-MM-DD>.` A Windows or macOS server compile break at release time is fixed by landing step 2, never by patching server code for an unsupported platform.
 
 Optional `--full` adds a local C++ + Erlang compile (~2 min).
 

@@ -356,12 +356,14 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    `pre-release.yml`: no change until step 2's artefact rename.
 
    **Release ordering (owner decision, 2026-11-10):** step 2 MUST merge before the next release
-   tag. From step 1 on, CI no longer compiles or tests the Windows or macOS server, but
-   `release.yml` still builds and ships it until step 2. A release tagged before step 2 merges
-   must record, in its release record, explicit acceptance of shipping an untested Windows/macOS
-   server that dev CI never compiled. If a Windows or macOS server compile break surfaces at
-   release time before step 2, the remedy is to land step 2 (drop the server from those release
-   jobs), not to patch server code for an unsupported platform.
+   tag, or that release MUST explicitly accept shipping a Windows/macOS server that CI never
+   compiled or tested, recorded as a line in its GitHub Release notes naming the approver, the
+   date and the tag (the exact form and the `release.yml` check are in
+   `.claude/skills/release/SKILL.md`, Phase 0 preflight). From step 1 on, CI no longer compiles
+   or tests the Windows or macOS server, but `release.yml` still builds and ships it until step 2.
+   If a Windows or macOS server compile break surfaces at release time before step 2, the remedy
+   is to land step 2 (drop the server from those release jobs), not to patch server code for an
+   unsupported platform.
 2. **Release + rename blast radius** — remove the server from the Windows/macOS staging in
    `release.yml` (incl. `install-server-postgres.sh` from the macOS tarball); delete the
    `YuzuServerSetup` / `deploy/packaging/windows/yuzu-server.iss` path; rename the Windows/macOS

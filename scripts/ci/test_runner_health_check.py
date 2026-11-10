@@ -574,7 +574,11 @@ class WorkflowWiringTests(unittest.TestCase):
         for job_name in ("windows", "macos"):
             with self.subTest(job=job_name):
                 found = self.meson_setups(self.job("ci.yml", job_name))
-                self.assertEqual(1, len(found))
+                self.assertEqual(
+                    1, len(found),
+                    f"{job_name}: expected exactly one `meson setup` (the agent-only "
+                    f"configure); a second setup could configure the server: {found!r}",
+                )
                 self.assert_agent_only_setup(found[0])
 
         ci_text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -615,12 +619,35 @@ class WorkflowWiringTests(unittest.TestCase):
         )
         legacy_loop = "for legacy in build-windows build-windows-debug build-windows-release; do"
         holders = [i for i, step in enumerate(steps) if legacy_loop in step]
-        self.assertEqual([checkout_idx - 1], holders)
+        self.assertEqual(
+            [checkout_idx - 1], holders,
+            "the legacy-dir loop must live in exactly one step, the one immediately "
+            "before actions/checkout",
+        )
         wipe = steps[checkout_idx - 1]
-        self.assertTrue(wipe.startswith("name: Wipe build-windows/ on branch switch (pre-checkout)\n"))
-        self.assertRegex(wipe, r'(?m)^ {10}for legacy in ')  # top level of run:, not inside the if
-        self.assertIn('rm -rf "${GITHUB_WORKSPACE:?}/$legacy"', wipe)
-        self.assertNotRegex(wipe, r'rm -rf "\$GITHUB_WORKSPACE')
+        self.assertTrue(
+            wipe.startswith("name: Wipe build-windows/ on branch switch (pre-checkout)\n"),
+            "the step before actions/checkout must be the pre-checkout wipe step",
+        )
+        self.assertRegex(
+            wipe, r'(?m)^ {10}for legacy in ',
+            "the legacy loop must sit at the top level of run:, not inside the "
+            "branch-switch if (which never fires on detached-HEAD PR checkouts)",
+        )
+        # Guarded rm, and best-effort: a file locked by a leftover process
+        # must warn (pointing at the recovery), never red the required check.
+        self.assertRegex(
+            wipe,
+            r'rm -rf "\$\{GITHUB_WORKSPACE:\?\}/\$legacy" \\\n[ \t]*'
+            r'\|\| echo "::warning::could not fully remove legacy \$legacy/[^"\n]*'
+            r'docs/ci-troubleshooting\.md entry 8\.?"\n',
+            "the legacy rm must be guarded by ${GITHUB_WORKSPACE:?} and best-effort "
+            "(`|| echo \"::warning::...\"` naming ci-troubleshooting entry 8)",
+        )
+        self.assertNotRegex(
+            wipe, r'rm -rf "\$GITHUB_WORKSPACE',
+            "every rm -rf in the wipe step must use ${GITHUB_WORKSPACE:?}",
+        )
 
         codeql = (ROOT / ".github" / "workflows" / "codeql.yml").read_text(encoding="utf-8")
         codeql_setups = self.meson_setups(codeql)
@@ -649,11 +676,17 @@ class WorkflowWiringTests(unittest.TestCase):
             "pg_mode", "postgres", "server-pg", "server-nonpg", "server-checks",
             "yuzu_pg_canary",
         )
+        # A second configure route (a post-setup `meson configure`, or the
+        # server re-enabled by any spelling) would undo -Dbuild_server=false.
+        forbidden_patterns = (r"build_server\s*=\s*true", r"meson\s+configure")
         for job_name in ("windows", "macos"):
             body = self.strip_comments(self.job("ci.yml", job_name)).lower()
             for token in forbidden:
                 with self.subTest(job=job_name, token=token):
                     self.assertNotIn(token, body)
+            for pattern in forbidden_patterns:
+                with self.subTest(job=job_name, pattern=pattern):
+                    self.assertNotRegex(body, pattern)
 
     def test_per_leg_suite_selectors_and_platform_entries(self) -> None:
         """docs runs on the Linux leg only; the OS-contract entries live in suite

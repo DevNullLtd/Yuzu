@@ -189,7 +189,14 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   wrapper change is involved — re-running the provisioning script is the whole
   cutover.
 
-  **No CI job on this box uses these clusters since ADR-0035 ladder step 1.**
+  **No `ci.yml` job on this box connects to these clusters since ADR-0035 ladder
+  step 1, but they are not yet unused: do not stop them before ladder step 4.**
+  `cache-prune.yml`'s weekly `prune-windows` job still sweeps them
+  (`scripts/ci/sweep-test-databases.sh`), `Assert-Toolchain.ps1` still
+  health-checks them (`pg_isready`, see below), and until the next `dev`→`main`
+  promotion carries step 1, and until every open branch is rebased past it,
+  `main` pushes and unrebased PRs still run the old `ci.yml` with its Windows
+  `Ensure Postgres` and pg-shard steps against them.
   The server is Linux-only: `ci.yml`'s Windows leg builds the agent only
   (`-Dbuild_server=false`, into `build-windows-agent-{debug,release}`; the job
   deletes the older `build-windows-{debug,release}` dirs on every run) and no

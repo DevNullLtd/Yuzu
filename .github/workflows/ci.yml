@@ -2296,10 +2296,14 @@ jobs:
           # either leg: the single-variant build-windows/ from before
           # per-variant dirs landed, and the server-configured
           # build-windows-{debug,release}/ from before ADR-0035 step 1.
+          # Best-effort: no step of this job reads these dirs, so a file
+          # locked by a leftover process must warn, never red the required
+          # check.
           for legacy in build-windows build-windows-debug build-windows-release; do
             if [[ -d "$GITHUB_WORKSPACE/$legacy" ]]; then
               echo "removing legacy $legacy/ (per-variant dirs are now build-windows-agent-{debug,release})"
-              rm -rf "${GITHUB_WORKSPACE:?}/$legacy"
+              rm -rf "${GITHUB_WORKSPACE:?}/$legacy" \
+                || echo "::warning::could not fully remove legacy $legacy/ (a file is in use); this job does not use it. If an older branch's run on this runner then fails with 'already configured', see docs/ci-troubleshooting.md entry 8."
             fi
           done
 
