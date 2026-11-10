@@ -8829,16 +8829,25 @@ void RestApiV1::register_routes(
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.unassigned",
                                                     "denied", "User", principal_id,
                                                     result.error());
-                res.status = last_admin ? 409 : 503;
+                // RbacAdminAuthorityOwner::unassign_role refuses a role name or principal id
+                // that is not clean text with "invalid role name" / "invalid principal". This
+                // route cannot produce one today: both values come from the path regex above
+                // (`[A-Za-z0-9._-]+`), which admits no control byte. The refusal is still a
+                // caller mistake, not a store fault, so if the regex is ever widened it answers
+                // 400 and not a retryable 503.
+                const bool bad_input =
+                    result.error() == "invalid role name" || result.error() == "invalid principal";
+                res.status = last_admin ? 409 : bad_input ? 400 : 503;
                 // The 409 carries the store's business-rule message; a store fault
                 // returns a constant client message (the raw text, which can name
                 // relations or carry a CONTEXT line, goes only to the audit row).
                 res.set_content(
-                    detail::a4_error(res, last_admin
-                                              ? result.error()
-                                              : std::string("role unassignment store fault; retry, "
-                                                            "and if this persists escalate to an "
-                                                            "operator")),
+                    detail::a4_error(
+                        res, last_admin || bad_input
+                                 ? result.error()
+                                 : std::string("role unassignment store fault; retry, "
+                                               "and if this persists escalate to an "
+                                               "operator")),
                     "application/json");
                 return;
             }

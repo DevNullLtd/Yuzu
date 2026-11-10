@@ -5,6 +5,12 @@
 /// comparison and a SQL bind. The rule is one function so the places that decide on a value and
 /// the place that acts on it cannot disagree about what the value is.
 ///
+/// Despite the name, this is no longer RBAC-only: the same predicate guards the id fields of the
+/// OTA package routes (update_registry.hpp) and the schedule routes (schedule_routes.cpp), the
+/// platform and architecture fields of the settings uploads, and the management-group id fields.
+/// The name is kept on purpose (it began as the RBAC rule and renaming it touches every caller);
+/// read "identifier" for "RBAC identifier" wherever the predicate is used outside RBAC.
+///
 /// EXTEND this, never fork it: this is the single clean-text predicate for RBAC identifiers.
 /// Near-duplicates exist in outbound_url_policy.hpp and instruction_execute.hpp for other
 /// fields; do not add another copy for an RBAC identifier.
