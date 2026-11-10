@@ -1504,8 +1504,8 @@ polled when, in what state.
   `list` column's class); retention is unchanged (erased with the device by `delete_agent`, kept
   lower-cased in `software_changes.identity_key` for 400 days). The server cannot minimise the
   value at read or store time without breaking the v3 hash agreement, so the control is the
-  agent writer's allowlist: the blob-v3 writer (`installed_software_v3.cpp`, branch
-  `feat/sam-15-agent-v3-sync`) keeps a location only under a machine root (`kMachineRoots`) and
+  agent writer's allowlist: the blob-v3 writer (`installed_software_v3.cpp`) keeps a location
+  only under a machine root (`kMachineRoots`) and
   blanks every other path, fail closed, and tests that no profile path is emitted. This read
   surface therefore depends on that writer shipping alongside it; until it does, no agent sends
   slot 13 or component rows and both fields are empty. An agent that does not apply the

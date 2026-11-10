@@ -218,14 +218,17 @@ struct SoftwareFleetQuery {
     /// Exact version filter: nullopt = any version; present (including "") = that exact
     /// version, so "" selects only the empty-version rows.
     std::optional<std::string> version;
-    /// How `name` is matched (default exact). kPrefix is a LIKE-escaped `name LIKE term%` served
-    /// by installed_software_name_idx; kContains is a literal ILIKE under the 5 s bound, like `q`.
+    /// How `name` is matched (default exact). kPrefix is a LIKE-escaped `name LIKE term%`, which
+    /// installed_software_name_idx serves only under the C collation (under a locale collation it
+    /// is a sequential scan the row LIMIT does not bound); kContains is a literal ILIKE. Both run
+    /// under the 5 s bound, like `q`; only kExact is index-driven everywhere.
     NameMatch match{NameMatch::kExact};
     /// Exact version SET (`version = ANY(...)`), the resolved form of a version range. nullopt =
     /// any; present-empty selects nothing (empty value, no SQL). ANDed with `version` if both set.
     std::optional<std::vector<std::string>> versions;
     /// Row status filter over the derived status ("current" | "unconfirmed" | "disabled");
-    /// "" = no filter. The same CASE the response `status` is derived from (kRowStatusCaseSql).
+    /// "" = no filter. The same CASE the response `status` is derived from (kRowStatusCaseSql);
+    /// no index serves it, so a non-empty status runs the read under the 5 s bound, like `q`.
     std::string status;
     /// Scope push-down (ADR-0033): nullopt = unfiltered; PRESENT-EMPTY = deny-all -> empty
     /// value with no SQL; non-empty -> `agent_id = ANY(...)` in SQL, so the last returned row

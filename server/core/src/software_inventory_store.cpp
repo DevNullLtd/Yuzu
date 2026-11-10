@@ -490,9 +490,11 @@ const std::vector<pg::PgMigration>& migrations() {
          // component_rollup: one row per (kind, name) with exact instance (row) and
          // distinct-device counts, replaced whole by refresh_component_rollup. component_rollup_meta is the singleton freshness stamp,
          // seeded refreshed_at = 0 ("building"). Two new EMPTY tables: online.
-         // software_components_name_idx serves the name-driven component lookups (exact, prefix,
-         // and the totals aggregate). software_components is EMPTY in every deployment until the
-         // component producer ships (no agent emits component rows before SAM-40; the server apply
+         // software_components_name_idx serves the exact-name component lookups and the totals
+         // aggregate (a prefix match uses it only under the C collation; otherwise it is a
+         // sequential scan under the 5 s bound, see add_name_predicate). software_components is
+         // EMPTY in every deployment until the component producer ships (no agent emits
+         // component rows before SAM-40; the server apply
          // path is live, so a v3 fixture can fill it), so this plain CREATE INDEX inside the ladder
          // transaction holds ACCESS EXCLUSIVE on an empty table for no measurable time and needs no
          // CONCURRENTLY, exactly like software_components_row_hash_idx in v11.

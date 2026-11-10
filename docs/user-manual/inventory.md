@@ -770,7 +770,9 @@ curl -H "Authorization: Bearer $TOKEN" \
   scope confinement, status and `totals` rule; its totals come from an hourly rollup on the
   catalogue rollup's thread (`yuzu_inventory_component_rollup_total{outcome}`, both outcomes
   seeded at 0 so the first failure is an increase; `yuzu_inventory_component_rollup_duration_seconds`;
-  `yuzu_inventory_component_rollup_last_success_timestamp`, seeded 0 until the first success).
+  `yuzu_inventory_component_rollup_last_success_timestamp`, seeded 0 until the first success;
+  watched by the shipped rules `YuzuInventoryComponentRollupStale` and
+  `YuzuInventoryComponentRollupFailing`).
   The refresh runs at server start and then hourly, with no manual trigger (a restart runs
   one at once); a failed, cancelled or over-budget refresh keeps the last-good rollup and its
   stamp, and the figures read `building` until the first refresh completes. The freshness
@@ -1332,7 +1334,8 @@ hourly by the background `SoftwareCatalogRollup` thread) emits three further ser
   a first refresh that has no last-good (a fresh deployment whose refresh fails or never
   fits its limit), which leaves the catalogue "building" for as long as the refreshes keep
   failing; on a fleet above the ceiling below that is permanent until the rollup is made
-  incremental. The failing statement and its cause are in the server log (warning).
+  incremental. The first-boot `building` window and what reads it are described in
+  [upgrading.md](upgrading.md). The failing statement and its cause are in the server log (warning).
 - `yuzu_inventory_catalog_rollup_duration_seconds` (gauge) — the last recompute's
   whole-refresh wall-clock. Compare it with the two compile-time limits (not flags): 60 s
   per statement and 600 s for the whole refresh. A value rising towards either is the

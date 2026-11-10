@@ -179,6 +179,23 @@ TEST_CASE("SoftwareCatalogRollup worker refreshes the components rollup and emit
     CHECK(metrics.counter(kCatalog, {{"outcome", "success"}}).value() == 0);
     CHECK(metrics.gauge(stamp).value() > 0);
     CHECK(metrics.gauge(std::string(kStem) + "_duration_seconds").value() >= 0);
+    // The exposition the scrape serves: the three component families render with their TYPE
+    // lines (the HELP text is ServerImpl's describe(), server.cpp, outside this unit), and the
+    // two outcome series nothing incremented in this tick still exist at 0. A zero-valued
+    // `error` series beside a success (and a zero-valued catalogue `success` beside its failure)
+    // can only be the construction-time seed: without it the first failure would be the birth
+    // of the series, which a rate rule cannot see.
+    const auto text = metrics.serialize();
+    for (const char* family : {"yuzu_inventory_component_rollup_total counter",
+                               "yuzu_inventory_component_rollup_duration_seconds gauge",
+                               "yuzu_inventory_component_rollup_last_success_timestamp gauge"}) {
+        CAPTURE(family);
+        CHECK(text.find(std::string("# TYPE ") + family + "\n") != std::string::npos);
+    }
+    CHECK(text.find("yuzu_inventory_component_rollup_total{outcome=\"error\"} 0\n") !=
+          std::string::npos);
+    CHECK(text.find("yuzu_inventory_catalog_rollup_total{outcome=\"success\"} 0\n") !=
+          std::string::npos);
     const auto after = store.component_rollup_meta();
     REQUIRE(after.has_value());
     CHECK(after->refreshed_at > 0);

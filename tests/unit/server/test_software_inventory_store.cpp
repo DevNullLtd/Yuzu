@@ -6932,9 +6932,18 @@ TEST_CASE("migration v12 resets the catalogue freshness stamp to building over a
         const auto meta = store.catalog_rollup_meta();
         REQUIRE(meta.has_value());
         CHECK(meta->refreshed_at == 0);
-        CHECK(sql_rows(pool, "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
-                             "'software_inventory_store' AND table_name = 'catalog_rollup' AND "
-                             "column_name = 'row_count'")[0][0] == "1");
+        // The column's persistence shape, not just its presence: a regression to a nullable,
+        // defaultless or non-bigint row_count would keep count(*) = 1 green while a reader could
+        // see NULL (serialised as a null installs figure) beside a non-zero device count.
+        const auto shape =
+            sql_rows(pool, "SELECT data_type, is_nullable, column_default FROM "
+                           "information_schema.columns WHERE table_schema = "
+                           "'software_inventory_store' AND table_name = 'catalog_rollup' AND "
+                           "column_name = 'row_count'");
+        REQUIRE(shape.size() == 1);
+        CHECK(shape[0][0] == "bigint");
+        CHECK(shape[0][1] == "NO");
+        CHECK(shape[0][2] == "0");
         const auto cmeta = store.component_rollup_meta();
         REQUIRE(cmeta.has_value());
         CHECK(cmeta->refreshed_at == 0); // seeded building

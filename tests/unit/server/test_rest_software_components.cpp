@@ -678,6 +678,106 @@ TEST_CASE("REST components: a confined caller's range is resolved over its own r
     CHECK(res->status == 400);
 }
 
+TEST_CASE("REST components: a confined caller's range serves its own in-range rows, under push-down and "
+          "above the push-down bound, where the fleet-wide read would have refused it",
+          "[pg][rest][inventory_components][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // The installs route's case for components: dev-in holds libfoo 1.0, 2.0 and 9.0; dev-out
+    // holds libfoo 1.0 plus enough other distinct versions that the fleet-wide read fills
+    // kCatalogRowCap. Over the caller's scope the range [1, 5] is {1.0, 2.0}.
+    std::vector<V3Component> out_rows;
+    out_rows.push_back(comp("libfoo", "/o/1", "1.0"));
+    for (int i = 0; out_rows.size() < static_cast<std::size_t>(kCatalogRowCap); ++i)
+        out_rows.push_back(comp("libfoo", "/o/x" + std::to_string(i), "3000." + std::to_string(i)));
+    seed_components(store, "dev-out", std::move(out_rows));
+    seed_components(store, "dev-in", {comp("libfoo", "/i/1", "1.0"), comp("libfoo", "/i/2", "2.0"),
+                                      comp("libfoo", "/i/9", "9.0")});
+
+    CompHarness h{&store};
+    const auto expect_in_range = [](const nlohmann::json& body, int devices_omitted) {
+        CHECK(row_keys(body) == std::set<std::string>{"dev-in|/i/1", "dev-in|/i/2"});
+        CHECK(body.at("data").at("devices_omitted") == devices_omitted);
+        CHECK(body.at("data").at("totals_omitted") == "scope");
+    };
+    h.fleet_scope = std::unordered_set<std::string>{"dev-in"};
+    expect_in_range(get_json(h, "?name=libfoo&kind=jar&version_min=1&version_max=5"), 0);
+    CHECK(h.audits("inventory.components.view", "denied") == 0);
+    // A scope wider than kScopePushdownMaxIds: the page is post-filtered, the version read still
+    // takes the whole scope, so dev-out's libfoo 1.0 is the one row scanned and dropped.
+    std::unordered_set<std::string> wide;
+    for (std::size_t i = 0; i <= software_catalogue::kScopePushdownMaxIds; ++i)
+        wide.insert("pad-" + std::to_string(i));
+    wide.insert("dev-in");
+    h.fleet_scope = std::move(wide);
+    expect_in_range(get_json(h, "?name=libfoo&kind=jar&version_min=1&version_max=5"), 1);
+    CHECK(h.audits("inventory.components.view", "denied") == 1);
+    h.fleet_scope.reset(); // unfiltered: the fleet-wide cut is this caller's truth
+    auto res = h.sink.Get(std::string(kPath) + "?name=libfoo&kind=jar&version_min=1&version_max=5");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("REST components: name-only totals (no kind, no version) are live: served before any refresh "
+          "with as_of null, across kinds",
+          "[pg][rest][inventory_components]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_components(store, "dev-a", {comp("libfoo", "/a", "1.0")});
+    seed_components(store, "dev-b", {comp("libfoo", "/b", "1.0", "dll")}); // another kind counts
+
+    CompHarness h{&store};
+    const auto expect_live = [](const nlohmann::json& body) {
+        const auto& t = body.at("data").at("totals");
+        REQUIRE(t.is_object());
+        CHECK(t.at("instances") == 2);
+        CHECK(t.at("devices") == 2);
+        CHECK(t.at("devices_unconfirmed") == 0);
+        CHECK(t.at("as_of").is_null()); // live, not a rollup epoch
+        CHECK_FALSE(body.at("data").contains("totals_omitted"));
+    };
+    // No refresh has run: a rollup read would be `building`; the name-only read is live.
+    expect_live(get_json(h, "?name=libfoo"));
+    REQUIRE(store.refresh_component_rollup());
+    expect_live(get_json(h, "?name=libfoo")); // the (kind, name) rollup is never consulted
+}
+
+TEST_CASE("REST components: the format=json export is audited as an export, flags the cap and continues "
+          "from next_cursor",
+          "[pg][rest][inventory_components][export]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_components(store, "dev-a",
+                    {comp("libfoo", "/a1", "1.0"), comp("libfoo", "/a2", "1.0"), comp("libfoo", "/a3", "1.0")});
+
+    CompHarness h{&store};
+    const auto page1 = get_json(h, "?format=json&limit=2");
+    REQUIRE(page1.at("data").at("components").size() == 2);
+    CHECK(page1.at("data").at("result_truncated_by_cap") == true);
+    const auto& cursor = page1.at("data").at("next_cursor");
+    REQUIRE(cursor.is_string());
+    CHECK(h.audits("inventory.components.export", "success", "components format=json rows=2 truncated=true") == 1);
+    CHECK(h.audits("inventory.components.view", "success") == 0); // the export verb, not the view verb
+
+    const auto page2 = get_json(h, "?format=json&limit=2&cursor=" + cursor.get<std::string>());
+    REQUIRE(page2.at("data").at("components").size() == 1);
+    std::set<std::string> all = row_keys(page1);
+    all.merge(row_keys(page2));
+    CHECK(all == std::set<std::string>{"dev-a|/a1", "dev-a|/a2", "dev-a|/a3"}); // no overlap, no gap
+    CHECK(page2.at("data").at("next_cursor").is_null());
+    CHECK_FALSE(page2.at("data").contains("result_truncated_by_cap"));
+    CHECK(h.audits("inventory.components.export", "success", "page=continuation") == 1);
+}
+
 TEST_CASE("REST components: a failed version read for a range is a 503 with retry_after_ms and one failure audit row",
           "[pg][rest][inventory_components]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);

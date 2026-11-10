@@ -7578,6 +7578,81 @@ tests:
           - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
             value: 1
 
+  # ── YuzuInventoryComponentRollupStale / YuzuInventoryComponentRollupFailing (SAM-17) ──
+  #
+  # The components rollup rides the catalogue rollup thread: hourly, one outcome increment per
+  # refresh, both outcome series and the stamp seeded at 0 at thread start. The Stale rule is the
+  # CatalogRollupStale shape (7200 s, `> 0` guard), the Failing rule the NormalizationFailing
+  # shape (increase()[3h] >= 2, for 10m); the cases mirror the normalisation group above.
+
+  # Healthy: the stamp tracks wall-clock and no refresh has failed. Both rules stay quiet.
+  - interval: 1m
+    name: components rollup - a healthy hourly refresh is quiet
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0+60x240"
+      - series: 'yuzu_inventory_component_rollup_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuInventoryComponentRollup.*", alertstate="firing"}'
+        eval_time: 3h50m
+        exp_samples: []
+
+  # Stale: s2's stamp tracks wall-clock for 60m then freezes at 3600; quiet under two cadences,
+  # firing after the age passes 7200 s plus the 10m hold. s1 sits at the seeded 0 forever
+  # (building, or never succeeded): the `> 0` guard keeps the Stale rule quiet. RED against
+  # dropping the guard.
+  - interval: 1m
+    name: components rollup - stale fires after two cadences and not while building
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0x300"
+      - series: 'yuzu_inventory_component_rollup_last_success_timestamp{job="yuzu",instance="s2"}'
+        values: "0+60x60 3600x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupStale", alertstate="firing", instance="s1"}'
+        eval_time: 4h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupStale", alertstate="firing", instance="s2"}'
+        eval_time: 2h50m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupStale", alertstate="firing", instance="s2"}'
+        eval_time: 3h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupStale", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # Failing: two failed hourly refreshes inside one 3h window fire after the hold; the leading
+  # zeros are the thread-start seed.
+  - interval: 1m
+    name: components rollup - two failed hourly refreshes fire
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x60 2x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 2h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # Failing: ONE isolated failure followed by successes never fires.
+  - interval: 1m
+    name: components rollup - one isolated hourly failure stays quiet
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing"}'
+        eval_time: 80m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing"}'
+        eval_time: 4h
+        exp_samples: []
+
   # ── YuzuDedupStoreDegraded (#3663) ───────────────────────────────────────
   #
   # yuzu_fleet_agents_dedup_store_degraded counts agents whose durable command-dedup store never

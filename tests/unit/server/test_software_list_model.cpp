@@ -101,6 +101,34 @@ TEST_CASE("parse_list_params: status is a closed set and the defaults add no fil
     CHECK_FALSE(parse_list_params(params({{"status", "stale"}})));
 }
 
+TEST_CASE("parse_list_params / parse_components_params: a repeated key keeps the FIRST value",
+          "[server][software_list_model]") {
+    // The raw routes' legacy rule (model_detail::first_param), documented in rest-api.md for
+    // both routes: never the last value, never a 400. A multimap keeps equal keys in insertion
+    // order, so the first pair below is the first value.
+    const auto list = parse_list_params(params({{"name", "git"},
+                                                {"name", "vim"},
+                                                {"match", "prefix"},
+                                                {"match", "contains"},
+                                                {"status", "current"},
+                                                {"status", "disabled"}}));
+    REQUIRE(list);
+    CHECK(list->base.query.name == "git");
+    CHECK(list->base.query.match == NameMatch::kPrefix);
+    CHECK(list->base.query.status == "current");
+    const auto comp = parse_components_params(params({{"name", "libfoo"},
+                                                      {"name", "libbar"},
+                                                      {"kind", "jar"},
+                                                      {"kind", "dll"},
+                                                      {"version", "1"},
+                                                      {"version", "2"}}));
+    REQUIRE(comp);
+    CHECK(comp->query.name == "libfoo");
+    CHECK(comp->query.kind == "jar");
+    REQUIRE(comp->query.versions.has_value());
+    CHECK(*comp->query.versions == std::vector<std::string>{"1"});
+}
+
 TEST_CASE("resolve_version_range: inclusive bounds under the catalogue comparator",
           "[server][software_list_model]") {
     const std::vector<std::string> versions{"1.9", "1.10", "2.0-rc1", "2.0", "", "1.0"};

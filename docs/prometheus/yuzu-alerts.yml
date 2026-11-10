@@ -6556,6 +6556,56 @@ groups:
             While it fires, /crypto reads its package names live (slower) if the shared
             catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryComponentRollupStale
+        # The software components rollup (component_rollup, the totals of
+        # GET /api/v1/inventory/software/components; SAM-17) rides the catalogue rollup thread
+        # on the same hourly, completion-spaced cadence, so this is the
+        # YuzuInventoryCatalogRollupStale shape: the gauge is seeded to 0 at thread start, the
+        # `> 0` guard skips that "building" window (a refresh that has never succeeded is the
+        # Failing rule's case below), and 7200 is twice the cadence.
+        expr: |
+          (time() - yuzu_inventory_component_rollup_last_success_timestamp) > 7200
+          and yuzu_inventory_component_rollup_last_success_timestamp > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software components rollup is stale"
+          description: >-
+            The components rollup has not refreshed in over 2h (cadence is 1h). Keep-last-good is
+            serving an aging rollup: the `as_of` of the components totals ages and recent
+            component changes are not counted. Check
+            yuzu_inventory_component_rollup_total{outcome="error"} and the SoftwareCatalogRollup
+            thread log (Postgres outage, or the single GROUP BY over software_components past its
+            60s statement limit at scale; the recorded upgrade path is a per-(kind, name, agent)
+            pre-aggregate). Rows and version-filtered totals are live and unaffected.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryComponentRollupFailing
+        # The never-succeeded / ongoing-failure case the Stale rule's `> 0` guard skips. The
+        # refresh is HOURLY and adds ONE error increment per failed tick, so this is the
+        # YuzuSoftwareNormalizationFailing shape below (increase()[3h] >= 2, for 10m: two failed
+        # ticks within 3h fire, one isolated failure stays quiet, and a sustained outage at a
+        # period a little over an hour stays firing), not the rate()[15m] of
+        # YuzuInventoryCatalogRollupFailing, whose window ages an hourly increment out before its
+        # hold elapses. Both outcome series are seeded at 0 when the thread starts, so the first
+        # failure is already an increase.
+        expr: |
+          sum by (instance) (increase(yuzu_inventory_component_rollup_total{outcome="error"}[3h])) >= 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software components rollup refreshes are failing"
+          description: >-
+            Two or more hourly components rollup refreshes failed within 3h. If
+            yuzu_inventory_component_rollup_last_success_timestamp is still 0 the rollup has never
+            populated and the components totals read "building"; otherwise they are frozen at the
+            last good rollup (its `as_of` ages). Investigate Postgres availability and
+            yuzu_inventory_component_rollup_duration_seconds against the 60s statement limit (the
+            single GROUP BY over software_components meets it near 11M rows; the recorded upgrade
+            path is a per-(kind, name, agent) pre-aggregate). Rows and version-filtered totals are
+            live and unaffected.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuSoftwareNormalizationStale
         # The title normalisation job (SoftwareNormalizationJob) ticks hourly (after a full
         # capped tick, or one that found the catalogue rollup's title_triples not yet filled,

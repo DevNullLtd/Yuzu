@@ -2003,6 +2003,55 @@ TEST_CASE("REST inventory/software: a confined caller's range is resolved over i
     CHECK(get_lookup(h, "?name=git&version_min=1", 400).contains("error"));
 }
 
+TEST_CASE("REST inventory/software: a confined caller's range serves its own in-range rows, under push-down "
+          "and above the push-down bound, where the fleet-wide read would have refused it",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // dev-in holds git 1.0, 2.0 and 9.0; dev-out holds git 1.0 and enough other distinct versions
+    // that the FLEET-wide distinct-version read fills kCatalogRowCap. Resolved over the caller's
+    // scope the range [1, 5] is {1.0, 2.0} and those rows are served (9.0 is outside the range,
+    // dev-out's versions outside the scope do not matter); resolved over the fleet it would be
+    // the cut read and the 400 the unfiltered caller gets below.
+    std::vector<SoftwareEntry> out_rows;
+    out_rows.push_back(lookup_entry("git", "1.0"));
+    for (int i = 0; out_rows.size() < static_cast<std::size_t>(kCatalogRowCap); ++i)
+        out_rows.push_back(lookup_entry("git", "3000." + std::to_string(i)));
+    seed_v3(store, "dev-out", V3Status::kFull, std::move(out_rows));
+    seed_v3(store, "dev-in", V3Status::kFull,
+            {lookup_entry("git", "1.0"), lookup_entry("git", "2.0"), lookup_entry("git", "9.0")});
+
+    InvHarness h{&store};
+    const auto expect_in_range = [](const nlohmann::json& body, int devices_omitted) {
+        const auto& rows = body.at("data").at("software");
+        REQUIRE(rows.size() == 2);
+        std::set<std::string> versions;
+        for (const auto& r : rows) {
+            CHECK(r.at("agent_id") == "dev-in");
+            versions.insert(r.at("version").get<std::string>());
+        }
+        CHECK(versions == std::set<std::string>{"1.0", "2.0"});
+        CHECK(body.at("data").at("devices_omitted") == devices_omitted);
+        CHECK(body.at("data").at("totals_omitted") == "scope");
+    };
+    // Push-down: the scope is in the page read and in the version read.
+    h.fleet_scope = std::unordered_set<std::string>{"dev-in"};
+    expect_in_range(get_lookup(h, "?name=git&version_min=1&version_max=5"), 0);
+    CHECK_FALSE(h.has_audit("denied"));
+    // Above kScopePushdownMaxIds the page is post-filtered, but the version read still takes the
+    // WHOLE scope (no bound): the set is {1.0, 2.0}, so dev-out's git 1.0 is scanned and dropped
+    // (devices_omitted 1, a denied row) while its cap's worth of other versions is never read.
+    h.fleet_scope = wide_scope({"dev-in"});
+    expect_in_range(get_lookup(h, "?name=git&version_min=1&version_max=5"), 1);
+    CHECK(h.has_audit("denied"));
+    // The unfiltered caller reads the fleet: the cut read is its truth.
+    h.fleet_scope.reset();
+    CHECK(get_lookup(h, "?name=git&version_min=1&version_max=5", 400).contains("error"));
+}
+
 TEST_CASE("REST inventory/software: a failed version read for a range is a 503 with retry_after_ms and one failure audit row",
           "[pg][rest][inventory_software]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);

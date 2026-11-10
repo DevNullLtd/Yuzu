@@ -109,6 +109,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     SECTION("the sweep-added MUST-run-per-replica / idempotent passes are ReplicaSafe") {
         for (std::string_view p : {"cert_reloader.run_loop",
                                    "software_catalog_rollup.refresh_catalog_rollup",
+                                   "software_catalog_rollup.refresh_component_rollup",
                                    "auth_db.cleanup_provisional_mfa",
                                    "ota_transfer_watchdog.sweep_once",
                                    "mcp_stream_bridge.run_projector",
