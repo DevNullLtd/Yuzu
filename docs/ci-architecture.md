@@ -20,9 +20,12 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   jobs `need`, and the `preflight` job ("Preflight (runner health)", the
   required-check name) that carries the source gates and runs alongside the
   builds.
-- **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
-  (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS (except
-  a docs-only push, which runs the preflight jobs plus the required-check stubs, #5320).
+- **Tier 2 — push to dev/main** (`ci.yml` on push): a push to `main` runs the
+  full 4-way Linux matrix (gcc-15 / clang-21 × debug / release), 2-way Windows
+  and 2-way macOS; a push to `dev` runs the **debug legs only** (Linux gcc-15 and
+  clang-21 debug, Windows MSVC debug, macOS debug), and its release/LTO legs move
+  to Tier 2b below. Either way a docs-only push runs the preflight jobs plus the
+  required-check stubs instead (#5320).
   **No
   sanitizers, no coverage** — those moved out (#410). **Since #3443 Phase 2**,
   the Linux matrix's `pg_mode` key (via `include:`, never a third axis) means
@@ -39,6 +42,27 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `docs-required-checks` stubs instead of the matrix, so the required contexts
   still appear on the `main` commit a release tags. See "Docs-only changes
   (#1978, #5320)" below.
+- **Tier 2b — daily release legs on dev** (`release-legs-nightly.yml`, cron
+  `30 2 * * *` UTC + `workflow_dispatch`): dispatches `ci.yml` against dev's tip
+  with `legs=release`, which expands to the four release legs only (Linux
+  gcc-15 release LTO, Linux clang-21 release, Windows MSVC release LTO, macOS
+  release LTO) — the debug legs already ran on that commit's push. It skips when
+  dev's tip already has a dispatch run that succeeded or is in flight. No
+  release leg is a required check, so moving them off the per-push path costs
+  no gating; it saves 9–23 min of self-hosted runner time per dev push, and a
+  release-only defect now surfaces within a day instead of within one push
+  (`main` pushes still build release, so nothing tags untested in release
+  mode). The dispatched run uses its own `-dispatch` concurrency group: GitHub
+  keeps one pending run per group, so sharing the dev push group would let a
+  dispatch evict a queued push run and strip that commit of its required
+  contexts. A direct dispatch is told apart from the trusted-fork
+  `workflow_call` path by `inputs.head_sha` (a reusable workflow inherits its
+  caller's `workflow_dispatch` event name), so trusted-fork runs still expand
+  the full debug + release matrix. **The cron fires only from `main`**, so it
+  goes live at the first dev → main promotion carrying the file; until then run
+  `gh workflow run release-legs-nightly.yml --ref dev` (or
+  `gh workflow run ci.yml --ref dev -f legs=release`) by hand. `-f legs=all`
+  runs the full matrix on any branch.
 - **Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC +
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
@@ -1685,8 +1709,8 @@ diagnosis (a `dev`/`main` push originally ran the full pg-shard suite on
 all 4 Linux legs, ~85% of each job's time, vs 2 Windows legs both running
 the same full set on their own 4-runner box) is cut by narrowing what the
 non-primary legs run on both platforms: Linux's 3 non-primary legs and
-Windows' release leg (push-only; PRs are debug-only, so only one Windows
-leg runs at all there) now run the `[pg-smoke]` subset instead. The Linux `matrix:` carries a
+Windows' release leg (a `main` push or the Tier 2b daily dispatch only; PRs
+and `dev` pushes are debug-only, so only one Windows leg runs there) now run the `[pg-smoke]` subset instead. The Linux `matrix:` carries a
 `pg_mode: full|smoke` key, added via `include:` on the existing
 compiler/build_type combinations — never a third axis (would double the
 matrix and break `max-parallel`'s 4-runner arithmetic) and never in the
@@ -2064,8 +2088,8 @@ step runs a similar set (it adds the server non-pg entries and drops docs) at 4
 behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported; the probe
 measurement above is still pending) and no per-runner memory limit is documented.
 This was measured on one leg (`gcc-15`/`debug`) but ships on all four: the
-clang-21 and release legs run only on a push, where all four non-pg steps can
-overlap at four wide on the box, so the 10-push-run check above is the only
+clang-21 and release legs run only on a push (release: a `main` push or the
+Tier 2b dispatch), where up to four non-pg steps can overlap at four wide on the box, so the 10-push-run check above is the only
 coverage for them.
 
 *Samples (measured, 2026-10-24).* Two same-SHA np=4 samples on the PR #6436

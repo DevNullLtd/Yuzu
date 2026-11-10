@@ -44,6 +44,24 @@ on:
     # a docs-only PR skips them, and a *skipped* required check is satisfied
     # whereas an *absent* one is not. The `push:` trigger above now does the
     # same (#5320).
+  # Release-leg schedule (CI speed programme, PR 1). A push to `dev` no longer
+  # builds the release/LTO legs (see the matrix excludes below); they run
+  # instead from a daily dispatch, `release-legs-nightly.yml`, against dev's
+  # tip, and on every push to `main` (release promotion) as before. The input
+  # picks which build_type legs a direct dispatch expands to. A dispatch is
+  # told apart from the trusted-fork `workflow_call` path by `inputs.head_sha`
+  # (empty here, always set by trusted-fork-ci.yml), because a reusable
+  # workflow inherits its caller's `github.event_name` — and that caller is
+  # itself a workflow_dispatch. The trusted-fork path is unchanged: it still
+  # expands the full debug + release matrix.
+  workflow_dispatch:
+    inputs:
+      legs:
+        description: "Which build_type legs to run: 'release' (release/LTO legs only, the scheduled default) or 'all'"
+        required: false
+        default: release
+        type: choice
+        options: [release, all]
   workflow_call:
     inputs:
       pr_number:
@@ -70,7 +88,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # The `-dispatch` suffix keeps a scheduled release-legs dispatch on dev
+  # (release-legs-nightly.yml) out of the dev PUSH group. GitHub keeps at most
+  # one PENDING run per group and a newer one replaces it, so sharing the group
+  # would let a dispatch evict a queued push run — that push commit would then
+  # carry no required contexts, and the next push's codegate (which needs the
+  # predecessor's push run to have succeeded) would build unconditionally.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'workflow_dispatch' && !inputs.head_sha && '-dispatch' || '' }}
   # PRs cancel-in-progress (rapid iteration — every push obsoletes the last).
   # Pushes to dev / main do NOT cancel — they queue. Mid-flight pushes were
   # killing 10+ min of compile work on rapid landings, and the
@@ -748,8 +772,10 @@ jobs:
     strategy:
       fail-fast: false
       # max-parallel: 4 (raised from 3 on 2026-10-21, owner's call) — Big Tam has
-      # exactly 4 yuzu-bigtam-linux runner agents on one box, so a `dev`/`main`
-      # push's whole 2x2 matrix now runs in one wave instead of two, which cuts
+      # exactly 4 yuzu-bigtam-linux runner agents on one box, so a `main` push's
+      # (or a `legs=all` dispatch's) whole 2x2 matrix runs in one wave instead of
+      # two; a `dev` push expands to the 2 debug legs only, and the daily
+      # release-legs dispatch to the 2 release legs only. That cuts
       # the push's wall time. The price: that push claims all 4 runners at once,
       # so a concurrently-queued PR's single Linux leg waits at the
       # RUNNER-ACQUISITION level — below with-test-slot.sh, which only gates
@@ -769,8 +795,14 @@ jobs:
         compiler: [gcc-15, clang-21]
         build_type: [debug, release]
         exclude:
-          # PRs: only gcc-15 debug (fast feedback)
-          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          # PRs: only gcc-15 debug (fast feedback).
+          # Release/LTO legs: not on a PR and not on a push to dev; they run on a
+          # push to main and from the daily dispatch (release-legs-nightly.yml).
+          # A direct dispatch with legs=release (the default) drops the debug
+          # legs, which every dev push already ran. Same three expressions in
+          # the windows and macos matrices below — keep them in lockstep.
+          - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
+          - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-21' || 'NONE' }}
         # pg_mode (#3443 Phase 2) is a DERIVED per-leg key via include:, never a
         # third axis (2x matrix, breaks max-parallel's 4-runner arithmetic) and
@@ -787,9 +819,10 @@ jobs:
         # then the gcc-15/debug override to full. On a PR the exclude above has
         # already trimmed the matrix to the single gcc-15/debug leg, so both
         # include entries match that one leg and the net result is pg_mode=full
-        # — PR coverage is unaffected. On a push, gcc-15/debug ends up full and
-        # the other three legs (clang-21/debug, gcc-15/release, clang-21/release)
-        # stay smoke. Item 4 of the original plan (a periodic full clang-release
+        # — PR coverage is unaffected. Wherever it expands, gcc-15/debug ends up
+        # full and the other three legs (clang-21/debug, gcc-15/release,
+        # clang-21/release) stay smoke; a dev push now expands only the two debug
+        # legs, the release legs come from main pushes and the daily dispatch. Item 4 of the original plan (a periodic full clang-release
         # PG run to cover the optimizer/NDEBUG-sensitive residual smoke can't
         # reach) is deliberately DEFERRED — Phase 6A (the nightly slot-gate
         # narrowing this would need to join) is shelved and nightly.yml only
@@ -1811,7 +1844,10 @@ jobs:
       matrix:
         build_type: [debug, release]
         exclude:
-          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          # Release legs: push to main + daily dispatch only (see the linux
+          # matrix for the full rule; keep the three matrices in lockstep).
+          - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
+          - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
         # pg_mode mirrors the Linux job's own matrix shape (#3443): an
         # include:-derived key, never a real axis (would double this
         # matrix and break the runner-pool arithmetic) and never in
@@ -1819,8 +1855,8 @@ jobs:
         # docs-required-checks). debug keeps full pg-shard coverage on
         # every PR and push (PRs are debug-only via the exclude: above, so
         # PR coverage is unchanged by this); release runs the pg smoke
-        # subset on a push instead (the only event that builds release on
-        # Windows).
+        # subset instead, on a push to main or the daily release-legs
+        # dispatch (the only events that build release on Windows).
         include:
           - pg_mode: smoke
           - build_type: debug
@@ -2471,7 +2507,10 @@ jobs:
       matrix:
         build_type: [debug, release]
         exclude:
-          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          # Release legs: push to main + daily dispatch only (see the linux
+          # matrix for the full rule; keep the three matrices in lockstep).
+          - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
+          - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2851,8 +2890,8 @@ jobs:
   #
   # Since #5320 the same holds for a docs-only PUSH to main/dev, so the commit a
   # release tags carries every required context even when it changed only
-  # CHANGELOG.md. On a push the real matrix has more legs (release builds,
-  # clang-21); only the three required names are stubbed, because only they
+  # CHANGELOG.md. On a push the real matrix has more legs (clang-21, and
+  # release builds on main); only the three required names are stubbed, because only they
   # gate anything.
   docs-required-checks:
     name: ${{ matrix.check }}
