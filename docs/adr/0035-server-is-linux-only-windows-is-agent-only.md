@@ -357,8 +357,9 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
 
    **Release ordering (owner decision, 2026-11-10):** step 2 MUST merge before the next release
    tag, or that release MUST explicitly accept shipping a Windows/macOS server that CI never
-   compiled or tested, recorded before tagging as a merged `changelog.d` fragment naming the
-   approver and the date, which `release.yml` carries into that release's notes (the exact form
+   built or tested before tagging, recorded as a `changelog.d` caveat fragment merged through a
+   reviewed PR (whose description names the approver and the date) and promoted before tagging,
+   so `release.yml` carries the caveat into that release's notes (the exact form
    and the `release.yml` check are in
    `.claude/skills/release/SKILL.md`, Phase 0 preflight). From step 1 on, CI no longer compiles
    or tests the Windows or macOS server, but `release.yml` still builds and ships it until step 2.

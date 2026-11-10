@@ -62,10 +62,10 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   in release mode — except the Windows and macOS **server**: since ADR-0035
   ladder step 1 no CI leg builds or tests it, yet `release.yml` still builds it
   at tag time until ladder step 2 removes it (step 2 must merge before the next
-  release tag, or, before tagging, a merged `changelog.d` fragment must record
-  who accepted shipping the untested Windows/macOS server, and when, so the
-  caveat is in that release's notes from the first publish: ADR-0035 and the
-  `/release` skill's preflight).
+  release tag, or, before tagging, a caveat `changelog.d` fragment merged
+  through a reviewed PR (naming who accepted it, and when) must be promoted
+  into that release's changelog section, so the caveat is in its notes when
+  `release.yml` publishes them: ADR-0035 and the `/release` skill's preflight).
   - **Failure signal.** A dispatched run is started by `github-actions[bot]`,
     which emails nobody. Whether to open, comment on or close a
     `release-legs-broken` issue is decided in one place,
