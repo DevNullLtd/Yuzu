@@ -542,7 +542,11 @@ TEST_CASE("quarantine_allow: the plugin action refuses bad input and an inactive
         st.allow = *fq::build_allow_set("203.0.113.7", "203.0.113.7:50051", {}, {});
         rig.put_record(st);
         const auto r = rig.run("quarantine_allow", {{"op", "add"}, {"exceptions", "198.18.0.9"}});
-        // a host without the recorded backend's tool has no leg at all, and refuses the same way
+        // a record always selects its leg (Linux: the recorded nft/iptables backend, built without
+        // consulting which tools the host has; Windows and macOS: their one platform leg), so
+        // `containment.leg` is never null here on any OS and fq::update answers not_active for a
+        // non-active phase on every host. The `unsupported_platform` arm in do_quarantine_allow is
+        // defensive only: a stored record cannot reach it today.
         CHECK(has_row(r.captured, "status|refused|not_active"));
         const auto after = rig.record();
         REQUIRE(after.has_value());
@@ -585,11 +589,10 @@ TEST_CASE("quarantine repair=1: with nothing contained, the self-check's firing 
           "[agent][firewall_quarantine]") {
     PLUGIN_RIG_OR_RETURN(rig);
 
-    // what the repair trigger dispatches every 60 s: with no record it answers inactive,
-    // touches nothing and starts nothing -- and no other parameter steers it, a bad time
-    // limit and a bad exception list included (it never builds an allow set)
-    const auto r = rig.run("quarantine", {{"repair", "1"}, {"ttl_seconds", "soon"},
-                                          {"exceptions", "garbage"}, {"probe_target", "nope"}});
+    // what the repair trigger dispatches every 60 s (`repair=1` and nothing else): with no
+    // record it answers inactive, touches nothing and starts nothing (it never builds an
+    // allow set)
+    const auto r = rig.run("quarantine", {{"repair", "1"}});
     INFO(r.captured);
     CHECK(r.rc == 0);
     CHECK(has_row(r.captured, "status|inactive"));
@@ -604,6 +607,31 @@ TEST_CASE("quarantine repair=1: with nothing contained, the self-check's firing 
     const auto bad = rig.run("quarantine", {{"repair", "1"}});
     CHECK(has_row(bad.captured, "status|degraded|state_unreadable"));
     CHECK(bad.result_provenance == "firewall:degraded");
+}
+
+TEST_CASE("quarantine repair=1: a dispatch that also names containment parameters is refused, not repaired",
+          "[agent][firewall_quarantine]") {
+    PLUGIN_RIG_OR_RETURN(rig);
+
+    // The plugin cannot tell the repair trigger from an operator's server dispatch, so a
+    // `repair=1` that carries a containment parameter is refused: an operator who meant to
+    // contain must not read `inactive nothing_to_repair` rc 0. Each parameter alone is
+    // enough, valid or not; nothing is read, started or written.
+    for (const auto& [key, value] : std::vector<std::pair<const char*, const char*>>{
+             {"ttl_seconds", "soon"}, {"ttl_seconds", "3600"}, {"exceptions", "garbage"},
+             {"exceptions", "198.18.0.9:22/tcp/in"}, {"probe_target", "nope"}}) {
+        INFO(key << "=" << value);
+        check_refused(rig.run("quarantine", {{"repair", "1"}, {key, value}}),
+                      "repair_with_containment_parameters");
+        CHECK_FALSE(rig.record().has_value());
+    }
+    // all three at once, as a server dispatch of a full containment request would
+    check_refused(rig.run("quarantine", {{"repair", "1"}, {"ttl_seconds", "3600"},
+                                         {"exceptions", "198.18.0.9"}, {"probe_target", "198.18.0.1:443"}}),
+                  "repair_with_containment_parameters");
+    CHECK_FALSE(rig.record().has_value());
+    // and `repair` other than `1` is no repair at all: the ordinary parameter checks apply
+    check_refused(rig.run("quarantine", {{"repair", "0"}, {"ttl_seconds", "soon"}}), "ttl_out_of_bounds");
 }
 
 TEST_CASE("live: apply, verify the block, release restores the host byte-identical",
@@ -854,6 +882,15 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
     REQUIRE(rec.has_value());
     CHECK(rec->ttl_expires > 0);
     CHECK(rec->os.ttl_unregistered); // recorded: every later status reads it
+
+    // The start-time note describes a containment still in force: once the host is
+    // released it is history, not status. Pins the `inactive` guard in
+    // do_quarantine_status (a dispatch of quarantine_status reads the host firewall on
+    // every leg, so this half cannot run in the normal suite).
+    CHECK(has_row(rig.run("release").captured, "status|inactive"));
+    const auto released = rig.run("quarantine_status").captured;
+    CHECK(has_row(released, "status|inactive"));
+    CHECK_FALSE(has_prefix(released, "note|init_recovery="));
 }
 
 TEST_CASE("live: the repair self-check re-applies a containment the host lost, from the stored set",

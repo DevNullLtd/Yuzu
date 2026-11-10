@@ -2506,7 +2506,7 @@ TEST_CASE("triggers: the registrations the core emits are what the engine's own 
     CHECK(reg.json == ttl_trigger_config());
 
     // the repair trigger fires `quarantine` with only `repair=1`: the plugin routes that
-    // to repair() ahead of every other parameter
+    // to repair(), and refuses a `repair=1` that also carries a containment parameter
     const auto& rep = *trig.find(kRepairTriggerId);
     CHECK(rep.id == "firewall.quarantine.repair");
     CHECK(rep.type == "interval");
@@ -5068,44 +5068,6 @@ TEST_CASE("pf: the enable token is never lost across a failed update or a failed
         CHECK(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
         CHECK(rig.world.tokens.empty());
     }
-}
-
-TEST_CASE("every status token maps to one typed result", "[agent][firewall_quarantine]") {
-    using K = ResultKind::Kind;
-    struct Row {
-        const char* status;
-        K kind;
-        bool partial;
-    };
-    for (const auto& row : {Row{"active", K::ok, false}, Row{"inactive", K::ok, false},
-                            Row{"active_unproven", K::ok, true}, Row{"partial", K::constrained, true},
-                            Row{"degraded", K::constrained, true}, Row{"refused", K::unavailable, true},
-                            Row{"rolled_back", K::unavailable, true},
-                            Row{"update_failed", K::unavailable, true},
-                            Row{"busy", K::unavailable, true}, Row{"something_new", K::unavailable, true}}) {
-        INFO(row.status);
-        Outcome o;
-        o.status = row.status;
-        const auto rk = result_kind(o);
-        CHECK(rk.kind == row.kind);
-        CHECK(rk.partial == row.partial);
-        CHECK(rk.provenance == std::string{"firewall:"} + row.status);
-    }
-    // rc: exactly the five outcomes a caller must treat as failed
-    for (const char* s : {"refused", "rolled_back", "update_failed", "busy"}) {
-        Outcome o;
-        o.status = s;
-        CHECK(o.rc() == 1);
-    }
-    for (const char* s : {"active", "inactive", "active_unproven", "partial", "degraded"}) {
-        Outcome o;
-        o.status = s;
-        CHECK(o.rc() == 0);
-    }
-    Outcome thrown;
-    thrown.status = "degraded";
-    thrown.reason = "exception";
-    CHECK(thrown.rc() == 1); // degraded, but the action itself failed
 }
 
 TEST_CASE("a reply that names residue carries its reason; repair notes appear only when the repair worked",

@@ -2712,10 +2712,16 @@ int do_repair(yuzu::CommandContext& ctx, YuzuPluginContext* raw) {
 }
 
 int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext* raw) {
-    // The repair trigger's dispatch: routed before anything else is read, so no
-    // operator parameter can steer it (it never builds an allow set or starts a record).
-    if (params.get("repair") == "1")
+    // The repair trigger's dispatch (its config carries `repair=1` and nothing else). The
+    // plugin cannot tell that trigger from an operator's dispatch, so a `repair=1` that also
+    // names a containment parameter is refused rather than answered as a repair: an operator
+    // who meant to contain must not read `inactive nothing_to_repair`. A bare `repair=1`
+    // is routed before anything else is read (it never builds an allow set or starts a record).
+    if (params.get("repair") == "1") {
+        if (params.has("ttl_seconds") || params.has("exceptions") || params.has("probe_target"))
+            return emit_refusal(ctx, "repair_with_containment_parameters", "quarantine");
         return do_repair(ctx, raw);
+    }
     const auto ttl = fq::parse_ttl_param(params.get("ttl_seconds"));
     if (!ttl)
         return emit_refusal(ctx, ttl.error(), "quarantine");

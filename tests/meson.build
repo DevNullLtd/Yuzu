@@ -4206,6 +4206,19 @@ test('agent server-peer publish wiring lexical gate (UP-8)',
   timeout: 30,
 )
 
+# Firewall containment (packaged-Linux privilege refusal): static lexical gate pinning that each of
+# do_quarantine / do_release / do_quarantine_allow / do_repair evaluates privilege_refusal() and
+# returns its refusal BEFORE constructing Containment, and that privilege_refusal()'s Linux branch
+# still calls fq::linux_privilege_refusal with the euid and PR_GET_NO_NEW_PRIVS reads. The helper is
+# `#if defined(__linux__)`, so no macOS or Windows build observes a dropped or reordered call. Carries
+# its own in-memory mutation self-test. No build required; one process, well under a second.
+test('firewall privilege-refusal call-site wiring lexical gate',
+  _python3_test,
+  args: [files('test_firewall_privilege_refusal_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
 # stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
 # page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes

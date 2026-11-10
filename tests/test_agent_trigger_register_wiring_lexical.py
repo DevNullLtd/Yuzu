@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Static lexical gate over the plugin trigger-registration bridge in agents/core/src/agent.cpp.
+"""Static lexical gate over two plugin.h C ABI bridges in agents/core/src/agent.cpp: trigger
+registration and the key-value `exists` tri-state.
 
 `yuzu_register_trigger` (the C ABI entry plugins call through PluginContext::register_trigger)
 turns the trigger engine's "table full, nothing registered" answer (`register_trigger` returns
@@ -14,6 +15,19 @@ test can call it. This gate pins the two lines the bridge depends on:
   2. `TriggerEngine::register_trigger` is declared with a `bool` return in trigger_engine.hpp
      (the bridge's `!` test is only meaningful on a bool; a `void` return would not compile
      there, and a quietly-ignored result would reopen the silent success).
+
+The second bridge is `yuzu_ctx_storage_exists`, which answers plugin.h's tri-state (0 present, 1
+absent, negative on error). The store's `exists_checked()` returns `std::optional<bool>`, nullopt
+meaning "the store could not answer" (closed handle, SQLITE_BUSY past the busy budget, a failed
+prepare). The bridge maps that to -3, never to "absent": a plugin that reads absent as "nothing to
+recover" (the firewall plugin's init-time recovery) would otherwise act on a fault as if it were
+the answer. The store half is unit-tested; the bridge reaches `PluginContextImpl` (TU-local, no
+seam), so this gate pins the three lines it depends on:
+
+  3. Inside the `yuzu_ctx_storage_exists` body the answer comes from `exists_checked(` (the plain
+     `exists()` collapses a fault into false).
+  4. `if (!present) return -3;` follows it (a nullopt is the error code, not absent).
+  5. `return *present ? 0 : 1;` (0 present, 1 absent -- not inverted).
 
 Robustness: `//` comments are stripped and whitespace is collapsed before matching, so line
 wrapping, re-indentation and comment text mentioning a token cannot satisfy or break a check.
@@ -37,8 +51,9 @@ AGENT_CPP = ROOT / "agents" / "core" / "src" / "agent.cpp"
 TRIGGER_HPP = ROOT / "agents" / "core" / "include" / "yuzu" / "agent" / "trigger_engine.hpp"
 TAG = "test_agent_trigger_register_wiring_lexical"
 HINT = (
-    " (this gate pins the plugin trigger-registration bridge; if agent.cpp or trigger_engine.hpp was"
-    " legitimately restructured, update tests/test_agent_trigger_register_wiring_lexical.py)"
+    " (this gate pins the plugin trigger-registration and storage-exists bridges; if agent.cpp or"
+    " trigger_engine.hpp was legitimately restructured, update"
+    " tests/test_agent_trigger_register_wiring_lexical.py)"
 )
 
 
@@ -63,6 +78,22 @@ def problems(agent_src, hpp_src):
     if not re.search(r"\bbool register_trigger\( ?TriggerConfig config ?\);", normalise(hpp_src)):
         out.append("trigger_engine.hpp no longer declares `bool register_trigger(TriggerConfig config);` "
                    "(the bridge's -5 depends on the bool return)")
+
+    exists = re.search(r"int yuzu_ctx_storage_exists\(.*?(?=YUZU_EXPORT const char\* yuzu_ctx_storage_list\()",
+                       normalise(agent_src))
+    if not exists:
+        out.append("agent.cpp no longer defines yuzu_ctx_storage_exists ahead of yuzu_ctx_storage_list")
+    else:
+        body = exists.group(0)
+        if not re.search(r"const auto present = impl->kv_store->exists_checked\(", body):
+            out.append("yuzu_ctx_storage_exists no longer reads the store through exists_checked( "
+                       "(a store fault would read as absent)")
+        if not re.search(r"if \( ?! ?present ?\) ?return -3;", body):
+            out.append("yuzu_ctx_storage_exists no longer returns -3 when exists_checked( could not answer "
+                       "(a fault would read as absent, or as present)")
+        if not re.search(r"return \*present \? 0 : 1;", body):
+            out.append("yuzu_ctx_storage_exists no longer returns `*present ? 0 : 1` "
+                       "(plugin.h: 0 present, 1 absent)")
     return out
 
 
@@ -76,6 +107,11 @@ MUTATIONS = [
      "no longer defines yuzu_register_trigger"),
     ("hpp", r"bool register_trigger\(TriggerConfig config\);", "void register_trigger(TriggerConfig config);",
      "trigger_engine.hpp no longer declares"),
+    ("cpp", r"kv_store->exists_checked\(impl->plugin_name, key\)", "kv_store->exists(impl->plugin_name, key)",
+     "no longer reads the store through exists_checked("),
+    ("cpp", r"if \(!present\)\s*return -3;", "if (!present)\n        return 1;",
+     "no longer returns -3"),
+    ("cpp", r"return \*present \? 0 : 1;", "return *present ? 1 : 0;", "no longer returns `*present ? 0 : 1`"),
 ]
 
 

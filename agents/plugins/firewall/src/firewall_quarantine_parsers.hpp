@@ -4078,8 +4078,10 @@ public:
 }
 
 /// The repair trigger's config: every `kRepairPollSeconds` the agent dispatches
-/// `firewall.quarantine` with `repair=1`, which the plugin routes to repair() ahead
-/// of every other parameter (no allow set is built, no limit parsed).
+/// `firewall.quarantine` with `repair=1`, which the plugin routes to repair() (no allow
+/// set is built, no limit parsed). A `repair=1` dispatch that also carries `ttl_seconds`,
+/// `exceptions` or `probe_target` is not that trigger and is refused
+/// `repair_with_containment_parameters`.
 [[nodiscard]] inline std::string repair_trigger_config() {
     return std::format(
         R"({{"interval_seconds":{},"plugin":"firewall","action":"quarantine","parameters":{{"repair":"1"}}}})",

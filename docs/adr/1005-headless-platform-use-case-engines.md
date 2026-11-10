@@ -1509,8 +1509,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      MCP `execute_instruction` reach them through the shared gates (the capability
      catalogue classifies `firewall.quarantine` Destructive and Reversible, so it needs
      explicit targets and the approval gate), but no definition publishes their
-     parameters (`probe_target`, `exceptions`, `op`, `if_ttl_expired`), so
-     discoverability (Decision 1) is not met for them yet. The server cut-over that
+     parameters (`ttl_seconds`, `probe_target`, `exceptions`, `op`, `if_ttl_expired`,
+     `repair`), so discoverability (Decision 1) is not met for them yet. The server cut-over that
      re-points the quarantine definitions at these actions is the change that adds
      them; until then the plugin README documents the parameters.
      - Recorded by the change author; ADR-owner acceptance pending.
