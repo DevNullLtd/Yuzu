@@ -450,11 +450,18 @@ struct LiveEnv {
         FAIL("YUZU_FQ_SERVER_ADDRESS and YUZU_FQ_PROBE_TARGET are required under "                 \
              "YUZU_FIREWALL_QUARANTINE_LIVE=1")
 
-/// Is the built plugin in this tree? A partial build (no agent plugins) has none,
-/// and the neighbouring local-dispatcher tests skip the same way.
+/// Is the built plugin in this tree? Under `meson test` (MESON_BUILD_ROOT set) the
+/// agent shards depend on the plugin build, so a missing file is a defect and FAILS:
+/// a green skip there would let a partial build pass the action-boundary cases without
+/// running one. A bare run of the test binary outside meson has no such guarantee and
+/// skips, like the neighbouring local-dispatcher tests.
 [[nodiscard]] bool firewall_plugin_built() {
-    if (!find_firewall_plugin_file())
-        return false; // a partial build: the neighbouring tests skip the same way
+    if (!find_firewall_plugin_file()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("firewall plugin not found under MESON_BUILD_ROOT: the agent shards depend on "
+                 "its build, so it must exist");
+        return false;
+    }
     // The file is THERE: a load failure is a defect, never a green skip.
     const auto loaded = load_firewall();
     REQUIRE(loaded.has_value());

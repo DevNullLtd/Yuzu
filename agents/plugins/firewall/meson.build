@@ -30,7 +30,9 @@ elif host_machine.system() == 'linux'
   endif
 endif
 
-shared_library(
+# Assigned to a variable so tests/meson.build can order the plugin build ahead of the agent
+# shards: the [firewall_quarantine] action-boundary cases load this file by path.
+firewall_plugin_lib = shared_library(
   'firewall',
   files('src/firewall_plugin.cpp'),
   name_prefix: '',

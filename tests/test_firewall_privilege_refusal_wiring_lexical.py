@@ -15,7 +15,9 @@ build or test can observe a dropped or reordered call. This gate pins what they 
      record; a refusal evaluated after it has already touched the host or the store).
   2. `privilege_refusal()`'s Linux branch calls `fq::linux_privilege_refusal(` with
      `::geteuid() == 0` and a `PR_GET_NO_NEW_PRIVS` prctl read (a predicate replaced by a constant
-     would refuse nothing, or everything).
+     would refuse nothing, or everything), and in that ORDER: the call shape is also pinned as one
+     anchored pattern, because the two arguments are both ints-or-bools and a swap compiles and
+     keeps every token present while inverting the refusal.
 
 The live half (a real NoNewPrivileges unit refusing for real) is exercised on the Linux lane at
 gate 4, not here.
@@ -26,7 +28,8 @@ Patterns anchor on distinctive tokens, never line numbers.
 
 Lexical only: it cannot see a relocation that keeps the tokens but changes control flow
 (review-enforced). The self-test applies in-memory mutations (each of the four calls deleted, one
-moved after the Containment constructor, the predicate replaced by std::nullopt) and requires
+moved after the Containment constructor, the predicate replaced by std::nullopt, the two arguments
+swapped, the root test replaced by a bare constant) and requires
 problems() to be non-empty on each; a mutation whose pattern no longer matches fails loudly
 (stale pattern) rather than passing vacuously.
 
@@ -51,6 +54,9 @@ HANDLERS = ("do_quarantine", "do_release", "do_quarantine_allow", "do_repair")
 
 # `\w+` so a renamed local does not break the gate; the call and the returned refusal are the invariant.
 REFUSAL = r"if \( ?const auto \w+ = privilege_refusal\(\) ?\) return emit_refusal\("
+
+# The full call shape on normalised text: root test first, then the NoNewPrivileges read.
+CALL_SHAPE = r"fq::linux_privilege_refusal\( ?::geteuid\( ?\) == 0, ?::prctl\( ?PR_GET_NO_NEW_PRIVS"
 
 
 def normalise(src):
@@ -94,6 +100,10 @@ def problems(plugin_src):
         if not re.search(r"PR_GET_NO_NEW_PRIVS", branch):
             out.append("privilege_refusal() Linux branch no longer reads PR_GET_NO_NEW_PRIVS "
                        "(NoNewPrivileges would not be detected)")
+        if not re.search(CALL_SHAPE, branch):
+            out.append("privilege_refusal() Linux branch no longer calls "
+                       "fq::linux_privilege_refusal(::geteuid() == 0, ::prctl(PR_GET_NO_NEW_PRIVS, ...) "
+                       "in that argument order (swapped or constant arguments would invert or void the refusal)")
     return out
 
 
@@ -129,6 +139,14 @@ MUTATIONS.append((lambda raw: re.subn(r"return fq::linux_privilege_refusal\([^;]
                   "no longer calls fq::linux_privilege_refusal("))
 MUTATIONS.append((lambda raw: re.subn(r"::geteuid\(\) == 0,", "true,", raw, count=1),
                   "no longer passes `::geteuid() == 0`"))
+# The two arguments swapped: every token is still present, so only the anchored shape sees it.
+MUTATIONS.append((lambda raw: re.subn(
+                      r"fq::linux_privilege_refusal\(::geteuid\(\) == 0,(\s*)(::prctl\(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0\))\)",
+                      r"fq::linux_privilege_refusal(\2,\1::geteuid() == 0)", raw, count=1),
+                  "in that argument order"))
+# The root test replaced by a bare constant (the shape, not just the token, must hold).
+MUTATIONS.append((lambda raw: re.subn(r"::geteuid\(\) == 0,", "0,", raw, count=1),
+                  "in that argument order"))
 MUTATIONS.append((lambda raw: re.subn(r"::prctl\(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0\)", "0", raw, count=1),
                   "no longer reads PR_GET_NO_NEW_PRIVS"))
 

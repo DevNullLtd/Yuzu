@@ -118,6 +118,13 @@ inline constexpr std::chrono::milliseconds kProbeTimeout{2'000};
 /// path's "not a bare SYN" (a peer must not open a NEW connection from its service
 /// port). It is a literal, never built from input, and the only place `&`, `|`,
 /// `(`, `)`, `!` and `=` are admitted, so no operator text can use them.
+///
+/// The iptables leg spells the same refusal as two positive `--tcp-flags` rules (no `!`
+/// argv token is allowed). Both refuse a bare SYN and admit SYN-ACK, ACK / data and any
+/// segment with RST set (so SYN|RST passes on both legs). They differ only on a segment
+/// with no ACK, no RST and no SYN (NULL, FIN-only, PSH-only): nft admits it, iptables
+/// does not, and no legitimate reply is one. A reader should not take the two spellings
+/// for a gap in what a peer can open.
 inline constexpr std::string_view kNftReplyFlagsMatch = "tcp flags & (syn|ack) != syn";
 
 /// A whole generated ruleset line: the token charset plus the structural
@@ -661,6 +668,22 @@ add_exceptions(AllowSet set, const std::vector<Endpoint>& add) {
     return e;
 }
 
+/// Put the live peer at the FRONT of a control set (deduplicated against what is
+/// listed): the verification proves that endpoint, and the set must admit it. The one
+/// place the front-of-set rule lives, shared by the allow-set builder and a repair.
+inline void lead_with_live_peer(std::vector<Endpoint>& control, const Endpoint& live) {
+    if (const auto at = std::find(control.begin(), control.end(), live); at != control.end())
+        std::rotate(control.begin(), at, at + 1);
+    else
+        control.insert(control.begin(), live);
+}
+
+/// `control_live_peer=<ip:port>` / `[v6]:port`.
+[[nodiscard]] inline std::string live_peer_note(const Endpoint& live) {
+    return std::format("control_live_peer={}{}:{}", live.ip.v6 ? "[" : "",
+                       format_ip(live.ip) + (live.ip.v6 ? "]" : ""), live.port);
+}
+
 /// loopback + control endpoints + DHCP + DNS resolvers + ICMPv6 ND are the
 /// mandatory part (emitted by flatten()); this builds the variable part.
 /// `control_ips_csv` is the agent's startup-resolved `agent.server_address_
@@ -709,15 +732,8 @@ build_allow_set(std::string_view control_ips_csv, std::string_view server_addres
         set.notes.push_back(std::format("control_ips_invalid={}", invalid));
     if (!live_peer.empty()) {
         if (const auto live = parse_live_peer(live_peer)) {
-            // Front of the set: the verification proves THIS endpoint first.
-            if (const auto at = std::find(set.control.begin(), set.control.end(), *live);
-                at != set.control.end())
-                std::rotate(set.control.begin(), at, at + 1);
-            else
-                set.control.insert(set.control.begin(), *live);
-            set.notes.push_back(std::format("control_live_peer={}{}:{}", live->ip.v6 ? "[" : "",
-                                            format_ip(live->ip) + (live->ip.v6 ? "]" : ""),
-                                            live->port));
+            lead_with_live_peer(set.control, *live);
+            set.notes.push_back(live_peer_note(*live));
         } else {
             set.notes.emplace_back("live_peer_invalid=1");
         }
@@ -1095,7 +1111,6 @@ struct OsPayload {
     bool state_flush_failed = false;      // macOS: the anchor load committed but its state flush did not
     bool ttl_unregistered = false;        // the TTL trigger could not be registered: nothing will expire it
     bool repair_unregistered = false;     // the repair trigger could not be registered: nothing re-checks the host
-    bool gpo_override = false;            // Windows: a Group Policy default action beats the profile defaults we write
     friend bool operator==(const OsPayload&, const OsPayload&) = default;
 };
 
@@ -1104,15 +1119,12 @@ struct OsPayload {
 /// the record no longer lists), so each is persisted and read back by every status
 /// until a later apply clears it.
 [[nodiscard]] inline bool has_residue(const OsPayload& os) noexcept {
-    return os.gpo_override || os.rules_not_disabled > 0 || os.stale_rules_left > 0 ||
-           os.state_flush_failed || os.ttl_unregistered || os.repair_unregistered;
+    return os.rules_not_disabled > 0 || os.stale_rules_left > 0 || os.state_flush_failed ||
+           os.ttl_unregistered || os.repair_unregistered;
 }
 
 /// The status reason for the first residue, in a fixed order.
 [[nodiscard]] inline std::string_view residue_reason(const OsPayload& os) noexcept {
-    // The default action not being in force outranks a rule that would not disable.
-    if (os.gpo_override)
-        return "gpo_override";
     if (os.rules_not_disabled > 0)
         return "rules_not_disabled";
     if (os.stale_rules_left > 0)
@@ -1129,8 +1141,6 @@ struct OsPayload {
 /// `k=v` notes for every residue present.
 [[nodiscard]] inline std::vector<std::string> residue_notes(const OsPayload& os) {
     std::vector<std::string> n;
-    if (os.gpo_override)
-        n.emplace_back("gpo_override=1");
     if (os.rules_not_disabled > 0)
         n.push_back(std::format("rules_not_disabled={}", os.rules_not_disabled));
     if (os.stale_rules_left > 0)
@@ -1191,8 +1201,6 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
         out += "ttl_unreg=1\n";
     if (s.os.repair_unregistered)
         out += "repair_unreg=1\n";
-    if (s.os.gpo_override)
-        out += "gpo=1\n";
     if (s.repairs != 0)
         out += std::format("repairs={}\n", s.repairs);
     if (s.repaired_at != 0)
@@ -1220,7 +1228,7 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
     bool seen_prev = false, seen_applied = false, seen_ttl = false;
     bool seen_probe = false, seen_pf = false, seen_boot = false, seen_ipt = false,
          seen_verify = false, seen_nd = false, seen_v6 = false, seen_stale = false,
-         seen_flush = false, seen_ttl_unreg = false, seen_repair_unreg = false, seen_gpo = false,
+         seen_flush = false, seen_ttl_unreg = false, seen_repair_unreg = false,
          seen_repairs = false, seen_repaired_at = false;
     for (const auto line : detail::split(text, '\n')) {
         if (line.empty())
@@ -1334,10 +1342,6 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
             if (!once(seen_repair_unreg) || val != "1")
                 return std::nullopt;
             s.os.repair_unregistered = true;
-        } else if (key == "gpo") {
-            if (!once(seen_gpo) || val != "1")
-                return std::nullopt;
-            s.os.gpo_override = true;
         } else if (key == "boot_time") {
             if (!once(seen_boot) || !is_safe_token(val))
                 return std::nullopt;
@@ -1481,16 +1485,27 @@ struct WinRuleInfo {
     std::string name;
     std::string group;
     bool enabled = false;
-    int direction = 0; // INetFwRule::Direction (1 in, 2 out)
-    int profiles = 0;  // INetFwRule::Profiles bitmask
+    int direction = 0;   // INetFwRule::Direction (1 in, 2 out)
+    int profiles = 0;    // INetFwRule::Profiles bitmask
+    int protocol = 0;    // INetFwRule::Protocol (6 tcp, 17 udp, 256 any, ...)
+    int action = -1;     // INetFwRule::Action (0 block, 1 allow); -1 unreadable
+    std::string local_ports;  // INetFwRule::LocalPorts ("80,443", "*", ...)
+    std::string remote_ports; // INetFwRule::RemotePorts
+    std::string application;  // INetFwRule::ApplicationName
+    std::string service;      // INetFwRule::ServiceName
 };
 
-/// The identity of one stock rule across a quarantine: Windows ships rules that
-/// share a NAME and differ by direction or profile (File and Printer Sharing,
-/// WinRM HTTP-In), one on and one off. The disable list and the release match on
-/// all three, so a rule that was OFF before is never switched on by a release.
+/// The identity of one stock rule across a quarantine. Windows ships rules that
+/// share a NAME and differ by direction, profile or any other property (File and
+/// Printer Sharing, WinRM HTTP-In, and an admin's own same-named copies), one on
+/// and one off. The disable list and the release match on every property that can
+/// tell two rules apart, so a rule that was OFF before is never switched on by a
+/// release because an ENABLED twin of it was disabled. A property that cannot be
+/// read is empty/-1 on BOTH the disable and the release side, so a rule is still
+/// matched consistently.
 [[nodiscard]] inline std::string win_rule_key(const WinRuleInfo& r) {
-    return std::format("{}|{}|{}", r.name, r.direction, r.profiles);
+    return std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}", r.name, r.direction, r.profiles, r.protocol,
+                       r.action, r.local_ports, r.remote_ports, r.application, r.service);
 }
 
 /// The keys of every ENABLED rule outside our group (an Allow RULE beats a
@@ -1643,8 +1658,13 @@ enum class PriorStore : std::uint8_t { store, keep_existing, refuse_unrestorable
     return PriorStore::store;
 }
 
+/// `v=2`: the key grew from name|direction|profiles to every property of the rule
+/// (win_rule_key). A list of another version is `disabled_list_unreadable`, never
+/// matched on a shorter key (a shorter key would re-enable a disabled twin).
+inline constexpr std::string_view kDisabledListHeader = "v=2";
+
 [[nodiscard]] inline std::string serialize_disabled_rules(const std::vector<std::string>& names) {
-    std::string out = "v=1\n";
+    std::string out = std::format("{}\n", kDisabledListHeader);
     for (const auto& n : names) {
         for (char c : n) {
             if (c == '\\')
@@ -1668,7 +1688,7 @@ parse_disabled_rules(std::string_view text) {
     for (const auto line : detail::split(text, '\n')) {
         if (first) {
             first = false;
-            if (line != "v=1")
+            if (line != kDisabledListHeader)
                 return std::nullopt;
             continue;
         }
@@ -1754,8 +1774,8 @@ using WinSwitchReading = std::array<std::optional<bool>, 3>;
 static_assert(std::tuple_size_v<WinSwitchReading> == kWinProfileLabels.size());
 
 struct WinSwitchVerdict {
-    enum class Kind : std::uint8_t { ok, disabled, unreadable } kind = Kind::ok;
-    std::size_t profile = 0; // index into kWinProfileLabels; meaningful unless ok
+    enum class Kind : std::uint8_t { ok, disabled, unreadable, gpo_override } kind = Kind::ok;
+    std::size_t profile = 0; // index into kWinProfileLabels; meaningful for disabled / unreadable
 };
 
 /// A profile whose firewall is switched off makes every rule and the default
@@ -1764,7 +1784,19 @@ struct WinSwitchVerdict {
 /// is then reverted, unseen), and turning on a firewall an administrator or
 /// another product turned off is not ours to undo on release. A definite "off"
 /// outranks an unreadable profile: it is the actionable fact.
-[[nodiscard]] constexpr WinSwitchVerdict win_firewall_switch_verdict(const WinSwitchReading& enabled) noexcept {
+///
+/// A host under Group Policy is refused the same way (`policy_overridden`: the
+/// firewall's `LocalPolicyModifyState` is `GP_OVERRIDE`, read as a definite S_OK
+/// only). Microsoft documents that a rule or default written locally "will not take
+/// effect because the firewall is controlled by Group Policy", so containment there
+/// would be a lie too (owner decision 2026-11-10: refuse, never apply and report
+/// partial). The state is policy-wide, one reading covers every profile, and the
+/// refusal names no profile. It outranks both other kinds: it is what no local
+/// action can change.
+[[nodiscard]] constexpr WinSwitchVerdict win_firewall_switch_verdict(const WinSwitchReading& enabled,
+                                                                     bool policy_overridden = false) noexcept {
+    if (policy_overridden)
+        return {WinSwitchVerdict::Kind::gpo_override, 0};
     for (std::size_t i = 0; i < enabled.size(); ++i)
         if (enabled[i] && !*enabled[i])
             return {WinSwitchVerdict::Kind::disabled, i};
@@ -1775,7 +1807,8 @@ struct WinSwitchVerdict {
 }
 
 /// The refusal / failure token for a verdict (empty when the switch is on
-/// everywhere): `firewall_disabled:<Profile>` or `firewall_state_unreadable:<Profile>`.
+/// everywhere): `firewall_disabled:<Profile>`, `firewall_state_unreadable:<Profile>`
+/// or `gpo_override`.
 [[nodiscard]] inline std::string win_firewall_switch_token(const WinSwitchVerdict& v) {
     switch (v.kind) {
     case WinSwitchVerdict::Kind::ok:
@@ -1784,6 +1817,8 @@ struct WinSwitchVerdict {
         return std::format("firewall_disabled:{}", kWinProfileLabels[v.profile]);
     case WinSwitchVerdict::Kind::unreadable:
         return std::format("firewall_state_unreadable:{}", kWinProfileLabels[v.profile]);
+    case WinSwitchVerdict::Kind::gpo_override:
+        return "gpo_override";
     }
     return {};
 }
@@ -2079,7 +2114,9 @@ using Argv = std::vector<std::string>;
         // A TCP REPLY refuses a bare SYN (see nft_ruleset_text). `! --syn` cannot be
         // an argv token (`!` is outside the charset that confines the privileged
         // call), so the same set is two positive rules: ACK set (SYN-ACK, ACK, FIN-ACK,
-        // data) or RST set; a bare SYN matches neither.
+        // data) or RST set; a bare SYN matches neither. Same refusal as
+        // kNftReplyFlagsMatch (SYN|RST and RST pass on both legs; see the note there for
+        // the one class of non-reply segment the two spell differently).
         auto reply = [&](bool match_src, int sport, int dport) {
             if (r.l4 != Proto::tcp) {
                 append(rule(match_src, sport, dport));
@@ -2569,12 +2606,21 @@ struct LegStatus {
 /// The master-switch part of a Windows status read. A verdict other than `ok`
 /// settles the status and returns true: a switched-off profile makes every rule
 /// and the default block inert, so nothing is enforced and re-applying cannot help
-/// (it refuses the same way); an unreadable switch is unreadable, never a guess
-/// either way. Both name the profile. Returns false when the switch is on
-/// everywhere and the read goes on.
+/// (it refuses the same way); a host under Group Policy enforces nothing of ours
+/// and re-applying cannot help either (`gpo_override`, no profile named: the state
+/// is policy-wide, and `reapply_helps=false` keeps the repair tick from looping);
+/// an unreadable switch is unreadable, never a guess either way. The first and
+/// last name the profile. Returns false when the switch is on everywhere and the
+/// read goes on.
 [[nodiscard]] inline bool win_switch_status(const WinSwitchVerdict& v, LegStatus& st) {
     if (v.kind == WinSwitchVerdict::Kind::ok)
         return false;
+    if (v.kind == WinSwitchVerdict::Kind::gpo_override) {
+        st.state = OsState::not_enforcing;
+        st.reason = "gpo_override";
+        st.reapply_helps = false;
+        return true;
+    }
     st.notes.push_back(std::format("firewall_profile={}", kWinProfileLabels[v.profile]));
     if (v.kind == WinSwitchVerdict::Kind::disabled) {
         st.state = OsState::not_enforcing;
@@ -3388,7 +3434,7 @@ struct VerifyResult {
 }
 
 /// A note the outcome already carries is not repeated: a leg's live read and the
-/// record's residue can name the same fact (`gpo_override=1`), and one row says it once.
+/// record's residue can name the same fact, and one row says it once.
 inline void add_notes(Outcome& o, const std::vector<std::string>& n) {
     for (const auto& note : n)
         if (!has_note(o, note))
@@ -3551,7 +3597,8 @@ struct ApplyRequest {
             // An `active` record is only true while the OS still enforces it: another
             // actor may have undone it (pf switched off, a table deleted, profile
             // defaults restored). Re-apply the STORED allow set -- a retry never
-            // rewrites a contained host's allow list -- instead of answering
+            // rewrites a contained host's allow list (a missing live control peer is
+            // the one addition, converge's repair rule) -- instead of answering
             // `already_active`. A read that fails changes nothing, and a defect a
             // re-apply cannot fix (a dangling anchor, an earlier sibling, a
             // switched-off profile) is reported, not re-applied on every retry.
@@ -3663,15 +3710,32 @@ namespace detail {
 /// committed and verified; a failure removes only what the update added. `repaired`
 /// marks a convergence that repairs a host which stopped enforcing the stored set:
 /// the record then counts it (repairs, repaired_at) -- on success only, so a failed
-/// attempt never reads as a repair.
+/// attempt never reads as a repair -- admits the agent's live control peer into the
+/// set when it is missing, and keeps what it applied when the proof fails.
 [[nodiscard]] inline Outcome converge(Env& env, QuarantineState prev, const AllowSet& next,
                                       Deadline& dl, bool repaired) {
     Outcome o;
+    // A repair re-applies the stored set, but the verification below connects to the
+    // endpoint the agent really uses NOW, and a server re-addressed since the quarantine
+    // began is not in that set: the proof would fail against a set that cannot pass it.
+    // The live peer is admitted the way build_allow_set admits it (published by
+    // agents/core from the authenticated stream, never chosen by the host); one that
+    // would push the set past the cap is left out, and said.
+    AllowSet target = next;
+    if (repaired && env.live_control) {
+        lead_with_live_peer(target.control, *env.live_control);
+        if (target.control.size() > kMaxControlIps) {
+            target.control = next.control;
+            o.notes.emplace_back("control_live_peer_over_cap=1");
+        } else if (!(target.control == next.control)) {
+            o.notes.push_back(live_peer_note(*env.live_control));
+        }
+    }
     QuarantineState cand = prev;
     cand.phase = Phase::applying;
     cand.prev_generation = replaced_generation(prev);
     cand.generation = prev.generation + 1;
-    cand.allow = next;
+    cand.allow = target;
     if (!env.store.save(cand))
         return refused("state_not_persisted");
 
@@ -3723,7 +3787,14 @@ namespace detail {
     const auto v = run_verify(env, cand, before, dl);
     o.verify = v.row;
     note_proof(o, v);
-    if (verify_action(v.outcome, VerifyMode::update) == VerifyAction::revert_to_previous) {
+    // A repair never reverts: it re-applies the set the record already holds, so the
+    // "previous" generation IS that set and a revert would flush and re-apply it
+    // again on every tick for as long as the proof keeps failing. It keeps what it
+    // applied and records the failed proof (`active_unproven`); the next tick reads
+    // the host as enforcing and does not converge again. An update to a new set
+    // still reverts to the set that was proven.
+    const auto mode = repaired ? VerifyMode::reapply : VerifyMode::update;
+    if (verify_action(v.outcome, mode) == VerifyAction::revert_to_previous) {
         QuarantineState back = cand;
         back.generation = cand.generation + 1;
         back.prev_generation = cand.generation;
@@ -3800,9 +3871,13 @@ namespace detail {
     }
     if (changed == 0) {
         Outcome o;
-        // Still no mutation and no leg read, but never `active` over a gap the
-        // record remembers: answer what `quarantine_status` would.
-        detail::status_from_record_only(o, cur);
+        // Still no mutation, but never `active` over a gap: answer what
+        // `quarantine_status` would, from one live read of the leg (a switched-off
+        // profile, a Group Policy that arrived mid-quarantine) AND the record's own
+        // residue -- the same ladder a retried `quarantine` uses over an unchanged host.
+        const auto ls = env.leg.read_status(cur.os, dl);
+        detail::add_notes(o, ls.notes);
+        detail::status_from_record(o, cur, ls);
         o.state = cur;
         o.notes.emplace_back("exceptions_unchanged=1");
         return o;
@@ -3982,9 +4057,8 @@ struct ReleaseRequest {
     }
     st.phase = Phase::active;
     st.last_verify = detail::verify_text(v);
-    // A host the leg reads as enforcing but PARTIAL (a Group Policy default action beats
-    // ours, perhaps arrived while the agent was down) is not `active` here either: the
-    // start-time summary says what the next status read will.
+    // A host the leg reads as enforcing but PARTIAL (a gap the leg itself reports) is not
+    // `active` here either: the start-time summary says what the next status read will.
     if (enforcing && ls.partial)
         ap.partial = true;
     detail::finish_status(o, st, ap, v);
@@ -4004,8 +4078,9 @@ struct ReleaseRequest {
 /// restart. It is NOT a bare `quarantine`: that would start a fresh containment with no
 /// record (a trigger outliving a release would re-contain the host) and converge an
 /// `applying` record every minute. It only ever moves an `active` record forward, with
-/// the record's own STORED allow set (a repair never rewrites a contained host's list),
-/// through the same converge a retried `quarantine` uses, and the shell calls it
+/// the record's own STORED allow set (a repair never rewrites a contained host's list
+/// beyond admitting the live control peer converge adds when it is missing, so the proof
+/// can pass), through the same converge a retried `quarantine` uses, and the shell calls it
 /// inside the MutationGate (busy answers, never waits behind another mutation).
 ///
 /// Never acts on an unreadable store (a fault is not "no record"), never converges a

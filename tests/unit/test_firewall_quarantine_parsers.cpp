@@ -738,7 +738,6 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     s.os.rules_not_disabled = 3;
     s.os.stale_rules_left = 2;
     s.os.state_flush_failed = true;
-    s.os.gpo_override = true;
     s.os.repair_unregistered = true;
     s.repairs = 4;
     s.repaired_at = 1'700'000'900;
@@ -748,7 +747,6 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     REQUIRE(back);
     CHECK(back->repairs == 4);
     CHECK(back->repaired_at == 1'700'000'900);
-    CHECK(back->os.gpo_override);
     CHECK(back->os.repair_unregistered);
     CHECK(back->phase == Phase::active);
     CHECK(back->generation == 7);
@@ -791,11 +789,9 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     CHECK_FALSE(parse_state(text + "flush_failed=1\n"));
     CHECK_FALSE(parse_state(replace(text, "flush_failed=1", "flush_failed=0")));
     CHECK_FALSE(parse_state(replace(text, "stale_left=2", "stale_left=many")));
-    CHECK_FALSE(parse_state(text + "gpo=1\n"));          // duplicate keys of this round
-    CHECK_FALSE(parse_state(text + "repairs=5\n"));
+    CHECK_FALSE(parse_state(text + "repairs=5\n")); // duplicate keys of this round
     CHECK_FALSE(parse_state(text + "repaired_at=1\n"));
     CHECK_FALSE(parse_state(text + "repair_unreg=1\n"));
-    CHECK_FALSE(parse_state(replace(text, "gpo=1", "gpo=0")));
     CHECK_FALSE(parse_state(replace(text, "repair_unreg=1", "repair_unreg=yes")));
     CHECK_FALSE(parse_state(replace(text, "repairs=4", "repairs=lots")));
     CHECK_FALSE(parse_state(replace(text, "repaired_at=1700000900", "repaired_at=-1")));
@@ -804,21 +800,24 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     clean.os.rules_not_disabled = 0;
     clean.os.stale_rules_left = 0;
     clean.os.state_flush_failed = false;
-    clean.os.gpo_override = false;
     clean.os.repair_unregistered = false;
     clean.repairs = 0;
     clean.repaired_at = 0;
     const auto clean_text = serialize_state(clean);
     CHECK(clean_text.find("stale_left") == std::string::npos);
     CHECK(clean_text.find("flush_failed") == std::string::npos);
-    CHECK(clean_text.find("gpo=") == std::string::npos);
     CHECK(clean_text.find("repair") == std::string::npos);
     CHECK_FALSE(has_residue(parse_state(clean_text)->os));
     // a record written before this round (none of its keys) still loads, with none of them set
     CHECK(parse_state(clean_text)->repairs == 0);
-    CHECK_FALSE(parse_state(clean_text)->os.gpo_override);
-    // the default action not being in force outranks every other residue
-    CHECK(residue_reason(back->os) == "gpo_override");
+    // a Group Policy host is refused, never recorded: a `gpo=1` key (no build writes one) is
+    // an unknown key, skipped, and sets no residue
+    {
+        const auto legacy = parse_state(clean_text + "gpo=1\n");
+        REQUIRE(legacy);
+        CHECK_FALSE(has_residue(legacy->os));
+        CHECK(legacy->os == parse_state(clean_text)->os);
+    }
     CHECK_FALSE(parse_state(replace(text, "exc=10.0.0.5:22/tcp/in", "exc=10.0.0.5;rm")));
     // no control endpoint: not a record we could ever have written
     std::string no_ctl;
@@ -901,10 +900,11 @@ TEST_CASE("windows: every enabled rule outside our group is disabled", "[agent][
     };
     const auto off = win_rules_to_disable(rules);
     REQUIRE(off.size() == 3);
-    // a key is name|direction|profiles (none read in this fixture: 0|0)
-    CHECK(off[0] == "CoreNet-DHCP-Out|0|0");
-    CHECK(off[1] == "Remote Desktop - User Mode (TCP-In)|0|0");
-    CHECK(off[2] == "No group at all|0|0");
+    // a key is name|direction|profiles|protocol|action|local ports|remote ports|program|service
+    // (none read in this fixture: 0|0|0|-1 and four empty text fields)
+    CHECK(off[0] == "CoreNet-DHCP-Out|0|0|0|-1||||");
+    CHECK(off[1] == "Remote Desktop - User Mode (TCP-In)|0|0|0|-1||||");
+    CHECK(off[2] == "No group at all|0|0|0|-1||||");
     for (const auto& n : off)
         CHECK_FALSE(n.starts_with(kWinRulePrefix));
     // the one "is ours" test: our group, or our name prefix without the group
@@ -957,8 +957,13 @@ TEST_CASE("windows: disabled-rule list round trip and update plan", "[agent][fir
     REQUIRE(back);
     CHECK(*back == names);
     CHECK_FALSE(parse_disabled_rules("no header"));
-    CHECK_FALSE(parse_disabled_rules("v=1\nbad\\x\n"));
-    CHECK(parse_disabled_rules("v=1\n")->empty());
+    CHECK_FALSE(parse_disabled_rules("v=2\nbad\\x\n"));
+    CHECK(parse_disabled_rules("v=2\n")->empty());
+    // a v=1 list (name|direction|profiles keys) is never read with the longer key: it
+    // would re-enable a disabled twin. It is `disabled_list_unreadable`, not an empty list.
+    CHECK_FALSE(parse_disabled_rules("v=1\n"));
+    CHECK_FALSE(parse_disabled_rules("v=1\nPlain|1|2\n"));
+    CHECK(serialize_disabled_rules({}).starts_with("v=2\n"));
 
     const auto set = make_set({}, {ex("10.0.0.5:22/tcp/in")});
     const auto g1 = win_rule_specs(set, 1);
@@ -1793,7 +1798,9 @@ TEST_CASE("quarantine_allow: update keeps the previous generation on failure",
         const auto o = update(rig.env, false, {ex("10.9.9.9")}, dl);
         CHECK(o.status == "active");
         CHECK(contains(o.notes, "exceptions_unchanged=1"));
-        CHECK(rig.world.crash.calls == calls);
+        // no mutation: the one runner call is the live read the answer is built from (K1)
+        CHECK(rig.world.crash.calls == calls + 1);
+        CHECK(rig.world.log.back()[1] == "list");
         CHECK(rig.store.state()->generation == 1);
     }
     SECTION("a ruleset that will not load leaves the previous generation in force") {
@@ -2188,6 +2195,35 @@ TEST_CASE("a switched-off Windows profile refuses before anything is touched, an
         const auto st = report_status(rig.env, dl);
         CHECK(st.status == "partial");
         CHECK(st.reason == "operation_in_progress");
+    }
+    SECTION("a no-op quarantine_allow reads the leg: degraded|firewall_disabled, mutating nothing") {
+        ScriptRig rig;
+        Deadline dl;
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto raw = rig.store.raw;
+        const auto saves = rig.store.saves;
+        const int applies = rig.leg.applies;
+        // a profile was switched off after the quarantine: the record is clean, the host is not
+        rig.leg.status.state = OsState::not_enforcing;
+        rig.leg.status.reason = "firewall_disabled";
+        rig.leg.status.reapply_helps = false;
+        rig.leg.status.notes.emplace_back("firewall_profile=Public");
+
+        const auto check = [&](const Outcome& o) {
+            CHECK(o.status == "degraded");
+            CHECK(o.reason == "firewall_disabled");
+            CHECK(contains(o.notes, "firewall_profile=Public"));
+            CHECK(contains(o.notes, "exceptions_unchanged=1"));
+            CHECK(rig.leg.applies == applies);
+            CHECK(rig.store.raw == raw);
+            CHECK(rig.store.saves == saves);
+        };
+        check(update(rig.env, false, {ex("10.9.9.9")}, dl)); // a removal of an exception never listed
+        check(update(rig.env, true, rig.store.state()->allow.exceptions, dl)); // an add of none new
+        // the same answer quarantine_status gives
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "degraded");
+        CHECK(st.reason == "firewall_disabled");
     }
     SECTION("status reads degraded|firewall_disabled; a retried quarantine reports it and does not re-apply") {
         ScriptRig rig;
@@ -3717,7 +3753,13 @@ TEST_CASE("pf: a no-op quarantine_allow after a failed state flush answers parti
     const auto mark = rig.world.log.size();
     check_noop_update_reports_residue(rig, dl, present, ex("10.9.9.9"), "state_flush_failed",
                                       "state_flush_failed=1");
-    CHECK(rig.world.log.size() == mark); // no pfctl call of any kind: nothing read, nothing written
+    // the two no-ops read the leg (the live half of the answer) and write nothing: every
+    // pfctl call since is a `-s` show
+    CHECK(rig.world.log.size() > mark);
+    for (auto i = mark; i < rig.world.log.size(); ++i) {
+        INFO(join(rig.world.log[i]));
+        CHECK(contains(rig.world.log[i], "-s"));
+    }
 
     // and it is the answer quarantine_status gives
     const auto st = report_status(rig.env, dl);
@@ -4375,9 +4417,9 @@ TEST_CASE("windows: a stock rule is told apart by name, direction and profile", 
     };
     const auto off = win_rules_to_disable(rules);
     REQUIRE(off.size() == 3);
-    CHECK(off[0] == "File and Printer Sharing (SMB-In)|1|2");
-    CHECK(off[1] == "WinRM (HTTP-In)|1|4");
-    CHECK(off[2] == "WinRM (HTTP-In)|1|2");
+    CHECK(off[0] == "File and Printer Sharing (SMB-In)|1|2|0|-1||||");
+    CHECK(off[1] == "WinRM (HTTP-In)|1|4|0|-1||||");
+    CHECK(off[2] == "WinRM (HTTP-In)|1|2|0|-1||||");
     // the public twin was off: its key is not in the list, so the release leaves it off
     CHECK(std::find(off.begin(), off.end(), win_rule_key(rules[1])) == off.end());
     CHECK(win_rule_key(rules[1]) != win_rule_key(rules[0]));
@@ -4388,6 +4430,57 @@ TEST_CASE("windows: a stock rule is told apart by name, direction and profile", 
     CHECK(merged.list.size() == 3);
     CHECK(merged.grew);
     // the round trip through the stored list keeps a '|'-bearing key intact
+    const auto parsed = parse_disabled_rules(serialize_disabled_rules(off));
+    REQUIRE(parsed);
+    CHECK(*parsed == off);
+}
+
+TEST_CASE("windows: a disabled twin differing only by protocol, ports, program, service or action is never re-enabled",
+          "[agent][firewall_quarantine]") {
+    // Same name, direction and profiles; the twin is OFF and differs by exactly one property.
+    // Before the key carried every property, the enabled rule's key matched the twin's and
+    // the release switched the twin on.
+    WinRuleInfo on{.name = "Remote Assistance (TCP-In)", .group = "Remote Assistance", .enabled = true,
+                   .direction = 1, .profiles = 7, .protocol = 6, .action = 1,
+                   .local_ports = "3389", .remote_ports = "*", .application = "C:\\Windows\\a.exe",
+                   .service = "TermService"};
+    const auto differ = [&](auto mutate) {
+        auto twin = on;
+        twin.enabled = false;
+        mutate(twin);
+        return twin;
+    };
+    const std::vector<WinRuleInfo> twins{
+        differ([](WinRuleInfo& r) { r.protocol = 17; }),
+        differ([](WinRuleInfo& r) { r.action = 0; }),
+        differ([](WinRuleInfo& r) { r.local_ports = "3390"; }),
+        differ([](WinRuleInfo& r) { r.remote_ports = "443"; }),
+        differ([](WinRuleInfo& r) { r.application = "C:\\Windows\\b.exe"; }),
+        differ([](WinRuleInfo& r) { r.service = "Other"; }),
+    };
+    std::vector<WinRuleInfo> rules{on};
+    rules.insert(rules.end(), twins.begin(), twins.end());
+
+    // only the enabled rule is listed, and no twin's key is in the list the release matches on
+    const auto off = win_rules_to_disable(rules);
+    REQUIRE(off.size() == 1);
+    CHECK(off[0] == win_rule_key(on));
+    for (const auto& t : twins) {
+        INFO(win_rule_key(t));
+        CHECK(win_rule_key(t) != win_rule_key(on));
+        CHECK(std::find(off.begin(), off.end(), win_rule_key(t)) == off.end());
+    }
+    // all the twins differ from each other too
+    std::set<std::string> keys;
+    for (const auto& r : rules)
+        keys.insert(win_rule_key(r));
+    CHECK(keys.size() == rules.size());
+
+    // an unreadable property is the same default on both sides, so a rule still matches itself
+    WinRuleInfo unread{.name = "x", .enabled = true};
+    CHECK(win_rule_key(unread) == win_rule_key(WinRuleInfo{.name = "x", .enabled = false}));
+
+    // every field survives the stored list
     const auto parsed = parse_disabled_rules(serialize_disabled_rules(off));
     REQUIRE(parsed);
     CHECK(*parsed == off);
@@ -5272,141 +5365,119 @@ TEST_CASE("log: what is logged for an outcome, at which level; the ticks stay qu
     }
 }
 
-// ── Windows hosts under Group Policy: contained by the rules, reported partial ──
+// ── Windows hosts under Group Policy: refused, never contained in part ──────
+//
+// Owner decision 2026-11-10: where LocalPolicyModifyState is GP_OVERRIDE a rule or default
+// written locally takes no effect, so the leg REFUSES (`gpo_override`, nothing written) and
+// reads `degraded|gpo_override` if the policy arrives mid-quarantine. Never partial, never
+// active, and no repair loop.
 
-TEST_CASE("gpo_override: residue outranks the others, is persisted, and every later read repeats it",
+TEST_CASE("gpo_override: the verdict, its token and the status read are one decision",
           "[agent][firewall_quarantine]") {
-    OsPayload os;
-    CHECK_FALSE(has_residue(os));
-    os.rules_not_disabled = 2;
-    CHECK(residue_reason(os) == "rules_not_disabled");
-    os.gpo_override = true;
-    CHECK(has_residue(os));
-    CHECK(residue_reason(os) == "gpo_override"); // the default action not in force outranks a rule that would not disable
-    const auto notes = residue_notes(os);
-    REQUIRE(notes.size() == 2);
-    CHECK(notes[0] == "gpo_override=1");
-    CHECK(notes[1] == "rules_not_disabled=2");
+    using K = WinSwitchVerdict::Kind;
+    const WinSwitchReading on{true, true, true};
 
-    // alone, it is the reason; it round-trips through the record text and a legacy
-    // record without the key still loads
-    QuarantineState rec = make_record();
-    rec.os.gpo_override = true;
-    const auto text = serialize_state(rec);
-    CHECK(text.find("gpo=1\n") != std::string::npos);
-    const auto back = parse_state(text);
-    REQUIRE(back);
-    CHECK(back->os.gpo_override);
-    CHECK(residue_reason(back->os) == "gpo_override");
-    QuarantineState plain = make_record();
-    CHECK_FALSE(parse_state(serialize_state(plain))->os.gpo_override);
+    // a definite GP_OVERRIDE reading refuses whatever the per-profile switch says...
+    const auto v = win_firewall_switch_verdict(on, true);
+    CHECK(v.kind == K::gpo_override);
+    const auto token = win_firewall_switch_token(v);
+    CHECK(token == "gpo_override");
+    CHECK(is_safe_token(token));
+    // ...and outranks a switched-off or unreadable profile (it is what no local action
+    // can change); without the reading nothing about the other kinds moves
+    CHECK(win_firewall_switch_verdict({false, true, true}, true).kind == K::gpo_override);
+    CHECK(win_firewall_switch_verdict({std::nullopt, true, true}, true).kind == K::gpo_override);
+    CHECK(win_firewall_switch_verdict(on, false).kind == K::ok);
+    CHECK(win_firewall_switch_verdict({true, false, true}, false).kind == K::disabled);
 
-    SECTION("status_from_record over a record that carries the residue") {
-        LegStatus ls;
-        ls.state = OsState::enforcing;
-        Outcome o;
-        detail::status_from_record(o, rec, ls);
-        CHECK(o.status == "partial");
-        CHECK(o.reason == "gpo_override");
-        CHECK(contains(o.notes, "gpo_override=1"));
-        CHECK(result_kind(o).partial);
-    }
-    SECTION("status_from_record over a live read that says so, before the residue is recorded") {
-        // a policy that arrived mid-quarantine: the record is clean, the leg is not
-        LegStatus ls;
-        ls.state = OsState::enforcing;
-        ls.partial = true;
-        ls.reason = "gpo_override";
-        Outcome o;
-        detail::status_from_record(o, plain, ls);
-        CHECK(o.status == "partial");
-        CHECK(o.reason == "gpo_override");
-        CHECK(o.status != "active");
-    }
-}
+    // the status read: not enforcing, a re-apply cannot help, no profile is named
+    LegStatus ls;
+    ls.state = OsState::enforcing; // a stale optimistic value must not survive
+    CHECK(win_switch_status(v, ls));
+    CHECK(ls.state == OsState::not_enforcing);
+    CHECK(ls.reason == "gpo_override");
+    CHECK_FALSE(ls.reapply_helps);
+    CHECK(ls.notes.empty());
 
-TEST_CASE("gpo_override: a Group Policy-managed host is contained and reported partial, never refused or active",
-          "[agent][firewall_quarantine]") {
-    ScriptRig rig;
-    // the Windows leg's apply writes the rules and the defaults, then reads the policy
-    // state: GP_OVERRIDE is residue and a partial apply
-    rig.leg.on_apply = [](OsPayload& os) {
-        os.gpo_override = true;
-        auto r = StepResult::success();
-        r.partial = true;
-        r.notes.emplace_back("gpo_override=1");
-        return r;
-    };
-    Deadline dl;
-    const auto o = apply_and_verify(rig.env, rig.request(), dl);
-    CHECK(o.status == "partial");
+    // over an active record the ladder answers degraded|gpo_override, never partial or active
+    const auto rec = make_record();
+    Outcome o;
+    detail::status_from_record(o, rec, ls);
+    CHECK(o.status == "degraded");
     CHECK(o.reason == "gpo_override");
-    CHECK(render_rows(o).front() == "status|partial|gpo_override");
-    CHECK(contains(o.notes, "gpo_override=1"));
-    REQUIRE(rig.store.state());
-    CHECK(rig.store.state()->phase == Phase::active);
-    CHECK(rig.store.state()->os.gpo_override);
+    CHECK(render_rows(o).front() == "status|degraded|gpo_override");
+    CHECK(result_kind(o).partial);
 
-    // every later status repeats it, from the record and from the live read
-    rig.leg.status.partial = true;
-    rig.leg.status.reason = "gpo_override";
-    rig.leg.status.notes = {"gpo_override=1"}; // the Windows leg's live read says it too
-    const auto st = report_status(rig.env, dl);
-    CHECK(st.status == "partial");
-    CHECK(st.reason == "gpo_override");
-    CHECK(std::count(st.notes.begin(), st.notes.end(), "gpo_override=1") == 1); // said once, not twice
-    CHECK(rig.store.state()->generation == 1);
-
-    // a retried quarantine answers the same and never re-applies (nothing a re-apply fixes)
+    // and the self-check tick over that LegStatus does not converge (reapply_helps=false)
+    ScriptRig rig;
+    Deadline dl;
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    rig.leg.status = ls;
     const int applies = rig.leg.applies;
-    const auto again = apply_and_verify(rig.env, rig.request(), dl);
-    CHECK(again.status == "partial");
-    CHECK(again.reason == "gpo_override");
-    CHECK(contains(again.notes, "already_active=1"));
-    CHECK(rig.leg.applies == applies);
-
-    // a restart that finds the policy in force says so as well, never `active`
-    const auto boot = recover_at_init(rig.env, dl);
-    CHECK(boot.status == "partial");
-    CHECK(boot.reason == "gpo_override");
-    CHECK(rig.leg.applies == applies);
-
-    // the unattended repair tick does not converge on it either
+    const auto saves = rig.store.saves;
     const auto tick = repair(rig.env, dl);
-    CHECK(tick.status == "partial");
+    CHECK(tick.status == "degraded");
     CHECK(tick.reason == "gpo_override");
     CHECK(rig.leg.applies == applies);
-    CHECK(log_level("repair", tick) == LogLevel::none);
-
-    // an update re-reads the policy: a policy that is gone clears the residue, one that
-    // stays keeps it
-    rig.leg.on_apply = [](OsPayload& os) {
-        os.gpo_override = false;
-        return StepResult::success();
-    };
-    rig.leg.status.partial = false;
-    rig.leg.status.reason.clear();
-    const auto cleared = update(rig.env, true, {ex("10.0.0.9:22/tcp/in")}, dl);
-    CHECK(cleared.status == "active");
-    CHECK_FALSE(rig.store.state()->os.gpo_override);
-    CHECK(report_status(rig.env, dl).status == "active");
+    CHECK(rig.store.saves == saves);
+    CHECK(log_level("repair", tick) == LogLevel::warn); // visible, but a re-apply is not attempted
 }
 
-TEST_CASE("gpo_override: a policy default that leaves the probe target reachable still rolls the first apply back",
+TEST_CASE("gpo_override: a Group Policy host is refused before anything is touched, and never re-applied over",
           "[agent][firewall_quarantine]") {
-    ScriptRig rig;
-    rig.leg.on_apply = [](OsPayload& os) {
-        os.gpo_override = true;
-        auto r = StepResult::success();
-        r.partial = true;
-        return r;
-    };
-    rig.probe.blocked = [] { return false; }; // the policy's default action lets the target through
-    Deadline dl;
-    const auto o = apply_and_verify(rig.env, rig.request(), dl);
-    CHECK(o.status == "rolled_back");
-    CHECK(o.reason == "probe_still_reachable");
-    CHECK_FALSE(rig.store.state()); // a containment that proved nothing is not left behind
+    SECTION("the initial quarantine is refused: no record, no apply") {
+        ScriptRig rig;
+        rig.leg.refuse = "gpo_override"; // preflight's token for the verdict
+        Deadline dl;
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "refused");
+        CHECK(o.reason == "gpo_override");
+        CHECK(render_rows(o)[1] == "refused|gpo_override");
+        CHECK(rig.leg.applies == 0);
+        CHECK(rig.store.raw.empty());
+    }
+    SECTION("a policy that arrives mid-quarantine: status degrades, nothing is re-applied, an update fails whole") {
+        ScriptRig rig;
+        Deadline dl;
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        const auto before = rig.store.state();
+        const int applies = rig.leg.applies;
+        rig.leg.status.state = OsState::not_enforcing;
+        rig.leg.status.reason = "gpo_override";
+        rig.leg.status.reapply_helps = false;
+
+        const auto st = report_status(rig.env, dl);
+        CHECK(st.status == "degraded");
+        CHECK(st.reason == "gpo_override");
+
+        // a retried quarantine answers what status would, and never re-applies
+        const auto again = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(again.status == "degraded");
+        CHECK(again.reason == "gpo_override");
+        CHECK(rig.leg.applies == applies);
+
+        // a no-op quarantine_allow reads the leg too (K1): never `active` over the gap
+        const auto noop = update(rig.env, false, {ex("10.9.9.9")}, dl);
+        CHECK(noop.status == "degraded");
+        CHECK(noop.reason == "gpo_override");
+        CHECK(contains(noop.notes, "exceptions_unchanged=1"));
+        CHECK(rig.leg.applies == applies);
+
+        // a quarantine_allow that changes the set reaches the leg, whose step 0 refuses:
+        // update_failed with the token, the previous generation stays in the record
+        rig.leg.on_apply = [](OsPayload&) { return StepResult::fail("gpo_override"); };
+        const auto u = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+        CHECK(u.status == "update_failed");
+        CHECK(u.reason == "gpo_override");
+        CHECK(rig.store.state()->allow == before->allow);
+        CHECK(rig.store.state()->generation == before->generation);
+
+        // the boot re-apply takes the same failed path and leaves the record active
+        const auto boot = recover_at_init(rig.env, dl);
+        CHECK(boot.status == "degraded");
+        CHECK(boot.reason == "reapply_failed:gpo_override");
+        CHECK(rig.store.state()->phase == Phase::active);
+    }
 }
 
 // ── the unattended self-check ───────────────────────────────────────────────
@@ -6057,4 +6128,113 @@ TEST_CASE("live peer: a server re-addressed AFTER containment still strands the 
     CHECK(rig.store.state()->phase == Phase::active);
     CHECK(rig.store.state()->allow.exceptions.empty());
     CHECK(rig.store.state()->generation == gen + 2); // the revert is itself a generation
+}
+
+TEST_CASE("repair: a live control peer missing from the stored set is admitted, and the proof is of it",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    PeerProbe net;
+    net.world = &rig.world;
+    net.up = {"198.51.100.7:50051", "203.0.113.200:50051"};
+    rig.env.probe = net.fn();
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    const auto stored = rig.store.state()->allow;
+
+    // the server moved after the quarantine; the agent learned the new address over another
+    // path; the table is flushed. Re-applying the stored set alone would block the channel
+    // the proof connects to, so the repair admits the live peer (published by agents/core).
+    rig.env.live_control = parse_live_peer("203.0.113.200:50051");
+    rig.world.table = false;
+    const auto o = repair(rig.env, dl);
+    CHECK(o.status == "active");
+    CHECK(contains(o.notes, "repaired=1"));
+    CHECK(contains(o.notes, "control_live_peer=203.0.113.200:50051"));
+    CHECK(contains(o.notes, "control_proved=live"));
+    const auto rec = rig.store.state();
+    REQUIRE(rec);
+    CHECK(rec->phase == Phase::active);
+    CHECK(rec->generation == 2); // one convergence, no revert generation
+    REQUIRE(rec->allow.control.size() == stored.control.size() + 1);
+    CHECK(rec->allow.control.front() == *rig.env.live_control);
+    CHECK(rec->allow.resolvers == stored.resolvers); // nothing else is rewritten
+    CHECK(rec->allow.exceptions == stored.exceptions);
+    CHECK(rig.world.text.find("203.0.113.200") != std::string::npos); // the host's table admits it
+    CHECK(rec->last_verify.starts_with("verified"));
+    CHECK(report_status(rig.env, dl).status == "active");
+
+    // a peer already first in the set changes nothing and says nothing
+    rig.world.table = false;
+    const auto again = repair(rig.env, dl);
+    CHECK(again.status == "active");
+    CHECK_FALSE(contains(again.notes, "control_live_peer=203.0.113.200:50051"));
+    CHECK(rig.store.state()->allow.control == rec->allow.control);
+}
+
+TEST_CASE("repair: a live peer that would push the control set past the cap is left out, and said",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    PeerProbe net;
+    net.world = &rig.world;
+    net.up = {"198.51.100.1:50051"};
+    rig.env.probe = net.fn();
+    std::string many;
+    for (std::size_t i = 1; i <= kMaxControlIps; ++i)
+        many += (many.empty() ? "" : ",") + std::format("198.51.100.{}", i);
+    const auto full = build_allow_set(many, "198.51.100.1:50051", {"203.0.113.53"}, {});
+    REQUIRE(full);
+    ApplyRequest req;
+    req.allow = *full;
+    req.probe_target = kProbeTarget;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, req, dl).status == "active");
+
+    rig.env.live_control = parse_live_peer("203.0.113.200:50051");
+    rig.world.table = false;
+    const auto o = repair(rig.env, dl);
+    CHECK(contains(o.notes, "control_live_peer_over_cap=1"));
+    CHECK_FALSE(contains(o.notes, "control_live_peer=203.0.113.200:50051"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->allow.control == full->control); // never past the cap
+    CHECK(rig.world.table);                                  // the repair still re-applied
+}
+
+TEST_CASE("repair: a failed proof keeps what it applied -- one load, no revert, never `active`",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    PeerProbe net;
+    net.world = &rig.world;
+    net.up = {"198.51.100.7:50051"}; // the live peer below does not answer
+    rig.env.probe = net.fn();
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+
+    rig.env.live_control = parse_live_peer("203.0.113.200:50051");
+    rig.world.table = false;
+    const auto loads = [&] {
+        return std::count_if(rig.world.log.begin(), rig.world.log.end(),
+                             [](const Argv& a) { return a.size() > 1 && a[1] == "-f"; });
+    };
+    const auto loads_before = loads();
+    const auto o = repair(rig.env, dl);
+    CHECK(o.status == "active_unproven");
+    CHECK(contains(o.notes, "repaired=1"));
+    CHECK(loads() == loads_before + 1); // one apply: a revert would be a second flush per tick
+    const auto rec = rig.store.state();
+    REQUIRE(rec);
+    CHECK(rec->phase == Phase::active);
+    CHECK(rec->generation == 2); // no revert generation
+    CHECK(rig.world.table);
+    // a FRESH proof text, never the stale `verified` the previous generation carried
+    CHECK(rec->last_verify.starts_with("control_unreachable"));
+    CHECK_FALSE(rec->last_verify.starts_with("verified"));
+    CHECK(rec->repairs == 1);
+
+    // the next tick reads the host as enforcing and does nothing: no second load, no save
+    const auto saves = rig.store.saves;
+    const auto next = repair(rig.env, dl);
+    CHECK(next.status == "active_unproven");
+    CHECK(loads() == loads_before + 1);
+    CHECK(rig.store.saves == saves);
+    CHECK(report_status(rig.env, dl).status == "active_unproven");
 }

@@ -1844,10 +1844,18 @@ struct OwnedBstr {
     return r.get_Enabled(&e) == S_OK && e != VARIANT_FALSE;
 }
 
-/// Name, group, enabled state, direction and profile mask of one rule: the identity
-/// the disable list and the release match on (fq::win_rule_key). A direction or
-/// profile that cannot be read is 0 on BOTH the disable and the release side, so a
-/// rule is still matched consistently.
+/// One BSTR property of a rule (ports, application, service); empty when it is unset
+/// or cannot be read -- the same on the disable and the release side.
+[[nodiscard]] std::string rule_text_of(INetFwRule& r, HRESULT (STDMETHODCALLTYPE INetFwRule::*get)(BSTR*)) {
+    OwnedBstr b;
+    return (r.*get)(&b.b) == S_OK ? b.str() : std::string{};
+}
+
+/// Name, group, enabled state and every property that can tell two same-named rules
+/// apart (direction, profile mask, protocol, ports, application, service, action):
+/// the identity the disable list and the release match on (fq::win_rule_key). A
+/// property that cannot be read keeps its default (0, -1 or empty) on BOTH the
+/// disable and the release side, so a rule is still matched consistently.
 [[nodiscard]] fq::WinRuleInfo rule_info_of(INetFwRule& r) {
     fq::WinRuleInfo info;
     info.name = rule_name_of(r);
@@ -1859,6 +1867,16 @@ struct OwnedBstr {
     long profiles = 0;
     if (r.get_Profiles(&profiles) == S_OK)
         info.profiles = static_cast<int>(profiles);
+    long protocol = 0;
+    if (r.get_Protocol(&protocol) == S_OK)
+        info.protocol = static_cast<int>(protocol);
+    NET_FW_ACTION action = NET_FW_ACTION_MAX;
+    if (r.get_Action(&action) == S_OK)
+        info.action = static_cast<int>(action);
+    info.local_ports = rule_text_of(r, &INetFwRule::get_LocalPorts);
+    info.remote_ports = rule_text_of(r, &INetFwRule::get_RemotePorts);
+    info.application = rule_text_of(r, &INetFwRule::get_ApplicationName);
+    info.service = rule_text_of(r, &INetFwRule::get_ServiceName);
     return info;
 }
 
@@ -1949,14 +1967,11 @@ public:
         });
         if (legacy)
             return std::string{"legacy_quarantine_active"};
-        // A profile whose firewall is switched off (or cannot be read) would make
-        // every rule below inert: refuse before anything is touched.
-        const auto why = fq::win_firewall_switch_token(
-            fq::win_firewall_switch_verdict(read_switch(*policy.get())));
-        if (!why.empty())
+        // A profile whose firewall is switched off (or cannot be read) would make every
+        // rule below inert, and a Group Policy-managed firewall ignores local rules and
+        // defaults altogether (`gpo_override`): refuse before anything is touched.
+        if (auto why = fq::win_firewall_switch_token(read_verdict(*policy.get())); !why.empty())
             return why;
-        // A Group Policy default action is NOT a refusal: the rules still apply, and
-        // apply() records `gpo_override` as residue (partial, never active).
         return std::nullopt;
     }
 
@@ -1976,10 +1991,10 @@ public:
             return fq::StepResult::fail(hr_token("rules_create", hr));
         yuzu::PluginContext pc{raw_};
 
-        // 0. The master switch, per profile. An init re-apply and an update do not
-        //    pass through preflight, and nothing has been written yet.
-        if (const auto why = fq::win_firewall_switch_token(
-                fq::win_firewall_switch_verdict(read_switch(*policy.get())));
+        // 0. The master switch, per profile, and the Group Policy override. An init
+        //    re-apply and an update do not pass through preflight, and nothing has
+        //    been written yet.
+        if (const auto why = fq::win_firewall_switch_token(read_verdict(*policy.get()));
             !why.empty())
             return fq::StepResult::fail(why);
 
@@ -2037,9 +2052,10 @@ public:
         // 3. The disable list, stored BEFORE the first rule is touched: a crash
         //    after disabling must not strand rules nobody remembers. The first
         //    apply writes it; later applies only ever add keys (a rule created
-        //    or re-enabled during the quarantine is disabled too). A key is
-        //    name|direction|profiles, so same-named stock rules on other profiles
-        //    are told apart.
+        //    or re-enabled during the quarantine is disabled too). A key carries every
+        //    property that tells same-named rules apart (fq::win_rule_key), so a
+        //    disabled twin that differs only by protocol, ports, program, service
+        //    or action is never switched on by the release.
         const auto to_disable = fq::win_rules_to_disable(infos);
         const std::string list_key{fq::kWinDisabledRulesKey};
         const auto list_presence = kv_presence(raw_, list_key);
@@ -2121,13 +2137,6 @@ public:
         }
         undo.committed = true; // this generation is in force; nothing below can fail the update
 
-        // A Group Policy default action beats the profile defaults written above: the
-        // rules are in force, the default block is not. Applied anyway (the owner's
-        // ruling) and recorded as residue like a rule that would not disable, so every
-        // later status repeats `partial|gpo_override`. Re-read on every apply, so a
-        // policy that is gone clears it and one that arrived sets it.
-        const bool gpo = policy_overridden(*policy.get());
-
         // 7. Remove the stale generation's rules LAST. One that will not go is
         //    not a failed update (this generation is in force) but it IS a live
         //    allowance the record no longer lists -- an Allow rule outranks the
@@ -2151,11 +2160,6 @@ public:
         if (refused > 0) {
             ok.partial = true;
             ok.notes.push_back(std::format("rules_not_disabled={}", refused));
-        }
-        os.gpo_override = gpo;
-        if (gpo) {
-            ok.partial = true;
-            ok.notes.emplace_back("gpo_override=1");
         }
         return ok;
     }
@@ -2185,8 +2189,9 @@ public:
         const auto ours_at_start = collect_our_rule_names(*rules.get(), dl);
         if (!ours_at_start)
             return enum_fail(dl);
-        // 2. Re-enable what quarantine disabled. Matched on name + direction + profile
-        //    (a stock rule that was OFF on another profile stays off).
+        // 2. Re-enable what quarantine disabled. Matched on the whole rule key
+        //    (fq::win_rule_key): a rule that was OFF before, or a twin differing only
+        //    by protocol, ports, program, service or action, stays off.
         const std::string list_key{fq::kWinDisabledRulesKey};
         const auto list_presence = kv_presence(raw_, list_key);
         const bool list_exists = list_presence == fq::KvPresence::present;
@@ -2242,6 +2247,14 @@ public:
             if (!prior)
                 result.notes.emplace_back("prior_policy_unavailable=1");
         }
+        // A default action that is not back (or could not be read) still BLOCKS, and our
+        // allowances are the only thing keeping the control channel and DNS open: deleting
+        // them now would strand the host block/block with no way back (the repair tick
+        // skips a `releasing` record). Stop here with them in place; the record stays
+        // `releasing` and the next release or start retries, which is safe because step 2
+        // only re-enables listed rules that are still disabled and step 3 is idempotent.
+        if (tally.policy_restore_failed > 0)
+            return release_incomplete(fq::win_release_decision(tally), result.notes);
 
         // 4. Our rules, by group, until none is left (Remove(name) takes one rule
         //    per call, and a rule added concurrently by a racing apply must not
@@ -2276,15 +2289,10 @@ public:
                 tally.images_not_deleted = true;
             decision = fq::win_release_decision(tally);
         }
-        if (decision.incomplete) {
-            auto r = fq::StepResult::fail("release_incomplete");
-            r.notes = std::move(decision.notes);
-            r.notes.insert(r.notes.end(), result.notes.begin(), result.notes.end());
-            return r;
-        }
+        if (decision.incomplete)
+            return release_incomplete(std::move(decision), result.notes);
         os.rules_not_disabled = 0;
         os.stale_rules_left = 0;
-        os.gpo_override = false;
         result.notes.insert(result.notes.end(), decision.notes.begin(), decision.notes.end());
         return result;
     }
@@ -2305,7 +2313,7 @@ public:
                 return true;
             }))
             return st; // unreadable (or out of time): never a guess
-        const auto sw = fq::win_firewall_switch_verdict(read_switch(*policy.get()));
+        const auto sw = read_verdict(*policy.get());
         bool all_block = true;
         for (const auto profile : kQuarantineProfiles) {
             NET_FW_ACTION in = NET_FW_ACTION_ALLOW, out = NET_FW_ACTION_ALLOW;
@@ -2319,20 +2327,12 @@ public:
             st.notes.emplace_back("legacy_quarantine_rules_present=1");
         if (!group && all_block)
             st.notes.emplace_back("rules_missing=1"); // block/block with no rules of ours
+        // A switched-off profile, an unreadable switch and a Group Policy-managed firewall
+        // (`gpo_override`: local rules and defaults take no effect, whatever
+        // get_Default*Action says, so a policy that arrived mid-quarantine reads
+        // not_enforcing here and a re-apply cannot help) all settle the status.
         if (fq::win_switch_status(sw, st))
             return st;
-        if (group && policy_overridden(*policy.get())) {
-            // A Group Policy default action overrides the local defaults we write: our
-            // rules are in force, the default block is not, whatever get_Default*Action
-            // says. Enforcing but PARTIAL (the status answers partial|gpo_override with
-            // or without the residue recorded: a policy can arrive mid-quarantine), and
-            // never something a re-apply fixes -- it would write the same local value.
-            st.state = fq::OsState::enforcing;
-            st.partial = true;
-            st.reason = "gpo_override";
-            st.notes.emplace_back("gpo_override=1");
-            return st;
-        }
         st.state = (group && all_block) ? fq::OsState::enforcing : fq::OsState::not_enforcing;
         if (st.state == fq::OsState::not_enforcing)
             st.reason = "policy_not_blocking";
@@ -2340,9 +2340,10 @@ public:
     }
 
 private:
-    /// LocalPolicyModifyState == GP_OVERRIDE: a Group Policy default action beats
-    /// the profile defaults written here. Only a definite S_OK reading says yes; an
-    /// unreadable state is not an override (the default reads decide the rest).
+    /// LocalPolicyModifyState == GP_OVERRIDE: the firewall is controlled by Group
+    /// Policy, so a rule or default written here takes no effect. Only a definite S_OK
+    /// reading says yes; an unreadable state is not an override (the default reads
+    /// decide the rest). Policy-wide: one reading covers every profile.
     [[nodiscard]] static bool policy_overridden(INetFwPolicy2& policy) {
         NET_FW_MODIFY_STATE state = NET_FW_MODIFY_STATE_OK;
         return policy.get_LocalPolicyModifyState(&state) == S_OK &&
@@ -2359,6 +2360,23 @@ private:
                 FwHrResult::Ok)
                 r[i] = on != VARIANT_FALSE;
         }
+        return r;
+    }
+
+    /// The master switch and the Group Policy override as ONE verdict: the single
+    /// pure decision (fq::win_firewall_switch_verdict) that preflight, apply step 0 and
+    /// read_status all route through, so the three can never disagree.
+    [[nodiscard]] static fq::WinSwitchVerdict read_verdict(INetFwPolicy2& policy) {
+        return fq::win_firewall_switch_verdict(read_switch(policy), policy_overridden(policy));
+    }
+
+    /// `release_incomplete`: what a release that could not finish reports, with the
+    /// decision's notes first and the step notes after.
+    [[nodiscard]] static fq::StepResult release_incomplete(fq::WinReleaseDecision decision,
+                                                           const std::vector<std::string>& step_notes) {
+        auto r = fq::StepResult::fail("release_incomplete");
+        r.notes = std::move(decision.notes);
+        r.notes.insert(r.notes.end(), step_notes.begin(), step_notes.end());
         return r;
     }
 
@@ -2942,9 +2960,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "INetFwPolicy2 COM rule group + per-profile default-block; other enabled rules "
          "disabled for the duration",
          "rules the policy store refuses to disable (GPO) leave the result partial; a host whose "
-         "firewall policy is Group Policy-managed (LocalPolicyModifyState GP_OVERRIDE) is contained "
-         "by its rules only and reports partial|gpo_override (a Group Policy default action beats "
-         "the profile default-block); contains the host's own IP traffic and traffic the host "
+         "firewall policy is Group Policy-managed (LocalPolicyModifyState GP_OVERRIDE) is refused "
+         "gpo_override and changes nothing (a rule or default written locally takes no effect "
+         "there), and reads degraded|gpo_override if the policy arrives mid-quarantine; contains "
+         "the host's own IP traffic and traffic the host "
          "routes (Hyper-V external-switch guests are not contained); a ttl_seconds limit rides the host "
          "wall clock (NTP is blocked while contained) and its expiry release is logged on the "
          "agent only"},
