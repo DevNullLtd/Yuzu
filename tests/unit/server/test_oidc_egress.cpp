@@ -1489,6 +1489,8 @@ TEST_CASE("OIDC resolver: a probe refused by a full pool is not remembered - the
     BoundedLookupGuard guard(make_lookup(st), pool);
     learn_prefix(*st);
     OidcProvider::expire_nat64_discovery_cache_for_test(); // the next fetch is due to probe
+    // The worker frees its slot just after waking the caller, so a cap-1 pool can still read 1.
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
 
     {
         VetThread holder(st->gate, "slow.a.test", 10000);
@@ -1568,7 +1570,7 @@ TEST_CASE("OIDC resolver: discovery refused for a full pool is retried only afte
           "and Test Connection does not wait for the window",
           "[oidc][oidc_egress][oidc_resolver][oidc_discovery]") {
     Nat64CacheReset cache;
-    constexpr int kWindowMs = 800;
+    constexpr int kWindowMs = 1500;
     auto pool = std::make_shared<net::ResolverPool>(1);
     auto st = std::make_shared<LookupState>();
     st->other_status = net::ResolveStatus::kNotFound; // a lookup that does run finds nothing
@@ -1586,7 +1588,8 @@ TEST_CASE("OIDC resolver: discovery refused for a full pool is retried only afte
     }
     REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
 
-    if (std::chrono::steady_clock::now() < first_attempt + std::chrono::milliseconds(kWindowMs / 2)) {
+    if (std::chrono::steady_clock::now() <
+        first_attempt + std::chrono::milliseconds(kWindowMs / 2)) {
         // Inside the window the pool is free, but the failed attempt is not retried.
         CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
         CHECK(st->others.load() == 0);
@@ -1595,7 +1598,7 @@ TEST_CASE("OIDC resolver: discovery refused for a full pool is retried only afte
         CHECK_FALSE(doc.has_value());
         CHECK(st->others.load() == 1);
     } else {
-        WARN("the box stalled past half the window: the in-window checks were skipped");
+        WARN("the host stalled past half the window: the in-window checks were skipped");
     }
 
     // After the window a login attempt performs a lookup again.
