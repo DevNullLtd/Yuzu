@@ -6,7 +6,7 @@ Range: `origin/dev..HEAD` (branch `feat/virtualization-runtime-posture`)
 
 This diff adds one **socket** (an `httplib::Client` over a unix domain socket, call-scoped, opened per
 request) and one **file descriptor** (the `O_PATH` endpoint descriptor), both RAII-owned and both
-opened only when the operator sets `agent.runtime_endpoint`, and, per request, one **thread** (the
+opened only when the operator sets `agent.container_runtime_endpoint`, and, per request, one **thread** (the
 deadline watchdog, R9), owned and joined by an RAII guard. It adds no detached thread, subprocess,
 `FILE*`, `sqlite3*`, OpenSSL object, mapped library or temp path. The nlohmann values are value types.
 
@@ -20,7 +20,7 @@ deadline watchdog, R9), owned and joined by an RAII guard. It adds no detached t
 | R4 | Parsed JSON (`nlohmann::json`) | `ParsedJson` locals | `parse_limited` (non-throwing, callback discards nesting past 32) | scope exit | readers take const references | value type; nothing deeper than 32 levels is ever built |
 | R5 | Rows (`std::vector<ContainerRow>`, `ConfigRow`, formatted strings) | locals of `runtime_posture_linux` | from the list reply, capped at 256 rows; inspections at 64 | moved into the `Posture` | to `report` | value types; fields are truncated to 256 bytes (64 for network mode and versions) before escaping |
 | R6 | `std::atomic<bool>` single-flight flag (`runtime_posture_flight`) | function-local static, process lifetime | `compare_exchange_strong` at the top of the leg | the `Release` guard's destructor on every exit path, an exception included | none | RAII guard; a concurrent dispatch returns `busy` without touching the filesystem or the socket |
-| R7 | Operator endpoint string (`g_runtime_endpoint`) | namespace-scope `inline` `std::string` behind an `inline` `std::mutex` (both constant-initialised) | `init()` copies `agent.runtime_endpoint` | process lifetime | read by copy | none; written once in `init()`, read under the mutex |
+| R7 | Operator endpoint string (`g_container_runtime_endpoint`) | namespace-scope `inline` `std::string` behind an `inline` `std::mutex` (both constant-initialised) | `init()` copies `agent.container_runtime_endpoint` | process lifetime | read by copy | none; written once in `init()`, read under the mutex |
 | R8 | `static constexpr Legs kLegs` (now three leg pointers) | static storage, constant-initialised | none | none | none | none |
 | R9 | Deadline watchdog thread (`DeadlineWatchdog`: one `std::thread`, a `std::mutex`, a `std::condition_variable`, a `bool`) | local of `one_request`, declared AFTER the `httplib::Client` it holds a reference to | per request, immediately before `Client::Get`; a failed thread start is a `std::system_error` that propagates to the one ABI `catch(...)` with nothing to release | the guard's destructor sets `done` under the mutex, notifies and JOINS, on every exit path (return and exception alike); it runs before the client's destructor, so the thread never outlives the client it calls `stop()` on | none; never detached, never moved | RAII; the thread only waits on the condition variable and, once the budget has passed, calls `Client::stop()` (the client's cross-thread-safe call: it shuts the in-flight socket down under the client's own mutex) every 100 ms until `done`, so it takes no other lock and holds its own only while checking `done` |
 
@@ -42,7 +42,7 @@ shell and again in the seam. The deadline logic is unit-tested over an injected 
 | Resource | Owner | This diff's interaction |
 |---|---|---|
 | plugin `execute()` | `VirtualizationPlugin` | `execute_action` gains a third arm; still one `try { ... } catch (...) { ... }` around the whole body, the catch writing a fixed-token status row named for the action in its own nested `try`/`catch (...)`. The leg itself adds no `catch`. |
-| `AgentConfig` / `plugin_ctx_.config` | agent core | one string field and one config key (`agent.runtime_endpoint`) beside `agent.data_dir`; copied at agent construction, no lifetime change. |
+| `AgentConfig` / `plugin_ctx_.config` | agent core | one string field and one config key (`agent.container_runtime_endpoint`) beside `agent.data_dir`; copied at agent construction, no lifetime change. |
 
 ## Tests
 
