@@ -323,7 +323,13 @@ the last echo.db quarantine ever recorded on the device (`0` = never);
 `db_health|quarantined|<epoch>` is reported only by the agent process whose
 startup quarantined a corrupt database (see "Corrupt-database quarantine" below).
 The fact is persisted in `echo_config` (`db_health_last_quarantine_epoch` /
-`db_health_last_quarantine_file`, basename only), so it survives restarts.
+`db_health_last_quarantine_file`, basename only) once the quarantine completed and
+the fresh database opened, so it then survives restarts. When the corrupt file
+could not be moved aside, or was kept under its `.corrupt-<epoch>` name because
+`echo.db` was replaced after the claim (see "Corrupt-database quarantine" below),
+the open fails before that write and nothing is persisted: the fact is then in
+the agent log and the kept file only, and the next start judges the file at
+`echo.db` afresh.
 
 **Per-source health.** `<source>_last_status` is the terminal outcome token of
 the source's most recent collection (`never_ran` until it has run in this agent
