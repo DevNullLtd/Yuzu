@@ -775,6 +775,8 @@ TEST_CASE("runtime seam: the action deadline is checked before every request",
         CHECK(f.calls.size() == 2); // the second request still fits in 1 ms ...
         CHECK(has_token(p, "info:timeout")); // ... and takes 19.999 s of it ...
         CHECK(has_token(p, "deadline_exhausted")); // ... so the third does not go out
+        CHECK(rows_with(p, "config|").empty()); // the late /info body (cgroup driver) is not read
+        CHECK(p.status == StatusState::constrained);
     }
 }
 
