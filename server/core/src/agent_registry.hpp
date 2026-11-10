@@ -1533,8 +1533,9 @@ public:
     /// memory is per-process and pruned every ~90 s): the sink
     /// (EchoCorruptionAuditGate) owns durable dedup and its own rate limit; a
     /// failed write is retried after the gate's degraded window, and a
-    /// candidate skipped only because the gate's slot was busy is retried on
-    /// the next heartbeat -- see echo_corruption_audit.hpp for the distinction.
+    /// candidate skipped because that agent's lookup was already in flight (or
+    /// the in-flight set is at its bound) is retried on the next heartbeat --
+    /// see echo_corruption_audit.hpp for the distinction.
     /// This is the store's first plugin-specific side-effecting hook -- a
     /// second consumer of the same "surface a candidate, let an injected sink
     /// durably dedup it" shape should generalize this to a small named-sink
