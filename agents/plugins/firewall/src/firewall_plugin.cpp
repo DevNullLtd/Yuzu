@@ -3064,7 +3064,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "INetFwPolicy2 COM rule-group removal, prior-policy restore, disabled rules re-enabled",
-         nullptr},
+         "a rule edited during the quarantine is re-found by name, direction and profile when that "
+         "is unambiguous, else the release completes partial|rules_unmatched (record erased, "
+         "nothing of ours left); a rule the policy store will not re-enable is noted "
+         "rules_not_reenabled"},
     },
     {
         /* .action      = */ "quarantine_status",

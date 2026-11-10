@@ -4615,6 +4615,54 @@ TEST_CASE("windows release: a retried release finds the rules a first attempt al
     CHECK(plan.unmatched == 0); // a listed rule that is on again is accounted for, not unmatched
 }
 
+TEST_CASE("windows release: a retry after the identity fallback finds the edited rule already on",
+          "[agent][firewall_quarantine]") {
+    const auto before = stock_rule("Rule A", true, "C:\\old.exe");
+    const auto listed = win_rule_key(before);
+    auto edited = before; // the program changed between the disable and the release
+    edited.enabled = false;
+    edited.application = "C:\\new.exe";
+
+    // first attempt: the fallback switches the edited rule back on, a guess it reports
+    auto plan = win_release_plan({listed}, {edited});
+    CHECK(plan.reenable == std::vector<std::size_t>{0});
+    CHECK(plan.by_identity == 1);
+
+    // the first attempt was left incomplete and the record kept the same list: the rule is on
+    // now, so the retry has nothing to switch and nothing it cannot account for
+    edited.enabled = true;
+    plan = win_release_plan({listed}, {edited});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.unmatched == 0);
+    CHECK(plan.unmatched_keys.empty());
+
+    // two enabled rules carry the identity: cannot be told from a deletion, so it is reported
+    auto other = edited;
+    other.application = "C:\\third.exe";
+    plan = win_release_plan({listed}, {edited, other});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.unmatched == 1);
+
+    // an untouched twin that an exact key already accounts for is not a candidate: the edited
+    // rule is the one enabled rule left, so a retry over both reports nothing unmatched
+    const auto twin = stock_rule("Rule A", true, "C:\\twin.exe");
+    plan = win_release_plan({listed, win_rule_key(twin)}, {edited, twin});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.unmatched == 0);
+
+    // a disabled candidate still wins over an enabled one (the existing fallback), and a rule
+    // of ours is never counted
+    auto off = edited;
+    off.enabled = false;
+    off.application = "C:\\fourth.exe";
+    plan = win_release_plan({listed}, {edited, off});
+    CHECK(plan.reenable == std::vector<std::size_t>{1});
+    CHECK(plan.by_identity == 1);
+    CHECK(plan.unmatched == 0);
+}
+
 TEST_CASE("windows release: an edited rule falls back to its identity only when exactly one disabled rule carries it",
           "[agent][firewall_quarantine]") {
     const auto before = stock_rule("Rule A", true, "C:\\old.exe");
@@ -4730,6 +4778,47 @@ TEST_CASE("windows release over the driver: an unmatched rule completes the rele
     settle_triggers(o, trig, rig.store);
     CHECK(trig.unregistered_count(kRepairTriggerId) == 1);
     CHECK(trig.unregistered_count(kTtlTriggerId) == 1);
+}
+
+TEST_CASE("triggers: teardown follows the record, not the reason of a stateless partial",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    Deadline dl;
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+
+    // a failed release with nothing stored (the record erased by an earlier release) has no
+    // quarantine left to bound: both triggers go, whatever the reason string says
+    const auto record = rig.store.raw;
+    rig.store.raw.clear();
+    rig.leg.on_remove = [](OsPayload&) { return StepResult::fail("os_busy"); };
+    auto gone = release(rig.env, ReleaseRequest{}, dl);
+    REQUIRE(gone.status == "partial");
+    REQUIRE(gone.reason.starts_with("release_failed"));
+    REQUIRE_FALSE(gone.state);
+    FakeTriggers trig;
+    settle_triggers(gone, trig, rig.store);
+    CHECK(trig.unregistered_count(kRepairTriggerId) == 1);
+    CHECK(trig.unregistered_count(kTtlTriggerId) == 1);
+    CHECK(trig.registered.empty());
+
+    // the same stateless partial over a store that cannot ANSWER is not "gone": the safeguard
+    // stays registered (a bookkeeping failure never lifts containment)
+    rig.store.fault = true;
+    Outcome unknown;
+    unknown.status = "partial";
+    unknown.reason = "release_failed:os_busy";
+    FakeTriggers kept;
+    settle_triggers(unknown, kept, rig.store);
+    CHECK(kept.unregistered.empty());
+    CHECK(kept.registered.empty());
+
+    // and so is one over a record that still exists but was not attached to the outcome
+    rig.store.fault = false;
+    rig.store.raw = record;
+    REQUIRE(rig.store.state());
+    FakeTriggers present;
+    settle_triggers(unknown, present, rig.store);
+    CHECK(present.unregistered.empty());
 }
 
 TEST_CASE("windows release: a default action that will not restore names its profile",

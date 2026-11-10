@@ -1558,9 +1558,14 @@ win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
 ///    program, ports, service or action during the quarantine, which changes the key): the
 ///    rule comes back on when exactly ONE still-disabled rule not already claimed carries
 ///    the key's name|direction|profiles. A best guess, so the shell reports how often it
-///    was taken. Residual, cannot be told apart: a listed rule DELETED during the quarantine
-///    beside a same-identity rule that was off before looks like an edit, and that one is
-///    switched on.
+///    was taken. With no such disabled rule, exactly ONE enabled unclaimed rule of that
+///    identity accounts for the key: the edited rule an earlier attempt's fallback already
+///    switched on (nothing to switch, no guess to report), so a retry of an incomplete
+///    release does not call it unmatched. An exact match claims its rule enabled or not,
+///    so an untouched twin is never that candidate. Residual, cannot be told apart: a
+///    listed rule DELETED during the quarantine beside a same-identity rule that was off
+///    before looks like an edit (switched on while disabled, taken as accounted for once
+///    enabled).
 /// 3. Otherwise the key is unmatched: more than one candidate, or none. The release still
 ///    completes (nothing of ours is left behind); it is reported, never silent.
 struct WinReleasePlan {
@@ -1574,13 +1579,12 @@ struct WinReleasePlan {
                                                      const std::vector<WinRuleInfo>& rules) {
     WinReleasePlan plan;
     std::unordered_map<std::string, std::vector<std::size_t>> by_key;
-    std::unordered_map<std::string, std::vector<std::size_t>> disabled_by_identity;
+    std::unordered_map<std::string, std::vector<std::size_t>> same_identity;
     for (std::size_t i = 0; i < rules.size(); ++i) {
         if (is_our_win_rule(rules[i].name, rules[i].group))
             continue;
         by_key[win_rule_key(rules[i])].push_back(i);
-        if (!rules[i].enabled)
-            disabled_by_identity[win_rule_identity(rules[i])].push_back(i);
+        same_identity[win_rule_identity(rules[i])].push_back(i);
     }
     std::vector<bool> claimed(rules.size(), false);
     std::unordered_set<std::string> seen;
@@ -1593,26 +1597,35 @@ struct WinReleasePlan {
             orphans.push_back(&key);
             continue;
         }
-        for (const auto i : it->second)
-            if (!rules[i].enabled && !claimed[i]) {
-                claimed[i] = true;
+        for (const auto i : it->second) {
+            if (!rules[i].enabled && !claimed[i])
                 plan.reenable.push_back(i);
-            }
+            claimed[i] = true;
+        }
     }
     for (const auto* key : orphans) {
-        std::optional<std::size_t> only;
-        int candidates = 0;
-        if (const auto it = disabled_by_identity.find(win_key_identity(*key));
-            it != disabled_by_identity.end())
-            for (const auto i : it->second)
-                if (!claimed[i]) {
-                    only = i;
-                    ++candidates;
+        std::optional<std::size_t> off;
+        std::optional<std::size_t> on;
+        int disabled = 0;
+        int enabled = 0;
+        if (const auto it = same_identity.find(win_key_identity(*key)); it != same_identity.end())
+            for (const auto i : it->second) {
+                if (claimed[i])
+                    continue;
+                if (rules[i].enabled) {
+                    on = i;
+                    ++enabled;
+                } else {
+                    off = i;
+                    ++disabled;
                 }
-        if (candidates == 1) {
-            claimed[*only] = true;
-            plan.reenable.push_back(*only);
+            }
+        if (disabled == 1) {
+            claimed[*off] = true;
+            plan.reenable.push_back(*off);
             ++plan.by_identity;
+        } else if (disabled == 0 && enabled == 1) {
+            claimed[*on] = true; // already back on: accounted for, nothing to switch
         } else {
             ++plan.unmatched;
             plan.unmatched_keys.push_back(*key);
@@ -4342,11 +4355,17 @@ public:
 /// poll of either trigger (`ttl_not_expired`, `repair_tick`) registers nothing: both
 /// are already in place, and re-registering every 30 or 60 s logs a replace and a fire
 /// each time. A poll that found no record (`inactive`) unregisters both, so a trigger
-/// that outlived a release stops.
+/// that outlived a release stops, as does any stateless `partial` over a record that
+/// reads absent (a release that erased it).
 inline void settle_triggers(Outcome& o, TriggerRegistry& triggers, StateStore& store) {
-    // A release that completed with rules it could not account for is `partial`, but its
-    // record is gone like an `inactive` one's, so its triggers go too.
-    if (o.status == "inactive" || (o.status == "partial" && o.reason == "rules_unmatched")) {
+    // The triggers go with the record. A `partial` outcome that still has one carries it in
+    // `o.state`; a stateless one is a release that completed with rules it could not account
+    // for (`rules_unmatched`, the record erased) or a failure with nothing stored, and only a
+    // positive read of an ABSENT record says which. An unreadable store keeps them: a
+    // bookkeeping failure never lifts a safeguard. The read runs only on a stateless
+    // `partial`, never on the 30 or 60 s ticks (they carry the record).
+    if (o.status == "inactive" ||
+        (o.status == "partial" && !o.state && store.load().kind == StateLoad::Kind::absent)) {
         (void)triggers.unregister_trigger(kRepairTriggerId);
         (void)triggers.unregister_trigger(kTtlTriggerId);
         return;

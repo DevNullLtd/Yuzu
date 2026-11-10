@@ -163,6 +163,7 @@ An `error|nftables:table:<reason>` row can appear next to a later successful `ba
 - **`quarantine_allow` / Linux** — the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges
 - **`quarantine_status` / macOS** — read-only; a disabled pf, a dangling anchor or an earlier sibling reads degraded
 - **`quarantine_status` / Linux** — netlink needs CAP_NET_ADMIN, which the unprivileged agent lacks: the sudo read is the usual path, and on the packaged systemd unit (NoNewPrivileges, no sudoers) it fails, so a host with a stored record reads degraded; needs the installer's sudoers grant on a unit without NoNewPrivileges
+- **`release` / Windows** — a rule edited during the quarantine is re-found by name, direction and profile when that is unambiguous, else the release completes partial|rules_unmatched (record erased, nothing of ours left); a rule the policy store will not re-enable is noted rules_not_reenabled
 - **`release` / macOS** — connections cut by the apply-time state flush are not restored; a token pf no longer knows is noted, not an error
 - **`release` / Linux** — the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges
 <!-- END GENERATED -->
