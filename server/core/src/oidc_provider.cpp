@@ -1,6 +1,7 @@
 #include "oidc_provider.hpp"
 #include "oidc_vetted_host.hpp"
 
+#include "bounded_resolver.hpp"
 #include "evp_raii.hpp"
 #include "oidc_abandoned_ledger.hpp"
 #include "oidc_egress_policy.hpp"
@@ -925,11 +926,11 @@ constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
 
 // Decides where ONE fetch may connect, BEFORE any socket exists. A host that is an IP literal is
 // classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver might
-// read differently, such as `127.1`) is resolved here, with httplib's own resolver, and EVERY
-// returned address is classified by its bytes. On a glibc build that resolver is not held to the
-// caller's time bound: a lookup against an unresponsive resolver can take about 30 s. Returns the
-// numeric addresses the connection may be PINNED to (the permitted ones, in resolver order, at most
-// kMaxPinnedAddresses), or an EMPTY list when the host is an IP literal that needs no pin. A
+// read differently, such as `127.1`) is resolved here (`resolve_host_addresses`: on POSIX a
+// detached worker through `net::bounded_resolve`, so the wait ends at the caller's time bound), and
+// EVERY returned address is classified by its bytes. Returns the numeric addresses the connection
+// may be PINNED to (the permitted ones, in resolver order, at most kMaxPinnedAddresses), or an
+// EMPTY list when the host is an IP literal that needs no pin. A
 // refusal or a resolver failure is a fixed reason (never the address, never resolver text). Pinning
 // closes the window between this check and the connect: httplib is told to connect to that numeric
 // address and does no second lookup, so a DNS answer that changes in between cannot redirect the
@@ -955,10 +956,32 @@ struct ResolvedAddress {
     std::array<unsigned char, 16> bytes{};
 };
 
-// Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses. The lookup is cancelled
-// after `timeout_sec` seconds, except on a glibc build where httplib then waits for the resolver
-// itself (about 30 s against an unresponsive one). False when the name did not resolve or the
-// lookup timed out. Own function per platform because httplib's helper cannot be consumed
+// Name lookups on POSIX run through `net::bounded_resolve` with a pool of their own, so they never
+// share slots with CRL source registration (the process pool). The pool is a leaked function-local
+// static: a detached worker may still hold it at process exit. Not a member of OidcProvider:
+// providers are swapped on Settings save and `vet_egress_target` is a free function.
+std::shared_ptr<net::ResolverPool>& oidc_resolver_pool_ref() {
+    static std::shared_ptr<net::ResolverPool>& p =
+        *new std::shared_ptr<net::ResolverPool>(std::make_shared<net::ResolverPool>());
+    return p;
+}
+
+// The test hook (OidcProvider::set_bounded_lookup_for_test): empty in production, which means the
+// system lookup and the OIDC pool.
+struct BoundedLookupHook {
+    std::mutex mu;
+    net::LookupFn lookup;
+    std::shared_ptr<net::ResolverPool> pool;
+};
+BoundedLookupHook& bounded_lookup_hook() {
+    static BoundedLookupHook h;
+    return h;
+}
+
+// Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses. On POSIX the caller
+// stops waiting after `timeout_sec` seconds (the lookup itself may run on until the resolver
+// returns, holding one pool slot). False when the name did not resolve, the lookup timed out or the
+// pool is full. Own function per platform because httplib's helper cannot be consumed
 // generically: on Windows it returns a GetAddrInfoExW result cast to `addrinfo`, whose layout
 // differs after ai_addr (the blob, blob length and provider fields precede ai_next) and which must
 // be released with FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it
@@ -1073,41 +1096,50 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 #else
 bool resolve_host_addresses(const std::string& host, int timeout_sec,
                             std::vector<ResolvedAddress>& out) {
-    struct addrinfo hints;
-    std::memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* result = nullptr;
-    if (::httplib::detail::getaddrinfo_with_timeout(host.c_str(), "0", &hints, &result,
-                                                    static_cast<time_t>(timeout_sec)) != 0 ||
-        result == nullptr)
+    net::LookupFn lookup;
+    std::shared_ptr<net::ResolverPool> pool;
+    {
+        std::lock_guard lock(bounded_lookup_hook().mu);
+        lookup = bounded_lookup_hook().lookup;
+        pool = bounded_lookup_hook().pool;
+    }
+    if (!pool)
+        pool = oidc_resolver_pool_ref();
+    const auto resolved = net::bounded_resolve(host, std::chrono::seconds(timeout_sec),
+                                               std::move(lookup), std::move(pool));
+    switch (resolved.status) {
+    case net::ResolveStatus::kOk:
+        break;
+    case net::ResolveStatus::kBusy:
+        spdlog::warn("OIDC egress: the name lookup for '{}' was not started: all {} lookup slots "
+                     "are held by lookups still waiting on the resolver",
+                     ::yuzu::log_key_token(host), net::kMaxInFlightLookups);
         return false;
-    struct Freer {
-        struct addrinfo* p;
-        Freer(struct addrinfo* list) : p(list) {}
-        Freer(const Freer&) = delete;
-        Freer& operator=(const Freer&) = delete;
-        ~Freer() { ::freeaddrinfo(p); }
-    } freer{result};
-    for (const struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
+    case net::ResolveStatus::kTimeout:
+        spdlog::warn("OIDC egress: the name lookup for '{}' did not answer within {} s; its slot "
+                     "is held until the resolver returns",
+                     ::yuzu::log_key_token(host), timeout_sec);
+        return false;
+    case net::ResolveStatus::kNotFound:
+    case net::ResolveStatus::kTemporary:
+        return false;
+    }
+    // The worker returns numeric text; the vetting classifies bytes, so convert back. Text that
+    // does not parse is skipped.
+    const auto before = out.size();
+    for (const auto& text : resolved.addresses) {
         ResolvedAddress address;
-        // ai_family names the sockaddr type ai_addr points at (the documented BSD sockets
-        // contract), and ai_addrlen is checked before the address bytes are read.
-        if (ai->ai_family == AF_INET && ai->ai_addr != nullptr &&
-            ai->ai_addrlen >= sizeof(sockaddr_in)) {
+        if (text.find(':') != std::string::npos) {
+            if (::inet_pton(AF_INET6, text.c_str(), address.bytes.data()) == 1) {
+                address.family = AF_INET6;
+                out.push_back(address);
+            }
+        } else if (::inet_pton(AF_INET, text.c_str(), address.bytes.data()) == 1) {
             address.family = AF_INET;
-            std::memcpy(address.bytes.data(),
-                        &reinterpret_cast<const sockaddr_in*>(ai->ai_addr)->sin_addr, 4);
-            out.push_back(address);
-        } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr &&
-                   ai->ai_addrlen >= sizeof(sockaddr_in6)) {
-            address.family = AF_INET6;
-            std::memcpy(address.bytes.data(),
-                        &reinterpret_cast<const sockaddr_in6*>(ai->ai_addr)->sin6_addr, 16);
             out.push_back(address);
         }
     }
-    return true;
+    return out.size() > before;
 }
 #endif
 
@@ -2328,8 +2360,7 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify,
             return std::unexpected("request failed: no file descriptor available");
         // Egress policy: resolve and classify the target BEFORE any socket exists, then pin the
         // connect to a vetted address (see vet_egress_target). Name resolution is part of the
-        // total bound below, except on a glibc build where it can run to about 30 s against an
-        // unresponsive resolver.
+        // total bound below: on POSIX the caller stops waiting for it at the per-lookup bound.
         const auto pins = vet_egress_target(target->host, allow_private_networks, target->cleartext,
                                             timeout_ms, nat64_prefixes);
         if (!pins)
@@ -2564,6 +2595,17 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
 void OidcProvider::set_resolver_for_test(ResolverForTest resolver) {
     std::lock_guard lock(test_resolver_mutex());
     test_resolver_slot() = std::move(resolver);
+}
+
+void OidcProvider::set_bounded_lookup_for_test(BoundedLookupForTest lookup,
+                                               std::shared_ptr<net::ResolverPool> pool) {
+    std::lock_guard lock(bounded_lookup_hook().mu);
+    bounded_lookup_hook().lookup = std::move(lookup);
+    bounded_lookup_hook().pool = std::move(pool);
+}
+
+int oidc_resolver_in_flight() {
+    return oidc_resolver_pool_ref()->in_flight.load();
 }
 
 void OidcProvider::clear_nat64_discovery_cache_for_test() {

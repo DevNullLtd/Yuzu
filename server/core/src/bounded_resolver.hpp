@@ -2,8 +2,8 @@
 
 /// @file bounded_resolver.hpp
 /// A name lookup with a hard time bound whose state is OWNED BY THE LOOKUP, never by the caller's
-/// stack. CRL source registration (ADR-0070 R1) is the first consumer; the OIDC egress path may
-/// adopt it in a later change, so that later egress checks resolve the same way.
+/// stack. CRL source registration (ADR-0070 R1) is the first consumer; the OIDC egress path is
+/// the second, with a pool of its own, so both resolve the same way.
 ///
 /// WHY NOT httplib's `getaddrinfo_with_timeout`: on Linux its wait is not bounded the way this
 /// header's is. Here the blocking lookup runs on a worker thread that owns a heap-allocated
@@ -24,7 +24,9 @@
 /// the timeout, the cap and the not-found paths deterministically, with no DNS.
 ///
 /// POOLS IN USE: CRL source registration uses the default process-wide pool (cap
-/// `kMaxInFlightLookups`), which any consumer that passes no pool also gets.
+/// `kMaxInFlightLookups`), which any consumer that passes no pool also gets. OIDC name lookups
+/// (`resolve_host_addresses` in `oidc_provider.cpp`) use their own pool of the same cap, so
+/// sign-in and registration do not starve each other.
 ///
 /// CONTRACT FOR CONSUMERS:
 ///  - POOL OWNERSHIP. Every consumer that passes no pool shares the process pool, so a slow

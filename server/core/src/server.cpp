@@ -689,6 +689,12 @@ public:
                           "registrations are refused until lookups return",
                           "gauge");
         metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight").set(0.0);
+        metrics_.describe("yuzu_server_oidc_resolver_in_flight",
+                          "Name lookups outstanding in the resolver pool the OIDC egress path "
+                          "resolves hosts in, published every 15 s; a value at the pool's cap "
+                          "means new OIDC lookups fail at once until lookups return",
+                          "gauge");
+        metrics_.gauge("yuzu_server_oidc_resolver_in_flight").set(0.0);
         // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".
         for (const char* reason :
              {"own_addresses_unavailable", "dns_unavailable", "dns_timeout", "dns_busy",
@@ -9801,6 +9807,9 @@ public:
                 // from a request path), so the in-flight gauge cannot sit stale after a lookup ends.
                 metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight")
                     .set(static_cast<double>(::yuzu::server::net::process_resolver_in_flight()));
+                // The OIDC egress resolver pool, from the same tick.
+                metrics_.gauge("yuzu_server_oidc_resolver_in_flight")
+                    .set(static_cast<double>(::yuzu::server::oidc::oidc_resolver_in_flight()));
                 // Workflow run table size: one catalog row, 250 ms to lease plus a 250 ms
                 // statement (roughly 250 ms plus connect_timeout_s if the pool must open a
                 // connection), noexcept (a failed sample keeps the previous gauge values).
