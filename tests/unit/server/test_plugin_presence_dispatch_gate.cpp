@@ -11,6 +11,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "../test_log_capture.hpp"
+
 #include <algorithm>
 #include <optional>
 #include <string>
@@ -546,7 +548,11 @@ TEST_CASE("an agent reporting only the retired `tar` plugin does not count as ha
     auto info = make_presence_test_info("dev-retired-name");
     info.add_plugins()->set_name("os_info");
     info.add_plugins()->set_name("tar");
+    yuzu::test::LogCapture logs;
     (void)registry.register_agent(info);
+    logs.stop();
+    // The operator's only signal that this agent is not an Echo agent here.
+    CHECK(logs.text().find("retired plugin name 'tar' and no 'echo'") != std::string::npos);
 
     CHECK(registry.ids_missing_plugin("echo", "sql").contains("dev-retired-name"));
 
