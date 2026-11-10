@@ -341,7 +341,8 @@ int run_linux_runtime_posture(yuzu::CommandContext& ctx) {
                                       budget);
                };
                const runtime::Clock clock = [] { return std::chrono::steady_clock::now(); };
-               return runtime::runtime_posture_linux(fs, transport, clock, runtime_endpoint());
+               return runtime::runtime_posture_linux(fs, transport, clock,
+                                                     container_runtime_endpoint());
            }));
     return 0;
 }

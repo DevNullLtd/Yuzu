@@ -33,11 +33,11 @@
 ///
 /// `runtime_posture` is ReadOnly/None and Linux-only (macOS and Windows answer one `unsupported`
 /// row). It stats the container runtimes' default sockets and config files and, ONLY when the
-/// operator has set `--runtime-endpoint`, sends four fixed GET requests over that one unix socket
-/// (docs/virtualization-runtime-posture-design.md). It reports container posture (names, images,
-/// privileged, network mode, host-socket-mounted), which is security posture rather than estate
-/// inventory, so it is `Security`:Read like `system_hardening` and `app_control` (owner decision
-/// 2026-11-08), ExecuteGate::None, no Forensics securable and no kill-switch seed.
+/// operator has set `--container-runtime-endpoint`, sends four fixed GET requests over that one
+/// unix socket (docs/virtualization-runtime-posture-design.md). It reports container posture
+/// (names, images, privileged, network mode, host-socket-mounted), which is security posture rather
+/// than estate inventory, so it is `Security`:Read like `system_hardening` and `app_control` (owner
+/// decision 2026-11-08), ExecuteGate::None, no Forensics securable and no kill-switch seed.
 /// The enforced control is this gate; the definition's `executeRoles` are advisory and follow the
 /// `host` document (`content/definitions/virtualization.yaml`), not `list_per_user`'s narrower list.
 namespace yuzu::server::capdecls {

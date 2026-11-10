@@ -14,10 +14,11 @@
  *               Linux and macOS answer one `unsupported` status row.
  *   "runtime_posture" -- Linux only: docker, podman and containerd presence and posture (default
  *               sockets, config files, docker daemon.json through a key allow-list) and, ONLY when
- *               the operator sets agent.runtime_endpoint (--runtime-endpoint), the containers an
- *               operator-provided read-only unix socket reports, through four fixed GET requests
- *               under a 20 s deadline. Design: docs/virtualization-runtime-posture-design.md.
- *               macOS and Windows answer one `unsupported` status row.
+ *               the operator sets agent.container_runtime_endpoint (--container-runtime-endpoint),
+ *               the containers an operator-provided read-only unix socket reports, through four
+ *               fixed GET requests under a 20 s deadline. Design:
+ *               docs/virtualization-runtime-posture-design.md. macOS and Windows answer one
+ *               `unsupported` status row.
  *
  * FACTS ONLY and read-only, no subprocess. A Windows machine running Hyper-V, VBS or WSL2 sets
  * the CPUID hypervisor bit but is the HOST, not a guest: the Hyper-V root-partition bit
@@ -95,8 +96,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "stat of the docker, podman and containerd default sockets, config files and data roots "
          "(no subprocess, no PATH walk), /etc/docker/daemon.json read through a key allow-list "
          "(nlohmann::json), /etc/containers and /etc/containerd presence only, and, only when "
-         "agent.runtime_endpoint names an operator-provided read-only unix socket, four fixed GET "
-         "requests over it (/version, /info, /containers/json?all=1, /containers/{id}/json) under "
+         "agent.container_runtime_endpoint names an operator-provided read-only unix socket, four "
+         "fixed GET requests over it (/version, /info, /containers/json?all=1, "
+         "/containers/{id}/json) under "
          "a 20 s action deadline",
          "no endpoint set (the default) means no socket is ever opened and no container is listed; "
          "the runtimes' own default sockets are refused as the endpoint (by path and by inode), "
@@ -145,10 +147,12 @@ public:
         return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
-    // Stashes the operator's agent.runtime_endpoint (empty = never open a socket). The plugin never
-    // validates it here: parse_endpoint decides, so a rejected value surfaces as a typed row.
+    // Stashes the operator's agent.container_runtime_endpoint (empty = never open a socket). The
+    // plugin never validates it here: parse_endpoint decides, so a rejected value surfaces as a
+    // typed row.
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
-        yuzu::virtualization::set_runtime_endpoint(ctx.get_config("agent.runtime_endpoint"));
+        yuzu::virtualization::set_container_runtime_endpoint(
+            ctx.get_config("agent.container_runtime_endpoint"));
         return {};
     }
 

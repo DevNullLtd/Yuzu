@@ -51,18 +51,18 @@ int run_windows_runtime_posture(yuzu::CommandContext& ctx);
 int run_linux_runtime_posture(yuzu::CommandContext& ctx);
 int run_macos_runtime_posture(yuzu::CommandContext& ctx);
 
-/// The operator's `agent.runtime_endpoint`, stashed by the plugin's init() and read by the Linux
-/// leg. Empty (the default) means the action never opens a socket. Guarded: init() and a worker
-/// thread's execute() are not ordered by the plugin ABI.
-inline std::mutex g_runtime_endpoint_mutex;
-inline std::string g_runtime_endpoint;
-inline void set_runtime_endpoint(std::string_view v) {
-    std::lock_guard<std::mutex> lk(g_runtime_endpoint_mutex);
-    g_runtime_endpoint = std::string{v};
+/// The operator's `agent.container_runtime_endpoint`, stashed by the plugin's init() and read by
+/// the Linux leg. Empty (the default) means the action never opens a socket. Guarded: init() and a
+/// worker thread's execute() are not ordered by the plugin ABI.
+inline std::mutex g_container_runtime_endpoint_mutex;
+inline std::string g_container_runtime_endpoint;
+inline void set_container_runtime_endpoint(std::string_view v) {
+    std::lock_guard<std::mutex> lk(g_container_runtime_endpoint_mutex);
+    g_container_runtime_endpoint = std::string{v};
 }
-inline std::string runtime_endpoint() {
-    std::lock_guard<std::mutex> lk(g_runtime_endpoint_mutex);
-    return g_runtime_endpoint;
+inline std::string container_runtime_endpoint() {
+    std::lock_guard<std::mutex> lk(g_container_runtime_endpoint_mutex);
+    return g_container_runtime_endpoint;
 }
 
 enum class StatusState { supported, constrained, unsupported };

@@ -461,7 +461,8 @@ TEST_CASE("virtualization plugin: runtime_posture without an endpoint reports de
         require_plugin_or_skip();
         return;
     }
-    // The real init() with a config that lacks agent.runtime_endpoint: the plugin never opens a socket.
+    // The real init() with a config that lacks agent.container_runtime_endpoint: the plugin never
+    // opens a socket.
     yuzu::agent::StandalonePluginContext ctx("virtualization", {});
     REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
 
@@ -504,7 +505,8 @@ TEST_CASE("virtualization plugin: runtime_posture without an endpoint reports de
 }
 
 #if defined(__linux__)
-TEST_CASE("virtualization plugin: init() plumbs agent.runtime_endpoint into runtime_posture",
+TEST_CASE("virtualization plugin: init() plumbs agent.container_runtime_endpoint into "
+          "runtime_posture",
           "[virtualization][dispatcher][runtime][endpoint]") {
     auto plugin = load_plugin();
     if (!plugin) {
@@ -529,8 +531,8 @@ TEST_CASE("virtualization plugin: init() plumbs agent.runtime_endpoint into runt
     };
     for (const Case c : {Case{"relative.sock", "relative"}, Case{"/run/docker.sock", "default_socket"}}) {
         INFO(c.endpoint);
-        yuzu::agent::StandalonePluginContext ctx("virtualization",
-                                                 {{"agent.runtime_endpoint", c.endpoint}});
+        yuzu::agent::StandalonePluginContext ctx(
+            "virtualization", {{"agent.container_runtime_endpoint", c.endpoint}});
         REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
         const auto result = dispatcher.run(plugin->descriptor, "runtime_posture");
         CHECK(result.rc == 0);

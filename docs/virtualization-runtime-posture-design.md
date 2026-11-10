@@ -82,9 +82,9 @@ and a new security review. That follow-up is deferred (section 10).
 
 ## 3. Opt-in mechanism
 
-- New agent option `--runtime-endpoint <absolute unix-socket path>`, environment name
-  `YUZU_AGENT_RUNTIME_ENDPOINT`, field `AgentConfig::runtime_endpoint` (default empty).
-- The agent publishes it to plugins as the config key `agent.runtime_endpoint`, beside `agent.data_dir`.
+- New agent option `--container-runtime-endpoint <absolute unix-socket path>`, environment name
+  `YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT`, field `AgentConfig::container_runtime_endpoint` (default empty).
+- The agent publishes it to plugins as the config key `agent.container_runtime_endpoint`, beside `agent.data_dir`.
 - Validation is not done in the command-line library: that library silently drops an environment value
   its validator rejects, which would turn a refused endpoint into a silent "unset". The plugin's pure
   `parse_endpoint()` decides, so a rejected value always surfaces as a typed `endpoint_refused` row.
@@ -462,7 +462,7 @@ body, with no probe committed:
 - *containerd.* Presence and `stat` only in this PR (section 2).
 
 **Packaging impact.** Nothing in `yuzu-agent.service` changes, and no package script changes. The operator
-sets `YUZU_AGENT_RUNTIME_ENDPOINT=/run/yuzu-agent/runtime.sock` in `/etc/yuzu-agent/yuzu-agent.env` (the
+sets `YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT=/run/yuzu-agent/runtime.sock` in `/etc/yuzu-agent/yuzu-agent.env` (the
 unit's existing `EnvironmentFile=`) or in an `Environment=` drop-in, then restarts the agent. The unit
 keeps only `CAP_DAC_READ_SEARCH`; connecting needs the socket's write bit, which that capability does not
 grant (section 9, item 5). The agent runs under `ProtectSystem=strict`, so `/run` is read-only to it and

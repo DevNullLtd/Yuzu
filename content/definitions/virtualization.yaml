@@ -250,7 +250,7 @@ status:
 ##
 ## Without an endpoint (the default) the agent never opens a socket: it stats the docker, podman
 ## and containerd default sockets, config files and data roots, and reads docker's daemon.json
-## through a key allow-list. When the operator sets --runtime-endpoint / YUZU_AGENT_RUNTIME_ENDPOINT
+## through a key allow-list. When the operator sets --container-runtime-endpoint / YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT
 ## to ONE read-only unix socket (an operator-supplied proxy in front of the runtime), the agent also
 ## sends four fixed GET requests over it (/version, /info, /containers/json?all=1 and
 ## /containers/{id}/json) under a 20 s deadline. The agent refuses the runtimes' default sockets as
