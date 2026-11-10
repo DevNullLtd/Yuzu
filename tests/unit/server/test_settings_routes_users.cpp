@@ -2258,3 +2258,96 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: a lost outcome row keeps t
     CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
     REQUIRE(h.attempts.size() == 1);
 }
+
+// ── #6940: the Users and API-token fragments are never cached ─────────────────
+// `set_header` appends, and `get_header_value` returns the first, so a doubled header would hide
+// from a value-only assertion: count them.
+namespace {
+void check_private_no_store(const httplib::Response& res) {
+    CHECK(res.get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res.get_header_value("Vary") == "Cookie");
+    CHECK(res.headers.count("Cache-Control") == 1);
+    CHECK(res.headers.count("Vary") == 1);
+}
+} // namespace
+
+TEST_CASE("SettingsRoutes users fragment: the list and every mutation re-render is no-store, private",
+          "[settings][users][cache]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.session_role = auth::Role::admin;
+
+    SECTION("GET /fragments/settings/users") {
+        auto res = h.Get("/fragments/settings/users");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/users: created") {
+        auto res = h.Post("/api/settings/users", "username=carol&password=carolpassword1",
+                          "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/users: required-field refusal re-renders the list") {
+        auto res = h.Post("/api/settings/users", "username=&password=",
+                          "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        REQUIRE(res->status == 400);
+        CHECK(res->body.find("hx-delete=\"/api/settings/users/bob\"") != std::string::npos);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/users/{name}/role: changed") {
+        auto res = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/users/{name}/role: unchanged") {
+        auto res = h.Post("/api/settings/users/bob/role", R"({"role":"user"})");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
+}
+
+TEST_CASE("SettingsRoutes users and API tokens: the PG-backed re-renders are no-store, private",
+          "[pg][settings][users][api_tokens][cache]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    SettingsAdr2001Harness h;
+
+    SECTION("DELETE /api/settings/users/{name}: removed") {
+        auto res = h.delete_user("bob");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
+    SECTION("GET /fragments/settings/api-tokens") {
+        REQUIRE(h.token_store->create_token("listed", "admin").has_value());
+        auto res = h.sink.Get("/fragments/settings/api-tokens");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(res->body.find("listed") != std::string::npos);
+        check_private_no_store(*res);
+    }
+    SECTION("POST /api/settings/api-tokens: the response carries the raw token once") {
+        auto res = h.sink.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24", kFormCt);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        REQUIRE(listed->size() == 1); // it minted, so the body is the reveal, not a refusal
+        check_private_no_store(*res);
+    }
+    SECTION("DELETE /api/settings/api-tokens/{id}: revoked") {
+        REQUIRE(h.token_store->create_token("revoke-me", "admin").has_value());
+        const auto before = h.token_store->list_tokens("admin");
+        REQUIRE(before.has_value());
+        REQUIRE(before->size() == 1);
+        auto res = h.sink.Delete("/api/settings/api-tokens/" + (*before)[0].token_id);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        check_private_no_store(*res);
+    }
+}

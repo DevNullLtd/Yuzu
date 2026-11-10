@@ -12393,13 +12393,13 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 **`GET /fragments/settings/mfa`** — Render the MFA card for the logged-in admin.
 
 - **Permission:** Admin only.
-- **Response (200):** HTML fragment showing current status (`Not enrolled` / `Enabled` / `Disabled`), recovery codes remaining, and the operative action buttons.
+- **Response (200):** HTML fragment showing current status (`Not enrolled` / `Enabled` / `Disabled`), recovery codes remaining, and the operative action buttons. Sent with the same headers as the POST routes below: `Cache-Control: no-store, private`, `Vary: Cookie`, `Pragma: no-cache` and `Referrer-Policy: no-referrer`.
 
 **`POST /api/settings/mfa/init`** — Begin TOTP enrollment.
 
 - **Permission:** Admin only.
 - **Effect:** Generates a fresh 20-byte CSPRNG secret and stores it provisionally (`mfa_enrolled_at` stays NULL). Re-running on an already-provisional row re-reveals the same secret (reuse, not rotate); refused if the user is already enrolled (`MfaAlreadyEnrolled` → 200 with error message in the fragment).
-- **Response (200):** HTML fragment containing the `otpauth://` URI + base32 secret as a one-time reveal, plus the verify-code form. Response carries `Cache-Control: no-store, private`, `Pragma: no-cache`, and `Referrer-Policy: no-referrer` so browsers / proxies / CDNs cannot retain the material.
+- **Response (200):** HTML fragment containing the `otpauth://` URI + base32 secret as a one-time reveal, plus the verify-code form. Response carries `Cache-Control: no-store, private`, `Vary: Cookie`, `Pragma: no-cache`, and `Referrer-Policy: no-referrer` so browsers / proxies / CDNs cannot retain the material. Every `200` answer of the MFA routes carries the same set, including the failure and "MFA store unavailable" re-renders and the answer to `POST /api/settings/mfa/disable`.
 - **Password changed during enrolment (#5342):** if the account's password is changed or reset while this call is minting the secret, nothing is stored or revealed; the fragment says "Your password changed during enrolment — sign in again".
 - **Audit:** `mfa.enroll.initiated` / `ok` (or `error` on failure); `mfa.enroll.failed` / `error` detail `credential_changed` for the password-changed case.
 
