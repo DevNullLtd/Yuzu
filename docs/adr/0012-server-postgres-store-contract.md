@@ -446,7 +446,7 @@ now refuses a bound text parameter that contains a NUL byte: the call returns a 
 (SQLSTATE 22021, "parameter $N contains a NUL byte") and the caller's statement is not executed.
 The value is never echoed. An open transaction aborts exactly as it does for any other failed
 statement, so a caller that runs inside `with_txn_for` rolls back as it already does for a failed
-query. Only NUL is refused; tab, newline and the rest of the control range are valid text and are
+query. A caller that manages its own `BEGIN` with `pg::PgTxn` gets `false` from `commit()` when a statement aborted the transaction (the guard rolls it back at once); `PgPool::with_txn*` already refused to commit an aborted transaction. A failed statement recovered with `ROLLBACK TO SAVEPOINT` still commits. Only NUL is refused; tab, newline and the rest of the control range are valid text and are
 bound unchanged. The refusal is produced by a server-side `DO` block, so it needs `USAGE` on
 `plpgsql`, which every database has by default.
 

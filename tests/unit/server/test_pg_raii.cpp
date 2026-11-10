@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
@@ -13,10 +14,12 @@
 #include <libpq-fe.h>
 
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgResult;
@@ -167,10 +170,11 @@ TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii][pg-smoke]") {
         PgResult bad{PQexec(conn.get(), "SELECT no_such_column FROM t")};
         CHECK(bad.status() == PGRES_FATAL_ERROR);
         // Postgres turns COMMIT on an aborted txn into ROLLBACK but still
-        // answers PGRES_COMMAND_OK, so commit() "succeeds" — the invariant
-        // that matters is the connection comes back idle and nothing
-        // persisted.
-        (void)txn.commit();
+        // answers PGRES_COMMAND_OK, so commit() checks the transaction state
+        // first, rolls back and returns false (see the aborted-transaction case
+        // below). The invariant here: the connection comes back idle and
+        // nothing persisted.
+        CHECK_FALSE(txn.commit());
         CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE);
         CHECK(count_rows(conn.get()) == 0);
     }
@@ -187,5 +191,58 @@ TEST_CASE("PgTxn rollback-unless-commit", "[pg][raii][pg-smoke]") {
         }
         CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE);
         CHECK(count_rows(conn.get()) == 0); // b rolled back exactly once
+    }
+}
+
+// Dave's review of #7376, item 3: PgTxn::commit() must not report success for a transaction a
+// refused or failed statement aborted. COMMIT in PQTRANS_INERROR completes as ROLLBACK yet
+// answers PGRES_COMMAND_OK, so commit() checks the transaction state first.
+TEST_CASE("PgTxn commit() and an aborted transaction", "[pg][raii][pg-smoke]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgConn conn = connect_with_table(db.dsn());
+
+    SECTION("a NUL refusal the callback ignored: commit() is false and nothing persists") {
+        begin(conn.get());
+        {
+            PgTxn txn{conn.get()};
+            insert_row(conn.get(), 1);
+            const std::vector<std::optional<std::string>> params{std::string("a\0b", 3)};
+            PgResult refused = yuzu::server::pg::exec_params(
+                conn.get(), "INSERT INTO t (id) VALUES (length($1))", params);
+            CHECK(refused.status() == PGRES_FATAL_ERROR); // the callback "ignores" this result
+            CHECK_FALSE(txn.commit());
+            CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE); // rolled back by commit()
+            CHECK_FALSE(txn.commit()); // stays false; no second COMMIT on a reused connection
+        }
+        CHECK(count_rows(conn.get()) == 0); // the earlier insert did not persist either
+    }
+
+    SECTION("a failed statement recovered with ROLLBACK TO SAVEPOINT still commits") {
+        begin(conn.get());
+        {
+            PgTxn txn{conn.get()};
+            insert_row(conn.get(), 1);
+            PgResult sp{PQexec(conn.get(), "SAVEPOINT s1")};
+            REQUIRE(sp.status() == PGRES_COMMAND_OK);
+            PgResult bad{PQexec(conn.get(), "INSERT INTO t (id) VALUES (1)")}; // duplicate key
+            CHECK(bad.status() == PGRES_FATAL_ERROR);
+            PgResult back{PQexec(conn.get(), "ROLLBACK TO SAVEPOINT s1")};
+            REQUIRE(back.status() == PGRES_COMMAND_OK);
+            insert_row(conn.get(), 2);
+            CHECK(txn.commit());
+        }
+        CHECK(count_rows(conn.get()) == 2);
+    }
+
+    SECTION("plain success is unchanged") {
+        begin(conn.get());
+        {
+            PgTxn txn{conn.get()};
+            insert_row(conn.get(), 1);
+            CHECK(txn.commit());
+            CHECK(txn.commit());
+        }
+        CHECK(PQtransactionStatus(conn.get()) == PQTRANS_IDLE);
+        CHECK(count_rows(conn.get()) == 1);
     }
 }
