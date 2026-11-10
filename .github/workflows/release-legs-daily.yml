@@ -26,9 +26,9 @@ name: Release legs (daily dispatch)
 #     `release-legs-broken` issue, and the next fully green one closes it
 #     (release-legs-alert.yml, a workflow_run listener — the fast path);
 #   - the `reconcile` job below re-judges the last completed dispatch run with
-#     the same script every day, before dispatching (the backstop);
-#   - a failure of THIS workflow (gh API error, dispatch refused) opens the
-#     same issue from the `alert` job below.
+#     the same script every day, before that day's dispatch (the backstop);
+#   - a failure of THIS workflow (reconcile or dispatch) opens the same issue
+#     from the `alert` job below, worded by which job failed.
 # A cron that never fires at all is not detected (no dead-man signal); the
 # Tier 2b runbook says how to check.
 #
@@ -66,11 +66,15 @@ jobs:
   # Backstop for the workflow_run listener (release-legs-alert.yml): judge the
   # most recent completed, non-cancelled dispatch run on dev with the same
   # script, opening the issue if it failed and none is open, or closing open
-  # issues if it was fully green. Catches a dropped/failed/never-fired listener
-  # run and a run that never started, and clears an issue a dispatcher failure
-  # opened once dev is known green.
+  # issues it predates if it was fully green. Catches a dropped/failed/
+  # never-fired listener run and a run that never started.
   reconcile:
     name: "Reconcile release-legs-broken with the last dispatch"
+    # Same group as the listener's job, so the two never act on one run at
+    # the same moment (both seeing no open issue and both opening one).
+    concurrency:
+      group: release-legs-alert
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -97,6 +101,10 @@ jobs:
 
   dispatch:
     name: "Dispatch release legs on dev"
+    # After reconcile (so it judges the previous run first), but not gated on
+    # it: a reconcile failure must not stop the day's dispatch.
+    needs: [reconcile]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -124,11 +132,12 @@ jobs:
           gh workflow run ci.yml -R "$REPO" --ref dev -f legs=release
           echo "Dispatched ci.yml legs=release on dev ($sha)." | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # Dispatcher failure → the same alert issue (gh API error, refused dispatch,
-  # a dev-side ci.yml that no longer accepts `legs`). Only open issues authored
-  # by github-actions[bot] are matched, never a PR or a hand-labelled issue.
+  # Failure of this workflow (reconcile or dispatch: gh API error, refused
+  # dispatch, a dev-side ci.yml that no longer accepts `legs`) → the same
+  # alert issue, worded by which job failed. Only open issues authored by
+  # github-actions[bot] are matched, never a PR or a hand-labelled issue.
   alert:
-    name: "Open release-legs-broken on dispatcher failure"
+    name: "Open release-legs-broken when this workflow fails"
     needs: [reconcile, dispatch]
     if: ${{ failure() }}
     runs-on: ubuntu-24.04
@@ -141,21 +150,30 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RECONCILE: ${{ needs.reconcile.result }}
+          DISPATCH: ${{ needs.dispatch.result }}
         run: |
           set -euo pipefail
           label=release-legs-broken
-          body=$(printf '%s\n\n%s\n\n%s\n' \
-            "The daily release-legs **dispatcher** failed, so no release-legs run was started on \`dev\` today: $RUN_URL" \
+          if [[ "$DISPATCH" == success ]]; then
+            what="Its \`reconcile\` step failed (result \`$RECONCILE\`), so the previous dispatch run was not re-judged; today's release-legs run WAS dispatched."
+            title="Release legs broken on dev: daily reconcile failed"
+          else
+            what="Its \`dispatch\` step did not succeed (result \`$DISPATCH\`; reconcile \`$RECONCILE\`), so no release-legs run was started on \`dev\` today."
+            title="Release legs broken on dev: dispatcher failed"
+          fi
+          body=$(printf '%s\n\n%s\n\n%s\n\n%s\n' \
+            "The daily release-legs workflow failed: $RUN_URL" \
+            "$what" \
             "This is a workflow or API problem, not a code regression. Triage: docs/ci-architecture.md, Tier 2b." \
-            "(auto-posted by .github/workflows/release-legs-daily.yml; closed by the next green release-legs dispatch.)")
+            "(auto-posted by .github/workflows/release-legs-daily.yml; closed by the next fully green release-legs dispatch.)")
           first=$(gh issue list -R "$REPO" --label "$label" --state open \
                     --author "app/github-actions" --json number --jq '.[0].number // empty')
           if [[ -n "$first" ]]; then
             gh issue comment "$first" -R "$REPO" --body "$body"
           else
-            # gh resolves --label by name and refuses an absent one, so make
-            # sure it exists (idempotent; --force only refreshes its metadata).
+            # gh resolves --label by name and refuses an absent one (idempotent).
             gh label create "$label" -R "$REPO" --color ededed --force \
               --description "Daily release/LTO legs on dev failed (docs/ci-architecture.md Tier 2b)"
-            gh issue create -R "$REPO" --title "Release legs broken on dev: dispatcher failed" --label "$label" --body "$body"
+            gh issue create -R "$REPO" --title "$title" --label "$label" --body "$body"
           fi

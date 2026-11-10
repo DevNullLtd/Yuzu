@@ -66,29 +66,35 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
       listener on CI runs, dev only, dispatch runs only. It fires as each run
       completes.
     - **Reconcile (backstop).** `release-legs-daily.yml`'s `reconcile` job
-      re-judges the last completed, non-cancelled dispatch run every day
-      before dispatching. A listener run that was dropped, failed or never
-      fired is still reported within a day, and an issue opened by a
-      dispatcher failure is cleared once dev is known green.
+      re-judges the last completed, non-cancelled dispatch run every day,
+      before that day's dispatch. It shares the listener's concurrency group,
+      so the two never act on one run at once. A listener run that was
+      dropped, failed or never fired is still reported within a day.
 
     What the script does:
     - **Opens or comments** on any failing conclusion, including a run that
       never started (`startup_failure`), and words it by cause: a code
       failure, infrastructure (only the preflight jobs failed), or a run that
-      started no job.
+      started no job. A failed preflight gate is reported as infrastructure even
+      though proto-compat then fails closed too.
     - **Closes** only when every OS (Linux, Windows MSVC, macOS) had at least
-      one `[dispatch]` build leg and all of them passed.
-    - **Does nothing** on a cancelled run.
+      one `[dispatch]` build leg and all of them passed, and only issues opened
+      before that run finished. A green run answers nothing reported after it,
+      such as a later dispatcher failure.
+    - **Does nothing** on a cancelled or skipped run.
+    - **Fails red** if listing the open issues fails, rather than reading that
+      as "none open" and opening a duplicate.
     - **Matches** only open issues authored by `github-actions[bot]`, so a
       hand-added label is never commented on or closed.
 
-    A failure of the dispatcher itself opens the same issue from the daily
-    workflow's `alert` job. There is no merge discipline attached, unlike
+    A failure of the daily workflow itself (its `reconcile` or `dispatch` job)
+    opens the same issue from its `alert` job, worded by which job failed. There is no merge discipline attached, unlike
     `nightly-broken`, but the release skill checks the label before tagging.
   - **When `release-legs-broken` opens (triage).**
-    1. Read the issue's cause line. A "dispatcher failed" issue means
-       `release-legs-daily.yml` itself failed: read that run's log, fix it,
-       then re-dispatch (step 4). If only the preflight jobs failed, it is
+    1. Read the issue's cause line. A "dispatcher failed" or "daily
+       reconcile failed" issue means `release-legs-daily.yml` itself failed:
+       read that run's log and fix it. Re-dispatch (step 4) if the dispatch
+       did not happen. If only the preflight jobs failed, it is
        infrastructure: a runner pool, a runner-health check or a source gate.
        Fix that, then re-run the failed jobs. If the run started no job, dev's
        `ci.yml` failed to load, and every dev push is likely red too.
@@ -104,10 +110,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
        close it, and a CANCELLED run neither opens nor closes one.
     Each dev push also shows a skipped "Release legs (alert)" run in the
     Actions tab; that is the listener filtering out non-dispatch runs.
-  - **Required contexts.** A dispatch must never post, satisfy or shadow a
-    required check on any SHA, including the dev tip that a dev → main
-    promotion PR uses as its head. A SKIPPED required context counts as
-    satisfied. Two mechanisms, because GitHub does not evaluate a skipped
+  - **Required contexts.** A dispatch must never post a SKIPPED (= satisfied)
+    or misattributed required check on any SHA, including the dev tip that a
+    dev → main promotion PR uses as its head. Two mechanisms, because GitHub does not evaluate a skipped
     job's `name:` expression (it posts the raw template,
     [community #13261](https://github.com/orgs/community/discussions/13261)):
     - **Renamed.** On a direct dispatch, Preflight (runner health) and the
@@ -116,9 +121,13 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
       suffix is always rendered or harmless.
     - **Never skipped.** Proto backward-compat is routinely skipped (every
       docs-only PR, #1978), so it keeps its literal name. On a dispatch it
-      always runs, giving an honest `buf breaking` result for that commit (the
-      same thing every dev push already posts). If `preflight-gate` did not
-      succeed, it fails red on a hosted runner instead of skipping.
+      always runs (`always()`, so a cancel does not skip it either), giving
+      an honest `buf breaking` result for that commit, the same thing every
+      dev push already posts. If `preflight-gate` did not succeed or the Linux
+      pool reads unhealthy, it fails red on a hosted runner instead of
+      skipping. That red is a real, fail-closed "Proto backward-compat" on the
+      dev tip; once the infrastructure is back, re-run it before merging a
+      promotion PR whose head is that commit.
 
     As defence in depth, `trusted_inputs` refuses a direct dispatch on any ref
     but `dev` or `main`.
@@ -1111,7 +1120,8 @@ previously used the bare `[self-hosted, Linux, X64]` label, which Shulgi's WSL2
 runner also carried, so they could land there instead of on Big Tam. The runners
 were deregistered on the GitHub side on 2026-10-03 (per the repo admin). With the pin, `proto-compat` queues (it does not fail) while all four
 Big Tam slots are busy. When no Big Tam runner is online, the `preflight-gate` job
-fails (required pool `bigtam`) and `proto-compat` is skipped.
+fails (required pool `bigtam`) and `proto-compat` is skipped on a PR or push
+(on a Tier 2b dispatch it instead fails red on a hosted runner, see Tier 2b).
 
 ### Ubuntu 26.04 migration (Big Tam) — COMPLETE
 

@@ -56,8 +56,8 @@ on:
   # expands the full debug + release matrix. A direct dispatch is accepted on
   # `dev` and `main` only (trusted_inputs refuses any other ref), and on it
   # the jobs that carry a ruleset-required context name are handled so a
-  # dispatch can never post, satisfy or shadow a required check (a SKIPPED
-  # required context counts as satisfied): Preflight (runner health) and the
+  # dispatch never posts a SKIPPED (= satisfied) or misattributed required
+  # check; the only required context it posts is proto-compat's own result: Preflight (runner health) and the
   # Linux/Windows/macOS legs get a ` [dispatch]` name suffix; Proto
   # backward-compat keeps its literal name (a skipped job's name expression is
   # not evaluated) and is never skipped on a dispatch — see that job.
@@ -734,8 +734,10 @@ jobs:
     # docs-only PR (github.com/orgs/community/discussions/13261). So on a
     # direct dispatch this job is never skipped instead: it RUNS the real
     # `buf breaking` check (an honest result for that commit, the same thing
-    # every dev push posts), or, when preflight-gate did not succeed, FAILS red
-    # on a hosted runner. A dispatch can therefore never post a SKIPPED
+    # every dev push posts), or, when preflight-gate did not succeed or the
+    # Linux pool reads unhealthy, FAILS red on a hosted runner (a real red
+    # "Proto backward-compat" on that commit: fail-closed, re-run once the
+    # infrastructure is back). A dispatch can therefore never post a SKIPPED
     # (= satisfied) "Proto backward-compat" (governance 2026-11-10).
     name: "Proto backward-compat"
     needs: [preflight-gate]
@@ -744,17 +746,26 @@ jobs:
     # `&& code_changed` (issue #1978): a docs-only PR skips this required job
     # (skipped == satisfied), so it no longer blocks the merge on an absent check.
     # The explicit success() keeps the non-dispatch arm exactly as before: the
-    # `!cancelled()` in the dispatch arm would otherwise drop the implicit one.
-    if: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && !cancelled()) || (success() && needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true') }}
-    runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && needs.preflight-gate.result != 'success') && 'ubuntu-24.04' || fromJSON('["self-hosted","Linux","X64","yuzu-bigtam-linux"]') }}
+    # status function in the dispatch arm would otherwise drop the implicit one.
+    # The dispatch arm is `always()`, not `!cancelled()`: a dispatch cancelled
+    # while preflight runs must still not leave a SKIPPED literal required
+    # context; with the gate cancelled it takes the hosted fail-closed arm
+    # (ends red), and a cancel during the job itself ends `cancelled`, which
+    # never satisfies a required check.
+    if: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && always()) || (success() && needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true') }}
+    # Hosted fail-closed fallback also when the Linux pool reads unhealthy:
+    # a job targeting a dead self-hosted pool queues for up to ~24h
+    # (timeout-minutes does not count queue time), holding the dispatch open.
+    runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')) && 'ubuntu-24.04' || fromJSON('["self-hosted","Linux","X64","yuzu-bigtam-linux"]') }}
     timeout-minutes: 5
     steps:
       - name: Fail closed when preflight-gate did not succeed (dispatch)
-        if: (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && needs.preflight-gate.result != 'success'
+        if: (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')
         env:
           GATE_RESULT: ${{ needs.preflight-gate.result }}
+          LINUX_POOL: ${{ needs.preflight-gate.outputs.linux_pool_healthy }}
         run: |
-          echo "::error::preflight-gate did not succeed ($GATE_RESULT) on a direct dispatch — failing closed rather than posting a skipped (= satisfied) Proto backward-compat"
+          echo "::error::preflight-gate result '$GATE_RESULT', Linux pool healthy '$LINUX_POOL' on a direct dispatch — failing closed rather than posting a skipped (= satisfied) Proto backward-compat"
           exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
