@@ -1703,8 +1703,10 @@ flip, with a red-first test each:
     is pinned by the golden fixture `tests/unit/fixtures/spark/rebuild_line.json` and by a
     captured-log test that the line is logged exactly once. That captured-log test SKIPs where
     its in-band probe line is not captured, so that protection is Linux-only until the macOS and
-    Windows runs. The new cases have run on Linux debug only: ASan/UBSan, TSan, Windows (MSVC) and
-    macOS (Apple Clang) runs of them are outstanding. The Armed return that attach_rule makes
+    Windows runs. The new cases have run on Linux debug, and `[5719]` and `[4415prA]` have also run
+    clean under TSan and under ASan/UBSan (at the commit that added the resume hook; later
+    commits changed comments, docs and one assertion, and were not re-run under sanitizers).
+    Windows (MSVC) and macOS (Apple Clang) runs of them are outstanding. The Armed return that attach_rule makes
     after it re-inspects its claim (the case in which the claim settled before attach_rule
     re-inspected it) carries a rebuild reason, and the io-class forced-resume SECTION of the R2
     case in `test_guardian_spark_reapply_skip_runtime.cpp` forces it through a test-only resume hook
