@@ -74,9 +74,10 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
       dropped, failed or never fired is still reported within a day.
 
     What the script does:
-    - **Opens or comments** on any failing conclusion of the newest completed
-      run (a late report for a run a newer one has superseded is dropped),
-      including a run that
+    - **Opens or comments** on any failing conclusion. A late report is
+      dropped when a newer completed, non-cancelled dispatch run has already
+      given a verdict: it failed, or it was fully green. A newer green run
+      with a skipped leg never swallows it. This includes a run that
       never started (`startup_failure`), and words it by cause: a code
       failure, infrastructure (the preflight gate, or only preflight jobs,
       failed; proto-compat then fails closed too), or a run that started no

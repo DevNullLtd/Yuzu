@@ -22,8 +22,12 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
-  "run view")   cat "$RUN_FIXTURE" ;;
-  "run list")   printf '%s\n' "${LATEST_RUN-5}" ;;
+  "run view")   if [ "$3" != 5 ] && [ -n "${NEWER_FIXTURE:-}" ]; then cat "$NEWER_FIXTURE"; else cat "$RUN_FIXTURE"; fi ;;
+  # Apply the script's OWN --jq expression to a fixture run list, so the
+  # cancelled/skipped filter is exercised, not assumed.
+  "run list")   q=""; while [ $# -gt 0 ]; do [ "$1" = --jq ] && q="$2"; shift; done
+                def='[{"databaseId":5,"conclusion":"success"}]'
+                printf '%s' "${RUN_LIST_JSON:-$def}" | jq -r "$q" ;;
   "issue list") [ -n "${LIST_FAILS:-}" ] && { echo "HTTP 502" >&2; exit 1; }; printf '%s' "${OPEN:-[]}" ;;
   "issue comment"|"issue close"|"issue create"|"label create") echo "$1 $2 $3" >> "$ACTIONS" ;;
   *) echo "unexpected gh call: $*" >&2; exit 99 ;;
@@ -64,7 +68,7 @@ fixture success "$ALL_GREEN"; run reconcile "$(iss 7@$EARLY)"
 check "reconcile closes too" "issue comment 7;issue close 7;" "$acts"
 fixture success "$ALL_GREEN"; run reconcile "$(iss 7@$EARLY 8@$LATE)"
 check "a green run never closes an issue opened after it finished" "issue comment 7;issue close 7;" "$acts"
-fixture success "$ALL_GREEN"; LATEST_RUN=6 run event "$(iss 7@$EARLY)"
+fixture success "$ALL_GREEN"; RUN_LIST_JSON='[{"databaseId":6,"conclusion":"failure"},{"databaseId":5,"conclusion":"success"}]' run event "$(iss 7@$EARLY)"
 check "a green re-run of an OLDER run never closes (a newer run exists)" "" "$acts"
 fixture success "$NO_MAC"; run event "$(iss 7@$EARLY)"
 check "an OS leg skipped/missing never closes" "" "$acts"
@@ -77,8 +81,19 @@ fixture failure "$LEG_RED"; run event "[]"
 check "event, none open: creates (label ensured first)" "label create release-legs-broken;issue create -R;" "$acts"
 fixture failure "$LEG_RED"; run event "$(iss 7@$EARLY)"
 check "event, one open: comments on it" "issue comment 7;" "$acts"
-fixture failure "$LEG_RED"; LATEST_RUN=6 run event "[]"
-check "event: a failure superseded by a newer completed run is not reported" "" "$acts"
+L65='[{"databaseId":6,"conclusion":"success"},{"databaseId":5,"conclusion":"failure"}]'
+fixture success "$ALL_GREEN"; cp "$TMP/run.json" "$TMP/newer.json"
+fixture failure "$LEG_RED"; NEWER_FIXTURE="$TMP/newer.json" RUN_LIST_JSON="$L65" run event "[]"
+check "event: failure superseded by a newer fully green run is not reported" "" "$acts"
+fixture failure "$LEG_RED"; cp "$TMP/run.json" "$TMP/newer.json"; NEWER_FIXTURE="$TMP/newer.json" RUN_LIST_JSON='[{"databaseId":6,"conclusion":"failure"},{"databaseId":5,"conclusion":"failure"}]' run event "[]"
+check "event: failure superseded by a newer failed run is not reported" "" "$acts"
+fixture success "$NO_MAC"; cp "$TMP/run.json" "$TMP/newer.json"
+fixture failure "$LEG_RED"; NEWER_FIXTURE="$TMP/newer.json" RUN_LIST_JSON="$L65" run event "[]"
+check "event: a newer green run with a skipped leg does NOT swallow the failure" "label create release-legs-broken;issue create -R;" "$acts"
+fixture failure "$LEG_RED"; RUN_LIST_JSON='[{"databaseId":7,"conclusion":"cancelled"},{"databaseId":5,"conclusion":"failure"}]' run event "[]"
+check "event: a newer CANCELLED run is ignored by the filter (reported)" "label create release-legs-broken;issue create -R;" "$acts"
+fixture failure "$LEG_RED"; RUN_LIST_JSON='[{"databaseId":4,"conclusion":"success"}]' run event "[]"
+check "event: list not yet showing this run (older latest) still reports" "label create release-legs-broken;issue create -R;" "$acts"
 fixture failure "$LEG_RED"; run reconcile "$(iss 7@$EARLY)"
 check "reconcile, one open: adds nothing" "" "$acts"
 fixture failure "$LEG_RED"; run reconcile "[]"

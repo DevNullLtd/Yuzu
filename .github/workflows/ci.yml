@@ -753,8 +753,9 @@ jobs:
     # The dispatch arm is `always()`, not `!cancelled()`: a dispatch cancelled
     # while preflight runs must still not leave a SKIPPED literal required
     # context; with the gate cancelled it takes the hosted fail-closed arm
-    # (ends red). If the run is cancelled while this job runs, its last step
-    # (`always() && cancelled()`) fails it red, so no cancel path can end it
+    # (ends red). If the run is cancelled while this job runs, its final
+    # check step (`always() && cancelled()`, just before the trusted-fork
+    # purge) fails it red, so no cancel path can end it
     # green-without-checking; a force-cancel ends it `cancelled`, which never
     # satisfies a required check.
     if: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && always()) || (success() && needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true') }}

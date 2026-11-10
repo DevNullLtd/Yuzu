@@ -20,8 +20,10 @@
 #     cancel, or a pending dispatch replaced by a newer one; the daily check
 #     re-dispatches an uncovered tip)
 #   anything else (failure, timed_out, startup_failure, ...) -> report:
-#     event mode comments on the open issue or opens one; reconcile mode opens
-#     one only if none is open (the listener already commented on this run).
+#     event mode comments on the open issue or opens one, UNLESS a numerically
+#     newer completed dispatch run already gave a verdict (failed, or fully
+#     green), in which case this superseded report is dropped; reconcile mode
+#     (which always judges the newest run) opens one only if none is open.
 # Only OPEN ISSUES authored by github-actions[bot] carrying the label are ever
 # touched (gh issue list never returns PRs), so a hand-labelled issue is safe.
 set -euo pipefail
@@ -45,6 +47,19 @@ fi
 
 # No `|| true`: an API error must fail this job (red), never read as "no open
 # issue" (which would open a duplicate, or silently skip a close).
+# "Every OS had a [dispatch] build leg and every such leg passed" — the one
+# definition of a fully green release-legs run, used for closing and for
+# deciding whether a newer run supersedes an older failure.
+LEGS_OK_JQ='[.jobs[] | select(.name | test("^(Linux|Windows MSVC|macOS) .*\\[dispatch\\]$"))] as $l
+  | ($l | length > 0) and ($l | all(.conclusion == "success"))
+    and ([ "Linux", "Windows MSVC", "macOS" ] | all(. as $os | $l | any(.name | startswith($os + " "))))'
+# Newest completed, non-cancelled, non-skipped dispatch run on dev.
+latest_run() {
+  gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch --branch dev \
+    --status completed --limit 20 --json databaseId,conclusion \
+    --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0].databaseId // empty'
+}
+
 open_json=$(gh issue list -R "$REPO" --label "$label" --state open \
               --author "app/github-actions" --json number,createdAt)
 open=$(jq -r '.[].number' <<<"$open_json")
@@ -53,10 +68,7 @@ case "$conclusion" in
   cancelled|skipped|"")
     echo "run $run_id conclusion '${conclusion:-none}' — nothing to report"; exit 0 ;;
   success)
-    legs_ok=$(jq '[.jobs[] | select(.name | test("^(Linux|Windows MSVC|macOS) .*\\[dispatch\\]$"))] as $l
-                  | ($l | length > 0) and ($l | all(.conclusion == "success"))
-                    and ([ "Linux", "Windows MSVC", "macOS" ]
-                         | all(. as $os | $l | any(.name | startswith($os + " "))))' <<<"$run_json")
+    legs_ok=$(jq "$LEGS_OK_JQ" <<<"$run_json")
     if [[ "$legs_ok" != true ]]; then
       echo "run $run_id succeeded but not every OS had a passing dispatch build leg — leaving issues as they are"; exit 0
     fi
@@ -66,9 +78,7 @@ case "$conclusion" in
     # Only the NEWEST completed (non-cancelled) dispatch run on dev may close:
     # re-running an older run's failed jobs to green must not close an issue
     # while a newer run is still red.
-    latest=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch --branch dev \
-               --status completed --limit 20 --json databaseId,conclusion \
-               --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0].databaseId // empty')
+    latest=$(latest_run)
     if [[ "$latest" != "$run_id" ]]; then
       echo "run $run_id is green but not the newest completed dispatch run (${latest:-none}) — leaving issues as they are"; exit 0
     fi
@@ -85,16 +95,20 @@ case "$conclusion" in
     exit 0 ;;
 esac
 
-# Failure of some kind. In event mode, a report for a run that a newer
-# completed (non-cancelled) dispatch run has already superseded is dropped:
-# workflow_run events arrive in no fixed order, and the newer run's own
-# event or the daily reconcile speaks for dev's current state.
+# Failure of some kind. In event mode, a report for a run that a NEWER
+# completed dispatch run has superseded with a real verdict (a failure, or a
+# fully green run) is dropped: workflow_run events arrive in no fixed order,
+# and the newer run's own event or the daily reconcile speaks for dev's
+# current state. "Newer" is numeric (run ids increase), so an eventually-
+# consistent list that does not yet show this run cannot drop it, and a
+# newer green run with a skipped leg (no verdict) never swallows it.
 if [[ "$mode" == event ]]; then
-  latest=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch --branch dev \
-             --status completed --limit 20 --json databaseId,conclusion \
-             --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0].databaseId // empty')
-  if [[ -n "$latest" && "$latest" != "$run_id" ]]; then
-    echo "run $run_id failed but newer dispatch run $latest has completed — not reporting a superseded run"; exit 0
+  latest=$(latest_run)
+  if [[ "$latest" =~ ^[0-9]+$ ]] && (( latest > run_id )); then
+    newer_json=$(gh run view "$latest" -R "$REPO" --json conclusion,jobs)
+    if [[ "$(jq -r '.conclusion' <<<"$newer_json")" != success || "$(jq "$LEGS_OK_JQ" <<<"$newer_json")" == true ]]; then
+      echo "run $run_id failed but newer dispatch run $latest has a verdict — not reporting a superseded run"; exit 0
+    fi
   fi
 fi
 failed=$(jq -r '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | .name] | join(", ")' <<<"$run_json")
