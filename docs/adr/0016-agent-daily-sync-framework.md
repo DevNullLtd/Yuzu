@@ -1274,8 +1274,8 @@ any read surface for the ledger or the components.
 `GET /api/v1/hardware/{id}` and the MCP tool
 `get_hardware_ci` serve the expanded record behind the fail-closed `inventory.device.ci` audit.
 The chassis, board and DIMM serials and the machine-id hash (with its algorithm and source) are
-served. Section rows are served only for the `ok` and `constrained` levels; a section at any other
-level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
+served. Section rows are served only for the `ok` and `constrained` levels, except a section withheld
+for an integrity mismatch (below); a section at any other level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
 snapshot (`get_device_ci_with_sections`), so the scalars and the rows are the same replace
 generation. A failed read of the sections is a `503` on REST and a retryable error on MCP
 (`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections
@@ -1286,8 +1286,8 @@ nullable): the number of child rows the full replace actually inserted for it, t
 the same transaction and never from the agent. The read side compares it with the rows it reads in the
 same snapshot; if they differ (child rows lost outside the product, for example a partial single-table
 restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason
-`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the
-rows that were read are still served.
+`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and its
+rows are withheld (`rows: []`; #7165, owner ruling 2026-11-09).
 
 The status row also records `content_digest` (the same migration v3, additive and nullable): the
 SHA-256 of a canonical, length-prefixed serialization of the section's rows (section kind, column
@@ -1306,7 +1306,7 @@ alarm on every stored row. (A column change also needs its own ALTER migration; 
 read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
 row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
 and `complete: false` with reason `server:content_digest_mismatch`, appended after any existing
-reason. The rows that were read are still served, but they are not the values the agent reported. A
+reason. Its rows are withheld (`rows: []`; #7165), because they are not the values the agent reported. A
 lost row is reported by the count token alone, since it changes the digest too. This is an integrity
 check against accident and non-malicious drift, not tamper resistance: anyone able to write the child
 tables can also rewrite the digest column, and the digest covers the rows only, not the section's
