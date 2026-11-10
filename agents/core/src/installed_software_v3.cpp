@@ -165,6 +165,9 @@ void append_section_header(std::string& out, const SectionPlan& p) {
     out += kRs;
 }
 
+// The planner's rows are written as planned: `adds` is already the normal form the section hash
+// and the row hashes were taken over, so this is a byte copy, not a second normalisation (one
+// would hash one record and transmit another whenever a pass is not a fixed point).
 std::string serialise_section(const SectionPlan& p) {
     std::string out;
     append_section_header(out, p);
@@ -173,7 +176,7 @@ std::string serialise_section(const SectionPlan& p) {
     for (const auto& e : p.adds) {
         out += '+';
         out += kUs;
-        out += v3_record(e);
+        out += record_of(e);
     }
     for (const auto& h : p.deletes) {
         out += '-';
@@ -239,9 +242,10 @@ bool is_ws(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\n';
 }
 
-} // namespace
-
-std::string machine_install_location(std::string_view p) {
+// One canonicalisation pass. NOT a fixed point on its own: a strip at the end of the string can
+// expose what an earlier step would have stripped (`/opt/foo"/.` loses its dot segment in step 4
+// and the quote step 1 would then take is left standing), so machine_install_location iterates it.
+std::string canonical_location_once(std::string_view p) {
     // 1. Quotes and padding: installers write `"C:\Program Files\X"` and ` C:\...`.
     while (!p.empty() && (is_ws(p.front()) || p.front() == '"'))
         p.remove_prefix(1);
@@ -250,8 +254,8 @@ std::string machine_install_location(std::string_view p) {
     if (p.empty())
         return {};
     for (const char c : p) {
-        if (static_cast<unsigned char>(c) < 0x20)
-            return {}; // a control byte is not a path
+        if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f)
+            return {}; // a control byte (DEL included) is not a path
     }
     // 2. The Win32 extended-length and device prefixes (`\\?\`, `\\.\`, `//?/`): the path after
     //    one is the same path as without it. What they can introduce besides a drive (`UNC\`,
@@ -348,6 +352,22 @@ std::string machine_install_location(std::string_view p) {
     return out;
 }
 
+} // namespace
+
+std::string machine_install_location(std::string_view raw) {
+    // The stored form is the FIXED POINT of the pass, so the planned row, the wire and any later
+    // normalisation of the same value agree byte for byte. The loop ends: a pass that changes
+    // anything other than case or separators shortens the string, and the pass after one that
+    // changed only those changes nothing.
+    std::string cur(raw);
+    for (;;) {
+        std::string next = canonical_location_once(cur);
+        if (next == cur)
+            return cur;
+        cur = std::move(next);
+    }
+}
+
 SwEntry v3_normal_form(const SwEntry& in) {
     SwEntry e;
     e.name = clamp(in.name);
@@ -372,7 +392,10 @@ namespace {
 
 // `planning`: the planner's rows get the facet as their source and the origin label for an empty
 // publisher (every `+` record has a non-empty slot 3 and the source the server demands); the pure
-// hash functions hash the fields as given.
+// hash functions hash the fields as given. A planned row is in normal form: the label is decided
+// on the clamped publisher (one that is empty only after its separators are stripped is labelled
+// too) and then clamped itself, since `via:` + a 1,024-byte ecosystem is over the field cap the
+// server applies to what it receives. The facet is the server's own name (at most 64 plain bytes).
 std::vector<SwEntry> normalise_rows(const std::vector<SwEntry>& rows, bool planning,
                                     std::string_view facet = {}) {
     std::vector<SwEntry> out;
@@ -384,6 +407,7 @@ std::vector<SwEntry> normalise_rows(const std::vector<SwEntry>& rows, bool plann
         if (planning) {
             e.source = std::string(facet); // the server refuses a `+` whose source is not its facet
             vendor_or_origin(e);
+            e.publisher = clamp(e.publisher);
         }
         out.push_back(std::move(e));
     }

@@ -1484,7 +1484,10 @@ workers).
 UTF-8, clamp to 1,024 bytes on a codepoint boundary, then strip 0x1F, 0x1E and NUL, the one preparation
 step), a canonical epoch (`0` and rpm's `(none)` are written empty) and release (`(none)` is empty), a
 `install_location` kept only under a machine root, the facet as `source`, and a publisher that is never empty (the
-declared vendor, else `via:<ecosystem>`, applied by the planner to every row it plans). Rows are
+declared vendor, else `via:<ecosystem>`, applied by the planner to every row it plans and clamped like
+every other field). The planner normalises ONCE and the writer transmits exactly the bytes the planner
+hashed; the stored form is a fixed point of its own normalisation (`machine_install_location` iterates
+its passes to stability), so a row normalised again on either side is the same bytes. Rows are
 sorted and de-duplicated in the server's comparator order (the 15 stored fields in wire order, location
 before `package_id` and `source`). The section hash, the row hash (the server's `instance_key`), the
 `v3:` report hash and the component record, row hash and section hash reproduce the server's recipes
@@ -1643,7 +1646,9 @@ the lane that identifies but does not assess.
 about 14 MB for eleven facets in the worst case; typical hosts hold 100 to 300 KB. A more compact form is a
 later change if a measurement asks for it.
 
-**Not in this change.** The component facet (no plugin produces it), the settings push of the 2026-11-05
-Update, the binary-evidence plugin and its two-at-once pairing, the `software_evidence.list_inventory` source row
-1.3a names (no such plugin exists; it is deferred with the component facet), and the `disabled` status (nothing in
-the agent turns a facet off yet).
+**Not in this change.** The component facet (no plugin produces it; its writer clamps `path` and `anchor_app` but
+applies no machine-root allowlist to them, so SAM-40 must canonicalise each component once, apply the allowlist
+there and pin planner-vs-wire equality for component sections as the installed-software tests do), the settings
+push of the 2026-11-05 Update, the binary-evidence plugin and its two-at-once pairing, the
+`software_evidence.list_inventory` source row 1.3a names (no such plugin exists; it is deferred with the component
+facet), and the `disabled` status (nothing in the agent turns a facet off yet).

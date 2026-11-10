@@ -700,6 +700,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
     include_directories('../agents/core/src'),               # dex_event.hpp (proto-aware mapping)
     include_directories('../agents/shared'),         # win_str.hpp (#1681, _WIN32-gated); also macos_console_user.hpp (test_certificates_macos.cpp)
+    include_directories('../server/core/src'),       # inventory_blob_v3.hpp (header-only server parser): the oracle test_installed_software_v3.cpp hashes the planned section against. Listed AFTER the agent dirs so an agent header of the same name wins.
     include_directories('../agents/plugins/hardware/src'),  # hardware_disks_macos.hpp (pure parser, PR1.8)
     include_directories('../agents/plugins/services/src'),      # services_macos_launchd.hpp (P8 test)
     include_directories('../agents/plugins/msi_packages/src'),  # msi_packages_macos.hpp (P8 test)

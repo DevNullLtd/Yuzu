@@ -107,13 +107,17 @@ enum class V3Status { full, delta, constrained, timeout, oversize, not_collected
 /// `E:\Profiles\alice`, `/Volumes/<label>/Users`), a UNC path (a home share cannot be told
 /// from an application share), a drive-relative path, an unexpanded `%ProgramFiles%`, an NT
 /// object name (`\??\`, `Volume{...}`, `GLOBALROOT`), an 8.3 name, a `..` that escapes the
-/// root, anything with a control byte. Fails closed: an unrecognised shape is blank. The
-/// row's name, version, publisher and hash are reported whatever this returns.
+/// root, anything with a control byte (DEL included). Fails closed: an unrecognised shape is
+/// blank. The row's name, version, publisher and hash are reported whatever this returns. The
+/// result is a fixed point (`machine_install_location(x) == machine_install_location(
+/// machine_install_location(x))`): a stored form normalised again is the same bytes.
 [[nodiscard]] YUZU_EXPORT std::string machine_install_location(std::string_view raw);
 
 /// The stored form of one row, exactly what the server holds after its own field step: every
 /// field through clamp_field, the canonical epoch and release, and install_location through
-/// machine_install_location. Idempotent. Every hash below is taken over this form.
+/// machine_install_location. A fixed point: `v3_normal_form(v3_normal_form(x)) == v3_normal_form(x)`
+/// over every field (tests/unit/test_installed_software_v3.cpp pins it over the privacy corpus).
+/// Every hash below is taken over this form.
 [[nodiscard]] YUZU_EXPORT SwEntry v3_normal_form(const SwEntry& e);
 
 /// Normal form of every row, nameless rows dropped (the server drops them too), then sorted and
@@ -142,6 +146,11 @@ v3_report_hash(std::vector<std::pair<std::string, std::string>> held);
 // ── Components (the `component_inventory` facet) ─────────────────────────────────────────
 // No plugin produces component rows yet (the evidence collector is a later change); the
 // records and hashes are pinned to the server recipe now so that change cannot drift.
+// component_normal_form clamps `path` and `anchor_app` but applies NO machine-root allowlist to
+// them (ADR-0016 holds the component writer to the slot-13 precondition: the server stores both
+// as sent). The producer (SAM-40) must canonicalise each row ONCE, apply the allowlist there,
+// and pin planner-vs-wire equality for component sections the way the installed-software tests
+// below do; nothing reaches the wire until it exists.
 
 struct SwComponent {
     std::string kind;
@@ -222,6 +231,8 @@ struct V3Blob {
 /// section count within kV3MaxSections. A row-bearing section that would cross a cap (it fits
 /// alone, the planner guarantees it) is deferred: not written and not claimed held, so the
 /// next collection sends it. An `unchanged` plan is skipped (it is in neither list).
+/// `adds` are written byte for byte as planned: plan_section is the ONE normalisation point, so
+/// the record the section hash and row hashes were taken over is the record on the wire.
 [[nodiscard]] YUZU_EXPORT V3Blob write_v3_blob(const std::vector<SectionPlan>& plans);
 
 // ── The persisted acked set ──────────────────────────────────────────────────────────────

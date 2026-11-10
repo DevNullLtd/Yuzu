@@ -1054,11 +1054,13 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
         plans.reserve(st->facets.size());
         for (std::size_t i = 0; i < st->facets.size(); ++i) {
             FacetState& f = st->facets[i];
-            f.pending_rows = false;
-            // A status section sent and never acknowledged (the response was lost) leaves the
-            // server's state unknown, so what was last acknowledged proves nothing about it.
-            if (f.pending_status)
+            // A section sent and never acknowledged (the response was lost) leaves the server's
+            // state unknown, so what was last acknowledged proves nothing about it: after a lost
+            // FULL the server may hold rows while the facet answers the status it last had
+            // acknowledged, and that status must be sent again, not read as unchanged.
+            if (f.pending_rows || f.pending_status)
                 f.last_status.reset();
+            f.pending_rows = false;
             f.pending_status.reset();
             f.pending = AckedSet{};
             // A pass inside the cooldown rebuilds from the rows already collected. Everything

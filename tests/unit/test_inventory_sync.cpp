@@ -5081,6 +5081,32 @@ TEST_CASE("collector: a status-only section is re-sent only on a change, a nack,
         CHECK(statuses_only(back->first) == std::vector<std::string>{kMsi});
         CHECK(c.src.wants_blob());
     }
+    SECTION("a lost FULL response: the acknowledged degraded status that follows is sent again") {
+        c.pass_cooldown();
+        g_fake[3].rc["list_inventory"] = 1; // constrained `rc=1`, acknowledged
+        REQUIRE(statuses_only(c.collect()->first) == std::vector<std::string>{kMsi});
+        c.ack();
+        c.pass_cooldown();
+        g_fake[3].rc.erase("list_inventory");
+        g_fake[3].out["list_inventory"] = "status|list_inventory|supported|-\n"; // rows: FULL
+        const auto full = c.collect();
+        REQUIRE(full.has_value());
+        REQUIRE(find_sec(sections_of(full->first), kMsi)->status == "full");
+        // The server applied the FULL but the response never arrived (no on_ack): it now shows
+        // rows as current. The facet degrades back to the status it last had acknowledged while a
+        // sibling changes, so the report is not hash-only and nothing in-band would notice an
+        // omitted section. The degraded status must be sent, not read as unchanged.
+        c.pass_cooldown();
+        g_fake[3].rc["list_inventory"] = 1;
+        g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\n";
+        const auto back = c.collect();
+        REQUIRE(back.has_value());
+        const auto secs = sections_of(back->first);
+        REQUIRE(find_sec(secs, kFacetApps) != nullptr); // the sibling's change went out
+        CHECK(statuses_only(back->first) == std::vector<std::string>{kMsi});
+        REQUIRE(find_sec(secs, kMsi) != nullptr);
+        CHECK(find_sec(secs, kMsi)->status == "constrained");
+    }
     SECTION("a nack of that facet sends it again") {
         c.pass_cooldown();
         REQUIRE(c.collect().has_value());

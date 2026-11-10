@@ -9,9 +9,12 @@
 #include "installed_software_v3.hpp"
 #include "sync_canonical.hpp"
 
+#include "inventory_blob_v3.hpp" // the server's parser (header-only): the oracle for the wire
+
 #include <algorithm>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 using namespace yuzu::agent;
@@ -289,11 +292,11 @@ TEST_CASE("machine_install_location and the writer's install_location rule", "[v
     CHECK(split(v3_record(e), '\x1f')[12] == "/Applications/Tool.app");
 }
 
-TEST_CASE("install_location is an allowlist: every spelling outside a machine root is blanked on the wire",
-          "[v3][writer][privacy]") {
-    // Every spelling the governance probe found leaking under the old blacklist, plus the shapes
-    // the canonicaliser cannot resolve. None of these may reach the wire.
-    const std::vector<std::string> blanked = {
+namespace {
+
+// Every spelling the governance probe found leaking under the old blacklist, plus the shapes
+// the canonicaliser cannot resolve. None of these may reach the wire.
+const std::vector<std::string> kBlankedSpellings = {
         // Quotes, padding, doubled separators, dot segments, trailing dots (installer-authored text).
         "\"C:\\Users\\alice\\AppData\\Local\\Foo\"", " C:\\Users\\alice", "C:\\\\Users\\\\alice\\\\Foo",
         "C:\\.\\Users\\alice", "C:\\Users.\\alice", "C:\\Program Files\\..\\Users\\alice",
@@ -320,9 +323,63 @@ TEST_CASE("install_location is an allowlist: every spelling outside a machine ro
         "/System/Volumes/Data/root/bin", "/System/Volumes/Data",
         "/users/alice/App", "/System/Volumes/Data/users/x", "C:\\Documents and Settings\\alice\\x",
         "c:/documents and settings/x", "\\Users\\alice\\x", "/Documents and Settings/x", "\\x",
-        // A control byte is not a path.
-        std::string("C:\\Program Files\\Tool\x01"), "/Applications/\tTool.app"};
-    for (const auto& path : blanked) {
+        // A control byte is not a path; DEL (0x7F) counts as one.
+        std::string("C:\\Program Files\\Tool\x01"), "/Applications/\tTool.app",
+        std::string("C:\\Program Files\\Tool\x7f"), std::string("/opt/\x7fTool")};
+
+// Under a machine root the location is kept, in ONE spelling: the shape's separator, an
+// upper-case drive letter, no quotes, padding, prefix, doubled separator, dot segment or
+// trailing separator, the segments' own case.
+const std::vector<std::pair<std::string, std::string>> kKeptSpellings = {
+    {"C:\\Program Files\\Tool", "C:\\Program Files\\Tool"},
+    {"\"C:\\Program Files\\Tool\"", "C:\\Program Files\\Tool"},
+    {" c:/program files (x86)/Tool/ ", "C:\\program files (x86)\\Tool"},
+    {"\\\\?\\C:\\Program Files (x86)\\Tool", "C:\\Program Files (x86)\\Tool"},
+    {"\\\\.\\C:\\Windows", "C:\\Windows"},
+    {"C:\\\\Program Files\\\\.\\Tool\\..\\Tool2.", "C:\\Program Files\\Tool2"},
+    {"D:\\ProgramData\\Vendor\\App", "D:\\ProgramData\\Vendor\\App"},
+    {"C:\\Program Files\\WindowsApps\\Vendor.App_1.0_x64__8wekyb3d8bbwe",
+     "C:\\Program Files\\WindowsApps\\Vendor.App_1.0_x64__8wekyb3d8bbwe"},
+    {"C:\\Windows\\System32\\drivers", "C:\\Windows\\System32\\drivers"},
+    {"/Applications/Tool.app", "/Applications/Tool.app"},
+    {"/Applications/Tool.app/", "/Applications/Tool.app"},
+    {"/System/Volumes/Data/Applications/Tool.app", "/Applications/Tool.app"},
+    {"/System/Applications/Tool.app", "/System/Applications/Tool.app"},
+    {"/Library/Application Support/Vendor", "/Library/Application Support/Vendor"},
+    {"/System/Volumes/Data/opt/x", "/opt/x"},
+    {"/usr/local/bin", "/usr/local/bin"},
+    {"/Developer/Tool", "/Developer/Tool"},
+    {"/snap/foo/12", "/snap/foo/12"},
+    {"/var/lib/flatpak/app/org.example.Foo", "/var/lib/flatpak/app/org.example.Foo"},
+    {"/nix/store/abc-foo", "/nix/store/abc-foo"},
+    {"/app/bin", "/app/bin"},
+    {"/opt//x/./y/../z", "/opt/x/z"},
+    // The rule is lexical (ADR-0016 section 8): under a machine root a segment that merely
+    // looks like a profile folder is kept; nothing below the root is inspected.
+    {"/opt/users/alice/app", "/opt/users/alice/app"},
+    {"/Library/Users", "/Library/Users"},
+    {"/opt/homedir", "/opt/homedir"},
+    {"C:\\Program Files", "C:\\Program Files"},
+    // Junk a single canonicalisation pass does not settle: a quote exposed by a stripped dot
+    // segment, trailing dot or padding. The stored form is the fixed point (quote gone), not the
+    // one-pass form (`/opt/foo"`): a one-pass writer planned one record and transmitted another.
+    {"/opt/foo\"/.", "/opt/foo"},
+    {"/opt/foo\"/", "/opt/foo"},
+    {"/opt/foo\". ", "/opt/foo\"."}, // POSIX keeps a trailing dot: one pass strips the padding only
+    {"C:\\Program Files\\foo\".", "C:\\Program Files\\foo"},
+    {"C:\\Program Files\\foo\" .", "C:\\Program Files\\foo"},
+    {"C:\\Program Files\\foo\"\\.", "C:\\Program Files\\foo"},
+    {"C:\\Program Files\\foo\".\".\".", "C:\\Program Files\\foo"}};
+
+// The same junk shapes under no machine root: blank on both sides, whatever the pass count.
+const std::vector<std::string> kJunkBlanked = {"/home/alice/foo\"/.", "C:\\Users\\alice\\foo\".",
+                                                "/Users/alice/foo\". ", "/opt/..\"/."};
+
+} // namespace
+
+TEST_CASE("install_location is an allowlist: every spelling outside a machine root is blanked on the wire",
+          "[v3][writer][privacy]") {
+    for (const auto& path : kBlankedSpellings) {
         CAPTURE(path);
         CHECK(machine_install_location(path).empty());
         SwEntry e = alpha();
@@ -339,40 +396,12 @@ TEST_CASE("install_location is an allowlist: every spelling outside a machine ro
         CHECK(plan.adds[0].install_location.empty());
         CHECK(plan.section_hash == plan_section(kApps, {blank}, std::nullopt, false).section_hash);
     }
-    // Under a machine root the location is kept, in ONE spelling: the shape's separator, an
-    // upper-case drive letter, no quotes, padding, prefix, doubled separator, dot segment or
-    // trailing separator, the segments' own case.
-    const std::vector<std::pair<std::string, std::string>> kept = {
-        {"C:\\Program Files\\Tool", "C:\\Program Files\\Tool"},
-        {"\"C:\\Program Files\\Tool\"", "C:\\Program Files\\Tool"},
-        {" c:/program files (x86)/Tool/ ", "C:\\program files (x86)\\Tool"},
-        {"\\\\?\\C:\\Program Files (x86)\\Tool", "C:\\Program Files (x86)\\Tool"},
-        {"\\\\.\\C:\\Windows", "C:\\Windows"},
-        {"C:\\\\Program Files\\\\.\\Tool\\..\\Tool2.", "C:\\Program Files\\Tool2"},
-        {"D:\\ProgramData\\Vendor\\App", "D:\\ProgramData\\Vendor\\App"},
-        {"C:\\Program Files\\WindowsApps\\Vendor.App_1.0_x64__8wekyb3d8bbwe",
-         "C:\\Program Files\\WindowsApps\\Vendor.App_1.0_x64__8wekyb3d8bbwe"},
-        {"C:\\Windows\\System32\\drivers", "C:\\Windows\\System32\\drivers"},
-        {"/Applications/Tool.app", "/Applications/Tool.app"},
-        {"/Applications/Tool.app/", "/Applications/Tool.app"},
-        {"/System/Volumes/Data/Applications/Tool.app", "/Applications/Tool.app"},
-        {"/System/Applications/Tool.app", "/System/Applications/Tool.app"},
-        {"/Library/Application Support/Vendor", "/Library/Application Support/Vendor"},
-        {"/System/Volumes/Data/opt/x", "/opt/x"},
-        {"/usr/local/bin", "/usr/local/bin"},
-        {"/Developer/Tool", "/Developer/Tool"},
-        {"/snap/foo/12", "/snap/foo/12"},
-        {"/var/lib/flatpak/app/org.example.Foo", "/var/lib/flatpak/app/org.example.Foo"},
-        {"/nix/store/abc-foo", "/nix/store/abc-foo"},
-        {"/app/bin", "/app/bin"},
-        {"/opt//x/./y/../z", "/opt/x/z"},
-        // The rule is lexical (ADR-0016 section 8): under a machine root a segment that merely
-        // looks like a profile folder is kept; nothing below the root is inspected.
-        {"/opt/users/alice/app", "/opt/users/alice/app"},
-        {"/Library/Users", "/Library/Users"},
-        {"/opt/homedir", "/opt/homedir"},
-        {"C:\\Program Files", "C:\\Program Files"}};
-    for (const auto& [path, canonical] : kept) {
+    for (const auto& path : kJunkBlanked) {
+        CAPTURE(path);
+        CHECK(machine_install_location(path).empty());
+    }
+    // Under a machine root the location is kept, in ONE spelling (kKeptSpellings).
+    for (const auto& [path, canonical] : kKeptSpellings) {
         CAPTURE(path);
         CHECK(machine_install_location(path) == canonical);
         SwEntry e = alpha();
@@ -539,6 +568,225 @@ TEST_CASE("every + record has a non-empty publisher: the planner applies the ori
         pubs.push_back(a[3]);
     std::sort(pubs.begin(), pubs.end());
     CHECK(pubs == std::vector<std::string>{"via:brew", "via:unknown"});
+}
+
+namespace {
+
+namespace srv = yuzu::server;
+
+// The server's side of the contract, over the rows ITS parser produced from the wire: the record
+// (software_inventory_store.cpp append_section_record), the comparator (entry_less) and the
+// section hash (canonical_section_hash). The planner must land on these bytes exactly.
+std::string server_record(const srv::SoftwareEntry& e) {
+    const std::string_view slots[16] = {e.name,       e.version,          e.publisher,
+                                        e.install_date, e.kind,           e.ecosystem,
+                                        e.epoch,      e.release,          e.arch,
+                                        e.signature_status, e.distro_id,  e.distro_version,
+                                        e.install_location, std::string_view{}, e.package_id,
+                                        e.source};
+    std::string out;
+    for (std::size_t i = 0; i < 16; ++i) {
+        if (i)
+            out += '\x1f';
+        out += slots[i];
+    }
+    out += '\x1e';
+    return out;
+}
+
+bool server_less(const srv::SoftwareEntry& a, const srv::SoftwareEntry& b) {
+    return std::tie(a.name, a.version, a.publisher, a.install_date, a.kind, a.ecosystem, a.epoch,
+                    a.release, a.arch, a.signature_status, a.distro_id, a.distro_version,
+                    a.install_location, a.package_id, a.source) <
+           std::tie(b.name, b.version, b.publisher, b.install_date, b.kind, b.ecosystem, b.epoch,
+                    b.release, b.arch, b.signature_status, b.distro_id, b.distro_version,
+                    b.install_location, b.package_id, b.source);
+}
+
+std::string server_section_hash(std::vector<srv::SoftwareEntry> rows) {
+    std::sort(rows.begin(), rows.end(), server_less);
+    rows.erase(std::unique(rows.begin(), rows.end(),
+                           [](const auto& a, const auto& b) {
+                               return !server_less(a, b) && !server_less(b, a);
+                           }),
+               rows.end());
+    std::string canon;
+    for (const auto& e : rows)
+        canon += server_record(e);
+    return sha256_hex(canon);
+}
+
+std::vector<std::string> server_row_hashes(const std::vector<srv::SoftwareEntry>& rows) {
+    std::vector<std::string> out;
+    for (const auto& e : rows)
+        out.push_back(sha256_hex(server_record(e)));
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// The one section of a blob as the server parses it, accepted whole.
+srv::V3Section server_section(const std::string& blob) {
+    const auto parsed = srv::parse_v3_blob(blob);
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->sections.size() == 1);
+    REQUIRE(parsed->sections[0].refusal == srv::V3Refusal::kNone);
+    return parsed->sections[0];
+}
+
+// The 15 stored fields of an agent row, for field-wise equality (SwEntry has no operator==).
+std::vector<std::string> fields_of(const SwEntry& e) {
+    return {e.name,  e.version, e.publisher, e.install_date, e.kind, e.ecosystem,
+            e.epoch, e.release, e.arch, e.signature_status, e.distro_id, e.distro_version,
+            e.install_location, e.package_id, e.source};
+}
+
+// The shapes that once made the planner hash one record and the writer transmit another: a
+// location that settles only after a second canonicalisation pass (with and without a kept
+// root), an origin label built from a 1,024-byte ecosystem (1,028 bytes before the clamp), and
+// a plain row beside them.
+std::vector<SwEntry> trigger_rows() {
+    std::vector<SwEntry> rows;
+    for (const char* loc : {"/opt/foo\"/.", "/opt/foo\". ", "C:\\Program Files\\foo\".",
+                            "C:\\Program Files\\foo\"\\.", "/home/alice/foo\"/.",
+                            "C:\\Users\\alice\\foo\"."}) {
+        SwEntry e = alpha();
+        e.name = std::string("loc-") + loc;
+        e.install_location = loc;
+        rows.push_back(e);
+    }
+    SwEntry eco = alpha();
+    eco.name = "long-ecosystem";
+    eco.publisher.clear();
+    eco.ecosystem = std::string(kV3MaxFieldLen, 'x');
+    rows.push_back(eco);
+    rows.push_back(alpha());
+    return rows;
+}
+
+} // namespace
+
+TEST_CASE("the planned section hash is the hash over the server-parsed wire records, trigger shapes included",
+          "[v3][planner][hash][privacy]") {
+    // Each shape alone, then all together: the server hashes what it stored, which is what it
+    // parsed, which must be what the planner hashed.
+    std::vector<std::vector<SwEntry>> sets;
+    for (const auto& r : trigger_rows())
+        sets.push_back({r});
+    sets.push_back(trigger_rows());
+    for (const auto& rows : sets) {
+        CAPTURE(rows[0].name, rows.size());
+        const SectionPlan p = plan_section(kApps, rows, std::nullopt, false);
+        REQUIRE(p.status == V3Status::full);
+        const srv::V3Section sec = server_section(write_v3_blob({p}).blob);
+        REQUIRE(sec.rows.size() == p.adds.size());
+        CHECK(server_section_hash(sec.rows) == p.section_hash);
+        CHECK(server_row_hashes(sec.rows) == p.row_hashes);
+        // ...and field for field: what the server holds is the planned row.
+        for (std::size_t i = 0; i < sec.rows.size(); ++i) {
+            CAPTURE(i, p.adds[i].name);
+            CHECK(sec.rows[i].publisher == p.adds[i].publisher);
+            CHECK(sec.rows[i].install_location == p.adds[i].install_location);
+        }
+    }
+    // The label is clamped on the planner's side, so the server keeps it whole.
+    const SectionPlan eco = plan_section(kApps, {trigger_rows()[6]}, std::nullopt, false);
+    CHECK(eco.adds[0].publisher.size() == kV3MaxFieldLen);
+    CHECK(eco.adds[0].publisher.starts_with("via:xxxx"));
+    CHECK(server_section(write_v3_blob({eco}).blob).rows[0].publisher == eco.adds[0].publisher);
+}
+
+TEST_CASE("a delta against the acknowledged FULL applies on the server-parsed set: deletions name held rows, expect is the result",
+          "[v3][planner][hash][delta]") {
+    const std::vector<SwEntry> before = trigger_rows();
+    const SectionPlan full = plan_section(kApps, before, std::nullopt, false);
+    const srv::V3Section held = server_section(write_v3_blob({full}).blob);
+    REQUIRE(server_section_hash(held.rows) == full.section_hash);
+    const AckedSet acked = acked_of(full); // what on_ack commits
+
+    // One junk-location row upgraded, one removed, one plain row added.
+    std::vector<SwEntry> after;
+    for (const auto& r : before) {
+        if (r.name == "loc-/opt/foo\". ")
+            continue; // gone
+        SwEntry e = r;
+        if (r.name == "loc-C:\\Program Files\\foo\".")
+            e.version = "1.1";
+        after.push_back(e);
+    }
+    after.push_back(row("plain-add"));
+    const SectionPlan delta = plan_section(kApps, after, acked, false);
+    REQUIRE(delta.status == V3Status::delta);
+    CHECK(delta.base == full.section_hash);
+    CHECK(delta.deletes.size() == 2);
+    CHECK(delta.adds.size() == 2);
+
+    const srv::V3Section wire = server_section(write_v3_blob({delta}).blob);
+    REQUIRE(wire.status == srv::V3Status::kDelta);
+    CHECK(wire.base == full.section_hash);
+    CHECK(wire.expect == delta.expect);
+    // Every `-` names a row the server holds, by the hash of the record IT stored.
+    const auto held_hashes = server_row_hashes(held.rows);
+    for (const auto& d : wire.deletions) {
+        CAPTURE(d);
+        CHECK(std::binary_search(held_hashes.begin(), held_hashes.end(), d));
+    }
+    // Apply as the server does: drop the named rows, add the `+` rows, hash the result.
+    std::vector<srv::SoftwareEntry> applied;
+    for (const auto& e : held.rows) {
+        const std::string h = sha256_hex(server_record(e));
+        if (std::find(wire.deletions.begin(), wire.deletions.end(), h) == wire.deletions.end())
+            applied.push_back(e);
+    }
+    applied.insert(applied.end(), wire.rows.begin(), wire.rows.end());
+    CHECK(server_section_hash(applied) == wire.expect);
+    CHECK(server_section_hash(applied) ==
+          plan_section(kApps, after, std::nullopt, false).section_hash);
+}
+
+TEST_CASE("write_v3_blob writes the planned record byte for byte: the planner is the one normalisation point",
+          "[v3][writer]") {
+    // A planned row is in normal form. This one is made not to be: epoch `0` is canonically
+    // empty. The writer must transmit `0`, because a writer that normalises again hashes one
+    // record and transmits another whenever a pass is not a fixed point.
+    SectionPlan p = plan_section(kApps, {alpha()}, std::nullopt, false);
+    REQUIRE(p.adds.size() == 1);
+    p.adds[0].epoch = "0";
+    const auto parsed = parse_like_server(write_v3_blob({p}).blob);
+    REQUIRE(parsed.sections.size() == 1);
+    REQUIRE(parsed.sections[0].adds.size() == 1);
+    CHECK(parsed.sections[0].adds[0][7] == "0"); // slot 6 (epoch) is field 7 after the `+`
+}
+
+TEST_CASE("v3_normal_form and machine_install_location are fixed points over the privacy corpus and the trigger shapes",
+          "[v3][writer][privacy][hash]") {
+    std::vector<std::string> corpus = kBlankedSpellings;
+    corpus.insert(corpus.end(), kJunkBlanked.begin(), kJunkBlanked.end());
+    for (const auto& [path, canonical] : kKeptSpellings) {
+        corpus.push_back(path);
+        corpus.push_back(canonical);
+    }
+    for (const auto& path : corpus) {
+        CAPTURE(path);
+        const std::string once = machine_install_location(path);
+        CHECK(machine_install_location(once) == once);
+        // ...and the whole row, with every other field at a value its clamp or canonical
+        // spelling changes: the normal form of the normal form is the normal form.
+        SwEntry e = alpha();
+        e.install_location = path;
+        e.publisher = std::string(kV3MaxFieldLen + 10, 'p');
+        e.ecosystem = std::string(kV3MaxFieldLen, 'x');
+        e.epoch = "(none)";
+        e.release = "(none)";
+        e.version = "1.\x1f" "0";
+        const SwEntry nf = v3_normal_form(e);
+        CHECK(fields_of(v3_normal_form(nf)) == fields_of(nf));
+    }
+    // Planned rows (the label applied, the source set) are a fixed point too: the wire form is
+    // the normal form, so the server's hash over what it stores is the planner's hash.
+    for (const auto& planned : plan_section(kApps, trigger_rows(), std::nullopt, false).adds) {
+        CAPTURE(planned.name);
+        CHECK(fields_of(v3_normal_form(planned)) == fields_of(planned));
+    }
 }
 
 TEST_CASE("write_v3_blob: header, S field order, status-only sections first, no rows in them",
