@@ -193,10 +193,10 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   step 1, but they are not yet unused: do not stop them before ladder step 4.**
   `cache-prune.yml`'s weekly `prune-windows` job still sweeps them
   (`scripts/ci/sweep-test-databases.sh`), `Assert-Toolchain.ps1` still
-  health-checks them (`pg_isready`, see below), and until the next `dev`→`main`
-  promotion carries step 1, and until every open branch is rebased past it,
-  `main` pushes and unrebased PRs still run the old `ci.yml` with its Windows
-  `Ensure Postgres` and pg-shard steps against them.
+  health-checks them (see below), `main` pushes still run the old `ci.yml`
+  with its Windows `Ensure Postgres` and pg-shard steps against them until the
+  next `dev`→`main` promotion carries step 1, and so does each open PR until it
+  is rebased past step 1.
   The server is Linux-only: `ci.yml`'s Windows leg builds the agent only
   (`-Dbuild_server=false`, into `build-windows-agent-{debug,release}`; the job
   deletes the older `build-windows-{debug,release}` dirs on every run) and no

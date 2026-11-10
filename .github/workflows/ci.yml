@@ -2303,7 +2303,7 @@ jobs:
             if [[ -d "$GITHUB_WORKSPACE/$legacy" ]]; then
               echo "removing legacy $legacy/ (per-variant dirs are now build-windows-agent-{debug,release})"
               rm -rf "${GITHUB_WORKSPACE:?}/$legacy" \
-                || echo "::warning::could not fully remove legacy $legacy/ (a file is in use); this job does not use it. If an older branch's run on this runner then fails with 'already configured', see docs/ci-troubleshooting.md entry 8."
+                || echo "::warning::could not fully remove legacy $legacy/ (in use, or no permission); this job does not use it. If an older branch's run on this runner then fails with 'already configured', see docs/ci-troubleshooting.md entry 8."
             fi
           done
 

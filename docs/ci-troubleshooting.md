@@ -645,7 +645,7 @@ half-deleted case below.
 **Warning, not failure: a legacy dir is in use.** The legacy-dir removal
 is best-effort. If a leftover process (a hung test, a debugger, an
 antivirus scan) holds a file open, the step logs
-`::warning::could not fully remove legacy build-windows-debug/ (a file is in use); this job does not use it. ...`
+`::warning::could not fully remove legacy build-windows-debug/ (in use, or no permission); this job does not use it. ...`
 and the job continues; the up-to-date job never reads that dir.
 
 **Half-deleted build dir: `meson setup` fails with "already configured".**

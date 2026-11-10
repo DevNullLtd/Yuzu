@@ -357,15 +357,18 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
 
    **Release ordering (owner decision, 2026-11-10):** step 2 MUST merge before the next release
    tag, or that release MUST explicitly accept shipping a Windows/macOS server that CI never
-   compiled or tested, recorded as a line in its GitHub Release notes naming the approver, the
-   date and the tag (the exact form and the `release.yml` check are in
+   compiled or tested, recorded before tagging as a merged `changelog.d` fragment naming the
+   approver and the date, which `release.yml` carries into that release's notes (the exact form
+   and the `release.yml` check are in
    `.claude/skills/release/SKILL.md`, Phase 0 preflight). From step 1 on, CI no longer compiles
    or tests the Windows or macOS server, but `release.yml` still builds and ships it until step 2.
    If a Windows or macOS server compile break surfaces at release time before step 2, the remedy
    is to land step 2 (drop the server from those release jobs), not to patch server code for an
    unsupported platform.
-2. **Release + rename blast radius** — remove the server from the Windows/macOS staging in
-   `release.yml` (incl. `install-server-postgres.sh` from the macOS tarball); delete the
+2. **Release + rename blast radius** — stop building the server in `release.yml`'s Windows and
+   macOS jobs (`-Dbuild_server=false` on their configure, and remove their server `--help` smoke
+   tests) and remove it from their staging (incl. `install-server-postgres.sh` from the macOS
+   tarball), so the `/release` preflight grep goes empty; delete the
    `YuzuServerSetup` / `deploy/packaging/windows/yuzu-server.iss` path; rename the Windows/macOS
    archives to their agent-only names and update **every** consumer: `scripts/check-release-artifacts.sh`
    (the `FILES` array **and** the `.cdx.json`/`.spdx.json` SBOM name expectations), the SBOM artifact
