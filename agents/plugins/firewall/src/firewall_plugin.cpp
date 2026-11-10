@@ -2199,10 +2199,12 @@ public:
         //    program, service or action, stays off (a twin differing only in addresses,
         //    interfaces or edge traversal shares the key and comes back with it, README
         //    caveat 3). A listed rule someone EDITED during the quarantine carries a
-        //    different key; it falls back to name, direction and profile when exactly one
-        //    switched-off rule carries them, and is otherwise reported `rules_unmatched`
-        //    (the release still completes). Every rule is read once and the switched-off
-        //    ones are held, so the decision and the re-enable see the same ruleset.
+        //    different key; it falls back to name, direction and profile only when exactly
+        //    one rule in total carries them: switched off it is switched on, already on it
+        //    is counted (`rules_accounted_enabled`), and with none or more than one it is
+        //    reported `rules_unmatched` and nothing is switched on for it (the release still
+        //    completes). Every rule is read once and the switched-off ones are held, so the
+        //    decision and the re-enable see the same ruleset.
         const std::string list_key{fq::kWinDisabledRulesKey};
         const auto list_presence = kv_presence(raw_, list_key);
         const bool list_exists = list_presence == fq::KvPresence::present;
@@ -2235,6 +2237,7 @@ public:
                         if (!held[i] || held[i]->put_Enabled(VARIANT_TRUE) != S_OK)
                             ++tally.not_reenabled;
                     tally.reenabled_by_identity = plan.by_identity;
+                    tally.accounted_enabled = plan.accounted_enabled;
                     tally.unmatched = plan.unmatched;
                     // The names are the agent's own record of what the release could not
                     // account for (the reply carries the count only).

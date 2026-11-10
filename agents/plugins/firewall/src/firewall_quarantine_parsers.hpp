@@ -1555,22 +1555,29 @@ win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
 ///    matches a rule at all, enabled or not, is accounted for: a retry of an incomplete
 ///    release finds the rules the first attempt already switched on.
 /// 2. IDENTITY FALLBACK, for a listed key no rule carries any more (someone edited its
-///    program, ports, service or action during the quarantine, which changes the key): the
-///    rule comes back on when exactly ONE still-disabled rule not already claimed carries
-///    the key's name|direction|profiles. A best guess, so the shell reports how often it
-///    was taken. With no such disabled rule, exactly ONE enabled unclaimed rule of that
-///    identity accounts for the key: the edited rule an earlier attempt's fallback already
-///    switched on (nothing to switch, no guess to report), so a retry of an incomplete
-///    release does not call it unmatched. An exact match claims its rule enabled or not,
-///    so an untouched twin is never that candidate. Residual, cannot be told apart: a
-///    listed rule DELETED during the quarantine beside a same-identity rule that was off
-///    before looks like an edit (switched on while disabled, taken as accounted for once
-///    enabled).
-/// 3. Otherwise the key is unmatched: more than one candidate, or none. The release still
-///    completes (nothing of ours is left behind); it is reported, never silent.
+///    program, ports, service or action during the quarantine, which changes the key). The
+///    key's name|direction|profiles must be carried by exactly ONE rule in total, claimed or
+///    not, on or off. Any second carrier is a rule the edit cannot be told apart from: a
+///    sibling that was off before the quarantine, or an untouched twin an exact key already
+///    claimed, and switching either on would leave the host MORE open than it was before.
+///    The sole carrier then decides:
+///    - switched off and not claimed: it comes back on. A best guess, so the shell reports
+///      how often it was taken (`by_identity`).
+///    - already on: the edited rule an earlier attempt's fallback switched on, or one
+///      switched back on by hand. Nothing to switch, no guess to report; it is counted
+///      (`accounted_enabled`) so the reply still says the rule was not found by its key.
+///    - switched off but already claimed (another listed key took it first): unmatched.
+/// 3. Otherwise the key is unmatched: no carrier, or more than one. Nothing is switched on
+///    for it (fail safe: a rule left off is never more open than before); the release still
+///    completes (nothing of ours is left behind), and is reported, never silent.
+///
+/// Residual, cannot be told apart: a listed rule DELETED during the quarantine beside exactly
+/// one rule of the same identity reads as an edit of it, so that rule is switched on if it
+/// is off, or accounted for if it is on.
 struct WinReleasePlan {
     std::vector<std::size_t> reenable;        // indices into `rules`, each a disabled rule
     int by_identity = 0;                      // how many of those the fallback chose
+    int accounted_enabled = 0;                // listed keys whose sole identity carrier was already on
     int unmatched = 0;                        // listed keys with no unique rule to switch on
     std::vector<std::string> unmatched_keys;  // those keys, for the agent's log
 };
@@ -1604,32 +1611,23 @@ struct WinReleasePlan {
         }
     }
     for (const auto* key : orphans) {
-        std::optional<std::size_t> off;
-        std::optional<std::size_t> on;
-        int disabled = 0;
-        int enabled = 0;
-        if (const auto it = same_identity.find(win_key_identity(*key)); it != same_identity.end())
-            for (const auto i : it->second) {
-                if (claimed[i])
-                    continue;
-                if (rules[i].enabled) {
-                    on = i;
-                    ++enabled;
-                } else {
-                    off = i;
-                    ++disabled;
-                }
+        // The identity must be carried by exactly one rule in total (see the contract above).
+        const auto it = same_identity.find(win_key_identity(*key));
+        if (it != same_identity.end() && it->second.size() == 1) {
+            const auto i = it->second.front();
+            if (rules[i].enabled) {
+                ++plan.accounted_enabled;
+                continue;
             }
-        if (disabled == 1) {
-            claimed[*off] = true;
-            plan.reenable.push_back(*off);
-            ++plan.by_identity;
-        } else if (disabled == 0 && enabled == 1) {
-            claimed[*on] = true; // already back on: accounted for, nothing to switch
-        } else {
-            ++plan.unmatched;
-            plan.unmatched_keys.push_back(*key);
+            if (!claimed[i]) {
+                claimed[i] = true;
+                plan.reenable.push_back(i);
+                ++plan.by_identity;
+                continue;
+            }
         }
+        ++plan.unmatched;
+        plan.unmatched_keys.push_back(*key);
     }
     return plan;
 }
@@ -1638,7 +1636,8 @@ struct WinReleasePlan {
 struct WinReleaseTally {
     bool reenable_unread = false;     // the rule enumeration failed part-way: unknown
     int not_reenabled = 0;            // rules the policy store refused to switch back on
-    int reenabled_by_identity = 0;    // rules switched on by the identity fallback (a guess)
+    int reenabled_by_identity = 0;    // rules the identity fallback chose to switch on (a guess)
+    int accounted_enabled = 0;        // listed rules whose sole same-identity rule was already on
     int unmatched = 0;                // listed rules with no unique rule to switch on
     int policy_restore_failed = 0;    // profile default actions that would not restore
     bool our_rules_left = false;      // a rule of ours would not go
@@ -1668,6 +1667,8 @@ struct WinReleaseDecision {
         d.notes.push_back(std::format("rules_unmatched={}", t.unmatched));
     if (t.reenabled_by_identity > 0)
         d.notes.push_back(std::format("rules_reenabled_by_identity={}", t.reenabled_by_identity));
+    if (t.accounted_enabled > 0)
+        d.notes.push_back(std::format("rules_accounted_enabled={}", t.accounted_enabled));
     if (t.images_not_deleted)
         d.notes.emplace_back("images_not_deleted=1");
     d.incomplete = t.reenable_unread || t.policy_restore_failed > 0 || t.our_rules_left ||
@@ -3702,7 +3703,10 @@ inline void status_from_record(Outcome& o, const QuarantineState& st, const LegS
 /// would re-apply, bringing back the containment that just failed its own control
 /// check. A failed intent write is a note and the removal still proceeds: undoing a
 /// containment whose control channel failed is the safety path, never skipped. The
-/// record is dropped only when the removal and the erase both completed.
+/// record is dropped only when the removal and the erase both completed. The removal is
+/// the same one a release makes, so what it learned rides the outcome on both arms (a
+/// Windows rule it left off or could not match, a stale image): `rolled_back` is never
+/// the whole story of a rollback that left the host short of clean.
 inline Outcome roll_back(Env& env, QuarantineState st, std::string reason, std::string det,
                          Deadline& dl, Outcome o) {
     st.phase = Phase::releasing;
@@ -3713,11 +3717,16 @@ inline Outcome roll_back(Env& env, QuarantineState st, std::string reason, std::
     if (!rm.ok) {
         saved = env.store.save(st); // remove() may have changed the leg's facts
         o.notes.emplace_back("rollback_incomplete=1");
+        if (!rm.detail.empty()) // `detail=` below is the apply's; this is the removal's own
+            o.notes.push_back("rollback_detail=" + rm.detail);
     } else if (env.store.erase()) {
         o.state.reset();
     } else {
         o.notes.emplace_back("state_not_erased=1");
     }
+    detail::add_notes(o, rm.notes);
+    if (rm.ok && rm.partial) // removed, but the leg could not vouch for all of it
+        o.notes.emplace_back("rollback_partial=1");
     if (o.state && !saved)
         o.notes.emplace_back("state_not_persisted=1");
     o.status = "rolled_back";

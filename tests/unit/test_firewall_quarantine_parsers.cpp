@@ -4634,6 +4634,7 @@ TEST_CASE("windows release: a retry after the identity fallback finds the edited
     plan = win_release_plan({listed}, {edited});
     CHECK(plan.reenable.empty());
     CHECK(plan.by_identity == 0);
+    CHECK(plan.accounted_enabled == 1); // counted, so the reply still says the key was not found
     CHECK(plan.unmatched == 0);
     CHECK(plan.unmatched_keys.empty());
 
@@ -4644,26 +4645,28 @@ TEST_CASE("windows release: a retry after the identity fallback finds the edited
     CHECK(plan.reenable.empty());
     CHECK(plan.unmatched == 1);
 
-    // an untouched twin that an exact key already accounts for is not a candidate: the edited
-    // rule is the one enabled rule left, so a retry over both reports nothing unmatched
+    // an untouched twin that an exact key accounts for is still a second carrier of the
+    // identity: the edited rule cannot be told from a deletion beside it, so it is reported
+    // (a retry reads the same as the first attempt, and nothing is switched on for it)
     const auto twin = stock_rule("Rule A", true, "C:\\twin.exe");
     plan = win_release_plan({listed, win_rule_key(twin)}, {edited, twin});
     CHECK(plan.reenable.empty());
     CHECK(plan.by_identity == 0);
-    CHECK(plan.unmatched == 0);
+    CHECK(plan.accounted_enabled == 0);
+    CHECK(plan.unmatched == 1);
 
-    // a disabled candidate still wins over an enabled one (the existing fallback), and a rule
-    // of ours is never counted
+    // an enabled and a disabled rule of the identity: two carriers, so the disabled one is
+    // NOT guessed to be ours (it may have been off before the quarantine)
     auto off = edited;
     off.enabled = false;
     off.application = "C:\\fourth.exe";
     plan = win_release_plan({listed}, {edited, off});
-    CHECK(plan.reenable == std::vector<std::size_t>{1});
-    CHECK(plan.by_identity == 1);
-    CHECK(plan.unmatched == 0);
+    CHECK(plan.reenable.empty());
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.unmatched == 1);
 }
 
-TEST_CASE("windows release: an edited rule falls back to its identity only when exactly one disabled rule carries it",
+TEST_CASE("windows release: an edited rule falls back to its identity only when exactly one rule in total carries it",
           "[agent][firewall_quarantine]") {
     const auto before = stock_rule("Rule A", true, "C:\\old.exe");
     const auto listed = win_rule_key(before);
@@ -4677,12 +4680,14 @@ TEST_CASE("windows release: an edited rule falls back to its identity only when 
     CHECK(plan.by_identity == 1);
     CHECK(plan.unmatched == 0);
 
-    // an enabled rule with the same identity is not a candidate (nothing to switch on)
+    // an enabled rule with the same identity is a second carrier: the disabled one may have
+    // been off before the quarantine, so neither is touched
     auto enabled_twin = edited;
     enabled_twin.enabled = true;
     plan = win_release_plan({listed}, {enabled_twin, edited});
-    CHECK(plan.reenable == std::vector<std::size_t>{1});
-    CHECK(plan.by_identity == 1);
+    CHECK(plan.reenable.empty());
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.unmatched == 1);
 
     // two disabled candidates: no way to tell which was ours, so neither is touched
     auto other = edited;
@@ -4699,14 +4704,15 @@ TEST_CASE("windows release: an edited rule falls back to its identity only when 
     CHECK(plan.reenable.empty());
     CHECK(plan.unmatched == 1);
 
-    // a candidate an exact match has claimed is not a candidate for another key's fallback:
-    // two same-named rules were disabled, one was edited, the other is untouched
+    // an untouched twin that an exact match has claimed still counts as a carrier: two
+    // same-named rules were disabled, one was edited, the other is untouched. The twin comes
+    // back by its key; the edited one cannot be told from a deletion and stays off, reported
     const auto second = stock_rule("Rule A", true, "C:\\second.exe");
     plan = win_release_plan({listed, win_rule_key(second)},
                             {edited, [&] { auto r = second; r.enabled = false; return r; }()});
-    CHECK(plan.reenable.size() == 2);
-    CHECK(plan.by_identity == 1); // the edited one, once the untouched one is spoken for
-    CHECK(plan.unmatched == 0);
+    CHECK(plan.reenable == std::vector<std::size_t>{1});
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.unmatched == 1);
 
     // two keys, one candidate: the rule is switched on once and the other key is unmatched
     auto sibling = before;
@@ -4733,6 +4739,34 @@ TEST_CASE("windows release: the twin protection still holds beside the fallback"
     CHECK(plan.unmatched == 0);
 }
 
+TEST_CASE("windows release: the fallback never switches on a rule that was off before the quarantine",
+          "[agent][firewall_quarantine]") {
+    // A listed rule A (port 3389) was on and was disabled. Another rule B of the same name,
+    // direction and profile (port 81) was already OFF before the quarantine and is not listed.
+    const auto a = stock_rule("Admin rule", true);
+    auto b = a;
+    b.local_ports = "81";
+    b.enabled = false;
+    auto edited = a; // someone edits A's port during the quarantine
+    edited.local_ports = "8080";
+
+    SECTION("A is edited and switched back on by hand: B is not guessed to be A") {
+        edited.enabled = true;
+        const auto plan = win_release_plan({win_rule_key(a)}, {edited, b});
+        CHECK(plan.reenable.empty()); // B stays off: it was off before
+        CHECK(plan.by_identity == 0);
+        CHECK(plan.accounted_enabled == 0);
+        CHECK(plan.unmatched == 1);
+    }
+    SECTION("A is edited, then a later apply disables it again and lists its new key") {
+        edited.enabled = false;
+        const auto plan = win_release_plan({win_rule_key(a), win_rule_key(edited)}, {edited, b});
+        CHECK(plan.reenable == std::vector<std::size_t>{0}); // the edited rule, by its exact key
+        CHECK(plan.by_identity == 0);                        // and B is not switched on beside it
+        CHECK(plan.unmatched == 1);
+    }
+}
+
 TEST_CASE("windows release: unmatched is a note on a completed, partial release; the fallback is only a note",
           "[agent][firewall_quarantine]") {
     WinReleaseTally t;
@@ -4749,6 +4783,16 @@ TEST_CASE("windows release: unmatched is a note on a completed, partial release;
     CHECK(d.partial);
     CHECK(contains(d.notes, "rules_unmatched=2"));
     CHECK(contains(d.notes, "rules_reenabled_by_identity=1"));
+
+    // a listed rule whose sole same-identity rule is already on is an informational note,
+    // never partial and never incomplete
+    WinReleaseTally accounted;
+    accounted.accounted_enabled = 2;
+    d = win_release_decision(accounted);
+    CHECK_FALSE(d.incomplete);
+    CHECK_FALSE(d.partial);
+    REQUIRE(d.notes.size() == 1);
+    CHECK(d.notes[0] == "rules_accounted_enabled=2");
 
     WinReleaseTally clean;
     CHECK_FALSE(win_release_decision(clean).partial);
@@ -4778,6 +4822,58 @@ TEST_CASE("windows release over the driver: an unmatched rule completes the rele
     settle_triggers(o, trig, rig.store);
     CHECK(trig.unregistered_count(kRepairTriggerId) == 1);
     CHECK(trig.unregistered_count(kTtlTriggerId) == 1);
+}
+
+TEST_CASE("rollback over the driver: what the removal learned rides the rolled_back outcome",
+          "[agent][firewall_quarantine]") {
+    Deadline dl;
+    SECTION("a removal that completed with a partial answer is a rolled_back that says so") {
+        ScriptRig rig;
+        rig.probe.control_up = false; // the apply fails its own control check
+        rig.leg.on_remove = [](OsPayload&) {
+            auto r = StepResult::success();
+            r.partial = true;
+            r.notes.emplace_back("rules_unmatched=1");
+            r.notes.emplace_back("rules_reenabled_by_identity=1");
+            return r;
+        };
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back"); // the token is unchanged: the result kind keys on it
+        CHECK(o.reason == "control_unreachable");
+        CHECK(contains(o.notes, "rules_unmatched=1"));
+        CHECK(contains(o.notes, "rules_reenabled_by_identity=1"));
+        CHECK(contains(o.notes, "rollback_partial=1"));
+        CHECK_FALSE(contains(o.notes, "rollback_incomplete=1"));
+        CHECK_FALSE(rig.store.state()); // the removal completed, so the record is erased
+        CHECK_FALSE(o.state);
+    }
+    SECTION("a removal that failed keeps its own notes and detail, and the record") {
+        ScriptRig rig;
+        rig.probe.control_up = false;
+        rig.leg.on_remove = [](OsPayload&) {
+            auto r = StepResult::fail("release_incomplete", "policy store busy");
+            r.notes.emplace_back("images_not_deleted=1");
+            return r;
+        };
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK(contains(o.notes, "rollback_incomplete=1"));
+        CHECK(contains(o.notes, "images_not_deleted=1"));
+        CHECK(contains(o.notes, "rollback_detail=policy store busy"));
+        CHECK_FALSE(contains(o.notes, "rollback_partial=1"));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::releasing);
+    }
+    SECTION("a clean removal adds no rollback note") {
+        ScriptRig rig;
+        rig.probe.control_up = false;
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK_FALSE(contains(o.notes, "rollback_partial=1"));
+        CHECK_FALSE(contains(o.notes, "rollback_incomplete=1"));
+        CHECK(std::none_of(o.notes.begin(), o.notes.end(),
+                           [](const std::string& n) { return n.starts_with("rollback_detail="); }));
+    }
 }
 
 TEST_CASE("triggers: teardown follows the record, not the reason of a stateless partial",
