@@ -53,6 +53,11 @@ struct ScopeEvalError {
         /// (`evaluate_scope`, never `evaluate_scope_local`, which never
         /// consults presence at all).
         PresenceDegraded,
+        /// A referenced result set (owned by the caller) cannot be used as scope: it is not
+        /// `materialized` (still pending, or failed), or it is incomplete (an agent failed or
+        /// never answered) and is referenced where a missing member would match (under NOT).
+        /// `detail` carries the result-set id.
+        ResultSetUnusable,
     };
     Kind kind;
     std::string detail; // e.g. the failing result-set id, for OwnerCheckFailed
@@ -78,6 +83,8 @@ inline const char* to_string(ScopeEvalError::Kind k) {
         return "owner_check_failed";
     case ScopeEvalError::Kind::PresenceDegraded:
         return "presence_degraded";
+    case ScopeEvalError::Kind::ResultSetUnusable:
+        return "result_set_unusable";
     }
     return "unknown";
 }
@@ -111,6 +118,7 @@ inline bool scope_abort_is_permanent(ScopeEvalError::Kind k) {
         return true;
     case ScopeEvalError::Kind::StoreDegraded:
     case ScopeEvalError::Kind::PresenceDegraded:
+    case ScopeEvalError::Kind::ResultSetUnusable: // a pending set may fill; retry then
         return false;
     }
     return false;

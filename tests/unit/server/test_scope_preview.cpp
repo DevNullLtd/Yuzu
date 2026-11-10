@@ -158,6 +158,16 @@ TEST_CASE("preview_scope_targets: evaluate_scope_fn aborting surfaces kEvaluatio
         CHECK(outcome.detail == "presence_degraded");
         CHECK(outcome.failing_refs.empty());
     }
+    SECTION("ResultSetUnusable is a transient abort with its own reason") {
+        auto outcome = preview_scope_targets(
+            R"(ostype == "linux")", "alice", std::nullopt, nullptr,
+            stub_fn(std::unexpected(ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusable, "rs_x"})));
+        REQUIRE(outcome.kind == ScopePreviewOutcome::Kind::kEvaluationAborted);
+        CHECK(outcome.detail == "result_set_unusable");
+        CHECK(outcome.failing_refs.empty());
+        REQUIRE(outcome.abort_kind.has_value());
+        CHECK(*outcome.abort_kind == ScopeEvalError::Kind::ResultSetUnusable);
+    }
     SECTION("OwnerCheckFailed carries the failing ref for the caller's own audit row") {
         auto outcome = preview_scope_targets(
             R"(ostype == "linux")", "alice", std::nullopt, nullptr,

@@ -125,7 +125,8 @@ TEST_CASE("preflight_rule_scopes: every non-Unresolvable error kind aborts",
     for (const auto kind : {ScopeEvalError::Kind::StoreDegraded,
                             ScopeEvalError::Kind::PrincipalUnresolved,
                             ScopeEvalError::Kind::OwnerCheckFailed,
-                            ScopeEvalError::Kind::PresenceDegraded}) {
+                            ScopeEvalError::Kind::PresenceDegraded,
+                            ScopeEvalError::Kind::ResultSetUnusable}) {
         const std::vector<Row> rules{{"ostype == \"linux\""}};
         auto out = preflight_rule_scopes(rules, [&](const yuzu::scope::Expression&) -> Members {
             return std::unexpected(ScopeEvalError{kind, "x"});

@@ -33,6 +33,8 @@ ScopeEvalError::Kind to_eval_error_kind(ScopeAbortReason r) {
         return ScopeEvalError::Kind::Unresolvable;
     case ScopeAbortReason::PresenceDegraded:
         return ScopeEvalError::Kind::PresenceDegraded;
+    case ScopeAbortReason::ResultSetUnusable:
+        return ScopeEvalError::Kind::ResultSetUnusable;
     }
     return ScopeEvalError::Kind::StoreDegraded;
 }

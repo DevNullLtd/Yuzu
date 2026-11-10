@@ -723,6 +723,24 @@ TEST_CASE("resolve_scope_targets: an Unresolvable registry evaluation aborts as 
     CHECK(*result.abort_reason == ScopeAbortReason::Unresolvable);
 }
 
+TEST_CASE("resolve_scope_targets: a ResultSetUnusable registry evaluation aborts as "
+          "result_set_unusable, matched absent",
+          "[server][dispatch][scope]") {
+    std::string aborted_reason;
+    ScopeLadderAudit audit;
+    audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+    const auto result = resolve_scope_targets(
+        "ostype == \"Windows\"", "alice", nullptr,
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusable, "rs_x"});
+        },
+        audit);
+    CHECK_FALSE(result.matched.has_value());
+    CHECK(aborted_reason == "result_set_unusable");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::ResultSetUnusable);
+}
+
 TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwise",
           "[server][dispatch][scope]") {
     // #4981 PR-1: scope_eval_error.hpp's to_string(ScopeEvalError::Kind) and
@@ -742,6 +760,11 @@ TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwis
           to_string(to_abort_reason(Kind::OwnerCheckFailed)));
     CHECK(std::string(to_string(Kind::PresenceDegraded)) ==
           to_string(to_abort_reason(Kind::PresenceDegraded)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusable)) ==
+          to_string(to_abort_reason(Kind::ResultSetUnusable)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusable)) == "result_set_unusable");
+    // A pending set may fill, so a retry can succeed: transient, not permanent.
+    CHECK_FALSE(scope_abort_is_permanent(Kind::ResultSetUnusable));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -199,6 +199,106 @@ TEST_CASE("evaluate_scope: LEN/STARTSWITH-wrapped from_result_set atoms get the 
     CHECK(aborted.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
 }
 
+// ── A set that is not ready or is incomplete must not be used under NOT ─────
+
+TEST_CASE("evaluate_scope: a result set that is not ready or is incomplete is not used under NOT",
+          "[pg][scope][result_set][incomplete]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
+
+    auto async_req = [](const char* name) {
+        CreateRequest r;
+        r.owner_principal = "alice";
+        r.name = name;
+        r.source_kind = std::string(source_kind::kEchoQuery);
+        r.source_payload = R"({"sql":"SELECT 1"})";
+        return r;
+    };
+    auto eval = [&](const std::string& text) {
+        auto expr = yuzu::scope::parse(text);
+        REQUIRE(expr.has_value());
+        return registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+    };
+    auto aborts_unusable = [&](const std::string& text, const std::string& id) {
+        auto r = eval(text);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ScopeEvalError::Kind::ResultSetUnusable);
+        CHECK(r.error().detail == id);
+    };
+
+    auto pending = store.create_pending(async_req("p"), "exec-p");
+    auto failed = store.create_pending(async_req("f"), "exec-f");
+    auto partial = store.create_pending(async_req("a"), "exec-a");
+    auto timed_out = store.create_pending(async_req("t"), "exec-t");
+    auto complete = store.create_pending(async_req("c"), "exec-c");
+    REQUIRE(pending.has_value());
+    REQUIRE(failed.has_value());
+    REQUIRE(partial.has_value());
+    REQUIRE(timed_out.has_value());
+    REQUIRE(complete.has_value());
+    store.mark_failed(failed->id, "bound exceeded");
+    REQUIRE(store.materialize(partial->id, {"agent-win"}, 1, 0).has_value());
+    REQUIRE(store.materialize(timed_out->id, {"agent-win"}, 0, 3).has_value());
+    REQUIRE(store.materialize(complete->id, {"agent-win"}, 0, 0).has_value());
+
+    SECTION("NOT over a pending, failed, partial or timed-out set aborts") {
+        aborts_unusable("NOT from_result_set:" + pending->id, pending->id);
+        aborts_unusable("NOT from_result_set:" + failed->id, failed->id);
+        aborts_unusable("NOT from_result_set:" + partial->id, partial->id);
+        aborts_unusable("NOT from_result_set:" + timed_out->id, timed_out->id);
+    }
+    SECTION("a positive reference to a pending or failed set also aborts (no membership yet)") {
+        aborts_unusable("from_result_set:" + pending->id, pending->id);
+        aborts_unusable("from_result_set:" + failed->id, failed->id);
+    }
+    SECTION("NOT over a complete set resolves to the complement") {
+        auto r = eval("NOT from_result_set:" + complete->id);
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == 1);
+        CHECK(has(*r, "agent-lin"));
+    }
+    SECTION("a positive reference to an incomplete set still resolves (it can only under-match)") {
+        auto r = eval("from_result_set:" + partial->id);
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == 1);
+        CHECK(has(*r, "agent-win"));
+        auto t = eval("from_result_set:" + timed_out->id + " == \"true\"");
+        REQUIRE(t.has_value());
+        CHECK(has(*t, "agent-win"));
+    }
+    SECTION("double negation: an even NOT depth is a positive use") {
+        auto r = eval("NOT NOT from_result_set:" + partial->id);
+        REQUIRE(r.has_value());
+        CHECK(has(*r, "agent-win"));
+        aborts_unusable("NOT NOT NOT from_result_set:" + partial->id, partial->id);
+    }
+    SECTION("mixed: A AND NOT incomplete aborts, A AND positive incomplete resolves") {
+        aborts_unusable("ostype != \"x\" AND NOT from_result_set:" + partial->id, partial->id);
+        auto r = eval("hostname != \"x\" AND from_result_set:" + partial->id);
+        REQUIRE(r.has_value());
+    }
+    SECTION("an inverted comparison or a wrapped atom needs a complete set") {
+        aborts_unusable("from_result_set:" + partial->id + " != \"true\"", partial->id);
+        aborts_unusable("LEN(from_result_set:" + partial->id + ") == 0", partial->id);
+    }
+    SECTION("a non-owner never learns the state of another operator's pending set") {
+        auto expr = yuzu::scope::parse("NOT from_result_set:" + pending->id);
+        REQUIRE(expr.has_value());
+        auto r = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "bob");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+    }
+}
+
 // ── Dispatch-time alias resolution (PR-E) ────────────────────────────────────
 
 TEST_CASE("resolve_scope_aliases: rewrites owner aliases, leaves ids/non-owners",

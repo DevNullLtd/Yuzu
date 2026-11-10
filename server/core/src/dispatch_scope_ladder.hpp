@@ -83,6 +83,7 @@ enum class ScopeAbortReason {
     PrincipalUnresolved,
     Unresolvable,
     PresenceDegraded,
+    ResultSetUnusable,
 };
 
 /// Audit-log string vocabulary for `ScopeAbortReason` — MUST agree pairwise
@@ -104,6 +105,8 @@ inline const char* to_string(ScopeAbortReason r) {
         return "unresolvable";
     case ScopeAbortReason::PresenceDegraded:
         return "presence_degraded";
+    case ScopeAbortReason::ResultSetUnusable:
+        return "result_set_unusable";
     }
     return "unknown";
 }
@@ -125,6 +128,8 @@ inline ScopeAbortReason to_abort_reason(ScopeEvalError::Kind k) {
         return ScopeAbortReason::OwnerCheckFailed;
     case ScopeEvalError::Kind::PresenceDegraded:
         return ScopeAbortReason::PresenceDegraded;
+    case ScopeEvalError::Kind::ResultSetUnusable:
+        return ScopeAbortReason::ResultSetUnusable;
     }
     return ScopeAbortReason::DbDegraded;
 }
