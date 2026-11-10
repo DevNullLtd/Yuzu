@@ -335,8 +335,10 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_release_leg_matrix_predicates_stay_in_lockstep(self) -> None:
         """The three build matrices carry the same two build_type excludes, and
-        the two conditional include: lists the same predicate. A drift silently
-        misconfigures one OS (e.g. a dev push building release on one pool)."""
+        the Linux conditional include: list the same predicate. A drift silently
+        misconfigures one OS (e.g. a dev push building release on one pool).
+        Windows and macOS are agent-only (ADR-0035) and carry no pg_mode
+        include."""
         rel = ("- build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' "
                "&& github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}")
         dbg = ("- build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha "
@@ -348,8 +350,11 @@ class WorkflowWiringTests(unittest.TestCase):
                 body = self.job("ci.yml", job)
                 self.assertIn(rel, body)
                 self.assertIn(dbg, body)
-                if job != "macos":  # macOS has no pg_mode include
+                if job == "linux":  # only Linux runs the server Postgres suites
                     self.assertIn(inc, body)
+                else:
+                    self.assertNotIn("matrix.pg_mode", body)
+                    self.assertNotIn('"pg_mode":', body)
 
     def test_direct_dispatch_never_posts_a_required_context_name(self) -> None:
         """Every job carrying a ruleset-required context name is suffixed on a
@@ -504,9 +509,10 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertNotRegex(text, r"needs\.preflight\.outputs\.")
 
     def test_windows_suite_cover_guards_match_their_selections(self) -> None:
-        """Both Windows Test steps run assert-suite-cover.py over the suites they
-        really select. The pg step must exclude `platform`, or its guard fails the
-        job on every debug/full run (#4884)."""
+        """The one Windows Test step runs assert-suite-cover.py over the suites it
+        really selects. The leg is agent-only (ADR-0035), so no server suite is
+        registered and none may be selected: assert-suite-cover.py fails on a
+        --suite that matches zero entries (#4884)."""
         windows = self.job("ci.yml", "windows")
         steps = [
             step
@@ -514,19 +520,12 @@ class WorkflowWiringTests(unittest.TestCase):
             if "python scripts/ci/assert-suite-cover.py" in step
         ]
         expected = (
-            (
-                {"agent", "platform", "proto", "echo", "gateway", "server-nonpg", "server-checks"},
-                {"server-pg", "server-pg-smoke", "docs"},
-            ),
-            (
-                {"server-pg"},
-                {"agent", "docs", "proto", "echo", "gateway", "server-nonpg", "server-checks",
-                 "server-pg-smoke", "platform"},
-            ),
+            ({"agent", "platform", "proto", "echo", "gateway"}, {"docs"}),
         )
         self.assertEqual(len(expected), len(steps))
         for step, (selected, excluded) in zip(steps, expected):
             with self.subTest(selected=sorted(selected)):
+                self.assertTrue(step.startswith("name: Test (non-pg suites)\n"))
                 suites = re.search(r"suites=\(([^)]*)\)", step)
                 self.assertIsNotNone(suites)
                 self.assertEqual(selected, set(re.findall(r"--suite (\S+)", suites.group(1))))
@@ -537,6 +536,44 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertEqual(excluded, set(re.findall(r"--exclude-suite (\S+)", guard.group(0))))
                 # The guard and flake-retry share one list, so neither can drift.
                 self.assertEqual(2, step.count('"${suites[@]}"'))
+
+    def test_server_build_is_linux_only_in_ci(self) -> None:
+        """ADR-0035 ladder step 1: the Windows and macOS legs (and the CodeQL
+        Windows row) configure with -Dbuild_server=false, and no Linux leg does.
+        The Windows leg builds into agent-only dir names, so a stored
+        build_server value can never be shared with a branch that predates
+        the change (Meson keeps stored options across --reconfigure)."""
+        def setups(body: str) -> list[str]:
+            # Each `meson setup` command (not a comment mentioning one) with
+            # its backslash continuation lines.
+            return re.findall(r"(?m)^[ \t]*meson setup (?:[^\n]*\\\n)*[^\n]*", body)
+
+        for job_name in ("windows", "macos"):
+            with self.subTest(job=job_name):
+                found = setups(self.job("ci.yml", job_name))
+                self.assertEqual(1, len(found))
+                self.assertIn("-Dbuild_server=false", found[0])
+        windows = self.job("ci.yml", "windows")
+        self.assertIn("BUILDDIR=build-windows-agent-${{ matrix.build_type }}", windows)
+        self.assertNotRegex(windows, r"build-windows-\$\{\{")
+        self.assertIn("for legacy in build-windows build-windows-debug build-windows-release; do", windows)
+        with self.subTest(job="linux"):
+            found = setups(self.job("ci.yml", "linux"))
+            self.assertTrue(found)
+            for cmd in found:
+                self.assertNotIn("build_server", cmd)
+        codeql = (ROOT / ".github" / "workflows" / "codeql.yml").read_text(encoding="utf-8")
+        codeql_setups = setups(codeql)
+        self.assertEqual(2, len(codeql_setups))
+        for cmd in codeql_setups:
+            if "vc++latest" in cmd:
+                self.assertIn("-Dbuild_server=false", cmd)
+            else:
+                self.assertNotIn("build_server", cmd)
+        # The live yuzu-server.exe smoke rig was server-only (ADR-0035).
+        self.assertFalse(
+            (ROOT / ".github" / "workflows" / "instructions-windows-validate.yml").exists()
+        )
 
     def test_per_leg_suite_selectors_and_platform_entries(self) -> None:
         """docs runs on the Linux leg only; the OS-contract entries live in suite
@@ -571,10 +608,10 @@ class WorkflowWiringTests(unittest.TestCase):
         """meson overwrites testlog.json on each invocation, so the summary runs
         once per flake-retry Test step, against that step's own build dir."""
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertEqual(6, len(re.findall(r"scripts/ci/test-durations-summary\.py --builddir", ci)))
+        self.assertEqual(5, len(re.findall(r"scripts/ci/test-durations-summary\.py --builddir", ci)))
         for job_name, labels in (
             ("linux", ["Linux non-pg (cheap suites)", "Linux non-pg (server shards)", "Linux pg shards"]),
-            ("windows", ["Windows non-pg", "Windows pg shards"]),
+            ("windows", ["Windows non-pg"]),
             ("macos", ["macOS"]),
         ):
             with self.subTest(job=job_name):
