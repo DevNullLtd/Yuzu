@@ -832,7 +832,7 @@ TEST_CASE("REST components: a failed last-poll read after a good page read is a 
     CHECK(body.at("error").at("message") ==
           "software inventory store degraded — last-poll read failed");
     CHECK(body.at("error").at("retry_after_ms") == 5000);
-    CHECK(h.audits("inventory.components.view", "failure") == 1);
+    CHECK(h.audits("inventory.components.view", "failure", "device facts degraded") == 1);
     CHECK(h.audits("inventory.components.view", "success") == 0);
 }
 
@@ -863,7 +863,7 @@ TEST_CASE("REST components: a degraded totals read alone is a 503 with retry_aft
     CHECK(body.at("error").at("retry_after_ms") == 5000);
     CHECK(body.at("error").at("message") ==
           "software inventory store degraded — totals read failed");
-    CHECK(h.audits("inventory.components.view", "failure") == 1);
+    CHECK(h.audits("inventory.components.view", "failure", "totals degraded") == 1);
 }
 
 TEST_CASE("REST components: a 100k-row CSV export walks every page with a continuation",

@@ -1869,6 +1869,8 @@ TEST_CASE("REST inventory/software: a failed last-poll read after a good page re
     }
     CHECK(failures == 1);
     CHECK(successes == 0);
+    // The failure detail is a documented SIEM key (audit-log.md): pin the stage name.
+    CHECK(count_audit(h, "inventory.software.query", "failure", "device facts degraded") == 1);
 }
 
 TEST_CASE("REST inventory/software: version_min/version_max resolve through the title's live versions, with or without a catalogue refresh",
@@ -2219,5 +2221,5 @@ TEST_CASE("REST inventory/software: a degraded totals read alone is a 503 with r
     CHECK(body.at("error").at("retry_after_ms") == 5000);
     CHECK(body.at("error").at("message") ==
           "software inventory store degraded — totals read failed");
-    CHECK(h.has_audit("failure"));
+    CHECK(count_audit(h, "inventory.software.query", "failure", "totals degraded") == 1);
 }

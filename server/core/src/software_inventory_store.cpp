@@ -2406,7 +2406,10 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         // The shapes whose cost the name index does not bound (q, match=contains, match=prefix
         // under a locale collation, a status filter) run under the 5 s statement bound and
         // degrade to the audited 503, never to a pool lease held to the 30 s pool default. The
-        // exact-name and plain scope reads below stay index-driven on the bare lease.
+        // reads below keep the bare lease: exact-name and agent_id/scope reads are index-driven;
+        // a kind, ecosystem, source or exact version filter with no name is a filtered walk under
+        // ORDER BY name, bounded only by the pool's 30 s statement_timeout (pre-existing shape,
+        // unchanged by this change; version without a name is new but takes the same path).
         static SiteSamplers samplers;
         return bounded_query(pool_, metrics_, "query_software", samplers, sql, params, parse);
     }

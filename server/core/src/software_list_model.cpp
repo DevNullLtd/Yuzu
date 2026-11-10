@@ -311,8 +311,10 @@ std::optional<DeviceFacts> load_device_facts(const FactsReads& io, const std::ve
     }
     if (io.hostnames) {
         const std::unordered_set<std::string> want(ids.begin(), ids.end());
+        // A roster row with a blank hostname (`endpoints.hostname` defaults to '') reads as
+        // unknown, the same as the dashboard's devices table and the crypto model: null, not "".
         for (auto& [id, host] : io.hostnames())
-            if (want.contains(id))
+            if (!host.empty() && want.contains(id))
                 f.hostname.emplace(id, std::move(host));
     }
     return f;

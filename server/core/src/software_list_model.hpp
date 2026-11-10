@@ -111,8 +111,8 @@ struct ComponentsRequest {
 };
 
 /// Keys: kind, name, match, version, version_min, version_max, agent_id, q, status, limit, cursor,
-/// format. Same hygiene, version-requires-exact-name rule, limits and export cap as the installs
-/// parser. A repeated key keeps the FIRST value.
+/// format. Same hygiene, range-requires-exact-name rule (a bare `version` needs no name), limits
+/// and export cap as the installs parser. A repeated key keeps the FIRST value.
 [[nodiscard]] std::expected<ComponentsRequest, std::string> parse_components_params(const Params& p);
 
 // ── Version range ────────────────────────────────────────────────────────────

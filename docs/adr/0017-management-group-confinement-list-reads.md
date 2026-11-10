@@ -327,7 +327,11 @@ gate.
     `totals_omitted: "scope"`; distinct counts are not additive across groups, so no confined
     total can be derived from a fleet one. `null` documents "not shown", never zero. The
     components figures come from a new fleet-wide rollup (`component_rollup`) that falls under
-    the same rule.
+    the same rule. For the same reason the `version_min` / `version_max` range is resolved
+    over the caller's own scope (the gate's `VisibleSet` pushed into the distinct-version read,
+    an unfiltered caller reading the fleet): a fleet-wide cut would make the range refusal a
+    fact about devices the caller cannot see, so a confined caller is answered for a title with
+    2000 versions outside its scope exactly as for an unknown title (ADR-0016 "Version range").
 - **Audit-log** — `AuditLog:Read` reads (`server.cpp:5848`); audit rows carry `agent_id`, so a
   confined auditor must see only in-scope events. (Classified here per Gate-2/Gate-3 review; it is
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)

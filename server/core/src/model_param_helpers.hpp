@@ -2,10 +2,11 @@
 
 /// @file model_param_helpers.hpp
 /// Query-parameter and cursor-payload helpers shared by the pure REST/MCP read models
-/// (`software_catalogue_model.cpp`, `crypto_library_model.cpp`). Both models parse the same
-/// `std::multimap` parameter bag, refuse the same unbindable text, and encode their keyset
-/// cursors with the same length-prefixed payload and FNV-1a filter fingerprint, so the helpers
-/// live ONCE here (review #6056 A10) rather than as two copies that could drift.
+/// (`software_catalogue_model.cpp`, `crypto_library_model.cpp`, `software_list_model.cpp`). The
+/// models parse the same `std::multimap` parameter bag, refuse the same unbindable text, and
+/// encode their keyset cursors with the same length-prefixed payload and FNV-1a filter
+/// fingerprint, so the helpers live ONCE here (review #6056 A10) rather than as copies that
+/// could drift.
 ///
 /// Pure: no httplib, no MCP, no libpq, no store types. Every function is `inline` (header-only),
 /// so both translation units see one definition.

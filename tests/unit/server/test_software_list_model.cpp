@@ -749,7 +749,7 @@ TEST_CASE("load_device_facts: one roster read per page, only the page's devices,
     io.hostnames = [&] {
         ++roster_reads;
         return std::unordered_map<std::string, std::string>{
-            {"a1", "host-a1"}, {"a2", "host-a2"}, {"offline-9", "host-offline"}};
+            {"a1", "host-a1"}, {"a2", "host-a2"}, {"a4", ""}, {"offline-9", "host-offline"}};
     };
     io.last_seen = [](const std::vector<std::string>& ids) {
         std::unordered_map<std::string, std::int64_t> m;
@@ -759,12 +759,13 @@ TEST_CASE("load_device_facts: one roster read per page, only the page's devices,
         return std::optional(std::move(m));
     };
 
-    const auto facts = load_device_facts(io, {"a1", "a2", "a3"});
+    const auto facts = load_device_facts(io, {"a1", "a2", "a3", "a4"});
     REQUIRE(facts.has_value());
     CHECK(roster_reads == 1);
     CHECK(facts->hostname.size() == 2); // a3 is unknown; offline-9 is not on the page
     CHECK(facts->hostname.at("a1") == "host-a1");
     CHECK(facts->hostname.contains("a2"));
+    CHECK_FALSE(facts->hostname.contains("a4")); // a blank roster hostname reads as unknown (null)
     CHECK_FALSE(facts->hostname.contains("offline-9"));
     CHECK(facts->last_seen.size() == 1);
     CHECK(facts->last_seen.at("a1") == 1700000100);

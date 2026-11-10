@@ -7058,7 +7058,9 @@ TEST_CASE("refresh_component_rollup: a peer holding the lock makes this replica 
         std::vector<std::string>{});
     REQUIRE(lk.status() == PGRES_TUPLES_OK);
     CHECK(store.refresh_component_rollup());
-    CHECK(store.component_rollup_meta()->refreshed_at == 0); // skipped: still building
+    const auto skipped = store.component_rollup_meta();
+    REQUIRE(skipped.has_value());
+    CHECK(skipped->refreshed_at == 0); // skipped: still building
     CHECK(sql_rows(pool, "SELECT count(*) FROM software_inventory_store.component_rollup")[0][0] ==
           "0");
     pg::PgResult ul = pg::exec_params(
@@ -7092,7 +7094,9 @@ TEST_CASE("refresh_component_rollup: a peer holding the lock makes this replica 
     REQUIRE(held);
     CHECK_FALSE(starved.refresh_component_rollup());
     held = {};
-    CHECK(store.component_rollup_meta()->refreshed_at == good->refreshed_at);
+    const auto kept = store.component_rollup_meta();
+    REQUIRE(kept.has_value());
+    CHECK(kept->refreshed_at == good->refreshed_at);
 }
 
 TEST_CASE("refresh_component_rollup: a statement failing after the DELETE rolls the whole refresh back and "

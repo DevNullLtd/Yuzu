@@ -741,6 +741,19 @@ curl -H "Authorization: Bearer $TOKEN" \
 # Everything on one device
 curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
+
+# The zero-day question, in one call each. Which devices run an affected version range of a
+# title, still confirmed by their last poll (status=current), with the fleet totals for an
+# unfiltered caller (a version filter reads the totals live, so it is not affected by the
+# catalogue ceiling):
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&status=current"
+# The same for a component bundled inside applications (empty until agents report components):
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software/components?name=log4j-core&version_min=2.0&version_max=2.14.1"
+# Hand the device list over as a file (up to 10,000 rows per call; follow X-Next-Cursor for more):
+curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
+  "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&format=csv"
 ```
 
 - Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
@@ -774,7 +787,8 @@ curl -H "Authorization: Bearer $TOKEN" \
   watched by the shipped rules `YuzuInventoryComponentRollupStale` and
   `YuzuInventoryComponentRollupFailing`).
   The refresh runs at server start and then hourly, with no manual trigger (a restart runs
-  one at once); a failed, cancelled or over-budget refresh keeps the last-good rollup and its
+  one at once; a restart disconnects that replica's agents, so restart one replica at a
+  time); a failed, cancelled or over-budget refresh keeps the last-good rollup and its
   stamp, and the figures read `building` until the first refresh completes. The freshness
   stamp is the single row `component_rollup_meta` (`id = 1`), seeded by the schema: if that
   row is deleted every refresh fails (keep-last-good) until it is restored, so never delete it.
@@ -1327,7 +1341,8 @@ hourly by the background `SoftwareCatalogRollup` thread) emits three further ser
 
 - `yuzu_inventory_catalog_rollup_total{outcome}` (counter, outcome ∈ `success` / `error`)
   — one per recompute attempt that completes or fails (a shutdown-cancelled attempt is
-  not counted as an error). A rising `error` count with a frozen
+  not counted as an error); both outcome series are seeded at 0 when the rollup thread
+  starts, so the first failure is an increase a rate rule can see. A rising `error` count with a frozen
   `…_last_success_timestamp` means recomputes are failing (PG outage, a statement over
   its 60 s limit, or the 10-minute whole-refresh limit exceeded at scale) and the
   catalogue is going stale; keep-last-good serves the prior rollup meanwhile, except for

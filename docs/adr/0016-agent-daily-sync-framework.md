@@ -1496,6 +1496,30 @@ polled when, in what state.
   (keep-last-good; rows and live totals are unaffected). Latent today: the table is empty until
   the component producer ships (SAM-40). A per-(kind, name, agent) pre-aggregate ran the same
   refresh in 8.2 s and is the recorded upgrade path.
+- **Recorded limits of the lookup surface (recorded, not fixed here).** (1) The live
+  version-set totals and the version-range reads (`installed_software_version_set_totals`,
+  `installed_software_distinct_versions`, `component_versions`) run under the 5 s statement
+  bound with no in-flight bound of their own (`/crypto` has one): about 3 requests per second
+  of 5-second reads can pin a 16-connection pool, which audit and revocation share; the figure
+  is 5 s divided by 16 leases, not measured. On a title above about 5M rows the live read times
+  out every time, so that `503` is deterministic and retrying does not clear it (the rows are
+  still served by paging or export). (2) The range read pushes the caller's whole scope as one
+  array with no `kScopePushdownMaxIds` cut (a cut distinct set cannot be post-filtered without
+  re-leaking the fleet property), so a confined caller with 100k or more devices sends a
+  multi-MB parameter per range request and the same 5 s bound caps it; cost at 100k and 500k
+  ids is unmeasured. (3) Rollup alerting shares the catalogue rollup's pattern: a peer holding
+  the advisory lock makes a replica's refresh a skip that counts as success and stamps the
+  liveness gauge, so replicas whose tick offsets alternate the lock winner, each timing out,
+  keep both `YuzuInventoryComponentRollup*` rules quiet while the totals age; a worker that
+  never started exports no series at all, and a throw in the catalogue leg (none expected, the
+  store returns bool) skips the components leg with no `error` increment. (4) The wide-scope
+  cursor's `skip` reaches `OFFSET` on the unbounded installs page read and a forged value can
+  hold a pool lease to the 30 s statement timeout; this is the pre-existing `read_devices_page`
+  behaviour moved verbatim into `read_scoped_page` (base `software_catalogue_model.cpp:865` and
+  `software_inventory_store.cpp:2268`), not introduced here. (5) A maximum-width CSV export
+  (1024-byte fields in 22 columns, 10,000 rows) can reach about 200 MB per request by cap
+  arithmetic; the measured exports used typical rows. Each is a candidate issue; none changes a
+  served figure.
 - **§8 re-opened for the first read-back of slot 13 and the component path.** `install_location`
   (and a component's `path` and `anchor_app`) is served by both routes and their CSV exports to
   every caller the gate admits with `Inventory:Read`; a confined caller sees only the paths of its
@@ -1503,14 +1527,18 @@ polled when, in what state.
   unchanged (operator-tier, a machine-scope path that can still name an account's directory, the
   `list` column's class); retention is unchanged (erased with the device by `delete_agent`, kept
   lower-cased in `software_changes.identity_key` for 400 days). The server cannot minimise the
-  value at read or store time without breaking the v3 hash agreement, so the control is the
-  agent writer's allowlist: the blob-v3 writer (`installed_software_v3.cpp`) keeps a location
-  only under a machine root (`kMachineRoots`) and
-  blanks every other path, fail closed, and tests that no profile path is emitted. This read
-  surface therefore depends on that writer shipping alongside it; until it does, no agent sends
-  slot 13 or component rows and both fields are empty. An agent that does not apply the
-  allowlist (older, forked or hostile) can place a per-user path here; the row is still served
-  as sent, which the manual states beside the field.
+  value at read or store time without breaking the v3 hash agreement, so the control for
+  `install_location` is the agent writer's allowlist: the agent-side blob-v3 writer
+  (`installed_software_v3.cpp`, delivered by the sibling SAM-15 change, which lands before this
+  surface is read) keeps a location only under a machine root (`kMachineRoots`) and blanks every
+  other path, fail closed, and tests that no profile path is emitted. A component's `path` and
+  `anchor_app` carry NO allowlist yet: the component writer only clamps them
+  (`component_normal_form`), and the SAM-40 producer must apply the same machine-root allowlist
+  with a no-profile-path test before it populates them. This read surface therefore depends on
+  the SAM-15 writer shipping alongside it; until it does, no agent sends slot 13 or component
+  rows and both fields are empty. An agent that does not apply the allowlist (older, forked or
+  hostile) can place a per-user path here; the row is still served as sent, which the manual
+  states beside the field.
 - **Not changed.** The MCP `query_installed_software` rows keep their 14 fields; the twin is a
   later change (recorded in `docs/api-parity-ledger.md` and as the 2026-11-09 entry of the
   ADR-1005 exception ledger, revisit by 2026-12-31).

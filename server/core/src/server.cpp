@@ -2655,8 +2655,9 @@ public:
                           "gauge");
         metrics_.describe("yuzu_inventory_component_rollup_last_success_timestamp",
                           "Epoch seconds of the last successful components rollup refresh (0 until "
-                          "the first); alert when now - this exceeds the rollup cadence guarded by "
-                          "> 0 (a failing refresh leaves the components totals aging or building)",
+                          "the first); alert when now - this exceeds twice the rollup cadence (7200 s), "
+                          "guarded by > 0 (a failing refresh leaves the components totals aging or "
+                          "building)",
                           "gauge");
         metrics_.describe("yuzu_software_normalization_pass_total",
                           "Software-title normalisation ticks by outcome (success/error); hourly, "

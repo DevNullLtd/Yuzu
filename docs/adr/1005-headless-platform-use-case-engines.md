@@ -617,12 +617,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `GET /api/v1/inventory/software?format=csv|json` has no MCP tool: an
        agent pages the same rows through the cursor on `query_installed_software`,
        and a bulk file is a human/automation convenience. **Revisit by
-       2026-11-07.**
+       2026-11-07** (lapsed; absorbed by the 2026-11-09 SAM-17 entry below, whose
+       revisit date now governs).
      - **The raw route's `q`, `kind`, `ecosystem` and `source` filters are
        REST-only (`#5699`).** `query_installed_software` takes `name`,
        `agent_id`, `version`, `limit` and `cursor` only; the parity ledger row
        stays `twinned` on the paged shape and the gap is recorded in
-       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07.**
+       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07** (lapsed; absorbed
+       by the 2026-11-09 SAM-17 entry below, whose revisit date now governs).
      - **The exception relaxes no control.** The fleet view is gated on a
        global `Inventory:Read` (the per-device view is admitted in scope),
        denies service-scoped tokens on the catalogue fleet view (the raw route
