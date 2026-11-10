@@ -3621,7 +3621,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // queries the response store for that command_id, **filters responses to
 // the operator's visible agents**, parses each agent's
 // `config|<source>_enabled|false` lines plus the matching paused_at /
-// live_rows / oldest_ts companions, and returns an HTML table fragment.
+// rows / oldest_ts companions, and returns an HTML table fragment.
 //
 // Per-username state + visibility filter together close the Gate 2
 // governance HIGH finding (cross-operator data leak via shared scan slot).
@@ -3804,7 +3804,7 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
             // one-release alias `<src>_live_rows` has not moved to the roll-up store: flagged,
             // and its raw-row figure is not presented as the hourly count.
             if (auto lr = kv.find(std::string{source} + "_rows"); lr != kv.end()) {
-                try { row.live_rows = std::stoll(lr->second); } catch (...) {}
+                try { row.hourly_rows = std::stoll(lr->second); } catch (...) {}
             } else if (kv.contains(std::string{source} + "_live_rows")) {
                 row.pre_rollup_agent = true;
             }
@@ -4019,10 +4019,10 @@ std::string DashboardRoutes::render_echo_retention_paused(
         if (r.pre_rollup_agent) {
             html += "<span class=\"echo-tree-mute\" title=\"This device runs an agent without "
                     "the roll-up tables; upgrade the agent\">—</span>";
-        } else if (r.live_rows < 0) {
+        } else if (r.hourly_rows < 0) {
             html += "<span class=\"echo-tree-mute\">—</span>";
         } else {
-            html += std::format("{}", r.live_rows);
+            html += std::format("{}", r.hourly_rows);
         }
         html += "</td>";
         html += "<td>" + format_age(r.oldest_ts, now) + "</td>";

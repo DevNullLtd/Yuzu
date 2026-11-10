@@ -1835,6 +1835,36 @@ TEST_CASE("echo_retention_paused_json: sorts value-error first, then oldest-paus
     CHECK(rows[2]["agent_id"] == "dev-new");
 }
 
+// The REST and MCP twins both serialise through this builder: the row count is the hourly
+// roll-up count under `hourly_rows`, and no `live_rows` key is emitted.
+TEST_CASE("echo_retention_paused_json: rows carry hourly_rows and no live_rows",
+          "[echo][tree][model]") {
+    EchoRetentionPausedScan scan;
+    EchoPausedSourceRow known;
+    known.agent_id = "dev-a";
+    known.agent_display = "dev-a";
+    known.source = "process";
+    known.hourly_rows = 42;
+    EchoPausedSourceRow unknown;
+    unknown.agent_id = "dev-b";
+    unknown.agent_display = "dev-b";
+    unknown.source = "tcp";
+    scan.rows = {known, unknown};
+
+    auto parsed = nlohmann::json::parse(echo_retention_paused_json(scan), nullptr, false);
+    REQUIRE_FALSE(parsed.is_discarded());
+    const auto& rows = parsed["rows"];
+    REQUIRE(rows.size() == 2);
+    for (const auto& r : rows) {
+        CHECK(r.contains("hourly_rows"));
+        CHECK_FALSE(r.contains("live_rows"));
+    }
+    // Both rows share paused_at 0 and no value error, so the order falls to agent_display.
+    CHECK(rows[0]["agent_id"] == "dev-a");
+    CHECK(rows[0]["hourly_rows"] == 42);
+    CHECK(rows[1]["hourly_rows"] == -1);
+}
+
 // #4644: `node` is ONE non-negative base-10 integer. `stoul` accepted "-1" (wrapping to
 // SIZE_MAX) and "5x" (as 5), so a malformed node id silently selected a different process node.
 TEST_CASE("process-tree detail: a malformed node id is a 400",

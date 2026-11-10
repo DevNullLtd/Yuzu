@@ -115,7 +115,7 @@ struct EchoPausedSourceRow {
     std::string agent_display;
     std::string source;
     std::int64_t paused_at = 0;
-    std::int64_t live_rows = -1; ///< -1 = unknown (no `<source>_rows` key)
+    std::int64_t hourly_rows = -1; ///< hourly roll-up row count; -1 = unknown (no `<source>_rows` key)
     /// The agent reported `<source>_live_rows` only: it has not moved to the roll-up store, so
     /// its count is raw capture rows and is rendered as a dash, not as the hourly count.
     bool pre_rollup_agent = false;

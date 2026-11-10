@@ -429,7 +429,7 @@ std::string echo_retention_paused_json(const EchoRetentionPausedScan& scan) {
                              {"agent_display", r.agent_display},
                              {"source", r.source},
                              {"paused_at", r.paused_at},
-                             {"live_rows", r.live_rows},
+                             {"hourly_rows", r.hourly_rows},
                              {"oldest_ts", r.oldest_ts},
                              {"value_error", r.value_error},
                              {"enabled_raw", r.enabled_raw}});
