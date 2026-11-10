@@ -20,8 +20,8 @@
 #     cancel, or a pending dispatch replaced by a newer one; the daily check
 #     re-dispatches an uncovered tip)
 #   anything else (failure, timed_out, startup_failure, ...) -> report:
-#     event mode comments on the open issue or opens one, UNLESS a numerically
-#     newer completed dispatch run already gave a verdict (failed, or fully
+#     event mode comments on the open issue or opens one, UNLESS the newest
+#     completed dispatch run is numerically newer and gave a verdict (failed, or fully
 #     green), in which case this superseded report is dropped; reconcile mode
 #     (which always judges the newest run) opens one only if none is open.
 # Only OPEN ISSUES authored by github-actions[bot] carrying the label are ever

@@ -75,8 +75,8 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
 
     What the script does:
     - **Opens or comments** on any failing conclusion. A late report is
-      dropped when a newer completed, non-cancelled dispatch run has already
-      given a verdict: it failed, or it was fully green. A newer green run
+      dropped when the newest completed, non-cancelled dispatch run is newer
+      than it and has given a verdict: it failed, or it was fully green. A newer green run
       with a skipped leg never swallows it. This includes a run that
       never started (`startup_failure`), and words it by cause: a code
       failure, infrastructure (the preflight gate, or only preflight jobs,
