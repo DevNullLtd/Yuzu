@@ -7,5 +7,6 @@
   directories; the first run on each Wee Tam runner, and any run of a branch not yet rebased onto
   this change, builds cold (ccache-warm). The dispatch-only `instructions-windows-validate.yml`
   server smoke rig is removed. `release.yml` still builds the Windows and macOS server until ladder
-  step 2, the vcpkg install still includes the server ports until step 3, and Wee Tam's Postgres
+  step 2, which must merge before the next release tag unless that release's record explicitly
+  accepts shipping the untested Windows/macOS server (ADR-0035, #7465); the vcpkg install still includes the server ports until step 3, and Wee Tam's Postgres
   services stay provisioned (and health-checked) until step 4.

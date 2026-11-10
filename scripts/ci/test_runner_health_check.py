@@ -537,43 +537,123 @@ class WorkflowWiringTests(unittest.TestCase):
                 # The guard and flake-retry share one list, so neither can drift.
                 self.assertEqual(2, step.count('"${suites[@]}"'))
 
+    @staticmethod
+    def strip_comments(body: str) -> str:
+        """`body` without the lines whose first non-space character is `#`
+        (YAML comments and bash comments inside run: blocks), so a pin cannot
+        be satisfied by a commented-out copy of the line it pins."""
+        return "\n".join(
+            line for line in body.splitlines() if not line.lstrip().startswith("#")
+        )
+
+    @staticmethod
+    def meson_setups(body: str) -> list[str]:
+        """Each `meson setup` command (not a comment mentioning one) with its
+        backslash continuation lines."""
+        return re.findall(r"(?m)^[ \t]*meson setup (?:[^\n]*\\\n)*[^\n]*", body)
+
+    def assert_agent_only_setup(self, cmd: str) -> None:
+        """Exactly one build_server token, and it is the plain argument
+        -Dbuild_server=false: not =true, not =falsey, not a second token that
+        overrides it, and not inside a ${{ }} expression that can evaluate
+        to something else on some matrix row."""
+        self.assertEqual(1, cmd.count("build_server"), cmd)
+        self.assertEqual(
+            1, len(re.findall(r"(?<!\S)-Dbuild_server=false(?!\S)", cmd)), cmd
+        )
+        for expr in re.findall(r"\$\{\{.*?\}\}", cmd, flags=re.S):
+            self.assertNotIn("build_server", expr, cmd)
+
     def test_server_build_is_linux_only_in_ci(self) -> None:
         """ADR-0035 ladder step 1: the Windows and macOS legs (and the CodeQL
-        Windows row) configure with -Dbuild_server=false, and no Linux leg does.
-        The Windows leg builds into agent-only dir names, so a stored
-        build_server value can never be shared with a branch that predates
-        the change (Meson keeps stored options across --reconfigure)."""
-        def setups(body: str) -> list[str]:
-            # Each `meson setup` command (not a comment mentioning one) with
-            # its backslash continuation lines.
-            return re.findall(r"(?m)^[ \t]*meson setup (?:[^\n]*\\\n)*[^\n]*", body)
-
+        Windows row) configure with -Dbuild_server=false, and no other leg
+        names build_server at all. The Windows leg builds into agent-only dir
+        names, so a stored build_server value can never be shared with a
+        branch that predates the change (Meson keeps stored options across
+        --reconfigure)."""
         for job_name in ("windows", "macos"):
             with self.subTest(job=job_name):
-                found = setups(self.job("ci.yml", job_name))
+                found = self.meson_setups(self.job("ci.yml", job_name))
                 self.assertEqual(1, len(found))
-                self.assertIn("-Dbuild_server=false", found[0])
-        windows = self.job("ci.yml", "windows")
-        self.assertIn("BUILDDIR=build-windows-agent-${{ matrix.build_type }}", windows)
+                self.assert_agent_only_setup(found[0])
+
+        ci_text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        other_jobs = [
+            name
+            for name in re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", ci_text.split("\njobs:\n", 1)[1])
+            if name not in ("windows", "macos")
+        ]
+        self.assertIn("linux", other_jobs)
+        linux_setups = self.meson_setups(self.job("ci.yml", "linux"))
+        self.assertTrue(linux_setups)
+        for job_name in other_jobs:
+            with self.subTest(job=job_name):
+                for cmd in self.meson_setups(self.job("ci.yml", job_name)):
+                    self.assertNotIn("build_server", cmd)
+
+        windows = self.strip_comments(self.job("ci.yml", "windows"))
+        # The one build-dir assignment is the agent-only name, and the
+        # configure, build, test and summary steps all use it.
+        self.assertEqual(
+            ["BUILDDIR=build-windows-agent-${{ matrix.build_type }}"],
+            re.findall(r"BUILDDIR=[^\n]*", windows),
+        )
+        self.assertRegex(windows, r'(?m)^[ \t]*meson setup \$reconfig "\$BUILDDIR" \\$')
         self.assertNotRegex(windows, r"build-windows-\$\{\{")
-        self.assertIn("for legacy in build-windows build-windows-debug build-windows-release; do", windows)
-        with self.subTest(job="linux"):
-            found = setups(self.job("ci.yml", "linux"))
-            self.assertTrue(found)
-            for cmd in found:
-                self.assertNotIn("build_server", cmd)
+        builddirs = re.findall(r'(?:--builddir|meson compile -C)\s+"?([^\s"]+)', windows)
+        self.assertTrue(builddirs)
+        for builddir in builddirs:
+            self.assertEqual("build-windows-agent-${{", builddir[: len("build-windows-agent-${{")], builddir)
+
+        # The legacy (server-configured) dirs are wiped by the step that
+        # runs BEFORE actions/checkout, on every run, outside the
+        # branch-switch condition (which does not fire on detached-HEAD PR
+        # checkouts).
+        steps = re.split(r"(?m)^      - ", windows)
+        checkout_idx = next(
+            i for i, step in enumerate(steps) if step.startswith("uses: actions/checkout@")
+        )
+        legacy_loop = "for legacy in build-windows build-windows-debug build-windows-release; do"
+        holders = [i for i, step in enumerate(steps) if legacy_loop in step]
+        self.assertEqual([checkout_idx - 1], holders)
+        wipe = steps[checkout_idx - 1]
+        self.assertTrue(wipe.startswith("name: Wipe build-windows/ on branch switch (pre-checkout)\n"))
+        self.assertRegex(wipe, r'(?m)^ {10}for legacy in ')  # top level of run:, not inside the if
+        self.assertIn('rm -rf "${GITHUB_WORKSPACE:?}/$legacy"', wipe)
+        self.assertNotRegex(wipe, r'rm -rf "\$GITHUB_WORKSPACE')
+
         codeql = (ROOT / ".github" / "workflows" / "codeql.yml").read_text(encoding="utf-8")
-        codeql_setups = setups(codeql)
+        codeql_setups = self.meson_setups(codeql)
         self.assertEqual(2, len(codeql_setups))
+        windows_rows = [cmd for cmd in codeql_setups if "vc++latest" in cmd]
+        self.assertEqual(1, len(windows_rows))
         for cmd in codeql_setups:
-            if "vc++latest" in cmd:
-                self.assertIn("-Dbuild_server=false", cmd)
+            if cmd in windows_rows:
+                self.assert_agent_only_setup(cmd)
             else:
                 self.assertNotIn("build_server", cmd)
         # The live yuzu-server.exe smoke rig was server-only (ADR-0035).
         self.assertFalse(
             (ROOT / ".github" / "workflows" / "instructions-windows-validate.yml").exists()
         )
+
+    def test_agent_only_legs_carry_no_server_or_postgres_steps(self) -> None:
+        """ADR-0035 ladder step 1 removed every server and Postgres step from
+        the Windows and macOS legs. Checked on the comment-stripped job body,
+        case-insensitively, so a re-added step, env var, matrix key or suite
+        selection fails here while the comments that explain the removal
+        stay legal. No legitimate non-comment occurrence exists today (Wee
+        Tam's Postgres health check lives inside Assert-Toolchain.ps1, not in
+        the job text), so nothing is exempted."""
+        forbidden = (
+            "pg_mode", "postgres", "server-pg", "server-nonpg", "server-checks",
+            "yuzu_pg_canary",
+        )
+        for job_name in ("windows", "macos"):
+            body = self.strip_comments(self.job("ci.yml", job_name)).lower()
+            for token in forbidden:
+                with self.subTest(job=job_name, token=token):
+                    self.assertNotIn(token, body)
 
     def test_per_leg_suite_selectors_and_platform_entries(self) -> None:
         """docs runs on the Linux leg only; the OS-contract entries live in suite

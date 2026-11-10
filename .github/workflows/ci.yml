@@ -1534,8 +1534,9 @@ jobs:
         # F=262.81s C=359.42s — E and G both already well past HALF the then-
         # 600s ceiling on their own, with no contention at all. --num-processes
         # 2 was held at 2 here, not a higher number: this mirrored Windows' own
-        # starting `--num-processes 2` on its "Test (pg shards, full)" step
-        # (#3443) rather than deriving a Linux-specific value — the two
+        # starting `--num-processes 2` on its then "Test (pg shards, full)" step
+        # (#3443; removed by ADR-0035 ladder step 1) rather than deriving a
+        # Linux-specific value — the two
         # platforms have since DIVERGED: PR #3677's staged Windows
         # measurement protocol (docs/ci-architecture.md, current value
         # there, not restated here to avoid this comment going stale every
@@ -1550,8 +1551,9 @@ jobs:
         # simultaneously, saturating all 4 Big Tam runners by itself, and a
         # concurrently-queued PR's Linux job was observed waiting 35 minutes for
         # a free runner while shard E timed out at exactly 600.01s under that
-        # same load. Mirrors Windows' own already-proven pattern (#3443, its
-        # "Test (non-pg suites)" / "Test (pg shards, full)" steps): caps
+        # same load. Mirrors Windows' then already-proven pattern (#3443, its
+        # then "Test (non-pg suites)" / "Test (pg shards, full)" steps; the pg
+        # step was removed by ADR-0035 ladder step 1): caps
         # concurrent heavy test PHASES to 2 per box (crash-safe
         # flock; the build phase stays 4-wide, unaffected). YUZU_TEST_SLOT_DIR
         # is set explicitly because Big Tam's RUNNER_TOOL_CACHE is PER-AGENT
@@ -2285,9 +2287,9 @@ jobs:
             current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
             if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
               echo "branch switch: $current -> $incoming — wiping build-windows*/"
-              rm -rf "$GITHUB_WORKSPACE/build-windows" \
-                     "$GITHUB_WORKSPACE/build-windows-agent-debug" \
-                     "$GITHUB_WORKSPACE/build-windows-agent-release"
+              rm -rf "${GITHUB_WORKSPACE:?}/build-windows" \
+                     "${GITHUB_WORKSPACE:?}/build-windows-agent-debug" \
+                     "${GITHUB_WORKSPACE:?}/build-windows-agent-release"
             fi
           fi
           # Always remove the legacy dirs so a stale state cannot poison
@@ -2578,7 +2580,8 @@ jobs:
       # is 115 min, close to this job's own 120-min budget; the explicit cap
       # turns a long slot wait into an attributable with-test-slot.sh failure
       # instead of an ambiguous job-level kill (same reasoning as Big Tam's
-      # explicit 30-min override on its own pg-shards step).
+      # explicit 30-min override on its merged "Test (non-pg + pg halves,
+      # concurrent)" step).
       - name: Test (non-pg suites)
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"

@@ -78,6 +78,8 @@ Preflight checks:
 7. `docker-compose.full-uat.yml` includes `--data-dir`
 8. `origin/dev` and `origin/main` are reconciled (no divergence either direction)
 
+Also check by hand (the script does not): **ADR-0035 ladder step 2 has merged.** If `release.yml` still builds `yuzu-server.exe`, `YuzuServerSetup` or the macOS server (`grep -nE 'yuzu-server.exe|YuzuServerSetup|install-server-postgres' .github/workflows/release.yml`), **stop**: CI no longer compiles or tests that server. Land step 2 first, or record the operator's explicit acceptance of shipping an untested Windows/macOS server in the release record (owner decision 2026-11-10).
+
 Optional `--full` adds a local C++ + Erlang compile (~2 min).
 
 **Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).

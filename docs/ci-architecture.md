@@ -59,7 +59,10 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   mode between promotions (`release.yml` builds with `-Dbuild_tests=false`), so
   a release-only defect now surfaces within about a day instead of on the push
   that caused it; `main` pushes still build release, so nothing tags untested
-  in release mode.
+  in release mode — except the Windows and macOS **server**: since ADR-0035
+  ladder step 1 no CI leg builds or tests it, yet `release.yml` still builds it
+  at tag time until ladder step 2 removes it (step 2 must merge before the next
+  release tag, ADR-0035).
   - **Failure signal.** A dispatched run is started by `github-actions[bot]`,
     which emails nobody. Whether to open, comment on or close a
     `release-legs-broken` issue is decided in one place,
@@ -2383,8 +2386,8 @@ non-timing red.
 the BEAM are multi-threaded, so load follows threads, not entries. With four
 runner agents, Linux can now have 16 concurrent entries box-wide (up from 8). The
 Linux non-pg step has no `with-test-slot.sh` gate, whereas the Windows non-pg
-step runs a similar set (it adds the server non-pg entries and drops docs) at 4
-behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported; the probe
+step runs the agent, platform, proto, echo and gateway suites (no server
+entries since ADR-0035 ladder step 1; no docs) at 4 behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported; the probe
 measurement above is still pending) and no per-runner memory limit is documented.
 This was measured on one leg (`gcc-15`/`debug`) but ships on all four: the
 clang-21 and release legs never run on a PR (clang-21 debug on any push; release
@@ -2789,17 +2792,17 @@ three (`ci-telemetry.py finish --logbase ...`); the Windows leg is now
 agent-only with ONE test invocation, so its single `testlog.junit.xml` is the
 whole record. The rest of this paragraph is history for both. Before
 that, the finalizer imported one `meson-logs/testlog.junit.xml`, and both platforms'
-Test steps now run multiple separate `meson test` invocations against the
-same builddir (Linux: 3; Windows: always 2 — the non-pg step plus
+Test steps ran multiple separate `meson test` invocations against the
+same builddir (Linux: 3; Windows: then 2 — the non-pg step plus
 exactly one of pg-full/pg-smoke, `matrix.pg_mode` resolves to exactly
-one or the job fails loud earlier), each overwriting that file. Only
+one or the job failed loud earlier), each overwriting that file. Only
 the LAST invocation's per-suite `ci_test_suites` rows and any `flake-retry`
-recovery it reports survive — the earlier, cheaper invocation(s) still gate
-the job (their own exit code), but produce no queryable history via
+recovery it reported survived — the earlier, cheaper invocation(s) still gated
+the job (their own exit code), but produced no queryable history via
 `test-db-query.sh ci-suite-stats`/`ci-flakes` for this job. This was true
 for Linux from the original #3443 restructuring and became true for
 Windows too once this PR mirrored that shape — see the "Telemetry note"
-above for the Windows-specific ordering detail (pg runs last on both
+above for the Windows-specific ordering detail (pg then ran last on both
 platforms, for the same reason). macOS was never affected — it never ran a
 `[pg]`-tagged suite (ADR-0035) and has one invocation.
 
@@ -2928,7 +2931,9 @@ The meson `docs` suite is OS-independent (lexical gates, selftests, lint
 tests) and runs on the **Linux leg only**. Its "runs on every leg" premise was
 false at the test-file level: nine entries pin OS-specific behaviour inside the
 test file or script itself, not behind a meson guard. Those nine carry the
-`platform` suite instead, which every leg runs:
+`platform` suite instead, which every leg runs (except where an entry is not
+registered: since ADR-0035 ladder step 1 the Windows and macOS legs configure
+with `-Dbuild_server=false`, so a `build_server`-gated entry runs on Linux only):
 
 | Entry | Why it is OS-contract |
 |---|---|
@@ -2940,10 +2945,10 @@ test file or script itself, not behind a meson guard. Those nine carry the
 | `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |
 | `start-UAT.sh kill_stale scoping (#5333)` | sources `scripts/start-UAT.sh`, the macOS/Linux rig with Darwin branches; registered off Windows, so it runs on Linux and macOS |
 | `capability matrix gate shell tests (#2204 F10)` | picks `.so`/`.dylib`/`.dll` and loads the real fixture plugins through `capmatrix-gen` on each leg |
-| `healthcheck CLI contract (#5906)` | a bash test that drives the real native `yuzu-server` binary (`.exe` probe, `MSYS2_ARG_CONV_EXCL`, `cygpath`); labelled `['server', 'platform']` |
+| `healthcheck CLI contract (#5906)` | a bash test that drives the real native `yuzu-server` binary (`.exe` probe, `MSYS2_ARG_CONV_EXCL`, `cygpath`); labelled `['server', 'platform']` (Linux only since ADR-0035 step 1; not registered when `build_server=false`) |
 
-Linux selects `--suite docs … --suite platform`; Windows selects `--suite platform`
-(not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
+Linux selects `--suite docs … --suite platform`; Windows selects `--suite agent
+--suite platform --suite proto --suite echo --suite gateway` (not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
 everything but `--no-suite docs`. The five dual-labelled node tests
 (`shell bell script behaviour`, `tokens page rotate behaviour`,
 `echo timeline script behaviour`, `mcp http adapter behaviour` and
@@ -3076,7 +3081,8 @@ Resolution order inside the script:
    Prefer the runner-level env override (path 1) if the box already runs
    Postgres with different credentials.
 
-   **Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4:** each runner
+   **Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4 (unused by CI
+   since ADR-0035 step 1):** each runner
    provides native PostgreSQL **18** services — agent 0's winget-installed
    `postgresql-x64-18-yuzu-ci` on `:5433` plus one initdb'd cluster per
    further agent (`postgresql-x64-18-yuzu-ci-<n>` on `:5433+<n>`, #2094) —

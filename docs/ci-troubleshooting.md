@@ -609,10 +609,12 @@ rebuild on every run and defeats the cache.
 **Symptom:** a Windows MSVC job's `Wipe build-windows/ on branch switch
 (pre-checkout)` step logs
 `removing legacy build-windows-debug/ (per-variant dirs are now build-windows-agent-{debug,release})`,
-and/or the Build step compiles every translation unit (ccache still hits,
-so it is slower than a warm incremental build but not a from-source
-rebuild). Or, on a branch cut before ADR-0035 step 1, the job uses
-`build-windows-debug` and starts cold every time.
+and/or the Build step compiles every translation unit. ccache should
+soften this, but its hit rate on the MSVC debug build (`/Zi`) is
+unverified until the first post-cutover run's ccache stats are read, so
+do not assume it is faster than a from-source rebuild. Or, on a branch
+cut before ADR-0035 step 1, the job uses `build-windows-debug` and starts
+cold every time.
 
 **Root cause:** ADR-0035 ladder step 1 made `ci.yml`'s Windows leg
 agent-only (`-Dbuild_server=false`) and moved it to
@@ -623,7 +625,15 @@ must never share a build dir with one that does not. The new job deletes
 the old `build-windows-{debug,release}` dirs on every run; a branch that
 predates the change recreates them (cold) on its next run, and the next
 up-to-date run deletes them again. Each runner workspace sees this once
-per old-branch/new-branch alternation; nothing fails.
+per old-branch/new-branch alternation; nothing fails. Pushes to `main`
+count as an old branch: until the next `dev`→`main` promotion carries
+this change, a `main` push runs `main`'s older `ci.yml`, which builds in
+`build-windows-{debug,release}`, so it too cold-rebuilds on Wee Tam and
+the next `dev` run deletes those dirs again.
+
+The macOS leg is exempt: it checks out with `actions/checkout`'s default
+`clean: true` and runs a fresh `meson setup build-macos` each run, so no
+stored option carries over between runs.
 
 **Fix:** rebase (or merge `dev` into) the branch. Once every active
 branch is past the change, the legacy dirs stop reappearing. No runner
