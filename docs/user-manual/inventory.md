@@ -1281,7 +1281,7 @@ ingest is failing. Four further series sharpen the picture:
   hash_only majority doesn't bury the `full` and `v3` tail, the pool-pressure
   signal under a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
+  `pool_acquire_timeout` / `query_error`, plus `sections_query_error` for `source="device_ci"` only: the hardware record read answered but its v2 sections did not, the case the REST record route answers `503` and the MCP tool with a retryable error, where `query_error` is the record read itself failing; plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`, and the `/crypto` sources `ca_issued` (Yuzu-issued certificate reads) and `crypto_layout` (dashboard layouts), see [metrics.md](metrics.md#crypto-dashboard-metrics)) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
@@ -1561,10 +1561,19 @@ sync, defeating the hash-skip protocol.
   device last synced in full (a row was edited, or the rows were swapped for another sync's out
   of band): the section is served `constrained` and incomplete, with the rows that were read, but
   those rows are **not** the values the agent reported, so do not rely on them. A lost row
-  reports `server:row_count_mismatch` alone. Neither token is stored: both are worked out each
-  time the record is read, so they never appear in the `device_ci_section` query further down.
-  Reading the record again does not clear either token. **Only a full device-record sync
-  repairs either** (a device whose hardware has not changed sends only a hash on its daily sync,
+  reports `server:row_count_mismatch` alone. A third token, `server:content_digest_unverifiable`,
+  means this **server** could not compute the digest to compare (its digest provider failed, an
+  OpenSSL fault): the section is served `constrained` and incomplete with the rows that were read,
+  which are not known to be wrong. It is a fault of the server, not of the device or the stored
+  rows, so no device sync clears it. The verdict is recomputed on every read, so a transient
+  provider fault may clear on a later read; a persistent one needs an operator to fix the server's
+  OpenSSL provider or FIPS configuration (for example `openssl list -providers` in the server's
+  environment). None of the tokens is stored: all are worked out each time the record is read,
+  so they never appear in the `device_ci_section` query further down. Each faulted section of a
+  read composed is also counted in `yuzu_hardware_section_integrity_total` ([Metrics](metrics.md#hardware-record-section-integrity-metric-7159)).
+  Reading the record again does not clear either mismatch token (it may clear
+  `server:content_digest_unverifiable`, see above). **Only a full device-record sync
+  repairs either mismatch** (a device whose hardware has not changed sends only a hash on its daily sync,
   which leaves the rows alone): use **Sync now** on the device's Hardware page, or
   `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`. The fleet-wide
   `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed
@@ -1579,13 +1588,14 @@ sync, defeating the hash-skip protocol.
   non-malicious drift, not tamper resistance: someone who can write the table can rewrite the
   digest. It covers the rows only, not the section's `status` or `reason`. Stored, it carries a
   layout version prefix (`v1:` then the SHA-256). A well-formed digest of a different layout
-  version (for example `v2:` followed by a digest) is treated as unverified, because this server
-  cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
+  version (for example `v2:` followed by a digest) is not compared (left unchecked, no token),
+  because this server cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
   by a colon and a non-empty remainder). Any other stored value that is not the current form (an
   empty or damaged value, `V1:`, a bare hex string, a malformed version) is compared as a
   mismatch and reported as `server:content_digest_mismatch`, so a damaged column cannot let an
   edited section read as complete. Only an absent value (a section stored before migration 3, or
-  a status-only kind) or a well-formed digest of another layout version is unverified. A section
+  a status-only kind) or a well-formed digest of another layout version is left unchecked (no
+  token). A section
   whose row count already disagrees reports the count token alone, and an `unavailable` or
   `permission_denied` section is never compared.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the

@@ -3193,6 +3193,38 @@ tests:
           - labels: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing", severity="warning"}'
             value: 1
 
+  # ── YuzuInventoryReadDegraded - source="device_ci" sections_query_error (#7159) ──
+  #
+  # The rule is reason-agnostic (`sum(rate(...[5m])) by (reason, source) > 0`), so a new reason
+  # needs no rule change - but a rule that parses and cannot fire for the new reason is invisible
+  # to every other gate, so this case pins that the hardware record's sections-read degrade
+  # actually pages.
+
+  # CASE - a sustained sections_query_error fires once the `for: 5m` bar clears, with the reason
+  # and source carried on the alert.
+  - interval: 1m
+    name: inventory read degraded - device_ci sections_query_error fires
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="device_ci",reason="sections_query_error"}'
+        values: "0+1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryReadDegraded", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryReadDegraded", alertstate="firing", severity="warning", source="device_ci", reason="sections_query_error"}'
+            value: 1
+
+  # CASE - the pre-seeded zero series (the normal healthy state) stays quiet.
+  - interval: 1m
+    name: inventory read degraded - a zero-seeded sections_query_error series stays quiet
+    input_series:
+      - series: 'yuzu_inventory_read_degrade_total{job="yuzu",instance="s1",source="device_ci",reason="sections_query_error"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryReadDegraded", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+
   # ── YuzuInventoryIngestSlow - blob v3 (phase="v3") ───────────────────────
   #
   # A blob-v3 call applies up to 32 sections in one transaction on one connection (the heaviest
