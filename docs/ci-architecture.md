@@ -74,7 +74,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
       dropped, failed or never fired is still reported within a day.
 
     What the script does:
-    - **Opens or comments** on any failing conclusion, including a run that
+    - **Opens or comments** on any failing conclusion of the newest completed
+      run (a late report for a run a newer one has superseded is dropped),
+      including a run that
       never started (`startup_failure`), and words it by cause: a code
       failure, infrastructure (the preflight gate, or only preflight jobs,
       failed; proto-compat then fails closed too), or a run that started no
@@ -103,9 +105,11 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
        read that run's log and fix it. Re-dispatch (step 4) if the dispatch
        did not happen. If the preflight gate (or only preflight jobs) failed,
        it is infrastructure: a runner pool, a runner-health check or a source
-       gate. Fix that, then re-run ALL jobs or re-dispatch. Re-running only
-       the failed jobs reuses the failed gate's result. If the run started no job, dev's
-       `ci.yml` failed to load, and every dev push is likely red too.
+       gate. Fix that, then re-run the failed jobs (GitHub re-runs the gate
+       and everything that depends on it) or re-dispatch. Never re-run
+       proto-compat alone: it would reuse the gate's earlier result. If the
+       run started no job, dev's `ci.yml` failed to load, and every dev push
+       is likely red too.
     2. Otherwise, open the failed leg. A timeout, a test-slot wait or a
        Postgres restart mid-run is a flake: re-run the failed jobs.
     3. A real test or link failure in release mode is a release-only
@@ -133,16 +137,18 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
       suffix is always rendered or harmless.
     - **Never skipped.** Proto backward-compat is routinely skipped (every
       docs-only PR, #1978), so it keeps its literal name. On a dispatch it
-      always runs (`always()`, so a cancel does not skip it either). It runs
-      the real `buf breaking` on the dev branch it checks out, the same thing
+      always runs (`always()`, so a cancel does not skip it either, and a final
+      step fails it red if the run was cancelled). It runs the real
+      `buf breaking` on the branch it checks out (dev; main on a by-hand
+      dispatch), the same thing
       every dev push already posts. If dev moved since the dispatch, its
       "Record built commit" step names the commit actually checked. If
       `preflight-gate` did not succeed (an infrastructure failure, or a
       dispatch cancelled during preflight), it fails red on a hosted runner
       instead of skipping. That red is a real, fail-closed "Proto
       backward-compat" on the dev tip. Before merging a promotion PR whose
-      head is that commit, re-run ALL jobs of that dispatch, or re-run the
-      PR's own CI.
+      head is that commit, re-run that dispatch's failed jobs (not
+      proto-compat alone), or re-run the PR's own CI.
 
     As defence in depth, `trusted_inputs` refuses a direct dispatch on any ref
     but `dev` or `main`.

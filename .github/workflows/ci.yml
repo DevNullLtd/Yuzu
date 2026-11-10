@@ -733,9 +733,11 @@ jobs:
     # required "Proto backward-compat" context would be absent on every
     # docs-only PR (github.com/orgs/community/discussions/13261). So on a
     # direct dispatch this job is never skipped instead: it RUNS the real
-    # `buf breaking` check on the dev branch it checks out (the same thing
+    # `buf breaking` check on the branch it checks out (dev, or main on a
+    # by-hand dispatch; the same thing
     # every dev push posts; if dev moved since the dispatch, its "Record built
-    # commit" step names the commit actually checked), or, when preflight-gate did not succeed or the
+    # commit" step names the commit actually checked), or, when preflight-gate
+    # did not succeed or the
     # Linux pool reads unhealthy, FAILS red on a hosted runner (a real red
     # "Proto backward-compat" on that commit: fail-closed, re-run once the
     # infrastructure is back). A dispatch can therefore never post a SKIPPED
@@ -751,9 +753,10 @@ jobs:
     # The dispatch arm is `always()`, not `!cancelled()`: a dispatch cancelled
     # while preflight runs must still not leave a SKIPPED literal required
     # context; with the gate cancelled it takes the hosted fail-closed arm
-    # (ends red). Once this job is running, a normal run cancel does not stop
-    # it (`always()` stays true), so it finishes with its real result; only a
-    # force-cancel ends it `cancelled`, which never satisfies a required check.
+    # (ends red). If the run is cancelled while this job runs, its last step
+    # (`always() && cancelled()`) fails it red, so no cancel path can end it
+    # green-without-checking; a force-cancel ends it `cancelled`, which never
+    # satisfies a required check.
     if: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && always()) || (success() && needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true') }}
     # The pool clause is defence in depth: today a successful gate implies the
     # Big Tam (= Linux) pool is healthy (--require-pool bigtam), so it only
@@ -799,6 +802,17 @@ jobs:
         run: buf lint proto
       - name: Check backward compatibility
         run: buf breaking proto --against '.git#subdir=proto,ref=origin/main'
+
+      # Direct dispatch only: if the run was cancelled at any point, end RED
+      # whatever happened above. Whether GitHub runs or skips implicit-success()
+      # steps after a run cancel must not decide this: a skipped lint/breaking
+      # with no failed step would otherwise conclude this job green without
+      # checking anything, on a literal required context.
+      - name: Fail closed if the dispatch was cancelled
+        if: always() && (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && cancelled()
+        run: |
+          echo "::error::the dispatch was cancelled — failing closed rather than posting an unchecked Proto backward-compat"
+          exit 1
 
       - name: Purge trusted-fork workspace
         if: ${{ always() && needs.preflight-gate.outputs.trusted_execution == 'true' }}

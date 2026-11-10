@@ -5,6 +5,6 @@
   listener (`release-legs-alert.yml`) and backstopped by a daily reconcile, and the release skill
   checks for one before tagging. For contributors: `ci.yml` gains a `workflow_dispatch` trigger
   (`legs=release|all`), accepted on `dev` and `main` only, and on a dispatch its required-check jobs
-  are renamed (` [dispatch]`) or never skipped, so a dispatch never posts a skipped or misattributed
-  required check. The cron and the alert go live once the files reach `main`. Details:
+  are renamed (` [dispatch]`) or never skipped, so a dispatch never posts a skipped (=
+  satisfied) required check. The cron and the alert go live once the files reach `main`. Details:
   `docs/ci-architecture.md`, Tier 2b.

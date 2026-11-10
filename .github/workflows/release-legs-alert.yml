@@ -50,7 +50,9 @@ jobs:
     # completion. At job level only acting jobs serialise, with the daily
     # reconcile and alert jobs (same group), so two writers never both open an
     # issue. A pending member can still be replaced by a newer one when three
-    # arrive at once; the next reconcile re-judges the run (accepted residual).
+    # arrive at once (accepted residual): a dropped listener job is covered by
+    # the next reconcile; a dropped daily `alert` job is not, so that day's
+    # workflow failure stays visible only as a red run in the Actions tab.
     concurrency:
       group: release-legs-alert
       cancel-in-progress: false

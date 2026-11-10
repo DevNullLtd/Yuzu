@@ -374,6 +374,7 @@ class WorkflowWiringTests(unittest.TestCase):
                       "|| needs.preflight-gate.outputs.linux_pool_healthy != 'true')", body)
         self.assertIn("runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')) && 'ubuntu-24.04' || fromJSON(", body)
         self.assertIn("if: always() && " + self.DIRECT_DISPATCH, body)
+        self.assertIn("if: always() && " + self.DIRECT_DISPATCH + " && cancelled()", body)
         self.assertIn("exit 1", body)
 
     def test_ci_yml_stays_within_the_trusted_fork_token_ceiling(self) -> None:

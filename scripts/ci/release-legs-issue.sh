@@ -13,7 +13,7 @@
 # Decision, from the run's conclusion and its job list:
 #   success + every OS (Linux, Windows MSVC, macOS) has >=1 `... [dispatch]`
 #     build leg and every such leg succeeded + this is the newest completed
-#     dispatch run on dev                            -> close every open issue
+#     non-cancelled dispatch run on dev                            -> close every open issue
 #     opened before this run finished (a later report is not answered by it)
 #   success otherwise (a leg skipped/missing)       -> leave issues as they are
 #   cancelled / skipped                             -> nothing (an operator
@@ -85,7 +85,18 @@ case "$conclusion" in
     exit 0 ;;
 esac
 
-# Failure of some kind.
+# Failure of some kind. In event mode, a report for a run that a newer
+# completed (non-cancelled) dispatch run has already superseded is dropped:
+# workflow_run events arrive in no fixed order, and the newer run's own
+# event or the daily reconcile speaks for dev's current state.
+if [[ "$mode" == event ]]; then
+  latest=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch --branch dev \
+             --status completed --limit 20 --json databaseId,conclusion \
+             --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0].databaseId // empty')
+  if [[ -n "$latest" && "$latest" != "$run_id" ]]; then
+    echo "run $run_id failed but newer dispatch run $latest has completed — not reporting a superseded run"; exit 0
+  fi
+fi
 failed=$(jq -r '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled") | .name] | join(", ")' <<<"$run_json")
 njobs=$(jq '.jobs | length' <<<"$run_json")
 # Infrastructure: the trusted-inputs or preflight GATE failed (every job after
