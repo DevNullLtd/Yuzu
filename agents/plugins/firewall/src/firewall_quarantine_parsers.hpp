@@ -1560,13 +1560,16 @@ win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
 ///    not, on or off. Any second carrier is a rule the edit cannot be told apart from: a
 ///    sibling that was off before the quarantine, or an untouched twin an exact key already
 ///    claimed, and switching either on would leave the host MORE open than it was before.
-///    The sole carrier then decides:
+///    The sole carrier is claimed either way, so a second listed key for it is unmatched
+///    (two original rules cannot both be the one rule left). It then decides:
 ///    - switched off and not claimed: it comes back on. A best guess, so the shell reports
 ///      how often it was taken (`by_identity`).
-///    - already on: the edited rule an earlier attempt's fallback switched on, or one
-///      switched back on by hand. Nothing to switch, no guess to report; it is counted
-///      (`accounted_enabled`) so the reply still says the rule was not found by its key.
-///    - switched off but already claimed (another listed key took it first): unmatched.
+///    - already on and not claimed: the edited rule an earlier attempt's fallback switched
+///      on, or one switched back on by hand. Nothing to switch, no guess to report; it is
+///      counted (`accounted_enabled`) so the reply still says the rule was not found by
+///      its key.
+///    - already claimed, on or off (an exact key or another listed key took it first):
+///      unmatched.
 /// 3. Otherwise the key is unmatched: no carrier, or more than one. Nothing is switched on
 ///    for it (fail safe: a rule left off is never more open than before); the release still
 ///    completes (nothing of ours is left behind), and is reported, never silent.
@@ -1615,14 +1618,14 @@ struct WinReleasePlan {
         const auto it = same_identity.find(win_key_identity(*key));
         if (it != same_identity.end() && it->second.size() == 1) {
             const auto i = it->second.front();
-            if (rules[i].enabled) {
-                ++plan.accounted_enabled;
-                continue;
-            }
             if (!claimed[i]) {
                 claimed[i] = true;
-                plan.reenable.push_back(i);
-                ++plan.by_identity;
+                if (rules[i].enabled) {
+                    ++plan.accounted_enabled;
+                } else {
+                    plan.reenable.push_back(i);
+                    ++plan.by_identity;
+                }
                 continue;
             }
         }

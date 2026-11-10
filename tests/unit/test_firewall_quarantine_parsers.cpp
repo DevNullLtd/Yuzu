@@ -4645,6 +4645,17 @@ TEST_CASE("windows release: a retry after the identity fallback finds the edited
     CHECK(plan.reenable.empty());
     CHECK(plan.unmatched == 1);
 
+    // two listed keys of one identity, one enabled carrier left: one of the two original rules
+    // is gone, so the carrier accounts for one key and the other is reported (not both counted)
+    auto gone = before;
+    gone.application = "C:\\gone.exe";
+    plan = win_release_plan({listed, win_rule_key(gone)}, {edited});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.accounted_enabled == 1);
+    CHECK(plan.unmatched == 1);
+    CHECK(plan.unmatched_keys == std::vector<std::string>{win_rule_key(gone)});
+
     // an untouched twin that an exact key accounts for is still a second carrier of the
     // identity: the edited rule cannot be told from a deletion beside it, so it is reported
     // (a retry reads the same as the first attempt, and nothing is switched on for it)
