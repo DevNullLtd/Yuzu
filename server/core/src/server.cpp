@@ -1707,8 +1707,9 @@ public:
                           "server_shutdown, credential_revoked, credential_indeterminate (the "
                           "caller's credential was checked before a step), late_denied or "
                           "definition_changed (a step was refused at send time), a zero-reach cause "
-                          "(containment_unreadable, route_unreadable, os_gate_unreadable, "
-                          "no_agents_reached, quarantined, plugin_not_found, kill_switched_os), "
+                          "(dispatch_denied, containment_unreadable, route_unreadable, "
+                          "os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, "
+                          "kill_switched_os), "
                           "run_failed (the engine ended the run before any dispatch), "
                           "dispatch_exception (the run threw after its requested audit row; steps "
                           "may have been sent), or none. A run killed with the process never "
@@ -14212,7 +14213,8 @@ private:
                                      /*payload=*/{}, /*stagger_seconds=*/0, /*delay_seconds=*/0,
                                      std::string(dispatch_arm_label(arm)), execution_id);
         if (!classified)
-            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id};
+            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id,
+                                                         .denied = classified.error()};
 
         agent_service_.record_send_time(command_id);
         // PR 2 / UP2-4: command_id -> (plugin, execution_id) was recorded BEFORE any RPC, inside

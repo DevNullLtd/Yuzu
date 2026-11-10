@@ -22,6 +22,7 @@
 #include "auth_routes.hpp"
 #include "baseline_store.hpp"
 #include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
+#include "dispatch_denial.hpp"    // #7114: the chokepoint refusal the live stub can return
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
@@ -149,6 +150,10 @@ struct RestGsHarness {
     // response row. live_sent toggles the offline path.
     std::unique_ptr<ResponseStore> resp_store;
     int live_sent{1};
+    /// #7114: when set, the dispatch stub answers as the chokepoint does for a refused pair (sent 0,
+    /// the denial on the outcome); `live_dispatches` counts the dispatches the route made.
+    std::optional<yuzu::server::detail::DispatchDenial> live_denied;
+    int live_dispatches{0};
     std::string last_live_plugin, last_live_action;
     /// #1788: the confinement set the /live handler derived and threaded into
     /// dispatch. The per-device scoped_perm_fn gate remains this route's
@@ -247,6 +252,11 @@ struct RestGsHarness {
     // the shared #1647 helper catches it (the throw arm was previously silent) and
     // still fails closed with Sec-Audit-Failed rather than letting it escape.
     bool audit_throws{false};
+
+    // Runs inside every audit write with its result: the window in which production lets a
+    // grant, an elevation or a session move between the route's first decision and its dispatch
+    // (#7110).
+    std::function<void(const std::string& result)> on_audit;
 
     // When false, the live deps (response_store + command_dispatch_fn) are left
     // unwired so a test can prove /live → 503 when the substrate is unavailable.
@@ -456,9 +466,12 @@ struct RestGsHarness {
                    const std::unordered_map<std::string, std::string>&, const std::string&,
                    const yuzu::server::DispatchCaller& caller)
             -> yuzu::server::ConfinedDispatchOutcome {
+            ++live_dispatches;
             last_live_plugin = plugin;
             last_live_action = action;
             last_live_exec_visible = caller.exec_visible;
+            if (live_denied)
+                return {.command_id = plugin + "-live", .denied = live_denied};
             // Model what the production seam does to the Ids arm rather than
             // ignoring the set the route just derived — otherwise this fake
             // reports a successful dispatch whatever confinement decided, which
@@ -579,6 +592,8 @@ struct RestGsHarness {
             if (audit_throws)
                 throw std::runtime_error("audit store unavailable (test)");
             audit_log.push_back({action, result, target_type, target_id, detail});
+            if (on_audit)
+                on_audit(result);
             return audit_succeeds;
         };
 
@@ -3669,6 +3684,14 @@ TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.last_live_plugin.empty()); // never dispatched
+    // The metric label is the closed set: an unresolved kind is counted as `unknown`, never as
+    // the caller's own text (one series per distinct string a caller sends).
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "unknown"}, {"outcome", "400"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "bogus"}, {"outcome", "400"}})
+              .value() == 0.0);
 }
 
 TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch",
@@ -4504,6 +4527,114 @@ TEST_CASE("REST dex/devices/{id}/live: Execute denied but Read allowed → 403, 
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.last_live_plugin.empty()); // the Execute gate denied before any dispatch
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a scoped gate or the caller withdrawn inside the requested-row "
+          "write dispatches nothing; 403 / failure row (#7110)",
+          "[pg][rest][dex][device][live][scope][7110]") {
+    struct Withdrawal {
+        const char* name;
+        std::function<void(RestGsHarness&)> mutate; // runs INSIDE the `requested` audit write
+        std::optional<int> status; // nullopt: this harness's auth_fn writes none (production's 401)
+        const char* detail;
+    };
+    const std::vector<Withdrawal> withdrawals = {
+        {"Execution:Execute withdrawn", [](RestGsHarness& h) { h.deny_scoped_op = "Execute"; }, 403,
+         "permission_revoked"},
+        {"GuaranteedState:Read withdrawn (every scoped gate refuses)",
+         [](RestGsHarness& h) { h.grant_perms = false; }, 403, "permission_revoked"},
+        {"the session no longer resolves", [](RestGsHarness& h) { h.session_user.clear(); },
+         std::nullopt, "caller_unresolved"},
+    };
+    for (const auto& w : withdrawals) {
+        DYNAMIC_SECTION(w.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            RestGsHarness h(true, true, true, true, &pool);
+            h.on_audit = [&](const std::string& result) {
+                if (result == "requested")
+                    w.mutate(h);
+            };
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            if (w.status)
+                CHECK(res->status == *w.status);
+            CHECK(h.last_live_plugin.empty()); // nothing dispatched
+            REQUIRE(h.audit_log.size() == 2);
+            CHECK(h.audit_log[0].result == "requested");
+            CHECK(h.audit_log[1].action == "device.live.uptime");
+            CHECK(h.audit_log[1].result == "failure");
+            CHECK(h.audit_log[1].target_id == "WS-1");
+            CHECK(h.audit_log[1].detail.find(w.detail) == 0);
+        }
+    }
+}
+
+// Kills: reverting the recheck's `fail` lambda to a bare audit_fn call. The failure row is the
+// only evidence the probe was NOT sent (the success path writes no outcome row), so its loss
+// must be on the answer.
+TEST_CASE("REST dex/devices/{id}/live: a lost failure row after a recheck refusal is flagged "
+          "Sec-Audit-Failed; the 403 and the no-dispatch hold (#7110)",
+          "[pg][rest][dex][device][live][scope][7110]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.deny_scoped_op = "Execute"; // withdrawn INSIDE the row write
+        if (result == "failure")
+            h.audit_succeeds = false; // the outcome row alone is lost
+    };
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_live_plugin.empty());
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].result == "failure");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a chokepoint refusal is a dispatch_denied answer, never a "
+          "retryable 'device offline' (#7114)",
+          "[pg][rest][dex][device][live][7114]") {
+    struct Case {
+        const char* name;
+        yuzu::server::detail::DispatchDenialReason reason;
+        int status;
+        const char* token;
+    };
+    using R = yuzu::server::detail::DispatchDenialReason;
+    // The pair comes from the server's own kind table: a permission-class refusal is the caller's
+    // 403, an Unclassified one is a server catalogue fault (500), unlike the 400 a caller-named
+    // pair would get.
+    const Case cases[] = {
+        {"approval_required is a 403", R::ApprovalRequired, 403, "approval_required"},
+        {"forbidden is a 403", R::Forbidden, 403, "forbidden"},
+        {"unclassified is a 500 (server-named pair)", R::Unclassified, 500, "unclassified"},
+    };
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            RestGsHarness h(true, true, true, true, &pool);
+            h.live_denied = yuzu::server::detail::DispatchDenial{c.reason, "Inventory",
+                                                                 yuzu::server::authz::Operation::Read};
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            CHECK(res->status == c.status);
+            const auto j = nlohmann::json::parse(res->body);
+            CHECK(j["error"]["message"].get<std::string>() ==
+                  std::string("dispatch denied: reason=") + c.token);
+            CHECK(res->body.find("offline") == std::string::npos);
+            CHECK(h.live_dispatches == 1); // refused once, never retried or re-sent
+            REQUIRE(h.audit_log.size() == 2);
+            CHECK(h.audit_log[0].result == "requested");
+            CHECK(h.audit_log[1].action == "device.live.uptime");
+            CHECK(h.audit_log[1].result == "failure");
+            CHECK(h.audit_log[1].target_id == "WS-1");
+            CHECK(h.audit_log[1].detail.find(std::string("dispatch_denied reason=") + c.token) == 0);
+        }
+    }
 }
 
 TEST_CASE("REST dex/devices/{id}/live: live substrate unavailable → 503",

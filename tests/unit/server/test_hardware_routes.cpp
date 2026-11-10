@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <expected>
+#include <functional>
 #include <algorithm>
 #include <optional>
 #include <string>
@@ -116,6 +117,10 @@ struct HwHarness {
 
     // When non-empty, `audit_should_fail` fails ONLY this audit action (the row is still recorded).
     std::string audit_fail_only;
+
+    /// Runs inside every audit write with its result: the window in which production lets a grant
+    /// move between the route's first gate and its dispatch (#7110).
+    std::function<void(const std::string& result)> on_audit;
 
     std::vector<std::string> audits;        // "action|result"
     std::vector<std::string> audit_full;    // "action|result|target_type|target_id"
@@ -212,6 +217,8 @@ struct HwHarness {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             audit_details.push_back(detail);
+            if (on_audit)
+                on_audit(r);
             return !(audit_should_fail && (audit_fail_only.empty() || audit_fail_only == a));
         };
         HardwareRoutes::DexScoreFn dex_fn = [this](const std::string& id) {
@@ -907,6 +914,46 @@ TEST_CASE("route: POST .../sync — audit-store degrade fails CLOSED, no dispatc
     // The whole point of auditing BEFORE dispatch: a degraded audit store must
     // never let the side effect through.
     REQUIRE(h.sync_dispatch_calls == 0);
+}
+
+TEST_CASE("route: POST .../sync — the device grant withdrawn inside the requested-row write "
+          "dispatches nothing; 403, failure row permission_revoked (#7110)",
+          "[hardware][route][rest][security][7110]") {
+    HwHarness h;
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.allow_scoped_perm = false; // withdrawn INSIDE the row write
+    };
+    auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", R"({"source":"app_perf"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.sync_dispatch_calls == 0); // the system-reserved dispatch cannot see the operator's grant
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0] == "inventory.sync.request|requested");
+    CHECK(h.audits[1] == "inventory.sync.request|failure");
+    CHECK(h.audit_details[1] == "permission_revoked");
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed")); // control: the failure row persisted
+}
+
+// Kills: reverting the recheck's failure row to try_persist_audit. That row is the only evidence
+// the sync was NOT requested of the agent, so its loss must be on the answer.
+TEST_CASE("route: POST .../sync — a lost failure row after the recheck refusal is flagged "
+          "Sec-Audit-Failed; the 403 and the no-dispatch hold (#7110)",
+          "[hardware][route][rest][security][7110]") {
+    HwHarness h;
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.allow_scoped_perm = false; // withdrawn INSIDE the row write
+        if (result == "failure")
+            h.audit_should_fail = true; // the outcome row alone is lost
+    };
+    auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", R"({"source":"app_perf"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.sync_dispatch_calls == 0);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1] == "inventory.sync.request|failure");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
 }
 
 // #4644: offset/limit/await_since are ONE base-10 integer or a 400. `await_since` is

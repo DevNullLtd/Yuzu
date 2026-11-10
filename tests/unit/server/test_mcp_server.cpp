@@ -47441,7 +47441,7 @@ TEST_CASE("MCP execute_instruction_definition: a chokepoint denial names the def
 }
 
 TEST_CASE("MCP execute_instruction_definition: the description lists the machine-branchable approval "
-          "and dispatch refusals and the five wiring gaps that write no audit row",
+          "and dispatch refusals and the six wiring gaps that write no audit row",
           "[mcp][integration][execute][idef]") {
     McpTestServer ts;
     ts.start();
@@ -47458,9 +47458,12 @@ TEST_CASE("MCP execute_instruction_definition: the description lists the machine
         INFO(token);
         CHECK(desc.find(token) != std::string::npos);
     }
-    // The five unwired components that write no row, exactly as the docs list them.
-    CHECK(desc.find("unwired definition lookup, authorizer, validator cache, classifier or "
-                    "dispatch write none") != std::string::npos);
+    // The six unwired components that write no row, exactly as the docs list them (#7110 added the
+    // post-row recheck: an unset readmit port is refused before the requested row).
+    CHECK(desc.find("unwired definition lookup, authorizer, validator cache, classifier, post-row "
+                    "recheck or dispatch write none") != std::string::npos);
+    // The post-row refusal is a machine-branchable error.data.reason, named with its meaning.
+    CHECK(desc.find("permission_revoked (-32003, permanent)") != std::string::npos);
 }
 
 TEST_CASE("MCP execute_instruction_definition: an unknown definition is -32602 and dispatches nothing",
@@ -47631,6 +47634,165 @@ TEST_CASE("MCP execute_instruction_definition: the audit row is written BEFORE d
     CHECK(rig.rows.empty());
 }
 
+TEST_CASE("MCP execute_instruction_definition: a withdrawn grant, an expired session or a changed "
+          "principal inside the execution-row write dispatches nothing, cancels the row and is "
+          "HTTP 200 kPermissionDenied permission_revoked (#7110)",
+          "[mcp][integration][execute][idef][audit][security][7110]") {
+    // The tool-level gate admitted the call; the world moves while the execution row is written
+    // (the core's last own write), so only the handler's own recheck (its `readmit` wiring) can
+    // catch it. `auth_fn` / `perm_fn` write 401 / 403 into the response on refusal; the rendered
+    // JSON-RPC envelope must replace that status, so all three refusals read alike on the wire.
+    for (const int k : {0, 1, 2}) {
+        DYNAMIC_SECTION((k == 0   ? "grant withdrawn"
+                         : k == 1 ? "session expired"
+                                  : "principal changed")) {
+            McpTestServer ts;
+            Rig rig;
+            rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+            rig.on_create = [&] {
+                if (k == 0)
+                    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+                        return !(sec == "Execution" && op == "Execute");
+                    };
+                else if (k == 1)
+                    ts.mock_auth_enabled = false;
+                else
+                    ts.mock_username = "someone-else";
+            };
+            idef_start(ts, rig, "operator");
+            auto res = ts.call(idef_call({{"definition_id", "d"}}));
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            const auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+            CHECK(body["error"]["data"]["reason"] == "permission_revoked");
+            CHECK(rig.calls.empty());
+            CHECK(rig.rows.size() == 1); // the row exists ...
+            CHECK(rig.cancelled == std::vector<std::string>{"exec-1"}); // ... and is closed
+            CHECK(idef_audited(ts, "requested"));
+            CHECK(idef_audited(ts, "failure"));
+        }
+    }
+}
+
+TEST_CASE("MCP execute_instruction_definition: the caller dispatched is the one re-derived after "
+          "the writes, with approval_provenance forced to None (#7110)",
+          "[mcp][integration][execute][idef][security][7110]") {
+    McpTestServer ts;
+    Rig rig;
+    rig.defs["d"] = yuzu::test::instr_exec::make_def("d");
+    // Not idef_start: it would overwrite the deriving caller_fn below.
+    ts.instr_exec_ports_for_test = rig.ports();
+    // The first derivation (the request's caller) sees agent-A and carries a Ticket stamp; the
+    // second (inside `readmit`) sees agent-B. Only a handler that derives the caller again after
+    // the writes dispatches agent-B with provenance None.
+    int derivations = 0;
+    ts.caller_fn_for_test = [&](const yuzu::server::auth::Session& s) {
+        ++derivations;
+        auto c = yuzu::test::instr_exec::make_caller(
+            s.username, true,
+            std::unordered_set<std::string>{derivations == 1 ? "agent-A" : "agent-B"});
+        c.approval_provenance = yuzu::server::ApprovalProvenance::Ticket;
+        return c;
+    };
+    ts.start("operator");
+    auto res = ts.call(idef_call({{"definition_id", "d"}}));
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("error"));
+    CHECK(derivations == 2);
+    REQUIRE(rig.calls.size() == 1);
+    CHECK(rig.calls[0].exec_visible ==
+          yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-B"}});
+    CHECK(rig.calls[0].provenance == yuzu::server::ApprovalProvenance::None);
+    CHECK(rig.cancelled.empty());
+}
+
+TEST_CASE("MCP execute_instruction_definition: a role demoted inside the execution-row write is seen "
+          "by the re-derived caller: the AdminOrApproval pair is refused, the row cancelled (#7110)",
+          "[mcp][integration][execute][idef][audit][security][7110]") {
+    // The control (no demotion) proves the pair dispatches for an admin; only the demotion differs.
+    for (const bool demote : {false, true}) {
+        DYNAMIC_SECTION((demote ? "demoted inside the write" : "control: still admin")) {
+            McpTestServer ts;
+            Rig rig;
+            rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "gated"); // AdminOrApproval pair
+            // Not idef_start: its `admin` parameter manufactures the bit. This deriver is the
+            // production shape (derive_dispatch_caller): the admin bit is read from the Session it
+            // is handed, so only a handler that re-authenticates after the writes sees a demotion.
+            ts.instr_exec_ports_for_test = rig.ports();
+            ts.caller_fn_for_test = [](const yuzu::server::auth::Session& s) {
+                return yuzu::test::instr_exec::make_caller(
+                    s.username, s.role == yuzu::server::auth::Role::admin);
+            };
+            ts.mock_role = yuzu::server::auth::Role::admin;
+            if (demote)
+                rig.on_create = [&] { ts.mock_role = yuzu::server::auth::Role::user; };
+            ts.start("operator");
+            auto res = ts.call(idef_call({{"definition_id", "d"}}));
+            REQUIRE(res);
+            const auto body = nlohmann::json::parse(res->body);
+            if (!demote) {
+                CHECK_FALSE(body.contains("error"));
+                CHECK(rig.calls.size() == 1);
+                CHECK(rig.cancelled.empty());
+            } else {
+                REQUIRE(body.contains("error"));
+                CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+                CHECK(body["error"]["data"]["reason"] == "approval_required");
+                CHECK(rig.calls.empty());
+                CHECK(rig.rows.size() == 1); // the row exists ...
+                CHECK(rig.cancelled == std::vector<std::string>{"exec-1"}); // ... and is closed
+                CHECK(idef_audited(ts, "requested"));
+                CHECK(idef_audited(ts, "failure"));
+            }
+        }
+    }
+}
+
+TEST_CASE("MCP execute_instruction_definition: a role-gated definition over an ExecuteGate::None pair "
+          "is permission_revoked when the admin standing lapses inside the execution-row write (#7110)",
+          "[mcp][integration][execute][idef][audit][security][7110]") {
+    // `ping` is ExecuteGate::None, so the pair re-decision admits a non-admin: only a re-decision of
+    // the definition's own approval_mode on the re-authenticated caller catches the lapse.
+    for (const bool lapse : {false, true}) {
+        DYNAMIC_SECTION((lapse ? "elevation lapsed inside the write" : "control: still admin")) {
+            McpTestServer ts;
+            Rig rig;
+            rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "role-gated");
+            ts.instr_exec_ports_for_test = rig.ports();
+            ts.caller_fn_for_test = [](const yuzu::server::auth::Session& s) {
+                return yuzu::test::instr_exec::make_caller(
+                    s.username, s.role == yuzu::server::auth::Role::admin);
+            };
+            ts.mock_role = yuzu::server::auth::Role::admin;
+            if (lapse)
+                rig.on_create = [&] { ts.mock_role = yuzu::server::auth::Role::user; };
+            ts.start("operator");
+            auto res = ts.call(idef_call({{"definition_id", "d"}}));
+            REQUIRE(res);
+            const auto body = nlohmann::json::parse(res->body);
+            if (!lapse) {
+                CHECK_FALSE(body.contains("error"));
+                CHECK(rig.calls.size() == 1);
+                CHECK(rig.cancelled.empty());
+            } else {
+                REQUIRE(body.contains("error"));
+                CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+                CHECK(body["error"]["data"]["reason"] == "permission_revoked");
+                CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+                CHECK(rig.calls.empty());
+                CHECK(rig.approvals.empty()); // refused, not queued
+                CHECK(rig.rows.size() == 1);
+                CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
+                CHECK(idef_audited(ts, "requested"));
+                CHECK(idef_audited(ts, "failure"));
+            }
+        }
+    }
+}
+
 TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-std) is -32603 "
           "with NO retry hint and a failure audit row",
           "[mcp][integration][execute][idef][audit][security]") {
@@ -47747,6 +47909,14 @@ TEST_CASE("MCP execute_instruction_definition: every zero-reach cause is a statu
         return o;
     };
     const Case cases[] = {
+        // #7114: the chokepoint's own refusal, first in the classifier's order, permanent.
+        {"dispatch_denied",
+         mk([](auto& o) {
+             o.denied = yuzu::server::detail::DispatchDenial{
+                 yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                 yuzu::server::authz::Operation::Write};
+         }),
+         false},
         {"invalid_scope", mk([](auto& o) { o.scope_parse_error = "bad"; }), false},
         {"containment_unreadable", mk([](auto& o) { o.containment_unreadable = true; }), true},
         {"route_unreadable", mk([](auto& o) { o.route_unreadable = true; }), true},
@@ -51274,7 +51444,8 @@ TEST_CASE("MCP execute_workflow: a zero-reach status is always one of the closed
         }
         // Every cause the shared classifier can name is in the list, except the one a workflow
         // never produces (its agents are named, so there is no scope to fail to parse).
-        for (const auto cause : {yuzu::server::ZeroReachCause::ContainmentUnreadable,
+        for (const auto cause : {yuzu::server::ZeroReachCause::Denied,
+                                 yuzu::server::ZeroReachCause::ContainmentUnreadable,
                                  yuzu::server::ZeroReachCause::RouteUnreadable,
                                  yuzu::server::ZeroReachCause::OsGateUnreadable,
                                  yuzu::server::ZeroReachCause::Quarantined,
