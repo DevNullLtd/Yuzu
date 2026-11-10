@@ -46,6 +46,23 @@ bool contains(const std::vector<std::string>& v, std::string_view s) {
     return std::find(v.begin(), v.end(), s) != v.end();
 }
 
+// Disable-list entries from bare keys. `sole_carrier` is the flag win_rules_to_disable
+// records when a key is listed; the tests that need the real flag build the list from a
+// before-snapshot instead.
+std::vector<WinListedRule> flagged_keys(std::initializer_list<std::string> keys,
+                                        bool sole_carrier) {
+    std::vector<WinListedRule> out;
+    for (const auto& k : keys)
+        out.push_back({k, sole_carrier});
+    return out;
+}
+std::vector<WinListedRule> sole_keys(std::initializer_list<std::string> keys) {
+    return flagged_keys(keys, true);
+}
+std::vector<WinListedRule> shared_keys(std::initializer_list<std::string> keys) {
+    return flagged_keys(keys, false);
+}
+
 std::string join(const Argv& a) {
     std::string s;
     for (const auto& t : a) {
@@ -902,11 +919,13 @@ TEST_CASE("windows: every enabled rule outside our group is disabled", "[agent][
     REQUIRE(off.size() == 3);
     // a key is name|direction|profiles|protocol|action|local ports|remote ports|program|service
     // (none read in this fixture: 0|0|0|-1 and four empty text fields)
-    CHECK(off[0] == "CoreNet-DHCP-Out|0|0|0|-1||||");
-    CHECK(off[1] == "Remote Desktop - User Mode (TCP-In)|0|0|0|-1||||");
-    CHECK(off[2] == "No group at all|0|0|0|-1||||");
-    for (const auto& n : off)
-        CHECK_FALSE(n.starts_with(kWinRulePrefix));
+    CHECK(off[0].key == "CoreNet-DHCP-Out|0|0|0|-1||||");
+    CHECK(off[1].key == "Remote Desktop - User Mode (TCP-In)|0|0|0|-1||||");
+    CHECK(off[2].key == "No group at all|0|0|0|-1||||");
+    for (const auto& n : off) {
+        CHECK_FALSE(n.key.starts_with(kWinRulePrefix));
+        CHECK(n.sole_carrier); // each of these names carries its identity alone
+    }
     // the one "is ours" test: our group, or our name prefix without the group
     CHECK(is_our_win_rule("anything", kWinGroup));
     CHECK(is_our_win_rule("YuzuFirewall_Quarantine_1_2", ""));
@@ -951,19 +970,39 @@ TEST_CASE("windows: prior policy image and the write-once decision", "[agent][fi
 }
 
 TEST_CASE("windows: disabled-rule list round trip and update plan", "[agent][firewall_quarantine]") {
-    const std::vector<std::string> names{"Plain", "With|pipe", "back\\slash", "multi\nline",
-                                         "unicode \xC3\xA9"};
-    const auto back = parse_disabled_rules(serialize_disabled_rules(names));
+    const std::vector<WinListedRule> names{{"Plain", true},
+                                           {"With|pipe", false},
+                                           {"back\\slash", true},
+                                           {"multi\nline", false},
+                                           {"unicode \xC3\xA9", true}};
+    const auto text = serialize_disabled_rules(names);
+    CHECK(text.starts_with("v=3\n1|Plain\n0|With|pipe\n"));
+    const auto back = parse_disabled_rules(text);
     REQUIRE(back);
-    CHECK(*back == names);
+    CHECK(*back == names); // keys AND flags survive
     CHECK_FALSE(parse_disabled_rules("no header"));
-    CHECK_FALSE(parse_disabled_rules("v=2\nbad\\x\n"));
-    CHECK(parse_disabled_rules("v=2\n")->empty());
-    // a v=1 list (name|direction|profiles keys) is never read with the longer key: it
-    // would re-enable a disabled twin. It is `disabled_list_unreadable`, not an empty list.
+    CHECK_FALSE(parse_disabled_rules("v=3\n1|bad\\x\n"));
+    CHECK(parse_disabled_rules("v=3\n")->empty());
+    CHECK(serialize_disabled_rules({}).starts_with("v=3\n"));
+    // a list of another version is never read: a v=1 list (name|direction|profiles keys) would
+    // re-enable a disabled twin, and a v=2 list (no flag) has no record of which keys were
+    // their identity's only carrier. Each is `disabled_list_unreadable`, not an empty list.
     CHECK_FALSE(parse_disabled_rules("v=1\n"));
     CHECK_FALSE(parse_disabled_rules("v=1\nPlain|1|2\n"));
-    CHECK(serialize_disabled_rules({}).starts_with("v=2\n"));
+    CHECK_FALSE(parse_disabled_rules("v=2\n"));
+    CHECK_FALSE(parse_disabled_rules("v=2\nPlain|1|2|6|1|80|*||\n"));
+    // a v=3 line without the flag never parses as eligible: the list is unreadable
+    CHECK_FALSE(parse_disabled_rules("v=3\nPlain|1|2|6|1|80|*||\n"));
+    CHECK_FALSE(parse_disabled_rules("v=3\n1|ok||||||\nPlain|1|2|6|1|80|*||\n"));
+    CHECK_FALSE(parse_disabled_rules("v=3\n2|Plain\n"));
+    CHECK_FALSE(parse_disabled_rules("v=3\n1Plain\n"));
+    CHECK_FALSE(parse_disabled_rules("v=3\n1\n"));
+    CHECK_FALSE(parse_disabled_rules("v=3\n|Plain\n"));
+    // the flag is read from the first two characters only: a '1|' inside the key stays key text
+    const auto inner = parse_disabled_rules("v=3\n0|1|x\n");
+    REQUIRE(inner);
+    REQUIRE(inner->size() == 1);
+    CHECK((*inner)[0] == WinListedRule{"1|x", false});
 
     const auto set = make_set({}, {ex("10.0.0.5:22/tcp/in")});
     const auto g1 = win_rule_specs(set, 1);
@@ -995,32 +1034,44 @@ TEST_CASE("windows: the disabled-rule list is written on the first apply and onl
         CHECK_FALSE(m.over_cap);
     }
     SECTION("the first apply stores what it disables") {
-        const auto m = win_merge_disabled_list({}, {"RDP", "SMB"}, false);
+        const auto m = win_merge_disabled_list({}, sole_keys({"RDP", "SMB"}), false);
         CHECK(m.grew);
-        CHECK(m.list == std::vector<std::string>{"RDP", "SMB"});
+        CHECK(m.list == sole_keys({"RDP", "SMB"}));
     }
     SECTION("a later apply with nothing new writes nothing") {
-        const auto m = win_merge_disabled_list({"RDP", "SMB"}, {"SMB"}, true);
+        const auto m = win_merge_disabled_list(sole_keys({"RDP", "SMB"}), sole_keys({"SMB"}), true);
         CHECK_FALSE(m.grew);
-        CHECK(m.list == std::vector<std::string>{"RDP", "SMB"});
+        CHECK(m.list == sole_keys({"RDP", "SMB"}));
         // an empty stored list that exists is not rewritten either
         CHECK_FALSE(win_merge_disabled_list({}, {}, true).grew);
     }
     SECTION("a later apply appends only the names it has not seen, in order") {
-        const auto m = win_merge_disabled_list({"RDP", "SMB"}, {"SMB", "WinRM", "RDP", "Print"}, true);
+        const auto m = win_merge_disabled_list(sole_keys({"RDP", "SMB"}),
+                                               sole_keys({"SMB", "WinRM", "RDP", "Print"}), true);
         CHECK(m.grew);
-        CHECK(m.list == std::vector<std::string>{"RDP", "SMB", "WinRM", "Print"});
+        CHECK(m.list == sole_keys({"RDP", "SMB", "WinRM", "Print"}));
     }
     SECTION("a name enabled again during the quarantine is never dropped from the list") {
-        const auto m = win_merge_disabled_list({"RDP", "SMB"}, {}, true);
-        CHECK(m.list == std::vector<std::string>{"RDP", "SMB"});
+        const auto m = win_merge_disabled_list(sole_keys({"RDP", "SMB"}), {}, true);
+        CHECK(m.list == sole_keys({"RDP", "SMB"}));
+    }
+    SECTION("a key already stored keeps the flag it was first listed with") {
+        // the flag is the state at the moment the key was first listed: a later generation that
+        // sees the identity shared (or alone) does not rewrite it, and a rewrite alone is no growth
+        auto m = win_merge_disabled_list(sole_keys({"RDP"}), shared_keys({"RDP", "SMB"}), true);
+        CHECK(m.grew);
+        CHECK(m.list == std::vector<WinListedRule>{{"RDP", true}, {"SMB", false}});
+        m = win_merge_disabled_list(shared_keys({"RDP"}), sole_keys({"RDP"}), true);
+        CHECK_FALSE(m.grew);
+        CHECK(m.list == shared_keys({"RDP"}));
     }
     SECTION("the cap refuses the apply") {
-        std::vector<std::string> at_cap;
+        std::vector<WinListedRule> at_cap;
         for (std::size_t i = 0; i < kMaxDisabledRules; ++i)
-            at_cap.push_back(std::format("rule-{}", i));
-        CHECK_FALSE(win_merge_disabled_list(at_cap, {"rule-3"}, true).over_cap); // nothing new
-        const auto over = win_merge_disabled_list(at_cap, {"one-more"}, true);
+            at_cap.push_back({std::format("rule-{}", i), true});
+        // nothing new
+        CHECK_FALSE(win_merge_disabled_list(at_cap, sole_keys({"rule-3"}), true).over_cap);
+        const auto over = win_merge_disabled_list(at_cap, sole_keys({"one-more"}), true);
         CHECK(over.over_cap);
         CHECK(over.grew);
     }
@@ -4420,11 +4471,15 @@ TEST_CASE("windows: a stock rule is told apart by name, direction and profile", 
     };
     const auto off = win_rules_to_disable(rules);
     REQUIRE(off.size() == 3);
-    CHECK(off[0] == "File and Printer Sharing (SMB-In)|1|2|0|-1||||");
-    CHECK(off[1] == "WinRM (HTTP-In)|1|4|0|-1||||");
-    CHECK(off[2] == "WinRM (HTTP-In)|1|2|0|-1||||");
+    CHECK(off[0].key == "File and Printer Sharing (SMB-In)|1|2|0|-1||||");
+    CHECK(off[1].key == "WinRM (HTTP-In)|1|4|0|-1||||");
+    CHECK(off[2].key == "WinRM (HTTP-In)|1|2|0|-1||||");
+    // the profile mask is part of the identity, so each of these is its identity's only carrier
+    for (const auto& n : off)
+        CHECK(n.sole_carrier);
     // the public twin was off: its key is not in the list, so the release leaves it off
-    CHECK(std::find(off.begin(), off.end(), win_rule_key(rules[1])) == off.end());
+    CHECK(std::none_of(off.begin(), off.end(),
+                       [&](const WinListedRule& n) { return n.key == win_rule_key(rules[1]); }));
     CHECK(win_rule_key(rules[1]) != win_rule_key(rules[0]));
     CHECK(win_rule_key(WinRuleInfo{.name = "x", .direction = 1, .profiles = 7}) !=
           win_rule_key(WinRuleInfo{.name = "x", .direction = 2, .profiles = 7})); // direction too
@@ -4467,11 +4522,14 @@ TEST_CASE("windows: a disabled twin differing only by protocol, ports, program, 
     // only the enabled rule is listed, and no twin's key is in the list the release matches on
     const auto off = win_rules_to_disable(rules);
     REQUIRE(off.size() == 1);
-    CHECK(off[0] == win_rule_key(on));
+    CHECK(off[0].key == win_rule_key(on));
+    // the six off twins share its name, direction and profiles: not its identity's only carrier
+    CHECK_FALSE(off[0].sole_carrier);
     for (const auto& t : twins) {
         INFO(win_rule_key(t));
         CHECK(win_rule_key(t) != win_rule_key(on));
-        CHECK(std::find(off.begin(), off.end(), win_rule_key(t)) == off.end());
+        CHECK(std::none_of(off.begin(), off.end(),
+                           [&](const WinListedRule& n) { return n.key == win_rule_key(t); }));
     }
     // all the twins differ from each other too
     std::set<std::string> keys;
@@ -4592,7 +4650,7 @@ TEST_CASE("windows release: an exact key match comes back on, and nothing else d
     const auto already_off = stock_rule("Rule C", false);
     const std::vector<WinRuleInfo> rules{a, b, twin, already_off};
 
-    const auto plan = win_release_plan({win_rule_key(a), win_rule_key(b)}, rules);
+    const auto plan = win_release_plan(sole_keys({win_rule_key(a), win_rule_key(b)}), rules);
     CHECK(plan.reenable == std::vector<std::size_t>{0, 1}); // the twin and Rule C stay off
     CHECK(plan.by_identity == 0);
     CHECK(plan.unmatched == 0);
@@ -4601,7 +4659,8 @@ TEST_CASE("windows release: an exact key match comes back on, and nothing else d
     // a listed key duplicated by hand counts once; the rules of ours are never candidates
     auto ours = stock_rule("YuzuFirewall_Quarantine_1", false);
     ours.group = std::string{kWinGroup};
-    const auto dup = win_release_plan({win_rule_key(a), win_rule_key(a), win_rule_key(ours)}, {a, ours});
+    const auto dup = win_release_plan(
+        sole_keys({win_rule_key(a), win_rule_key(a), win_rule_key(ours)}), {a, ours});
     CHECK(dup.reenable == std::vector<std::size_t>{0});
     CHECK(dup.unmatched == 1); // the listed key of ours matches no candidate and no identity
 }
@@ -4610,7 +4669,7 @@ TEST_CASE("windows release: a retried release finds the rules a first attempt al
           "[agent][firewall_quarantine]") {
     const auto a = stock_rule("Rule A", true); // back on since the first attempt
     const auto b = stock_rule("Rule B", false, "C:\\b.exe");
-    const auto plan = win_release_plan({win_rule_key(a), win_rule_key(b)}, {a, b});
+    const auto plan = win_release_plan(sole_keys({win_rule_key(a), win_rule_key(b)}), {a, b});
     CHECK(plan.reenable == std::vector<std::size_t>{1});
     CHECK(plan.unmatched == 0); // a listed rule that is on again is accounted for, not unmatched
 }
@@ -4624,14 +4683,14 @@ TEST_CASE("windows release: a retry after the identity fallback finds the edited
     edited.application = "C:\\new.exe";
 
     // first attempt: the fallback switches the edited rule back on, a guess it reports
-    auto plan = win_release_plan({listed}, {edited});
+    auto plan = win_release_plan(sole_keys({listed}), {edited});
     CHECK(plan.reenable == std::vector<std::size_t>{0});
     CHECK(plan.by_identity == 1);
 
     // the first attempt was left incomplete and the record kept the same list: the rule is on
     // now, so the retry has nothing to switch and nothing it cannot account for
     edited.enabled = true;
-    plan = win_release_plan({listed}, {edited});
+    plan = win_release_plan(sole_keys({listed}), {edited});
     CHECK(plan.reenable.empty());
     CHECK(plan.by_identity == 0);
     CHECK(plan.accounted_enabled == 1); // counted, so the reply still says the key was not found
@@ -4641,7 +4700,7 @@ TEST_CASE("windows release: a retry after the identity fallback finds the edited
     // two enabled rules carry the identity: cannot be told from a deletion, so it is reported
     auto other = edited;
     other.application = "C:\\third.exe";
-    plan = win_release_plan({listed}, {edited, other});
+    plan = win_release_plan(sole_keys({listed}), {edited, other});
     CHECK(plan.reenable.empty());
     CHECK(plan.unmatched == 1);
 
@@ -4649,7 +4708,7 @@ TEST_CASE("windows release: a retry after the identity fallback finds the edited
     // is gone, so the carrier accounts for one key and the other is reported (not both counted)
     auto gone = before;
     gone.application = "C:\\gone.exe";
-    plan = win_release_plan({listed, win_rule_key(gone)}, {edited});
+    plan = win_release_plan(sole_keys({listed, win_rule_key(gone)}), {edited});
     CHECK(plan.reenable.empty());
     CHECK(plan.by_identity == 0);
     CHECK(plan.accounted_enabled == 1);
@@ -4660,7 +4719,7 @@ TEST_CASE("windows release: a retry after the identity fallback finds the edited
     // identity: the edited rule cannot be told from a deletion beside it, so it is reported
     // (a retry reads the same as the first attempt, and nothing is switched on for it)
     const auto twin = stock_rule("Rule A", true, "C:\\twin.exe");
-    plan = win_release_plan({listed, win_rule_key(twin)}, {edited, twin});
+    plan = win_release_plan(sole_keys({listed, win_rule_key(twin)}), {edited, twin});
     CHECK(plan.reenable.empty());
     CHECK(plan.by_identity == 0);
     CHECK(plan.accounted_enabled == 0);
@@ -4671,7 +4730,7 @@ TEST_CASE("windows release: a retry after the identity fallback finds the edited
     auto off = edited;
     off.enabled = false;
     off.application = "C:\\fourth.exe";
-    plan = win_release_plan({listed}, {edited, off});
+    plan = win_release_plan(sole_keys({listed}), {edited, off});
     CHECK(plan.reenable.empty());
     CHECK(plan.by_identity == 0);
     CHECK(plan.unmatched == 1);
@@ -4686,7 +4745,7 @@ TEST_CASE("windows release: an edited rule falls back to its identity only when 
     edited.application = "C:\\new.exe";
 
     // program changed -> the fallback switches it back on, and says it guessed
-    auto plan = win_release_plan({listed}, {edited});
+    auto plan = win_release_plan(sole_keys({listed}), {edited});
     CHECK(plan.reenable == std::vector<std::size_t>{0});
     CHECK(plan.by_identity == 1);
     CHECK(plan.unmatched == 0);
@@ -4695,7 +4754,7 @@ TEST_CASE("windows release: an edited rule falls back to its identity only when 
     // been off before the quarantine, so neither is touched
     auto enabled_twin = edited;
     enabled_twin.enabled = true;
-    plan = win_release_plan({listed}, {enabled_twin, edited});
+    plan = win_release_plan(sole_keys({listed}), {enabled_twin, edited});
     CHECK(plan.reenable.empty());
     CHECK(plan.by_identity == 0);
     CHECK(plan.unmatched == 1);
@@ -4703,7 +4762,7 @@ TEST_CASE("windows release: an edited rule falls back to its identity only when 
     // two disabled candidates: no way to tell which was ours, so neither is touched
     auto other = edited;
     other.application = "C:\\third.exe";
-    plan = win_release_plan({listed}, {edited, other});
+    plan = win_release_plan(sole_keys({listed}), {edited, other});
     CHECK(plan.reenable.empty());
     CHECK(plan.by_identity == 0);
     CHECK(plan.unmatched == 1);
@@ -4711,7 +4770,7 @@ TEST_CASE("windows release: an edited rule falls back to its identity only when 
     CHECK(plan.unmatched_keys[0] == listed);
 
     // no rule with that identity at all (deleted, or renamed): unmatched, nothing switched on
-    plan = win_release_plan({listed}, {stock_rule("Unrelated", false)});
+    plan = win_release_plan(sole_keys({listed}), {stock_rule("Unrelated", false)});
     CHECK(plan.reenable.empty());
     CHECK(plan.unmatched == 1);
 
@@ -4719,7 +4778,7 @@ TEST_CASE("windows release: an edited rule falls back to its identity only when 
     // same-named rules were disabled, one was edited, the other is untouched. The twin comes
     // back by its key; the edited one cannot be told from a deletion and stays off, reported
     const auto second = stock_rule("Rule A", true, "C:\\second.exe");
-    plan = win_release_plan({listed, win_rule_key(second)},
+    plan = win_release_plan(sole_keys({listed, win_rule_key(second)}),
                             {edited, [&] { auto r = second; r.enabled = false; return r; }()});
     CHECK(plan.reenable == std::vector<std::size_t>{1});
     CHECK(plan.by_identity == 0);
@@ -4728,7 +4787,7 @@ TEST_CASE("windows release: an edited rule falls back to its identity only when 
     // two keys, one candidate: the rule is switched on once and the other key is unmatched
     auto sibling = before;
     sibling.application = "C:\\sibling.exe";
-    plan = win_release_plan({listed, win_rule_key(sibling)}, {edited});
+    plan = win_release_plan(sole_keys({listed, win_rule_key(sibling)}), {edited});
     CHECK(plan.reenable == std::vector<std::size_t>{0});
     CHECK(plan.by_identity == 1);
     CHECK(plan.unmatched == 1);
@@ -4744,7 +4803,7 @@ TEST_CASE("windows release: the twin protection still holds beside the fallback"
     off_before.local_ports = "3390";
     auto enabled_before = on;
     enabled_before.enabled = true;
-    const auto plan = win_release_plan({win_rule_key(enabled_before)}, {on, off_before});
+    const auto plan = win_release_plan(sole_keys({win_rule_key(enabled_before)}), {on, off_before});
     CHECK(plan.reenable == std::vector<std::size_t>{0});
     CHECK(plan.by_identity == 0);
     CHECK(plan.unmatched == 0);
@@ -4754,27 +4813,241 @@ TEST_CASE("windows release: the fallback never switches on a rule that was off b
           "[agent][firewall_quarantine]") {
     // A listed rule A (port 3389) was on and was disabled. Another rule B of the same name,
     // direction and profile (port 81) was already OFF before the quarantine and is not listed.
+    // The list is built from the before-snapshot, as the apply builds it, so A's key is
+    // flagged as sharing its identity with B.
     const auto a = stock_rule("Admin rule", true);
     auto b = a;
     b.local_ports = "81";
     b.enabled = false;
+    const auto list = win_rules_to_disable({a, b});
+    REQUIRE(list.size() == 1);
+    CHECK_FALSE(list[0].sole_carrier);
     auto edited = a; // someone edits A's port during the quarantine
     edited.local_ports = "8080";
 
     SECTION("A is edited and switched back on by hand: B is not guessed to be A") {
         edited.enabled = true;
-        const auto plan = win_release_plan({win_rule_key(a)}, {edited, b});
+        const auto plan = win_release_plan(list, {edited, b});
         CHECK(plan.reenable.empty()); // B stays off: it was off before
         CHECK(plan.by_identity == 0);
         CHECK(plan.accounted_enabled == 0);
         CHECK(plan.unmatched == 1);
     }
     SECTION("A is edited, then a later apply disables it again and lists its new key") {
+        // generation 2 reads the ruleset as it is then: the edited rule is on, B is off
+        auto on_again = edited;
+        on_again.enabled = true;
+        const auto merged =
+            win_merge_disabled_list(list, win_rules_to_disable({on_again, b}), true);
+        REQUIRE(merged.list.size() == 2);
+        CHECK_FALSE(merged.list[1].sole_carrier); // B still shares the identity
         edited.enabled = false;
-        const auto plan = win_release_plan({win_rule_key(a), win_rule_key(edited)}, {edited, b});
+        const auto plan = win_release_plan(merged.list, {edited, b});
         CHECK(plan.reenable == std::vector<std::size_t>{0}); // the edited rule, by its exact key
         CHECK(plan.by_identity == 0);                        // and B is not switched on beside it
         CHECK(plan.unmatched == 1);
+    }
+}
+
+TEST_CASE("windows release: a rule edited out of an identity it shared at disable never switches on its sibling",
+          "[agent][firewall_quarantine]") {
+    // The case that fell through the release-time-only fallback: A (on, listed) and B (off before
+    // the quarantine, different port and action) share name, direction and profiles. During the
+    // quarantine A's rename, direction or profile edit moves it out of that identity, leaving B
+    // the only carrier of A's old one. B must not be taken for A.
+    const auto a = stock_rule("Admin rule", true);
+    auto b = a;
+    b.local_ports = "81";
+    b.action = 0;
+    b.enabled = false;
+    const auto list = win_rules_to_disable({a, b});
+    REQUIRE(list.size() == 1);
+    CHECK_FALSE(list[0].sole_carrier);
+    // through the stored form, as the release reads it
+    const auto stored = parse_disabled_rules(serialize_disabled_rules(list));
+    REQUIRE(stored);
+    CHECK(*stored == list);
+
+    const auto check_unmatched = [&](const WinRuleInfo& moved) {
+        auto off = moved;
+        off.enabled = false; // the quarantine's disable still holds
+        const auto plan = win_release_plan(*stored, {off, b});
+        CHECK(plan.reenable.empty()); // B stays off
+        CHECK(plan.by_identity == 0);
+        CHECK(plan.accounted_enabled == 0);
+        CHECK(plan.unmatched == 1);
+        REQUIRE(plan.unmatched_keys.size() == 1);
+        CHECK(plan.unmatched_keys[0] == win_rule_key(a));
+        // the same read with the moved rule switched on by hand: still nothing for B
+        auto on = moved;
+        on.enabled = true;
+        const auto again = win_release_plan(*stored, {on, b});
+        CHECK(again.reenable.empty());
+        CHECK(again.by_identity == 0);
+        CHECK(again.unmatched == 1);
+    };
+    SECTION("renamed") {
+        auto moved = a;
+        moved.name = "Admin rule (renamed)";
+        check_unmatched(moved);
+    }
+    SECTION("profile mask edited") {
+        auto moved = a;
+        moved.profiles = 2;
+        check_unmatched(moved);
+    }
+    SECTION("direction edited") {
+        auto moved = a;
+        moved.direction = 2;
+        check_unmatched(moved);
+    }
+    SECTION("port edited beside B: two carriers now, and not flagged to begin with") {
+        auto moved = a;
+        moved.local_ports = "8080";
+        moved.enabled = false;
+        const auto plan = win_release_plan(*stored, {moved, b});
+        CHECK(plan.reenable.empty());
+        CHECK(plan.by_identity == 0);
+        CHECK(plan.unmatched == 1);
+    }
+}
+
+TEST_CASE("windows release: a key flagged sole-carrier at disable is still found by identity after an edit",
+          "[agent][firewall_quarantine]") {
+    const auto a = stock_rule("Admin rule", true);
+    const auto unrelated = stock_rule("Unrelated", false);
+    const auto list = win_rules_to_disable({a, unrelated});
+    REQUIRE(list.size() == 1);
+    CHECK(list[0].sole_carrier);
+    const auto stored = parse_disabled_rules(serialize_disabled_rules(list));
+    REQUIRE(stored);
+
+    // a sole carrier edited (port): still re-enabled, and the guess is reported
+    auto edited = a;
+    edited.enabled = false;
+    edited.local_ports = "8080";
+    auto plan = win_release_plan(*stored, {edited, unrelated});
+    CHECK(plan.reenable == std::vector<std::size_t>{0});
+    CHECK(plan.by_identity == 1);
+    CHECK(plan.unmatched == 0);
+
+    // renamed out of its identity: nothing carries it now, so it is unmatched, never guessed
+    auto renamed = edited;
+    renamed.name = "Admin rule (renamed)";
+    plan = win_release_plan(*stored, {renamed, unrelated});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.unmatched == 1);
+
+    // a rule of that identity that appeared during the quarantine beside the original
+    // (two carriers at release) is not guessed either
+    auto created = edited;
+    created.application = "C:\\created.exe";
+    plan = win_release_plan(*stored, {edited, created});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.unmatched == 1);
+}
+
+TEST_CASE("windows release: the residual the flag cannot close is exactly the one the docs name",
+          "[agent][firewall_quarantine]") {
+    // A was its identity's only carrier when listed and was DELETED during the quarantine; a
+    // rule C of the same name, direction and profiles appeared meanwhile (created, or renamed
+    // or re-profiled into that identity) and is off. C reads as an edit of A and is switched on.
+    const auto a = stock_rule("Admin rule", true);
+    const auto list = win_rules_to_disable({a});
+    REQUIRE(list.size() == 1);
+    CHECK(list[0].sole_carrier);
+    auto c = a;
+    c.enabled = false;
+    c.local_ports = "9999";
+    c.application = "C:\\c.exe";
+    auto plan = win_release_plan(list, {c});
+    CHECK(plan.reenable == std::vector<std::size_t>{0});
+    CHECK(plan.by_identity == 1); // reported, so the reply says it was a guess
+    // and accounted for when C is on
+    c.enabled = true;
+    plan = win_release_plan(list, {c});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.accounted_enabled == 1);
+    CHECK(plan.unmatched == 0);
+}
+
+TEST_CASE("windows release: a key that was not flagged sole-carrier never falls back to its identity",
+          "[agent][firewall_quarantine]") {
+    // the flag is the only door to the fallback: an unflagged key whose identity has exactly one
+    // switched-off carrier at release is unmatched, and nothing is switched on
+    const auto before = stock_rule("Rule A", true, "C:\\old.exe");
+    auto carrier = before;
+    carrier.enabled = false;
+    carrier.application = "C:\\new.exe";
+    auto plan = win_release_plan(shared_keys({win_rule_key(before)}), {carrier});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.accounted_enabled == 0);
+    CHECK(plan.unmatched == 1);
+    CHECK(plan.unmatched_keys == std::vector<std::string>{win_rule_key(before)});
+    // already on: not accounted for either (the fallback never ran)
+    carrier.enabled = true;
+    plan = win_release_plan(shared_keys({win_rule_key(before)}), {carrier});
+    CHECK(plan.accounted_enabled == 0);
+    CHECK(plan.unmatched == 1);
+    // the exact match does not need the flag
+    auto exact = before;
+    exact.enabled = false;
+    plan = win_release_plan(shared_keys({win_rule_key(before)}), {exact});
+    CHECK(plan.reenable == std::vector<std::size_t>{0});
+    CHECK(plan.unmatched == 0);
+}
+
+TEST_CASE("windows: the sole-carrier flag counts every non-ours rule of the identity, on or off",
+          "[agent][firewall_quarantine]") {
+    const auto a = stock_rule("Rule A", true);
+    SECTION("alone") {
+        const auto off = win_rules_to_disable({a});
+        REQUIRE(off.size() == 1);
+        CHECK(off[0].sole_carrier);
+    }
+    SECTION("a disabled sibling is a second carrier") {
+        auto b = a;
+        b.enabled = false;
+        b.local_ports = "81";
+        const auto off = win_rules_to_disable({a, b});
+        REQUIRE(off.size() == 1); // only the enabled rule is listed
+        CHECK_FALSE(off[0].sole_carrier);
+    }
+    SECTION("two enabled siblings are both listed, neither alone") {
+        auto b = a;
+        b.local_ports = "81";
+        const auto off = win_rules_to_disable({a, b});
+        REQUIRE(off.size() == 2);
+        CHECK_FALSE(off[0].sole_carrier);
+        CHECK_FALSE(off[1].sole_carrier);
+    }
+    SECTION("exact twins share a key and neither is alone") {
+        const auto off = win_rules_to_disable({a, a});
+        REQUIRE(off.size() == 2);
+        CHECK(off[0] == off[1]);
+        CHECK_FALSE(off[0].sole_carrier);
+    }
+    SECTION("a rule of another identity is not a carrier") {
+        auto other_profile = a;
+        other_profile.profiles = 2;
+        auto other_direction = a;
+        other_direction.direction = 2;
+        auto other_name = a;
+        other_name.name = "Rule B";
+        const auto off = win_rules_to_disable({a, other_profile, other_direction, other_name});
+        REQUIRE(off.size() == 4);
+        for (const auto& n : off)
+            CHECK(n.sole_carrier);
+    }
+    SECTION("a rule of ours is not a carrier") {
+        auto ours = a;
+        ours.enabled = false;
+        ours.group = std::string{kWinGroup};
+        const auto off = win_rules_to_disable({a, ours});
+        REQUIRE(off.size() == 1);
+        CHECK(off[0].sole_carrier);
     }
 }
 

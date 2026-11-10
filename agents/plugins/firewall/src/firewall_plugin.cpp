@@ -2059,14 +2059,17 @@ public:
         //    property fq::win_rule_key names, so a disabled twin that differs only by
         //    protocol, ports, program, service or action is never switched on by the
         //    release; a twin differing only in addresses, interfaces or edge traversal
-        //    shares the key (README caveat 3).
+        //    shares the key (README caveat 3). Each key also records, from this same
+        //    snapshot, whether its name, direction and profile had exactly one carrier
+        //    (on or off) right now: only such a key may be found again by identity at
+        //    release (fq::win_rules_to_disable).
         const auto to_disable = fq::win_rules_to_disable(infos);
         const std::string list_key{fq::kWinDisabledRulesKey};
         const auto list_presence = kv_presence(raw_, list_key);
         if (list_presence == fq::KvPresence::unknown)
             return fq::StepResult::fail("storage_unreadable");
         const bool list_exists = list_presence == fq::KvPresence::present;
-        std::vector<std::string> stored;
+        std::vector<fq::WinListedRule> stored;
         if (list_exists) {
             const auto parsed = fq::parse_disabled_rules(pc.storage_get(list_key));
             if (!parsed)
@@ -2199,12 +2202,16 @@ public:
         //    program, service or action, stays off (a twin differing only in addresses,
         //    interfaces or edge traversal shares the key and comes back with it, README
         //    caveat 3). A listed rule someone EDITED during the quarantine carries a
-        //    different key; it falls back to name, direction and profile only when exactly
-        //    one rule in total carries them: switched off it is switched on, already on it
-        //    is counted (`rules_accounted_enabled`), and with none or more than one it is
-        //    reported `rules_unmatched` and nothing is switched on for it (the release still
-        //    completes). Every rule is read once and the switched-off ones are held, so the
-        //    decision and the re-enable see the same ruleset.
+        //    different key; it falls back to name, direction and profile only when the key
+        //    was flagged at disable time as the only carrier of them AND exactly one rule in
+        //    total carries them now: switched off it is switched on, already on it is
+        //    counted (`rules_accounted_enabled`). In every other case it is reported
+        //    `rules_unmatched` and nothing is switched on for it (the release still
+        //    completes): not flagged at disable (a sibling shared its name, direction and
+        //    profile, so a rename or re-profile of the rule would leave that sibling looking
+        //    like it), no carrier or more than one now, or the only carrier already claimed
+        //    by another listed rule. Every rule is read once and the switched-off ones are
+        //    held, so the decision and the re-enable see the same ruleset.
         const std::string list_key{fq::kWinDisabledRulesKey};
         const auto list_presence = kv_presence(raw_, list_key);
         const bool list_exists = list_presence == fq::KvPresence::present;

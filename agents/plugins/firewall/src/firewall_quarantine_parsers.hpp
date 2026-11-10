@@ -1533,31 +1533,55 @@ struct WinRuleInfo {
     return std::string{key.substr(0, end)};
 }
 
-/// The keys of every ENABLED rule outside our group (an Allow RULE beats a
+/// One entry of the disable list: the rule's key, and whether its identity
+/// (win_rule_identity) was carried by exactly ONE non-ours rule, enabled or not, at the
+/// moment the key was listed. Only such a key may be found again by identity at release
+/// (win_release_plan): where the identity was shared when the rule was disabled, an edit of
+/// it cannot be told from its sibling's, whatever the release finds later.
+struct WinListedRule {
+    std::string key;
+    bool sole_carrier = false;
+    friend bool operator==(const WinListedRule&, const WinListedRule&) = default;
+};
+
+/// The entries of every ENABLED rule outside our group (an Allow RULE beats a
 /// profile-default block, so leaving them enabled would leave the host reachable).
-/// Ours are never listed, whatever their group string says.
-[[nodiscard]] inline std::vector<std::string>
+/// Ours are never listed, whatever their group string says. The flag counts the
+/// identity's carriers over ALL non-ours rules in `rules`, enabled or not, because the
+/// release's own test is "exactly one rule in total": a disabled sibling is a second carrier.
+[[nodiscard]] inline std::vector<WinListedRule>
 win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
-    std::vector<std::string> out;
+    std::unordered_map<std::string, std::size_t> carriers;
+    for (const auto& r : rules)
+        if (!is_our_win_rule(r.name, r.group))
+            ++carriers[win_rule_identity(r)];
+    std::vector<WinListedRule> out;
     for (const auto& r : rules) {
         if (!r.enabled || is_our_win_rule(r.name, r.group))
             continue;
-        out.push_back(win_rule_key(r));
+        out.push_back({win_rule_key(r), carriers[win_rule_identity(r)] == 1});
     }
     return out;
 }
 
-/// Which rules a release switches back on. `listed` is the stored disable list (win_rule_key
-/// strings); `rules` is every rule the release enumerated, enabled or not. A rule of ours
+/// Which rules a release switches back on. `listed` is the stored disable list (a
+/// win_rule_key per entry, with the sole-carrier flag win_rules_to_disable recorded when it
+/// was listed); `rules` is every rule the release enumerated, enabled or not. A rule of ours
 /// is never a candidate.
 ///
 /// 1. EXACT: every disabled rule whose key is listed comes back on. A listed key that
 ///    matches a rule at all, enabled or not, is accounted for: a retry of an incomplete
 ///    release finds the rules the first attempt already switched on.
 /// 2. IDENTITY FALLBACK, for a listed key no rule carries any more (someone edited its
-///    program, ports, service or action during the quarantine, which changes the key). The
-///    key's name|direction|profiles must be carried by exactly ONE rule in total, claimed or
-///    not, on or off. Any second carrier is a rule the edit cannot be told apart from: a
+///    program, ports, service or action during the quarantine, which changes the key), and
+///    ONLY when the entry is flagged `sole_carrier`: its name|direction|profiles was carried
+///    by exactly one rule when it was disabled, so an edit that keeps those three is the one
+///    change that can have moved it. An unflagged key never reaches this step (step 3): its
+///    identity was shared when listed, so a rule that carries it at release cannot be told
+///    from a sibling that was off before the quarantine, and that includes the sibling left
+///    as the sole carrier after the rule was RENAMED or re-profiled out of the identity.
+///    The identity must be carried by exactly ONE rule in total at release as well, claimed
+///    or not, on or off. Any second carrier is a rule the edit cannot be told apart from: a
 ///    sibling that was off before the quarantine, or an untouched twin an exact key already
 ///    claimed, and switching either on would leave the host MORE open than it was before.
 ///    The sole carrier is claimed either way, so a second listed key for it is unmatched
@@ -1570,13 +1594,20 @@ win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
 ///      its key.
 ///    - already claimed, on or off (an exact key or another listed key took it first):
 ///      unmatched.
-/// 3. Otherwise the key is unmatched: no carrier, or more than one. Nothing is switched on
-///    for it (fail safe: a rule left off is never more open than before); the release still
-///    completes (nothing of ours is left behind), and is reported, never silent.
+/// 3. Otherwise the key is unmatched: it was not flagged sole-carrier when listed, no rule
+///    carries its identity now, more than one does, or the only one is already claimed by
+///    another listed key. Nothing is switched on for it (fail safe: a rule left off is never
+///    more open than before); the release still completes (nothing of ours is left behind),
+///    and is reported, never silent.
 ///
-/// Residual, cannot be told apart: a listed rule DELETED during the quarantine beside exactly
-/// one rule of the same identity reads as an edit of it, so that rule is switched on if it
-/// is off, or accounted for if it is on.
+/// Residual, cannot be told apart: a listed rule that was the only carrier of its name,
+/// direction and profile when it was disabled, then DELETED during the quarantine, beside
+/// exactly one rule of that identity that appeared during the quarantine (created, or renamed
+/// or re-profiled into it) and is off, reads as an edit of it and is switched on (accounted
+/// for if it is on). Exact twins (identical in every key property), both enabled when the
+/// quarantine switched them off, share one key and the list holds it once: if one is then
+/// edited, the untouched twin matches the key and comes back, the edited one stays off and
+/// nothing is reported (fail safe: a rule left off is never more open than before).
 struct WinReleasePlan {
     std::vector<std::size_t> reenable;        // indices into `rules`, each a disabled rule
     int by_identity = 0;                      // how many of those the fallback chose
@@ -1585,7 +1616,7 @@ struct WinReleasePlan {
     std::vector<std::string> unmatched_keys;  // those keys, for the agent's log
 };
 
-[[nodiscard]] inline WinReleasePlan win_release_plan(const std::vector<std::string>& listed,
+[[nodiscard]] inline WinReleasePlan win_release_plan(const std::vector<WinListedRule>& listed,
                                                      const std::vector<WinRuleInfo>& rules) {
     WinReleasePlan plan;
     std::unordered_map<std::string, std::vector<std::size_t>> by_key;
@@ -1598,13 +1629,13 @@ struct WinReleasePlan {
     }
     std::vector<bool> claimed(rules.size(), false);
     std::unordered_set<std::string> seen;
-    std::vector<const std::string*> orphans;
-    for (const auto& key : listed) {
-        if (!seen.insert(key).second)
+    std::vector<const WinListedRule*> orphans;
+    for (const auto& entry : listed) {
+        if (!seen.insert(entry.key).second)
             continue;
-        const auto it = by_key.find(key);
+        const auto it = by_key.find(entry.key);
         if (it == by_key.end()) {
-            orphans.push_back(&key);
+            orphans.push_back(&entry);
             continue;
         }
         for (const auto i : it->second) {
@@ -1613,9 +1644,11 @@ struct WinReleasePlan {
             claimed[i] = true;
         }
     }
-    for (const auto* key : orphans) {
-        // The identity must be carried by exactly one rule in total (see the contract above).
-        const auto it = same_identity.find(win_key_identity(*key));
+    for (const auto* entry : orphans) {
+        // Only a key that was its identity's sole carrier when listed may fall back, and
+        // the identity must still be carried by exactly one rule in total (see the contract).
+        const auto it = entry->sole_carrier ? same_identity.find(win_key_identity(entry->key))
+                                            : same_identity.end();
         if (it != same_identity.end() && it->second.size() == 1) {
             const auto i = it->second.front();
             if (!claimed[i]) {
@@ -1630,7 +1663,7 @@ struct WinReleasePlan {
             }
         }
         ++plan.unmatched;
-        plan.unmatched_keys.push_back(*key);
+        plan.unmatched_keys.push_back(entry->key);
     }
     return plan;
 }
@@ -1785,15 +1818,20 @@ enum class PriorStore : std::uint8_t { store, keep_existing, refuse_unrestorable
     return PriorStore::store;
 }
 
-/// `v=2`: the key grew from name|direction|profiles to every property of the rule
-/// (win_rule_key). A list of another version is `disabled_list_unreadable`, never
-/// matched on a shorter key (a shorter key would re-enable a disabled twin).
-inline constexpr std::string_view kDisabledListHeader = "v=2";
+/// `v=3`: each line is `<flag>|<escaped key>`, the flag `1` when the key's identity had
+/// exactly one carrier when it was listed and `0` when it did not (WinListedRule). `v=2`
+/// grew the key from name|direction|profiles to every property of the rule (win_rule_key).
+/// A list of another version is `disabled_list_unreadable`, never matched on a shorter key
+/// (a shorter key would re-enable a disabled twin) and never read with a flag it never
+/// recorded. A line whose first two characters are not `0|` or `1|` makes the whole list
+/// unreadable, so a line without the flag never parses as eligible for the identity fallback.
+inline constexpr std::string_view kDisabledListHeader = "v=3";
 
-[[nodiscard]] inline std::string serialize_disabled_rules(const std::vector<std::string>& names) {
+[[nodiscard]] inline std::string serialize_disabled_rules(const std::vector<WinListedRule>& rules) {
     std::string out = std::format("{}\n", kDisabledListHeader);
-    for (const auto& n : names) {
-        for (char c : n) {
+    for (const auto& r : rules) {
+        out += r.sole_carrier ? "1|" : "0|";
+        for (char c : r.key) {
             if (c == '\\')
                 out += "\\\\";
             else if (c == '\n')
@@ -1808,9 +1846,9 @@ inline constexpr std::string_view kDisabledListHeader = "v=2";
     return out;
 }
 
-[[nodiscard]] inline std::optional<std::vector<std::string>>
+[[nodiscard]] inline std::optional<std::vector<WinListedRule>>
 parse_disabled_rules(std::string_view text) {
-    std::vector<std::string> out;
+    std::vector<WinListedRule> out;
     bool first = true;
     for (const auto line : detail::split(text, '\n')) {
         if (first) {
@@ -1821,24 +1859,27 @@ parse_disabled_rules(std::string_view text) {
         }
         if (line.empty())
             continue;
-        std::string name;
-        for (std::size_t i = 0; i < line.size(); ++i) {
+        if (line.size() < 2 || line[1] != '|' || (line[0] != '0' && line[0] != '1'))
+            return std::nullopt;
+        WinListedRule entry;
+        entry.sole_carrier = line[0] == '1';
+        for (std::size_t i = 2; i < line.size(); ++i) {
             if (line[i] != '\\') {
-                name += line[i];
+                entry.key += line[i];
                 continue;
             }
             if (++i >= line.size())
                 return std::nullopt;
             if (line[i] == '\\')
-                name += '\\';
+                entry.key += '\\';
             else if (line[i] == 'n')
-                name += '\n';
+                entry.key += '\n';
             else if (line[i] == 'r')
-                name += '\r';
+                entry.key += '\r';
             else
                 return std::nullopt;
         }
-        out.push_back(std::move(name));
+        out.push_back(std::move(entry));
         if (out.size() > kMaxDisabledRules)
             return std::nullopt;
     }
@@ -1848,26 +1889,28 @@ parse_disabled_rules(std::string_view text) {
 }
 
 struct WinDisabledMerge {
-    std::vector<std::string> list; // the list to keep
-    bool grew = false;             // it differs from what is stored: write it
-    bool over_cap = false;         // more than kMaxDisabledRules: refuse the apply
+    std::vector<WinListedRule> list; // the list to keep
+    bool grew = false;               // it differs from what is stored: write it
+    bool over_cap = false;           // more than kMaxDisabledRules: refuse the apply
 };
 
 /// The disabled-rule list across generations. `stored` is the persisted list
 /// (empty when none exists), `list_exists` whether one is stored at all. The
 /// FIRST apply always writes the list, even an empty one (its presence is what
-/// the release keys on); later applies only ever ADD names (a rule created or
+/// the release keys on); later applies only ever ADD keys (a rule created or
 /// re-enabled during the quarantine is disabled too), never drop one -- the
-/// release must re-enable everything any generation disabled.
-[[nodiscard]] inline WinDisabledMerge win_merge_disabled_list(std::vector<std::string> stored,
-                                                              const std::vector<std::string>& to_disable,
-                                                              bool list_exists) {
+/// release must re-enable everything any generation disabled. A key already stored
+/// keeps its stored flag: the flag is the state at the moment the key was first listed.
+[[nodiscard]] inline WinDisabledMerge
+win_merge_disabled_list(std::vector<WinListedRule> stored,
+                        const std::vector<WinListedRule>& to_disable, bool list_exists) {
     WinDisabledMerge m;
     m.list = std::move(stored);
     m.grew = !list_exists;
-    for (const auto& name : to_disable)
-        if (std::find(m.list.begin(), m.list.end(), name) == m.list.end()) {
-            m.list.push_back(name);
+    for (const auto& entry : to_disable)
+        if (std::none_of(m.list.begin(), m.list.end(),
+                         [&](const WinListedRule& have) { return have.key == entry.key; })) {
+            m.list.push_back(entry);
             m.grew = true;
         }
     m.over_cap = m.list.size() > kMaxDisabledRules;
