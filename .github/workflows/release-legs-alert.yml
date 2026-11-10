@@ -47,8 +47,10 @@ jobs:
     # Job-level, not workflow-level: a workflow-level group is entered BEFORE
     # the job `if:`, so every dev push completion (skipped here) would queue in
     # it, and GitHub's one-pending-per-group rule could evict a pending dispatch
-    # completion. At job level only acting runs serialise (so two
-    # near-simultaneous failures cannot open two issues).
+    # completion. At job level only acting jobs serialise, with the daily
+    # reconcile and alert jobs (same group), so two writers never both open an
+    # issue. A pending member can still be replaced by a newer one when three
+    # arrive at once; the next reconcile re-judges the run (accepted residual).
     concurrency:
       group: release-legs-alert
       cancel-in-progress: false

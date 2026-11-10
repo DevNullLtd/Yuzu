@@ -23,6 +23,7 @@ cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
   "run view")   cat "$RUN_FIXTURE" ;;
+  "run list")   printf '%s\n' "${LATEST_RUN-5}" ;;
   "issue list") [ -n "${LIST_FAILS:-}" ] && { echo "HTTP 502" >&2; exit 1; }; printf '%s' "${OPEN:-[]}" ;;
   "issue comment"|"issue close"|"issue create"|"label create") echo "$1 $2 $3" >> "$ACTIONS" ;;
   *) echo "unexpected gh call: $*" >&2; exit 99 ;;
@@ -63,6 +64,8 @@ fixture success "$ALL_GREEN"; run reconcile "$(iss 7@$EARLY)"
 check "reconcile closes too" "issue comment 7;issue close 7;" "$acts"
 fixture success "$ALL_GREEN"; run reconcile "$(iss 7@$EARLY 8@$LATE)"
 check "a green run never closes an issue opened after it finished" "issue comment 7;issue close 7;" "$acts"
+fixture success "$ALL_GREEN"; LATEST_RUN=6 run event "$(iss 7@$EARLY)"
+check "a green re-run of an OLDER run never closes (a newer run exists)" "" "$acts"
 fixture success "$NO_MAC"; run event "$(iss 7@$EARLY)"
 check "an OS leg skipped/missing never closes" "" "$acts"
 ONE_RED='[{"name":"Linux gcc-15 release [dispatch]","conclusion":"success"},{"name":"Linux clang-21 release [dispatch]","conclusion":"failure"},{"name":"Windows MSVC release [dispatch]","conclusion":"success"},{"name":"macOS release [dispatch]","conclusion":"success"}]'

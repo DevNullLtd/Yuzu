@@ -12,7 +12,8 @@
 #
 # Decision, from the run's conclusion and its job list:
 #   success + every OS (Linux, Windows MSVC, macOS) has >=1 `... [dispatch]`
-#     build leg and every such leg succeeded        -> close every open issue
+#     build leg and every such leg succeeded + this is the newest completed
+#     dispatch run on dev                            -> close every open issue
 #     opened before this run finished (a later report is not answered by it)
 #   success otherwise (a leg skipped/missing)       -> leave issues as they are
 #   cancelled / skipped                             -> nothing (an operator
@@ -62,6 +63,15 @@ case "$conclusion" in
     body=$(printf '%s\n\n%s\n' \
       "Release-legs dispatch on \`dev\` @ \`$head_sha\` is **green** (every OS leg passed): $url" \
       "(auto-closed by scripts/ci/release-legs-issue.sh; a later failing dispatch opens a new issue.)")
+    # Only the NEWEST completed (non-cancelled) dispatch run on dev may close:
+    # re-running an older run's failed jobs to green must not close an issue
+    # while a newer run is still red.
+    latest=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch --branch dev \
+               --status completed --limit 20 --json databaseId,conclusion \
+               --jq '[.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0].databaseId // empty')
+    if [[ "$latest" != "$run_id" ]]; then
+      echo "run $run_id is green but not the newest completed dispatch run (${latest:-none}) — leaving issues as they are"; exit 0
+    fi
     # Close only issues opened BEFORE this run finished: a green run says
     # nothing about a failure reported after it (e.g. a dispatcher failure the
     # next day, judged by reconcile against this older green run).

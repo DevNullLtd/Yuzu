@@ -50,6 +50,8 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   LTO); the debug legs normally already ran on that commit's push. It skips
   when dev's tip already has a dispatch run that succeeded or is in flight; a
   failed or cancelled run does not count, so a red tip is retried the next day.
+  While a bot-opened `release-legs-broken` issue is open, only an in-flight run
+  counts, so the tip is re-checked daily until a green run closes the issue.
   No release leg is a required check, so moving them off the per-push path
   costs no gating; it saves 9–23 min of self-hosted runner time per leg per dev
   push. These legs are the only place the test suite runs in release/NDEBUG
@@ -74,60 +76,73 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
     What the script does:
     - **Opens or comments** on any failing conclusion, including a run that
       never started (`startup_failure`), and words it by cause: a code
-      failure, infrastructure (only the preflight jobs failed), or a run that
-      started no job. A failed preflight gate is reported as infrastructure even
-      though proto-compat then fails closed too.
-    - **Closes** only when every OS (Linux, Windows MSVC, macOS) had at least
-      one `[dispatch]` build leg and all of them passed, and only issues opened
-      before that run finished. A green run answers nothing reported after it,
-      such as a later dispatcher failure.
+      failure, infrastructure (the preflight gate, or only preflight jobs,
+      failed; proto-compat then fails closed too), or a run that started no
+      job.
+    - **Closes** only when the run is the newest completed dispatch run on
+      dev, and every OS (Linux, Windows MSVC, macOS) had at least one
+      `[dispatch]` build leg and all of them passed. Even then it closes only
+      issues opened before that run finished. A green re-run of an older run
+      never closes an issue while a newer run is red, and a green run answers
+      nothing reported after it, such as a later reconcile or dispatch
+      failure.
     - **Does nothing** on a cancelled or skipped run.
     - **Fails red** if listing the open issues fails, rather than reading that
       as "none open" and opening a duplicate.
     - **Matches** only open issues authored by `github-actions[bot]`, so a
       hand-added label is never commented on or closed.
 
-    A failure of the daily workflow itself (its `reconcile` or `dispatch` job)
-    opens the same issue from its `alert` job, worded by which job failed. There is no merge discipline attached, unlike
+    A failure of the daily workflow itself (its `reconcile` or `dispatch`
+    job) opens the same issue from its `alert` job, worded by which job
+    failed. All three writers (listener, reconcile, alert) share one
+    concurrency group. There is no merge discipline attached, unlike
     `nightly-broken`, but the release skill checks the label before tagging.
   - **When `release-legs-broken` opens (triage).**
     1. Read the issue's cause line. A "dispatcher failed" or "daily
        reconcile failed" issue means `release-legs-daily.yml` itself failed:
        read that run's log and fix it. Re-dispatch (step 4) if the dispatch
-       did not happen. If only the preflight jobs failed, it is
-       infrastructure: a runner pool, a runner-health check or a source gate.
-       Fix that, then re-run the failed jobs. If the run started no job, dev's
+       did not happen. If the preflight gate (or only preflight jobs) failed,
+       it is infrastructure: a runner pool, a runner-health check or a source
+       gate. Fix that, then re-run ALL jobs or re-dispatch. Re-running only
+       the failed jobs reuses the failed gate's result. If the run started no job, dev's
        `ci.yml` failed to load, and every dev push is likely red too.
     2. Otherwise, open the failed leg. A timeout, a test-slot wait or a
        Postgres restart mid-run is a flake: re-run the failed jobs.
     3. A real test or link failure in release mode is a release-only
        regression. Take the commit from the leg's "Record built commit
        (dispatch)" step and bisect back to the last green dispatch (below).
-    4. The issue closes itself on the next fully green dispatch: a re-run of
-       the failed jobs counts, as does a fresh
-       `gh workflow run ci.yml --ref dev -f legs=release`; no need to wait a
-       day. A green run in which a dispatch build leg was skipped does NOT
-       close it, and a CANCELLED run neither opens nor closes one.
+    4. The issue closes itself on the next fully green dispatch that is the
+       newest on dev. A re-run of the newest run counts, as does a fresh
+       `gh workflow run ci.yml --ref dev -f legs=release`, so there is no need
+       to wait a day. Three cases do not close it:
+       - a green run in which a dispatch build leg was skipped;
+       - a green run that finished before the issue was opened;
+       - a re-run of an older run.
+
+       A CANCELLED run neither opens nor closes one.
     Each dev push also shows a skipped "Release legs (alert)" run in the
     Actions tab; that is the listener filtering out non-dispatch runs.
   - **Required contexts.** A dispatch must never post a SKIPPED (= satisfied)
-    or misattributed required check on any SHA, including the dev tip that a
-    dev → main promotion PR uses as its head. Two mechanisms, because GitHub does not evaluate a skipped
-    job's `name:` expression (it posts the raw template,
-    [community #13261](https://github.com/orgs/community/discussions/13261)):
+    required check on any SHA, including the dev tip that a dev → main
+    promotion PR uses as its head. There are two mechanisms, because GitHub
+    does not evaluate a skipped job's `name:` expression (it posts the raw
+    template, [community #13261](https://github.com/orgs/community/discussions/13261)):
     - **Renamed.** On a direct dispatch, Preflight (runner health) and the
       Linux/Windows/macOS legs get a ` [dispatch]` suffix. Preflight always
       runs, and a skipped matrix leg already posts an unexpanded name, so the
       suffix is always rendered or harmless.
     - **Never skipped.** Proto backward-compat is routinely skipped (every
       docs-only PR, #1978), so it keeps its literal name. On a dispatch it
-      always runs (`always()`, so a cancel does not skip it either), giving
-      an honest `buf breaking` result for that commit, the same thing every
-      dev push already posts. If `preflight-gate` did not succeed or the Linux
-      pool reads unhealthy, it fails red on a hosted runner instead of
-      skipping. That red is a real, fail-closed "Proto backward-compat" on the
-      dev tip; once the infrastructure is back, re-run it before merging a
-      promotion PR whose head is that commit.
+      always runs (`always()`, so a cancel does not skip it either). It runs
+      the real `buf breaking` on the dev branch it checks out, the same thing
+      every dev push already posts. If dev moved since the dispatch, its
+      "Record built commit" step names the commit actually checked. If
+      `preflight-gate` did not succeed (an infrastructure failure, or a
+      dispatch cancelled during preflight), it fails red on a hosted runner
+      instead of skipping. That red is a real, fail-closed "Proto
+      backward-compat" on the dev tip. Before merging a promotion PR whose
+      head is that commit, re-run ALL jobs of that dispatch, or re-run the
+      PR's own CI.
 
     As defence in depth, `trusted_inputs` refuses a direct dispatch on any ref
     but `dev` or `main`.

@@ -42,7 +42,7 @@ Before invoking the skill, the operator should already have:
   ```
 
   It must print all six names, each `completed` with `success` or `skipped`. The ruleset that lists them is the repo's "Protect Main" setting, not this file.
-- The release/LTO legs green on `main`'s tip, and no open `release-legs-broken` issue. These legs are not required checks, but they are the only place the test suite runs in release/NDEBUG mode: `release.yml` builds with `-Dbuild_tests=false`. Since Tier 2b (`docs/ci-architecture.md`) they no longer run on dev pushes, only on `main` pushes and a daily dispatch on dev. An open issue means dev's release legs were red at the last dispatch, or the daily dispatcher itself failed (the issue says which). Find out whether that defect reached `main` before tagging:
+- The release/LTO legs green on `main`'s tip, and no open `release-legs-broken` issue. These legs are not required checks, but they are the only place the test suite runs in release/NDEBUG mode: `release.yml` builds with `-Dbuild_tests=false`. Since Tier 2b (`docs/ci-architecture.md`) they no longer run on dev pushes, only on `main` pushes and a daily dispatch on dev. An open issue means dev's release legs were red at the last dispatch, or the daily workflow itself failed (its reconcile or dispatch job; the issue says which). Find out whether that defect reached `main` before tagging:
 
   ```bash
   SHA=$(git rev-parse origin/main)

@@ -16,6 +16,8 @@ name: Release legs (daily dispatch)
 # It skips when dev's tip already has a ci.yml dispatch run (legs=release or
 # all) that succeeded or is still in flight, so a quiet day costs nothing; a
 # failed or cancelled run does not count, so a red tip is retried the next day.
+# While a bot-opened release-legs-broken issue is open, only an IN-FLIGHT run
+# counts, so the tip is re-checked daily until a green run closes the issue.
 # The covered check keys on the DISPATCHED commit. The legs check out the dev
 # branch when they start (not a pinned SHA: see ci.yml's trusted_inputs), so
 # if dev moves while they queue they build a later commit; each leg's
@@ -110,6 +112,7 @@ jobs:
     permissions:
       actions: write   # gh workflow run (dispatch ci.yml) + gh run list
       contents: read   # read dev's tip commit
+      issues: read     # an open release-legs-broken issue forces a re-check
     steps:
       - name: Dispatch ci.yml (legs=release) unless dev's tip is already covered
         env:
@@ -125,6 +128,18 @@ jobs:
           covered=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch \
                       --commit "$sha" --limit 20 --json status,conclusion \
                       --jq '[.[] | select(.status != "completed" or .conclusion == "success")] | length')
+          # While a bot-opened release-legs-broken issue is open, a green run on
+          # this tip does not count as covered: re-dispatch so a fresh green run
+          # can close it. Otherwise an issue opened after the last green run
+          # (e.g. a reconcile/dispatch failure) would never close on a quiet dev.
+          open_issue=$(gh issue list -R "$REPO" --label release-legs-broken --state open \
+                         --author "app/github-actions" --json number --jq '.[0].number // empty')
+          if [[ -n "$open_issue" ]]; then
+            covered=$(gh run list -R "$REPO" --workflow ci.yml --event workflow_dispatch \
+                        --commit "$sha" --limit 20 --json status \
+                        --jq '[.[] | select(.status != "completed")] | length')
+            echo "release-legs-broken #$open_issue is open — only an in-flight run counts as covered."
+          fi
           if (( covered > 0 )); then
             echo "dev tip $sha already has a release-legs run (success or in flight) - nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -140,6 +155,11 @@ jobs:
     name: "Open release-legs-broken when this workflow fails"
     needs: [reconcile, dispatch]
     if: ${{ failure() }}
+    # Serialised with the listener and reconcile, so two writers never both
+    # see "no open issue" and both open one.
+    concurrency:
+      group: release-legs-alert
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

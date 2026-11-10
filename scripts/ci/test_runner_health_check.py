@@ -370,9 +370,10 @@ class WorkflowWiringTests(unittest.TestCase):
         body = self.job("ci.yml", "proto-compat")
         self.assertIn('    name: "Proto backward-compat"\n', body)
         self.assertIn(f"if: ${{{{ ({self.DIRECT_DISPATCH} && always()) || (success() && ", body)
-        self.assertIn(f"if: {self.DIRECT_DISPATCH} && (needs.preflight-gate.result != 'success' "
+        self.assertIn(f"if: always() && {self.DIRECT_DISPATCH} && (needs.preflight-gate.result != 'success' "
                       "|| needs.preflight-gate.outputs.linux_pool_healthy != 'true')", body)
-        self.assertIn("'ubuntu-24.04' || fromJSON(", body)
+        self.assertIn("runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')) && 'ubuntu-24.04' || fromJSON(", body)
+        self.assertIn("if: always() && " + self.DIRECT_DISPATCH, body)
         self.assertIn("exit 1", body)
 
     def test_ci_yml_stays_within_the_trusted_fork_token_ceiling(self) -> None:

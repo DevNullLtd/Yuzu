@@ -56,11 +56,11 @@ on:
   # expands the full debug + release matrix. A direct dispatch is accepted on
   # `dev` and `main` only (trusted_inputs refuses any other ref), and on it
   # the jobs that carry a ruleset-required context name are handled so a
-  # dispatch never posts a SKIPPED (= satisfied) or misattributed required
-  # check; the only required context it posts is proto-compat's own result: Preflight (runner health) and the
-  # Linux/Windows/macOS legs get a ` [dispatch]` name suffix; Proto
-  # backward-compat keeps its literal name (a skipped job's name expression is
-  # not evaluated) and is never skipped on a dispatch — see that job.
+  # dispatch never posts a SKIPPED (= satisfied) required check. Preflight
+  # (runner health) and the Linux/Windows/macOS legs get a ` [dispatch]` name
+  # suffix. Proto backward-compat keeps its literal name (a skipped job's name
+  # expression is not evaluated) and is never skipped on a dispatch: it posts
+  # its real result or a fail-closed red — see that job.
   # ci.yml requests no permission beyond the trusted-fork caller's ceiling
   # (contents/pull-requests/actions: read): a called workflow's jobs are
   # permission-checked against the caller at load time, before any `if:`, so
@@ -733,8 +733,9 @@ jobs:
     # required "Proto backward-compat" context would be absent on every
     # docs-only PR (github.com/orgs/community/discussions/13261). So on a
     # direct dispatch this job is never skipped instead: it RUNS the real
-    # `buf breaking` check (an honest result for that commit, the same thing
-    # every dev push posts), or, when preflight-gate did not succeed or the
+    # `buf breaking` check on the dev branch it checks out (the same thing
+    # every dev push posts; if dev moved since the dispatch, its "Record built
+    # commit" step names the commit actually checked), or, when preflight-gate did not succeed or the
     # Linux pool reads unhealthy, FAILS red on a hosted runner (a real red
     # "Proto backward-compat" on that commit: fail-closed, re-run once the
     # infrastructure is back). A dispatch can therefore never post a SKIPPED
@@ -750,17 +751,20 @@ jobs:
     # The dispatch arm is `always()`, not `!cancelled()`: a dispatch cancelled
     # while preflight runs must still not leave a SKIPPED literal required
     # context; with the gate cancelled it takes the hosted fail-closed arm
-    # (ends red), and a cancel during the job itself ends `cancelled`, which
-    # never satisfies a required check.
+    # (ends red). Once this job is running, a normal run cancel does not stop
+    # it (`always()` stays true), so it finishes with its real result; only a
+    # force-cancel ends it `cancelled`, which never satisfies a required check.
     if: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && always()) || (success() && needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true') }}
-    # Hosted fail-closed fallback also when the Linux pool reads unhealthy:
-    # a job targeting a dead self-hosted pool queues for up to ~24h
-    # (timeout-minutes does not count queue time), holding the dispatch open.
+    # The pool clause is defence in depth: today a successful gate implies the
+    # Big Tam (= Linux) pool is healthy (--require-pool bigtam), so it only
+    # matters if that coupling ever changes. A pool that dies AFTER the probe
+    # still leaves this job queued on the self-hosted label.
     runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')) && 'ubuntu-24.04' || fromJSON('["self-hosted","Linux","X64","yuzu-bigtam-linux"]') }}
     timeout-minutes: 5
     steps:
       - name: Fail closed when preflight-gate did not succeed (dispatch)
-        if: (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')
+        # always(): never skipped by an implicit success() after a run cancel.
+        if: always() && (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')
         env:
           GATE_RESULT: ${{ needs.preflight-gate.result }}
           LINUX_POOL: ${{ needs.preflight-gate.outputs.linux_pool_healthy }}
@@ -776,6 +780,18 @@ jobs:
           # A trusted fork never reuses a prior self-hosted workspace.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+      # Direct dispatch only: proto-compat checks out the dev BRANCH, which may
+      # have moved since the dispatch; record the commit actually checked.
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Checked commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: proto-compat checked $built, not the dispatched $DISPATCHED_SHA"
+          fi
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           version: "1.50.0"
