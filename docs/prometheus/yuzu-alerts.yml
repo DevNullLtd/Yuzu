@@ -873,13 +873,16 @@ groups:
       # READS: op="session_lookup" (HA WS-5 batched session_id resolution) and
       # op="cluster_affinity_check" (#4669). Same counter, same pool-health
       # root cause, so one rule covers reads and writes.
-      # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
-      # fresh-registration branch returns UNAVAILABLE on this); the other
-      # five writer SITES (announce_connected, both ProxyRegister renew
-      # branches, BatchHeartbeat's renew, deregister) — which collapse to
-      # three fail-OPEN `op` label values (announce_connected, renew_leases,
-      # deregister; see the label set in docs/user-manual/metrics.md) — are
-      # deliberately fail-OPEN, so a rate here can mean silent directory drift even with
+      # The fail-CLOSED sites (the RPC returns UNAVAILABLE) are ProxyRegister's
+      # fresh-registration branch (`op="register_fresh"`) and both of its
+      # replay-adopt branches (`op="renew_leases"` and
+      # `op="reclaim_tombstoned_session"`). The four writer SITES —
+      # announce_connected, BatchHeartbeat's renew_leases, deregister and the
+      # adopted-session set_legacy_echo_wire_name flag refresh — are
+      # deliberately fail-OPEN and use the `op` label values announce_connected,
+      # renew_leases, deregister and set_legacy_echo_wire_name (see the label
+      # set in docs/user-manual/metrics.md), so a rate here can mean silent
+      # directory drift even with
       # no visible RPC failure. INITIAL / conservative threshold — no fleet
       # background-rate data exists yet to tune against (same lesson as the
       # #913 OTA-bounds alert thresholds, the single largest source of
@@ -919,7 +922,12 @@ groups:
             announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
             NULL) — lease renewal does NOT repopulate placement, so it does NOT
             self-heal on the lease TTL and needs another CONNECTED / agent
-            re-registration to restore routing. op="session_lookup" is the
+            re-registration to restore routing. op="set_legacy_echo_wire_name"
+            (an upgrade-window shim) leaves the row's legacy plugin-name flag
+            stale: nothing repairs it until that agent registers fresh or is
+            adopted again, and until then a directory-routed Echo dispatch to
+            it is written under the wrong plugin name and the agent answers
+            plugin_not_found. op="session_lookup" is the
             batched READ that resolves gateway session ids (HA WS-5): while it
             fails, BatchHeartbeat is fail-SOFT (locally hinted pairs are still
             acked and renewed, unreadable ids with no local hint are neither
@@ -7862,6 +7870,90 @@ groups:
             boot log line says which. Make the data directory writable
             (one persistent data directory per replica; an ephemeral one makes
             the mechanism inert).
+
+  - name: yuzu-echo
+    # No alert on the echo.status registry_* keys yet (no fleet gauge); decision and follow-up in
+    # docs/observability-conventions.md (#6521).
+    rules:
+      # The gauge counts agents once per sweep, so a rise is a net rise in the agents reporting a
+      # quarantine history, not an event count (limits spelled out in the description). It is a gauge, so `delta`, not `increase`: an
+      # agent that leaves and returns takes the count down and back up, and `increase` would
+      # read the return as a rise. `for: 0m`: a rise is an event, a sustained condition would
+      # never clear. Warning, not critical: the value is agent-self-reported inside the
+      # heartbeat trust boundary, so one forged or buggy agent can raise it.
+      #
+      # THE RESTART GUARD. The server publishes the gauge every sweep, 0 included, over agents
+      # with a live heartbeat, so a restarted replica starts at 0 and ramps back to N as agents
+      # reconnect. About an hour later the 1h window start slides into that ramp and
+      # `delta(...[1h]) > 0` fires with no new corruption (the same happens on a series younger
+      # than 1h). `unless ... (yuzu_server_uptime_seconds < 3900)` suppresses the rule for the
+      # first 65 minutes of a replica's life: the 1h window plus a 5 minute reconnect ramp. A
+      # real rise stays visible to `delta[1h]` for an hour, so the guard loses a rise inside the
+      # first ~5 minutes of a boot and delays one later in the first 65. If agents take longer than 5 minutes to
+      # reconnect, the tail of the ramp can still leak. An absent uptime series suppresses
+      # nothing. The join is `on (job, instance)` because the guard is about one replica's own
+      # uptime (both series must come from the same scrape job and target, as the shipped scrape
+      # config does; otherwise the guard silently never matches): any label a scrape attaches to only one of the two series would otherwise
+      # defeat the join and silence the guard, and `on (job)` alone would let a young sibling
+      # replica silence an old one (pinned by the two-replica case). The 1h any-rise threshold
+      # is the #5065 starting default, not sized from fleet data.
+      - alert: YuzuEchoDbCorruptionDetected
+        expr: |
+          delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
+            unless on (job, instance) (yuzu_server_uptime_seconds < 3900)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The count of agents with a quarantined Echo database rose in the last hour"
+          description: >-
+            At least one more agent than an hour ago reports that its Echo database failed its
+            integrity check and was quarantined. This is a net rise in the agents reporting a
+            quarantine history, not an event count: the gauge counts agents once per sweep, so an
+            agent returning from offline with an old quarantine raises it, a repeat quarantine on
+            an agent already counted does not, and an agent leaving in the same window can mask
+            one arriving. A rise seen while the reporting replica has been up under 65 minutes is
+            held until the guard lifts. A failover, a rolling upgrade, agents returning after a
+            site or gateway outage, or ordinary endpoint churn can all raise it with no new
+            corruption, once per replica that gains agents; treat it as a ticket, not a page. The
+            signal is agent-self-reported, so one agent can raise or mask it; the
+            echo.db.corruption_quarantined audit rows name the affected agents but corroborate
+            rather than prove it.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
+
+      # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the
+      # description carries the Echo remedy. The plugin label is agent-supplied: agent-minted
+      # names can push a real plugin past the 64-name cut into plugin="other" (server fix tracked
+      # separately). The family is absent-not-zero, so a clean fleet
+      # returns no series and the rule stays quiet (max_over_time over an absent series is
+      # absent too).
+      #
+      # Same expression and effects as YuzuDedupStoreDegraded (#3663,
+      # docs/observability-conventions.md); do not widen the window.
+      - alert: YuzuPluginInitFailed
+        expr: |
+          sum by (job, plugin) (max_over_time(yuzu_fleet_plugin_init_failed[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "About {{ $value }} agent(s) report plugin {{ $labels.plugin }} failed to initialise"
+          description: >-
+            For more than 10 minutes, about {{ $value }} agent(s) (summed across core replicas,
+            so a failover can count one twice for a few minutes) have reported that plugin
+            {{ $labels.plugin }} failed init (heartbeat tag yuzu.plugins_failed); it is loaded
+            but not running, as distinct from not installed. plugin="other" is the sum over
+            plugins past the first 64 names the server labels per sweep; the agent log names
+            them. The runbook link is the Echo upgrade note; for any other plugin the agent log
+            is the source. For plugin="echo" the usual causes are a failed tar.db adoption after
+            the rename (including a sidecar present under both names) and a corrupt echo.db that
+            could not be moved aside; the upgrade notes cover adoption under 'Two cases the
+            agent refuses, and what to do', and the corrupt-database case is under
+            Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack
+            of free space is not counted here (#7290). The value and the plugin label are
+            agent-self-reported: agent-minted names can displace a real plugin into
+            plugin="other", so the label is not authoritative.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
 
   - name: yuzu-web-writes
     # Cookie-session requests refused by the pre-routing same-site gate

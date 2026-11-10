@@ -2546,8 +2546,9 @@ void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Resp
                                       DexScorePolicyWriteRequest::Op op, bool dry_run) {
     const bool put = op == DexScorePolicyWriteRequest::Op::Put;
     const char* leaf = dry_run ? "preview" : (put ? "save" : "reset");
-    // Authority is the REST twin's (ADR-1005 Decision 4): Infrastructure:Write first, then
-    // GuaranteedState:Read (every answer carries application names), both through the loud
+    // Authority (ADR-1005 Decision 4): REST PUT/DELETE gate Infrastructure:Write alone; this tab
+    // and the MCP tools also gate GuaranteedState:Read (every answer carries application names).
+    // Here: Infrastructure:Write first, then GuaranteedState:Read, both through the loud
     // perm_fn_. Never admin_fn_ (it bypasses RBAC, so the REST route's refusal could be written
     // around) and never read_perm on an action route (it is quiet for a cookie session).
     if (!perm_fn_(req, res, "Infrastructure", "Write"))

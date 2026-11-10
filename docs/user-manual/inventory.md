@@ -1499,12 +1499,16 @@ sync, defeating the hash-skip protocol.
   `machine_id` section means the reported machine ID was not a hash and was discarded;
   `server:row_count_mismatch` means the rows stored for the section no longer match the count
   recorded when the device last synced in full (rows were lost outside the product, for example
-  a partial database restore), so the section is served `constrained` and incomplete with the
-  rows that remain. `server:content_digest_mismatch` means the number of rows still matches but
+  a partial database restore), so the section is served `constrained` and incomplete with its
+  `rows` empty: the rows that remain are withheld, not listed (#7165). `server:content_digest_mismatch` means the number of rows still matches but
   the rows no longer hash to the digest the server recorded beside the section's status when the
   device last synced in full (a row was edited, or the rows were swapped for another sync's out
-  of band): the section is served `constrained` and incomplete, with the rows that were read, but
-  those rows are **not** the values the agent reported, so do not rely on them. A lost row
+  of band): the section is served `constrained` and incomplete with its `rows` empty, because the
+  rows read are **not** the values the agent reported. This holds even when the agent's own level
+  was already `constrained` (for example `server_cap:<n>`). Only a full device-record sync
+  repairs either. A damaged stored digest alone, with intact rows, is withheld the same way. The
+  stored rows stay in the database (read them with SQL if you need to inspect them; neither REST
+  nor MCP shows them). A lost row
   reports `server:row_count_mismatch` alone. A third token, `server:content_digest_unverifiable`,
   means this **server** could not compute the digest to compare (its digest provider failed, an
   OpenSSL fault): the section is served `constrained` and incomplete with the rows that were read,

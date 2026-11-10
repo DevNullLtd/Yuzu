@@ -22571,9 +22571,13 @@ private:
         // listener thread(s) before it resets the store, so no handler is running when the
         // reference dies (the same ordering the provider's reader relies on). Without an open
         // store the three routes answer 503. MUST run BEFORE register_routes().
+        // #6087: the MCP twins (mcp_tools_dex.cpp) take a copy of the SAME deps through ToolDeps
+        // below, so the two surfaces share one reader, one pair of conditional writes and one
+        // provider; only the audit hook differs per surface and per request.
+        std::optional<DexScorePolicyWriteDeps> dex_score_policy_deps;
         if (dex_score_policy_provider_) {
             auto policy_writes = dex_score_policy_store_writer(*runtime_config_store_);
-            DexScorePolicyWriteDeps policy_deps{
+            dex_score_policy_deps = DexScorePolicyWriteDeps{
                 .read_stored = dex_score_policy_store_reader(*runtime_config_store_),
                 .compare_and_set = std::move(policy_writes.compare_and_set),
                 .compare_and_remove = std::move(policy_writes.compare_and_remove),
@@ -22581,8 +22585,8 @@ private:
                 .audit = {}};
             // AP-3.12: the Scoring tab shares these deps; its setters read per request, so only
             // the REST setter below must precede register_routes.
-            settings_routes_->set_dex_score_policy_writer(policy_deps);
-            rest_api_v1_->set_dex_score_policy_writer(std::move(policy_deps));
+            settings_routes_->set_dex_score_policy_writer(*dex_score_policy_deps);
+            rest_api_v1_->set_dex_score_policy_writer(*dex_score_policy_deps);
             // The suggestions and the pre-save tier-change preview score the Apps model through
             // the production scorer with a substituted policy. Deliberately absent where the
             // signals store is (a runtime-config store without one is a shipped configuration):
@@ -23372,6 +23376,29 @@ private:
                     };
             }
             tool_deps.crypto_access_fn = crypto_access_cb;
+            // #6087: get/set/reset_dex_score_policy. The read closure is the REST GET's
+            // reader; the apply closure is a pure forward of apply_dex_score_policy, the one
+            // audit-first write path REST PUT/DELETE also call, with the per-request audit
+            // hook swapped in. Lifetime is the REST route's: the store reference inside the
+            // deps is released only after the listener threads join (see stop()). Empty when
+            // the deployment has no runtime-config store; the tools then answer an internal
+            // error.
+            if (dex_score_policy_deps) {
+                // The write tools resolve the caller's session once and stamp every domain row
+                // from it, as the REST PUT/DELETE do (audit_as_session_fn, #6065 PR-Q).
+                tool_deps.session_fn = [this](const httplib::Request& req)
+                    -> std::optional<auth::Session> { return auth_routes_->resolve_session(req); };
+                tool_deps.audit_as_session_fn = auth_routes_->audit_as_session_fn();
+                tool_deps.dex_score_policy_read_fn = dex_score_policy_deps->read_stored;
+                tool_deps.dex_score_policy_apply_fn =
+                    [deps = *dex_score_policy_deps](
+                        const DexScorePolicyWriteRequest& rq,
+                        mcp::ToolDeps::DexScorePolicyAuditFn audit) {
+                        auto d = deps;
+                        d.audit = std::move(audit);
+                        return apply_dex_score_policy(rq, d);
+                    };
+            }
             // The registry path carries no session, and the two dashboard-layout tools key the
             // caller's OWN layout on the session username: re-resolve it from the request, the
             // way crypto_access does for the gate (a request that just authenticated resolves;

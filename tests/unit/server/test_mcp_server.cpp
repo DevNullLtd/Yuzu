@@ -2213,6 +2213,24 @@ TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tet
         CHECK(blob.find(std::string(fam.name)) != std::string::npos);
 }
 
+// The family-name tether above proves a family is mentioned; it cannot tell that the DEX family's
+// description still names the score policy writes and their posture (#6087), which is what an
+// agent reading the orientation blob needs to know before it tries one.
+TEST_CASE("MCP 2g: the DEX signals family description names the score policy writes and their "
+          "posture",
+          "[mcp][2g]") {
+    const mcp::ToolFamily* dex = nullptr;
+    for (const auto& fam : mcp::tool_families())
+        if (fam.name == "DEX signals")
+            dex = &fam;
+    REQUIRE(dex != nullptr);
+    const std::string blurb(dex->blurb);
+    CHECK(blurb.find("set_dex_score_policy") != std::string::npos);
+    CHECK(blurb.find("reset_dex_score_policy") != std::string::npos);
+    CHECK(blurb.find("supervised-tier writes") != std::string::npos);
+    CHECK(blurb.find("approval-gated") != std::string::npos);
+}
+
 // #2146 A2-R1 Gate 8 fix: this test's `nlohmann::json::parse(res->body)` call
 // is ALSO, incidentally but genuinely, a whole-catalogue JSON-validity net
 // over every served tool's inputSchema/outputSchema -- `tools/list`'s
@@ -33121,6 +33139,7 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
              R"({"id":1,"expected_config_version":1,"name":"n","ca_certificates":["x"],"crl_urls":[{"url":"http://crl.example.com/a.crl"}]})")},
         {"remove_revocation_source", nlohmann::json::parse(R"({"id":1})")},
         {"reset_revocation_source_high_water", nlohmann::json::parse(R"({"id":1})")},
+        {"reset_dex_score_policy", nlohmann::json::parse(R"({"if_match":"default"})")},
         // #2146 batch B: Workflow:Execute is supervised-tier gated (requires_approval(), owner
         // ruling 2026-10-30); the operator tier is denied outright by tier_allows().
         {"execute_workflow",
