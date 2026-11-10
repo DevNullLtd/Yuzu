@@ -88,7 +88,7 @@ URL structure:
 
 The source of truth is the agent's `echo_config` table — the `<source>_enabled` keys, set by the `echo.configure` action. The server does not currently maintain a centralised "Echo config" mirror; the data path is **request-driven**:
 
-1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_rows` count + `<source>_oldest_ts` per source; the server reads `<source>_rows`; an agent that sends only `<source>_live_rows`, from before the roll-up-only release, is shown with a dash and an upgrade note, never with that figure as the count) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
+1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_rows` count + `<source>_oldest_ts` per source; the server reads `<source>_rows`; a source with no `<source>_rows` shows a dash) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
 2. Responses stream back via the standard agent-streaming pipeline.
 3. Server collates into a transient in-memory table; renders as HTMX OOB swaps.
 4. Empty rows (`enabled=true` for all four sources) are dropped — the table only shows the *paused* state, not the entire fleet.
@@ -108,11 +108,11 @@ The action's response gains four lines per source (so 16 new lines total for the
 
 ```
 config|process_enabled|true
-config|process_live_rows|18402
+config|process_rows|18402
 config|process_oldest_ts|1730000000
 config|process_paused_at|0           # 0 = never; otherwise the ts when last set to false
 config|tcp_enabled|false
-config|tcp_live_rows|4193
+config|tcp_rows|4193
 config|tcp_oldest_ts|1733000000
 config|tcp_paused_at|1735689600
 ...
