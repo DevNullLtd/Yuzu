@@ -1813,7 +1813,6 @@ constexpr NET_FW_PROFILE_TYPE2 kQuarantineProfiles[] = {
 // The prior-policy image is indexed by the same profile position.
 static_assert(std::tuple_size_v<fq::WinPriorPolicy> == std::size(kQuarantineProfiles));
 static_assert(std::tuple_size_v<fq::WinSwitchReading> == std::size(kQuarantineProfiles));
-static_assert(fq::kWinModifyStateGpOverride == NET_FW_MODIFY_STATE_GP_OVERRIDE);
 
 /// A BSTR out-param owner (the shared BStr type only builds by allocating).
 struct OwnedBstr {
@@ -1863,10 +1862,13 @@ struct OwnedBstr {
     return info;
 }
 
-/// Visits every rule. Returns false when the enumeration itself failed part-way
-/// (the caller must not treat a partial pass as the whole ruleset); `fn` returns
-/// false to stop early, which is a clean exit.
-template <class Fn> [[nodiscard]] bool for_each_rule(INetFwRules& rules, Fn&& fn) {
+/// Visits every rule. Returns false when the enumeration itself failed part-way,
+/// or the deadline expired (checked every 256 rules; a single COM call cannot be
+/// cancelled, #1391): the caller must not treat a partial pass as the whole
+/// ruleset, and `dl.expired()` tells the two apart. `fn` returns false to stop
+/// early, which is a clean exit.
+template <class Fn>
+[[nodiscard]] bool for_each_rule(INetFwRules& rules, fq::Deadline& dl, Fn&& fn) {
     ComPtr<IUnknown> unk;
     if (FAILED(rules.get__NewEnum(unk.put())) || !unk)
         return false;
@@ -1874,6 +1876,7 @@ template <class Fn> [[nodiscard]] bool for_each_rule(INetFwRules& rules, Fn&& fn
     if (FAILED(unk->QueryInterface(__uuidof(IEnumVARIANT), reinterpret_cast<void**>(ev.put()))) ||
         !ev)
         return false;
+    std::size_t seen = 0;
     for (;;) {
         VARIANT v;
         VariantInit(&v);
@@ -1894,12 +1897,19 @@ template <class Fn> [[nodiscard]] bool for_each_rule(INetFwRules& rules, Fn&& fn
                                                  reinterpret_cast<void**>(rule.put()))) &&
             rule) {
             VariantClear(&v);
+            if (++seen % 256 == 0 && dl.expired())
+                return false;
             if (!fn(*rule.get()))
                 return true;
         } else {
             VariantClear(&v);
         }
     }
+}
+
+/// A pass that returned false: the deadline stopped it, or the enumeration broke.
+[[nodiscard]] fq::StepResult enum_fail(const fq::Deadline& dl) {
+    return fq::StepResult::fail(dl.expired() ? "deadline_exceeded" : "rule_enumeration_failed");
 }
 
 [[nodiscard]] std::string hr_token(const char* what, HRESULT hr) {
@@ -1922,7 +1932,7 @@ public:
     /// Refuse while the legacy plugin's rules (`YuzuQuarantine_*`) are present.
     /// An unreadable ruleset does not block here: the apply that follows reads
     /// the same ruleset and fails loudly if it truly cannot.
-    [[nodiscard]] std::optional<std::string> preflight(fq::Deadline&) override {
+    [[nodiscard]] std::optional<std::string> preflight(fq::Deadline& dl) override {
         ComInit com;
         ComPtr<INetFwPolicy2> policy;
         ComPtr<INetFwRules> rules;
@@ -1930,7 +1940,7 @@ public:
             !rules)
             return std::nullopt;
         bool legacy = false;
-        (void)for_each_rule(*rules.get(), [&](INetFwRule& r) {
+        (void)for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
             if (fq::is_legacy_marker(rule_name_of(r))) {
                 legacy = true;
                 return false;
@@ -1976,15 +1986,13 @@ public:
         // 1. Read the ruleset once: legacy markers, our group, what to disable.
         std::vector<fq::WinRuleInfo> infos;
         bool legacy = false;
-        std::size_t n = 0;
-        const bool complete = for_each_rule(*rules.get(), [&](INetFwRule& r) {
-            fq::WinRuleInfo info = rule_info_of(r);
-            legacy = legacy || fq::is_legacy_marker(info.name);
-            infos.push_back(std::move(info));
-            return (++n % 256 != 0) || !dl.expired();
-        });
-        if (!complete)
-            return fq::StepResult::fail("rule_enumeration_failed");
+        if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
+                fq::WinRuleInfo info = rule_info_of(r);
+                legacy = legacy || fq::is_legacy_marker(info.name);
+                infos.push_back(std::move(info));
+                return true;
+            }))
+            return enum_fail(dl);
         if (dl.expired())
             return fq::StepResult::fail("deadline_exceeded");
         if (legacy)
@@ -2088,21 +2096,17 @@ public:
         //    default-block, so leaving them on would leave the host reachable.
         //    A rule the policy store refuses (GPO) is counted and reported.
         std::uint32_t refused = 0;
-        std::size_t seen = 0;
-        const bool disabled_pass = for_each_rule(*rules.get(), [&](INetFwRule& r) {
-            if (++seen % 256 == 0 && dl.expired())
-                return false;
-            if (!rule_enabled(r))
+        if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
+                if (!rule_enabled(r))
+                    return true;
+                const auto name = rule_name_of(r);
+                if (fq::is_our_win_rule(name, rule_group_of(r)))
+                    return true;
+                if (r.put_Enabled(VARIANT_FALSE) != S_OK)
+                    ++refused;
                 return true;
-            const auto name = rule_name_of(r);
-            if (fq::is_our_win_rule(name, rule_group_of(r)))
-                return true;
-            if (r.put_Enabled(VARIANT_FALSE) != S_OK)
-                ++refused;
-            return true;
-        });
-        if (!disabled_pass)
-            return fq::StepResult::fail("rule_enumeration_failed");
+            }))
+            return enum_fail(dl);
         if (dl.expired())
             return fq::StepResult::fail("deadline_exceeded");
 
@@ -2180,7 +2184,7 @@ public:
         // 1. Which of our rules exist (needed to decide the policy fallback below).
         const auto ours_at_start = collect_our_rule_names(*rules.get(), dl);
         if (!ours_at_start)
-            return fq::StepResult::fail(dl.expired() ? "deadline_exceeded" : "rule_enumeration_failed");
+            return enum_fail(dl);
         // 2. Re-enable what quarantine disabled. Matched on name + direction + profile
         //    (a stock rule that was OFF on another profile stays off).
         const std::string list_key{fq::kWinDisabledRulesKey};
@@ -2194,13 +2198,7 @@ public:
             if (!parsed) {
                 result.notes.emplace_back("disabled_list_unreadable=1");
             } else if (!parsed->empty()) {
-                std::size_t seen = 0;
-                bool out_of_time = false;
-                if (!for_each_rule(*rules.get(), [&](INetFwRule& r) {
-                        if (++seen % 256 == 0 && dl.expired()) {
-                            out_of_time = true;
-                            return false;
-                        }
+                if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
                         const auto info = rule_info_of(r);
                         if (info.enabled)
                             return true;
@@ -2210,10 +2208,11 @@ public:
                         if (r.put_Enabled(VARIANT_TRUE) != S_OK)
                             ++tally.not_reenabled;
                         return true;
-                    }))
+                    })) {
+                    if (dl.expired())
+                        return fq::StepResult::fail("deadline_exceeded");
                     tally.reenable_unread = true;
-                if (out_of_time)
-                    return fq::StepResult::fail("deadline_exceeded");
+                }
             }
         }
 
@@ -2250,7 +2249,7 @@ public:
         for (int pass = 0; pass < 3; ++pass) {
             const auto ours = collect_our_rule_names(*rules.get(), dl);
             if (!ours)
-                return fq::StepResult::fail(dl.expired() ? "deadline_exceeded" : "rule_enumeration_failed");
+                return enum_fail(dl);
             if (ours->empty())
                 break;
             (void)remove_rules_by_name(*rules.get(), *ours, dl);
@@ -2260,7 +2259,7 @@ public:
         {
             const auto left = collect_our_rule_names(*rules.get(), dl);
             if (!left)
-                return fq::StepResult::fail(dl.expired() ? "deadline_exceeded" : "rule_enumeration_failed");
+                return enum_fail(dl);
             tally.our_rules_left = !left->empty();
         }
 
@@ -2298,20 +2297,14 @@ public:
         if (!com.ok() || FAILED(get_fw_policy(policy)) || FAILED(policy->get_Rules(rules.put())) ||
             !rules)
             return st;
-        bool group = false, legacy = false, out_of_time = false;
-        std::size_t seen = 0;
-        if (!for_each_rule(*rules.get(), [&](INetFwRule& r) {
-                if (++seen % 256 == 0 && dl.expired()) {
-                    out_of_time = true;
-                    return false;
-                }
+        bool group = false, legacy = false;
+        if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
                 const auto name = rule_name_of(r);
                 group = group || rule_group_of(r) == fq::kWinGroup;
                 legacy = legacy || fq::is_legacy_marker(name);
                 return true;
-            }) ||
-            out_of_time)
-            return st; // unreadable: never a guess
+            }))
+            return st; // unreadable (or out of time): never a guess
         const auto sw = fq::win_firewall_switch_verdict(read_switch(*policy.get()));
         bool all_block = true;
         for (const auto profile : kQuarantineProfiles) {
@@ -2336,7 +2329,7 @@ public:
             // never something a re-apply fixes -- it would write the same local value.
             st.state = fq::OsState::enforcing;
             st.partial = true;
-            st.reason = std::string{fq::kWinGpoOverrideReason};
+            st.reason = "gpo_override";
             st.notes.emplace_back("gpo_override=1");
             return st;
         }
@@ -2353,7 +2346,7 @@ private:
     [[nodiscard]] static bool policy_overridden(INetFwPolicy2& policy) {
         NET_FW_MODIFY_STATE state = NET_FW_MODIFY_STATE_OK;
         return policy.get_LocalPolicyModifyState(&state) == S_OK &&
-               fq::win_policy_overridden(static_cast<long>(state));
+               state == NET_FW_MODIFY_STATE_GP_OVERRIDE;
     }
 
     /// The master switch per profile, through classify_fw_hr: only S_OK is a
@@ -2374,19 +2367,12 @@ private:
     [[nodiscard]] static std::optional<std::vector<std::string>> collect_our_rule_names(
         INetFwRules& rules, fq::Deadline& dl) {
         std::vector<std::string> out;
-        std::size_t seen = 0;
-        bool out_of_time = false;
-        if (!for_each_rule(rules, [&](INetFwRule& r) {
-                if (++seen % 256 == 0 && dl.expired()) {
-                    out_of_time = true;
-                    return false;
-                }
+        if (!for_each_rule(rules, dl, [&](INetFwRule& r) {
                 auto name = rule_name_of(r);
                 if (fq::is_our_win_rule(name, rule_group_of(r)))
                     out.push_back(std::move(name));
                 return true;
-            }) ||
-            out_of_time)
+            }))
             return std::nullopt;
         return out;
     }

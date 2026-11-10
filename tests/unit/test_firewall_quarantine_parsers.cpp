@@ -4381,7 +4381,8 @@ TEST_CASE("windows: a stock rule is told apart by name, direction and profile", 
     // the public twin was off: its key is not in the list, so the release leaves it off
     CHECK(std::find(off.begin(), off.end(), win_rule_key(rules[1])) == off.end());
     CHECK(win_rule_key(rules[1]) != win_rule_key(rules[0]));
-    CHECK(win_rule_key("x", 1, 7) != win_rule_key("x", 2, 7)); // direction too
+    CHECK(win_rule_key(WinRuleInfo{.name = "x", .direction = 1, .profiles = 7}) !=
+          win_rule_key(WinRuleInfo{.name = "x", .direction = 2, .profiles = 7})); // direction too
     // the cross-generation merge works on the same keys
     const auto merged = win_merge_disabled_list({off[0]}, off, true);
     CHECK(merged.list.size() == 3);
@@ -4418,10 +4419,6 @@ TEST_CASE("windows: a GPO-locked rule is a note on a completed release; a leftov
     d = win_release_decision(x);
     CHECK(d.incomplete);
     CHECK(contains(d.notes, "images_not_deleted=1"));
-
-    CHECK(win_policy_overridden(kWinModifyStateGpOverride));
-    CHECK_FALSE(win_policy_overridden(0));
-    CHECK_FALSE(win_policy_overridden(2)); // inbound-blocked is not an override of OUR block
 }
 
 TEST_CASE("windows release over the driver: a GPO-locked rule completes; a stuck image keeps the record releasing",

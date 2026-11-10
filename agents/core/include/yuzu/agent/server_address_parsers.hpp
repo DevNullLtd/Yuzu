@@ -7,6 +7,8 @@
  */
 
 #include <algorithm>
+#include <charconv>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -71,16 +73,22 @@ inline std::string grpc_peer_literal(std::string_view peer) {
     const auto strip = [&](std::string_view prefix) {
         return peer.starts_with(prefix) ? peer.substr(prefix.size()) : std::string_view{};
     };
-    const auto port_ok = [](std::string_view p) {
-        if (p.empty() || p.size() > 5)
-            return false;
+    // The whole of `s` as a decimal of at most `max_len` digits and at most `max_v`.
+    // from_chars on an unsigned type takes no sign and no leading space.
+    const auto dec = [](std::string_view s, std::size_t max_len,
+                        unsigned max_v) -> std::optional<unsigned> {
+        if (s.empty() || s.size() > max_len)
+            return std::nullopt;
         unsigned v = 0;
-        for (char c : p) {
-            if (c < '0' || c > '9')
-                return false;
-            v = v * 10 + static_cast<unsigned>(c - '0');
-        }
-        return v >= 1 && v <= 65535;
+        const char* const end = s.data() + s.size();
+        const auto [ptr, ec] = std::from_chars(s.data(), end, v);
+        if (ec != std::errc{} || ptr != end || v > max_v)
+            return std::nullopt;
+        return v;
+    };
+    const auto port_ok = [&](std::string_view p) {
+        const auto v = dec(p, 5, 65535);
+        return v && *v >= 1;
     };
 
     if (const auto rest = strip("ipv4:"); !rest.empty()) {
@@ -93,15 +101,7 @@ inline std::string grpc_peer_literal(std::string_view peer) {
         while (pos <= host.size()) {
             const auto dot = host.find('.', pos);
             const auto part = host.substr(pos, dot == std::string_view::npos ? dot : dot - pos);
-            if (part.empty() || part.size() > 3)
-                return {};
-            unsigned v = 0;
-            for (char c : part) {
-                if (c < '0' || c > '9')
-                    return {};
-                v = v * 10 + static_cast<unsigned>(c - '0');
-            }
-            if (v > 255)
+            if (!dec(part, 3, 255))
                 return {};
             ++octets;
             if (dot == std::string_view::npos)

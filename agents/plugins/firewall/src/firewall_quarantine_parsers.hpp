@@ -1489,11 +1489,8 @@ struct WinRuleInfo {
 /// share a NAME and differ by direction or profile (File and Printer Sharing,
 /// WinRM HTTP-In), one on and one off. The disable list and the release match on
 /// all three, so a rule that was OFF before is never switched on by a release.
-[[nodiscard]] inline std::string win_rule_key(std::string_view name, int direction, int profiles) {
-    return std::format("{}|{}|{}", name, direction, profiles);
-}
 [[nodiscard]] inline std::string win_rule_key(const WinRuleInfo& r) {
-    return win_rule_key(r.name, r.direction, r.profiles);
+    return std::format("{}|{}|{}", r.name, r.direction, r.profiles);
 }
 
 /// The keys of every ENABLED rule outside our group (an Allow RULE beats a
@@ -1509,16 +1506,6 @@ win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
     }
     return out;
 }
-
-/// INetFwPolicy2::LocalPolicyModifyState value NET_FW_MODIFY_STATE_GP_OVERRIDE (1):
-/// a Group Policy default action overrides the local profile defaults this plugin
-/// writes, so a default-block we put there is not in force and the reply path
-/// cannot be proven.
-inline constexpr long kWinModifyStateGpOverride = 1;
-[[nodiscard]] constexpr bool win_policy_overridden(long modify_state) noexcept {
-    return modify_state == kWinModifyStateGpOverride;
-}
-inline constexpr std::string_view kWinGpoOverrideReason = "gpo_override";
 
 /// What one Windows release found, as counts the COM leg tallies.
 struct WinReleaseTally {
@@ -3345,34 +3332,29 @@ namespace detail {
     return ap.partial || has_residue(st.os);
 }
 
-/// What the control check proved and against which endpoints: `live` is the endpoint the
-/// agent is connected through right now (the only one that matters: a listed endpoint that
-/// still answers says nothing about the path in use), `listed` is the scan of the allow set
-/// used when no live peer is known (agent start).
-struct ControlProof {
-    bool ok = false;
-    std::string_view proved = "listed";
-};
-
-[[nodiscard]] inline ControlProof control_reachable(Env& env, const AllowSet& set, Deadline& dl) {
+/// Whether the control channel still answers, and against which endpoint: `live` is the
+/// endpoint the agent is connected through right now (the only one that matters: a listed
+/// endpoint that still answers says nothing about the path in use), `listed` is the scan of
+/// the allow set used when no live peer is known (agent start). Which of the two a check
+/// used is `env.live_control ? "live" : "listed"` (VerifyResult::proved).
+[[nodiscard]] inline bool control_reachable(Env& env, const AllowSet& set, Deadline& dl) {
     if (env.live_control) {
         const auto& c = *env.live_control;
-        return {!dl.expired() && env.probe(format_ip(c.ip), c.port, dl.cap(kProbeTimeout)) ==
-                                     ProbeOutcome::connected,
-                "live"};
+        return !dl.expired() &&
+               env.probe(format_ip(c.ip), c.port, dl.cap(kProbeTimeout)) == ProbeOutcome::connected;
     }
     int tried = 0;
     for (const auto& c : set.control) {
         if (tried++ >= 4 || dl.expired())
             break;
         if (env.probe(format_ip(c.ip), c.port, dl.cap(kProbeTimeout)) == ProbeOutcome::connected)
-            return {true, "listed"};
+            return true;
     }
-    return {false, "listed"};
+    return false;
 }
 
 struct VerifyResult {
-    std::string_view proved = "listed"; // ControlProof::proved
+    std::string_view proved = "listed"; // `live` when the check ran against env.live_control
     bool control_ok = false;
     std::optional<ProbeOutcome> before, after;
     VerifyOutcome outcome = VerifyOutcome::unproven;
@@ -3385,9 +3367,8 @@ struct VerifyResult {
                                              std::optional<ProbeOutcome> before, Deadline& dl) {
     auto vdl = dl.fresh(kVerifyBudget);
     VerifyResult v;
-    const auto proof = control_reachable(env, st.allow, vdl);
-    v.control_ok = proof.ok;
-    v.proved = proof.proved;
+    v.control_ok = control_reachable(env, st.allow, vdl);
+    v.proved = env.live_control ? "live" : "listed";
     v.before = before;
     if (const auto t = parse_probe_target(st.probe_target))
         v.after = env.probe(format_ip(t->ip), t->port, vdl.cap(kProbeTimeout));
@@ -3444,6 +3425,33 @@ inline void finish_status(Outcome& o, const QuarantineState& st, const StepResul
     }
 }
 
+/// The apply took hold, fully or in part: a note that only a success can carry (a
+/// repair, a converged retry) is never written over a refusal or a degraded read.
+/// Deliberately not the set settle_triggers (no `partial`) or log_level (also
+/// `inactive`) test.
+[[nodiscard]] inline bool settled(const Outcome& o) {
+    return o.status == "active" || o.status == "active_unproven" || o.status == "partial";
+}
+
+/// What the record alone earns when no live read says more: recorded residue is
+/// `partial` (its reason and notes), any phase but `active` is
+/// `partial|operation_in_progress`, and the rest is `active` / `active_unproven`.
+/// Every caller but the TTL tick (which reads no leg) holds `phase == active` (a
+/// retried quarantine, an exception update, a status after its applying/releasing
+/// returns, the repair tick), so the middle rung is the tick's alone.
+inline void status_from_record_only(Outcome& o, const QuarantineState& st) {
+    if (has_residue(st.os)) {
+        o.status = "partial";
+        o.reason = std::string{residue_reason(st.os)};
+        add_notes(o, residue_notes(st.os));
+    } else if (st.phase != Phase::active) {
+        o.status = "partial";
+        o.reason = "operation_in_progress";
+    } else {
+        o.status = std::string{active_token(st)};
+    }
+}
+
 /// What an `active` record earns against one live read of its leg: the ONE ladder
 /// behind `quarantine_status` and a retried `quarantine`, so the two answer alike
 /// over the same host -- except that a retry re-applies (`repaired=1`) a gap a
@@ -3458,12 +3466,11 @@ inline void status_from_record(Outcome& o, const QuarantineState& st, const LegS
     } else if (ls.state == OsState::not_enforcing) {
         o.status = "degraded";
         o.reason = ls.reason.empty() ? "policy_not_blocking" : ls.reason;
-    } else if (ls.partial || has_residue(st.os)) {
+    } else if (ls.partial && !has_residue(st.os)) {
         o.status = "partial";
-        o.reason = has_residue(st.os) ? std::string{residue_reason(st.os)} : ls.reason;
-        add_notes(o, residue_notes(st.os));
+        o.reason = ls.reason;
     } else {
-        o.status = std::string{active_token(st)};
+        status_from_record_only(o, st);
     }
     // The unattended self-check's work is never invisible: a record that was ever
     // re-applied by it says how often and when, on every read.
@@ -3552,7 +3559,7 @@ struct ApplyRequest {
             Outcome o;
             if (ls.state == OsState::not_enforcing && ls.reapply_helps) {
                 o = detail::converge(env, cur, cur.allow, dl, /*repaired=*/true);
-                if (o.status == "active" || o.status == "active_unproven" || o.status == "partial")
+                if (detail::settled(o))
                     o.notes.emplace_back("repaired=1");
             } else {
                 // Nothing a re-apply would repair: answer what `quarantine_status`
@@ -3591,7 +3598,7 @@ struct ApplyRequest {
             overlay.emplace_back("probe_from_retry=1");
         }
         auto o = detail::converge(env, seed, req.allow, dl);
-        if (o.status == "active" || o.status == "active_unproven" || o.status == "partial")
+        if (detail::settled(o))
             o.notes.emplace_back("incomplete_apply_converged=1");
         detail::add_notes(o, overlay);
         return o;
@@ -3793,15 +3800,9 @@ namespace detail {
     }
     if (changed == 0) {
         Outcome o;
-        if (has_residue(cur.os)) {
-            // Still no mutation and no leg read, but never `active` over a gap the
-            // record remembers: answer what `quarantine_status` would.
-            o.status = "partial";
-            o.reason = std::string{residue_reason(cur.os)};
-            detail::add_notes(o, residue_notes(cur.os));
-        } else {
-            o.status = std::string{detail::active_token(cur)};
-        }
+        // Still no mutation and no leg read, but never `active` over a gap the
+        // record remembers: answer what `quarantine_status` would.
+        detail::status_from_record_only(o, cur);
         o.state = cur;
         o.notes.emplace_back("exceptions_unchanged=1");
         return o;
@@ -3830,16 +3831,7 @@ struct ReleaseRequest {
             // so it answers from the record alone and never `active` over a gap or a
             // failed proof the record remembers.
             const auto& st = loaded.state;
-            if (has_residue(st.os)) {
-                o.status = "partial";
-                o.reason = std::string{residue_reason(st.os)};
-                detail::add_notes(o, residue_notes(st.os));
-            } else if (st.phase != Phase::active) {
-                o.status = "partial";
-                o.reason = "operation_in_progress";
-            } else {
-                o.status = std::string{detail::active_token(st)};
-            }
+            detail::status_from_record_only(o, st);
             o.state = st;
             o.notes.emplace_back("ttl_not_expired=1");
             return o;
@@ -4054,7 +4046,7 @@ struct ReleaseRequest {
             return o;
         }
         auto r = detail::converge(env, st, st.allow, dl, /*repaired=*/true);
-        if (r.status == "active" || r.status == "active_unproven" || r.status == "partial")
+        if (detail::settled(r))
             r.notes.emplace_back("repaired=1");
         r.notes.emplace_back("repair_tick=1");
         return r;
