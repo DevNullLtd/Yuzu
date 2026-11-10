@@ -121,12 +121,6 @@ EchoTimelineRegion unreadable(EchoUnreadableReason why, std::int64_t a = W0, std
     r.reason = why;
     return r;
 }
-EchoTimelineRegion capped(std::int64_t a, std::int64_t b, std::int64_t rows, std::int64_t from) {
-    auto r = region(EchoRegionKind::capped, a, b);
-    r.cap_rows = rows;
-    r.coverage_from_ts = from;
-    return r;
-}
 EchoTimelineRegion paused(std::int64_t a, std::int64_t b, std::int64_t since) {
     auto r = region(EchoRegionKind::paused, a, b);
     r.paused_since_ts = since;
@@ -157,7 +151,7 @@ EchoTimelineItem bucket(const std::string& id, std::int64_t from, std::int64_t t
     return i;
 }
 EchoTimelineItem column(const std::string& id, std::int64_t from, std::int64_t to,
-                       std::int64_t value, EchoTier tier = EchoTier::exact) {
+                       std::int64_t value, EchoTier tier = EchoTier::hourly) {
     auto i = bar(id, from, to, std::to_string(value) + "%");
     i.shape = EchoItemShape::column;
     i.count = value;
@@ -167,7 +161,7 @@ EchoTimelineItem column(const std::string& id, std::int64_t from, std::int64_t t
 
 EchoTimelineLane lane(const std::string& id, const std::string& source, const std::string& name,
                      std::vector<EchoTimelineItem> items = {},
-                     std::vector<EchoTimelineRegion> regions = {region(EchoRegionKind::exact)}) {
+                     std::vector<EchoTimelineRegion> regions = {rolled(EchoTier::hourly)}) {
     EchoTimelineLane l;
     l.id = id;
     l.source = source;
@@ -181,12 +175,11 @@ EchoKeptBand band(EchoTier t, std::int64_t oldest, std::int64_t policy_s = 0) {
     return {t, oldest, policy_s};
 }
 
-EchoKeptRow kept(const std::string& source, const std::string& label, std::int64_t row_limit,
+EchoKeptRow kept(const std::string& source, const std::string& label,
                 std::vector<EchoKeptBand> bands, std::int64_t paused_since = 0) {
     EchoKeptRow r;
     r.source = source;
     r.label = label;
-    r.row_limit = row_limit;
     r.bands = std::move(bands);
     r.paused_since_ts = paused_since;
     return r;
@@ -217,15 +210,15 @@ EchoTimelineModel base() {
         st.label = label;
         m.sources.push_back(st);
     }
-    // Row-limited exact tier (process), and a time-limited ladder (arp).
-    m.kept.push_back(kept("process", "Processes", 100000,
-                          {band(EchoTier::exact, W1 - 2 * kDay), band(EchoTier::hourly, W1 - 20 * kDay, 20 * kDay),
+    // Process and arp carry a stated hourly policy; service's hourly depth is budget-dependent.
+    m.kept.push_back(kept("process", "Processes",
+                          {band(EchoTier::hourly, W1 - 20 * kDay, 20 * kDay),
                            band(EchoTier::daily, W1 - 90 * kDay, 90 * kDay)}));
-    m.kept.push_back(kept("arp", "ARP neighbours", 0,
-                          {band(EchoTier::exact, W1 - kDay, kDay), band(EchoTier::hourly, W1 - 10 * kDay, 10 * kDay),
+    m.kept.push_back(kept("arp", "ARP neighbours",
+                          {band(EchoTier::hourly, W1 - 10 * kDay, 10 * kDay),
                            band(EchoTier::daily, W1 - 31 * kDay, 31 * kDay)}));
-    m.kept.push_back(kept("service", "Services", 20000,
-                          {band(EchoTier::exact, W1 - 25 * kDay), band(EchoTier::hourly, 0)}, W1 - 20 * kDay));
+    m.kept.push_back(kept("service", "Services",
+                          {band(EchoTier::hourly, W1 - 25 * kDay)}, W1 - 20 * kDay));
 
     auto p1 = bar("P1", W0 + 600, W0 + 2400, "proc-a.exe 4120");
     p1.facts = {{"Started by", "proc-b.exe 100"}, {"User", "s.user"}};
@@ -494,15 +487,15 @@ TEST_CASE("echo timeline collapse: wide items never collapse; the per-lane cap c
 TEST_CASE("echo timeline region_at: boundaries, last region closed, a gap is nullptr",
           "[echo][timeline]") {
     const auto l = lane("l", "process", "p", {},
-                        {region(EchoRegionKind::exact, W0, W0 + 1000),
+                        {rolled(EchoTier::hourly, W0, W0 + 1000),
                          region(EchoRegionKind::pruned, W0 + 1000, W0 + 2000)});
     auto kind_at = [&](std::int64_t t) {
         const auto* r = echo_timeline_region_at(l, t);
         REQUIRE(r != nullptr);
         return r->kind;
     };
-    CHECK(kind_at(W0) == EchoRegionKind::exact);
-    CHECK(kind_at(W0 + 999) == EchoRegionKind::exact);
+    CHECK(kind_at(W0) == EchoRegionKind::rolled_up);
+    CHECK(kind_at(W0 + 999) == EchoRegionKind::rolled_up);
     CHECK(kind_at(W0 + 1000) == EchoRegionKind::pruned);
     CHECK(kind_at(W0 + 2000) == EchoRegionKind::pruned); // closed at the end
     CHECK(echo_timeline_region_at(l, W0 + 2001) == nullptr);
@@ -672,7 +665,7 @@ TEST_CASE("echo timeline banners: one per distinct lane and reason, offline not 
     // two unreadable stretches of one lane with one reason: one banner
     auto m = with_lane(lane("l", "tcp", "TCP connections", {},
                             {unreadable(EchoUnreadableReason::read_failed, W0, W0 + 600),
-                             region(EchoRegionKind::exact, W0 + 600, W0 + 1800),
+                             rolled(EchoTier::hourly, W0 + 600, W0 + 1800),
                              unreadable(EchoUnreadableReason::read_failed, W0 + 1800, W0 + 3000)}));
     CHECK(count_of(render_timeline_lanes(m), "could not be read") == 1);
     // a second reason on the same lane is its own banner
@@ -686,33 +679,49 @@ TEST_CASE("echo timeline banners: one per distinct lane and reason, offline not 
     contains(render_timeline_lanes(on), "TCP connections could not be read: device offline.");
 }
 
-TEST_CASE("echo timeline capped: stretches of one lane are one banner and one limits bullet",
+TEST_CASE("echo timeline roll-up only: every stretch draws and none is exact or cut off",
           "[echo][timeline]") {
-    // two adjacent, non-overlapping capped stretches of one lane, and a second capped lane
     auto m = with_lane(lane("L-p", "process", "proc-a.exe", {},
-                            {capped(W0, W0 + 1200, 10000, W0 + 1200),
-                             capped(W0 + 1200, W0 + 2400, 10000, W0 + 1500),
-                             region(EchoRegionKind::exact, W0 + 2400, W1)}));
-    m.groups[0].lanes.push_back(
-        lane("L-t", "tcp", "TCP connections", {}, {capped(W0, W1, 5000, W0 + 3000)}));
-    const std::string first = "The read of proc-a.exe was cut off at 10000 rows; nothing before "
-                              "2026-10-20T09:20:00Z is shown.";
+                            {rolled(EchoTier::hourly, W0, W0 + 1200),
+                             rolled(EchoTier::daily, W0 + 1200, W0 + 2400),
+                             rolled(EchoTier::monthly, W0 + 2400, W1)}));
     const auto lanes = render_timeline_lanes(m);
-    CHECK(count_of(lanes, "tl-warn") == 2); // one per capped lane
-    contains(lanes, "<div class=\"tl-warn\">" + first + "</div>");
-    contains(lanes, "<div class=\"tl-warn\">The read of TCP connections was cut off at 5000 rows; "
-                    "nothing before 2026-10-20T09:50:00Z is shown.</div>");
-    lacks(lanes, "nothing before 2026-10-20T09:25:00Z"); // the later stretch is not a second claim
-    CHECK(count_of(lanes, "tl-rg capped") == 3);         // every stretch still draws its own region
-    const auto limits = render_timeline_limits(m, links_full());
-    CHECK(count_of(limits, "was cut off") == 2);
-    contains(limits, "<li>" + first + "</li>");
-    lacks(limits, "nothing before 2026-10-20T09:25:00Z");
+    CHECK(count_of(lanes, "tl-rg rolled") == 3);
+    contains(lanes, "<b>Hourly roll-up</b>");
+    contains(lanes, "<b>Daily roll-up</b>");
+    contains(lanes, "<b>Monthly roll-up</b>");
+    lacks(lanes, "tl-rg unstated");
+    lacks(lanes, "tl-warn");
+    for (const auto& out : {lanes, render_timeline_limits(m, links_full()),
+                            render_timeline_moment(m, W0 + 1800, links_full())}) {
+        lacks(out, "cut off");
+        lacks(out, "Exact");
+        lacks(out, "Nothing at this time");
+    }
+}
+
+TEST_CASE("echo timeline kept chart: no row limit; the hourly band is first and budget-dependent",
+          "[echo][timeline]") {
+    auto m = kept_model(3600);
+    m.kept = {kept("process", "Processes",
+                   {band(EchoTier::hourly, W1 - 20 * kDay, 0), band(EchoTier::daily, W1 - 90 * kDay, 90 * kDay)})};
+    const auto html = render_timeline_kept(m);
+    const auto proc = kept_row_html(html, "process");
+    lacks(html, "rows kept");
+    lacks(html, "Exact");
+    contains(proc, "hourly is budget-dependent; reaches back to 2026-09-30T10:00:00Z on this device");
+    contains(proc, "tl-ks h1\" style=\"left:0.000%;width:" + pct3(ax(20 * kDay)));
+    contains(proc, "<small>budget-dependent</small>");
+    contains(proc, ">hourly, budget-dependent, 20 days here</div>"); // the measured reach
+    CHECK(proc.find("tl-ks h1") < proc.find("tl-ks h2")); // hourly drawn first
+    // no hourly band observed: the sub-label still says the depth is budget-dependent
+    m.kept = {kept("process", "Processes", {})};
+    contains(kept_row_html(render_timeline_kept(m), "process"), "Budget-dependent");
 }
 
 TEST_CASE("echo timeline golden: lanes paused", "[echo][timeline][golden]") {
     auto m = base();
-    m.groups[2].lanes[0].regions = {region(EchoRegionKind::exact, W0, W0 + 1800),
+    m.groups[2].lanes[0].regions = {rolled(EchoTier::hourly, W0, W0 + 1800),
                                     paused(W0 + 1800, W1, W0 + 1800)};
     const auto html = render_timeline_lanes(m);
     check_golden("lanes__paused", html);
@@ -724,7 +733,7 @@ TEST_CASE("echo timeline paused: an unreported pause time is said in words, neve
           "[echo][timeline]") {
     // a pre-0.12.0 agent reports a disabled source with a pause time of 0
     auto m = with_lane(lane("L-svc", "service", "Service changes", {},
-                            {region(EchoRegionKind::exact, W0, W0 + 1800), paused(W0 + 1800, W1, 0)}));
+                            {rolled(EchoTier::hourly, W0, W0 + 1800), paused(W0 + 1800, W1, 0)}));
     const auto lanes = render_timeline_lanes(m);
     contains(lanes, "<b>Paused since a time the agent did not report</b>");
     lacks(lanes, "Paused since 20"); // no date
@@ -733,7 +742,7 @@ TEST_CASE("echo timeline paused: an unreported pause time is said in words, neve
     contains(moment, "Service changes: Not recorded since a time the agent did not report");
     lacks(moment, "\xE2\x80\x94");
     // a known pause time still names it
-    m.groups[0].lanes[0].regions = {region(EchoRegionKind::exact, W0, W0 + 1800),
+    m.groups[0].lanes[0].regions = {rolled(EchoTier::hourly, W0, W0 + 1800),
                                     paused(W0 + 1800, W1, W0 + 1800)};
     contains(render_timeline_lanes(m), "<b>Paused since 2026-10-20T09:30:00Z</b>");
 }
@@ -741,22 +750,11 @@ TEST_CASE("echo timeline paused: an unreported pause time is said in words, neve
 TEST_CASE("echo timeline golden: lanes pruned", "[echo][timeline][golden]") {
     auto m = base();
     m.groups[1].lanes[1].regions = {region(EchoRegionKind::pruned, W0, W0 + 1800),
-                                    region(EchoRegionKind::exact, W0 + 1800, W1)};
+                                    rolled(EchoTier::hourly, W0 + 1800, W1)};
     const auto html = render_timeline_lanes(m);
     check_golden("lanes__pruned", html);
     contains(html, "tl-rg pruned");
     contains(html, "<b>Pruned</b>");
-}
-
-TEST_CASE("echo timeline golden: lanes capped", "[echo][timeline][golden]") {
-    auto m = base();
-    m.groups[0].lanes[0].regions = {capped(W0, W0 + 1800, 10000, W0 + 1800),
-                                    region(EchoRegionKind::exact, W0 + 1800, W1)};
-    const auto html = render_timeline_lanes(m);
-    check_golden("lanes__capped", html);
-    contains(html, "Record cut off at 10000 rows; showing from 2026-10-20T09:30:00Z");
-    contains(html, "The read of proc-a.exe was cut off at 10000 rows; nothing before "
-                   "2026-10-20T09:30:00Z is shown.");
 }
 
 TEST_CASE("echo timeline golden: lanes rolled up", "[echo][timeline][golden]") {
@@ -792,7 +790,7 @@ TEST_CASE("echo timeline golden: lanes dense collapse of counts", "[echo][timeli
 TEST_CASE("echo timeline golden: lanes unstated", "[echo][timeline][golden]") {
     auto m = base();
     m.groups[0].lanes[0].regions = {};
-    m.groups[0].lanes[1].regions = {region(EchoRegionKind::exact, W0, W0 + 1200)};
+    m.groups[0].lanes[1].regions = {rolled(EchoTier::hourly, W0, W0 + 1200)};
     const auto html = render_timeline_lanes(m);
     check_golden("lanes__unstated", html);
     contains(html, "Coverage not stated");
@@ -806,22 +804,22 @@ TEST_CASE("echo timeline golden: kept online", "[echo][timeline][golden]") {
     const auto html = render_timeline_kept(m);
     check_golden("kept__online", html);
 
-    // process: row-limited exact tier; bands exact -> hourly -> daily, no overlap
+    // process: the hourly band draws first from now; bands hourly -> daily, no overlap
     const auto proc = kept_row_html(html, "process");
-    contains(proc, "100000 rows kept; exact records reach back to " + std::string("2026-10-18T10:00:00Z") + " on this device");
-    contains(proc, "tl-ks l\" style=\"left:0.000%;width:" + pct3(ax(2 * kDay)));
-    contains(proc, "tl-ks h1\" style=\"left:" + pct3(ax(2 * kDay)) + "%;width:" + pct3(ax(20 * kDay) - ax(2 * kDay)));
+    contains(proc, "hourly kept 20 days by default");
+    contains(proc, "tl-ks h1\" style=\"left:0.000%;width:" + pct3(ax(20 * kDay)));
+    lacks(html, "tl-ks l\"");
     contains(proc, "tl-ks h2\" style=\"left:" + pct3(ax(20 * kDay)));
     contains(proc, "Hourly roll-up"); // the moment is 15 days back: the hourly tier
     contains(proc, "pruned 20 days after each hour starts, at the earliest");
 
     // arp: time-limited, daily tier at 15 days
     const auto arp = kept_row_html(html, "arp");
-    contains(arp, "kept 1 day by default");
+    contains(arp, "hourly kept 10 days by default");
     contains(arp, "pruned 31 days after each day starts, at the earliest");
 
-    // a tier with oldest_ts == 0 draws nothing: the service row has no hourly segment
-    lacks(kept_row_html(html, "service"), "tl-ks h1");
+    // a tier with oldest_ts == 0 draws nothing: the service row has no daily segment
+    lacks(kept_row_html(html, "service"), "tl-ks h2");
     for (const char* s : {"tl-kp", "now", "1 hour", "1 year", "Age of the record"})
         contains(html, s);
 }
@@ -830,11 +828,11 @@ TEST_CASE("echo timeline golden: kept paused long", "[echo][timeline][golden]") 
     const auto m = kept_model(15 * kDay);
     const auto html = render_timeline_kept(m);
     check_golden("kept__paused-long", html);
-    // service paused 20 days before read_ts; exact oldest 25 days before read_ts
+    // service paused 20 days before read_ts; hourly oldest 25 days before read_ts
     const auto svc = kept_row_html(html, "service");
     contains(svc, "tl-ks none\" style=\"left:0.000%;width:" + pct3(ax(20 * kDay)));
-    contains(svc, "tl-ks l\" style=\"left:" + pct3(ax(20 * kDay)) + "%;width:" + pct3(ax(25 * kDay) - ax(20 * kDay)));
-    CHECK(count_of(svc, "tl-ks l\"") == 1); // the pause is counted once
+    contains(svc, "tl-ks h1\" style=\"left:" + pct3(ax(20 * kDay)) + "%;width:" + pct3(ax(25 * kDay) - ax(20 * kDay)));
+    CHECK(count_of(svc, "tl-ks h1\"") == 1); // the pause is counted once
     // the moment (15 days back) is newer than the pause
     contains(svc, "<span>Not recorded</span>");
     contains(svc, "Source paused since 2026-09-30T10:00:00Z");
@@ -852,10 +850,20 @@ TEST_CASE("echo timeline golden: kept offline", "[echo][timeline][golden]") {
 
 TEST_CASE("echo timeline kept: the moment column states retention, never a rate or a remaining span",
           "[echo][timeline]") {
-    // newest data: the row-limited exact tier
+    // newest data: the hourly tier, with its configured policy
     const auto exact = render_timeline_kept(kept_model(3600));
-    contains(kept_row_html(exact, "process"), "Exact records");
-    contains(kept_row_html(exact, "process"), "kept until newer rows push it out");
+    contains(kept_row_html(exact, "process"), "Hourly roll-up");
+    contains(kept_row_html(exact, "process"), "pruned 20 days after each hour starts, at the earliest");
+    lacks(exact, "Exact records");
+    lacks(exact, "rows kept");
+    // hourly with no stated policy is budget-dependent, said so; the chart keys it too
+    auto budget = kept_model(3600);
+    budget.kept = {kept("process", "Processes", {band(EchoTier::hourly, W1 - 20 * kDay, 0)})};
+    const auto budget_html = render_timeline_kept(budget);
+    contains(kept_row_html(budget_html, "process"), "budget-dependent");
+    contains(kept_row_html(budget_html, "process"), "hourly, budget-dependent");
+    contains(budget_html, "Hourly roll-up (budget-dependent)");
+    lacks(budget_html, "How long this is kept is not stated");
     // older than every band: Gone
     const auto gone = render_timeline_kept(kept_model(59 * kDay));
     contains(kept_row_html(gone, "arp"), "Gone: nothing is kept this far back");
@@ -880,12 +888,12 @@ TEST_CASE("echo timeline kept: a source the engine could not measure says why, n
     auto m = kept_model(15 * kDay);
     // Both rows have no measured band, and the lanes of base() read fine (exact regions), so
     // the chart cannot lean on a lane: the row itself carries the reason.
-    auto failed = kept("process", "Processes", 100000, {band(EchoTier::exact, 0), band(EchoTier::hourly, 0)});
+    auto failed = kept("process", "Processes", {band(EchoTier::hourly, 0)});
     failed.unreadable = EchoUnreadableReason::read_failed;
-    auto too_old = kept("arp", "ARP neighbours", 0, {});
+    auto too_old = kept("arp", "ARP neighbours", {});
     too_old.unreadable = EchoUnreadableReason::agent_too_old;
     // control: a measured row with nothing observed this far back is still pruned, i.e. Gone
-    m.kept = {failed, too_old, kept("service", "Services", 20000, {band(EchoTier::exact, W1 - kDay)})};
+    m.kept = {failed, too_old, kept("service", "Services", {band(EchoTier::hourly, W1 - kDay)})};
     const auto html = render_timeline_kept(m);
     const auto proc = kept_row_html(html, "process");
     contains(proc, "<span>Not readable: the read failed</span>");
@@ -921,8 +929,8 @@ TEST_CASE("echo timeline retention contract: measured coverage never changes an 
     std::string line, qualifier;
     for (std::int64_t oldest_days : {40, 55, 59}) {
         auto m = kept_model(15 * kDay);
-        m.kept = {kept("arp", "ARP neighbours", 0,
-                       {band(EchoTier::exact, W1 - kDay, kDay), band(EchoTier::hourly, W1 - 10 * kDay, 10 * kDay),
+        m.kept = {kept("arp", "ARP neighbours",
+                       {band(EchoTier::hourly, W1 - 10 * kDay, 10 * kDay),
                         band(EchoTier::daily, W1 - oldest_days * kDay, 31 * kDay)})};
         auto bk = bucket("BK", W0 + 100, W0 + 160, 3, EchoTier::daily);
         m.groups = {EchoTimelineGroup{"G", {lane("L-arp", "arp", "ARP neighbours", {bk})}}};
@@ -1050,14 +1058,14 @@ TEST_CASE("echo timeline golden: limits offline", "[echo][timeline][golden]") {
     auto m = base();
     m.online = false;
     m.sources[4].paused_since_ts = W0 - 3 * kDay;
-    m.groups[0].lanes[0].regions = {capped(W0, W0 + 1800, 10000, W0 + 1800)};
+    m.groups[0].lanes[0].regions = {region(EchoRegionKind::pruned, W0, W0 + 1800)};
     const auto html = render_timeline_limits(m, links_full());
     check_golden("limits__offline", html);
     limits_always(html);
     contains(html, "Not readable");
     contains(html, "Services is paused since 2026-10-17T09:00:00Z");
     contains(html, "href=\"/echo#paused\"");
-    contains(html, "The read of proc-a.exe was cut off at 10000 rows");
+    lacks(html, "cut off");
 }
 
 TEST_CASE("echo timeline limits: the capture claim comes from the method, never from the OS",
@@ -1091,13 +1099,15 @@ TEST_CASE("echo timeline limits: the capture claim comes from the method, never 
 
 // ═══ goldens: moment ══════════════════════════════════════════════════════════════════
 
-TEST_CASE("echo timeline golden: moment exact", "[echo][timeline][golden]") {
+TEST_CASE("echo timeline golden: moment rolled up many", "[echo][timeline][golden]") {
     std::vector<EchoTimelineItem> alive;
     for (int i = 1; i <= 14; ++i)
-        alive.push_back(bar("X" + std::to_string(i), W0 + 600, W0 + 2400, "proc-" + std::to_string(i) + ".exe"));
+        alive.push_back(bucket("X" + std::to_string(i), W0 + 600, W0 + 2400, i));
+    alive.push_back(tick("T1", W0 + 600)); // event markers feed the previous / next links
+    alive.push_back(tick("T2", W0 + 2400));
     auto m = with_lane(lane("L-p", "process", "Processes", alive), "Processes");
     const auto html = render_timeline_moment(m, W0 + 1800, links_full());
-    check_golden("moment__exact", html);
+    check_golden("moment__rolled-up-many", html);
     CHECK(count_of(html, "class=\"tl-pr") == 12);
     contains(html, "and 2 more");
     contains(html, "2026-10-20T09:30:00Z");
@@ -1108,9 +1118,9 @@ TEST_CASE("echo timeline golden: moment exact", "[echo][timeline][golden]") {
     const auto bare = render_timeline_moment(m, W0 + 1800, EchoTimelineLinks{});
     contains(bare, "<button type=\"button\" class=\"btn sm\" disabled>Previous event</button>");
     contains(bare, "disabled>Next event</button>");
-    // an exact lane with nothing at t says so, it is not silent
-    const auto none = render_timeline_moment(with_lane(lane("L", "dns", "DNS cache", {}), "Network"), W0 + 5, links_full());
-    contains(none, "DNS cache: Nothing at this time");
+    // a lane no region covers at t says so, it is not silent
+    const auto none = render_timeline_moment(with_lane(lane("L", "dns", "DNS cache", {}, {}), "Network"), W0 + 5, links_full());
+    contains(none, "DNS cache: Coverage not stated");
 }
 
 TEST_CASE("echo timeline golden: moment rolled up", "[echo][timeline][golden]") {
@@ -1134,21 +1144,21 @@ TEST_CASE("echo timeline golden: moment mixed lanes", "[echo][timeline][golden]"
     auto m = base();
     m.groups = {EchoTimelineGroup{
         "Mixed",
-        {lane("L-p", "process", "Processes", {bar("X1", W0 + 600, W0 + 2400, "proc-a.exe")}),
-         lane("L-t", "tcp", "TCP connections", {}, {capped(W0, W1, 10000, W0 + 1000)}),
+        {lane("L-p", "process", "Processes", {bucket("X1", W0 + 600, W0 + 2400, 5)}),
+         lane("L-t", "tcp", "TCP connections", {}, {region(EchoRegionKind::pruned)}),
          lane("L-s", "service", "Service changes", {}, {unreadable(EchoUnreadableReason::read_failed)}),
          lane("L-d", "dns", "DNS cache", {bucket("B1", W0, W1, 4)}, {rolled(EchoTier::hourly)}),
          lane("L-a", "arp", "ARP neighbours", {bucket("B2", W0, W1, 9)}, {rolled(EchoTier::hourly)})}}};
     const auto html = render_timeline_moment(m, W0 + 1800, links_full());
     check_golden("moment__mixed-lanes", html);
     // distinct state lines, each naming its lane
-    contains(html, "TCP connections: The read was cut off at 10000 rows; nothing before 2026-10-20T09:16:40Z is shown");
+    contains(html, "TCP connections: Nothing is kept for this time");
     contains(html, "Service changes: Not readable: the read failed");
     // identical rolled-up states merge into one line naming both
     contains(html, "DNS cache, ARP neighbours: Hourly roll-up: counts only; exact times are not kept.");
-    CHECK(count_of(html, "Hourly roll-up") == 1);
-    // the exact lane lists its item with the lane named
-    contains(html, "<span class=\"nm\">proc-a.exe</span><span class=\"pid\">Processes</span>");
+    CHECK(count_of(html, "Hourly roll-up") == 2); // the process line, and the merged DNS and ARP line
+    // the lane lists its item with the lane named
+    contains(html, "<span class=\"nm\">5</span><span class=\"pid\">Processes</span>");
 }
 
 TEST_CASE("echo timeline golden: moment pruned", "[echo][timeline][golden]") {
@@ -1177,13 +1187,6 @@ TEST_CASE("echo timeline golden: moment offline", "[echo][timeline][golden]") {
     lacks(html, "class=\"tl-pr");
 }
 
-TEST_CASE("echo timeline golden: moment capped", "[echo][timeline][golden]") {
-    auto m = with_lane(lane("L-p", "process", "Processes", {}, {capped(W0, W1, 10000, W0 + 3000)}), "Processes");
-    const auto html = render_timeline_moment(m, W0 + 1800, links_full());
-    check_golden("moment__capped", html);
-    contains(html, "Processes: The read was cut off at 10000 rows; nothing before 2026-10-20T09:50:00Z is shown");
-}
-
 TEST_CASE("echo timeline moment: a rolled-up process lane says what it no longer holds",
           "[echo][timeline]") {
     auto m = with_lane(lane("L-p", "process", "Processes", {bucket("PB", W0, W1, 31)}, {rolled(EchoTier::hourly)}),
@@ -1203,8 +1206,8 @@ TEST_CASE("echo timeline monthly tier: every surface names it", "[echo][timeline
                        "Network");
     m.window_from_ts = W1 - 200 * kDay;
     m.moment_ts = W1 - 100 * kDay; // only the monthly tier reaches this far back
-    m.kept = {kept("dns", "DNS cache", 0,
-                   {band(EchoTier::exact, W1 - kDay, kDay), band(EchoTier::hourly, W1 - 10 * kDay, 10 * kDay),
+    m.kept = {kept("dns", "DNS cache",
+                   {band(EchoTier::hourly, W1 - 10 * kDay, 10 * kDay),
                     band(EchoTier::daily, W1 - 60 * kDay, 60 * kDay),
                     band(EchoTier::monthly, W1 - 400 * kDay, 400 * kDay)})};
     // lanes: the region reason
@@ -1235,17 +1238,19 @@ TEST_CASE("echo timeline monthly tier: every surface names it", "[echo][timeline
 
 // ═══ goldens: selected ════════════════════════════════════════════════════════════════
 
-TEST_CASE("echo timeline golden: selected bar row limited", "[echo][timeline][golden]") {
-    const auto html = render_timeline_selected(base(), "P2", W0 + 3300, links_full());
-    check_golden("selected__bar-row-limited", html);
-    contains(html, "Kept until newer rows push it past the 100000-row limit; no date can be given");
+TEST_CASE("echo timeline golden: selected bar hourly budget", "[echo][timeline][golden]") {
+    auto m = base();
+    m.kept[0].bands[0].policy_s = 0; // process hourly: no stated duration, budget-dependent
+    const auto html = render_timeline_selected(m, "P2", W0 + 3300, links_full());
+    check_golden("selected__bar-hourly-budget", html);
+    contains(html, "Budget-dependent: kept while the device byte budget allows");
     contains(html, "Flagged");
-    contains(html, "<span class=\"pill ok\">Exact</span>");
+    contains(html, "<span class=\"pill warn\">Hourly roll-up</span>");
     // the linked id that exists becomes a button; the unknown one is dropped
     contains(html, "href=\"/echo/selected?ref=P1&amp;t=" + std::to_string(W0 + 3300) + "\"");
     lacks(html, "gone-id");
     // no date in the retention line
-    const auto a = html.find("Kept until newer rows");
+    const auto a = html.find("Budget-dependent");
     REQUIRE(a != std::string::npos);
     const auto line = html.substr(a, html.find("</b>", a) - a);
     CHECK_FALSE(std::regex_search(line, std::regex("[0-9]{4}-[0-9]{2}-[0-9]{2}")));
@@ -1274,15 +1279,21 @@ TEST_CASE("echo timeline golden: selected not found", "[echo][timeline][golden]"
 
 TEST_CASE("echo timeline selected: retention is stated only from policy, else not stated",
           "[echo][timeline]") {
-    // policy_s == 0 and row_limit == 0: not stated
+    // an hourly item with policy_s == 0 is budget-dependent, never a guessed duration
     auto m = with_lane(lane("L", "dns", "DNS cache", {bar("D", W0, W0 + 100)}), "Network");
-    m.kept = {kept("dns", "DNS cache", 0, {band(EchoTier::exact, W0 - kDay, 0)})};
+    m.kept = {kept("dns", "DNS cache", {band(EchoTier::hourly, W0 - kDay, 0)})};
+    contains(render_timeline_selected(m, "D", W0, links_full()),
+             "Budget-dependent: kept while the device byte budget allows");
+    // a daily item with policy_s == 0: not stated
+    m.groups[0].lanes[0].items[0].tier = EchoTier::daily;
+    m.kept = {kept("dns", "DNS cache", {band(EchoTier::daily, W0 - kDay, 0)})};
     contains(render_timeline_selected(m, "D", W0, links_full()), "How long this is kept is not stated");
     // no kept row at all: also not stated
     m.kept.clear();
     contains(render_timeline_selected(m, "D", W0, links_full()), "How long this is kept is not stated");
-    // time-limited exact tier
-    m.kept = {kept("dns", "DNS cache", 0, {band(EchoTier::exact, W0 - kDay, 20 * 3600)})};
+    // time-limited tier
+    m.groups[0].lanes[0].items[0].tier = EchoTier::hourly;
+    m.kept = {kept("dns", "DNS cache", {band(EchoTier::hourly, W0 - kDay, 20 * 3600)})};
     contains(render_timeline_selected(m, "D", W0, links_full()),
              "Pruned after 2026-10-21T05:00:00Z at the earliest (a record ages from its start");
     // the unlinked panel never shows linked buttons without a builder
@@ -1311,7 +1322,7 @@ TEST_CASE("echo timeline escaping: hostile strings in every dynamic slot", "[ech
     auto l = lane(hostile("lane-id"), hostile("lane-source"), hostile("lane-name"), {a, b});
     l.sub = hostile("lane-sub");
     m.groups = {EchoTimelineGroup{hostile("group-name"), {l}}};
-    m.kept.push_back(kept(hostile("lane-source"), hostile("kept-label-2"), 5, {band(EchoTier::exact, W0 - kDay)}));
+    m.kept.push_back(kept(hostile("lane-source"), hostile("kept-label-2"), {band(EchoTier::hourly, W0 - kDay)}));
     EchoTimelineLinks links = links_full();
     links.device = hostile("link-device");
     links.choose_device = hostile("link-choose");
@@ -1357,22 +1368,18 @@ TEST_CASE("echo timeline honesty: no fleet claim, no guessed figure, no invented
     models.push_back(off);
     models.push_back(kept_model(15 * kDay));
     models.push_back(kept_model(59 * kDay));
-    // the states the goldens draw: paused (stated and not reported), capped, pruned, rolled up
+    // the states the goldens draw: paused (stated and not reported), pruned, rolled up
     auto paused_m = base();
-    paused_m.groups[2].lanes[0].regions = {region(EchoRegionKind::exact, W0, W0 + 1800),
+    paused_m.groups[2].lanes[0].regions = {rolled(EchoTier::hourly, W0, W0 + 1800),
                                            paused(W0 + 1800, W1, W0 + 1800)};
     paused_m.sources[4].paused_since_ts = W0 - 3 * kDay;
     paused_m.sources[3].paused = true;
     paused_m.kept[2].paused_since_ts = 0;
     paused_m.kept[2].paused = true;
     models.push_back(paused_m);
-    auto capped_m = base();
-    capped_m.groups[0].lanes[0].regions = {capped(W0, W0 + 1800, 10000, W0 + 1800),
-                                           region(EchoRegionKind::exact, W0 + 1800, W1)};
-    models.push_back(capped_m);
     auto pruned_m = base();
     pruned_m.groups[1].lanes[1].regions = {region(EchoRegionKind::pruned, W0, W0 + 1800),
-                                           region(EchoRegionKind::exact, W0 + 1800, W1)};
+                                           rolled(EchoTier::hourly, W0 + 1800, W1)};
     models.push_back(pruned_m);
     models.push_back(with_lane(lane("L-dns", "dns", "DNS cache", {bucket("B1", W0, W1, 14)},
                                     {rolled(EchoTier::hourly)})));
@@ -1544,7 +1551,7 @@ TEST_CASE("echo timeline selected: retention never states a wrapped or out-of-ra
           "[echo][timeline]") {
     auto model = [](std::int64_t from_ts) {
         auto m = with_lane(lane("L", "arp", "ARP neighbours", {bar("it", from_ts, 0)}), "G");
-        m.kept = {kept("arp", "ARP neighbours", 0, {band(EchoTier::exact, W0 - kDay, kDay)})};
+        m.kept = {kept("arp", "ARP neighbours", {band(EchoTier::hourly, W0 - kDay, kDay)})};
         return m;
     };
     // before the representable past, no start at all, at the far end, and an expiry past year 9999
@@ -1563,11 +1570,11 @@ TEST_CASE("echo timeline selected: retention never states a wrapped or out-of-ra
 TEST_CASE("echo timeline times: one past year 9999 is said in words, never as 1900-", "[echo][timeline]") {
     auto m = kept_model(15 * kDay);
     m.read_ts = kMax;
-    // the exact band reaches back further than the pause, so both segments draw
-    m.kept = {kept("process", "Processes", 100000, {band(EchoTier::exact, kMax / 4)}, kMax / 2)};
+    // the hourly band reaches back further than the pause, so both segments draw
+    m.kept = {kept("process", "Processes", {band(EchoTier::hourly, kMax / 4)}, kMax / 2)};
     const auto html = render_timeline_kept(m);
     contains(html, "oldest observed a time outside the recordable range");
-    contains(html, "exact records reach back to a time outside the recordable range on this device");
+    contains(html, "reaches back to a time outside the recordable range on this device");
     lacks(html, "1900-");
     // the device bar chip and a limits bullet say the same; the playhead chip cannot, because a
     // window outside 1970..9999 draws no playhead at all
@@ -1631,7 +1638,7 @@ TEST_CASE("echo timeline empty model: every renderer says something", "[echo][ti
 
 TEST_CASE("echo timeline region_at: overlapping, unsorted and zero-length regions agree with the lane",
           "[echo][timeline]") {
-    const auto exact_a = region(EchoRegionKind::exact, W0, W0 + 100);
+    const auto exact_a = rolled(EchoTier::hourly, W0, W0 + 100);
     const auto pruned_b = region(EchoRegionKind::pruned, W0 + 50, W0 + 100);
     for (const bool pruned_first : {false, true}) {
         INFO("pruned region first in the vector: " << pruned_first);
@@ -1639,35 +1646,35 @@ TEST_CASE("echo timeline region_at: overlapping, unsorted and zero-length region
         if (pruned_first)
             std::swap(rs[0], rs[1]);
         const auto l = lane("l", "process", "p", {}, rs);
-        CHECK(kind_in(l, W0 + 25) == EchoRegionKind::exact);
+        CHECK(kind_in(l, W0 + 25) == EchoRegionKind::rolled_up);
         CHECK(kind_in(l, W0 + 75) == EchoRegionKind::pruned);  // the later start is drawn on top
         CHECK(kind_in(l, W0 + 100) == EchoRegionKind::pruned); // closed end: the same winner
     }
     // equal starts: the later region in vector order is drawn on top
     for (const bool pruned_last : {false, true}) {
-        std::vector<EchoTimelineRegion> rs{region(EchoRegionKind::exact, W0, W0 + 100),
+        std::vector<EchoTimelineRegion> rs{rolled(EchoTier::hourly, W0, W0 + 100),
                                           region(EchoRegionKind::pruned, W0, W0 + 100)};
         if (!pruned_last)
             std::swap(rs[0], rs[1]);
         CHECK(kind_in(lane("l", "process", "p", {}, rs), W0 + 10) ==
-              (pruned_last ? EchoRegionKind::pruned : EchoRegionKind::exact));
+              (pruned_last ? EchoRegionKind::pruned : EchoRegionKind::rolled_up));
     }
     // a region at its own instant (to <= from) is never drawn, so it never answers, in either order
     for (const bool zero_first : {false, true}) {
-        std::vector<EchoTimelineRegion> rs{region(EchoRegionKind::exact, W0, W0 + 1000),
+        std::vector<EchoTimelineRegion> rs{rolled(EchoTier::hourly, W0, W0 + 1000),
                                           region(EchoRegionKind::paused, W0 + 1000, W0 + 1000)};
         if (zero_first)
             std::swap(rs[0], rs[1]);
         const auto l = lane("l", "process", "p", {}, rs);
-        CHECK(kind_in(l, W0 + 500) == EchoRegionKind::exact);
-        CHECK(kind_in(l, W0 + 1000) == EchoRegionKind::exact);
+        CHECK(kind_in(l, W0 + 500) == EchoRegionKind::rolled_up);
+        CHECK(kind_in(l, W0 + 1000) == EchoRegionKind::rolled_up);
     }
     CHECK(echo_timeline_region_at(lane("l", "process", "p", {}, {region(EchoRegionKind::paused, W0 + 10, W0 + 10)}),
                                  W0 + 10) == nullptr);
 
     // the moment panel names the region the lane draws, from an unsorted vector
     auto m = with_lane(lane("l", "process", "Processes", {},
-                            {region(EchoRegionKind::exact, W0 + 100, W1), exact_a, pruned_b}),
+                            {rolled(EchoTier::hourly, W0 + 100, W1), exact_a, pruned_b}),
                        "G");
     contains(render_timeline_lanes(m), "tl-rg pruned");
     contains(render_timeline_moment(m, W0 + 75, links_full()), "Processes: Nothing is kept for this time");
@@ -1697,11 +1704,11 @@ TEST_CASE("echo timeline moment and selected: t == 0 resolves the way the playhe
 
 TEST_CASE("echo timeline resolve_moment: a bucket's end is not an event boundary", "[echo][timeline]") {
     auto m = with_lane(lane("L", "dns", "DNS cache",
-                            {tick("T", W0 + 2000, "files.example.net"), bucket("BK", W0 + 1500, W0 + 3000, 7)}));
+                            {bucket("BK0", W0 + 2000, W0 + 3500, 3), bucket("BK", W0 + 1500, W0 + 3000, 7)}));
     m.moment_ts = 0;
-    CHECK(echo_timeline_resolve_moment(m) == W0 + 2000); // not the bucket's end at W0 + 3000
+    CHECK(echo_timeline_resolve_moment(m) == W0 + 2000); // not a bucket's end at W0 + 3000
     const auto html = render_timeline_moment(m, echo_timeline_resolve_moment(m), links_full());
-    contains(html, "files.example.net");
+    contains(html, "<span class=\"nm\">3</span>");
     lacks(html, "Nothing at this time");
     // a bucket's start still counts, as a sample's does
     auto starts = with_lane(lane("L", "perf", "CPU", {tick("T", W0 + 1000), column("K", W0 + 1500, W0 + 1530, 5)}));
@@ -1796,7 +1803,7 @@ TEST_CASE("echo timeline golden: kept paused, time not reported", "[echo][timeli
     contains(svc, "; paused since a time the agent did not report");
     lacks(svc, "tl-ks none"); // nothing is placed on the axis that the model does not state
     // the moment is decided by the measured bands: a pause it cannot place is not applied
-    contains(svc, "<span>Exact records</span>");
+    contains(svc, "<span>Hourly roll-up</span>");
     lacks(svc, "Not recorded");
     // a row that is not paused says nothing of it
     lacks(kept_row_html(html, "process"), "paused");

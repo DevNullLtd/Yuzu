@@ -511,17 +511,20 @@ TEST_CASE("render_retention_table appends the Echo tier table after the three wi
     const auto wo = sm::render_retention_table(without);
     CHECK(w.compare(0, wo.size(), wo) == 0);
     CHECK_FALSE(has(wo, "Echo capture sources"));
-    // Only what the builder guarantees on a table with or without `live` rows: the Exact column
-    // and the live-row cells (100,000 rows, Row count only, 1 day, 7 days) belong to the renderer
-    // and the table contents, which other changes own.
-    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Boot</th>",
-                          "<th>Look again after</th>", ">process<", ">3 months<", ">6 months<", ">31 days<", ">12 months<",
-                          ">11 months<", "400 rows", ">30 days<", "every 900 s", "never pruned",
+    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Hourly</th>", "<th>Boot</th>",
+                          "<th>Look again after</th>", ">process<", "every 900 s", "never pruned",
                           "not per-device"})
         CHECK(has(w, n));
+    CHECK_FALSE(has(w, "<th>Exact</th>"));
     const auto cap = w.find("<caption");
     REQUIRE(cap != std::string::npos);
-    CHECK_FALSE(has(w.substr(cap), "class=\"pill"));
+    // The only pill the table draws is the budget-dependent one on a budget-dependent hourly
+    // cell; the retired exact/capped pills are gone.
+    auto table = w.substr(cap);
+    const std::string budget_pill = "<span class=\"pill info\">budget-dependent</span>";
+    for (auto at = table.find(budget_pill); at != std::string::npos; at = table.find(budget_pill))
+        table.erase(at, budget_pill.size());
+    CHECK_FALSE(has(table, "class=\"pill"));
 }
 
 TEST_CASE("render_retention_table with echo:null renders only the three windows",
@@ -606,7 +609,7 @@ TEST_CASE("Echo look-again reads guaranteed depth not the limit",
     const auto t = html.substr(html.find("<caption"));
     CHECK(has(t, "<td class=\"look\">11 months</td>"));
     CHECK(has(t, "<td>12 months</td>"));
-    CHECK(count_sub(t, "Row count only") == 1);
+    CHECK(count_sub(t, "No guarantee: budget-dependent") == 1);
     CHECK(has(t, "<td class=\"look\">30 days</td>"));
     const auto d = t.find(">D<");
     REQUIRE(d != std::string::npos);
@@ -622,9 +625,12 @@ TEST_CASE("Echo hint copy renders the supplied tick and each fixed clause",
     const auto t = html.substr(html.find("<caption"));
     CHECK(has(t, "pruned every 123 s"));
     CHECK_FALSE(has(t, "every 900 s"));
-    for (const char* n : {"agent's clock", "31-day worst-case", "not a deeper tier", "never pruned",
-                          "not per-device"})
+    for (const char* n : {"agent's clock", "deepest guaranteed tier", "not a deeper tier", "never pruned",
+                          "not per-device", "48 hours", "5 days for per-process performance",
+                          "kept for the time shown in the Daily column"})
         CHECK(has(t, n));
+    // The Daily limit differs per source in the payload, so no fixed number of days is promised.
+    CHECK_FALSE(has(t, "kept 180 days"));
 }
 
 TEST_CASE("Echo tier css block is tokens only", "[settings][settings_model][retention][echo][css]") {
@@ -770,4 +776,62 @@ TEST_CASE("build_plugin_signing_settings emits trust_bundle_pem only when explic
     auto j_with = sm::build_plugin_signing_settings(false, std::nullopt, "-----BEGIN...-----");
     REQUIRE(j_with.contains("trust_bundle_pem"));
     CHECK(j_with.at("trust_bundle_pem").get<std::string>() == "-----BEGIN...-----");
+}
+
+namespace {
+nlohmann::json echo_tier_fixture(bool with_budget, std::int64_t budget = 262144000) {
+    nlohmann::json echo = {
+        {"tick_seconds", 900},
+        {"tiers",
+         nlohmann::json::array(
+             {{{"source", "process"}, {"tier", "hourly"}, {"limit_kind", "seconds"},
+               {"limit", 172800}, {"budget_dependent", true}},
+              {{"source", "process"}, {"tier", "daily"}, {"limit_kind", "seconds"},
+               {"limit", 15552000}, {"guaranteed_depth_seconds", 15552000}},
+              {{"source", "arp"}, {"tier", "hourly"}, {"limit_kind", "seconds"},
+               {"limit", 172800}, {"budget_dependent", false}}})}};
+    if (with_budget)
+        echo["db_budget_bytes"] = budget;
+    return nlohmann::json{{"echo", echo}};
+}
+} // namespace
+
+TEST_CASE("render_retention_table Echo tiers: budget line and budget-dependent pill only with db_budget_bytes",
+          "[settings][settings_model][retention][echo]") {
+    const auto with = sm::render_retention_table(echo_tier_fixture(true));
+    CHECK(has(with, "Byte budget per device: 262,144,000 bytes (250 MiB); hourly history "
+                    "is kept while the device is within it"));
+    CHECK_FALSE(has(with, "250 MiB default"));
+    CHECK(has(with, "<td>2 days <span class=\"pill info\">budget-dependent</span></td>"));
+    // arp is not budget-dependent in the fixture: plain hourly cell
+    CHECK(has(with, "<td>2 days</td>"));
+    CHECK(has(with, "<span class=\"hint\">No guarantee: budget-dependent</span>"));
+    CHECK_FALSE(has(with, "Exact"));
+
+    const auto without = sm::render_retention_table(echo_tier_fixture(false));
+    CHECK_FALSE(has(without, "Byte budget per device"));
+    CHECK_FALSE(has(without, "Exact"));
+    CHECK(has(without, "<th>Source</th><th>Hourly</th><th>Daily</th><th>Monthly</th><th>Boot</th>"));
+}
+
+TEST_CASE("render_retention_table Echo tiers: the budget in MiB follows the payload and not a default",
+          "[settings][settings_model][retention][echo]") {
+    // 32 MiB exactly, then a value that rounds up and one that rounds down.
+    CHECK(has(sm::render_retention_table(echo_tier_fixture(true, 33554432)),
+              "33,554,432 bytes (32 MiB)"));
+    CHECK(has(sm::render_retention_table(echo_tier_fixture(true, 33554432 + 524288)),
+              "bytes (33 MiB)"));
+    CHECK(has(sm::render_retention_table(echo_tier_fixture(true, 33554432 + 524287)),
+              "bytes (32 MiB)"));
+    // The largest budget does not overflow the rounding.
+    CHECK(has(sm::render_retention_table(
+                  echo_tier_fixture(true, std::numeric_limits<std::int64_t>::max())),
+              "9,223,372,036,854,775,807 bytes (8,796,093,022,208 MiB)"));
+}
+
+TEST_CASE("render_retention_table Echo tiers: INT64_MIN budget does not overflow",
+          "[settings][settings_model][retention][echo]") {
+    const auto html = sm::render_retention_table(
+        echo_tier_fixture(true, std::numeric_limits<std::int64_t>::min()));
+    CHECK(has(html, "-9,223,372,036,854,775,808 bytes"));
 }

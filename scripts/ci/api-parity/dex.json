@@ -268,5 +268,49 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "composed-of:get.fragments-settings-dex-alerts"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dex/scoring",
+    "capability_id": "get.fragments-dex-scoring",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/score-policy"
+    },
+    "mcp_twin": null,
+    "status": "planned:#6087"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/dex-scoring/save",
+    "capability_id": "post.api-settings-dex-scoring-save",
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/dex/score-policy"
+    },
+    "mcp_twin": null,
+    "status": "planned:#6087"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/dex-scoring/preview",
+    "capability_id": "post.api-settings-dex-scoring-preview",
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/dex/score-policy"
+    },
+    "mcp_twin": null,
+    "status": "planned:#6087"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/dex-scoring/reset",
+    "capability_id": "post.api-settings-dex-scoring-reset",
+    "rest_v1_twin": {
+      "method": "DELETE",
+      "path": "/api/v1/dex/score-policy"
+    },
+    "mcp_twin": null,
+    "status": "planned:#6087"
   }
 ]
