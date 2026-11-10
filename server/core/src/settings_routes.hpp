@@ -11,6 +11,9 @@
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
 #include "deprovision_erasure.hpp"
+#include "dex_read_model.hpp"         // DexAppsModel / DexPolicyInForce (Scoring tab preview seam)
+#include "dex_score_policy_form.hpp"   // DexFormValues / DexScoringView (Scoring tab, pure)
+#include "dex_score_policy_writer.hpp" // DexScorePolicyWriteDeps (Scoring tab)
 #include "engine_principal_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
@@ -103,6 +106,26 @@ public:
     /// (so no request can race the set). May stay empty (tests) — the
     /// handlers then persist without the live apply.
     void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
+
+    /// The DEX Scoring tab's write seam: the SAME deps object RestApiV1 holds for
+    /// PUT/DELETE /api/v1/dex/score-policy (store reader, compare-and-set/remove, provider),
+    /// with `audit` left empty here - each POST binds its own session-stamped audit closure.
+    /// Wired by server.cpp inside the `dex_score_policy_provider_` block, after
+    /// register_routes and before the listener starts; the member is read per request. Left
+    /// unset (no runtime-config store, tests) the tab answers "Config store unavailable".
+    void set_dex_score_policy_writer(DexScorePolicyWriteDeps deps) {
+        dex_score_policy_writer_ = std::move(deps);
+    }
+
+    /// Scores the Apps model (7 days, all platforms) under the policy in force (nullopt: the
+    /// provider's cache, which can trail another replica's write by a refresh interval, used for
+    /// the suggestions only) or under an explicit one (a value; the preview scores both its
+    /// sides this way): the production scorer, never a recomputation here.
+    /// Feeds the image-name suggestions and the pre-save tier-change preview. Set only where
+    /// the signals store exists; with it unset the tab still edits, without suggestions and
+    /// with the preview answering "unavailable".
+    using DexAppsFn = std::function<DexAppsModel(const std::optional<DexPolicyInForce>&)>;
+    void set_dex_apps_fn(DexAppsFn fn) { dex_apps_fn_ = std::move(fn); }
 
     /// Quiet admin gate for the three auto-loading enrolment GET fragments (tokens, pending,
     /// auto-approve). The Groups page loads all three on every view and the pending panel
@@ -312,6 +335,21 @@ private:
     /// dex_signal_groups() catalogue) + the blast-radius alert-shape trio.
     /// State lives in runtime_config; applied live via dex_alert_apply_fn_.
     std::string render_dex_alerts_fragment();
+    /// The DEX Scoring tab body (no wrapper id; GET adds #dex-scoring-section). `posted`
+    /// non-null re-renders the submitted values (a refusal or a preview) instead of `in_force`.
+    /// `editable` = the caller holds Infrastructure:Write (the REST write gate); false renders every
+    /// control disabled. `suggestions` non-null supplies the image suggestions (the preview path
+    /// already holds the "now" model); null reads them, unless the page is locked (read-only or a
+    /// stale refusal), which has no use for them.
+    std::string render_dex_scoring_section(const DexPolicyInForce& in_force, bool editable,
+                                           const std::string& if_match, const DexFormValues* posted,
+                                           std::optional<DexFormError> error,
+                                           std::optional<DexTierPreview> preview,
+                                           const std::string& refused,
+                                           const std::vector<std::string>* suggestions = nullptr);
+    /// POST /api/settings/dex-scoring/{save,preview,reset} share this body.
+    void dex_scoring_post(const httplib::Request& req, httplib::Response& res,
+                          DexScorePolicyWriteRequest::Op op, bool dry_run);
     std::string render_mcp_fragment();
     std::string render_nvd_fragment();
     /// The OIDC SSO form. `message` renders INSIDE #oidc-feedback (an out-of-band
@@ -400,6 +438,8 @@ private:
     AuditAsSessionFn audit_as_session_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
+    std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_; // Scoring tab; see setter
+    DexAppsFn dex_apps_fn_;                                           // Scoring tab; may be empty
     std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()
     std::function<void()> stamp_fault_hook_;   // test seam; empty in production
     RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
