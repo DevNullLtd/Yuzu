@@ -2347,14 +2347,14 @@ TEST_CASE("v2 ingest persists the stored row count and an out-of-band child dele
         CHECK(raw->row_count == std::optional<int>(2));
         CHECK(raw->rows.empty());
     }
-    SECTION("a PARTIAL loss (one of two dimm rows) is caught too, and the surviving row is served") {
+    SECTION("a PARTIAL loss (one of two dimm rows) is caught too, and the surviving row is withheld (#7165)") {
         exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_dimm "
                         "WHERE agent_id = 'agent-rc' AND ord = 1");
         const auto dimm = served_section(store, "agent-rc", "dimm");
         CHECK(dimm["status"] == "constrained");
         CHECK(dimm["complete"] == false);
         CHECK(dimm["reason"] == "server:row_count_mismatch");
-        CHECK(dimm["rows"].size() == 1);
+        CHECK(dimm["rows"].empty());
     }
     SECTION("a capped section that also loses rows keeps server_cap and gains the mismatch token") {
         exec_stmt(pool, "DELETE FROM device_inventory_store.device_ci_cpu "
@@ -2362,7 +2362,7 @@ TEST_CASE("v2 ingest persists the stored row count and an out-of-band child dele
         const auto cpu = served_section(store, "agent-rc", "cpu");
         CHECK(cpu["status"] == "constrained");
         CHECK(cpu["reason"] == "server_cap:32;server:row_count_mismatch");
-        CHECK(cpu["rows"].size() == 10);
+        CHECK(cpu["rows"].empty()); // the ten rows that remain are withheld (#7165)
     }
 }
 
@@ -2526,7 +2526,7 @@ TEST_CASE("a same-count out-of-band edit of a child row is served constrained wi
     CHECK(dimm["status"] == "constrained");
     CHECK(dimm["complete"] == false);
     CHECK(dimm["reason"] == "server:content_digest_mismatch");
-    CHECK(dimm["rows"].size() == 2); // served, but not the reported generation
+    CHECK(dimm["rows"].empty()); // withheld: not the reported generation (#7165)
     // The row COUNT still agrees: the count rule alone would have said complete.
     auto raw = store.get_device_ci_sections("agent-ed");
     REQUIRE(raw.has_value());
@@ -2577,7 +2577,7 @@ TEST_CASE("rows swapped for another generation of the same size are served const
     CHECK(dimm["status"] == "constrained");
     CHECK(dimm["complete"] == false);
     CHECK(dimm["reason"] == "server:content_digest_mismatch");
-    CHECK(dimm["rows"].size() == 2);
+    CHECK(dimm["rows"].empty());
     // The device that was never touched still serves complete.
     CHECK(served_section(store, "agent-g2", "dimm")["complete"] == true);
 }
@@ -2678,7 +2678,7 @@ TEST_CASE("a damaged stored content digest is served constrained with the digest
         CHECK(dimm["status"] == "constrained");
         CHECK(dimm["complete"] == false);
         CHECK(dimm["reason"] == "server:content_digest_mismatch");
-        CHECK(dimm["rows"].size() == 2);
+        CHECK(dimm["rows"].empty()); // withheld on a digest mismatch (#7165)
         // Siblings keep their own digest.
         CHECK(served_section(store, "agent-cd", "cpu")["complete"] == true);
     }
