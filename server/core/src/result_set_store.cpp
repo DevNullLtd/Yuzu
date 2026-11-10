@@ -81,6 +81,8 @@ const char* to_string(ResultSetError e) {
         return "RESULT_SET_TOO_MANY_MEMBERS";
     case ResultSetError::DbError:
         return "RESULT_SET_DB_ERROR";
+    case ResultSetError::NotReady:
+        return "RESULT_SET_NOT_READY";
     }
     return "RESULT_SET_DB_ERROR";
 }
@@ -210,6 +212,11 @@ const std::vector<pg::PgMigration>& migrations() {
         {4,
          "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS agents_failed BIGINT NOT NULL "
          "DEFAULT 0;"},
+        // v5: targeted agents that never answered before an async set was filled at the pending
+        // timeout (see ResultSet::agents_unanswered). Rows filled earlier read 0.
+        {5,
+         "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS agents_unanswered BIGINT NOT NULL "
+         "DEFAULT 0;"},
     };
     return kMigrations;
 }
@@ -225,7 +232,7 @@ bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 constexpr const char* kRowCols =
     "id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, "
     "source_kind, source_payload, status, source_execution_id, matcher, device_count, "
-    "agents_failed";
+    "agents_failed, agents_unanswered";
 
 ResultSet read_row(PGresult* res, int i) {
     ResultSet r;
@@ -250,6 +257,7 @@ ResultSet read_row(PGresult* res, int i) {
     r.matcher = PQgetvalue(res, i, c++);
     r.device_count = to_i64(PQgetvalue(res, i, c++));
     r.agents_failed = to_i64(PQgetvalue(res, i, c++));
+    r.agents_unanswered = to_i64(PQgetvalue(res, i, c++));
     return r;
 }
 
@@ -661,7 +669,7 @@ std::expected<bool, ResultSetError> ResultSetStore::contains(const std::string& 
     return PQntuples(res.get()) > 0;
 }
 
-std::expected<std::unordered_set<std::string>, ResultSetError>
+std::expected<OwnedMembers, ResultSetError>
 ResultSetStore::member_set_owned(const std::string& id, const std::string& owner) {
     if (!open_)
         return std::unexpected(ResultSetError::DbError);
@@ -682,7 +690,8 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
     // when the owner predicate didn't match (or when `id` has zero members).
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT (r.owner_principal = $2) AS owned, m.device_id "
+        "SELECT (r.owner_principal = $2) AS owned, m.device_id, r.status, r.agents_failed, "
+        "r.agents_unanswered "
         "FROM result_set_store.result_sets r "
         "LEFT JOIN result_set_store.result_set_members m "
         "ON m.result_set_id = r.id AND r.owner_principal = $2 "
@@ -707,7 +716,13 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
     const bool owned = to_bool(PQgetvalue(res.get(), 0, 0));
     if (!owned)
         return std::unexpected(ResultSetError::NotOwner);
-    std::unordered_set<std::string> out;
+    // Only a `materialized` set has a membership that means anything: a pending set has none
+    // yet and a failed set never will. Both are errors here, never an empty success.
+    if (result_set_status_from(PQgetvalue(res.get(), 0, 2)) != ResultSetStatus::Materialized)
+        return std::unexpected(ResultSetError::NotReady);
+    OwnedMembers out;
+    out.complete =
+        to_i64(PQgetvalue(res.get(), 0, 3)) == 0 && to_i64(PQgetvalue(res.get(), 0, 4)) == 0;
     out.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i) {
         if (PQgetisnull(res.get(), i, 1))
@@ -1017,7 +1032,8 @@ std::vector<PendingSet> ResultSetStore::list_pending() {
 }
 
 std::expected<void, ResultSetError> ResultSetStore::materialize(
-    const std::string& id, const std::vector<std::string>& members, int64_t agents_failed) {
+    const std::string& id, const std::vector<std::string>& members, int64_t agents_failed,
+    int64_t agents_unanswered) {
     if (!open_)
         return std::unexpected(ResultSetError::DbError);
 
@@ -1054,10 +1070,12 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
         pg::PgResult upd = pg::exec_params(
             conn,
             "UPDATE result_set_store.result_sets SET status = 'materialized', "
-            "device_count = $1::bigint, agents_failed = $2::bigint "
-            "WHERE id = $3 AND status = 'pending' RETURNING id",
+            "device_count = $1::bigint, agents_failed = $2::bigint, "
+            "agents_unanswered = $3::bigint "
+            "WHERE id = $4 AND status = 'pending' RETURNING id",
             std::vector<std::string>{std::to_string(static_cast<int64_t>(uniq.size())),
-                                     std::to_string(agents_failed), id});
+                                     std::to_string(agents_failed),
+                                     std::to_string(agents_unanswered), id});
         if (upd.status() != PGRES_TUPLES_OK) {
             spdlog::error("ResultSetStore::materialize: update failed: {}", PQerrorMessage(conn));
             return false;
@@ -1175,8 +1193,8 @@ bool ResultSetStore::heal_poisoned_payload(const std::string& id) {
 
     // Status is deliberately left untouched (see the header doc comment):
     // a materialized row's members are real and still scope-walkable
-    // (member_set_owned never filters on status), so this only replaces the
-    // poisoned blob, never the row's status.
+    // (member_set_owned still reads it), so this only replaces the poisoned blob, never the
+    // row's status.
     // #4540: RETURNING id + an affected-row check, same idiom as
     // materialize()'s own status-guarded UPDATE above -- a concurrent delete
     // between the SELECT above and this UPDATE (delete_set on an independent

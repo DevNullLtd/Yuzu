@@ -598,7 +598,7 @@ TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op 
         CHECK(got->device_count == 2);
         CHECK(got->agents_failed == 0);
         CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta WHERE store = "
-                                     "'result_set_store'") == "4");
+                                     "'result_set_store'") == "5");
     }
 }
 
@@ -903,6 +903,82 @@ TEST_CASE("ResultSetStore: member_set_owned's four outcomes (#4981 PR-1 A1 rewri
         auto r = store.member_set_owned(rs->id, "bob");
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ResultSetError::NotOwner);
+    }
+}
+
+TEST_CASE("ResultSetStore: member_set_owned refuses a set that is not materialized and flags an "
+          "incomplete one",
+          "[pg][result_set][owner][incomplete]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto pending_req = [](const char* name) {
+        CreateRequest r = req("alice", name);
+        r.source_kind = std::string(source_kind::kEchoQuery);
+        r.source_payload = R"({"sql":"SELECT 1"})";
+        return r;
+    };
+
+    SECTION("pending -> NotReady, not an empty success") {
+        auto rs = store.create_pending(pending_req("pending-set"), "exec-p");
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotReady);
+    }
+    SECTION("failed -> NotReady") {
+        auto rs = store.create_pending(pending_req("failed-set"), "exec-f");
+        REQUIRE(rs.has_value());
+        store.mark_failed(rs->id, "bound exceeded");
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotReady);
+    }
+    SECTION("a non-owner of a pending set still sees NotOwner") {
+        auto rs = store.create_pending(pending_req("foreign-pending"), "exec-o");
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "bob");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ResultSetError::NotOwner);
+    }
+    SECTION("materialized and complete") {
+        auto rs = store.create_pending(pending_req("complete-set"), "exec-c");
+        REQUIRE(rs.has_value());
+        REQUIRE(store.materialize(rs->id, {"dev-1", "dev-2"}).has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 2);
+        CHECK(r->complete);
+    }
+    SECTION("a synchronous set is complete") {
+        auto rs = store.create_materialized(req("alice", "sync-set"), {"dev-1"});
+        REQUIRE(rs.has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->complete);
+    }
+    SECTION("materialized with a failed agent is incomplete") {
+        auto rs = store.create_pending(pending_req("partial-set"), "exec-a");
+        REQUIRE(rs.has_value());
+        REQUIRE(store.materialize(rs->id, {"dev-1"}, 2, 0).has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->size() == 1);
+        CHECK_FALSE(r->complete);
+    }
+    SECTION("materialized with an unanswered agent is incomplete and the count is stored") {
+        auto rs = store.create_pending(pending_req("timeout-set"), "exec-u");
+        REQUIRE(rs.has_value());
+        REQUIRE(store.materialize(rs->id, {"dev-1"}, 0, 4).has_value());
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->complete);
+        auto got = get_ok(store, rs->id);
+        REQUIRE(got.has_value());
+        CHECK(got->agents_unanswered == 4);
     }
 }
 

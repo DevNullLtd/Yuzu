@@ -4876,8 +4876,9 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     std::ostringstream ss;
     ss << in.rdbuf();
     const auto src = ss.str();
-    CHECK(src.find("result_set_store_->materialize(p.id, members, agents_failed)") !=
+    CHECK(src.find("result_set_store_->materialize(p.id, members, agents_failed,") !=
           std::string::npos);
+    CHECK(src.find("agents_unanswered = std::max<int64_t>(") != std::string::npos);
     CHECK(src.find("agents_failed = found->agents_failed;") != std::string::npos);
     // The truncated branch: between its `if` and the line that adopts the membership, the set
     // is marked failed and the branch ends in `continue;` with nothing but the closing brace

@@ -15112,7 +15112,8 @@ private:
     // owner-resolve against), "owner_check_failed" (#4981 PR-1 A3, a
     // referenced set is absent/expired/not owned — including the Finding A
     // TOCTOU case), "presence_degraded" (#4981 PR-1 B, the cross-replica
-    // presence read could not answer), or "unresolvable" (a store the atom
+    // presence read could not answer), "result_set_unusable" (a referenced
+    // set is not ready, or is incomplete under a NOT), or "unresolvable" (a store the atom
     // needs was never wired at this call site). Without this, a dispatch
     // silently reduced to 0 targets by an ABORT is indistinguishable in
     // telemetry/audit from a genuine "0 agents matched" (UP-12) — an operator
@@ -19036,11 +19037,20 @@ private:
                             if (p.source_execution_id.empty())
                                 continue;
                             bool terminal = false;
+                            // Targeted agents that never answered: absent from a set filled at
+                            // the timeout, and not counted in agents_failed.
+                            int64_t agents_unanswered = 0;
                             if (execution_tracker_) {
                                 auto sum = execution_tracker_->get_summary(p.source_execution_id);
                                 terminal = sum.agents_targeted > 0 &&
                                            sum.agents_responded >= sum.agents_targeted;
+                                agents_unanswered = std::max<int64_t>(
+                                    0, int64_t{sum.agents_targeted} - sum.agents_responded);
                             }
+                            // Filled at the timeout without proof that every agent answered
+                            // (no tracker data, or none targeted): not known complete.
+                            if (!terminal)
+                                agents_unanswered = std::max<int64_t>(agents_unanswered, 1);
                             const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
                             if (!terminal && !timed_out)
                                 continue;
@@ -19088,7 +19098,8 @@ private:
                                              "answered execution {} with a failure and never "
                                              "matched",
                                              p.id, agents_failed, p.source_execution_id);
-                            if (result_set_store_->materialize(p.id, members, agents_failed)) {
+                            if (result_set_store_->materialize(p.id, members, agents_failed,
+                                                              agents_unanswered)) {
                                 metrics_
                                     .counter("yuzu_result_sets_total",
                                              {{"source_kind", p.source_kind},
