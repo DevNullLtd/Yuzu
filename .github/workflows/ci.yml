@@ -2246,19 +2246,10 @@ jobs:
           # matrix for the full rule; keep the three matrices in lockstep).
           - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
           - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
-        # pg_mode mirrors the Linux job's own matrix shape (#3443): an
-        # include:-derived key, never a real axis (would double this
-        # matrix and break the runner-pool arithmetic) and never in
-        # `name:` above (job names are required-check contexts,
-        # docs-required-checks). debug keeps full pg-shard coverage on
-        # every PR and push (PRs are debug-only via the exclude: above, so
-        # PR coverage is unchanged by this); release runs the pg smoke
-        # subset instead, on a push to main or the daily release-legs
-        # dispatch (the only events that build release on Windows).
-        # Conditional for the same reason as the linux include (a static
-        # debug entry would re-add the excluded debug leg on a `legs=release`
-        # dispatch); keep the two in lockstep.
-        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && '[{"pg_mode":"smoke"}]' || '[{"pg_mode":"smoke"},{"build_type":"debug","pg_mode":"full"}]') }}
+        # No pg_mode include: (ADR-0035 ladder step 1). This leg builds the
+        # agent only (-Dbuild_server=false at Configure below) and runs no
+        # server or Postgres test, so the Linux job's pg_mode key has nothing
+        # to select here.
 
     steps:
       # PR-5 of the CI overhaul plan: normal CI keeps clean:false on the persistent
@@ -2266,8 +2257,8 @@ jobs:
       # MSYS2 bash configured by `defaults.run.shell` above (so $GITHUB_*
       # env vars and bash test syntax both work).
       #
-      # Per-variant build dirs (build-windows-debug, build-windows-release)
-      # mirror the Linux pattern at lines 265-274. Sharing one build-windows/
+      # Per-variant build dirs (build-windows-agent-debug,
+      # build-windows-agent-release) mirror the Linux pattern. Sharing one dir
       # across debug+release on the same self-hosted runner triggers the same
       # meson --reconfigure variant-leak edge case observed on Linux: when
       # the release build runs first and debug runs second, ninja's link
@@ -2276,8 +2267,17 @@ jobs:
       # mismatches plus LNK1181 truncated-input-path errors. Per-variant
       # dirs eliminate the reconfigure entirely; ccache absorbs the per-TU
       # work across matrix runs so the disk cost is the only added cost.
-      # Also wipe the legacy non-variant dir if it lingers from before
-      # this change.
+      #
+      # The "-agent-" in the dir names (ADR-0035 ladder step 1): this leg
+      # configures with -Dbuild_server=false, while branches cut before that
+      # change still configure the server. Meson keeps a stored option across
+      # `meson setup --reconfigure`, and the branch-switch wipe below does not
+      # fire on detached-HEAD PR checkouts, so a shared dir would hand
+      # build_server=false to an older branch (whose server-suite selection
+      # then matches nothing) or the reverse. Distinct names keep the two
+      # configurations apart. The legacy names are removed unconditionally
+      # below; an older branch that runs after this one rebuilds cold
+      # (ccache-warm) and passes — rebasing onto dev ends that.
       - name: Wipe build-windows/ on branch switch (pre-checkout)
         run: |
           incoming="${GITHUB_REF#refs/heads/}"
@@ -2286,23 +2286,27 @@ jobs:
             if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
               echo "branch switch: $current -> $incoming — wiping build-windows*/"
               rm -rf "$GITHUB_WORKSPACE/build-windows" \
-                     "$GITHUB_WORKSPACE/build-windows-debug" \
-                     "$GITHUB_WORKSPACE/build-windows-release"
+                     "$GITHUB_WORKSPACE/build-windows-agent-debug" \
+                     "$GITHUB_WORKSPACE/build-windows-agent-release"
             fi
           fi
-          # Always remove the legacy single-variant dir so a stale state
-          # from before per-variant dirs landed cannot poison either leg.
-          if [[ -d "$GITHUB_WORKSPACE/build-windows" ]]; then
-            echo "removing legacy build-windows/ (per-variant dirs are now build-windows-{debug,release})"
-            rm -rf "$GITHUB_WORKSPACE/build-windows"
-          fi
+          # Always remove the legacy dirs so a stale state cannot poison
+          # either leg: the single-variant build-windows/ from before
+          # per-variant dirs landed, and the server-configured
+          # build-windows-{debug,release}/ from before ADR-0035 step 1.
+          for legacy in build-windows build-windows-debug build-windows-release; do
+            if [[ -d "$GITHUB_WORKSPACE/$legacy" ]]; then
+              echo "removing legacy $legacy/ (per-variant dirs are now build-windows-agent-{debug,release})"
+              rm -rf "${GITHUB_WORKSPACE:?}/$legacy"
+            fi
+          done
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ needs.preflight-gate.outputs.checkout_repository }}
           ref: ${{ needs.preflight-gate.outputs.checkout_ref }}
           submodules: recursive
-          # clean:false — persist build-windows-{debug,release}/ +
+          # clean:false — persist build-windows-agent-{debug,release}/ +
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
@@ -2460,13 +2464,19 @@ jobs:
           # Per-variant build dir under PR-5 clean:false — see the
           # pre-checkout wipe step above for the rationale. Branch on
           # existence to satisfy meson's "use --reconfigure" requirement.
-          BUILDDIR=build-windows-${{ matrix.build_type }}
+          # -Dbuild_server=false (ADR-0035 ladder step 1): the server is
+          # Linux-only, so this leg builds and tests the agent only. Passed
+          # explicitly on every configure, including a --reconfigure, so a
+          # stored value can never win. vcpkg above still installs the full
+          # manifest (server ports included) until ladder step 3.
+          BUILDDIR=build-windows-agent-${{ matrix.build_type }}
           reconfig=""
           [[ -d "$BUILDDIR/meson-info" ]] && reconfig="--reconfigure"
           meson setup $reconfig "$BUILDDIR" \
             --buildtype=${{ matrix.build_type }} \
             -Dcpp_std=vc++latest \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
+            -Dbuild_server=false \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
           python scripts/ci/assert-gateway-tests.py "$BUILDDIR"
@@ -2480,95 +2490,8 @@ jobs:
         # job's identical Build step for the full rationale, including why
         # a standalone step tripped CodeQL (CWE-349) here.
         run: |
-          meson compile -C build-windows-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
-          bash scripts/ci/check-plugin-capture-os-guard.sh "build-windows-${{ matrix.build_type }}"
-
-      # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
-      # DELIBERATELY dynamic (triplet static override = grpc stack only; the
-      # release zip's vcpkg-DLL sweep ships libpq.dll like sqlite3/openssl —
-      # ADR-0008 "Correction (2026-06-10)"). Assert the import is present so a
-      # silent posture flip in either direction is caught.
-      - name: Assert canary libpq link provenance (DLL import on Windows)
-        run: |
-          bin="build-windows-${{ matrix.build_type }}/server/core/yuzu_pg_canary.exe"
-          test -f "$bin" || { echo "::error::canary binary missing at $bin"; exit 1; }
-          deps="$(dumpbin -dependents "$bin")"
-          if ! echo "$deps" | grep -qi 'libpq.dll'; then
-            echo "::error::canary does not import libpq.dll — Windows linkage posture changed (expected dynamic per ADR-0008 Correction; if flipping to static, update this assert + the triplet override together)"
-            echo "$deps"
-            exit 1
-          fi
-          echo "OK: libpq.dll import present — dynamic linkage as recorded in ADR-0008"
-
-      # Postgres for server tests (ADR-0006 decision 8, #1318).
-      # Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4: each runner
-      # provides a native PostgreSQL 18 service — agent 0's
-      # `postgresql-x64-18-yuzu-ci` on :5433, agents 1-3 their own
-      # `postgresql-x64-18-yuzu-ci-<n>` on :5433+<n> (#2094) — and a
-      # machine-level YUZU_TEST_POSTGRES_DSN (the agent-0 DSN) that the
-      # script's path 1 derives the per-agent port from before exporting it;
-      # required since #1320 PR 1 (SOFT_EXIT=1) — nothing answering fails the
-      # job at this step. See docs/ci-architecture.md "Postgres for server
-      # tests" for the full path-1 mechanism and deploy/windows/ for
-      # provisioning.
-      #
-      # `source`, NOT `bash scripts/...`: inside the step's MSYS2 bash,
-      # PATH puts C:\Windows\system32 before C:\msys64\usr\bin, so a bare
-      # `bash` resolves to the WSL stub, which refuses to run as the
-      # LOCAL SYSTEM service account (Bash/WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED).
-      # Same idiom as `source setup_msvc_env.sh` / `ensure-erlang.sh`.
-      - name: Ensure Postgres (server tests)
-        run: source scripts/ci/ensure-postgres.sh
-
-      # Mirrors the Linux job's own step of the same name (#3443) — see that
-      # step's comment for the full rationale (loud-fail backstop for a
-      # provisioning/matrix-include defect, checked BEFORE any test
-      # invocation runs, not just the PG ones). MATRIX_BUILD_TYPE only:
-      # Windows has no `compiler` axis, so the "primary leg" the Linux
-      # version pins to gcc-15/debug collapses to "debug" alone here.
-      - name: Resolve pg_mode + assert Postgres DSN
-        env:
-          PG_MODE: ${{ matrix.pg_mode }}
-          MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
-          DISPATCH_RELEASE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'true' || 'false' }}
-        run: |
-          case "$PG_MODE" in
-            full|smoke) ;;
-            *)
-              echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke' — matrix include: may be misconfigured"
-              exit 1
-              ;;
-          esac
-          if [[ -z "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
-            echo "::error::YUZU_TEST_POSTGRES_DSN is unset after Ensure Postgres — refusing to proceed to any PG-tagged test invocation (pg_mode=$PG_MODE) rather than let it silently skip"
-            exit 1
-          fi
-          if [[ "$MATRIX_BUILD_TYPE" == "debug" && "$PG_MODE" != "full" ]]; then
-            echo "::error::Windows debug resolved to pg_mode=$PG_MODE, expected 'full' — the matrix include: mapping is broken; this leg must keep full PG-shard coverage on every PR and push"
-            exit 1
-          fi
-          # Symmetric guard (mirrors the Linux step's own): a push leg that
-          # is NOT debug (i.e. release, the only other Windows leg) must
-          # resolve to smoke, or a future include: edit could silently send
-          # every leg back to full and reintroduce full-PG-shard contention
-          # on every push.
-          # Dispatch-aware, as in the Linux step (the daily release-legs
-          # dispatch is now where the release leg usually runs).
-          if [[ "$DISPATCH_RELEASE_ONLY" == "true" && "$MATRIX_BUILD_TYPE" == "debug" ]]; then
-            echo "::error::Windows debug expanded on a legs=release dispatch — the conditional matrix include: is broken"
-            exit 1
-          fi
-          if [[ ( "$GITHUB_EVENT_NAME" == "push" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ) && "$MATRIX_BUILD_TYPE" != "debug" && "$PG_MODE" != "smoke" ]]; then
-            echo "::error::Windows $MATRIX_BUILD_TYPE on a $GITHUB_EVENT_NAME resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces full-PG-shard contention on every Windows push"
-            exit 1
-          fi
-          echo "pg_mode=$PG_MODE"
-          # Bound every libpq connect in the later steps: same export and
-          # rationale as the Linux job's Resolve step above, and the "Connect
-          # cap on the Linux and Windows test legs" paragraph in
-          # docs/ci-architecture.md.
-          echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
-          echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
+          meson compile -C build-windows-agent-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
+          bash scripts/ci/check-plugin-capture-os-guard.sh "build-windows-agent-${{ matrix.build_type }}"
 
       # #6488: proves both decisions of the leftover check; see scripts/ci/check-registry-test-leftovers.ps1
       - name: Self-test the registry leftover check
@@ -2634,30 +2557,28 @@ jobs:
         shell: pwsh
         run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase pre-test
 
-      # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
-      # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md
-      # "PG coverage by platform" for the full rationale and the measured
-      # numbers as the staged protocol produces them. Three differences from
-      # Linux, each with its own reason:
-      #   1. ONE gated non-pg invocation, not two uncapped ones — Wee Tam's
+      # Windows CI test phase. Since ADR-0035 ladder step 1 this leg is
+      # agent-only (-Dbuild_server=false), so ONE invocation runs every suite
+      # the build registers here; the #3443 non-pg/pg-shards/pg-smoke split
+      # it used to carry is gone with the server suites (history:
+      # docs/ci-architecture.md "Windows test-phase concurrency gate" and
+      # "PG coverage by platform"). The step keeps its "non-pg" name
+      # (tests/test_etw_cleanup_wiring.py and the docs refer to it). Two
+      # differences from the Linux non-pg step, each with its own reason:
+      #   1. The invocation is gated by with-test-slot.sh — Wee Tam's
       #      measured contention (docs/ci-architecture.md "Windows test-phase
-      #      concurrency gate") is DRAM/disk/Defender-minifilter, not
-      #      Postgres, so Big Tam's "cheap suites are never the contention
-      #      source, leave them uncapped" reasoning does not transfer; every
-      #      non-pg suite here shares the same box-wide gate.
-      #   2. --suite selection has no by-name fallback (Windows registers no
-      #      per-shard by-name list the way Linux's second invocation does),
-      #      and a bad --suite silently matches zero entries — so
-      #      assert-suite-cover.py runs FIRST, failing loud on a dropped or
-      #      misspelled suite before the real invocation could silently skip
-      #      a whole category.
-      #   3. YUZU_TEST_SLOT_TIMEOUT_MIN: "30" on both gated steps below —
-      #      Wee Tam's with-test-slot.sh default is 115 min; two acquisitions
-      #      per job (non-pg, then pg-shards-full) at that default could
-      #      together exceed this job's own 120-min budget, turning a slot
-      #      wait into an ambiguous job-level kill instead of an attributable
-      #      with-test-slot.sh failure (same reasoning as Big Tam's explicit
-      #      30-min override on its own pg-shards step).
+      #      concurrency gate") is DRAM/disk/Defender-minifilter, so Big
+      #      Tam's "cheap suites are never the contention source, leave them
+      #      uncapped" reasoning does not transfer.
+      #   2. --suite selection has no by-name fallback, and a bad --suite
+      #      silently matches zero entries — so assert-suite-cover.py runs
+      #      FIRST, failing loud on a dropped or misspelled suite before the
+      #      real invocation could silently skip a whole category.
+      # YUZU_TEST_SLOT_TIMEOUT_MIN: "30" — Wee Tam's with-test-slot.sh default
+      # is 115 min, close to this job's own 120-min budget; the explicit cap
+      # turns a long slot wait into an attributable with-test-slot.sh failure
+      # instead of an ambiguous job-level kill (same reasoning as Big Tam's
+      # explicit 30-min override on its own pg-shards step).
       - name: Test (non-pg suites)
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
@@ -2679,13 +2600,13 @@ jobs:
           # previously scoped to alone - this step is the one that includes --suite
           # agent. Absolute path, same reason as windows-asan's own comment on this.
           export YUZU_TEST_PROGRESS=1
-          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-windows-${{ matrix.build_type }}/meson-logs/progress.log"
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-windows-agent-${{ matrix.build_type }}/meson-logs/progress.log"
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
           # #4666/#5025: clear any pid-suffixed MI-1b topology report left over from a
           # prior run in this reused (clean:false) build dir, so the "Surface MI-1b..."
           # step below can't present a stale previous run's verdict as this run's own.
-          rm -f "build-windows-${{ matrix.build_type }}/log_handoff_multi_image_topology."*.txt
+          rm -f "build-windows-agent-${{ matrix.build_type }}/log_handoff_multi_image_topology."*.txt
           # Single-sourced: the guard and the real invocation must select the
           # SAME suites, or the guard certifies a list the real run doesn't
           # actually use (sre Gate 6 finding, governance 2026-08-28) — a
@@ -2694,18 +2615,20 @@ jobs:
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and run on every leg, so
           # the selection swaps docs for platform and the guard excludes docs.
-          suites=(--suite agent --suite platform --suite proto --suite echo --suite gateway --suite server-nonpg --suite server-checks)
-          python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
+          # No server suite: the build registers none (-Dbuild_server=false),
+          # and assert-suite-cover.py fails on a --suite that matches nothing.
+          suites=(--suite agent --suite platform --suite proto --suite echo --suite gateway)
+          python scripts/ci/assert-suite-cover.py --builddir build-windows-agent-${{ matrix.build_type }} \
             "${suites[@]}" \
-            --exclude-suite server-pg --exclude-suite server-pg-smoke --exclude-suite docs
-          rm -f build-windows-${{ matrix.build_type }}/meson-logs/testlog.json
+            --exclude-suite docs
+          rm -f build-windows-agent-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 2 -- \
-            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 \
+            python scripts/ci/flake-retry.py --builddir build-windows-agent-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 \
               "${suites[@]}"
           # Duration summary per invocation: testlog.json is removed before each run
           # (meson overwrites it), so a run that selects no tests leaves no stale log.
           # On a red run bash -e stops before it, use the meson-logs artifact (#4884).
-          python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows non-pg"
+          python scripts/ci/test-durations-summary.py --builddir build-windows-agent-${{ matrix.build_type }} --label "Windows non-pg"
 
       # #6488: the registry plugin's tests create scratch keys under HKLM\SOFTWARE (and Wow6432Node) and HKCU\Software
       # (HKU\.DEFAULT for LOCAL SYSTEM) and each fixture removes its own; this step is the tripwire that notices one that
@@ -2730,77 +2653,6 @@ jobs:
         shell: pwsh
         run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase post-test
 
-      # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
-      # debug-only (exclude: above), so PR coverage is unaffected. k=2 was
-      # the STARTING pool width (measured 602s, one sample); push 2 widened
-      # to k=4 and took 2 same-SHA samples per the protocol's own median
-      # rule (358s / 359s — remarkably stable run-to-run despite the
-      # non-pg step swinging 3x on the SAME commit, confirming the pg step
-      # itself isn't the noisy part): a real 40.5% improvement, no shard's
-      # own duration inflated past 1.16x its k=2 value (well under the
-      # 1.5x stop-rule), nowhere near the 700s per-shard timeout. Push 3
-      # widens to k=6 on that same basis — each width change lands in its
-      # own, individually-measured push (docs/ci-architecture.md), never
-      # bundled with a topology change, so a wall-time delta stays
-      # attributable to one axis at a time.
-      - name: Test (pg shards, full)
-        if: matrix.pg_mode == 'full'
-        env:
-          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
-        run: |
-          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
-            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
-          else
-            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
-          fi
-          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          # Same zero-match hazard the non-pg step's guard above exists for
-          # (review finding, PR #3677): --suite server-pg is inline below
-          # with no by-name fallback, so a typo'd/renamed suite label would
-          # silently match zero tests and this step would "pass" having run
-          # nothing. Excludes everything else so the guard also catches a
-          # future suite this step should select but doesn't.
-          # Single-sourced (build-ci Gate 8 finding, governance
-          # 2026-08-28): the guard and the real invocation must select the
-          # SAME suite, mirroring the non-pg step's pattern above — a
-          # future edit to one without the other would let the guard pass
-          # while flake-retry silently selected a different suite.
-          suites=(--suite server-pg)
-          python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
-            "${suites[@]}" \
-            --exclude-suite agent --exclude-suite docs --exclude-suite proto --exclude-suite echo \
-            --exclude-suite gateway --exclude-suite server-nonpg --exclude-suite server-checks \
-            --exclude-suite server-pg-smoke --exclude-suite platform
-          # Runs LAST (after the non-pg step above): flake-retry.py /
-          # ci-import-junit only import the LAST invocation's testlog.junit.xml
-          # into CI telemetry per job — ordering it last means the pg-shard
-          # numbers (the ones the staged measurement protocol reads) are what
-          # survives, not the non-pg step's. The non-pg step's own
-          # job-summary "Suite durations vs meson budgets" table (written on
-          # every invocation, not just the last) is where its numbers live.
-          rm -f build-windows-${{ matrix.build_type }}/meson-logs/testlog.json
-          bash scripts/ci/with-test-slot.sh 2 -- \
-            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 6 \
-              "${suites[@]}"
-          python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows pg shards"
-
-      # if: matrix.pg_mode == 'smoke' — only the release leg, which runs on a
-      # `main` push or the daily release-legs dispatch (PRs and `dev` pushes
-      # are debug-only, so this step never runs on either; it was verified
-      # post-merge by the first push that built release, not pre-merge). Deliberately UNGATED, mirroring
-      # the Linux smoke step: the smoke set costs seconds, far cheaper than
-      # the slot-wait it would otherwise pay.
-      - name: Test (pg smoke)
-        if: matrix.pg_mode == 'smoke'
-        run: |
-          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
-            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
-          else
-            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
-          fi
-          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs "server pg smoke"
-
       # meson+ninja truncate test stdout to the last 100 lines in the Actions
       # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
       # every failed test — without this artifact, a multi-assertion failure
@@ -2817,7 +2669,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-logs-windows-${{ matrix.build_type }}-${{ github.run_attempt }}
-          path: build-windows-${{ matrix.build_type }}/meson-logs/
+          path: build-windows-agent-${{ matrix.build_type }}/meson-logs/
           if-no-files-found: warn
           retention-days: 14
 
@@ -2846,7 +2698,7 @@ jobs:
         continue-on-error: true
         run: |
           shopt -s nullglob
-          files=(build-windows-${{ matrix.build_type }}/log_handoff_multi_image_topology.*.txt)
+          files=(build-windows-agent-${{ matrix.build_type }}/log_handoff_multi_image_topology.*.txt)
           if [ ${#files[@]} -eq 0 ]; then
             echo "MI-1b: no topology report found (the test case may not have run)." >> "$GITHUB_STEP_SUMMARY"
           else
@@ -2900,7 +2752,7 @@ jobs:
           python scripts/ci/ci-telemetry.py finish
           --job-name "Windows MSVC ${{ matrix.build_type }}"
           --triplet x64-windows
-          --builddir build-windows-${{ matrix.build_type }}
+          --builddir build-windows-agent-${{ matrix.build_type }}
           --conclusion "$YUZU_CI_CONCLUSION"
 
       - name: Purge trusted-fork workspace
@@ -3174,11 +3026,16 @@ jobs:
           CC: ccache cc
           CXX: ccache c++
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-osx/lib/pkgconfig
+        # -Dbuild_server=false (ADR-0035 ladder step 1): the server is
+        # Linux-only, so this leg builds and tests the agent only. vcpkg above
+        # still installs the full manifest (server ports included) until
+        # ladder step 3.
         run: |
           meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
+            -Dbuild_server=false \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
           python3 scripts/ci/assert-gateway-tests.py build-macos
@@ -3197,42 +3054,6 @@ jobs:
         run: |
           meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
           bash scripts/ci/check-plugin-capture-os-guard.sh build-macos
-
-      # Link-provenance assertion (#1331 review HIGH-2): hosted macOS images can
-      # carry a system PostgreSQL, so prove the canary linked vcpkg's static
-      # archive rather than a system dylib resolved by cmake's FindPostgreSQL.
-      - name: Assert canary libpq link provenance (static on macOS)
-        run: |
-          bin="build-macos/server/core/yuzu_pg_canary"
-          test -x "$bin" || { echo "::error::canary binary missing at $bin"; exit 1; }
-          if otool -L "$bin" | grep -qi 'libpq'; then
-            echo "::error::canary dynamically links libpq — expected vcpkg static archive (ADR-0008)"
-            otool -L "$bin" | grep -i 'libpq'
-            exit 1
-          fi
-          echo "OK: no dynamic libpq dependency — static archive linked"
-
-      # The server Postgres suite is DELIBERATELY NOT run on macOS (ADR-0035:
-      # the Yuzu server is a Linux-only component; macOS/Windows are agent-only
-      # platforms). macos-15 GHA runners have a SINGLE brew Postgres cluster,
-      # and the auth->Postgres migration (ADR-0006) ~doubled the [pg] test
-      # population to ~660 clone-bound cases (each does CREATE DATABASE ...
-      # TEMPLATE + DROP ... FORCE). One slow cluster cannot service that within
-      # the per-suite meson budget, and sharding does NOT help — parallel shards
-      # contend on the one cluster (both shards hit their 600s timeout, #2394).
-      # So we intentionally do NOT provision Postgres / export
-      # YUZU_TEST_POSTGRES_DSN here: every [pg] server test then SKIPS
-      # (env-unset -> skip, the same contract the Catch2 PG fixtures and
-      # tests/shell/test_mfa_reset.sh use), while the non-PG server suite
-      # (~[pg]), the agent suite, and the Apple-Clang compile all still run.
-      # Linux + Windows keep FULL [pg] coverage (multi-cluster, faster I/O).
-      # Do NOT re-add ensure-postgres here without first solving the
-      # single-cluster capacity problem — see the shard comment in
-      # tests/meson.build and docs/ci-architecture.md.
-      - name: Server Postgres suite skipped on macOS (ADR-0035; no DSN exported)
-        run: |
-          echo "macOS: server [pg] tests SKIP (YUZU_TEST_POSTGRES_DSN intentionally unset)."
-          echo "The Yuzu server is Linux-only (ADR-0035); Linux + Windows CI legs run the full [pg] suite."
 
       - name: Test
         # --timeout-multiplier 2: BigMags is a shared box (2 runner agents, and
@@ -3255,6 +3076,9 @@ jobs:
           rm -f "$YUZU_TEST_PROGRESS_FILE"
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and keep running here.
+          # No server suite is registered (-Dbuild_server=false, ADR-0035), so
+          # this runs the agent, proto, echo, gateway and platform suites; the
+          # server and its Postgres suites run on Linux only.
           rm -f build-macos/meson-logs/testlog.json
           python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs --timeout-multiplier 2 --no-suite docs
           python3 scripts/ci/test-durations-summary.py --builddir build-macos --label "macOS"

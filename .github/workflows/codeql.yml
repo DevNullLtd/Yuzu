@@ -527,10 +527,14 @@ jobs:
           # Note: the gateway custom_target may fail on Windows if
           # rebar3/erl aren't installed on the runner; meson will skip
           # it via the `if command -v rebar3` guard inside meson.build.
+          # -Dbuild_server=false (ADR-0035 ladder step 1): the server is
+          # Linux-only, so this row analyses the agent's Windows code only;
+          # server code is analysed by the Linux row.
           meson setup ${{ matrix.build_dir }} \
             --buildtype=debug \
             -Dcpp_std=vc++latest \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
+            -Dbuild_server=false \
             -Dbuild_tests=true
 
       - name: Build (CodeQL-traced)
