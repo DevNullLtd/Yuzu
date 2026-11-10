@@ -46,7 +46,7 @@ threads (cert reloader, catalogue rollup, software-title normalisation, provisio
 cleanup, OTA watchdog, MCP projector, the two store-worker delivery pools, and — since HA
 WS-8 — the Postgres reachability probe) each get their own entry too — the 2026-09-07 sweep
 (methodology recorded in the `kBackgroundJobs` header) brought the table to 40 after
-an earlier revision missed eight of these; later additions (49 passes now, including the one-shot
+an earlier revision missed eight of these; later additions (51 passes now, including the one-shot
 `inventory_store.purge_typed_sources` on `typed_purge_thread_` and the hourly
 `software_normalization_job.run_tick` on `SoftwareNormalizationJob::thread_`) are recorded in
 that header.
@@ -61,8 +61,9 @@ that header.
   (the `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
   DisabledUntilFixed passes (incl. the concurrency reconciler), plus the load-bearing
   ReplicaSafe ones (the event-outbox poll, the one-shot typed-source purge
-  `inventory_store.purge_typed_sources` (2a-1b), the four retention prunes (incl.
-  `offline_endpoint_store.run_retention_prune`, #5678), the app_perf rollup upsert,
+  `inventory_store.purge_typed_sources` (2a-1b), the five retention prunes (incl.
+  `offline_endpoint_store.run_retention_prune`, #5678, and
+  `software_inventory_store.run_retention_prune_changes`, SAM-14), the app_perf rollup upsert,
   and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, software-title normalisation (`software_normalization_job.run_tick`), provisional-MFA cleanup, OTA watchdog, MCP
   projector, MCP bridge sweep + session gc, the Guardian reconcile claim sweep
   `guardian_reconcile_gate.sweep` (#5513), store-worker delivery pools, the HA WS-8
@@ -83,7 +84,10 @@ The three formerly-bare wall-clock prunes — `app_perf_fleet_store`,
 the full seven-part clock guard + a `pg_try_advisory_xact_lock` making it
 SINGLE-WRITER-safe, reading Postgres `now()` in-SQL (the shared clock). A fourth,
 `offline_endpoint_store.run_retention_prune` (#5678), adopts the same helper on
-`preflight_runner_thread_` (keyed on the PG-authored `last_seen_at`). The
+`preflight_runner_thread_` (keyed on the PG-authored `last_seen_at`). A fifth,
+`software_inventory_store.run_retention_prune_changes` (SAM-14), adopts it on the same thread
+(keyed on the replica-stamped `observed_at`; the register row records why that clock split is
+accepted). The
 `concurrency_claims` reconciler gained the same advisory lock, but **not** the shared
 clock — its clock authority stays replica-local and its part-3 sanitiser is
 floors-only, so it is **DisabledUntilFixed**, not ReplicaSafe, until the

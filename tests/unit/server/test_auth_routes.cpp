@@ -849,9 +849,9 @@ TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ap
 
 // Workflow:Execute joined the supervised-tier requires_approval() list (owner ruling 2026-10-30).
 // The legacy POST /api/workflows/{id}/execute route gates on require_permission, which mirrors
-// that rule on every non-MCP transport, so a supervised token is refused pending a ticket. No MCP
-// tool maps to Workflow:Execute in this change, so the refusal has no ticket path yet; the gap
-// this closes is a supervised token running a workflow with no human in the loop.
+// that rule on every non-MCP transport, so a supervised token is refused pending a ticket. The ticket
+// path is the MCP execute_workflow tool, which the 403 remediation names; the gap this closes is a
+// supervised token running a workflow with no human in the loop.
 TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from approval-gated "
           "Workflow:Execute on the legacy REST route",
           "[pg][auth_routes][scope][mcp]") {
@@ -872,6 +872,11 @@ TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ap
     auto j = nlohmann::json::parse(res.body);
     CHECK(j["error"]["code"].get<int>() == 403);
     CHECK(j["error"]["permission"].get<std::string>() == "Workflow:Execute");
+    // The remediation names the real entry point and what it needs; the generic text does not.
+    const auto remediation = j["error"]["remediation"].get<std::string>();
+    CHECK(remediation.find("execute_workflow") != std::string::npos);
+    CHECK(remediation.find("idempotency_key") != std::string::npos);
+    CHECK(remediation.find("approval_id") != std::string::npos);
 }
 
 // The "unaffected" side of the rule above: the approval gate is the supervised branch only. An
@@ -906,6 +911,50 @@ TEST_CASE("AuthRoutes::require_permission - Workflow:Execute: untiered token pas
         CHECK(res.status == 403);
         CHECK(res.body.find("does not allow") != std::string::npos);
         CHECK(res.body.find("requires approval") == std::string::npos);
+    }
+}
+
+// ADR-0070 R1 (slice 2b-1a): RevocationSource:Write joined the supervised-tier requires_approval()
+// list. Registration, replace, removal and the anti-rollback reset are ALL a `Write` (never a
+// `Delete`), so without the entry a supervised MCP token held by an administrator would register an
+// egress target, remove a source or reopen the CRL replay window with no ticket on MCP. On a REST
+// transport require_permission applies the same predicate to an MCP token and answers 403 for the
+// four mutation routes (an MCP-tier token can never complete a REST call here: there is no ticket
+// flow on REST, and the administrator predicate with kRest refuses it too), which this test pins.
+// The Read pair is untouched.
+TEST_CASE("AuthRoutes::require_permission - supervised MCP token gets approval_required for every "
+          "RevocationSource mutation on a REST transport, and reads pass",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-rs-sup", "test_user", now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+
+    const std::vector<std::pair<std::string, std::string>> mutations = {
+        {"POST", "/api/v1/crypto/revocation-sources"},
+        {"PUT", "/api/v1/crypto/revocation-sources/1"},
+        {"DELETE", "/api/v1/crypto/revocation-sources/1"},
+        {"POST", "/api/v1/crypto/revocation-sources/1/reset-high-water"},
+    };
+    for (const auto& [method, path] : mutations) {
+        INFO(method << " " << path);
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        req.method = method;
+        req.path = path; // a REST (non-MCP) transport
+        httplib::Response res;
+        // Every one of the four routes gates on the same (securable, operation) pair.
+        CHECK_FALSE(fix.ar->require_permission(req, res, "RevocationSource", "Write"));
+        CHECK(res.status == 403);
+        CHECK(res.body.find("approval") != std::string::npos);
+    }
+    {
+        // The reads are not approval-gated by the policy table.
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        req.path = "/api/v1/crypto/revocation-sources";
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "RevocationSource", "Read"));
+        CHECK(res.body.find("approval") == std::string::npos);
     }
 }
 
@@ -1230,6 +1279,9 @@ TEST_CASE("AuthRoutes::require_permission — supervised MCP token blocked from 
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("approval") != std::string::npos);
+    // A pair with no named MCP tool keeps the generic remediation.
+    CHECK(res.body.find("ticket-then-recall") != std::string::npos);
+    CHECK(res.body.find("execute_workflow") == std::string::npos);
 }
 
 // Complement of the above: on the MCP JSON-RPC transport (`/mcp/v1/`) the C8 gate
@@ -1979,7 +2031,7 @@ TEST_CASE("revalidate_stream: a live token for the stream's principal is valid",
     AuthRoutesFixture f;
     const auto token = f.mint_token();
     auto req = request_with_header("Authorization", "Bearer " + token);
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kValid);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kValid);
 }
 
 TEST_CASE("revalidate_stream: a revoked token DEFINITIVELY ends the stream",
@@ -1993,7 +2045,7 @@ TEST_CASE("revalidate_stream: a revoked token DEFINITIVELY ends the stream",
     auto req = request_with_header("Authorization", "Bearer " + token);
     // kRevoked, NOT kIndeterminate: an indeterminate answer would buy the revoked
     // credential a full grace window of extra life on a live stream.
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kRevoked);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kRevoked);
 }
 
 TEST_CASE("revalidate_stream: a valid token for ANOTHER principal is not authority",
@@ -2003,13 +2055,13 @@ TEST_CASE("revalidate_stream: a valid token for ANOTHER principal is not authori
     auto req = request_with_header("Authorization", "Bearer " + token);
     // The stream carries test_user's messages. A credential that authenticates as
     // somebody else does not entitle the holder to keep reading them.
-    CHECK(f.ar->revalidate_stream(req, "someone_else") == auth::CredentialCheck::kRevoked);
+    CHECK(f.ar->revalidate_stream(req, "someone_else", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kRevoked);
 }
 
 TEST_CASE("revalidate_stream: no credential at all is a definitive no", "[pg][auth][stream][ch4]") {
     AuthRoutesFixture f;
     httplib::Request bare;
-    CHECK(f.ar->revalidate_stream(bare, "test_user") == auth::CredentialCheck::kRevoked);
+    CHECK(f.ar->revalidate_stream(bare, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kRevoked);
 }
 
 TEST_CASE("revalidate_stream: a dead cookie FALLS THROUGH to a live token",
@@ -2025,7 +2077,7 @@ TEST_CASE("revalidate_stream: a dead cookie FALLS THROUGH to a live token",
     httplib::Request req;
     req.set_header("Cookie", "yuzu_session=dead-and-gone");
     req.set_header("Authorization", "Bearer " + token);
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kValid);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kValid);
 }
 
 TEST_CASE("revalidate_stream: X-Yuzu-Token is honoured alongside a dead Bearer",
@@ -2035,7 +2087,7 @@ TEST_CASE("revalidate_stream: X-Yuzu-Token is honoured alongside a dead Bearer",
     httplib::Request req;
     req.set_header("Authorization", "Bearer yuzu_not_a_real_token_000000000000");
     req.set_header("X-Yuzu-Token", token);
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kValid);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kValid);
 }
 
 TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE, not revoked",
@@ -2062,7 +2114,89 @@ TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE, not r
         REQUIRE(r.ok());
     }
 
-    CHECK(f.ar->revalidate_stream(req, "test_user") == auth::CredentialCheck::kIndeterminate);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) == auth::CredentialCheck::kIndeterminate);
+}
+
+// ── revalidate_stream, kAuthoritative: the workflow run's per-step question ───
+//
+// The per-step credential re-check of a workflow run must see a revoke committed by ANOTHER
+// replica, whose in-process cache invalidation never ran here. These tests revoke by a direct
+// write from a second connection (the shape another replica's `revoke_token` has from this
+// process's point of view): `revoke_token` itself would bump the local generation and erase the
+// entry, which is exactly what a remote revoke does not do.
+
+namespace {
+void revoke_behind_the_cache(const std::string& dsn, const std::string& token_id) {
+    yuzu::server::pg::PgConn saboteur{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(saboteur.get()) == CONNECTION_OK);
+    const char* params[1] = {token_id.c_str()};
+    yuzu::server::pg::PgResult r{PQexecParams(
+        saboteur.get(),
+        "UPDATE api_token_store.api_tokens SET revoked = true WHERE token_id = $1", 1, nullptr,
+        params, nullptr, nullptr, 0)};
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+    REQUIRE(std::string(PQcmdTuples(r.get())) == "1");
+}
+} // namespace
+
+TEST_CASE("revalidate_stream: a revoke made behind the token cache is seen by the authoritative "
+          "read and not by the cached one",
+          "[pg][auth][stream][ch4][authoritative]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    const auto live = f.api_tokens->validate_token(token); // warms the 60 s cache
+    REQUIRE(live.has_value());
+
+    revoke_behind_the_cache(f.api_tokens.dsn(), live->token_id);
+
+    // The cache lies, and that is the baseline this feature exists to step around.
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) ==
+          auth::CredentialCheck::kValid);
+    // The authoritative read goes to the row.
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kAuthoritative) ==
+          auth::CredentialCheck::kRevoked);
+    // ...and it touched the cache neither way: the cached read still answers as before.
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) ==
+          auth::CredentialCheck::kValid);
+}
+
+TEST_CASE("revalidate_stream: the authoritative read answers kValid for a live token and does "
+          "not stamp it",
+          "[pg][auth][stream][ch4][authoritative]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kAuthoritative) ==
+          auth::CredentialCheck::kValid);
+    CHECK(f.api_tokens->cache_size() == 0); // read through, inserted nothing
+    // Another principal's token is not authority, in this mode either.
+    CHECK(f.ar->revalidate_stream(req, "someone_else", auth::CredentialReadMode::kAuthoritative) ==
+          auth::CredentialCheck::kRevoked);
+}
+
+TEST_CASE("revalidate_stream: an unreachable token store is INDETERMINATE for the authoritative "
+          "read even when the cache is warm",
+          "[pg][auth][stream][ch4][authoritative]") {
+    AuthRoutesFixture f;
+    const auto token = f.mint_token();
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    REQUIRE(f.api_tokens->validate_token(token).has_value()); // WARM: the cached read will not ask
+
+    {
+        yuzu::server::pg::PgConn saboteur{PQconnectdb(f.api_tokens.dsn().c_str())};
+        REQUIRE(PQstatus(saboteur.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(saboteur.get(), "DROP TABLE api_token_store.api_tokens")};
+        REQUIRE(r.ok());
+    }
+
+    // The cache still vouches for the token; the authoritative read could not ask, and "could not
+    // ask" is neither valid nor revoked.
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kCached) ==
+          auth::CredentialCheck::kValid);
+    CHECK(f.ar->revalidate_stream(req, "test_user", auth::CredentialReadMode::kAuthoritative) ==
+          auth::CredentialCheck::kIndeterminate);
 }
 
 // ---------------------------------------------------------------------------

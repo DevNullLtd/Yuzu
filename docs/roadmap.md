@@ -1005,7 +1005,7 @@ Implement Ed25519-based signing, 3-level key hierarchy (org root → signing key
 **Scope:** Server
 **Depends on:** 2.5, 2.12
 
-Server-side orchestration: `workflow.if` (branch on expression), `workflow.foreach` (iterate result rows, dispatch child per row), `workflow.retry` (retry with backoff). Compose existing InstructionDefinitions — no new execution semantics. Uses `Execution.parent_id` for linking. Design: `docs/Instruction-Engine.md` Section 7.9.
+Server-side orchestration: `workflow.if` (branch on expression), `workflow.foreach` (iterate result rows, dispatch child per row), `workflow.retry` (retry with backoff). Compose existing InstructionDefinitions - no new execution semantics. Uses `Execution.parent_id` for linking. Design: `docs/Instruction-Engine.md` Section 7.9. Running a workflow is also exposed over REST v1 and MCP (`execute_workflow`, #2146 batch B); the residuals of that surface are listed in the ADR-1005 2026-11-05 entry.
 
 **Files:** New `server/core/src/workflow_engine.cpp`, `server/core/src/execution_tracker.cpp`, `server/core/src/instruction_store.cpp`
 
@@ -1499,7 +1499,7 @@ Server-side resource registry for versioned binary blobs:
 ### Issue 13.1: 2FA for Instruction Approval (TOTP)
 **Capability:** new | **Scope:** Server | **Status:** Open (stale: TOTP + MFA step-up landed generally and gates instruction approve and reject, and #6061 and #6079 require an interactive session and an enrolled factor with a fresh proof; the `totp_code` parameter this issue asked for is not wired, the code is entered at the step-up prompt)
 
-TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 37 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. MFA step-up now gates `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` among those routes. This issue's specific ask, a `totp_code` request parameter on instruction approval, is not wired; the step-up check reads the session's MFA proof instead. Original sketch:
+TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream - the step-up check is enforced centrally on 41 named REST/dashboard routes (the three JIT-elevation routes keep their own handler gate) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`, and MCP tools are not step-up gated. MFA step-up now gates `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` among those routes. This issue's specific ask, a `totp_code` request parameter on instruction approval, is not wired; the step-up check reads the session's MFA proof instead. Original sketch:
 
 TOTP (RFC 6238) second factor on instruction approval:
 - Per-user TOTP secret stored encrypted in auth store

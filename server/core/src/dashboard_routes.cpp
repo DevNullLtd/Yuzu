@@ -3702,7 +3702,9 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
     // Each response is from one agent. Parse each line for
     //   config|<source>_enabled|<value>
     //   config|<source>_paused_at|<ts>
-    //   config|<source>_live_rows|<count>
+    //   config|<source>_rows|<count>        (the hourly count; an agent from before the roll-up-
+    //   config|<source>_live_rows|<count>   only release sends only this raw-row figure, which is
+    //                                       read to flag the agent, never shown as the count)
     //   config|<source>_oldest_ts|<ts>
     // and emit one row for every (agent, source) pair where `<source>_enabled` ==
     // "false". Sources with `enabled=true` are dropped — callers want the *paused*
@@ -3798,9 +3800,13 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
                 p != kv.end()) {
                 try { row.paused_at = std::stoll(p->second); } catch (...) {}
             }
-            if (auto lr = kv.find(std::string{source} + "_live_rows");
-                lr != kv.end()) {
+            // Row count: `<src>_rows` is the hourly count. An agent that sends only the
+            // one-release alias `<src>_live_rows` has not moved to the roll-up store: flagged,
+            // and its raw-row figure is not presented as the hourly count.
+            if (auto lr = kv.find(std::string{source} + "_rows"); lr != kv.end()) {
                 try { row.live_rows = std::stoll(lr->second); } catch (...) {}
+            } else if (kv.contains(std::string{source} + "_live_rows")) {
+                row.pre_rollup_agent = true;
             }
             if (auto ot = kv.find(std::string{source} + "_oldest_ts");
                 ot != kv.end()) {
@@ -3830,8 +3836,14 @@ std::string DashboardRoutes::render_echo_retention_paused(
     // `EchoPausedSourceRow` fields) needs no further edits.
     std::vector<EchoPausedSourceRow>& rows = scan.rows;
 
+    // One sentence on every return path: paused rows are held in place, not pruned.
+    static constexpr const char* kPausedHint =
+        "<p class=\"hint\">A paused source is never pruned, so its hourly rows keep their "
+        "place until it is re-enabled or purged.</p>";
+
     if (scan_id.empty()) {
-        return "<div class=\"empty-state\">No scan data yet — click "
+        return std::string(kPausedHint) +
+               "<div class=\"empty-state\">No scan data yet — click "
                "<strong>Scan fleet</strong> above to query the agents "
                "in your scope for Echo retention state.</div>";
     }
@@ -3891,6 +3903,7 @@ std::string DashboardRoutes::render_echo_retention_paused(
                             agents_filtered_out_of_scope == 1 ? "" : "s");
     }
     html += "</div>";
+    html += kPausedHint;
     if (scan.result_truncated_by_cap) {
         // A cut read drops whole responses, which reads as agents that never answered, i.e. as
         // "collecting normally". Say the picture is partial (#4644, row 6a).
@@ -3965,8 +3978,8 @@ std::string DashboardRoutes::render_echo_retention_paused(
             "<th>Source</th>"
             "<th>Paused since</th>"
             "<th>Paused for</th>"
-            "<th class=\"r\">Live rows</th>"
-            "<th>Oldest data</th>"
+            "<th class=\"r\">Hourly rows</th>"
+            "<th>Oldest hourly bucket</th>"
             "<th></th>"
             "</tr></thead><tbody>";
 
@@ -4003,7 +4016,10 @@ std::string DashboardRoutes::render_echo_retention_paused(
             html += "<td>" + format_age(r.paused_at, now) + "</td>";
         }
         html += "<td class=\"r\">";
-        if (r.live_rows < 0) {
+        if (r.pre_rollup_agent) {
+            html += "<span class=\"echo-tree-mute\" title=\"This device runs an agent without "
+                    "the roll-up tables; upgrade the agent\">—</span>";
+        } else if (r.live_rows < 0) {
             html += "<span class=\"echo-tree-mute\">—</span>";
         } else {
             html += std::format("{}", r.live_rows);

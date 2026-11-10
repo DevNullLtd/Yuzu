@@ -1050,14 +1050,37 @@
         var watched = !!polling[row.getAttribute('data-workflow-id')];
         // Disabled while its run is watched: the server accepts duplicate executes, and the
         // earlier one may still be running although the request timed out.
+        var list = $('.ops-list', wfHost);
+        var gated = !!list && list.getAttribute('data-run-gate') === 'approval';
         setReason(b, can('run') && !watched, watched
-          ? 'A run of this workflow may still be in progress.' : 'Requires Workflow:Execute');
+          ? 'A run of this workflow may still be in progress.'
+          : gated ? 'Approval-gated for this MCP token tier: use the MCP execute_workflow tool and its approval ticket'
+                  : 'Requires Workflow:Execute');
       });
     }
 
     function errText(r, fallback) {
       if (r.status === 401) return 'Your session has expired. Sign in again.';
       return r.message || fallback;
+    }
+
+    // A refused run (429: this account already has runs in progress or the server's held-open
+    // budget is full; 503: the server is shutting down or a store is unavailable). The server's
+    // message and the follow-up are separate sentences. A 429 says when to retry from the
+    // Retry-After header (seconds). A 503 never gets a retry-in-N hint: a draining server is
+    // stopping and its own remediation says where to go instead, so that is shown when it sent one.
+    function sentence(text) {
+      var t = typeof text === 'string' ? text.trim() : '';
+      if (!t) return '';
+      t = t.charAt(0).toUpperCase() + t.slice(1);
+      return /[.!?]$/.test(t) ? t : t + '.';
+    }
+    function runRefusalText(status, message, retryAfter, remediation) {
+      var why = sentence(message) || (status === 429 ? 'Too many workflow runs are in progress.'
+                                                     : 'The server is not starting new workflow runs.');
+      if (status === 503) return why + ' ' + (sentence(remediation) || 'Try again shortly.');
+      var secs = parseInt(retryAfter, 10);
+      return why + (secs > 0 && secs <= 3600 ? ' Try again in ' + secs + ' seconds.' : ' Try again shortly.');
     }
 
     function newWorkflow() {
@@ -1348,6 +1371,10 @@
               if (r.status === 401) return 'Your session has expired. Sign in again.';
               var msg = data && data.error && typeof data.error.message === 'string' ? data.error.message : '';
               if (r.status === 403) return msg || 'You do not have permission to run this workflow.';
+              if (r.status === 429 || r.status === 503) {
+                var rem = data && data.error && typeof data.error.remediation === 'string' ? data.error.remediation : '';
+                return runRefusalText(r.status, msg, r.headers.get('Retry-After'), rem);
+              }
               return msg || 'Could not start the run (HTTP ' + r.status + ').';
             });
           }, function () {
@@ -1359,7 +1386,7 @@
       }).then(function (v) {
         if (v === null) return;
         if (outcome === 'timeout') {
-          showToast('The run may keep running on the server. Check Recent runs before running it again.', 'warning');
+          showToast('The run may keep running on the server. Check Recent runs before running it again; starting another run may be refused for up to a minute.', 'warning');
           watchRun(id, baseline);
           return;
         }

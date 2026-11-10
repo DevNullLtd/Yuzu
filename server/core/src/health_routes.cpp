@@ -15,6 +15,7 @@
 #include "baseline_store.hpp"
 #include "ca_store.hpp"
 #include "crypto_dashboard_layout_store.hpp"
+#include "revocation_source_store.hpp"
 #include "custom_properties_store.hpp"
 #include "default_certs.hpp"
 #include "deployment_store.hpp"
@@ -45,6 +46,7 @@
 #include "process_health.hpp"
 #include "product_pack_store.hpp"
 #include "product_registry_store.hpp"
+#include "software_collection_settings_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
@@ -804,6 +806,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
              deps.certificate_inventory_store && deps.certificate_inventory_store->is_open()},
             {"product_registry_store",
              deps.product_registry_store && deps.product_registry_store->is_open()},
+            {"software_collection_settings_store",
+             deps.software_collection_settings_store &&
+                 deps.software_collection_settings_store->is_open()},
             // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
             // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
             // that fails to open AND `--allow-unsigned-packs` set produces
@@ -906,6 +911,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // ADR-3006 — the enablement tables ride the plugin-config schema; boot
             // state only (latched), like the row above.
             {"enablement_store", deps.enablement_store && deps.enablement_store->is_open()},
+            // ADR-0070 R1 - registered CRL sources. AUTHORITATIVE per ADR-0012 section 1: the
+            // registered egress targets and the CA keys every later revocation statement is
+            // judged against. Construction fail-closed already makes a not-open state
+            // unreachable in production (startup_failed_ stops the server before it serves);
+            // boot state only (is_open() is latched, #3061).
+            {"revocation_source_store",
+             deps.revocation_source_store && deps.revocation_source_store->is_open()},
         };
 
         // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction

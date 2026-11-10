@@ -529,6 +529,79 @@ TEST_CASE("ResultSetStore: materialize dedups members and drops empty ids",
     CHECK(members[0] == "a");
 }
 
+// agents_failed: how many agents never matched and answered with a failure. It is persisted
+// with the membership so a reader can tell "no match" from "the query failed".
+TEST_CASE("ResultSetStore: materialize persists agents_failed and every read returns it",
+          "[pg][result_set][async][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "partial");
+    r.source_kind = std::string(source_kind::kEchoQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_pending(r, "exec-failed");
+    REQUIRE(rs.has_value());
+    CHECK(rs->agents_failed == 0); // a pending set has counted nothing yet
+
+    REQUIRE(store.materialize(rs->id, {"dev-1"}, 3).has_value());
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->device_count == 1);
+    CHECK(got->agents_failed == 3);
+
+    // The default is no failures, and a sync set never has any.
+    CreateRequest r2 = req("alice", "complete");
+    r2.source_kind = std::string(source_kind::kEchoQuery);
+    r2.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs2 = store.create_pending(r2, "exec-clean");
+    REQUIRE(rs2.has_value());
+    REQUIRE(store.materialize(rs2->id, {"dev-1"}).has_value());
+    CHECK(get_ok(store, rs2->id)->agents_failed == 0);
+    auto sync = store.create_materialized(req("alice", "sync"), {"dev-1"});
+    REQUIRE(sync.has_value());
+    CHECK(sync->agents_failed == 0);
+}
+
+// Migration v4 adds the column. Roll the recorded version back to 3 and drop the column, as a
+// database last opened by the previous build would be, then open the store twice: the first
+// open applies v4 and keeps the old row's count at 0, the second applies nothing and keeps data.
+TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op on re-run",
+          "[pg][result_set][migration][agents_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    std::string old_id;
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ResultSetStore store(pool);
+        REQUIRE(store.is_open());
+        auto rs = store.create_materialized(req("alice", "old-row"), {"dev-1", "dev-2"});
+        REQUIRE(rs.has_value());
+        old_id = rs->id;
+    }
+    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets DROP COLUMN agents_failed");
+    exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 3 WHERE store = 'result_set_store'");
+    REQUIRE(query_scalar(db.dsn(),
+                         "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+                         "'result_set_store' AND table_name = 'result_sets' AND column_name = "
+                         "'agents_failed'") == "0");
+
+    for (int open = 0; open < 2; ++open) {
+        INFO("open " << open);
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ResultSetStore store(pool);
+        REQUIRE(store.is_open());
+        auto got = get_ok(store, old_id);
+        REQUIRE(got.has_value());
+        CHECK(got->device_count == 2);
+        CHECK(got->agents_failed == 0);
+        CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta WHERE store = "
+                                     "'result_set_store'") == "4");
+    }
+}
+
 TEST_CASE("ResultSetStore: touch extends TTL", "[pg][result_set][ttl]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

@@ -17,7 +17,9 @@
 #include "settings_model.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
 #include <chrono>
+#include <limits>
 #include <string>
 
 #include <yuzu/server/server.hpp>
@@ -439,8 +441,12 @@ TEST_CASE("build_data_retention_settings publishes the Echo retention tiers",
     CHECK(j.at("echo").at("tick_seconds").get<int>() == 900);
     const auto& tiers = j.at("echo").at("tiers");
     REQUIRE(tiers.is_array());
-    for (const auto& t : tiers)
-        CHECK(t.size() == 6);
+    for (const auto& t : tiers) {
+        CHECK(t.size() == 7);
+        REQUIRE(t.at("budget_dependent").is_boolean());
+        CHECK(t.at("budget_dependent").get<bool>() == (t.at("tier") == "hourly"));
+    }
+    CHECK(j.at("echo").at("db_budget_bytes").get<long long>() == 262144000);
 
     const auto find = [&](const char* src, const char* tier) -> const nlohmann::json* {
         for (const auto& t : tiers)
@@ -448,20 +454,14 @@ TEST_CASE("build_data_retention_settings publishes the Echo retention tiers",
                 return &t;
         return nullptr;
     };
-    // The one row-count tier left among the sources: usage keeps its own live table.
-    const auto* live = find("usage", "live");
-    REQUIRE(live);
-    CHECK(live->at("limit_kind") == "rows");
-    CHECK(live->at("limit").get<long long>() == 200000);
-    CHECK(live->at("bucket_seconds").get<long long>() == 0);
-    CHECK(live->at("guaranteed_depth_seconds").is_null());
-    // A roll-up tier: 90 days hourly, a bucket START cut, so the depth is the limit less a bucket.
-    const auto* hourly = find("perf", "hourly");
+    const auto* hourly = find("process", "hourly");
     REQUIRE(hourly);
     CHECK(hourly->at("limit_kind") == "seconds");
     CHECK(hourly->at("limit").get<long long>() == 7776000);
     CHECK(hourly->at("bucket_seconds").get<long long>() == 3600);
-    CHECK(hourly->at("guaranteed_depth_seconds").get<long long>() == 7772400);
+    CHECK(hourly->at("guaranteed_depth_seconds").get<long long>() ==
+          hourly->at("limit").get<long long>() - 3600);
+    CHECK(hourly->at("budget_dependent").get<bool>());
     const auto* daily = find("process", "daily");
     REQUIRE(daily);
     CHECK(daily->at("guaranteed_depth_seconds").get<long long>() == 15465600);
@@ -511,16 +511,20 @@ TEST_CASE("render_retention_table appends the Echo tier table after the three wi
     const auto wo = sm::render_retention_table(without);
     CHECK(w.compare(0, wo.size(), wo) == 0);
     CHECK_FALSE(has(wo, "Echo capture sources"));
-    // 90 days hourly, 180 days daily, a year monthly; usage keeps its own live rows and a 31-day
-    // daily tier; the look-again figure is the monthly depth.
-    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Exact</th>", "<th>Boot</th>",
-                          "<th>Look again after</th>", ">process<", "200,000 rows", ">3 months<",
-                          ">6 months<", ">31 days<", ">12 months<", ">11 months<", "400 rows",
-                          ">30 days<", "every 900 s", "never pruned", "not per-device"})
+    for (const char* n : {"<caption>Echo capture sources</caption>", "<th>Hourly</th>", "<th>Boot</th>",
+                          "<th>Look again after</th>", ">process<", "every 900 s", "never pruned",
+                          "not per-device"})
         CHECK(has(w, n));
+    CHECK_FALSE(has(w, "<th>Exact</th>"));
     const auto cap = w.find("<caption");
     REQUIRE(cap != std::string::npos);
-    CHECK_FALSE(has(w.substr(cap), "class=\"pill"));
+    // The only pill the table draws is the budget-dependent one on a budget-dependent hourly
+    // cell; the retired exact/capped pills are gone.
+    auto table = w.substr(cap);
+    const std::string budget_pill = "<span class=\"pill info\">budget-dependent</span>";
+    for (auto at = table.find(budget_pill); at != std::string::npos; at = table.find(budget_pill))
+        table.erase(at, budget_pill.size());
+    CHECK_FALSE(has(table, "class=\"pill"));
 }
 
 TEST_CASE("render_retention_table with echo:null renders only the three windows",
@@ -549,6 +553,17 @@ TEST_CASE("echo_duration_text worked examples", "[settings][settings_model][rete
     CHECK(sm::echo_duration_text(60 * d) == "2 months");
     CHECK(sm::echo_duration_text(14 * d) == "2 weeks");
     CHECK(sm::echo_duration_text(13 * d) == "13 days");
+}
+
+TEST_CASE("Echo row counts group thousands including the most negative value",
+          "[settings][settings_model][retention][echo]") {
+    // Negating INT64_MIN as a signed value is undefined; the magnitude is formatted unsigned.
+    const auto html = sm::render_retention_table(retention_with_echo(nlohmann::json::array({
+        tier("A", "hourly", "rows", std::numeric_limits<long long>::min()),
+        tier("B", "hourly", "rows", 1234567),
+    })));
+    CHECK(has(html, "<td>-9,223,372,036,854,775,808 rows</td>"));
+    CHECK(has(html, "<td>1,234,567 rows</td>"));
 }
 
 TEST_CASE("Echo tier table escapes the source name", "[settings][settings_model][retention][echo]") {
@@ -594,7 +609,7 @@ TEST_CASE("Echo look-again reads guaranteed depth not the limit",
     const auto t = html.substr(html.find("<caption"));
     CHECK(has(t, "<td class=\"look\">11 months</td>"));
     CHECK(has(t, "<td>12 months</td>"));
-    CHECK(count_sub(t, "Row count only") == 1);
+    CHECK(count_sub(t, "No guarantee: budget-dependent") == 1);
     CHECK(has(t, "<td class=\"look\">30 days</td>"));
     const auto d = t.find(">D<");
     REQUIRE(d != std::string::npos);
@@ -610,9 +625,12 @@ TEST_CASE("Echo hint copy renders the supplied tick and each fixed clause",
     const auto t = html.substr(html.find("<caption"));
     CHECK(has(t, "pruned every 123 s"));
     CHECK_FALSE(has(t, "every 900 s"));
-    for (const char* n : {"agent's clock", "31-day worst-case", "not a deeper tier", "never pruned",
-                          "not per-device"})
+    for (const char* n : {"agent's clock", "deepest guaranteed tier", "not a deeper tier", "never pruned",
+                          "not per-device", "48 hours", "5 days for per-process performance",
+                          "kept for the time shown in the Daily column"})
         CHECK(has(t, n));
+    // The Daily limit differs per source in the payload, so no fixed number of days is promised.
+    CHECK_FALSE(has(t, "kept 180 days"));
 }
 
 TEST_CASE("Echo tier css block is tokens only", "[settings][settings_model][retention][echo][css]") {
@@ -758,4 +776,62 @@ TEST_CASE("build_plugin_signing_settings emits trust_bundle_pem only when explic
     auto j_with = sm::build_plugin_signing_settings(false, std::nullopt, "-----BEGIN...-----");
     REQUIRE(j_with.contains("trust_bundle_pem"));
     CHECK(j_with.at("trust_bundle_pem").get<std::string>() == "-----BEGIN...-----");
+}
+
+namespace {
+nlohmann::json echo_tier_fixture(bool with_budget, std::int64_t budget = 262144000) {
+    nlohmann::json echo = {
+        {"tick_seconds", 900},
+        {"tiers",
+         nlohmann::json::array(
+             {{{"source", "process"}, {"tier", "hourly"}, {"limit_kind", "seconds"},
+               {"limit", 172800}, {"budget_dependent", true}},
+              {{"source", "process"}, {"tier", "daily"}, {"limit_kind", "seconds"},
+               {"limit", 15552000}, {"guaranteed_depth_seconds", 15552000}},
+              {{"source", "arp"}, {"tier", "hourly"}, {"limit_kind", "seconds"},
+               {"limit", 172800}, {"budget_dependent", false}}})}};
+    if (with_budget)
+        echo["db_budget_bytes"] = budget;
+    return nlohmann::json{{"echo", echo}};
+}
+} // namespace
+
+TEST_CASE("render_retention_table Echo tiers: budget line and budget-dependent pill only with db_budget_bytes",
+          "[settings][settings_model][retention][echo]") {
+    const auto with = sm::render_retention_table(echo_tier_fixture(true));
+    CHECK(has(with, "Byte budget per device: 262,144,000 bytes (250 MiB); hourly history "
+                    "is kept while the device is within it"));
+    CHECK_FALSE(has(with, "250 MiB default"));
+    CHECK(has(with, "<td>2 days <span class=\"pill info\">budget-dependent</span></td>"));
+    // arp is not budget-dependent in the fixture: plain hourly cell
+    CHECK(has(with, "<td>2 days</td>"));
+    CHECK(has(with, "<span class=\"hint\">No guarantee: budget-dependent</span>"));
+    CHECK_FALSE(has(with, "Exact"));
+
+    const auto without = sm::render_retention_table(echo_tier_fixture(false));
+    CHECK_FALSE(has(without, "Byte budget per device"));
+    CHECK_FALSE(has(without, "Exact"));
+    CHECK(has(without, "<th>Source</th><th>Hourly</th><th>Daily</th><th>Monthly</th><th>Boot</th>"));
+}
+
+TEST_CASE("render_retention_table Echo tiers: the budget in MiB follows the payload and not a default",
+          "[settings][settings_model][retention][echo]") {
+    // 32 MiB exactly, then a value that rounds up and one that rounds down.
+    CHECK(has(sm::render_retention_table(echo_tier_fixture(true, 33554432)),
+              "33,554,432 bytes (32 MiB)"));
+    CHECK(has(sm::render_retention_table(echo_tier_fixture(true, 33554432 + 524288)),
+              "bytes (33 MiB)"));
+    CHECK(has(sm::render_retention_table(echo_tier_fixture(true, 33554432 + 524287)),
+              "bytes (32 MiB)"));
+    // The largest budget does not overflow the rounding.
+    CHECK(has(sm::render_retention_table(
+                  echo_tier_fixture(true, std::numeric_limits<std::int64_t>::max())),
+              "9,223,372,036,854,775,807 bytes (8,796,093,022,208 MiB)"));
+}
+
+TEST_CASE("render_retention_table Echo tiers: INT64_MIN budget does not overflow",
+          "[settings][settings_model][retention][echo]") {
+    const auto html = sm::render_retention_table(
+        echo_tier_fixture(true, std::numeric_limits<std::int64_t>::min()));
+    CHECK(has(html, "-9,223,372,036,854,775,808 bytes"));
 }

@@ -1,0 +1,247 @@
+## Virtualization Definitions
+## Reports whether the device is a virtual machine, which hypervisor, and whether the agent
+## itself runs in a container, as facts only: nothing is enforced, changed or fetched.
+## Plugin: virtualization | Actions: host, wsl
+##
+## Sources by platform (no subprocess on any):
+##   Linux:   CPUID (x86), /sys/class/dmi/id/{sys_vendor,product_name}, /sys/hypervisor/type,
+##            /.dockerenv, /run/.containerenv, /run/systemd/container and the agent's own
+##            /proc/self/cgroup.
+##   macOS:   sysctl kern.hv_vmm_present and hw.model.
+##   Windows: CPUID (x86) and the SMBIOS System Information table (GetSystemFirmwareTable RSMB).
+##   Windows (`wsl`): the HKLM ProfileList and Lxss\MSI keys, and each local profile's Lxss key
+##            through the shared with_user_hive ladder (loaded hive first, else a guarded offline
+##            NTUSER.DAT mount); see the second document below.
+##
+## A Windows machine running Hyper-V, VBS or WSL2 sets the CPUID hypervisor bit but is the HOST:
+## the Hyper-V root-partition bit separates it from a guest (kind host_with_hypervisor,
+## is_virtual no). A host-decision source (SMBIOS, CPUID, OS hint) that cannot be read never
+## reads as bare metal: the kind is `unknown` and the host row's source field carries the reason.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.virtualization.host
+  displayName: Virtualization Host
+  version: 1.0.0
+  description: >
+    Reports whether this device is a virtual machine, which hypervisor it runs under and whether
+    the agent itself runs in a container, as facts only. The kind separates a guest from a
+    Windows host that merely runs Hyper-V, VBS or WSL2 (host_with_hypervisor), and from
+    bare_metal, which means no virtualization signal was seen, not proof of physical hardware: a
+    Linux KVM host reads bare_metal, a Xen dom0 reads guest with vendor xen, and an ARM machine
+    with no readable negative signal reads unknown. A host-decision source (SMBIOS, CPUID, OS
+    hint) that cannot be read never reads as bare_metal: the kind is unknown and the reason is on
+    the status row and in the host row's source field; a failed container read makes the status
+    constrained. A leading status row states whether the read was complete: constrained means a
+    source could not be read (a refused read stays refused until permissions change), unsupported
+    means the leg threw. Container membership is best effort: a container without a marker file
+    or systemd record can read no when its readable, non-root cgroup path has no recognised
+    runtime signature, and Windows does not read it.
+  tags: [inventory, virtualization, hypervisor, container, posture]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: virtualization
+    action: host
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Rows are discriminated by field 0 (row_kind); "-" is an absent value. A status row always
+    # comes first.
+    #
+    #   status|host|<supported|constrained|unsupported>|<reason or ->
+    #   host|<yes|no|unknown>|<guest|host_with_hypervisor|bare_metal|unknown>|<vendor>|<product>|<source>|<high|medium|low>
+    #   container|<yes|no|unknown>|<evidence or reason>
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, host, container]
+        description: 'Row shape discriminator (field 0). Values: status, host, container.'
+        example: host
+        platforms: [windows, linux, darwin]
+      - name: field_1
+        type: string
+        description: 'status: the literal "host". host: is_virtual, yes (a guest), no (bare metal or a host running a hypervisor) or unknown. container: yes, no or unknown (is the agent itself in a container).'
+        example: 'no'
+        platforms: [windows, linux, darwin]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained or unsupported (a leg that threw). host: kind, guest, host_with_hypervisor (a Windows host running Hyper-V, VBS or WSL2), bare_metal (no virtualization signal seen, not proof of physical hardware) or unknown. container: the evidence (/.dockerenv, /run/.containerenv, /run/systemd/container, cgroup:<runtime>, linux:no_container_marker, macos:no_container_runtime) or, for unknown, the reason (linux:virtualization:container:cgroup_root_opaque for a cgroup-v2 namespace that hides the answer, windows:virtualization:container:not_read on Windows). A container no is best effort: a container without a marker file or systemd record can read no when its readable, non-root cgroup path has no recognised runtime signature.'
+        example: bare_metal
+        platforms: [windows, linux, darwin]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like linux:virtualization:dmi:permission_denied, linux:virtualization:cpuid:unavailable, windows:virtualization:smbios:truncated, macos:virtualization:hw_model:unreadable, linux:leg:exception. host: the virtualization platform (kvm, hyperv, vmware, xen, virtualbox, parallels, bhyve, qemu, acrn, aws, gce, alibaba, openstack, nutanix, apple or other) for a guest or host_with_hypervisor, the hardware manufacturer for bare_metal and unknown, "-" when not read.'
+        example: Apple Inc.
+        platforms: [windows, linux, darwin]
+      - name: field_4
+        type: string
+        description: 'host: the SMBIOS product name or macOS hw.model, "-" when not read. Not used by the other kinds.'
+        example: Mac16,10
+        platforms: [windows, linux, darwin]
+      - name: field_5
+        type: string
+        description: 'host: the evidence source that decided the kind (cpuid, smbios, sysctl or sys_hypervisor); when the kind is unknown, the joined reason tokens instead. Not used by the other kinds.'
+        example: sysctl
+        platforms: [windows, linux, darwin]
+      - name: field_6
+        type: string
+        description: 'host: confidence, high, medium or low (an unknown is low). Not used by the other kinds.'
+        example: high
+        values: [high, medium, low]
+        platforms: [windows, linux, darwin]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "Report virtualization facts"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [virtualization]
+
+status:
+  phase: active
+
+---
+## windows.virtualization.wsl: the WSL distributions of every local profile (Windows only).
+##
+## For each real local profile the agent reads Software\Microsoft\Windows\CurrentVersion\Lxss
+## through the shared with_user_hive ladder: the loaded HKU hive first, else a guarded offline
+## NTUSER.DAT mount under SeBackupPrivilege and SeRestorePrivilege (already held by the agent
+## account, enabled only inside the offline arm, under the process-wide offline-hive lock and the
+## default-on hive-file guard). No subprocess. The work per dispatch is bounded in rows, bytes and
+## registry calls; the mount calls have no wall-clock deadline (bounded work, not bounded time).
+## A hive that could not be reached is reported on its own profile row and counted, never read as
+## having no distributions. gather.ttlSeconds is the response window of the definition, not a
+## schedule. A registry link planted at an Lxss or distribution key is detected and reported
+## (windows:virtualization:wsl:lxss_link), never followed.
+##
+## Roles: executeRoles follows the `host` document and is advisory (docs/yaml-dsl-spec.md); the
+## enforced control is the server's ExecuteGate, AdminOrApproval, which mirrors
+## installed_apps.list_per_user (approval.mode role-gated).
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.virtualization.wsl
+  displayName: WSL Distributions
+  version: 1.0.0
+  description: >
+    Lists the Windows Subsystem for Linux distributions installed for each local user profile:
+    the account (the profile folder name), the distribution name, its WSL version (1 or 2), its
+    install state, whether it is that user's default and its flavor. A profile that is not logged
+    on is read through the same guarded offline hive mount the per-user software inventory uses
+    (SeBackupPrivilege and SeRestorePrivilege, already held by the agent; the mount changes that
+    hive's sequence number and hash, #4977). This is per-user data (account and distribution names), so
+    it requires an administrator or an approval. A summary row counts the distributions, how many are WSL 2 (not a VM count: every WSL 2
+    distribution shares one utility VM whose running state is not read), the profiles read, the
+    profiles whose hive could not be reached and the WSL package version. A profile whose hive
+    was not reached, or whose mount could not be released, is reported on its own profile row;
+    the status row is constrained whenever anything was not read in full, and a registry link
+    planted at the Lxss key or at a distribution key is reported rather than followed. Install paths, disk image
+    paths, SIDs, user ids and mount names are never reported.
+  tags: [inventory, virtualization, wsl, per-user]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: virtualization
+    action: wsl
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Rows are discriminated by field 0 (row_kind); "-" is an absent value. A status row always
+    # comes first, then one summary row.
+    #
+    #   status|wsl|<supported|constrained|unsupported>|<reason or ->
+    #   summary|<distributions>|<wsl2>|<profiles_read>|<profiles_not_loaded>|<package_version or ->
+    #   profile|<account or ->|<outcome>|<detail or ->
+    #   distribution|<account or ->|<name>|<1|2|unknown>|<state>|<yes|no>|<flavor or ->
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, summary, profile, distribution]
+        description: 'Row shape discriminator (field 0). Values: status, summary, profile, distribution.'
+        example: distribution
+        platforms: [windows]
+      - name: field_1
+        type: string
+        description: 'status: the literal "wsl". summary: the number of distributions listed. profile and distribution: the account, the profile folder name ("-" when it cannot be resolved), never the SID.'
+        example: alice
+        platforms: [windows]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained or unsupported (a leg that threw). summary: the number of WSL 2 distributions (not a VM count). profile: the outcome, not_found, privilege_missing, mount_failed, access_denied, file_refused, unload_failed, backup_skipped or sid_invalid. distribution: the distribution name as WSL records it (an e-mail-shaped name is replaced by [redacted-email]).'
+        example: Ubuntu-26.04
+        platforms: [windows]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like windows:virtualization:wsl:hive_mount_failed, windows:virtualization:wsl:lxss_link, windows:virtualization:wsl:row_cap, windows:leg:exception. summary: the number of profiles whose Lxss key was read or found absent (it need not add up with field 4 to the profile count: a reached hive whose Lxss key could not be opened, or is a registry link, appears only as a status token). profile: a detail, the hive-file guard refusal for file_refused (hive_path_unc and similar), otherwise "-". distribution: the WSL version, 1, 2 or unknown.'
+        example: '2'
+        platforms: [windows]
+      - name: field_4
+        type: string
+        description: 'summary: the number of profiles whose hive was reached by neither the loaded hive nor the offline mount (a .bak entry or an invalid SID counts, and so does a profile never reached because a dispatch-wide limit stopped the walk). distribution: the install state, installed, installing, uninstalling, converting, exporting, compacting, state_<n> for an unrecognised value or unknown.'
+        example: installed
+        platforms: [windows]
+      - name: field_5
+        type: string
+        description: 'summary: the WSL package version, "-" when unavailable. distribution: whether this is the account''s default distribution, yes or no.'
+        example: 'yes'
+        platforms: [windows]
+      - name: field_6
+        type: string
+        description: 'distribution: the flavor WSL records (for example ubuntu), "-" when absent; an e-mail-shaped value is replaced by [redacted-email]. Not used by the other kinds.'
+        example: ubuntu
+        platforms: [windows]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "List WSL distributions per user profile"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [virtualization]
+
+status:
+  phase: active

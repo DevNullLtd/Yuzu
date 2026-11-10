@@ -261,11 +261,27 @@ public:
         std::optional<ApiToken> token;  ///< engaged iff kValid
     };
 
+    /// Where `validate_token_checked` may take its answer from. There is NO default, on purpose:
+    /// each caller states which question it is asking.
+    enum class TokenReadMode {
+        /// May be served from the process-local 60 s cache (`kTokenCacheTtl`). A revoke handled
+        /// by ANOTHER replica is not seen until the entry ages out (#4766). For a caller that
+        /// polls on a timer (the held-open stream pump) and tolerates that lag by design.
+        kCached,
+        /// Never consults the cache: one indexed read of the durable row, so a revoke committed
+        /// by any replica before the read is seen by it. For a caller that decides, at a
+        /// boundary, whether an already-authenticated operation may go on (the workflow run's
+        /// per-step check). Touches the cache neither way (no hit, no insert, no erase), counts
+        /// neither a hit nor a miss, and writes nothing (no `last_used_at`).
+        kAuthoritative,
+    };
+
     /// `validate_token` with the failure mode preserved. The extra store probe
-    /// runs ONLY on the negative path (a valid token — the steady state for a
+    /// runs ONLY on the negative path under `kCached` (a valid token, the steady state for a
     /// live stream — is served from the same 60 s cache as `validate_token`, so
-    /// re-validation stays O(cache-refresh), not O(streams × tick)).
-    CheckedToken validate_token_checked(const std::string& raw_token);
+    /// re-validation stays O(cache-refresh), not O(streams × tick)). Under `kAuthoritative`
+    /// every call is one read: a lease or query failure is `kUnavailable`, never `kInvalid`.
+    CheckedToken validate_token_checked(const std::string& raw_token, TokenReadMode mode);
 
     /// List all tokens (for admin UI). Raw token values are never returned.
     /// Authoritative read (ADR-0012 §1): `unexpected` on a runtime DB error, a

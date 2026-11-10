@@ -61,6 +61,14 @@ inline constexpr int kStatusSuccess = 1;
 /// membership in a result set whose pending row carries `matcher_json`.
 bool response_matches(std::string_view matcher_json, int status, std::string_view output);
 
+/// True when `matcher_json` is a column matcher (a string `column`, no `kind`) and `output` is an
+/// echo `__schema__`-headed answer whose header does not name that column: the agent answered
+/// from a table that lacks the column (a stored matcher over a column the roll-up does not
+/// keep), which the membership computation counts as a failed agent rather than a silent
+/// non-member. False for every other matcher, for an answer with no `__schema__` line, and for a
+/// header that names the column over zero data rows (a legitimate empty answer).
+bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output);
+
 /// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
 /// message. A present `kind` must be a string; on a kind-less matcher a present `column`, `op`
 /// or `value` must be a string and a present `value_set` an array. Only `echo_rows_ge` has a numeric field: its `n`
@@ -89,6 +97,37 @@ std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher
 /// caller.
 void bind_declared_columns(nlohmann::json& matcher, const std::string& result_schema_json,
                            const std::string& plugin);
+
+/// True when the stored echo SQL still reads a raw capture table: one of the sixteen real
+/// `<source>_live` table names, or its `$<Source>_Live` spelling (the `$` is not a word character,
+/// so both tokenise to the same lower-cased name), as a whole identifier outside comments
+/// (case-insensitive), or as the whole content of a `'...'` token wherever it stands (SQLite
+/// reads `FROM 'process_live'`, `main.'process_live'` and `x IN 'process_live'` as the table;
+/// the rule is position-free, so `WHERE name = 'process_live'` is refused too, while a longer
+/// literal such as `'see process_live'` is not). Quoted identifiers (`"..."`, `` `...` ``,
+/// `[...]`) are read as SQLite tokenises them: their content is checked like code, and a `'`,
+/// `--` or `/*` inside one never hides the code after it. Roll-up is the only mode, so such a query
+/// answers with no rows (the shims) rather than an error, and re-evaluating it would silently
+/// build an empty set. `usage_live` and an unknown `$Foo_Live` are not matched: the agent
+/// answers those with an error, which the failure signal counts. Three false positives are
+/// accepted (the predicate fails closed): a name inside a double-quoted string literal
+/// (`SELECT "$Process_Live"`), a single-quoted literal that is exactly a raw table name, and
+/// a CTE that shadows a shim name. Pure; used by the REST and
+/// MCP re-evaluation and create paths (RESULT_SET_REEVAL_STALE_SOURCE).
+bool references_raw_capture_table(std::string_view sql);
+
+/// The same predicate for an instruction_result set, applied to the SQL it will actually run:
+/// `params.sql` when the stored params carry a string, else the `sql` parameter's schema default
+/// in the definition's `parameter_schema` JSON (the canned queries keep their SQL there). False
+/// when neither yields text.
+bool instruction_reads_raw_capture_table(const nlohmann::json& params,
+                                         std::string_view parameter_schema);
+
+/// The 400 / -32602 message for a refused stale-source set (REST and MCP share it).
+inline constexpr std::string_view kStaleSourceMessage =
+    "RESULT_SET_REEVAL_STALE_SOURCE: the query reads a raw capture table (a $<Source>_Live "
+    "name or a <source>_live table). Echo keeps hourly, daily and monthly roll-ups only, so "
+    "it would match no devices. Query the hourly roll-up instead, for example $Process_Hourly";
 
 /// Count the rows in an echo `echo.sql` response `output`. The echo plugin emits
 /// a `__schema__|col|col` header line, one `|`-joined line per row, then a

@@ -131,6 +131,17 @@ message GuaranteedStateEvent {
   // ignored for family != "reflex" rows.
   string set_id = 22;
   string reflex_id = 23;
+
+  // Agent-asserted event ORDER, for the server's census ordering (UP-14). 0 = unset
+  // on both; a sender sets BOTH or NEITHER. `boot_epoch` identifies the agent process
+  // incarnation (monotonic across restarts of one agent); `emit_seq` is the 1-based
+  // ordinal drawn at the point the agent decided the event's queue order, strictly
+  // increasing within one `boot_epoch`. Compare (boot_epoch, emit_seq) lexicographically.
+  // Both are agent-asserted ordinals, NOT timestamps (boot_epoch is seeded from the
+  // clock but must not be read as one). Neither is compared by the server's
+  // stored_event_matches (redelivery equality is unchanged).
+  uint64 boot_epoch = 24;
+  uint64 emit_seq = 25;
 }
 
 message GuaranteedStateStatus {

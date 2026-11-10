@@ -399,13 +399,15 @@ from the registry changes what a FRESH database gets and nothing about a deploye
   constructor (a `LIMIT 0` SELECT of every table and column the runtime reads, which refuses to
   open the store and names the table, so a registry ahead of its database fails at boot and not
   as `42P01`/`42703` on the first sections read).
-- **This is not the runner's drift detection** (#7158, a version recorded with different text).
-  That is a different question (same version, different SQL) and does not replace the projection
-  check: do not consolidate the two. The projection is column PRESENCE only (an extra column is
-  tolerated, in line with the ahead-database stance of #3894); names, types, nullability, order and
-  the key shape (primary key, cascading foreign key) are pinned for the shipped literals by the
-  schema test, and column defaults are pinned by nothing. A third test pins each registry kind's
-  column list to the stored digest layout, so a column change cannot land without this rule.
+- **This is not the runner's drift detection** (#7158). The runner now refuses a store whose
+  recorded migration hash differs from this build's text (see "Recorded-hash drift guard (#7158)"); the projection
+  check asks a different question (does the schema carry every column this build reads) and
+  does not replace it: do not consolidate the two. The projection is column PRESENCE only (an
+  extra column is tolerated, in line with the ahead-database stance of #3894); names, types,
+  nullability, order and the key shape (primary key, cascading foreign key) are pinned for the
+  shipped literals by the schema test, and column defaults are pinned by nothing. A third test
+  pins each registry kind's column list to the stored digest layout, so a column change cannot
+  land without this rule.
 - **The refusal is a boot failure.** The store's `is_open()` is checked in `server.cpp` and a
   closed store stops the server from starting, so a registry ahead of its database never runs
   degraded. The log message distinguishes SQLSTATE 42P01/42703 (a schema defect) from any other
@@ -449,12 +451,16 @@ from the registry changes what a FRESH database gets and nothing about a deploye
   to get subtly wrong by reasoning alone.
 - A plaintext secret column. Use `SecretCodec` / verify-only hash.
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
-- **Editing an already-shipped migration's DDL in place.** `PgMigrationRunner` tracks only an
-  integer `version` per store in `schema_meta` (no content/checksum verification) — so an in-place
-  edit to a migration that already ran against a real deployed database silently diverges that
-  deployment's actual schema from what a fresh install now creates, with nothing to detect the
-  drift. Safe **only** when the migration has never shipped to any real deployment (confirm via
-  `git merge-base --is-ancestor <the-migrating-PR> origin/main` returning false, or an equivalent
+- **Editing an already-shipped migration's DDL in place.** `PgMigrationRunner` gates on the integer
+  `version` per store in `schema_meta`, so an in-place edit to a migration that already ran
+  against a real deployed database never runs there and diverges that deployment's schema from
+  what a fresh install now creates. Since #7158 the runner records each applied migration's
+  SHA-256 in `public.yuzu_schema_migrations` and REFUSES to start the store when a recorded hash
+  differs from this build's text, so the edit is now caught at boot on any database that
+  recorded the old text after that change landed (a database that predates the table is
+  recorded as first seen and cannot be checked retroactively). It is still wrong, and the
+  refusal is a boot failure. Safe **only** when the migration has never shipped to any real
+  deployment (confirm via `git merge-base --is-ancestor <the-migrating-PR> origin/main` returning false, or an equivalent
   release-history check) — PolicyStore's `sqlite_backfill_source` table removal (ADR-0009's
   fresh-start-by-default retirement, 2026-08-25) is the reference case: its PG migration never
   reached a release, so the edit carried no drift risk. Every other case needs a proper
@@ -608,6 +614,8 @@ pool's 10 s `lock_timeout` bounds only the wait for the lock, so a migration que
 reader rolls back and the server refuses to start. It ends with the contract. It does not change
 the rule for new work.
 
+A seventh plain build, `WorkflowEngine` `workflow_executions` v3 (#2146, `idx_wf_exec_idem`, a partial UNIQUE index on `(principal, idempotency_key) WHERE idempotency_key IS NOT NULL`, with four nullable columns (`principal`, `idempotency_key`, `request_fingerprint`, `correlation_id`) and a CHECK added in the same migration; `principal` and `correlation_id` are stored on every run the execute twins start, keyed or not, and only the CHECK ties `principal` to a key), rests on the same basis as the fourth and fifth: the deployment contract is a fresh database only (`docs/user-manual/upgrading.md` "Deployment contract"), so `workflow_executions` is empty when v3 runs and the empty-table rule above already applies; the entry records that the contract is procedural. The migration is re-run safe (`ADD COLUMN IF NOT EXISTS`, `DROP CONSTRAINT IF EXISTS` before `ADD CONSTRAINT`, `CREATE UNIQUE INDEX IF NOT EXISTS`), so a rewound version stamp, or an index built by hand ahead of it, does not fail it. On a carried-forward table the migration would be heavier than the index build alone: `ADD COLUMN` and `ADD CONSTRAINT` each take `ACCESS EXCLUSIVE` on `workflow_executions` (reads and writes blocked, and `ADD CONSTRAINT` validates every existing row under it), and the non-concurrent `CREATE UNIQUE INDEX` takes `SHARE` (writes blocked, reads allowed). The migration is one transaction, so the `ACCESS EXCLUSIVE` locks are held to its end, and the pool's 10 s `lock_timeout` could roll it back when the lock cannot be taken so the server refuses to start; retry when the table is quiescent. Building the index by hand with `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` shortens only the `SHARE` part, and the migration then skips it; the index names `principal` and `idempotency_key`, so those columns have to be added by hand first (the migration's `ADD COLUMN IF NOT EXISTS` then skips them); check `pg_index.indisvalid` first, because a failed concurrent build leaves an INVALID index that `IF NOT EXISTS` also skips, so the migration would succeed with no working constraint. The index is partial, so a keyless run never touches it. It ends with the contract.
+
 ## Substrate quick facts (pool / runner / helpers)
 
 Design facts every store author inherits (previously recorded only in CLAUDE.md and the
@@ -640,8 +648,10 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
 - **Version-ahead warning (#3894):** when a store's recorded `schema_meta` version is HIGHER than
   the highest version in the calling binary's own `migrations()` vector (an older build started
   against a database a newer one already migrated), `run()` logs one `warn` per call naming the
-  store and both versions, applies nothing and still returns true
-  (`PgMigrationRunner::is_schema_ahead` is the pure decision). It is **warn-only on purpose**, not
+  store and both versions, applies nothing and the ahead check itself still returns true (the #7158 hash
+  check that follows can still refuse, including for a database that is ahead AND carries edited
+  text for a version this binary knows: a second failure, refused on purpose, pinned by a test,
+  see the `PgMigrationRunner::run` header; `PgMigrationRunner::is_schema_ahead` is the pure decision). It is **warn-only on purpose**, not
   a refusal: the situation is already outside the supported procedure (rolling upgrades and a
   return to an earlier build are not supported at this stage; see the "Recorded exception" in the
   migrations section above and ADR-0053 "Update (2026-10-20)"), and a refusal would add a second
@@ -654,8 +664,39 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   or reshapes a table is still a hazard for an older build: say so in that release's `upgrading.md`
   section. Operator text: `upgrading.md` "When a server build finds its database ahead of it
   (every Postgres store)".
-- **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
-  refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
+- **Recorded-hash drift guard (#7158)**: every applied migration's SHA-256 (exact bytes of the
+  SQL, no normalisation) is written to `public.yuzu_schema_migrations` in the same transaction that
+  bumps `schema_meta`, as an UPSERT (a rewound `schema_meta` re-applies and overwrites the row:
+  the text that just ran is the authority). On every `run()` the hash of each version at or
+  below the recorded schema version is compared with this build's; a difference makes `run()`
+  return false with one error line (store, version, the first 12 characters of both hashes) and the
+  store does not open.
+  It fails closed, with no override, because it is on-procedure (same build lineage) and the
+  refusal is the first failure, unlike the ahead-database case (#3894, WARN-only). A version
+  applied before the table existed has no row and is recorded as first seen
+  (`recorded_by = 'tofu'`, under the per-store lock with a re-read); that cannot detect drift
+  that predates the table, and it assumes ONE build lineage per database (a binary that applied
+  different text and was then replaced is recorded as whatever the current build holds, which
+  the hard-cutover deployment contract excludes). Steady state is one lock-free read. A migration's
+  SQL must therefore be byte-identical across processes and deployments: never interpolate a
+  config value, environment variable, timestamp or random value into it (a deterministic
+  generator over fixed text is fine). That includes a constant the runtime SQL also uses when a
+  migration is built from it: `kV4ShapeCheck` (`guaranteed_state_store.cpp`, concatenated into
+  v4's text and also executed by `ordering_schema_defect`) and `kDbNowEpochSql`
+  (`approval_manager.cpp`, concatenated into v2's text and also used by runtime queries) are part
+  of the hashed migration text, so tightening one for a runtime reason makes every database at
+  that version refuse to boot. This detects accidental or procedural drift, not
+  tampering: whoever can write the table can rewrite `schema_meta`, and a deleted row is recorded
+  again as `'tofu'`. Nor does it see drift in a version recorded by a build that predates the
+  table. A test that hand-copies a migration vector under a SHIPPED store name and then
+  opens the real store will be refused as drift: use a unique store name, slice the store's own
+  vector, or delete that store's `public.yuzu_schema_migrations` rows to model a database that
+  predates the table. The per-store
+  projection smoke-read below remains the second line of defence (column presence, which a hash
+  cannot tell you); it is not mass-adopted by this change.
+- **Runner guards**: schema-drift guard — a schema whose version is still 0 on a re-read, yet already
+  contains tables, is refused (never blindly re-run migration 1); a concurrent first boot that
+  commits between the two reads is adopted, not refused. Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match
   `[a-z_][a-z0-9_]{0,62}` and must not be `public`/`information_schema`/`pg_*`. **Duplicate/
   non-monotonic version guard (#3013, #2961/#2964):** `run()` checks a store's own

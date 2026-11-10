@@ -309,7 +309,7 @@ Every request is checked against a per-route body-size cap **before authenticati
 | Status | Meaning |
 |---|---|
 | `413` | The body's **declared `Content-Length`** exceeds the resolved cap for this route's class. |
-| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Five classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes), `hardware`, `dex_score_policy` and `commands`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
+| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Six classes refuse an unmeasurable body today: `/mcp/`, `upload_session` (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes), `hardware`, `dex_score_policy`, `dex_score_policy_form` and `commands`** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
 | `415` | The request carries a `Content-Encoding` header set to anything other than `identity` (case-insensitive). Refused **unconditionally, on every route class, regardless of `requires_measurable`** — unlike the framing rule above, this does not depend on a per-class opt-in. Why: this build compiles `CPPHTTPLIB_BROTLI_SUPPORT`, httplib decompresses transparently and enforces only its 100 MiB global limit against the **decompressed** size, so `Content-Length` on a compressed body measures the wrong thing and a sub-cap compressed body can expand to ~100 MiB before anything downstream sees it. No Yuzu route accepts a compressed request body today, so this costs a conforming client nothing — send the body identity-encoded by **omitting `Content-Encoding` entirely**. An explicit `Content-Encoding: identity` is admitted by this gate and, on cpp-httplib 0.59, passed through unchanged by httplib's body reader (through 0.37.1 httplib answered it with a bare `415` of its own). Omitting the header remains the plainest way to send an identity-encoded body. |
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
@@ -320,11 +320,11 @@ All three responses use the standard [A4 error envelope](#json-envelope) with a 
 
 ### Post-Read Backstop (#2407)
 
-The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 30 of 35 classes (distinct `path_class` labels, the catch-all `default` included) below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
+The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 32 of 37 classes (distinct `path_class` labels, the catch-all `default` included) below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
 
 A second stage, installed by `server.cpp` through `PostReadStageRegistry` and run by the route sink (`HttplibRouteSink` wraps every handler it registers on the web server), closes that gap from the other side. It runs **after** httplib's `read_content` has consumed the body off the socket into `req.body`, and after the route has matched, but **before the route's own handler runs**. It is deliberately not `Server::set_pre_request_handler`: from cpp-httplib v0.47.0 that handler runs *before* the body is read, where `req.body` is empty and a size check on it can never fire. At that point the body's actual size is known, so this stage resolves the SAME `kBodyCapTable`/`resolve_body_cap` the pre-routing gate uses (no forked table) and, if the now-fully-read body is over the class's cap, refuses with the same `413` A4/SCIM envelope shape and the same 1-in-100 per-reason log throttle as the pre-routing gate (tagged `[#2407 post-read]` in the journal rather than `[#2407]`). The rejection reason is a new value, `over_cap_post_read`, on `yuzu_body_cap_rejected_total{path_class,reason}` — pre-seeded at 0 for every class, unconditionally, unlike `unmeasurable`; see `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for the full description.
 
-**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 30-of-35-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
+**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 32-of-37-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
 
 **The two stages are mutually exclusive per request, not stacked.** httplib's `routing()` returns as soon as the pre-routing handler answers Handled, so it never calls `dispatch_request` for a request that gate already refused — a **measurable** over-cap body (a declared `Content-Length` above the cap) is still rejected by the pre-routing gate, before anything is buffered, exactly as before this stage existed. Do not describe this as "the cap now runs twice" — in practice `over_cap_post_read` fires almost exclusively for the chunked/unmeasurable case the pre-routing gate deliberately admits.
 
@@ -341,7 +341,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 
 | Method | Path prefix | Cap | `path_class` | Notes |
 |---|---|---|---|---|
-| any | `/mcp/` | 4 MiB | `mcp` | One of five classes with `requires_measurable=true` — see the 411 row above. |
+| any | `/mcp/` | 4 MiB | `mcp` | One of six classes with `requires_measurable=true` — see the 411 row above. |
 | POST | `/api/v1/bundles` | 70 MiB | `bundles` | Sized to the live-query bundle route's own computed 64 MiB parameter-byte floor plus JSON overhead headroom. |
 | any | `/api/v1/uploads` | 8 MiB | `upload_session` | The second `requires_measurable=true` class. Exact mirror of the PR1.6a chunked-receive protocol's own `kDefaultChunkMaxBytes` (`upload_grant_parsers.hpp`), bound to it by a `static_assert` in `file_retrieval_routes.cpp` so the two cannot drift. Any method — the session-open POST, chunk PUT, status GET, commit POST, and cancel DELETE all share this class; only the chunk PUT carries a large body, but scoping to PUT alone would silently drop the sibling verbs to the 4 MiB catch-all. |
 | any | `/api/v1/plugin-config` | 256 KiB | `plugin_config` | † The store's own grammar caps a config value at 8 KiB and a secret plaintext at 64 KiB (`plugin_config_parsers.hpp`); 256 KiB covers the larger of the two plus JSON framing/escaping headroom, while keeping an unauthenticated flood against this surface two orders of magnitude under the 4 MiB catch-all. Any method — PUT config/secret writes, DELETE carries no body, GET/list are bodyless. |
@@ -374,17 +374,20 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/guaranteed-state/policy-generation` | 1 KiB | `guardian_policy_generation` | The Guardian policy-generation raise (`POST .../raise`). Body is `{"target_generation": <integer>, "acknowledge_rule_set_replaced": true}`, under 128 bytes even pretty-printed; 1 KiB is 8× headroom. The row is any-method, so the read-only `GET .../policy-generation` resolves to the same class; it carries no body. A segment-boundary-distinct prefix from `guardian_rule_authoring` (`/api/v1/guaranteed-state/rules`), so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/users` | 16 KiB | `users` | The local-account user subtree: `POST .../me/password` and `POST .../{name}/password` (#5342) plus the bodyless `.../unlock` and the small `.../elevation-eligibility`. The largest legitimate body is two passwords at the 1024-byte policy maximum; worst-case JSON escaping puts that near 12.3 KiB, so 16 KiB admits every policy-conformant request. Any method, because the bodyless siblings share the prefix. |
 | any | `/api/v1/dex/score-policy` | 320 KiB | `dex_score_policy` | The fourth `requires_measurable=true` class. `PUT`'s body IS the score policy document, which the handler caps at 256 KiB (`kDexScorePolicyMaxBytes`); 320 KiB leaves framing headroom, so a legitimate document is never refused here. `GET` and `DELETE` are bodyless siblings sharing the class. The permission gate runs in the handler, after the body is buffered (a cookie session's same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body is refused up front with `411`. |
+| any | `/api/settings/dex-scoring` | 512 KiB | `dex_score_policy_form` | The sixth `requires_measurable=true` class. The DEX Scoring tab's three form `POST`s (`.../save`, `.../preview`, `.../reset`), each of which submits the whole score policy as a urlencoded form. The largest valid form (200 overrides, every field set, 260-byte keys that percent-encode to three bytes a character, 17-digit numbers) is about 360 KB, so 512 KiB never refuses a legitimate form; it is larger than the `dex_score_policy` row's 320 KiB because that row's body is the 256 KiB JSON document, not the encoded form. The permission gate runs in the handler, after the body is buffered, so an unmeasurable (chunked) body is refused up front with `411`. |
 | any | `/api/v1/crypto` | 16 KiB | `crypto` | The `/crypto` REST v1 subtree. The only body-bearing route is `PUT /api/v1/crypto/dashboard/layout` (at most 64 catalogue ids, about 4.4 KiB even fully escaped); 16 KiB mirrors the handler's own `kLayoutBodyMaxBytes` exactly. Any method, because every sibling is a bodyless GET and shares the prefix. |
 | any | `/api/v1/config` | 16 KiB | `config` | The runtime-configuration REST v1 subtree. The only body-bearing route is `PUT /api/v1/config/{key}` (`{"value": ...}`, one scalar: an integer, a flag, a log level, a tag key, an OIDC client secret or a string holding a short JSON array); 16 KiB is far above any legal value. Any method, because the sibling `GET /api/v1/config` is bodyless and shares the prefix. The legacy `PUT /api/config/{key}` stays on the catch-all. |
 | any | `/api/v1/commands` | 4 MiB | `commands` | The fifth `requires_measurable=true` class. The REST v1 twin of MCP `execute_instruction` (`POST /api/v1/commands`). The same 4 MiB as the `/mcp/` class, because the same worst case rides it: 10000 agent ids, 32 parameters of 64 KiB and an 8 KiB scope come to about 3.3 MiB. `requires_measurable=true`, like `/mcp/`: a chunked (unmeasurable) body is refused here rather than read unbounded. Any method, so a sibling under the prefix is capped too. |
 | any | `/api/v1/inventory/software/normalization/` | 64 KiB | `software_curation` | The software-title curation subtree. The body-bearing routes are `POST .../aliases` (one JSON object of at most eight strings, each at most 256 bytes) and `POST .../queue/{key}/reject` (bodyless); the status and queue GETs are bodyless siblings sharing the prefix, so any method. |
 | any | `/api/v1/inventory/software/normalization/pack` | 1 MiB | `software_alias_pack` | The alias-pack CSV upload. The raw body is the CSV, which `parse_normalization_pack` refuses over 1 MiB, so the cap mirrors that bound exactly. A longer prefix than the row above, so it wins for this path. |
+| any | `/api/v1/crypto/revocation-sources` | 192 KiB | `crypto_revocation_sources` | ADR-0070 R1 registered CRL sources: `POST` and `PUT` carry `{name, ca_certificates (up to 8 PEM certificates), crl_urls (up to 8 URLs of up to 2,048 bytes)}`. 192 KiB mirrors the handler's own `revocation_source::kBodyMaxBytes` exactly (a `static_assert` pins the pair) and outranks the 16 KiB `/api/v1/crypto` row for this subtree only (longest match). |
+| any | `/api/v1/inventory/software/collection-settings` | 16 KiB | `software_collection_settings` | The per-group collection settings routes. The only body-bearing route is `PUT .../{group_id}`: one small JSON object (an interval, a window, a zone name, six boolean switches, a priority and a version). The GET siblings share the prefix. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `echo_dashboard_sql`/`echo_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the five 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **39 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config`, `dex_score_policy`, `software_curation` and `software_alias_pack`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **35 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `echo_dashboard_sql`, `echo_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **42 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, #5342 `users`, and then `crypto`, `config`, `dex_score_policy`, `dex_score_policy_form`, `commands`, `crypto_revocation_sources`, `software_curation`, `software_alias_pack` and `software_collection_settings`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **38 classes** overall (the catch-all `default` included). Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -489,16 +492,43 @@ List every device visible to the caller.
         "hostname": "web-01",
         "os": "linux",
         "arch": "x86_64",
-        "agent_version": "0.13.1"
+        "agent_version": "0.13.1",
+        "guardian_backend": "legacy"
+      },
+      {
+        "agent_id": "f6e5d4c3b2a1",
+        "hostname": "db-01",
+        "os": "windows",
+        "arch": "x86_64",
+        "agent_version": "0.13.1",
+        "guardian_backend": null
       }
     ],
-    "count": 1,
+    "count": 2,
     "devices_omitted": 0
   },
-  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "pagination": { "total": 2, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
+
+`guardian_backend` is the Guardian detection backend the device reports on its heartbeat (the
+`yuzu.guardian_backend` tag), one of `legacy`, `spark`, `spark_failed` or `unwired`, from a closed
+server-side table. The key is always present. `null` means the device has not reported one: an agent
+older than the tag, no Guardian, a Guardian heartbeat tag group that faulted on the latest beat, a
+forged or unrecognised value, no heartbeat in the last 90 seconds, or no heartbeat yet. `null` is
+never `legacy`, and one device cannot show whether it is a forged value or an old agent;
+`yuzu_fleet_guardian_backend_tag_rejected` is the fleet signal for rejected values. Until `prefer_spark` is
+enabled every device that reports reads `legacy`. The value is the device's own report, not independent verification, and `null` on a connected device is routine (for example before its first heartbeat), not evidence that it is unprotected. The set is closed: adding a value is a
+breaking change under the API versioning policy. During a rolling upgrade a response from a replica
+older than this change omits the key. The field covers only connected devices and is read live, while the
+`yuzu_fleet_guardian_backend{os,backend}` gauge is republished every 15 seconds and also counts an
+agent that disconnected within the last 90 seconds, so after a disconnect the two can differ for up
+to about 105 seconds. It is machine metadata in the same class as `os` and `agent_version`, so the
+unaudited posture above is unchanged. It is served only here and on the MCP twins, never on the
+unauthenticated legacy `GET /api/agents`. A degraded tag store on `GET /api/v1/devices/{id}` returns
+`503` with `retry_after_ms: 5000` and a `remediation` in the error body; no `Retry-After` header is
+set.
 
 `devices_omitted` counts agents dropped by the caller's management-group/service-scope
 confinement (0 when unfiltered or nothing was dropped) — the same "out of my scope" vs. "not
@@ -522,6 +552,7 @@ Fetch one device's identity.
     "os": "linux",
     "arch": "x86_64",
     "agent_version": "0.13.1",
+    "guardian_backend": "legacy",
     "tags": [
       { "key": "environment", "value": "production", "source": "server" }
     ]
@@ -530,8 +561,9 @@ Fetch one device's identity.
 }
 ```
 
+`guardian_backend` is as described under the list route (always present, `null` when not reported).
 `tags` is always present (`[]` when the device has no tags, or in the never-hit-in-production case
-of an unwired TagStore). A device outside the caller's fleet-read scope returns the SAME 404 as a
+of an unwired TagStore). A degraded tag store returns 503 with `retry_after_ms` 5000. A device outside the caller's fleet-read scope returns the SAME 404 as a
 genuinely nonexistent `agent_id` — an out-of-scope match is never distinguishable from "does not
 exist" in the response body (matches the pre-existing MCP `get_agent_details` tool's
 existence-oracle closure exactly).
@@ -571,7 +603,7 @@ One device's CI record: identity, device-CI blob, the per-section hardware recor
 
 **Response:** `{ "data": { "agent_id", "hostname", "os", "online", "last_seen", "identity_state", "ci", "ci_state", "software", "tags", ... }, "meta" }`. `identity_state` is `found`, `degraded` (the device roster could not be read) or `absent`; `ci_state` is `found`, `absent` or `degraded`. `agent_id`, `hostname`, `os` and `last_seen` are `null` (and `online` is `false`) unless `identity_state` is `found`.
 
-`ci` also carries the chassis (`chassis_type`, `chassis_serial`, `chassis_asset_tag`, `chassis_source`), baseboard (`board_vendor`, `board_product`, `board_serial`, `board_source`) and hashed machine-id (`machine_id_hash`, `machine_id_algorithm`, `machine_id_source`) values, each `null` when the agent did not report it (including a record from an agent that predates the v2 record, and the agent's `-` placeholder), and `sections`: an array, in registry order (`chassis`, `baseboard`, `machine_id`, `cpu`, `dimm`, `disk`, `swap`, `volume`, `partition`, `topology`), of `{ kind, status, reason, source, complete, rows }` for each section the agent reported. `status` is the agent's level and `reason` its token (for example `linux:planned`; `server_cap:<n>` where the server cut a section at its row cap; `server:row_count_mismatch` where the section's stored rows no longer match the row count recorded when it was written, such as after a partial database restore; or `server:content_digest_mismatch` where the row count still matches but the rows hash differently from the digest recorded when it was written, such as rows edited or swapped for another sync's out of band). A section carrying either `server:` token is served `constrained` and incomplete, with the rows that were read; under `server:content_digest_mismatch` those rows are NOT the values the agent reported. Neither token is stored: both are worked out on each read, so reading again does not clear them. Only a full device-record sync repairs either token: `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`, or **Sync now** on the device's Hardware page. The fleet-wide `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed software only and do not repair a section, and there is no MCP tool that does. Otherwise it clears on the device's next hardware change or weekly full report. The digest is an integrity check against accident and non-malicious drift, not tamper resistance: someone who can write the table can rewrite the digest, and it covers the rows only, not `status` or `reason`. A section stored before these checks existed is not verified until the device's next full sync (see [Inventory](inventory.md)). The levels mean: `ok` read in full; `constrained` a partial read (read the reason); `unavailable` could not be read on this host, including a collector not shipped for that OS, which reads `<os>:planned` (today the `chassis`, `baseboard`, `machine_id` and `swap` collectors ship on Windows only, `partition` on Windows only, and `topology` on no OS yet, so those sections read `unavailable` with `linux:planned` or `macos:planned` elsewhere, and `windows:planned` for topology; `volume` has rows on macOS only today and otherwise reads `unavailable` with its own reason); `permission_denied` the agent was refused. Treat any other value as not complete. `complete` is `true` only for `ok`: a `constrained` section is a bounded or partial read and reads as incomplete, never as a device with fewer rows, and it still lists the rows it has. An `unavailable` or `permission_denied` section lists its reason and **no rows**. `source` is the matching `*_source` value for `chassis`, `baseboard` and `machine_id` (whose values are the scalars above, so their `rows` are always empty) and `null` for a list section. `rows` holds objects keyed by the section's column names (the full column list is in the OpenAPI `HardwareCiSection` schema). Cells are strings: parse numerics using the unit in the column name (`size_mb`, `clock_mhz`). An unread value is `null`, never missing: a blank cell and a lone `-` are both mapped to `null`. A section the agent did not report is absent from the array. The record can be large (tens of KB, up to about 150 KB); within `ci` the identity scalars come first and `sections` is last.
+`ci` also carries the chassis (`chassis_type`, `chassis_serial`, `chassis_asset_tag`, `chassis_source`), baseboard (`board_vendor`, `board_product`, `board_serial`, `board_source`) and hashed machine-id (`machine_id_hash`, `machine_id_algorithm`, `machine_id_source`) values, each `null` when the agent did not report it (including a record from an agent that predates the v2 record, and the agent's `-` placeholder), and `sections`: an array, in registry order (`chassis`, `baseboard`, `machine_id`, `cpu`, `dimm`, `disk`, `swap`, `volume`, `partition`, `topology`), of `{ kind, status, reason, source, complete, rows }` for each section the agent reported. `status` is the agent's level and `reason` its token (for example `linux:planned`; `server_cap:<n>` where the server cut a section at its row cap; `server:row_count_mismatch` where the section's stored rows no longer match the row count recorded when it was written, such as after a partial database restore; or `server:content_digest_mismatch` where the row count still matches but the rows hash differently from the digest recorded when it was written, such as rows edited or swapped for another sync's out of band; or `server:content_digest_unverifiable` where this server could not compute the digest to compare, because its digest provider failed). A section carrying any of these `server:` tokens is served `constrained` and incomplete, with the rows that were read; under `server:content_digest_mismatch` those rows are NOT the values the agent reported. `server:content_digest_unverifiable` is a fault of the server, not of the device or its stored rows: a full device-record sync does not clear it. The verdict is recomputed on every read, so a transient provider fault may clear on a later read; a persistent one needs an operator to fix the server's OpenSSL provider or FIPS configuration. None of the tokens is stored: all are worked out on each read, so reading again does not clear either mismatch token (it may clear `server:content_digest_unverifiable`). Only a full device-record sync repairs either mismatch token: `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`, or **Sync now** on the device's Hardware page. The fleet-wide `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed software only and do not repair a section, and there is no MCP tool that does. Otherwise a mismatch clears on the device's next hardware change or weekly full report. The digest is an integrity check against accident and non-malicious drift, not tamper resistance: someone who can write the table can rewrite the digest, and it covers the rows only, not `status` or `reason`. A section stored before these checks existed is not verified until the device's next full sync (see [Inventory](inventory.md)). The levels mean: `ok` read in full; `constrained` a partial read (read the reason); `unavailable` could not be read on this host, including a collector not shipped for that OS, which reads `<os>:planned` (today the `chassis`, `baseboard`, `machine_id` and `swap` collectors ship on Windows only, `partition` on Windows only, and `topology` on no OS yet, so those sections read `unavailable` with `linux:planned` or `macos:planned` elsewhere, and `windows:planned` for topology; `volume` has rows on macOS only today and otherwise reads `unavailable` with its own reason); `permission_denied` the agent was refused. Treat any other value as not complete. `complete` is `true` only for `ok`: a `constrained` section is a bounded or partial read and reads as incomplete, never as a device with fewer rows, and it still lists the rows it has. An `unavailable` or `permission_denied` section lists its reason and **no rows**. `source` is the matching `*_source` value for `chassis`, `baseboard` and `machine_id` (whose values are the scalars above, so their `rows` are always empty) and `null` for a list section. `rows` holds objects keyed by the section's column names (the full column list is in the OpenAPI `HardwareCiSection` schema). Cells are strings: parse numerics using the unit in the column name (`size_mb`, `clock_mhz`). An unread value is `null`, never missing: a blank cell and a lone `-` are both mapped to `null`. A section the agent did not report is absent from the array. The record can be large (tens of KB, up to about 150 KB); within `ci` the identity scalars come first and `sections` is last.
 
 `sections_state` (a sibling of `ci_state`) is `found`, `absent` or `degraded`. `absent` with an empty `sections` array means no sections are stored: an older (v1) agent, or a v2 agent that reported no section, or no record yet. It is **not** "this device has no CPUs", and the server is already ahead of such agents, so upgrade the agents to get sections. `degraded` means `ci_state` is `degraded` (the record has no `ci`), so the sections were not read. Only a failed read of the sections themselves, made after the record itself was read successfully, is a `503`, not a `200` (below); a failure at or before the record read (a pool timeout, a failed transaction start or commit, or a failed record query) degrades instead to `ci: null` with `ci_state` and `sections_state` `degraded`, HTTP `200`, and an audited `state=store degraded` row. The record and its sections are read in one consistent snapshot, so the scalars and the sections are always from the same sync. The section rows are values the agent supplied: the agent minimises them at the source, but the server treats them as untrusted data and a client must too. The MCP tool `get_hardware_ci` returns the same body and answers a failed sections read with a retryable error (`retry_after_ms` 5000) instead of this `503`.
 
@@ -1759,7 +1791,7 @@ curl -s -X POST \
 
 `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as the session-revoke routes above — `false` means the unlock completed but the audit row was lost, degrading the CC6.3 evidence chain for that request.
 
-**Errors:** `400`: username empty or malformed (e.g. contains a reserved `:`); `401`: MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403`: caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions, unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 37 step-up-gated routes); `500`: the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503`: the lockout subsystem is not wired (no `AuthDB`).
+**Errors:** `400`: username empty or malformed (e.g. contains a reserved `:`); `401`: MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403`: caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions, unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 41 step-up-gated routes); `500`: the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503`: the lockout subsystem is not wired (no `AuthDB`).
 
 **Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
 
@@ -4357,6 +4389,11 @@ flag it for revocation. Covers all three RBAC principal types: **user**,
 > corresponding audit verb is recorded with `result=denied` and
 > `detail="engine_session_denied"`.
 
+**Response envelope.** Every successful JSON response of the access-review routes below is wrapped as
+`{"data": ..., "meta": {"api_version": "v1"}}`, and a body written in shorthand below is the content of `data` (where a
+shorthand names `data` and `meta` itself it is shown as written). The JSON export adds `pagination` and
+`rbac_enforcement` beside them; the CSV export (`?format=csv`) is not wrapped.
+
 **Grant-table-driven completeness.** The export and every campaign freeze
 are driven by the grant table, not a roster walk — a principal with **zero**
 role grants produces no row (the export answers "who currently has access",
@@ -4467,8 +4504,10 @@ exists to surface.
 
 List every review campaign's metadata (**not** its attestations — use
 `GET /api/v1/access-reviews/{id}` for those), newest-first, capped at the
-most recent 500. The surface an auditor needs to prove reviews ran on
-cadence without already knowing a `campaign_id` out-of-band.
+most recent 500, so a `campaign_id` need not be known out-of-band. The list
+carries no decided or pending counts and is not by itself proof that a review
+was completed: read a campaign with `GET /api/v1/access-reviews/{id}` to see
+`pending_count` and the attestation rows.
 
 **Permission:** `AccessReview:Read`.
 
@@ -4507,10 +4546,11 @@ below.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `title` | string | Yes | Human-readable campaign name |
+| `title` | string | Yes | Human-readable campaign name, 1 to 256 bytes, no NUL byte |
 
 **Responses:** `201` — `{campaign_id, grant_count}`. `400` — invalid JSON,
-or `title` missing/empty. `403` without `AccessReview:Attest` (or an
+or `title` missing, empty, longer than 256 bytes or containing a NUL byte (neither an over-long nor a
+NUL-bearing title writes an audit row). `403` without `AccessReview:Attest` (or an
 engine-classed caller), or for a browser (session-cookie) request that
 carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
 API-token callers are exempt). `415` — `Content-Type` is not
@@ -4524,34 +4564,104 @@ Audited as `access_review.campaign_opened` (`detail` carries
 
 Full evidentiary state of one review campaign: metadata plus every frozen
 attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`
-(the review-completeness number).
+(the review-completeness number). Each attestation row carries its current
+decision, `decision_seq` and `history[]`, the decisions recorded for that grant (the
+limits are below).
 
 **Permission:** `AccessReview:Read`.
 
-**Responses:** `200` —
+**Campaign id:** the `{id}` path segment must be 1 to 64 characters of `A-Z`,
+`a-z`, `0-9`, `_` or `-`; anything else (including an empty or over-long
+id, or one carrying a NUL byte) is refused with `400` and the message
+`campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
+store is read, and writes no audit row. The check runs after the permission
+gate, so a caller without the permission still gets the `403`. A path that is
+longer than 256 bytes in all is refused by the server before the route runs
+(`404`, with the connection closed), so an id of a few hundred characters never
+reaches this check (see "Refusals that come before this gate" above).
+
+**Responses:** `200`, the object below, in `data`, with `meta` as shown.
 
 ```json
 {
-  "campaign": {
-    "campaign_id": "...", "title": "...", "status": "open",
-    "created_by": "alice", "created_at_ms": 0,
-    "closed_by": "", "closed_at_ms": 0,
-    "rbac_enforcement": "enabled"
+  "data": {
+    "campaign": {
+      "campaign_id": "...", "title": "...", "status": "open",
+      "created_by": "alice", "created_at_ms": 0,
+      "closed_by": "", "closed_at_ms": 0,
+      "rbac_enforcement": "enabled"
+    },
+    "attestations": [
+      {
+        "principal_type": "user", "principal_id": "bob", "role_name": "Operator",
+        "decision": "pending", "reviewer": "", "decided_at_ms": 0,
+        "justification": "", "grant_snapshot": { "display_name": "bob", "...": "..." },
+        "decision_seq": 0, "history": []
+      }
+    ],
+    "pending_count": 1
   },
-  "attestations": [
-    {
-      "principal_type": "user", "principal_id": "bob", "role_name": "Operator",
-      "decision": "pending", "reviewer": "", "decided_at_ms": 0,
-      "justification": "", "grant_snapshot": { "display_name": "bob", "...": "..." }
-    }
-  ],
-  "pending_count": 1
+  "meta": { "api_version": "v1" }
 }
 ```
 
-`403` without `AccessReview:Read` (or an engine-classed caller). `404` — no
-campaign with that id. `503` — the access-review store is unavailable, or a
-genuine read failure.
+`decision_seq` is the number of decisions recorded for the grant: `0` exactly
+while it is `pending`, then `1`, `2` and so on. `history[]` lists the grant's
+decisions in `seq` order, oldest first (at most the latest 100), and is empty
+while the grant is pending. Each entry has `seq` (1 for the first decision on the grant; order is by
+`seq`, never by time), `decision`, `previous_decision` (the decision it replaced:
+`pending` for the first one; an empty string means *not recorded*, for a decision
+that predates the history table, and never means pending), `reviewer`,
+`justification`, `justification_truncated` and `decided_at_ms` (authored by the
+database clock, the write transaction's `now()` in epoch milliseconds; it is the transaction START time, so it can precede the
+commit by the lock wait, and a decision queued behind a lock can carry an earlier stamp than the one it follows, so order one
+grant's decisions by `seq`). `created_at_ms` and `closed_at_ms` are authored the same way. A decision stamp later than the campaign's `closed_at_ms` is not a post-close decision: both stamps are the transaction START time, so an attest that begins after a close has begun can take its `FOR SHARE` lock on the campaign row and commit first while the close waits, and that decision then carries a `decided_at_ms` later than `closed_at_ms`. `decision_seq` and commit order, not the stamps, order decisions against each other and against the close. This holds for rows written by this build; rows imported or restored from an earlier build, and legacy rows that predate the history table, keep the replica-clock stamps they were written with. Audit rows are still stamped from the server replica's own system clock (epoch seconds), so comparing a `decided_at_ms` with the audit row's timestamp can differ by the clock skew between the application host and the PostgreSQL host. The grant's own `decision`, `reviewer`,
+`justification` and `decided_at_ms` are the latest entry. Only the latest entry
+carries its whole `justification`. Every earlier entry carries at most the first
+64 characters of the text it was recorded with (counted in characters, so on a
+UTF8 database a multibyte character is never split; see "Database encoding" in
+`docs/auth-architecture.md`), and `justification_truncated` is `true`
+exactly when text was cut (always `false` for the latest entry and for a short
+one). The full text of an earlier entry stays in the database and is not
+returned by this call, which limits the response for a campaign with many
+grants: at most 100 entries per grant, and at most 64 characters of
+justification on all but the latest. The API and the Access page show only that
+preview of a superseded decision, never the full record; the full text is a
+database read of `access_review_store.access_review_attestation_history`
+(queries and caveats: "Obtaining the full justification of a superseded
+decision" in `docs/auth-architecture.md`; the read is outside the product and
+Yuzu does not audit it). To match your own earlier entry after a lost
+answer (see `POST .../attestations` below), compare its `justification` with the
+first 64 characters of what you sent. The response grows with every recorded
+decision, up to 100 per grant: `history[]` lists at most the latest 100 entries of
+a grant, and `decision_seq` stays the total, so `decision_seq` greater than the
+number of entries means earlier ones are not shown (the write cap keeps a grant at
+or under 100 for rows written through the application path, so this appears only if
+rows were added or removed by other means, such as owner-level SQL with the guard
+triggers disabled, which is outside the guarantee). The server builds the whole response in
+memory, and a campaign of 1000 grants at the limits measured 32 MB to 105 MB on the wire with a server
+peak several times that; the figures and the sizing advice are in `docs/auth-architecture.md`,
+"The decision history".
+The Settings campaign fragment shows the latest decision only and has
+no marker for earlier ones; that difference is intended. The Access page shows the
+latest decision with a marker and the earlier ones behind a disclosure; when the
+grant has more recorded decisions than are listed, the disclosure starts with the
+line "N earlier decisions are not shown" ("1 earlier decision is not shown" for
+one). The marker
+reads "re-recorded" when every later entry repeats the one before it exactly (the
+same decision, reviewer and justification), which is what a retry after an
+unacknowledged commit produces (see `POST .../attestations` below), and
+"superseded <n> earlier decisions" otherwise. An entry's own line says whether it
+is a re-recording or supersedes the one before. An entry whose justification was
+cut shows the shortened text followed by "(truncated)". A pair in which either
+entry was cut is never labelled a re-recording, because a cut text cannot be
+shown to equal the next one; it reads as superseding even when the full texts
+were identical.
+
+`400`: the campaign id is malformed (see the rule above). `403` without
+`AccessReview:Read` (or an engine-classed caller). `404` — no campaign with
+that id. `503` — the access-review store is unavailable, or a genuine read
+failure.
 
 Audited as `access_review.get`.
 
@@ -4560,6 +4670,13 @@ Audited as `access_review.get`.
 Record one reviewer decision against a grant frozen into an open campaign.
 
 **Permission:** `AccessReview:Attest`.
+
+**Campaign id:** the `{id}` path segment must be 1 to 64 characters of `A-Z`,
+`a-z`, `0-9`, `_` or `-`; anything else (including an empty or over-long
+id, or one carrying a NUL byte) is refused with `400` and the message
+`campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
+store is read, and writes no audit row. The check runs after the permission
+gate, so a caller without the permission still gets the `403`.
 
 **Request body:**
 
@@ -4576,10 +4693,10 @@ Record one reviewer decision against a grant frozen into an open campaign.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `principal_type` | string | Yes | `user` \| `group` \| `engine` |
-| `principal_id` | string | Yes | Principal identifier |
-| `role_name` | string | Yes | Role being reviewed |
+| `principal_id` | string | Yes | Principal identifier, 1 to 1024 bytes, no NUL byte |
+| `role_name` | string | Yes | Role being reviewed, 1 to 1024 bytes, no NUL byte |
 | `decision` | string | Yes | `attested` \| `flagged_revoke` |
-| `justification` | string | No | Free-text reviewer note |
+| `justification` | string | No | Free-text reviewer note, at most 4096 bytes. It is kept with the decision and the application never deletes it: do not enter personal data beyond what the review requires. |
 
 **`flagged_revoke` records evidence ONLY — it never itself revokes the
 grant.** No RBAC/EnginePrincipal mutation happens on this path; acting on
@@ -4587,40 +4704,176 @@ the flag (unassigning the role, revoking the engine principal, etc.) is a
 separate, explicit operator action performed after reading this evidence.
 flag ≠ revoke.
 
-**Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
-`principal_id`, or `role_name` missing, or `decision` is neither `attested`
-nor `flagged_revoke`, or an identifier contains a NUL byte or is longer than 512 bytes (a `campaign_id` in the URL path
-that makes the whole path longer than 256 bytes answers `404` with the connection closed instead), or the
-`justification` contains a NUL byte or is longer than 8192 bytes. `403` without `AccessReview:Attest` (or an engine-classed
-caller), or for a browser (session-cookie) request that carries no
-`Origin`/`Referer` naming this site (audited as `csrf.denied`; API-token
-callers are exempt). Also `403` when the caller is the subject of the grant
-(a `user` grant whose `principal_id` is the caller's own username) or the owner
-of the `engine` principal being reviewed — see "Separation of duties" below.
-`404` — no campaign with that id, no such frozen grant in it, or
-the campaign is already closed. `409` — the grant already has a decision.
-`415` — `Content-Type` is not
-`application/json`. `503` — the access-review store is
-unavailable, or a genuine write failure.
+**Responses:** `200` with `{recorded: true, decision_seq, previous_decision}`:
+`decision_seq` is this decision's position in the grant's history (`1` for the
+first) and `previous_decision` is the decision it replaced (`pending` for the
+first), so a reviewer working from a stale view can see that it replaced another
+decision. `400`, one cause each:
 
-**A decision is final.** The first `attested` or `flagged_revoke` recorded for a
-`(campaign_id, principal_type, principal_id, role_name)` grant stays: a second
-call, by any reviewer, returns `409` and changes nothing. If a decision was a
-mistake, open a new campaign and review the grant again. (`record_attestation`
-on MCP is `destructiveHint:true` because the write is irreversible, see
-`docs/mcp-server.md`.)
+- The campaign id is malformed (see the rule above).
+- `principal_type`, `principal_id` or `role_name` is missing, or `decision` is neither `attested` nor
+  `flagged_revoke`.
+- `principal_type`, `principal_id` or `role_name` is longer than 1024 bytes or contains a NUL byte. The
+  message is `principal_type, principal_id and role_name must be 1-1024 bytes without NUL`. It is decided
+  before any lookup, so it holds for all three principal types, and it writes no audit row (the schema
+  `maxLength` values are discovery metadata; the handler enforces the limit). The limit bounds the
+  audit rows and no known creation path produces a longer id, but a frozen grant whose `principal_id` or
+  `role_name` exceeds 1024 bytes cannot be attested: it stays `pending` and is reported as an incomplete
+  review when the campaign closes.
+- `justification` is present and not a string (a number, boolean, array or object; `null` counts as
+  absent). It is refused before the gate and writes no audit row: an entry cannot be corrected once
+  recorded, so a note is never read as empty and dropped.
+- `justification` is longer than 4096 bytes or contains a NUL byte. The store checks this after the
+  separation-of-duties gate and writes a `failure` audit row.
+- The grant already holds the maximum of 100 recorded decisions. The message is
+  `this grant already has the maximum number of recorded decisions (100) in this campaign; no further decision can be recorded on it. To review it again, open a new campaign (closing this one is a separate choice: it leaves every undecided grant pending). If an earlier attempt may have been recorded, read the campaign first`,
+  with no `bad_request:` prefix. It is decided in the store, leaves the state unchanged and writes a
+  `failure` audit row.
 
-**Separation of duties.** You cannot decide your own access. The route returns
-`403` when the caller is the subject of a `user` grant, or the owner of an
-`engine` principal as recorded when the campaign was opened; another reviewer
-must decide it. The comparison is exact (no case folding), and a call made with
-an API token counts as the token's owner. Group grants have no owner, so they
-are not covered by this check. When one call breaks both rules, the `403` is
-returned.
+Other statuses: `403`
+without `AccessReview:Attest` (or an engine-classed caller), for a browser
+(session-cookie) request that carries no `Origin`/`Referer` naming this site
+(audited as `csrf.denied`; API-token callers are exempt), or because the reviewer
+is the subject of the grant (see the next paragraph). `404` — no campaign with
+that id, no such frozen grant in it, or the campaign is already closed (a
+reviewer who is the subject of the grant, of any of the three types, gets the
+`403` instead, even for a closed campaign). `415` — `Content-Type` is not `application/json`. `503` — the
+access-review store is unavailable, a genuine write failure (including a row-lock
+wait that expired after 3 seconds, SQLSTATE `55P03`, in which nothing was
+committed), or the check that the reviewer differs from the subject could not be
+answered (see below).
+
+**The reviewer must differ from the subject of the grant.** The reviewer is the
+session's principal. The route refuses the decision when the reviewer is the
+subject of the grant, by `principal_type`: a `user` grant whose `principal_id` is
+the reviewer (an exact, case-sensitive comparison of the account name); an
+`engine` grant for an engine principal the reviewer owns now or owned when the campaign opened (revoked ones included; the owner is frozen into the grant at open, so a former owner stays refused after a transfer; the way out is another reviewer, or a new campaign, which freezes the current owner as the grant's owner);
+a `group` grant for a group the reviewer is a member of (memberships an identity
+provider assigns count). An engine id or group with no record is admitted. The
+same rule holds for both decisions, so a subject cannot flag or un-flag a grant
+that names them. The group check, and the check of who owns the engine principal now,
+are read just before the write, not inside it, so a membership change, or an ownership the
+reviewer acquires, that lands in between is not seen; the user rule and the comparison with
+the owner frozen at campaign open (made inside the write transaction, answered with the same
+`403` body and the audit reason `sod_engine_owner`) have no such gap. The two identities of one
+person (a local account and an SSO identity) count as two reviewers.
+
+**How fresh the engine and group checks are.** Both pre-reads see the state at the
+moment of the attest, so a member who left a group before attesting is admitted, and a
+reviewer who owns the engine principal now is refused even if they did not own it at open.
+An owner who transferred the engine away is still refused by the frozen owner comparison. The way out is to ask another reviewer to record the decision, or to open a new campaign, which freezes the current owner as the grant's owner.
+Current engine ownership is a live read. Group membership is read
+from Yuzu's stored membership, which an identity provider updates only when that
+member signs in: a change at the identity provider is not seen by the group rule
+until that member next signs in interactively (a long-lived API or MCP token can outlast it), and a sign-in whose token
+skips the membership refresh (for example an Entra groups-overage token) does not
+refresh it. For identity-provider-governed groups the group rule is therefore not
+a current-membership check; review those groups at the identity provider when the
+campaign closes. For an engine or group grant the history entry does not record the
+ownership or membership basis; the `sod=pass` audit row is the evidence of
+independence (see `docs/auth-architecture.md` "Periodic access reviews"). Treat
+independence as unevidenced if that row was not persisted (`Sec-Audit-Failed: true`
+on the response).
+
+**Every decision is kept.** A second decision for the same `(campaign_id,
+principal_type, principal_id, role_name)` does not replace the first: it is
+appended to the grant's history at the next `seq`, with the decision it replaced.
+Only the grant's current decision, reviewer and justification are replaced, and
+a grant cannot return to `pending`. An identical repeat is appended too, as a new
+entry. `decision_seq` in the `GET /api/v1/access-reviews/{id}` response shows how
+many decisions the grant has. A grant keeps at most 100: the 100th decision is
+final, and no further decision is accepted on that grant in that campaign. The
+history and the audit rows identify who wrote the entries. To review the grant
+again, open a new campaign, which re-freezes the whole population as pending (closing this one is a separate choice that leaves every undecided grant pending). `record_attestation`'s MCP `destructiveHint` stays
+`true` because the current decision is replaced with no route back to pending; the
+earlier one is kept in the history (a read returns the latest 100 entries per grant,
+an earlier justification cut to its first 64 characters).
+
+**If the answer is lost, read before retrying.** A decision is recorded when its
+transaction commits. If the connection drops after the commit was sent, the server
+cannot tell whether it was recorded and answers a write failure (`503`). Before
+retrying, `GET /api/v1/access-reviews/{id}`, compare `decision_seq` with the value
+you last saw and look for your own entry (match `reviewer`, `justification` and
+`decided_at_ms`; once a later decision exists, an earlier entry's `justification`
+is at most its first 64 characters). A blind retry after an unacknowledged commit appends an identical
+decision at the next `seq`; it is kept and visible, not an error, until the
+grant reaches its limit of 100 decisions, after which the request is refused (read
+the campaign first if your earlier attempt may have been recorded). The first
+attempt writes a `failure` audit row, so an auditor sees a failure row next to a
+committed decision. There is no idempotency key.
+
+**Store failure answer.** A store failure that is not the caller's (a lease timeout,
+a query error, a row-lock wait that expired after 3 seconds (SQLSTATE `55P03`, nothing
+committed), a lost commit acknowledgement) is answered `503` with the fixed
+message `the decision store is unavailable or the decision may not have been
+committed; read the campaign and compare decision_seq before retrying`,
+`retry_after_ms: 5000` and that remediation. It never carries database text, which
+goes to the server log; the `failure` audit row carries the same fixed message.
+
+**Separation-of-duties answers.** `403` with the message `the reviewer must
+differ from the subject of this grant; ask another reviewer to record this
+decision` when the reviewer is the subject of the grant. The error body names no
+`permission` (the caller already holds `AccessReview:Attest`, so there is no grant
+to ask for) and carries `remediation: "ask another reviewer to record this
+decision"`; nothing is recorded. This case is decided before the campaign is
+looked up, for all three principal types, so it is also the answer for a grant in a closed campaign.
+`503` with the message `could not confirm that the reviewer differs from the subject of this
+grant; no decision was recorded` and `retry_after_ms: 5000` when the engine or
+group lookup could not be answered (nothing is recorded; retry the request).
 
 Audited as `access_review.attested` (decision `attested`) or
 `access_review.flagged` (decision `flagged_revoke`) — the two outcomes are
-separately countable/alertable, not one verb with a buried field.
+separately countable/alertable, not one verb with a buried field. Every row of
+these two verbs for an outcome that reaches the gate or the store has
+`target_id=<campaign_id>` alone and the grant in the detail as
+`principal_type=<t> principal_id=<id> role=<role>`; the refusal of an engine session
+and the `415` refusal carry an empty `target_id`. On the REST route the engine-session
+refusal writes that row; on the MCP twin it writes only the `mcp.record_attestation`
+wrapper row and no `access_review.*` row. Each value is passed through the
+audit token filter, which folds spaces and a few separators, so two grants whose ids
+fold to the same text cannot be told apart in a row, a success row included. A
+success row also carries `seq`, which numbers the decisions of one grant: with the
+campaign id and the grant it identifies one history entry. Rows written before this
+build keep the earlier shape (`target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`),
+so an archive holds both:
+
+| Outcome | `result` | `detail` (then the grant, as above) |
+|---|---|---|
+| Recorded | `success` | `decision=<d> previous=<pending\|attested\|flagged_revoke\|-> seq=<n> sod=pass` (`-` for a previous decision that was not recorded) |
+| Reviewer is the user subject | `denied` | `sod_self_subject` |
+| Reviewer owns the engine now, or owned it when the campaign opened | `denied` | `sod_engine_owner` (covers the live-owner and the frozen-owner refusal; the two cannot be told apart in the audit row) |
+| Reviewer is a group member | `denied` | `sod_group_member` |
+| Engine or group lookup unavailable | `failure` | `sod_check_unavailable store=engine` or `store=rbac` |
+| Store fault that is not the caller's (lease timeout, query error, lost commit) | `failure` | the fixed store-failure message above, never the database text |
+| Store refusal of the request (the 100-decision cap, a justification over its bound, no such grant or campaign) | `failure` | the store's message |
+
+A refusal row is written before the `403`/`503` body. The recorded decision is
+committed first and its audit row follows: a failed audit write never undoes the
+decision and sets `Sec-Audit-Failed: true`. The decision history, not the audit row,
+is the primary record of what was decided. A failed audit row for a successful open
+or close of a campaign likewise leaves the change in place and sets the header.
+
+For a refusal, the header depends on which refusal it is. A failed refusal row sets
+it for an engine-session refusal (all three write routes) and, on the attestation
+route, for the separation-of-duties refusals and the store failures and refusals; the
+refusal stands. A cross-site cookie request (all three routes) is refused earlier, by the
+server-wide same-site check, before the route runs; that check writes its own `csrf.denied`
+row and sets the header when the row cannot be saved (see the Audit Log guide). The route's
+own copy of the check is defence in depth, which a cookie session does not reach. A failed
+refusal row does not set the header for a wrong Content-Type (open and attestation; close
+takes no body) or for a store refusal on open or close: those rows are attempted and a
+failure to save one is ignored. A refusal by the permission check writes its own row and
+sets no header, and a malformed request (a bad id, bad JSON, a grant field over its bound, a
+`justification` that is not a string, a `title` that is over-long or holds a NUL byte) writes no
+row. A `justification` over 4096 bytes or holding a NUL byte is refused by the store after the
+separation-of-duties gate and does write a `failure` row.
+
+Both machine contracts declare the signal: the OpenAPI success responses of the three
+write routes (201 for open, 200 for attest and close) document the `Sec-Audit-Failed` header, and
+the output schemas of the MCP tools `open_access_review`, `record_attestation` and
+`close_access_review` list `audit_persisted` as an optional boolean that is present,
+and false, only when the audit row was not saved. Refusals are counted in
+`yuzu_access_review_attestation_refused_total{surface,reason}`.
 
 #### `POST /api/v1/access-reviews/{id}/close`
 
@@ -4631,12 +4884,23 @@ forces to completion.
 
 **Permission:** `AccessReview:Attest`.
 
-**Responses:** `200` — `{closed: true}`. `403` without `AccessReview:Attest`
+**Campaign id:** the `{id}` path segment must be 1 to 64 characters of `A-Z`,
+`a-z`, `0-9`, `_` or `-`; anything else (including an empty or over-long
+id, or one carrying a NUL byte) is refused with `400` and the message
+`campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -`, before the
+store is read, and writes no audit row. The check runs after the permission
+gate, so a caller without the permission still gets the `403`.
+
+**Responses:** `200` — `{closed: true}`. `400`: the campaign id is malformed
+(see the rule above). `403` without `AccessReview:Attest`
 (or an engine-classed caller), or for a browser (session-cookie) request that
 carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
 API-token callers are exempt). `404` — no campaign with that id, or already
 closed. `503` — the access-review store is unavailable, or a genuine write
-failure. The route reads no body, so it has no `Content-Type` requirement.
+failure, including a row-lock wait that expired after 3 seconds (SQLSTATE `55P03`,
+nothing committed; retry). A close whose answer was lost may already have closed
+the campaign, and the retry then gives `404`: read the campaign first. The route
+reads no body, so it has no `Content-Type` requirement.
 
 Audited as `access_review.closed`.
 
@@ -4647,38 +4911,34 @@ Audited as `access_review.closed`.
 | `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv\|view> rows=<N> rbac_enforcement=<value>` (`view` is the dashboard's Current grants panel, `GET /fragments/access/reviews/grants`). `result=success`. |
 | `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews` or the dashboard fragment `GET /fragments/access/reviews/campaigns`. `target_type=AccessReview`. `result=success`. |
 | `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N> rbac_enforcement=<value>` on success. `result` ∈ {`success`, `failure`}. |
-| `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>` on `success` and `denied` rows; a `failure` row carries `<campaign_id>` only (empty when the request was a `400` for a NUL-bearing or over-long identifier). `result` ∈ {`success`, `failure`, `denied`}. |
+| `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations` (or MCP `record_attestation`). `target_id=<campaign_id>` alone; the grant is in `detail` (see the attestations route for the `detail` shapes). `result` ∈ {`success`, `failure`, `denied`}: `denied` when the reviewer is the subject of the grant (`sod_self_subject`, `sod_engine_owner`, `sod_group_member`), `failure` when the lookup behind that check was unavailable (`sod_check_unavailable store=engine\|rbac`) or the store failed. |
 | `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
 | `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |
 | `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}` or the dashboard fragment `GET /fragments/access/reviews/campaign`. `target_id=<campaign_id>`. `result=success`. |
 
 Every `access_review.*` verb above additionally records `result=denied`
 (`detail="engine_session_denied"`) when the caller's own session is
-engine-classed — see the "Engine-session denial" note above.
+engine-classed on a REST route — see the "Engine-session denial" note above. An
+engine session refused by an MCP twin writes only the `mcp.<tool>` wrapper row and no
+`access_review.*` row.
 The Settings Access reviews fragments (`GET /fragments/settings/access-reviews` and its
 `/campaign` view) write the same denied rows, under `access_review.list` and
 `access_review.get`, with an empty `target_id`.
 `access_review.campaign_opened` and `access_review.attested` also record
 `result=denied`, `detail=content_type_not_json` (empty `target_id`) when a
 request is refused with `415`.
-`access_review.attested` and `access_review.flagged` (by the decision requested)
-record `result=denied` when the store refuses the decision on purpose:
-`detail=self_attestation_blocked` for the `403` (the caller is the subject or
-owner) and `detail=already_decided` for the `409`. `target_id` is the full
-`<campaign_id>:<principal_type>:<principal_id>:<role_name>`. A denied row means
-nothing was recorded. If a denied row cannot be saved, the `403` or `409` still
-stands and the response carries `Sec-Audit-Failed: true`. The `409` message names the
-decision already recorded.
 
 The three mutating routes (`POST /api/v1/access-reviews`,
 `POST /api/v1/access-reviews/{id}/attestations` and
 `POST /api/v1/access-reviews/{id}/close`) are called by the dashboard with a
 session cookie, so a cookie-authenticated request must carry an `Origin` (or
 `Referer`) naming this site, or it is refused with `403` before the body is
-read and a `csrf.denied` row is written (`target_type=Endpoint`, `target_id` is
-the route as written above). A request that authenticates with an API token is
-not riding a cookie and is not gated. Behind a proxy that rewrites `Host`, add
-the dashboard origin to `--csrf-trusted-origin`.
+read and a `csrf.denied` row is written by the server-wide same-site check
+(`target_type=Endpoint`, `target_id` is the method and path of the request, for example
+`POST /api/v1/access-reviews/<id>/attestations`, and `detail` ends with `reason=<token>`).
+The route's own copy of the check is defence in depth and is not reached by a cookie session.
+A request that authenticates with an API token is not riding a cookie and is not gated.
+Behind a proxy that rewrites `Host`, add the dashboard origin to `--csrf-trusted-origin`.
 
 MCP twins (JSON only — the REST `?format=csv` export path has no MCP
 equivalent): `export_access_review`, `open_access_review`,
@@ -5868,36 +6128,39 @@ is absent or not open, which is "unknown", not zero. The two differ after a runt
 `PUT /api/config/<key>`, which is stored but not applied (see
 [When a change takes effect](#when-a-change-takes-effect)).
 
-`echo` publishes the Echo warehouse retention tiers: `tick_seconds` (the agent's prune
-tick, 900) and `tiers`, one row per source and tier (`live`, `hourly`, `daily`, `monthly`,
-`boot`). Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the
-roll-up bucket: 0 for `live`/`boot`, 3600, 86400, or 2678400 for a month, the 31-day worst
-case) and `guaranteed_depth_seconds`. Roll-up rows age from the start of their bucket, so
-a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
-guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how
-fast a device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not
-where it sits: a record is still in its finer tier until the coarser roll-up closes. It holds while
-the device is within its `db_budget_bytes` (default 250 MiB): a device over its byte budget removes
-hourly rows older than 48 h (5 days for `procperf`) inside these depths, oldest first, until it is
-back under (daily and monthly rows, the `usage` tables and paused sources are never taken);
-`echo.status` reports it as `budget_evicted_hourly_rows_total` (`budget_evicted_raw_rows_total` is
-retired: there is no raw tier) (see the Echo manual, The database byte budget). It is a floor on
-rows that exist, not on coverage: every event folds into every tier as it arrives, so an agent that
-is offline records nothing for that span in any tier, and there is no later aggregation pass or
-catch-up window that could fill it. The
-`usage`/`live` row is a backstop, not an operative bound: the usage fold bounds its own open
-set (20,000 runs) before this limit can apply.
+`echo` publishes the Echo warehouse retention tiers: `tick_seconds` (the cadence of the agent's
+retention and byte-budget pass, 900), `db_budget_bytes` (the default byte budget, 262144000) and
+`tiers`, one row per source and tier (`hourly`, `daily`, `monthly`, `boot`). Echo keeps roll-up
+tiers only, so `hourly` is the finest tier: there is no raw tier and no setting that brings one
+back. Each row has `limit_kind` (`rows` or `seconds`), `limit`, `bucket_seconds` (the roll-up
+bucket: 0 for `boot`, 3600, 86400, or 2678400 for a month, the 31-day worst case),
+`guaranteed_depth_seconds` and `budget_dependent`. Roll-up rows age from the start of their
+bucket, so a time-based tier is guaranteed for `limit - bucket_seconds` (a 365-day monthly tier is
+guaranteed for 334 days). It is `null` for `rows` tiers, whose time depth depends on how fast a
+device writes. `guaranteed_depth_seconds` is a floor on how long a record is kept, not where it
+sits: a record is still in its finer tier until the coarser roll-up closes. `budget_dependent` is
+`true` for the `hourly` tier only: it holds while the device is within its `db_budget_bytes`
+(default 250 MiB). A device over its byte budget removes hourly rows older than 48 h (5 days for
+`procperf`) inside their depth, oldest first, until it is back under, so an hourly row's depth holds
+only while the device is within its budget (daily and monthly rows, the `usage` tables and paused
+sources are never taken). `echo.status` reports it as `budget_evicted_hourly_rows_total` (see the
+Echo manual, The database byte budget). It is a floor on rows that exist, not on coverage: every
+event folds into every tier as it arrives, so an agent that is offline records nothing for that
+span in any tier, and there is no later aggregation pass or catch-up window that could fill it.
 
-These are the registry **defaults** an agent of this server's release applies (agents on other
-releases may differ), not per-device readings: Echo prunes on the agent, so the server has no
-live value. Every source's tiers are declared on every OS; where a source does not run on the
-agent's OS (see the OS compatibility matrix in the Echo manual) its tier applies to an empty
-table. A paused or errored source is never pruned (per-device paused sources: [`GET /api/v1/echo/retention-paused`](#get-apiv1echoretention-paused)); while the agent is running, rows may
-outlive their limit by up to `tick_seconds` (an offline agent or a disabled plugin prunes
-nothing), longer when the retention clock guard declines a prune, shorter by any plausible
-forward skew of the endpoint clock, which the guard does not decline (the depth is measured on
-the agent's own clock), and longer still while a backlog drains through the per-pass delete cap
-(5,000 rows per table per tick). `echo` is `null` only if the server's embedded table cannot be read. A server older than this release omits `echo`; treat absent like `null`.
+These are the registry **defaults** the current release applies (agents on other releases may
+differ), not per-device readings: Echo prunes on the agent, so the server holds no per-device
+value. Every source's tiers are declared on every OS; where a source does not run on the agent's
+OS (see the OS compatibility matrix in the Echo manual) its tier applies to an empty table. A
+paused or errored source is never pruned (per-device paused sources:
+[`GET /api/v1/echo/retention-paused`](#get-apiv1echoretention-paused)) and becomes eligible again
+when it is re-enabled. `tick_seconds` is the cadence of the retention pass, not a bound: while the
+agent is running a row can outlive its limit by that tick and by ordinary scheduling lag (an offline
+agent or a disabled plugin prunes nothing), longer when the retention clock guard declines a prune,
+shorter by any plausible forward skew of the endpoint clock, which the guard does not decline (the
+depth is measured on the agent's own clock), and longer still while a backlog drains through the
+per-pass delete cap (5,000 rows per table per tick). `echo` is `null` only if the server's embedded
+table cannot be read. A server older than this release omits `echo`; treat absent like `null`.
 
 The order of `tiers` is unspecified; match rows by (`source`, `tier`). Clients must tolerate
 unknown `tier` and `limit_kind` values: a new tier is an additive change. A per-device or
@@ -5916,11 +6179,12 @@ server-enforced reading, if one ever ships, lands under a new key, never by rede
     },
     "echo": {
       "tick_seconds": 900,
+      "db_budget_bytes": 262144000,
       "tiers": [
-        { "source": "usage", "tier": "live", "limit_kind": "rows", "limit": 200000,
-          "bucket_seconds": 0, "guaranteed_depth_seconds": null },
+        { "source": "process", "tier": "hourly", "limit_kind": "seconds", "limit": 7776000,
+          "bucket_seconds": 3600, "guaranteed_depth_seconds": 7772400, "budget_dependent": true },
         { "source": "process", "tier": "daily", "limit_kind": "seconds", "limit": 15552000,
-          "bucket_seconds": 86400, "guaranteed_depth_seconds": 15465600 }
+          "bucket_seconds": 86400, "guaranteed_depth_seconds": 15465600, "budget_dependent": false }
       ]
     }
   },
@@ -6731,24 +6995,54 @@ pre-migration `{"deleted": false}`.
 
 #### `POST /api/workflows/{id}/execute`
 
-Execute a workflow against targeted agents. Fails (workflow-not-found, `400`) if the workflow
-does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0064).
+Execute a workflow against named agents. Fails (workflow-not-found, `400`) if the workflow
+does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0064). The
+versioned twin with a fail-closed precheck and a pre-dispatch audit row is
+[`POST /api/v1/workflows/{id}/execute`](#post-apiv1workflowsidexecute); prefer it.
+
+**Permission:** `Workflow:Execute`. A supervised-tier MCP token is refused (`403`, use the MCP
+ticket flow); this route never accepted an operator-tier one.
 
 **Request body:**
 
 ```json
 {
-  "scope": "os = 'windows' AND tag:environment = 'production'",
-  "parameters": {}
+  "agent_ids": ["agent-1", "agent-2"]
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `scope` | string | Yes | Scope expression selecting target agents |
-| `parameters` | object | No | Override parameters for workflow steps |
+| `agent_ids` | array of strings | Yes | The agents to run the workflow against (`400` if missing or empty). There is no `scope` field. |
 
-**Approval:** `Workflow:Execute` requires an approval ticket at the `supervised` MCP token tier, so a supervised-tier MCP token that calls this route is refused (`403`, approval required on this transport, audit action `auth.approval_required`). No MCP tool maps to `Workflow:Execute` yet, so such a token has no ticket path to run a workflow until the `execute_workflow` tool ships; use a session or a non-MCP API token. Treat that as temporary and do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation the token performs. Running the steps one at a time through `execute_instruction` stays approval-gated per step. The `operator` tier is refused by the tier check, and an untiered token is unaffected.
+The per-step approval check (a step whose instruction is not `auto` is refused with `403`) and the
+unknown-instruction `400` run only when the approval manager and the instruction store are both
+wired and open; if either is not, this legacy route skips them and goes on to dispatch. The v1 twin
+refuses with `503` instead. The route replies `202` after the steps have been dispatched.
+A step refused at send time by the targeting gate is recorded failed at once, with no retry and no
+retry sleep. If a step throws, the engine closes the execution `failed`, marks its remaining steps
+`skipped`, and the request fails with the server's generic `500` (an empty body). The close is one
+write, tried once more with a longer lease when the first fails; if both fail the row stays
+`running` (counted on `yuzu_server_workflow_finalize_failed_total`; see "A workflow run left
+`running`" in [server-admin.md](server-admin.md#a-workflow-run-left-running)).
+
+**Admission and run bound (#2146).** This route holds one HTTP worker for the whole run, so it
+takes the same held-open slot as [`POST /api/v1/workflows/{id}/execute`](#post-apiv1workflowsidexecute)
+and MCP `execute_workflow`, through the same admission step and keyed by the same principal: a
+slot held by a run on any of the three counts against all of them. It is taken after the
+permission check and the body check and before the workflow or any instruction is read. A
+principal that already has 2 runs in progress, or a full server-wide held-open budget, is refused
+`429`, and a draining server `503`, each with `Retry-After: 5`, `retry_after_ms: 5000` in the
+error body, no workflow or instruction read and nothing sent or audited (the refusal is counted on
+`yuzu_server_workflow_run_refused_total{reason}`). The slot is released when the response is
+written, whatever the outcome. The run is bounded to 60 seconds from the moment the request is
+taken: no dispatch attempt starts after that, a retry delay is cut to the time left, the remaining
+steps are skipped and the execution is closed `failed`. The answer is unchanged (`202`, `status: running`), so a stopped run reads as a started one; the `workflow.execute` audit detail gains ` (run stopped: deadline_exceeded)`, so
+read the run with `GET /api/workflow-executions/{id}`. Unlike the v1 twin, this route does not
+refuse up front a workflow whose retry sleeps could exceed 60 seconds, and does not re-check the
+caller's credential between steps.
+
+**Approval:** `Workflow:Execute` requires an approval ticket at the `supervised` MCP token tier, so a supervised-tier MCP token that calls this route is refused (`403`, approval required on this transport, audit action `auth.approval_required`). Such a token runs a workflow through the MCP tool `execute_workflow`, which takes an approval ticket (`-32006` with an `approval_id`, approval, recall), or from a session or a non-MCP API token. Do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation the token performs. Running the steps one at a time through `execute_instruction` stays approval-gated per step. The `operator` tier is refused by the tier check, and an untiered token is unaffected.
 
 #### `GET /api/workflow-executions/{id}`
 
@@ -6821,6 +7115,279 @@ you've already narrowed them.
 twin of `GET /api/workflows/{id}` above, MCP twin `get_workflow`. `404` for an unknown or
 soft-deleted id.
 
+#### `POST /api/v1/workflows/{id}/execute`
+
+**Permission:** `Workflow:Execute` (global). Run a workflow against named agents. The v1 twin of
+`POST /api/workflows/{id}/execute`, MCP twin `execute_workflow` (#2146); both run one shared
+sequence, so they cannot disagree about what a run may do. A service-scoped token and an
+operator-tier MCP token are refused; a supervised-tier MCP token is refused with `403` here and
+must use `execute_workflow`'s ticket flow (`docs/user-manual/mcp.md`).
+
+**Headers:** `Idempotency-Key` (optional on REST, required on the MCP twin): send one on every call
+whose answer you could lose, see **Idempotency** below.
+
+**Request body:** `{"agent_ids": ["agent-1", "agent-2"]}`. `agent_ids` is required: 1 to 10000 ids
+of at most 128 bytes each. `scope` is not accepted (`400`, `reason: scope_unsupported`); there is no
+fleet-wide default. A body nested deeper than 32 levels is `400`.
+
+**Authority is all-or-nothing; reach is per step.** Before anything is sent, every step of the
+workflow is checked against the CALLER, and one refused step refuses the whole run with nothing
+sent. For every step: its instruction must exist (`400 unknown_instruction`); the caller must be
+allowed to dispatch its `plugin.action` (RBAC on the action's securable, the action's
+admin-or-approval gate judged against the caller's real administrator status, and the action's kill
+switch), else `403 dispatch_denied` naming the step, which is permanent for that caller (`retry_after_ms:
+null`, retrying cannot help; the chokepoint's own reason is in the audit row and in
+`yuzu_server_dispatch_denied_total{reason}`); and its approval mode must admit the caller (`auto`
+always; `role-gated` only for an administrator, JIT elevation included; `always` or an unknown mode
+never, `403 approval_required` naming the step). A step whose `plugin.action` is not in the
+capability catalogue is refused (`400 step_unclassified`). A Destructive or Forensics step needs
+`agent_ids` with at least one agent visible to the caller (`404 destructive_no_visible_target`
+otherwise); a Forensics step needs exactly one id (`400 forensic_untargeted`), and the permission
+check comes first (`403` before `400`). This does NOT promise that every step will reach a device:
+which devices a step reaches (visibility, containment, plugin presence, the per-OS kill switch,
+concurrency claims) is decided per step at send time, so an earlier step may already have been sent
+when a later one reaches nobody (see the `503` below). Unlike the legacy route, if the instruction
+store, the approval gate, the dispatcher or the authorizer is not available the answer is `503` and
+nothing is sent.
+
+| Status | `error.reason` | Meaning |
+|---|---|---|
+| `400` | `body_type`, `agent_ids_required`, `agent_ids_empty`, `agent_ids_type`, `agent_id_type`, `agent_id_len`, `agent_ids_count`, `scope_unsupported` | The body failed the targeting shape check. A `denied` audit row is written. |
+| `400` | `body_depth`, `invalid_json` | The body nests too deeply or is not JSON. A `denied` audit row is written. |
+| `400` | `invalid_workflow_id` | The workflow id in the path is empty, longer than 128 bytes, holds a control byte (below `0x20` or `0x7F`, NUL included) or is not valid UTF-8 (for example a percent-encoded `%00` or `%FF`). Never retryable: it can never succeed as sent. Checked first, before the key, the body, admission or any read, so nothing is leased, read or sent; the message does not echo the id. One `denied` audit row is written, carrying the id cut to 128 bytes and neutralised. |
+| `400` | `idempotency_key_invalid` | The `Idempotency-Key` header is not 8 to 128 characters from `A-Z a-z 0-9 . _ : -`, or was sent more than once. Checked before anything is read or leased. A `denied` audit row is written. |
+| `400` | `workflow_no_steps` | The workflow exists but has no steps. |
+| `400` | `unknown_instruction` | A step names an instruction that does not exist. |
+| `400` | `step_unclassified` | A step's `plugin.action` is not in the capability catalogue. |
+| `400` | `destructive_untargeted`, `forensic_untargeted` | A Destructive or Forensics step is not explicitly targeted. |
+| `400` | `workflow_exceeds_sync_budget` | The sum over the workflow's steps of `retryCount` x `retryDelay` exceeds the 60 second run budget (see **Run budget** below). Nothing was done and no row is written; the workflow cannot be run until it is replaced by one with fewer retries or shorter delays. |
+| `400` | `rejected` | The engine refused the run after the preflight; `error.message` carries its reason, and a closing `failure` audit row is written. |
+| `403` | `approval_required` | A step's approval mode does not admit the caller. |
+| `403` | `dispatch_denied` | The caller may not dispatch a step's `plugin.action`. Not retryable. |
+| `404` | `workflow_not_found` | Unknown or soft-deleted workflow. |
+| `404` | `destructive_no_visible_target` | A Destructive or Forensics step whose named agents are all outside the caller's view. |
+| `422` | `idempotency_key_conflict` | The `Idempotency-Key` is already bound to a DIFFERENT request (another workflow, or another set of agent ids). Terminal: nothing was sent, `error.execution_id` names the run the key is bound to. Use a new key for a different request. |
+| `429` | `per_principal_stream_cap`, `global_stream_cap` | Admission: the caller already has 2 workflow runs in progress (counted per principal and per server process), or the server's shared held-open budget (`--max-sse-streams`) is full. `Retry-After: 5` and `retry_after_ms: 5000`. No workflow or instruction was read, nothing was sent or audited; a call that carries an `Idempotency-Key` has had the key looked up first (a read), and a repeat of a key already bound to a run is answered with the replay instead of this refusal. Retrying is safe. |
+| `500` | `no_principal`, `idempotency_requires_principal` | The session has no principal (the second reason: a call that carries a key). Nothing was sent. |
+| `500` | `request_fingerprint_unavailable` | A keyed call whose request fingerprint (a SHA-256) could not be computed. Audited (`failure`); nothing was sent. |
+| `500` | `dispatch_exception` | The run THREW after its `requested` row, so steps may already have been sent. `error.execution_id` names the run (empty when the engine had not admitted it) and `error.agents_sent` the lower-bound count of agents the send path had accepted a send to (present only when at least one). **No retry hint, on purpose: do not re-send.** Read the run with `GET /api/v1/workflow-executions/{id}` (a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running) and start another run only on that evidence. The engine closes the execution `failed` and marks its remaining steps `skipped`. A closing `failure` audit row names both handles; if that row is lost the answer carries `Sec-Audit-Failed: true`. |
+| `503` | `draining` | Admission: the server is shutting down and starts no new run. `Retry-After: 5` and `retry_after_ms: 5000`; no workflow or instruction was read and nothing was sent or audited (a keyed call has had its key looked up). Retry against another replica or after the restart. |
+| `503` | `audit_unavailable` | The server has no audit sink wired (a configuration defect, `retry_after_ms: null`, `Sec-Audit-Failed: true`), or the `requested` row could not be saved. Nothing was read, leased, run or sent. |
+| `503` | `workflow_engine_unavailable`, `instruction_store_unavailable`, `approval_gate_unavailable`, `dispatch_unavailable` | A dependency is not wired or open; nothing was sent. |
+| `503` | `store_unavailable` | A store read failed (`retry_after_ms: 5000`). A failed idempotency lookup is this too: it is never treated as "no run is bound to the key", so nothing is written and nothing is sent. |
+| `503` | `internal_error` | The idempotency pre-check or the preflight (before the `requested` row) THREW an exception (`retry_after_ms: 5000`, message `workflow execution failed`; the detail is in the server log). Nothing was sent and no run was started, so retrying is safe, with the same key if one was sent: the key is not bound before the claim. |
+| `503` | a zero-reach cause | The run started and no step reached any agent (below). |
+
+**Events.** As the legacy `POST /api/workflows/{id}/execute` does, a call whose run the engine admitted publishes the platform event `workflow.executed` once, after the closing audit row and whatever the run's outcome (`completed`, `partial`, `aborted`, `interrupted`, or a run that reached no agent), with no attributes or payload (see [analytics-events.md](../analytics-events.md)). A refusal, an idempotent replay (a repeat of a key, or a call that lost the engine's claim), an engine refusal and a run that threw publish nothing, and a failed publish never changes the answer; it is counted on `yuzu_server_event_emit_failed_total{event_type="workflow.executed"}` when the hook itself throws.
+
+**Audit.** Every `workflow.execute` row of a call starts `surface=rest correlation_id=<id>`, the value of the response's `X-Correlation-Id` header and of the error body's `correlation_id`; the run's own row stores the same `correlation_id` and the caller's `principal`, keyed or not, so a `requested` row (written before any execution id exists) and an orphaned run join by it. A keyed call carries `idempotency_key=<key>` in its `requested` and closing rows. A refusal before the sequence runs (`invalid_workflow_id`, `idempotency_key_invalid`, `body_depth`, `invalid_json`, the body-shape reasons above) writes ONE `denied` row (`reason=<reason> workflow=<id cut to 128 bytes and neutralised>`; `target_id` is the same cleaned id, never the raw malformed one) and nothing else; a lost row adds `Sec-Audit-Failed: true` and the `400` stands. A server with no audit sink wired answers every call `503` `audit_unavailable` with `Sec-Audit-Failed: true` and `retry_after_ms: null` (a configuration defect) right after the permission check, before anything is read, leased or sent. A terminal
+replay (every status but `running`) writes one `success` row (`idempotent_replay=true
+run_status=<the replay's status>`, the first-answer class in the table below, not the engine's
+word); a `running` replay writes none (counted on
+`yuzu_server_workflow_run_idempotent_total{outcome="in_progress"}`); a conflict is `denied`
+(`reason=idempotency_key_conflict`) and a lost claim race closes its `requested` row `denied`
+(`reason=idempotent_duplicate`). A `workflow.execute` row with `result=requested` is written before anything is sent; if
+it cannot be saved the answer is `503` with `Sec-Audit-Failed: true` and nothing was sent. A step
+refused at send time because its definition changed after the preflight is audited as `denied` at
+that moment (detail ends `(late)`). A closing row records the outcome: `success` ONLY for a run
+whose `data.status` is `completed`, otherwise `failure` with `run_outcome=failed|partial|aborted|interrupted`
+in the detail (the same tokens as the `partial`/`aborted`/`interrupted` status, and `failed` for the `503` where
+nothing reached; `interrupted` is a run stopped by a server shutdown, with `reason=server_shutdown`; `aborted` also covers a run the credential check stopped, with `reason=credential_revoked` or `reason=credential_indeterminate`); if that one is lost the `202` carries `data.audit_persisted: false` and
+`Sec-Audit-Failed: true`. A refusal by the per-step checks (`approval_required`, `dispatch_denied`,
+`step_unclassified`, the targeting refusals) is audited as `denied` with the `reason`, and writes no
+`requested` row. A wiring failure, an unknown or empty workflow, an unknown instruction and a store
+read failure write no `workflow.execute` row at all. Audit details are neutralised (CWE-117); the
+full row list is in [audit-log.md](audit-log.md).
+
+**Idempotency.** A caller whose answer is lost (a timeout, a dropped connection, a proxy) cannot
+tell "never started" from "started", and a blind re-send dispatches every step twice. Send an
+`Idempotency-Key` header: a fresh unique string per intended run, 8 to 128 characters from
+`A-Z a-z 0-9 . _ : -`, sent exactly once. The key belongs to the calling principal (another principal's
+identical key is a different key) and stays bound to its run for the life of the run record; nothing
+prunes it. The run record also keeps your account name, the call's correlation id and the agent ids it named (distinct ids, capped at 1,000 and at 131,072 bytes, then a count and digest marker), so
+what is stored about whom is listed under "Workflow run records are not pruned" in
+[server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146). A repeat of the SAME key with the SAME request (the workflow id and the SET of agent ids:
+order and repeats do not matter; the stored step definitions are not part of it, so an instruction
+edited since does not turn a retry into a conflict) sends nothing and answers `202` with the thin body
+of the run the key is bound to. The replay says the class the FIRST answer said: it is judged from
+the run's stored step results (each step's final outcome), not from the engine's own run status,
+because the engine closes a run `completed` when an `onFailure: continue` step reached nobody. The
+two outcomes cannot disagree: the same rule classifies both.
+
+| `data.status` | Meaning | Extra fields |
+|---|---|---|
+| `completed` | The run succeeded: the engine recorded it completed, no step was refused at send time, and every step's final attempt reached an agent. The ONLY status that means success. | none |
+| `partial` | Something was sent but the run did not succeed: some step's final attempt reached nobody (an `onFailure: continue` step), or the engine did not complete after a send. Final. | `retryable: false`, `remediation` |
+| `failed` | No step is recorded as sent, or the run threw. A step the store did not record may still have been sent (the write that stores a step's command id can be dropped, and a thrown dispatch can follow a partial send), so read the run before deciding. Final: the key stays bound; a deliberate re-run needs a NEW key. | `retryable: false`, `remediation` |
+| `aborted` | A step was refused at send time (its definition changed after approval or the preflight, or its approval mode was raised), or the run was stopped by its 60 second deadline or by the credential check. A step after a refused `onFailure: continue` step may still have run; after a deadline or credential stop the rest did not. The replay does not say which of the stop causes (`data.reason` is absent). Final. | `retryable: false`, `remediation` |
+| `interrupted` | The stopping server ended the run. Final. | `retryable: false`, `remediation` |
+| `running` | The run is still in progress. **Poll `GET /api/v1/workflow-executions/{id}`; never re-send.** | `retry_after_ms: 2000`, `Retry-After: 2` |
+| `indeterminate` | The run has been `running` for over 180 seconds (the process died after the claim, or the final status write was dropped), OR the engine recorded it `completed` but its stored step rows cannot prove an outcome (a step still `pending` or `running`, a skip a completed run cannot hold, no rows, or rows that cannot be read back). Never `completed`. Not retryable. Read the run: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running. A run read on a replica whose clock is far ahead can still be live: if it may be, wait for it before re-running. Treat a `running` answer older than 180 seconds the same way. | `retryable: false`, `remediation` |
+
+What the stored rows can and cannot say: a run the engine recorded `failed` or `cancelled` whose rows cannot be read back replays `failed`. A step-result write the engine dropped under a database brownout costs precision (a run may replay `partial` or `failed` where the first answer said `interrupted` or `aborted`), and a step whose write was dropped is recorded `pending` or `running` although it may have been sent, so a `failed` replay does not prove nothing was sent: every replay but `completed` and `running` carries a `remediation` that says so. The replay is never `completed` for a run it cannot prove succeeded. A `foreach` step is judged by its last attempt (every item of that attempt must have reached an agent); the engine sends one item today.
+
+Every replay body also carries `execution_id`, `workflow_id`, `idempotent_replay: true`, `started_at`
+(epoch seconds) and a `message`; every status but `completed` and `running` adds `retryable: false` and a
+`remediation` (read the run, a step recorded `pending` or `skipped` may still have been sent, a deliberate
+re-run needs a NEW key). It has NO `steps` and no `late_denied`: the engine does not keep a
+per-step answer, so the original response cannot be rebuilt; read the run instead. A replay is a
+short read, so it is answered while the server is draining and when the run cap is full, takes no
+slot and writes no `requested` row. A call that raced the original (it passed the lookup before the
+original claimed the key) loses the claim inside the database, closes its own `requested` row
+`denied` (`reason=idempotent_duplicate`) and is answered the same way. A call WITHOUT a key is
+unchanged, and must never be re-sent to retry.
+
+**Run budget (60 seconds) and admission.** A run is synchronous, so it holds one of the server's
+HTTP worker threads for its whole length. Three things bound that. (1) *Admission:* before the
+workflow is read or any row is written (a keyed call's key is looked up first), the run takes a slot from the same held-open budget the streaming
+endpoints share (`--max-sse-streams`; `yuzu_http_held_open_responses`), at most 2 per principal. A
+principal at its limit, a full server budget and a draining server are refused up front (`429`
+`per_principal_stream_cap` / `global_stream_cap`, `503` `draining`) with `Retry-After: 5`; the
+refusal is counted on `yuzu_server_workflow_run_refused_total{reason}` and writes no audit row.
+The slot is held until the response is written, whatever the outcome. (2) *Precheck:* a workflow
+whose worst-case retry sleep, the sum over its steps of `retryCount` x `retryDelay`, exceeds 60
+seconds is refused `400 workflow_exceeds_sync_budget` (exactly 60 is accepted). This models sleeps
+only; dispatch time and `foreach` fan-out are not modelled, so it is a prefilter. (3) *Deadline:*
+the run has 60 seconds from the moment the request is taken. No send attempt starts after the
+deadline, and a retry delay is cut to the time left. At the deadline the engine stops the run: the
+step in progress is recorded `failed`, the remaining steps are `skipped` (`run stopped`, the step's
+`on_failure` policy does not apply), the execution is closed `failed`, and the answer is the typed
+`202` below with `data.status: "aborted"`, `data.reason: "deadline_exceeded"` and `retryable:
+false` (or, if no step reached any agent, the `503` `deadline_exceeded`, also not retryable). A send
+already in flight is not interrupted. The closing audit row is `failure` with
+`run_outcome=aborted reason=deadline_exceeded`.
+
+**Limits are per server process.** The 2-runs-per-principal cap, the held-open budget behind it and
+the gauge `yuzu_server_workflow_runs_in_flight` are all counted inside one server process. With N
+replicas a principal can have up to 2N runs in progress, and each replica's `429` says nothing about
+the others; to see the fleet-wide number, sum the gauge across replicas
+(`sum(yuzu_server_workflow_runs_in_flight)`). A repeat of an `Idempotency-Key` is the exception: it
+is looked up in the shared database, so any replica answers it.
+
+**Shutdown.** A server that is *draining* (it has been told to stop and is holding its listener open
+for in-flight work) lets a run in flight finish its dispatching: a retry the run had not yet made is
+abandoned at once (the pending retry counts as exhausted and no delay is slept; the wait is checked
+every 250 ms, so a run asleep in a retry delay wakes within a quarter of a second), the step then
+fails under its own `on_failure` policy, and the run goes on with its remaining steps. The shutdown
+waits for these runs, counted inside the server process (never from the table, so a run left
+`running` by a crash or owned by another replica does not hold it), up to the same 30 second cap it
+applies to tracked executions. A server that is *stopping* ends the run: nothing more is sent, the
+steps not yet started are `skipped` with reason `server_shutdown`, the execution is closed `failed`
+(it is not marked `cancelled`), and the answer is the typed `202` below with `data.status:
+"interrupted"`, `data.reason: "server_shutdown"` and `retryable: false`, even when nothing had been
+sent. Steps already sent are not recalled. The closing audit row is `failure` with
+`run_outcome=interrupted reason=server_shutdown`. Read the run with `GET
+/api/v1/workflow-executions/{id}`: a step recorded `pending` or `skipped` may still have been sent; check the audit and response stores by plugin and time before re-running.
+
+**Credential check before every step.** A run asks, before each step's first send and again on
+waking from each retry delay (once per wake, not once per 250 ms wait slice), whether the credential
+that made the call is still live: the same re-validation that cuts a held-open MCP stream, applied to
+this request's own cookie, `Authorization: Bearer` or `X-Yuzu-Token` and to the session's principal
+(for an engine principal, whether the principal is still `Active`). A live credential continues,
+whatever the answer's source. A revoked, expired or rebound
+credential stops the run before the next send. An answer that cannot be given (the auth store did
+not respond) is asked once more after at most one second, never past the run's deadline, and a
+second non-answer stops the run too: fail closed. A `foreach` step is asked once per item, since
+each item is a send. A stopped run is the typed `202` below with `data.status: "aborted"`,
+`data.reason: "credential_revoked"` (or `"credential_indeterminate"`) and `retryable: false`, even
+when nothing had been sent; the steps not yet started are `skipped` (`run stopped`, as for a
+deadline stop), the execution is closed `failed`, steps already sent are not recalled, and the
+closing audit row is `failure` with `run_outcome=aborted reason=credential_revoked` (or
+`credential_indeterminate`). **What this does not do:** it re-checks that the credential is live; it
+does not rebuild the caller. A role grant removed during the run is caught per step, because the
+shared dispatch chokepoint judges each send against the live RBAC store. An administrator
+elevation that expires during the run, and a device-group narrowing, are not re-read: the caller's
+elevation flag and visible device set are those taken when the call was accepted, so they are
+bounded only by the 60 second deadline.
+
+**Where the check reads from.** For a caller authenticated with an API token (an ordinary, MCP or
+engine token) the check reads the token's row from the server's Postgres at every step boundary, and,
+for an engine token, the backing engine principal's row too. It does not use the 60 second token
+cache or the 15 second engine-principal cache that the held-open streams use. So a token revoked
+through ANY replica before the read is seen at the next step boundary of a run on any replica: the
+next step is not sent. The cost is one indexed read per presented token header (an `Authorization: Bearer` and an
+`X-Yuzu-Token` header make up to two) plus, for an engine token, one read of the principal row. A check
+runs before every send attempt: each step's first send, each wake from a retry delay, and each item
+of a `foreach` step (so a `foreach` over N items makes N checks), and a check whose answer cannot be
+given is asked once more. A run is capped at 2 per principal and 60 seconds. If the database does
+not answer within the 1.5 second lease wait or the query fails, the answer is "cannot be given", not
+"revoked" and not "valid": it is asked once more and a second non-answer stops the run. Under a
+connection-pool brownout one boundary can wait about 4 seconds when every pooled connection is in
+use, or about 21 seconds when the database accepts connections but does not answer. A database that
+stops answering on a connection a read is already using can hold that read for longer than the 60
+second run cap (a test saw no return in 150 seconds), because the cap is checked between attempts;
+the run still fails closed whenever a read returns. What is not covered: a step already sent when the revoke lands
+is not recalled, a token's expiry time is still judged against the clock of the replica running the
+call, and a cookie session is decided by the durable session store's generation, which each replica
+polls at most once per second, so while the session store answers a sign-out on another replica is
+seen within about a second rather than at the very next boundary, and while a replica's poll is
+failing it can keep serving the cached session for up to 30 seconds before failing closed. A cookie session whose
+store read still fails after that is stopped as `credential_revoked`; only token reads report
+`credential_indeterminate`. The 60
+second deadline, the live RBAC check at each send and the revoke itself apply as before. Other
+callers of the token store, including the held-open MCP streams (see the MCP manual), keep the cached
+read and its lag (#4766).
+
+**Dispatch is synchronous, device work is not.** The call returns after every step's command has
+been sent, including step retries and delays (within the run budget above), so it can be slow. Each step is sent only to the
+agents the caller can see (the same confinement as every other dispatch); a named agent outside the
+caller's view is dropped silently. Read the run with `GET /api/v1/workflow-executions/{execution_id}`
+and each device's output with the step's `command_id`. Without an `Idempotency-Key`, do not repeat the
+call to retry: every step is sent again. A started run that fails part-way is never retried blind: a step the engine records as
+failed is retried only when its failure is transient (`retry_count` times, with `retry_delay_seconds`
+between attempts); a step refused at send time (its definition changed, or it no longer passes the
+caller's approval or targeting checks) is a permanent failure, recorded at once with no retry and no
+sleep, and the step's `on_failure` policy applies. A fault that throws out of the run closes the
+execution `failed` and answers `500 dispatch_exception` as above. The close is a single write
+retried once; if both tries fail the row stays `running` (see "A workflow run left `running`" in
+[server-admin.md](server-admin.md#a-workflow-run-left-running)).
+
+**Success `202`** (a repeat of an `Idempotency-Key` answers with the thin body under **Idempotency**
+instead): `data.execution_id`, `data.workflow_id`, `data.status`, `data.late_denied` and
+`data.steps`, one entry per send attempt (retries and `foreach` add entries): `instruction_id`,
+`attempt` (1-based: a retry of a step has the next number and the next step starts again at 1, so a
+reader can tell a retry from a new step), `command_id`, `agents_reached`, and, when `agents_reached` is `0`, `reason`, `retryable` and the
+withheld counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`.
+`data.status` is `completed` ONLY when the engine recorded the run `completed`, no step was refused
+at send time and every step's FINAL send attempt reached at least one agent (commands were sent;
+devices have not necessarily finished). A run that sent something and did not meet all three is still a `202` (a
+`5xx` would invite a blind re-send of steps already sent) but is NOT a success: `data.status` is
+`partial` (some step's final attempt reached nobody, or the engine did not complete after a send), `aborted` (a
+step was refused at send time because its definition changed, the run reached its 60 second
+deadline, or the credential check stopped it: `data.reason` `deadline_exceeded`,
+`credential_revoked` or `credential_indeterminate`; after a deadline or credential stop the rest did not run, but a step after a refused `onFailure: continue` step may still have run) or `interrupted` (the server began stopping: `data.reason`
+`server_shutdown`), with
+`data.run_status` (the engine's own status), `data.message` and `data.retryable: false`. Read the run
+with `GET /api/v1/workflow-executions/{id}` and each step's `reason`; never re-send. A step is judged
+by its LAST attempt: one that reached nobody and was retried to success is reached, and a run whose
+every step ends reached reads `completed` (its earlier zero-reach entry stays in `data.steps` with
+its `attempt` number, and the closing audit row is a `success`). A step the engine left failed (an
+`onFailure: continue` step that never reached anyone) makes the run `partial`, retried or not. The same
+rule classifies a repeat of the key, so the replay says `completed` for a retried-to-success run and
+`partial` for the continue case.
+
+**Nothing reached `503`:** if the run started but no step reached any agent, the answer is `503`
+with `error.reason` and `error.execution_id` (the run exists and is readable). The reasons are
+`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached` (offline
+devices, or a per-device concurrency claim), `quarantined`, `plugin_not_found`, `kill_switched_os`,
+`late_denied`, `deadline_exceeded` (the 60 second run budget ended the run before any step reached
+an agent) and `run_failed` (the engine ended the run without a single dispatch attempt, or its final
+state could not be read).
+
+*With an `Idempotency-Key`* the key was bound to the run when it started, so a repeat of the call
+replays this run (`202`; `data.status` is `failed`, or `aborted` when the stored steps show a deadline stop (`deadline_exceeded`) or a send-time refusal (`late_denied`)) and never runs again: every one of these
+answers has `retry_after_ms: null`, no `Retry-After` header and `error.remediation` naming the way
+forward (use a new idempotency key). Read the run with `GET /api/v1/workflow-executions/{id}`, then
+start another under a new key.
+
+*Without a key* nothing was sent, so a retry is safe for the causes that carry `retry_after_ms: 5000`
+(`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached`);
+`quarantined`, `plugin_not_found`, `kill_switched_os`, `late_denied`, `deadline_exceeded` and
+`run_failed` are permanent (`retry_after_ms: null`). Send a key anyway: it is what makes a lost
+answer safe to ask about.
+
+A missing `Workflow:Execute` permission is a `403` from the surface gate, before any of the above.
+
 #### `GET /api/v1/workflow-executions`
 
 **Permission:** `Workflow:Read`, gated on the fleet-read chokepoint (ADR-0017), the same sole gate as
@@ -6833,8 +7400,9 @@ workflow was soft-deleted; its history is kept), `status`, `current_step`, `star
 `completed_at`. Never agent ids, step results or `agents_reached` (use the detail route for those).
 Newest first by `(started_at, id)`.
 
-A confined caller (management-group or service-scoped) sees only runs with at least one agent in
-its scope. The scope is applied in the database **before** ordering and the page limit, so a run
+A confined caller (management-group or service-scoped) sees only runs with at least one of the
+stored agent ids in its scope (for a run that named more ids than a row stores, see the cap note
+under `GET /api/v1/workflow-executions/{id}`). The scope is applied in the database **before** ordering and the page limit, so a run
 the caller cannot see never takes a page slot, `next_cursor` and the page length depend only on
 runs the caller may see, and a hand-made cursor naming a hidden run reveals nothing. A run whose
 stored agent list is malformed, empty or not an array is invisible to a confined caller.
@@ -6912,6 +7480,27 @@ REST's usual fail-closed-on-audit-failure posture — this file's `AuditFn` pred
 
 For an unconfined (global-grant) caller, each step's `result` also carries `agents_reached` (the
 step's dispatch-time target-agent count) — stripped above for a confined caller, as described.
+
+A run row stores each distinct agent id the run named once, in the order first named, at most
+1,000 of them and at most 131,072 bytes of JSON text (the run itself still sends to every id as
+sent). When the distinct ids do not all fit (or one was skipped: an id over 256 bytes or holding a
+NUL byte is never stored), `agent_ids` holds only the stored ids (when the creator is a confined
+caller, the ids in the creator's own dispatch scope, its `Execution:Execute` visibility, are
+stored first; the creator keeps seeing the run exactly while at least one stored id lies in the scope
+its reads are checked against, `Workflow:Read`, which is guaranteed when the run names a device inside
+its `Execute` scope and that scope lies within its `Read` scope; a confined creator is a custom role
+that holds `Workflow:Execute` globally plus a scoped grant, since no seeded role below `Administrator`
+can start a run), `agent_ids_truncated` is `true`,
+and a caller with no device scope also gets `agent_ids_total`, the number of distinct ids the run
+named. Both fields are absent for a run stored whole, and `agent_ids_total` is never sent to a
+confined caller. A confined caller sees a truncated run only if one of the stored ids is in its
+scope, so a confined reader whose devices fall past the stored ids does not see the run, and that
+includes the creator unless the run names at least one device inside its `Execution:Execute` scope and
+that scope lies within its `Workflow:Read` scope (overlapping scopes are not enough; a global `Execute`
+grant with a group-scoped `Read` grant stores the ids in the order named, so the creator loses its run
+when none of its group's devices is among those stored) (an owner-accepted residual, see [server-admin.md](server-admin.md#workflow-run-records-are-not-pruned-2146));
+unconfined readers and the audit log still see it. The same applies to
+`GET /api/workflow-executions/{id}` and MCP `get_workflow_execution`.
 
 #### `GET /api/v1/executions`
 
@@ -7109,8 +7698,9 @@ flag, parameters and creator are in no read that carries another user's schedule
 are not rendered for one. The page view also carries `data-can-write`, `data-can-enable` and
 `data-can-delete` on its list root (render hints probed once per render from `Schedule:Write`,
 `Execution:Execute` and `Schedule:Delete`, never a gate; each probe refused writes one
-`auth.permission_required` audit row) and per-row Enable/Disable and Delete buttons, disabled for
-a row the caller did not create. The default view is unchanged.
+`auth.permission_required` audit row; a supervised-tier MCP token's approval-gated pairs are not
+probed and write none, so those two hints are `0` for it) and per-row Enable/Disable and Delete
+buttons, disabled for a row the caller did not create. The default view is unchanged.
 
 #### `GET /fragments/workflows`
 
@@ -7125,7 +7715,10 @@ up and shown only when the caller also holds `InstructionDefinition:Read` (a sep
 `data-can-delete` (`0` or `1`): render hints probed once per render from `Workflow:Execute`,
 `Workflow:Write` and `Workflow:Delete`, deciding which controls the page offers. They are not an
 authorization decision; the run, create and delete routes check their own grant. Each refused probe
-writes one `auth.permission_required` audit row. Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
+writes one `auth.permission_required` audit row, except for a supervised-tier MCP token: its
+approval-gated pairs (`Workflow:Execute`, `Workflow:Delete`) are not probed, so a render writes no
+`auth.approval_required` row, the list root carries `data-run-gate="approval"` and Run now is
+disabled with the reason that the token must use the MCP `execute_workflow` ticket flow. Twin: `GET /api/v1/workflows`, MCP `list_workflows`.
 
 #### `GET /fragments/workflow-runs`
 
@@ -7927,8 +8520,9 @@ re-eval, unchanged.
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
+| 400 | `RESULT_SET_REEVAL_STALE_SOURCE` — on `from-echo-query`, the `sql` reads a raw capture table (a `$<Source>_Live` name or a `<source>_live` table); on `from-instruction-result`, an `echo.sql` definition's SQL does (the `params.sql` value, else the definition's declared default: the text the dashboard submits for a canned query; a default is never injected at dispatch, so a dispatch without `sql` is answered with an error by the agent and counted in `agents_failed`); on `re-eval`, the stored SQL does (for an `instruction_result` set, the stored `sql` param, else that same declared default). Echo keeps roll-up tiers only, so such a query answers with no rows and the set would be silently empty. Nothing is dispatched; query the hourly roll-up instead (for example `$Process_Hourly`). A match inside a comment, or inside a longer string literal (`'see process_live'`), is not a reference; a single-quoted token that is exactly a raw table name (`'process_live'`, `'$Process_Live'`) is one wherever it stands, because SQLite reads such a token as the table after `FROM`, `JOIN`, `IN` and in other positions, so `FROM 'process_live'` and `x IN 'process_live'` are refused, and so is a string literal equal to a raw table name (`WHERE name = 'process_live'`), the price of a rule that does not depend on position. This is a behaviour change for a stale client that stored a set over a `$<Source>_Live` name |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
-| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"echo_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` with `"kind":"echo_rows_ge"` whose `n` is present but not a JSON integer from `1` to `2147483647` (a wrong type or a wrapped value used to throw in the maintenance tick, which re-threw every 2 seconds and starved the result-set GC; an `n` or `kind` already stored that is malformed, or an `n` below 1, now matches no device). `n` counts the rows the agent returned, which on the roll-up tiers are hour-bucket rows (one per key per hour), not events. A `matcher` that is present but not a JSON object, or a `kind` that is not a string, is refused too, and so is a column matcher (no `kind`) whose `column`, `op` or `value` is present but not a string or whose `value_set` is present but not an array (`{"column":5,"op":"eq"}` used to qualify every responder; a stored one now matches no device, while a MISSING key keeps the accept-all default so a typo cannot silently empty the set); it used to be dropped, which meant every responder qualified (omit `matcher` for that default). Nothing is dispatched (#4644) |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result`, a `matcher` that carries `declared_columns`, `plugin` or `row_discriminator`. These three keys are server-authored: when the matcher's `column` is a column the instruction definition declares in its `result_schema`, the server stores them (`declared_columns` = field names in output order, `plugin` = the definition's plugin) so a column matcher works on any plugin's pipe-row output, not only Echo or JSON. The header row and short status rows (`status\|not_found`, `not_available\|<reason>`) are skipped. A column the definition does not declare stores nothing extra |
 | 400 | `sql`/`instruction_id`/`name` present but not a JSON string (a clean 400 rather than an uncaught exception, #4406); `name` over 256 bytes on `from-echo-query` or `from-instruction-result` |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
@@ -8276,6 +8870,58 @@ Marks one open queue entry `rejected` (`200 {"data": {"rejected": true}}`). `key
 
 Replaces the stored alias pack. The body is the alias-pack CSV (`Content-Type: text/csv` or `text/plain`, else `415`); the format and the 1 MiB, 5,000-row (and at least 50-row) and 256-byte-field limits are those of the seed pack parser, whose refusal reason is returned in the `400` (a NUL byte or invalid UTF-8 included). A body over 1 MiB never reaches the parser: the pre-auth body cap answers `413`. A replace keeps products a curator owns (`origin` curated) at their category, and at their `cpe_product` once it is non-empty. A replace also leaves curated aliases active. An alias curated with the category omitted still marks its product curated, which freezes that product's category against later packs. The pack aliases the new pack no longer carries stop resolving, the ones it carries stay, and every title is marked for re-resolution. A pack whose `pack_version` equals the stored one is a `409`. `200` returns `{pack_version, sha256, rows}`.
 
+#### Software collection settings
+
+Per-management-group settings for the daily installed-software collection: how often it runs, in which local-time window, in which time zone, and which collectors run (see [Collection settings](inventory.md#collection-settings)). The server stores one document per group and resolves the single document that applies to a device. REST only: there is no MCP tool or page for these routes yet. This build sends no settings to agents: they take effect only when the settings push lands, and storing or changing a document never starts a collection and never contacts an agent.
+
+**A document** is the group's whole setting, replaced as a unit:
+
+| Field | Type | Rule |
+|---|---|---|
+| `interval_s` | integer | Required. 3600 to 604800 (1 hour to 7 days) |
+| `window` | object or `null` | Optional; omitted or `null` is no window. `{"start_min": 60, "end_min": 300}`, minutes past local midnight, `0 <= start_min < end_min <= 1440`; allowed only with a whole-day interval (86400, 172800, ...) |
+| `timezone` | string | Optional; omitted or empty is the machine's own zone, else an IANA zone name known to the database (`Europe/London`); at most 64 bytes. Names under `posix/`, `right/` or `SystemV/` and the placeholder `Factory` are a `400` (an agent cannot resolve them); link names such as `US/Pacific` are accepted |
+| `plugins` | object | Required. Every collector as a boolean: `installed_apps`, `middleware`, `msi_packages`, `pkg_inventory`, `runtimes`, `windows_optional_features`. `installed_apps` cannot be `false`. An unknown or missing key is a `400` |
+| `priority` | integer | Optional; omitted is 0. 0 to 1000; decides only between branches (below). The root group's document takes no priority (any other value is a `400`) |
+| `expected_version` | string | Optional, write only: the `version` last read, or `none` (also the default) to create only |
+
+Any other top-level key is a `400`. `version` is the SHA-256 of the stored document including its priority, so a concurrent priority-only edit is caught by `expected_version`.
+
+**Authority.** Settings are managed by fleet administrators. A write needs the global `ManagementGroup:Write` grant while RBAC enforcement is on, and the administrator role while it is off (the default). The list and a group's document follow the same `ManagementGroup:Read` gate as the other management-group routes: the global grant while RBAC enforcement is on, and any signed-in user session or API token while it is off. A service-scoped token is refused with `403` in both modes, an engine principal needs an explicit RBAC grant, and an MCP-tier token is also held to its tier. Group-scoped delegation (a group owner managing its own branch) is not part of this build: a management-group role assignment admits nothing on these routes. The device route is gated differently: `Inventory:Read` scoped to the device (below). For the per-group `GET` and the `PUT`, an authority read that cannot be completed (the RBAC store) is a `503` with `retry_after_ms`, never a `403` and never an admit; the list and the device route use the shared deny-on-degrade gate (ADR-0041), so the same outage answers `403` there.
+
+**Stored copies.** Each save also adds a row to the store's own change history (the newest 200 rows per group, readable with SQL only). That history is a capped, secondary copy: the audit log is the record of who changed what and when. The document's `updated_by` and each history row carry the writer's user name; they are kept with the document, which no route deletes, including once its group is deleted.
+
+#### `GET /api/v1/inventory/software/collection-settings`
+
+Every stored document and the built-in fleet default. The answer is `data.fleet_default` (24 hours, 01:00 to 05:00, machine-local zone, every collector on, `priority` 0, and a `version`) and `data.documents[]` (one object per stored document, in the shape the per-group `GET` returns). `fleet_default.version` is an effective-settings version (the hash a device's effective settings carry, below), not a document version. Gated by `ManagementGroup:Read` (see Authority above). A document whose group has been deleted is neither listed nor used by the resolver; it counts toward the cap below. More than 20,000 documents, or a stored row that fails the read rule (a `version` that is not 64 lowercase hex included), is a `503` with no `retry_after_ms` and a remediation saying operator action is required, never a truncated list. The read fails closed on purpose: documents are written only through the validating `PUT`, so a row that fails the read rule means the table has been damaged out of band, and one such row makes this list and every device's effective-settings read answer `503` until the row is repaired or removed. The server log names the group (`found a corrupt row for group <id>`).
+
+#### `GET /api/v1/inventory/software/collection-settings/{group_id}`
+
+The group's own stored document (`group_id`, `interval_s`, `window`, `timezone`, `plugins`, `priority`, `version`, `updated_at`, `updated_by`), not the resolved result for any device. `404` when the group does not exist or has no document. A refused read (`403`) is audited as `software_estate.collection_settings.read` with `result=denied`; a served read is not audited (see [audit-log.md](audit-log.md)).
+
+#### `PUT /api/v1/inventory/software/collection-settings/{group_id}`
+
+Replaces the group's document and answers `200` with the stored document and `previous_version` (`null` on create). Authority is decided first, ahead of reading the body: a caller the write gate refuses gets `403` whatever the body holds, and only an authorised caller sees a `400` for an invalid body. A group that does not exist is a `404`. The write gate is checked again immediately ahead of the write, once the `requested` audit row is stored: authority withdrawn in between answers `403`, a session that ended in between answers `401`, and nothing is written (a withdrawal landing during the store call itself is ordered behind the write). A stale `expected_version` answers `409` with the stored document in `error.current`, including when a concurrent create won. A versioned write on a group with no document answers `409` with `error.current` `null` and a remediation to send `expected_version` `none`. A retry of a write that landed (a lost response, say) answers `409` with the caller's own document in `error.current`: compare it with the body sent. A zone the database does not know is a `400`. The request is audited as `software_estate.collection_settings.update` with a `requested` row stored ahead of the write and an outcome row (see [audit-log.md](audit-log.md)). A `503` reading `outcome unknown` means the commit did not confirm and the write may be live: `GET` the document to verify. Creating a document when 20,000 documents exist (a deleted group's document counts) is a `503` with no retry hint: operator action is required, because no route deletes a document. A write identical to the stored document keeps its `version` and counts as a save: it adds a history row and its audit rows. The route is exempt from MFA step-up (no proof required) by the project owner's decision for this change; the owner ruling on the plugin kill-switch route, which can also switch collectors off fleet-wide, is pending.
+
+#### `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings`
+
+The settings that apply to one device, resolved across every management group it belongs to:
+
+```json
+{"data": {"agent_id": "agent-1",
+          "effective": {"interval_s": 7200, "window": null, "timezone": "", "plugins": {"installed_apps": true, "middleware": true, "msi_packages": true, "pkg_inventory": true, "runtimes": false, "windows_optional_features": true}},
+          "source_group_id": "a1b2c3d4e5f6", "version": "<64 hex>", "kill_switched": ["runtimes"]},
+ "meta": {"api_version": "v1"}}
+```
+
+- Each group the device belongs to is a branch, except a group that is an ancestor of another group the device belongs to: the nearer group stands for that branch, so a device in a group and in its descendant resolves through the descendant whatever the priorities. In each branch the nearest group (itself, then its ancestors) with a document is the branch winner; an ancestor's document therefore competes for a sibling branch that has none of its own. Priority decides only between branch winners. The winner is chosen by priority (higher wins), then depth (deeper wins), then group creation time (older wins), then group id.
+- The root group's document is the fleet default layer: it applies to a device with no other candidate and never competes with a group's document.
+- The plugin kill switches always win: a killed collector is `false` in `effective.plugins` and listed in `kill_switched`. Registered apps collection (`installed_apps`) is on unless it is itself kill-switched. Only plugin-level, all-OS kill-switch rows are read: a switch on one action of a plugin, or on one OS, is not reflected here.
+- `version` is the SHA-256 of the effective fields only (interval, window, zone, sorted switches): no priority, source group or timestamps. It is a different hash from a stored document's `version`, which includes `priority`: a priority-only edit changes the document's `version` and leaves this one unchanged.
+- `source_group_id` is the winning group, the root group id (`000000000000`) when the root document applies, or empty for the built-in default. It is an opaque id and can name a group outside a scoped caller's branch when the device is also a member there.
+- A device in no group, or one the server has no record of, answers `200` with the root document and `source_group_id` `000000000000` when a root document exists, else the built-in default with an empty `source_group_id`; no device lookup is made.
+- Requires `Inventory:Read` on the device. A membership, settings or kill-switch read that cannot be completed is a `503`, never a document with collectors off.
+
 ---
 
 ### Crypto
@@ -8584,6 +9230,103 @@ Errors: `401`, `403` (no `Inventory:Read`, written by the gate, or a confined ca
 
 The `/fragments/crypto/dashboard`, `/fragments/crypto/widget/{id}` and `/fragments/crypto/ca/certificates` fragments render the same data for the page (always HTTP 200, a note on refusal and a banner on degrade) and write the same audit verbs; for a service-scoped token, or an MCP token whose tier refuses the layout read, `/fragments/crypto/dashboard` draws the default layout read-only and never reads the minting operator's saved layout (the layout routes refuse the same tokens); the dashboard fragment writes one row per source per draw (see [crypto.md](crypto.md#audit)). `/fragments/crypto/ca/certificates` is the page's twin of the filtered `GET /api/v1/ca/issued` and needs `Security:Read`.
 
+#### Revocation sources (registered CRL sources)
+
+A **revocation source** is one certificate authority (its CA certificates) plus the CRL URLs the server may fetch for it (ADR-0070 R1). This release **registers** sources only: nothing is fetched and no certificate is judged yet, so `crl_status` reads `no_crl_fetched` and every `fetch_status.state` reads `never_fetched`. A source in this list is not evidence that any certificate was checked. Scope: facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion.
+
+**Permission.** The surface is **admin-only in both RBAC states and not grantable**. Every route needs the `RevocationSource` securable (`Read` for the two reads, `Write` for the other four; removal and the reset are a `Write`, there is no `Delete`) **and** a durable Administrator role (the same `is_rbac_administrator` check as the RBAC grant routes). A custom role granted `RevocationSource:Read` or `:Write` is still refused. With RBAC off, `Write` is admin-only already and `Read` is in the [authorization topology floor](rbac.md#the-authorization-topology-floor-2376). A service-scoped API token and an MCP-tier bearer token (of any tier) are refused `403`. Mutations also need MFA step-up when the caller has an enrolled factor and its proof is stale, and a cookie session must be same-site. An MCP-tier bearer token of any tier is refused on these REST routes; the MCP twins are the route for an MCP caller, where a supervised token needs an approval ticket for each mutation (see the [MCP tools](mcp.md)).
+
+| Method and path | MCP twin | Permission |
+|---|---|---|
+| `GET /api/v1/crypto/revocation-sources` | `list_revocation_sources` | `RevocationSource:Read` |
+| `GET /api/v1/crypto/revocation-sources/{id}` | `get_revocation_source` | `RevocationSource:Read` |
+| `POST /api/v1/crypto/revocation-sources` | `register_revocation_source` | `RevocationSource:Write` |
+| `PUT /api/v1/crypto/revocation-sources/{id}` | `update_revocation_source` | `RevocationSource:Write` |
+| `DELETE /api/v1/crypto/revocation-sources/{id}` | `remove_revocation_source` | `RevocationSource:Write` |
+| `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water` | `reset_revocation_source_high_water` | `RevocationSource:Write` |
+
+##### `POST /api/v1/crypto/revocation-sources`
+
+Registers a CA and its CRL URLs. `PUT` replaces a source with the same body. `PUT` REQUIRES `expected_config_version` (the source's `config_version` as you last read it; on both REST and MCP): if the configuration would change and the source has moved on since, the call is `409` and replaces nothing. A body equal to the stored configuration is a no-op success whatever version it names, so retrying your own committed change is safe.
+
+```json
+{
+  "name": "Corp issuing CA",
+  "ca_certificates": ["-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"],
+  "crl_urls": [
+    {"url": "http://crl.example.com/ca.crl", "confirmed_address_classes": ["public"]}
+  ]
+}
+```
+
+- `name`: 1 to 128 bytes of UTF-8 without control characters (free text, escaped on render).
+- `ca_certificates`: 1 to 8 PEM `CERTIFICATE` blocks, one per string, nothing else in the string. Each must parse, be a CA (`basicConstraints` `cA=TRUE`) and carry `cRLSign` if it has a key usage extension. **All must share one subject Name**: a source is one CA, and several keys let a CA renewal keep verifying. The server keeps each certificate's SHA-256, subject key identifier and public-key hash, and the subject Name hash.
+- `crl_urls`: 1 to 8 objects. `url` is `http` or `https`, with a host, no userinfo, no fragment, at most 2,048 bytes, ASCII only (give an internationalised host as punycode); `file:`, LDAP, UNC and anything else is refused.
+- **The host is resolved at registration**, and every address it resolves to is classified. **Refused with no override** (also by the fetcher on every fetch): unspecified, link-local, cloud-metadata, multicast and reserved addresses, **loopback**, and **every address this server is bound to or listening on** (a wildcard bind covers every local interface address). In an HA deployment the last refusal covers only the replica that handled the request, not the other replicas' addresses; only an administrator can register a URL, so reaching another replica's listener needs an administrator to name it.
+- **NAT64 prefixes:** IPv6 hosts are judged by the IPv4 address they embed (the well-known `64:ff9b::/96`, 6to4, IPv4-mapped, and the prefixes the operator declared with `--oidc-nat64-prefix`). Declared prefixes only at registration: no RFC 7050 (`ipv4only.arpa`) discovery is done, so an address behind a prefix the network advertises but the operator did not declare is judged here as plain IPv6. The fetcher (a later release) discovers the network's prefixes and re-judges every address at fetch time, so a class confirmed now can still be refused at the first fetch if discovery shows a different class.
+- **Any other class must be confirmed.** `confirmed_address_classes` lists the classes you accept the server fetching from: `public`, `private`, `carrier-grade-nat`, `unique-local`, `non-global`. Omit it and the request is refused `400` with the classes the host resolves to; resend with them. They are stored with the URL, and the fetcher refuses an address outside them (an address class that later changes is refused, not followed).
+- At most **64** sources, **one per CA**: registering a CA that is already registered is `409` and names the existing source in `error.remediation`.
+- **No outbound proxy is used** in this release: a site whose only route out is a proxy cannot fetch CRLs yet.
+
+Example:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d @source.json https://yuzu.example.com/api/v1/crypto/revocation-sources
+```
+
+Response `201` (`Location` names the source):
+
+```json
+{
+  "data": {
+    "id": 3,
+    "name": "Corp issuing CA",
+    "ca_subject_name_sha256": "9f1c...e2",
+    "config_version": 1,
+    "created_by": "alice",
+    "created_at": "2026-10-23T09:00:00Z",
+    "updated_at": "2026-10-23T09:00:00Z",
+    "held_crl_count": 0,
+    "crl_status": "no_crl_fetched",
+    "ca_certificates": [{"cert_sha256": "4b0a...91", "ski": "6d2e...c7", "spki_sha256": "a83f...10"}],
+    "crl_urls": [{
+      "id": 5, "url": "http://crl.example.com/ca.crl", "host": "crl.example.com",
+      "confirmed_address_classes": ["public"],
+      "fetch_status": {"state": "never_fetched", "last_attempt_at": null, "last_success_at": null,
+                        "last_failure_cause": null, "consecutive_failures": 0, "next_attempt_at": null}
+    }]
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+##### `GET /api/v1/crypto/revocation-sources`
+
+The list is `{data: {sources[], total, max_sources, crl_past_next_update}}`. `crl_past_next_update` counts the registered CRL **scopes** (not sources: one source can hold several scoped CRLs) whose held CRL (base or delta) is past its `nextUpdate`; it is `0` until the fetcher holds CRLs. A degraded store answers `503` with `retry_after_ms: 5000`, never an empty list.
+
+##### `GET /api/v1/crypto/revocation-sources/{id}`
+
+One source, as in the example above, with its CA certificates, URLs, confirmed address classes and fetch status. An unknown id is `404`.
+
+##### `PUT /api/v1/crypto/revocation-sources/{id}`
+
+Replaces the source's name, CA certificates and URLs; this is how a renewed CA key is added. The new certificates must name the **same subject** as the registered source (a different subject is `400`: register that CA as its own source). A URL absent from the body is deleted with its fetch status and every CRL held from it; a key absent from the body deletes every CRL that verified only under it (nothing is held in this release). The CA's anti-rollback marks are never touched. The call is **idempotent**: a body equal to the stored configuration changes nothing and leaves `config_version` unchanged (`changed: false`). The response is the source plus `changed`, `dropped_urls`, `dropped_ca_certificates` and `crls_deleted`.
+
+##### `DELETE /api/v1/crypto/revocation-sources/{id}`
+
+Removes the source with its URLs, held CRLs and entries. Certificates it covered then read "issuer not registered". The CA's anti-rollback marks **survive**, so removing and re-registering a CA cannot accept an older CRL. A repeat answers `404`.
+
+##### `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water`
+
+Resets the CA's anti-rollback marks and discards the source's held CRLs. Use it only after confirming that the CA's clock or CRL numbering moved backwards on purpose: until the next CRL is accepted the CA's certificates read "revocation not checked", and the reset opens a **replay window** (a CRL that verifies and is dated at or after the reset is accepted whatever its number). The optional body `{"reset_at": "<RFC 3339 UTC>"}` (no later than the server clock; default now; a leap second `23:59:60` is accepted and stored, and read back, as `00:00:00` of the next day, while the audit row keeps the value as sent) sets the floor: a value below the CA's current `thisUpdate` widens the window to everything since it. The response echoes the window: `{reset_at, crls_deleted, replay_window_opens_at, pinned}` (`pinned` is true when `pin_crl_sha256` was recorded). **Before a reset, `PUT` the CA's new certificates first**: a reset removes the held CRLs, and a CRL signed by a key you have not registered yet cannot be accepted afterwards. The call is **not idempotent**: each call sets a new `reset_at` and deletes the held CRLs again. The optional body field `pin_crl_sha256` (64 hex) names the only first CRL to accept afterwards. The reset also clears each scope's CRL number and `thisUpdate`, keeps `reset_at` permanently and bumps `config_version`. A reset whose outcome is unknown can be checked by reading the source: `high_water.reset_at` (null until the first reset) and `high_water.pinned_crl_sha256`.
+
+##### Audit, errors and degrade
+
+- **Audit:** reads write `crypto.revocation_source.list` / `.view` and **fail closed** on REST (a row that does not persist answers `503` with `Sec-Audit-Failed: true` and no data). Mutations write `crypto.revocation_source.register` / `.update` / `.remove` / `.reset_high_water` with **no audit row, no mutation**: an `attempted` row first (if it cannot be stored the answer is `503` and nothing changes), then the outcome row. A lost outcome row keeps the `2xx`, sets `Sec-Audit-Failed: true` and adds `audit_persisted: false`; an `attempted` row with no outcome row means the outcome was not recorded, not that the change was not applied. See the [audit log catalogue](audit-log.md).
+- **Errors** are the A4 envelope: `400` (a field outside its rule, including a missing `expected_config_version`; `remediation` names the parameter), `401` (including a stale MFA step-up proof: `meta.challenge_url`), `403` (`error.message` says an administrator role is required; an MCP-tier token is refused), `404` (no such source, or an id that cannot be a source id: more than 18 digits or a leading zero. An id with a non-digit character matches no route and gets the server's plain `404`), `409` (CA already registered, 64 sources, or a stale `expected_config_version` whose `remediation` names the current one), `413` (body over 192 KiB), `503` (`retry_after_ms: 5000`: store degraded, the `attempted` audit row could not be written, the change outcome is unknown, **this server's own addresses could not be determined, or a name lookup timed out / had no capacity** (nothing was registered; retry); read the source to check an unknown outcome).
+
+
 ---
 
 ### Result Sets
@@ -8611,11 +9354,13 @@ The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-wal
   "source_kind": "manual_curate",
   "status": "materialized",
   "source_execution_id": "",
-  "device_count": 42
+  "device_count": 42,
+  "agents_failed": 0,
+  "partial": false
 }
 ```
 
-`parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `echo_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
+`agents_failed` counts the agents that answered an asynchronous producer's dispatch with a failure (a non-success status, output starting `error|`, or a success answer whose `__schema__` header lacks the column a column matcher names) and never produced a matching row. They are absent from the set because their query failed, not because they do not match, so `partial` is `true` whenever `agents_failed` is above zero and the set may be missing devices. An agent that failed once and later matched is a member and is not counted. `partial` means at least one *answering* agent failed: an agent that never answered is neither a member nor counted, so a set filled at the five-minute fill timeout reflects the answers stored by then and says nothing about the agents still missing. The execution's `agents_targeted` (`GET /api/v1/executions/{id}`) shows how many were sent the query, but under confinement it counts only agents with a response row, so a confined caller cannot see the non-responders that way. The fill reads every stored answer of the execution, 500 rows at a time, up to 100,000 rows; past that bound the set is marked `failed` rather than filled as partial: it reads `device_count` `0`, `agents_failed` `0` and `partial` `false`, and the reason (`response rows exceed the members read bound`) is in the server log only, not in the set. Both are `0` / `false` for a set that is not filled from agent answers, and while a set is still `pending`. On a database carried forward from an earlier build (not a supported deployment; see Upgrading), a set filled before this release, or by a server replica from before it, also reads `0` / `false` without information. `parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `echo_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
 
 #### `GET /api/v1/result-sets`
 
@@ -11155,7 +11900,7 @@ App-centric stability list — every application with a crash/hang signal in the
 
 #### `GET / PUT / DELETE /api/v1/dex/score-policy`
 
-The customer DEX score policy: tier edges and names, deduction weights, scoring model parameters and per-application overrides, stored as one JSON document that every server instance reads. `GET` returns the policy in force, `PUT` replaces it and `DELETE` removes it (the shipped defaults apply again). This is the only route that writes the document: `PUT /api/config/dex_score_policy` is refused. There is no Settings page for the policy yet: use this API. The MCP twins are tracked in #6087; there is no MCP tool for this route yet.
+The customer DEX score policy: tier edges and names, deduction weights, scoring model parameters and per-application overrides, stored as one JSON document that every server instance reads. `GET` returns the policy in force, `PUT` replaces it and `DELETE` removes it (the shipped defaults apply again). This is the only route that writes the document: `PUT /api/config/dex_score_policy` is refused. The dashboard surface over this route is the DEX **Scoring** tab (see [DEX](dex.md#scoring)), which calls the same apply function under the same `Infrastructure:Write` grant. Tier names and image keys are HTML-escaped wherever the tab shows them, because a name may contain an apostrophe. The MCP twins are tracked in #6087; there is no MCP tool for this route yet.
 
 - **Permission:** `GET` needs `GuaranteedState:Read` (with RBAC off, any authenticated session). `PUT` and `DELETE` need `Infrastructure:Write`, the broad infrastructure grant (the seeded roles that hold it are Administrator and ITServiceOwner; with RBAC off, only administrators). A cookie session must also be same-site: a cross-site or header-less browser write is refused `403` `cross-site request refused` by the server-wide check (see Authentication, "Cookie-session writes") and audited as `csrf.denied` with `target_id` `PUT /api/v1/dex/score-policy` or `DELETE /api/v1/dex/score-policy`. The server-wide check answers first; this route keeps its own copy as defence in depth. API, MCP and engine token callers are exempt from the same-site rule. A service-scoped API token is refused `403` on all three methods.
 - **`GET` response:** `data` object `{document, revision, source, fault?}`, with the header `ETag: "<revision>"`. `document` is the stored shape (`version`, `tiers.edges.{excellent,good,fair}`, `tiers.names.{excellent,good,fair,poor}`, `weights.{breadth,crashes,hangs,regression}`, `model.{per_device_event_cap,regression_full_ratio,regression_start_ratio,interval_confidence}` (only when a parameter is in use, see Rules), `overrides[]`), not the `tiers.<tier>.{edge,name}` projection that the Apps `policy` block carries. `revision` is `default` when nothing is stored and otherwise 16 lower-case hex digits that identify the stored text. `source` is `default` or `custom`; `fault` is present when the stored text is refused and the shipped defaults are in force. `GET` reads the store directly, is not audited, and answers `503` (`retry_after_ms: 2000`) when the store is unavailable.
@@ -11596,7 +12341,7 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 **`POST /api/settings/mfa/recovery-codes`** — Regenerate the 10 recovery codes.
 
 - **Permission:** Admin only. Requires existing enrollment.
-- **Step-up:** one of the 37 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
+- **Step-up:** one of the 41 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
 - **Effect:** Atomic DELETE + 10×INSERT inside a Postgres transaction, serialized on the caller's `auth.users` row (`SELECT … FOR UPDATE`) so two concurrent regenerations cannot interleave (#3779). All prior codes (consumed and unconsumed) are invalidated. If the account has been deactivated, the codes are **not** reissued and the request fails.
 - **Response (200):** HTML fragment with the fresh 10 codes as a one-time reveal. Same `Cache-Control: no-store` headers.
 - **Audit:** `mfa.recovery_codes.generated` / `ok` (detail = `10 codes issued (rotation)`).
@@ -11604,7 +12349,7 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 **`POST /api/settings/mfa/disable`** — Clear MFA state for the logged-in admin.
 
 - **Permission:** Admin only.
-- **Step-up:** one of the 37 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
+- **Step-up:** one of the 41 routes in the [step-up list](#step-up-envelope-on-high-risk-endpoints), checked before the permission check: an MFA-enrolled session whose proof is older than `mfa_step_up_window_secs` receives `401` `mfa_step_up_required`. The Settings MFA panel cannot yet prompt for the code: the button shows a toast and the operator signs in again (a just-enrolled administrator is covered inside the window, for the confirming session only, by the proof recorded at enrolment confirmation). An account with no MFA enrolled is not affected.
 - **Effect:** Atomic UPDATE users (clears `mfa_totp_secret`, `mfa_enrolled_at`; stamps `mfa_disabled_at`) + DELETE `mfa_recovery_codes` inside one Postgres transaction, serialised on the caller's `auth.users` row (`SELECT ... FOR UPDATE`). **Self-target guard (PR 3):** while `--mfa-enforcement` protects the caller's role (`required` → all roles; `admin-only` → admins), the disable is refused - the operator cannot strip the MFA that policy requires of them. After a successful disable every session of the account is ended, the caller's included, because any of them may hold an MFA proof made under the factor just cleared. API tokens are not ended.
 - **Response (503):** the `mfa.disabled` intent row (see Audit) could not be written, so nothing was cleared and no session was ended; the response carries `Sec-Audit-Failed: true` and `Retry-After: 5`, and the message "Audit store unavailable; MFA was not changed." is shown as a toast on both Settings pages (the response carries an `HX-Trigger` `showToast` header; an error toast has a close button) and, on Security and sign-in, also inline in the Two-factor sign-in panel (that page swaps `text/html` error bodies for requests made from inside its panels). Nothing was changed: retry once the audit store has recovered, or tell the operator that the audit store needs attention.
 - **Response (200):** on success an empty body with the `yuzu_session` cookie cleared and `HX-Redirect: /home` (the same exit as logout; the user signs in again). When the self-target guard fires, the unchanged "Enabled" fragment with an inline "MFA is required by policy" message. When the factor was cleared but the sessions could not be ended, the fragment carries the inline message "MFA was disabled, but the account's sessions could not be ended. Ask an administrator to end them." There is no retry control on that page: after the clear the fragment shows the not-enrolled view, and the Disable form exists only in the enrolled view. An administrator ends the sessions with `DELETE /api/v1/sessions?username=<name>` or `yuzu-server --mfa-reset <name>` (see `docs/ops-runbooks/auth-db-recovery.md` "Emergency MFA disable"). This route has no REST v1 or MCP twin yet (ledgered exception #6325, `scripts/ci/api-parity/auth-mfa.json`): the partial and unknown-state outcomes are HTTP 200 `text/html` with no machine-readable marker, so an automated caller must read the audit row to tell them from success. When the clear itself fails, the sessions are still ended, because the clear may have committed with its acknowledgement lost: if that delete succeeds the response is the same sign-out exit (with no hint that the clear failed; the audit row is the record), otherwise the fragment carries "Could not confirm MFA was disabled, and the account's sessions could not be ended. Its state is unknown: ask an administrator to check it and end the sessions." **Cancel setup** on an enrolment that was never verified clears no usable factor, so it ends no session and does not redirect: the not-enrolled fragment is returned.
@@ -13298,7 +14043,7 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 
 This stream holds an HTTP worker thread for as long as the drawer stays open, so it leases
 from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, MCP streamed POST,
-`GET /api/v1/events`, and the legacy `/events` stream (ADR-0034). That means enough open
+`GET /api/v1/events`, the legacy `/events` stream and synchronous workflow runs (ADR-0034). That means enough open
 drawers — or enough traffic on any of the other surfaces — can cause a *new* drawer to be
 refused with `429`. A live stream is never evicted to make room.
 
@@ -13404,7 +14149,7 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 
 This endpoint holds an HTTP worker thread open for the life of the subscription, so it
 leases from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, the dashboard
-executions drawer, MCP streamed POST, and the legacy `/events` stream (ADR-0034). A cap hit rejects the
+executions drawer, MCP streamed POST, the legacy `/events` stream and synchronous workflow runs (ADR-0034). A cap hit rejects the
 *new* stream with `429` — a live stream is never evicted to make room.
 
 A4 envelope shape:
@@ -13503,7 +14248,7 @@ Execute an Echo warehouse SQL query against targeted agents. Returns HTMX HTML f
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `sql` | string | Yes | A SELECT query using `$`-prefixed table names (e.g., `$Process_Live`, `$TCP_Hourly`). |
+| `sql` | string | Yes | A SELECT query using `$`-prefixed table names (e.g., `$Process_Hourly`, `$TCP_Hourly`). |
 | `scope` | string | No | Target scope. An agent ID, `group:<expression>`, or `__all__` for all agents. Defaults to all connected agents. |
 
 **Example (curl):**
@@ -13512,7 +14257,7 @@ Execute an Echo warehouse SQL query against targeted agents. Returns HTMX HTML f
 curl -X POST https://yuzu.example.com/api/dashboard/echo-execute \
   -H "Cookie: yuzu_session=abc123" \
   -H "Origin: https://yuzu.example.com" \
-  -d "sql=SELECT name, pid FROM \$Process_Live LIMIT 10" \
+  -d "sql=SELECT hour_ts, name, start_count FROM \$Process_Hourly LIMIT 10" \
   -d "scope=__all__"
 ```
 
@@ -13663,7 +14408,7 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 
 **Audit:** none on success — scan/config metadata, not per-device behavioral content (matches the fragment's own today-unaudited posture).
 
-**Not twinned (#4027 exception, recorded in `scripts/ci/api-parity/echo.json`):** `GET /fragments/echo/process-tree/result` and `GET /fragments/echo/process-tree/detail` are deliberately not given REST/MCP twins by #4027 — deferred as scope, not impossibility. `/detail`'s cache `token` is a CSPRNG value minted and principal-bound only inside the `/result` handler itself; no other path mints one, so a `/detail` twin genuinely has no usable input today. `/result`'s `pcmd`/`tcmd` command-id pair is an ordinary `echo sql` dispatch result (`Infrastructure:Read`, no execute gate) and could in principle be obtained by an operator through the already-twinned generic dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing the two canned `$Process_Live`/`$TCP_Live` queries verbatim — but that is not a dedicated API path, and a real `/result` twin would still need a new async "not ready yet" polling contract (REST/MCP have no htmx auto-reissue equivalent). Both routes are otherwise reachable today only via the dashboard-only `GET /fragments/echo/process-tree/run` route, itself excluded (a dispatch-shaped GET batched with a later dispatch-twin effort, #3994). Revisit once that later batch ships `/run` (and `/result`) twins that mint these artifacts directly over the API.
+**Not twinned (#4027 exception, recorded in `scripts/ci/api-parity/echo.json`):** `GET /fragments/echo/process-tree/result` and `GET /fragments/echo/process-tree/detail` are deliberately not given REST/MCP twins by #4027 — deferred as scope, not impossibility. `/detail`'s cache `token` is a CSPRNG value minted and principal-bound only inside the `/result` handler itself; no other path mints one, so a `/detail` twin genuinely has no usable input today. `/result`'s `pcmd`/`tcmd`/`hcmd` command-id set is an ordinary `echo sql` dispatch result (`Infrastructure:Read`, no execute gate) and could in principle be obtained by an operator through the already-twinned generic dispatch surface (`execute_instruction` / `POST /api/command`) by reproducing the three canned `$Process_Hourly`/`$TCP_Hourly` queries verbatim — but that is not a dedicated API path, and a real `/result` twin would still need a new async "not ready yet" polling contract (REST/MCP have no htmx auto-reissue equivalent). Both routes are otherwise reachable today only via the dashboard-only `GET /fragments/echo/process-tree/run` route, itself excluded (a dispatch-shaped GET batched with a later dispatch-twin effort, #3994). Revisit once that later batch ships `/run` (and `/result`) twins that mint these artifacts directly over the API.
 
 #### `GET /fragments/echo/capture-sources`
 
@@ -13673,7 +14418,7 @@ Render the **Capture sources** frame body for `/echo` (ADR-0015): an operator-sc
 
 #### `GET /fragments/echo/capture-sources/load`
 
-Self-re-issuing poll that dispatches `echo.status` + `echo.compatibility` to one selected device and renders the per-source toggle table (enable state, live-row count, per-OS support, category). First call dispatches and returns a polling fragment carrying the two command IDs; subsequent calls (`scmd`/`ccmd`/`n` params) poll until both complete.
+Self-re-issuing poll that dispatches `echo.status` + `echo.compatibility` to one selected device and renders the per-source toggle table (enable state, hourly row count, per-OS support, category). First call dispatches and returns a polling fragment carrying the two command IDs; subsequent calls (`scmd`/`ccmd`/`n` params) poll until both complete.
 
 **Permission:** `Infrastructure:Read` (scoped to the device) + `Execution:Execute` (the read dispatches a live query). **Audit:** `echo.sources.read` at dispatch.
 
@@ -13691,11 +14436,11 @@ Apply staged capture-source enable/disable changes. The dashboard stages toggles
 
 #### `GET /fragments/echo/process-tree/device-net`
 
-Self-re-issuing poll that dispatches read-only `echo.sql` over `$DNS_Live` + `$ARP_Live` to the selected host and renders the device-level **DNS-cache** and **ARP-table** panels embedded in the process-tree pane (ADR-0015). **Device-level, not per-process** (the DNS cache carries no pid).
+Self-re-issuing poll that dispatches read-only `echo.sql` over `$DNS_Hourly` + `$ARP_Hourly` to the selected host, for one hour, and renders the device-level **DNS-cache** and **ARP-table** panels embedded in the process-tree pane (ADR-0015). **Device-level, not per-process** (the DNS cache carries no pid).
 
-**Permission:** `Infrastructure:Read` (scoped) + `Execution:Execute`. **Audit:** `echo.dns.read` **and** `echo.arp.read` (distinct verbs — DNS is usage-class PII, separately countable) at dispatch.
+**Permission:** `Infrastructure:Read` (scoped) + `Execution:Execute`. **Audit:** `echo.dns.read` **and** `echo.arp.read` (distinct verbs — separately countable) at dispatch (`hour=<epoch> command_id=<id>`) and again when the rows are rendered (`hour=<epoch> rows=<n>`, or a `failure` row with the hour only).
 
-**Query params:** `device`; `dcmd`/`acmd`/`n` (poll continuation, server-supplied).
+**Query params:** `device`; `hour` (the hour bucket start, epoch seconds; omitted = the last 24 hours, newest hour with rows); `dcmd`/`acmd`/`n` (poll continuation, server-supplied).
 
 ---
 
@@ -14146,11 +14891,11 @@ curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
 
 #### Step-up envelope on high-risk endpoints
 
-A fresh MFA proof is required on 37 named high-risk routes (listed below) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied. The three JIT-elevation routes, whose handlers apply their own stricter check, are separate. Other mutating routes and all MCP tools are not MFA-step-up gated in this release. The 37 are checked by one central step-up check that runs after the session is resolved and after the server-wide same-site check (a cross-site or header-less cookie write is answered `403` `cross-site request refused` before it), and **before** the route's own authorization, own same-site copy and body checks. These routes return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the JIT-elevation routes at the end of this list use a 300s window instead when that flag is `0` or less; a positive value is used as it is).
+A fresh MFA proof is required on 41 named high-risk routes (listed below) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`; un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied. The three JIT-elevation routes, whose handlers apply their own stricter check, are separate. Other mutating routes and all MCP tools are not MFA-step-up gated in this release. The 41 are checked by one central step-up check that runs after the session is resolved and after the server-wide same-site check (a cross-site or header-less cookie write is answered `403` `cross-site request refused` before it), and **before** the route's own authorization, own same-site copy and body checks. These routes return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the JIT-elevation routes at the end of this list use a 300s window instead when that flag is `0` or less; a positive value is used as it is).
 
 Other outcomes of that check:
 
-- `403` for a SAML session (no SAML MFA attestation in this release; the remediation says SAML sessions cannot satisfy step-up, re-authenticating does not help, and to use an existing untiered, unscoped API token where the route accepts one, or ask an administrator). The escape hatch precedes this denial, so with `--mfa-step-up-window-secs` at `0` or less SAML sessions pass all 37 routes. Also `403` for an engine principal on every one of the 37 routes, regardless of its grants (audited as `mfa.step_up.required` with `result=error` and `reason=engine_principal_denied`; the body carries `meta.mfa_step_up_required: false` and no `challenge_url`). Once its credential resolves, an engine principal is refused before any role grant is consulted and without any MFA store read, even when `--mfa-step-up-window-secs` is `0`; it can never satisfy a TOTP challenge. During a database outage the pre-routing authentication cannot resolve the credential (an engine token reads the store on every request; a cookie session is served from the validation cache for about 30 seconds of a stall and is in the same position only once that cache lapses), so the request is answered as an unauthenticated one: `401` `unauthorized` (a JSON body on `/api/`, `/events` and `/mcp/` paths; other paths, such as `/fragments/`, get a redirect or `HX-Redirect`) without the step-up envelope, the engine quota or a step-up audit row. The checks that precede the denial are the pre-routing gates (on-behalf rejection, the rate limit, the `401` for no session and the engine quota `429`) and the unwired-store `503` below, which answers every caller class. On these 37 routes this replaces the per-route handler denial (a `result=denied` audit row with detail `engine_session_denied` and the body text `engine principals cannot access this endpoint`), which is no longer produced there; update SIEM rules keyed on it.
+- `403` for a SAML session (no SAML MFA attestation in this release; the remediation says SAML sessions cannot satisfy step-up, re-authenticating does not help, and to use an existing untiered, unscoped API token where the route accepts one, or ask an administrator). The escape hatch precedes this denial, so with `--mfa-step-up-window-secs` at `0` or less SAML sessions pass all 41 routes. Also `403` for an engine principal on every one of the 41 routes, regardless of its grants (audited as `mfa.step_up.required` with `result=error` and `reason=engine_principal_denied`; the body carries `meta.mfa_step_up_required: false` and no `challenge_url`). Once its credential resolves, an engine principal is refused before any role grant is consulted and without any MFA store read, even when `--mfa-step-up-window-secs` is `0`; it can never satisfy a TOTP challenge. During a database outage the pre-routing authentication cannot resolve the credential (an engine token reads the store on every request; a cookie session is served from the validation cache for about 30 seconds of a stall and is in the same position only once that cache lapses), so the request is answered as an unauthenticated one: `401` `unauthorized` (a JSON body on `/api/`, `/events` and `/mcp/` paths; other paths, such as `/fragments/`, get a redirect or `HX-Redirect`) without the step-up envelope, the engine quota or a step-up audit row. The checks that precede the denial are the pre-routing gates (on-behalf rejection, the rate limit, the `401` for no session and the engine quota `429`) and the unwired-store `503` below, which answers every caller class. On these 41 routes this replaces the per-route handler denial (a `result=denied` audit row with detail `engine_session_denied` and the body text `engine principals cannot access this endpoint`), which is no longer produced there; update SIEM rules keyed on it.
 - `503` when the server has no wired authentication store (for any caller, including a token caller and a disabled window), or when the store cannot be read or the stored second factor cannot be decrypted (for a local session; API-token and MCP-token callers pass before any store read, and an OIDC session is judged on its identity-provider assertion). A `503` still carries `meta.mfa_step_up_required: true`, with no `challenge_url`; a client must treat a `503` as "retry shortly" and prompt for a code only on a `401`. Any other failure to read the enrollment state of a local session is a `401` whose remediation names the store.
 - A refusal carries an `X-Correlation-Id` response header equal to the body's `error.correlation_id`, and the audit row of a refusal made by the central check carries `cid=<id>` (the same value) and `stage=pre_authz` in the `mfa.step_up.required` row's `detail`, so the response is joinable to its row. The detail of a stale or absent proof is `user=<name> age_secs=<n> window_secs=<n> cid=<id> stage=pre_authz` (`age_secs=-1` when the session has no proof); every other refusal is `user=<name> reason=<token> cid=<id> stage=pre_authz`. The gate the three JIT-elevation handlers apply in their own handler writes the same fields without `cid=` or `stage=`, so only the central check's rows join by correlation id. The row is best effort, and the central check writes none for a request with no session (counted on the metric only; pre-routing answers anonymous requests first). An over-cap request body is refused `413` before the step-up check runs.
 - **Dashboard controls.** The `/fragments/...` and `/api/settings/...` routes below answer in the same envelope. When the request carries `HX-Request` (an htmx control, on these routes or on an `/api/v1/` route such as `DELETE /api/v1/sessions`) the response also carries an `HX-Trigger` error toast whose text is the envelope's `message`; a `fetch` request has no such header and gets no toast. The Guardian page's Edit and Delete controls use `fetch` through the shared dialog, which prompts for a code on a `401` envelope and shows the `message` of a `403` or `503` inside the dialog. See [Authentication](authentication.md) for the prompts each dashboard control raises.
@@ -14173,6 +14918,10 @@ The server refuses to start (exit status `1`) if a mutating route is registered 
 - `POST /api/v1/guaranteed-state/push` (fan out Guardian rules)
 - `POST /api/v1/guaranteed-state/policy-generation/raise` (raise the Guardian policy generation)
 - `PUT /api/v1/config/{key}` (write a runtime-configuration override; its legacy twin `PUT /api/config/{key}` is not step-up gated)
+- `POST /api/v1/crypto/revocation-sources` (register a CRL source)
+- `PUT /api/v1/crypto/revocation-sources/{id}` (replace a CRL source)
+- `DELETE /api/v1/crypto/revocation-sources/{id}` (remove a CRL source)
+- `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water` (reset a CA's CRL anti-rollback marks)
 - `POST /api/settings/api-tokens` (mint an API token from the dashboard)
 - `DELETE /api/settings/api-tokens/{id}` (revoke an API token from the dashboard)
 - `POST /api/settings/mfa/recovery-codes` (regenerate your MFA recovery codes from the dashboard)

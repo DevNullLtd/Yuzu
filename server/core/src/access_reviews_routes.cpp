@@ -40,14 +40,16 @@ bool deny_engine_session(const ReviewsDeps& d, const auth::Session& s, const htt
 
 // AccessReview:Read (loud, or the quiet probe for the self-loading list), then the session, then
 // the engine refusal. Nothing is read before this returns true; on false the response is already
-// written.
+// written. `viewer`, when given, receives the session's username.
 bool gate(const ReviewsDeps& d, const ReviewsDeps::PermFn& perm, const httplib::Request& req,
-          httplib::Response& res, const char* action) {
+          httplib::Response& res, const char* action, std::string* viewer = nullptr) {
     if (!perm(req, res, "AccessReview", "Read"))
         return false;
     const auto session = d.auth_fn(req, res);
     if (!session)
         return false;
+    if (viewer)
+        *viewer = session->username;
     return !deny_engine_session(d, *session, req, res, action);
 }
 
@@ -78,7 +80,8 @@ void register_access_reviews_routes(HttpRouteSink& sink, ReviewsDeps deps) {
 
     sink.Get("/fragments/access/reviews/campaign",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!gate(deps, deps.perm_fn, req, res, "access_review.get"))
+                 std::string viewer;
+                 if (!gate(deps, deps.perm_fn, req, res, "access_review.get", &viewer))
                      return;
                  const std::string id = req.get_param_value("id");
                  if (id.empty()) {
@@ -105,7 +108,7 @@ void register_access_reviews_routes(HttpRouteSink& sink, ReviewsDeps deps) {
                  }
                  (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, "access_review.get",
                                                      "success", "AccessReview", id, "");
-                 respond_fragment(res, render_campaign(std::move(*view), can_attest));
+                 respond_fragment(res, render_campaign(std::move(*view), can_attest, {}, viewer));
              });
 
     sink.Get("/fragments/access/reviews/grants",

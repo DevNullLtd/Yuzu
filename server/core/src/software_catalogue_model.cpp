@@ -749,7 +749,7 @@ CatalogueReads catalogue_reads(SoftwareInventoryStore& store, const DeviceApi* d
                       [&store](std::int64_t cutoff) { return store.count_stale_agents(cutoff); }};
     if (device_api)
         io.connected = [device_api] {
-            return static_cast<std::int64_t>(device_api->list_devices().size());
+            return static_cast<std::int64_t>(device_api->connected_count());
         };
     return io;
 }

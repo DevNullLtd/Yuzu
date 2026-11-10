@@ -1,0 +1,13 @@
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-08 · LocalSystem (elevated; account names replaced with jsmith) · leg-hash 2a955b994291
+== action=host
+status|host|supported|-
+host|no|host_with_hypervisor|hyperv|EliteMini Series|cpuid|high
+container|unknown|windows:virtualization:container:not_read
+[result_status] OK / FULL / 
+
+== action=wsl
+status|wsl|supported|-
+summary|1|1|6|0|3.0.3.0
+distribution|jsmith|Ubuntu-26.04|2|installed|yes|ubuntu
+[result_status] OK / FULL / 
+

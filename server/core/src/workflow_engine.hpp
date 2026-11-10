@@ -21,8 +21,11 @@
 /// backfill" line, and the caller (`server.cpp`) runs `legacy_sqlite_probe::warn_if_legacy_rows()`
 /// over the legacy file so a locally-wrong "no production fleet" premise gets a loud signal.
 
+#include "refusal_log_throttle.hpp" // bounds the repeated size-sample failure warning
+#include "workflow_run_port.hpp" // WorkflowRunControl (the per-run hooks execute() consumes)
 #include "workflow_types.hpp" // ADR-0031 WS-A4 (eighth family): relocated pure POD types
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -31,6 +34,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+struct pg_conn; // libpq's PGconn (typedef struct pg_conn PGconn)
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -42,20 +47,9 @@ class MetricsRegistry;
 
 namespace yuzu::server {
 
-// ── Dispatch callback type ───────────────────────────────────────────────────
-// The workflow engine invokes this callback to dispatch a step to agents.
-// Returns a JSON result string on success, or an error string on failure.
-using StepDispatchFn = std::function<std::expected<std::string, std::string>(
-    const std::string& instruction_id,
-    const std::string& agent_ids_json,
-    const std::string& parameters_json)>;
-
-// ── Condition evaluator callback type ────────────────────────────────────────
-// Evaluates a compliance/CEL expression against result fields.
-// Returns true if the condition is satisfied.
-using ConditionEvalFn = std::function<bool(
-    const std::string& expression,
-    const std::map<std::string, std::string>& result_fields)>;
+// `StepDispatchFn` (the per-step dispatch callback `execute()` invokes) and `ConditionEvalFn` (the
+// step-condition evaluator) now live in `workflow_types.hpp`, included above, so the store-free
+// `WorkflowRunFn` port can name them. Same types, same namespace: no includer changes.
 
 // ── Execution-list SQL ──────────────────────────────────────────────────────
 
@@ -92,6 +86,25 @@ struct ExecutionPageSql {
     const std::optional<std::vector<std::string>>& visible_agents,
     std::chrono::milliseconds statement_timeout = kExecutionPageStatementTimeout);
 
+// ── Run-table size gauges ───────────────────────────────────────────────────
+
+/// Planner-estimate size of `workflow_engine.workflow_executions`, sampled on the server's
+/// maintenance tick (not per scrape and never COUNT(*)). Rows are never pruned (ADR-1005 residual
+/// 13), so these are the operator's only warning that the table is filling the shared Postgres
+/// volume. The gauges are absent until the first successful sample (a fabricated 0 would read as
+/// "empty table"); a failed sample leaves the previous value and bumps the unavailable counter.
+inline constexpr char kWorkflowExecutionsRowsMetric[] = "yuzu_server_workflow_executions_rows";
+inline constexpr char kWorkflowExecutionsBytesMetric[] = "yuzu_server_workflow_executions_bytes";
+inline constexpr char kWorkflowExecutionsStatsUnavailableMetric[] =
+    "yuzu_server_workflow_executions_stats_unavailable_total";
+
+/// What one sample of the run table reports. `rows` is `max(n_live_tup, reltuples)`, both planner
+/// estimates; `bytes` is `pg_total_relation_size` (heap + TOAST + indexes) of the same table.
+struct ExecutionTableEstimate {
+    std::int64_t rows{0};
+    std::int64_t bytes{0};
+};
+
 // ── WorkflowEngine ──────────────────────────────────────────────────────────
 
 class WorkflowEngine {
@@ -108,6 +121,44 @@ public:
     /// `create_workflow`/`delete_workflow`/`execute`/`cancel_execution`). Set-before-traffic
     /// contract, same as every other metrics-emitting store on this ladder.
     void set_metrics(yuzu::MetricsRegistry* metrics) noexcept { metrics_ = metrics; }
+
+    /// The engine-level shutdown state every run consults (`WorkflowStopLevel`), legacy route
+    /// included: the server wires it to `draining_` / `stop_requested_`. A run acts on the higher
+    /// of this and its own `WorkflowRunControl::should_stop`. Unset == `kNone`. Set-before-traffic
+    /// contract (like `set_metrics`): the function is read without a lock while runs are in
+    /// flight, and it must be cheap and must not throw.
+    void set_should_stop(std::function<WorkflowStopLevel()> fn) { should_stop_ = std::move(fn); }
+
+    /// Lease timeouts for the writes of a run already in flight (step results, the finalize).
+    /// `write` bounds each of them (default 2 s); `finalize_retry` bounds the ONE retry the final
+    /// status write gets when the first attempt could not get a lease (default 10 s). A seam so a
+    /// test can starve the pool in milliseconds; production never calls it. Set-before-traffic.
+    void set_run_lease_timeouts(std::chrono::milliseconds write,
+                                std::chrono::milliseconds finalize_retry) noexcept {
+        write_timeout_ = write;
+        finalize_retry_timeout_ = finalize_retry;
+    }
+
+    /// Test-only fault injection into the admission (claim) transaction, the only way to reach
+    /// its COMMIT-failure arms without a network proxy. Production never sets it. Set-before-
+    /// traffic.
+    struct ClaimTxnTestHooks {
+        /// Runs inside the claim transaction after the run's rows were written, with its
+        /// connection. A statement that fails there aborts the transaction while the body still
+        /// reports success, which is a COMMIT that did not commit.
+        std::function<void(pg_conn*)> in_txn_tail;
+        /// After a transaction that really committed, report its COMMIT as failed (a lost ack).
+        bool lose_commit_ack{false};
+    };
+    void set_claim_txn_hooks_for_test(ClaimTxnTestHooks hooks) { claim_hooks_ = std::move(hooks); }
+
+    /// Runs inside `execute()` right now, counted in-process from the top of `execute()` to after
+    /// its final status write (a throw included). The shutdown drain waits on this. It is
+    /// deliberately NOT a count of `running` rows: an orphan left by a crash, or a run owned by
+    /// another replica, must never hold this process's shutdown.
+    [[nodiscard]] int in_flight_runs() const noexcept {
+        return in_flight_.load(std::memory_order_acquire);
+    }
 
     // ── Workflow CRUD ────────────────────────────────────────────────────
     std::expected<std::string, std::string> create_workflow(const std::string& yaml_source);
@@ -134,11 +185,55 @@ public:
     /// Fails (workflow-not-found error) if the workflow does not exist OR was soft-deleted —
     /// admission is checked atomically at execution-row creation (ADR-0064 "New atomicity"),
     /// closing the race between an earlier `get_workflow` read and this call.
+    ///
+    /// A failed step is recorded, not returned; a `permanent` StepDispatchError is not retried and
+    /// is not slept on (the step's `on_failure` policy applies at once). A THROW from `dispatch_fn`,
+    /// `condition_fn` or `control.on_admitted` is a failed, never-retried step: the execution is
+    /// closed `failed` through the guarded finalize, the remaining steps are marked skipped, and
+    /// the exception is rethrown to the caller, so a throw leaves a run `running` only when the
+    /// final status write itself fails twice (below).
+    /// `control.on_admitted` is called once with the new execution id after admission and before
+    /// the first step.
+    ///
+    /// SHUTDOWN. The engine asks the higher of `control.should_stop` and the engine-level
+    /// `set_should_stop` at the top of every step, before every attempt and while a retry delay is
+    /// waited out (an interruptible wait, `workflow_wait.hpp`, so a change is seen within one
+    /// slice). `kDraining` abandons the retry a step had not yet made (the step then fails under
+    /// its own `on_failure` policy) and the run goes on dispatching its remaining steps. `kStop`
+    /// ends the run: the unstarted steps are marked skipped with reason `server_shutdown`, the
+    /// execution is finalized `failed` through the same guarded UPDATE, `control.on_interrupted`
+    /// is called, and `cancel_execution` is NOT used. The final write gets one retry with a longer
+    /// lease; if that also fails the row stays `running`, the error is logged and
+    /// `yuzu_server_workflow_finalize_failed_total` counts it.
+    ///
+    /// IDEMPOTENCY. `control.idempotency` claims `(principal, key)` in the same transaction that
+    /// admits the run, so two concurrent calls with one key start exactly one run. The loser gets
+    /// `control.on_replay` and a `kWorkflowIdempotentReplayError` result, writes nothing and
+    /// dispatches nothing. See `WorkflowRunControl::idempotency`.
+    ///
+    /// `control` carries the run's bounds (`workflow_run_port.hpp`): before every dispatch attempt
+    /// the engine first announces it (`control.on_attempt`: the step's index and the 1-based
+    /// attempt number, so a caller can attribute what each dispatch did to its step), then asks
+    /// `control.before_attempt` and compares `control.deadline` with the steady
+    /// clock; either refusing STOPS the run (the attempt is not made, the step is recorded failed,
+    /// the remaining steps are skipped `run stopped`, the execution is finalized `failed` through
+    /// the same guarded UPDATE, and `on_failure` does not apply). A retry delay is cut to the time
+    /// left before the deadline. A default `control` is no bound: the legacy route's behaviour.
     std::expected<std::string, std::string> execute(
         const std::string& workflow_id,
         const std::vector<std::string>& agent_ids,
         StepDispatchFn dispatch_fn,
-        ConditionEvalFn condition_fn = nullptr);
+        ConditionEvalFn condition_fn = nullptr,
+        const WorkflowRunControl& control = {});
+
+    /// The run a client's idempotency key is bound to, or `nullopt` when none is. Bound to
+    /// `principal`, never global: the same key under two principals is two keys. `unexpected(msg)`
+    /// (prefixed `kDbErrorPrefix`) is a genuine read failure and is NEVER "no run bound", because
+    /// the caller then dispatches (workflow_execute.hpp fails the call closed instead). The key is
+    /// bound for the life of the run's row; nothing deletes a workflow execution today, and a
+    /// future prune of this table owns the retention obligation (docs/clock-guarded-retention.md).
+    std::expected<std::optional<WorkflowIdempotentRun>, std::string> find_execution_by_key(
+        const std::string& principal, const std::string& idempotency_key) const;
 
     /// Get execution status with step results.
     std::expected<std::optional<WorkflowExecution>, std::string> get_execution(
@@ -183,10 +278,34 @@ public:
     /// Cancel a running execution.
     std::expected<void, std::string> cancel_execution(const std::string& id);
 
+    /// One cheap read of the run table's size: a single catalog/statistics row, no table scan, in
+    /// one transaction whose lease acquire is bounded at 250 ms (plus the pool's connect timeout
+    /// when it must open a connection) and whose statement is bounded by a 250 ms
+    /// `statement_timeout`.
+    /// `unexpected(msg)` (prefixed `kDbErrorPrefix`) is a genuine failure and is never a zero.
+    std::expected<ExecutionTableEstimate, std::string> execution_table_estimate() const;
+
+    /// Samples `execution_table_estimate()` and publishes it to the wired metrics sink
+    /// (`kWorkflowExecutionsRowsMetric`, `kWorkflowExecutionsBytesMetric`). A failed sample, or a
+    /// sample that throws, leaves both gauges at their previous value, counts
+    /// `kWorkflowExecutionsStatsUnavailableMetric` and logs a warning at most once per five
+    /// minutes per cause. Never throws; no-op without a sink. Called
+    /// from the maintenance tick (`health_recompute_thread_`), so it must stay inside that
+    /// thread's serial budget: about 250 ms plus the 250 ms statement timeout when a connection is
+    /// idle, but when the pool must open a connection a started connect runs to completion, so the
+    /// bound is roughly 250 ms plus `connect_timeout_s` (10 s by default).
+    void refresh_table_size_metrics() noexcept;
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    mutable RefusalLogThrottle sample_warn_throttle_{std::chrono::seconds(300)};
+    std::function<WorkflowStopLevel()> should_stop_;
+    std::chrono::milliseconds write_timeout_;
+    std::chrono::milliseconds finalize_retry_timeout_;
+    std::atomic<int> in_flight_{0};
+    ClaimTxnTestHooks claim_hooks_;
 
     std::string generate_id() const;
 

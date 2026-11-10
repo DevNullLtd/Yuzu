@@ -84,9 +84,11 @@ enum class KvRename { Renamed, NotFound, Conflict, Error };
 
 /// The storage contract GuardianLifecycleJournal requires: the 8 KvStore methods it
 /// calls, with signatures identical to KvStore's own. This is a NARROW seam (#4153),
-/// not a general KvStore abstraction - it exists solely so the journal's concurrency
+/// not a general KvStore abstraction - it exists so the journal's concurrency
 /// checkpoints can run against an in-memory test double instead of real SQLite I/O.
-/// Production always constructs the journal with a real KvStore.
+/// Production always constructs the journal with a real KvStore. A second consumer is
+/// the Guardian boot-epoch claim (guardian_boot_epoch.hpp), which uses only get_entry, set
+/// and pragma_synchronous.
 ///
 /// Contract every implementation MUST keep - the journal's multi-caller safety
 /// argument (see guardian_lifecycle_journal.hpp's CONCURRENCY block) rests on it:
@@ -96,7 +98,7 @@ enum class KvRename { Renamed, NotFound, Conflict, Error };
 ///     internal state, and releases its lock before returning;
 ///   * a call never invokes a callback, blocks on another participant, or calls
 ///     back into the journal while holding its lock.
-/// A future second consumer of this interface must not weaken any of the three.
+/// A further consumer of this interface must not weaken any of the three.
 class YUZU_EXPORT IJournalStore {
 public:
     virtual ~IJournalStore() = default;
@@ -232,8 +234,10 @@ public:
      * Re-key every row of plugin `from` to plugin `to` in ONE transaction: copy with
      * INSERT OR IGNORE (a key already present under `to` keeps its value), then delete the
      * `from` rows. All-or-nothing; true when the move committed (including "nothing to
-     * move"), false on error. Upgrade-window step for the tar -> echo rename, removed with
-     * the other legacy-name shims.
+     * move", which is decided by a read that takes no write lock), false on error or on a
+     * refused call: `from` or `to` empty, `from == to`, or either name starting with `__`
+     * (the agent-owned namespaces). Upgrade-window step for the tar -> echo rename, removed
+     * with the other legacy-name shims.
      */
     [[nodiscard]] bool rename_plugin(std::string_view from, std::string_view to);
 
@@ -248,8 +252,9 @@ public:
     /**
      * The effective `PRAGMA synchronous` level (0=OFF, 1=NORMAL, 2=FULL,
      * 3=EXTRA), or -1 on error. The journal's power-loss-durability claim wants
-     * FULL; the caller SOFT-warns on anything less (never a hard abort - config
-     * drift must not kill an agent).
+     * FULL; the journal SOFT-warns on anything less (never a hard abort - config
+     * drift must not kill an agent). The Guardian boot-epoch claim is stricter: it
+     * REFUSES a level below FULL and treats an unreadable (-1) pragma as a failed read.
      */
     [[nodiscard]] int pragma_synchronous() override;
 

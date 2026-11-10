@@ -1,8 +1,13 @@
 #pragma once
 
-// Interval of the agent's `echo.rollup` trigger, in seconds. It is also the
-// `tick_seconds` the data-retention API publishes: rows may outlive their
-// retention limit by up to one tick. Pure constant; shared so the two cannot drift.
+#include <cstdint>
+
+// Interval of the agent's `echo.rollup` trigger, in seconds. The data-retention
+// API publishes it as `tick_seconds`: it is how often the agent runs its
+// retention and byte-budget pass, so a row can outlive its limit by ordinary
+// scheduling lag (the interval is a cadence, not a bound), and by more when the
+// retention clock guard declines a pass. Pure constants; shared so the figures
+// the server publishes cannot drift from the agent's trigger.
 
 #include <cstdint>
 
