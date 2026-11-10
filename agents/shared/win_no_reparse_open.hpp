@@ -22,8 +22,10 @@
 //
 // FAIL CLOSED. Never a path-based fallback: a missing `NtCreateFile` symbol, a build that rejects
 // OBJ_DONT_REPARSE (STATUS_INVALID_PARAMETER), or any other failure is a refusal.
-// `drive_relative_name` refuses every spelling `NtCreateFile` would resolve differently from
-// CreateFileW (see below), so such a name reads as refused, never as a false "absent".
+// `drive_relative_name` refuses the spellings `NtCreateFile` would resolve differently from
+// CreateFileW (see below), so such a name reads as refused, never as a false "absent". A root-level
+// DOS device name (`X:\NUL`) passes the lexical filter by design: the open answers not-found, and a
+// device handle would fail the caller's by-handle disk-type check.
 //
 // STATUS MAPPING: ok (handle owned), absent (object name or path not found), unsupported (no
 // NtCreateFile, or STATUS_INVALID_PARAMETER), refused (everything else: a reparse point

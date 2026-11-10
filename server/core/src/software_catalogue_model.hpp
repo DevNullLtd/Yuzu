@@ -47,8 +47,9 @@ inline constexpr std::size_t kScopePushdownMaxIds = 10000;
 inline constexpr int kWideScopeMaxReads = 4;
 /// Most rows a wide-scope cursor may ask the store to pass over (its `skip`, an SQL OFFSET): a
 /// deliberate product limit. An honest walk over a sparse scope grows the skip by
-/// kWideScopeMaxReads x limit per request, so 100000 is 25 consecutive empty pages of the maximum
-/// size (250 at limit 100). The cursor is opaque and unauthenticated, so the same bound holds for
+/// kWideScopeMaxReads x limit per request, so in page mode 100000 is 25 consecutive empty pages of
+/// the maximum size (250 at limit 100); an export reads up to 10000 rows per request and reaches
+/// the ceiling after a few continuations. The cursor is opaque and unauthenticated, so the same bound holds for
 /// any token a caller presents: no request's OFFSET exceeds it. A cursor past it is refused with
 /// CursorError::kScanLimit; the caller narrows the filter or pages with a smaller scope.
 inline constexpr std::int64_t kWideScopeMaxSkip = 100000;

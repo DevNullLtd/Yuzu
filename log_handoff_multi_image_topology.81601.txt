@@ -1,0 +1,15 @@
+#4666 PR-2 W3a MI-1b(b) measurement (the direct load-bearing-vs-no-op answer)
+closed_after_bare_teardown=false
+closed_after_exe_image_swap=true (REQUIRE'd above)
+verdict: a bare h->teardown() did NOT destroy the sink - this image's OWN registry still held a live reference to the logger (and therefore its sinks) after the library-only teardown ran; the exe-image logger swap in release_log_handoff_from_this_image() is LOAD-BEARING on this platform, confirmed below by observing it actually finish the job
+#4666 PR-2 W3a MI-1 measurement (see MI-1b for the topology verdict)
+saw_library_line=true
+saw_test_line=true
+finding: both the library-image probe and the test-image call reached the same capture sink after install_log_handoff_in_this_image() ran (does NOT by itself distinguish one shared registry from two separately-installed ones - see MI-1b)
+raw capture (2 line(s)):
+  - from library image
+  - from test image
+#4666 PR-2 W3a MI-1b(a) measurement
+same_default_ptr=false
+reached=false
+verdict: TWO (or more) registries: LogHandoff::install() alone did NOT route this image's own spdlog::info() to the sink (same_default_ptr=false, reached=false) - install_log_handoff_in_this_image()'s redundant exe-image spdlog::set_default_logger() call is what makes that work in production

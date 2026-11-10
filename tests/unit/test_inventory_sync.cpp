@@ -4551,7 +4551,7 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
             "Rocky Linux Build System (Peridot) <releng@rockylinux.org>")),
         inv_row_of(ia_inv::parse_rpm_inv_line(
             "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\td\t(none)\t(none)\t(none)\tFedora (43) Signing")),
-        inv_row_of(ia_inv::parse_rpm_inv_line("bare\t0\t1\t1\tnoarch\t(none)\td\t(none)\t(none)\t(none)")),
+        inv_row_of(ia_inv::parse_rpm_inv_line("bare\t0\t1\t1\tnoarch\td\t(none)\t(none)\t(none)\t(none)")),
         inv_row_of(ia_inv::parse_pacman_inv_line("zlib 1:1.3.1-2")),
         inv_row_of(ia_inv::parse_apk_inv_line("musl-1.2.5-r0")),
         inv_row("Contoso Tool", "Contoso Ltd", "app", "windows"),
