@@ -34,6 +34,16 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Returning to an earlier build.** Not supported: see "Deployment contract (hard cutover)" further down this page.
 
+## ⚠️ Breaking: the Echo retention-paused list names its row count `hourly_rows`
+
+**What changed.** Each row of `GET /api/v1/echo/retention-paused` and of the MCP tool `list_echo_retention_paused` carried its row count under `live_rows`. Echo keeps roll-up tiers only, so that count is the number of rows in the source's hourly roll-up tier, never raw capture rows. The field is now `hourly_rows`, and `live_rows` is gone with no alias. The OpenAPI `EchoRetentionPausedRow` schema and the MCP `outputSchema` list `hourly_rows` as required.
+
+**Affected.** Any integration or MCP client that reads `rows[].live_rows` from either surface. A client that treats a missing key as zero will read every count as zero.
+
+**To migrate.** Read `rows[].hourly_rows`. The value is the same: the rows in the source's hourly roll-up tier, or `-1` when the agent sent no `<source>_rows` line. Search integration and MCP client code for `live_rows`.
+
+**Unchanged.** The dashboard list (its column already read "Hourly rows") and the agent's `echo.status` lines.
+
 ## ⚠️ Breaking: cpp-httplib 0.59 changes HTTP request handling, connection closing and, on Windows, outbound certificate trust
 
 **What changed.** The vcpkg baseline moves cpp-httplib from 0.37.1 to 0.59.0. The following changes are visible to a client, to anything in front of the server, or to the agent's and server's own outbound HTTP clients.
