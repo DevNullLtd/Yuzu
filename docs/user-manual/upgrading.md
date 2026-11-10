@@ -44,8 +44,6 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Unchanged.** The dashboard list (its column already read "Hourly rows") and the agent's `echo.status` lines.
 
-**Mixed versions.** A server on the previous build answers with `live_rows` and a server on this build answers with `hourly_rows`, so upgrade a client with or after the server. While servers of both builds can answer, accept either key, and treat a missing key as unknown, never as zero. Returning to an earlier build is not supported (see "Deployment contract (hard cutover)" further down this page).
-
 ## ⚠️ Breaking: cpp-httplib 0.59 changes HTTP request handling, connection closing and, on Windows, outbound certificate trust
 
 **What changed.** The vcpkg baseline moves cpp-httplib from 0.37.1 to 0.59.0. The following changes are visible to a client, to anything in front of the server, or to the agent's and server's own outbound HTTP clients.
