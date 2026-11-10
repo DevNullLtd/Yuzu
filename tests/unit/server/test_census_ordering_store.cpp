@@ -2428,7 +2428,7 @@ TEST_CASE("census ordering: an empty-string rule id is an id, not a wildcard",
     CHECK(all->rule_ids == std::vector<std::string>{"", "r1"});
 }
 
-// -- #5675: GuaranteedStateStore::delete_agent (decommission erasure) ----------------------------------------
+// -- #5675: GuaranteedStateStore::delete_agent (decommission erasure) -------------------------
 
 namespace {
 
