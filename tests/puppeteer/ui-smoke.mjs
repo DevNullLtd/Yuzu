@@ -331,16 +331,18 @@ async function scenarioEngineAudit(page) {
   clearStubs(page);
   w.reset();
   await stub(page, { method: 'GET', path: ROSTER, status: 200, contentType: 'text/html', body });
-  await stub(page, { method: 'GET', path: '/fragments/settings/tokens', status: 200,
+  const tokensRule = await stub(page, { method: 'GET', path: '/fragments/settings/tokens', status: 200,
     contentType: 'text/html', body: '<p>t</p>', headers: { 'Sec-Audit-Failed': 'true' } });
-  await stub(page, { method: 'GET', path: '/fragments/settings/api-tokens', status: 500,
+  const apiRule = await stub(page, { method: 'GET', path: '/fragments/settings/api-tokens', status: 500,
     contentType: 'text/html', body: '<p>down</p>' });
   await visit(page, '/settings');
   await rosterShown();
   await quiesce(page);
   check('#6749 control: an unrelated fragment (audit-failed 200, or a 500) shows no Engine Principals banner',
-    (await banners()).length === 0 && w.pageErrors().length === 0,
-    JSON.stringify({ banners: await banners(), pageErrors: w.pageErrors() }));
+    (await banners()).length === 0 && w.pageErrors().length === 0 &&
+    tokensRule.calls.length >= 1 && apiRule.calls.length >= 1,
+    JSON.stringify({ banners: await banners(), pageErrors: w.pageErrors(),
+      tokensCalls: tokensRule.calls.length, apiCalls: apiRule.calls.length }));
 
   // Negative control 3: the roster itself failing (403, with the header) is not a "data is still
   // current" claim: no banner, the permission note instead.

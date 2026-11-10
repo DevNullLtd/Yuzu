@@ -65,9 +65,12 @@ Principals panel" section); none admits a caller the route refuses.
 
 When the audit record of a roster read could not be saved, the list is still shown and a note
 above it says "An audit record for this read could not be saved. The data shown is still
-current." The note stays until the page is reloaded. It is the same sentence the Access page
-shows for the same condition, and it appears only after a successful read: a refused read shows
-the permission note instead.
+current." The note stays until the page is reloaded. It is the same sentence the Tokens and principals
+page shows for the same condition, and it appears only after a successful read: a refused read
+shows the permission note instead. The read happened but has no audit record: check the audit
+store's health and the `yuzu_server_audit_emit_failed_total` counter (alert
+`YuzuAuditPersistFailures`). Reloading the page clears the note and any credential reveal, so
+copy a secret first.
 
 A revoked row's **Detail (earliest retained record)** cell is the audit trail's text
 for that principal, shown to a caller who also holds `AuditLog:Read`. It is

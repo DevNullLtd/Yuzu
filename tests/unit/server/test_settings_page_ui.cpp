@@ -177,7 +177,7 @@ TEST_CASE("Settings page says so, once, when the Engine Principals roster read's
           "[settings][settings_page][engine_principal]") {
     // The roster read answers 200 with `Sec-Audit-Failed: true` when its audit write failed: the
     // data is current, the evidence is missing. A body listener shows the same sentence the
-    // Access page shows. CSP-safe: no hx-on, no eval, text only.
+    // Tokens and principals page shows. CSP-safe: no hx-on, no eval, text only.
     const std::string html = kSettingsHtml;
     constexpr std::string_view kSentence =
         "An audit record for this read could not be saved. The data shown is still current.";
@@ -197,7 +197,8 @@ TEST_CASE("Settings page says so, once, when the Engine Principals roster read's
     // Keyed on the REQUEST PATH (the section is the only requester of it), not on an element id,
     // and only on a 200: a 403 never claims "the data shown is still current".
     CHECK(count_of(html, "d.pathInfo.requestPath") == 1);
-    CHECK(count_of(html, "d.pathInfo.requestPath !== '/fragments/settings/engine-principals'") == 1);
+    CHECK(count_of(html,
+                   "d.pathInfo.requestPath !== '/fragments/settings/engine-principals'") == 1);
 
     // The listener's slice: from its addEventListener to its own close.
     const auto at = html.find("document.getElementById('engine-principals-notices')");
@@ -213,6 +214,9 @@ TEST_CASE("Settings page says so, once, when the Engine Principals roster read's
     CHECK(count_of(body, "className = 'failbox'") == 1);
     CHECK(count_of(body, "setAttribute('role', 'alert')") == 1);
     CHECK(count_of(body, "box.textContent = ") == 1);
+    CHECK(count_of(body, "notices.appendChild(box)") == 1);
+    // Each guard ends in `return;`, so a failed guard never reaches the insert.
+    CHECK(count_of(body, ") return;") == 4);
     // Text only; never markup, never the secret-reveal element, never eval.
     CHECK(count_of(body, "innerHTML") == 0);
     CHECK(count_of(body, "engine-principal-reveal") == 0);
@@ -222,7 +226,7 @@ TEST_CASE("Settings page says so, once, when the Engine Principals roster read's
     // getElementById is how the notices div is found (insert-once needs the lookup).
     CHECK(count_of(body, "getElementById('engine-principals-notices')") == 1);
 
-    // The sentence is the Access page's AUDIT_FAILED, byte for byte (a hand copy, pinned).
+    // The sentence is the Tokens and principals page's AUDIT_FAILED, byte for byte (a hand copy).
     CHECK(count_of(body, std::string("'") + std::string(kSentence) + "'") == 1);
     CHECK(count_of(yuzu::server::kYuzuTokensJs,
                    std::string("var AUDIT_FAILED = '") + std::string(kSentence) + "';") == 1);

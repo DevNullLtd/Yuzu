@@ -12399,7 +12399,7 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 
 - **Permission:** Admin only.
 - **Effect:** Generates a fresh 20-byte CSPRNG secret and stores it provisionally (`mfa_enrolled_at` stays NULL). Re-running on an already-provisional row re-reveals the same secret (reuse, not rotate); refused if the user is already enrolled (`MfaAlreadyEnrolled` → 200 with error message in the fragment).
-- **Response (200):** HTML fragment containing the `otpauth://` URI + base32 secret as a one-time reveal, plus the verify-code form. Response carries `Cache-Control: no-store, private`, `Vary: Cookie`, `Pragma: no-cache`, and `Referrer-Policy: no-referrer` so browsers / proxies / CDNs cannot retain the material. Every `200` answer of the MFA routes carries the same set, including the failure and "MFA store unavailable" re-renders and the answer to `POST /api/settings/mfa/disable`.
+- **Response (200):** HTML fragment containing the `otpauth://` URI + base32 secret as a one-time reveal, plus the verify-code form. Response carries `Cache-Control: no-store, private`, `Vary: Cookie`, `Pragma: no-cache`, and `Referrer-Policy: no-referrer` so browsers / proxies / CDNs cannot retain the material. Every `200` answer of the MFA routes carries the same set, including the failure and "MFA store unavailable" re-renders and the answer to `POST /api/settings/mfa/disable`. On a running server the response-header bundle also adds `Referrer-Policy: strict-origin-when-cross-origin` after the route has answered, and that policy is the one that takes effect over the route's `no-referrer`.
 - **Password changed during enrolment (#5342):** if the account's password is changed or reset while this call is minting the secret, nothing is stored or revealed; the fragment says "Your password changed during enrolment — sign in again".
 - **Audit:** `mfa.enroll.initiated` / `ok` (or `error` on failure); `mfa.enroll.failed` / `error` detail `credential_changed` for the password-changed case.
 
@@ -12447,7 +12447,7 @@ The handler enforces a **self-target guard** on destructive operations: the curr
 Render the user table fragment.
 
 - **Permission:** Admin only
-- **Response (200):** HTML fragment of the user table. The row matching the caller's session username renders an italic `Current user` badge in place of the Remove button. All other rows include an `hx-delete` attribute targeting the DELETE endpoint below.
+- **Response (200):** HTML fragment of the user table. The row matching the caller's session username renders an italic `Current user` badge in place of the Remove button. All other rows include an `hx-delete` attribute targeting the DELETE endpoint below. Sent with `Cache-Control: no-store, private` and `Vary: Cookie`, like the answers of the add, remove and role-change routes that re-render it.
 - **Response (401):** Returned defensively when the admin gate passes but the session cannot be re-resolved (e.g., concurrent logout). The dashboard should redirect to login.
 - **Response (500):** Returned when the resolved session has an empty username — defense-in-depth against an upstream auth misconfiguration (e.g., OIDC returning empty `preferred_username`). Server log records the cause.
 

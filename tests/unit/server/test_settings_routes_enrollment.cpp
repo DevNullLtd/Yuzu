@@ -1004,14 +1004,15 @@ TEST_CASE("settings enrollment: token responses are no-store and private",
     }
 }
 
-// #6940: a token request the store's bounds refuse (here a negative use limit; the numeric-parameter
+// #6940: a token request the store's bounds refuse (here a negative use limit; the numeric-param
 // refusal above answers an A4 JSON body and lists nothing) re-renders the token list, so it is
 // uncacheable and private like the success and the outage answers.
 TEST_CASE("settings enrollment: a token request the store refuses is a 400 list re-render, "
           "no-store and private",
           "[pg][settings_routes][enrollment][cache]") {
     EnrollRoutesHarness h;
-    auto res = h.sink.Post("/api/settings/enrollment-tokens", "label=x&max_uses=-1&ttl_hours=1", kForm);
+    auto res =
+        h.sink.Post("/api/settings/enrollment-tokens", "label=x&max_uses=-1&ttl_hours=1", kForm);
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(raw_token_in(res->body).empty());

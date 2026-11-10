@@ -17,9 +17,10 @@ copy is invisible without it. This gate pins the source shape:
   4. The two access-reviews fragments call `no_store_private(res)` AFTER the belt and before the
      render (#6940): a cached copy of the grant evidence is the leak, and a call before the belt
      would stamp the headers on a refusal that already sets its own `no-store`.
-  5. `valid_campaign_id(` is called ONCE in the file (the campaign renderer's single validator,
-     #7315): a second call is a duplicate validator, for example from a stale port of an older
-     change.
+  5. `valid_campaign_id(` is called AT MOST ONCE in the file (the campaign renderer's single
+     validator, #7315): a second call is a duplicate validator, for example from a stale port of
+     an older change. Deleting the call is caught by behaviour (the malformed-id case of
+     test_settings_access_review_engine_authz.cpp), not by this gate.
 
 Source-text only, no build. Carries its own mutation self-test.
 """

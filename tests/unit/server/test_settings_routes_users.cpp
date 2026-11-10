@@ -2271,7 +2271,8 @@ void check_private_no_store(const httplib::Response& res) {
 }
 } // namespace
 
-TEST_CASE("SettingsRoutes users fragment: the list and every mutation re-render is no-store, private",
+TEST_CASE("SettingsRoutes users fragment: the list and every mutation re-render is no-store "
+          "and private",
           "[settings][users][cache]") {
     SettingsRoutesHarness h;
     h.session_user = "admin";
@@ -2302,12 +2303,14 @@ TEST_CASE("SettingsRoutes users fragment: the list and every mutation re-render 
         auto res = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
         REQUIRE(res);
         REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("HX-Trigger").find("Role updated") != std::string::npos);
         check_private_no_store(*res);
     }
     SECTION("POST /api/settings/users/{name}/role: unchanged") {
         auto res = h.Post("/api/settings/users/bob/role", R"({"role":"user"})");
         REQUIRE(res);
         REQUIRE(res->status == 200);
+        CHECK(res->get_header_value("HX-Trigger").find("Role unchanged") != std::string::npos);
         check_private_no_store(*res);
     }
 }

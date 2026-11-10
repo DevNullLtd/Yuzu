@@ -704,7 +704,7 @@ const char* const kSettingsPageTemplate =
     /* #6749: the roster read answers 200 with Sec-Audit-Failed when its audit row could not be
        saved. Say so, persistently, in the notices div (outside the section that refreshes), once.
        The sentence is yuzu-tokens.js AUDIT_FAILED (pinned equal in test_settings_page_ui.cpp);
-       it is only true after a successful read, hence the status test. Text only, no markup. */
+       the sentence is only true after a successful read, hence the status test. Text only, no markup. */
     document.body.addEventListener('htmx:afterRequest', function(e) {
       var d = e.detail || {}, x = d.xhr;
       if (!x || x.status !== 200 || !d.pathInfo) return;
