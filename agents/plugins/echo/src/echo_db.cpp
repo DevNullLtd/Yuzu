@@ -959,7 +959,8 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // after the integrity check, which can run for seconds and wait the busy timeout): the
     // quarantine below moves only this inode, so a link or a different file put at the name while
     // the check runs is refused and nothing is moved (#1527). The gap between the open and this
-    // read is the one recorded residual of the binding (sqlite_quarantine.hpp, BINDING).
+    // read is a recorded residual of the binding (sqlite_quarantine.hpp, BINDING, which records
+    // the others: the drop of the original by name, and a planted hard link).
     const auto judged = yuzu::shared::sqlite_quarantine::file_identity(path);
     if (seams.before_integrity_check)
         seams.before_integrity_check(); // the swap-during-check test's fault point

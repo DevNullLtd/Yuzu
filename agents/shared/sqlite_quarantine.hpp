@@ -40,13 +40,18 @@
 /// no-follow regular-file checks bind the claim: a replaced regular file is a recorded residual on
 /// that platform (SQLite holds its files without FILE_SHARE_DELETE, so a live database another
 /// process has open cannot lose its name there; unproven until the MSVC leg runs).
-/// Two residuals remain on POSIX. The original is re-examined and then dropped by name, and
+/// Three residuals remain on POSIX. The original is re-examined and then dropped by name, and
 /// POSIX has no unlink-if-same-inode, so a second recovery that drops the name AND creates a new
 /// file at it inside that gap loses its file (two agent processes on one data directory are
-/// unsupported). And a HARD link planted at the name is a regular file with its target's
-/// identity, so it is judged, claimed and secured as that target: the open that judged it had
-/// already used it as the database (pre-existing; Linux protected_hardlinks refuses a link to a
-/// file the planter does not own, and the packaged POSIX data directory is root-owned).
+/// unsupported). A HARD link planted at the name is a regular file with its target's identity,
+/// so it is judged, claimed and secured as that target: the open that judged it had already used
+/// it as the database (pre-existing; Linux protected_hardlinks refuses a link to a file the
+/// planter does not own, and the packaged POSIX data directory is root-owned). And a name in the
+/// quarantine set swapped for a hard link to a third file between the move and the mode change
+/// (`secure` below) has that file's mode tightened to 0600: tighten-only, and it needs write
+/// access to the data directory. The link count is deliberately not checked there, because an
+/// interrupted earlier claim legitimately leaves the re-quarantined file under two names (above),
+/// and skipping the change would leave that evidence at its live mode.
 ///
 /// Names have the exact form `<file><suffix><epoch>[-<n>]` (suffix `.corrupt-` or `.planted-`),
 /// which the dedup store's prune parser relies on.
