@@ -18,6 +18,8 @@ descriptor, callback, `FILE*`, SQLite handle or Postgres lease is added.
 - **Postgres column `agent_routes.legacy_echo_wire_name`:** stays in the table (an applied
   migration is never edited); `register_fresh`, `lookup_route` and `lookup_routes` no longer write or
   read it. The upsert drops one bound parameter (`$3`).
+- **`GatewayRouteFallback::legacy_wire_`:** a `std::unordered_set<std::string>` of agent ids, filled in
+  `prepare()` from the directory rows and read by `legacy_wire_for()`. Removed with both.
 - **Static set in `is_legacy_live_shim`:** a function-local `unordered_set` of sixteen names.
   Removed.
 

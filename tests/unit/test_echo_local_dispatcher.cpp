@@ -831,11 +831,10 @@ TEST_CASE("echo plugin: a rollup pass on an over-budget legacy database evicts t
     const auto wal_size = fs::file_size(fs::path{db_path.string() + "-wal"}, wal_ec);
     CHECK((wal_ec || wal_size == 0));
 
-    // Eviction ran on the public path and took the hourly rows (enforce_budget in do_rollup); the
-    // retired raw-row counter stays at its stored value.
+    // Eviction ran on the public path and took the hourly rows (enforce_budget in do_rollup); there
+    // is no raw-row counter to report.
     CHECK(evicted_total() >= evicted_by_paused_pass + 34);
-    CHECK(plugin_status_value(d, desc, "budget_evicted_raw_rows_total") ==
-          std::optional<std::string>{"0"});
+    CHECK_FALSE(plugin_status_value(d, desc, "budget_evicted_raw_rows_total").has_value());
     // Only the 47 h row is left: the 48 h floor holds.
     const auto left = raw_sql(db_path, "SELECT count(*) FROM service_hourly_r");
     REQUIRE(left.size() == 1);

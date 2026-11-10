@@ -1044,7 +1044,7 @@ TEST_CASE("v10 migration: a fresh database gets the roll-up schema directly",
     open_raw(check, tmp.path);
     CHECK(has_table(check.db, "process_hourly", "view"));
     CHECK(has_table(check.db, "process_hourly_r"));
-    CHECK(has_table(check.db, "process_live", "view"));
+    CHECK(!has_table(check.db, "process_live", "view"));
     CHECK(!has_table(check.db, "process_live"));
     CHECK(has_table(check.db, "usage_live"));
     CHECK(has_table(check.db, "netqual_boot"));
