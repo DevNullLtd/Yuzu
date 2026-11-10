@@ -2118,9 +2118,12 @@ background halves and waits on both:
 
 Selections, widths, the slot gate and the `Resolve pg_mode + assert Postgres DSN`
 step are unchanged; the step also rejects a `pg_mode` other than `full` or
-`smoke`. Both halves always run to the end, and the step fails if either half
-exits non-zero, printing both exit codes and the failing half's last 60 lines
-(prefixed, so its `::error::` lines are not annotated twice).
+`smoke`. Both halves always run to the end. Each half's output is printed, in
+one collapsed group, as soon as that half ends; a failing half gets an
+`::error::` line naming it just before its group, so a red non-pg half is
+visible while the pg half is still running. The step fails if either half exits
+non-zero, and prints both exit codes with each half's wall seconds (also written
+to the job summary as a "Linux test half" table).
 
 Running two `meson test` processes in one build directory needs four kinds of
 isolation, all in the step:
@@ -2133,27 +2136,81 @@ isolation, all in the step:
    preserved enumeration junit and stale-file sweep
    (`<logbase>-flake-retry-enum-*`). Without `--logbase` (Windows, macOS) every
    path keeps its old name. `test-durations-summary.py` and the telemetry
-   finalizer (`ci-telemetry.py finish --logbase`, three times) take the same names.
+   finalizer (`ci-telemetry.py finish`, one `--logbase` per base) take the same
+   names. Before either half starts, the step deletes all three bases' files
+   left by an earlier run in the persistent build directory, so an invocation
+   that never ran this time cannot upload or import a stale file.
 2. **ninja.** `meson test` runs `ninja` before testing; two of those at once in
    one build directory race on `.ninja_log`. The step builds
    `meson-test-prereq` once, serially, and every invocation passes
    `--no-rebuild`.
 3. **Job summary.** Each half writes its own summary file in `meson-logs/`;
-   both are appended to the job summary after the wait.
+   each is appended to the job summary when its half ends.
 4. **Step log.** Each half's output goes to `meson-logs/ci-half-{nonpg,pg}.log`
-   and is printed in full, one collapsed group per half, after the wait. A
-   heartbeat prints each half's latest line every two minutes. If the job times
-   out or is cancelled the logs are not printed, but the `meson-logs` artifact
-   upload (which runs on failure or cancel) carries them.
+   and is printed when that half ends. A heartbeat prints each running half's
+   latest line every two minutes. Because the output is printed per half, the
+   runner's per-line timestamps show when a line was printed, not when the test
+   wrote it; use the times in the meson lines themselves. If the job times out or
+   is cancelled the logs are not printed, but the `meson-logs` artifact upload
+   (which runs on failure or cancel) carries them.
 
-**Expected effect, not yet measured.** The step should take about as long as
-the longer half (the pg half on `gcc-15`/`debug`), roughly 7 min less than the
-sum. Both halves now share the job's 16 CPUs (4 non-pg workers and 4 pg shards
-at once, where it used to be one or the other), so watch the step's wall time,
-the #2093 per-shard watchdog and the timing-assertion flakes the non-pg width
-history warns about. This is a topology change; measure it with two same-SHA
-samples on its own, as for the ladder below, before bundling it with a width
-push. Reverting it is restoring the three sequential steps.
+**Cancel and timeout.** Each half runs in its own process group, so the
+runner's SIGINT/SIGTERM to the step's shell does not reach the halves on its
+own; the step traps both, sends SIGTERM to both halves' process groups, and
+exits 1 (`meson test` then stops its per-test sessions). The runner's final
+SIGKILL cannot be trapped; if it lands first, the runner's end-of-job orphan
+sweep is what reaps the halves, and until then a pg half can still hold its
+`with-test-slot.sh` slot.
+
+**Windows stays sequential, deliberately.** The Windows job keeps its separate
+`Test (non-pg suites)`, `Test (pg shards, full)` and `Test (pg smoke)` steps.
+Its test-phase widths are set by the measurements under "Windows test-phase
+concurrency gate", each taken with the non-pg and pg phases running one after
+the other; running them side by side would change the load those numbers were
+measured under, on a box (Wee Tam) this change has not measured at all. A
+Windows version would be its own change with its own same-SHA samples.
+
+**Kill switch.** Setting the repository variable `YUZU_CI_SEQUENTIAL_HALVES`
+to `1` makes the step run the non-pg half, then the pg half, and skip the pg
+half if the non-pg half failed: the old back-to-back behaviour, with the same
+log names and outputs. It needs no code change, so use it first; a revert of
+the change is the fallback.
+
+**Revert triggers.** Set `YUZU_CI_SEQUENTIAL_HALVES=1` on any of these on the
+`gcc-15`/`debug` leg after the change: a spark or guardian `spin_until` (or
+`ArmOutcomeKind`/`ReceiptStatus`) failure; a `blocked log sink SIGTERM
+harness` failure; a pg-shard TIMEOUT or repeated 560 s watchdog warnings; a
+non-pg entry passing 80% of its meson timeout. Each of these is a load
+symptom the non-pg width history and Push 2c already treat as revert-grade. A
+red that also occurs at a comparable rate with the switch set is recorded,
+not a reason to keep the switch on.
+
+**Slot-gate sizing.** `with-test-slot.sh 3` was sized for a slot holder that
+runs only pg shards. A job holding a slot now also runs up to 4 non-pg
+workers at the same time, so each slot carries more load than when the count
+was chosen. Nothing changes the count here; watch the triggers above, which
+are where the extra load would show.
+
+**Expected effect and measurement plan.** The saving applies to the
+`pg_mode=full` leg (`gcc-15`/`debug`) only: on the smoke legs the pg half takes
+seconds, so the step lasts about as long as the non-pg half, as before. On the
+full leg the step should last about as long as the longer half, the pg half.
+Both halves share the job's 16 CPUs (up to 4 non-pg workers: 4 for the cheap
+suites, 2 for the server-shard invocation; beside up to 4 pg shards), so the
+saving is an estimate until measured:
+
+- Baseline: the `gcc-15`/`debug` job wall time (`started_at` to
+  `completed_at`, jobs API) of the last 12 or more successful dev-push runs
+  before the change.
+- Candidate: two or more same-SHA runs of the change (the PR run plus a re-run).
+- Per entry: in each candidate, no entry of the non-pg half or pg shard
+  reaches 80% of its meson timeout, and no entry of 5 s or more takes more
+  than 1.5x its baseline mean. Read the halves' wall seconds from the
+  "Linux test half" summary table.
+- Record the samples, run and job ids, SHAs, runner names and slot waits here.
+
+This is a topology change; measure it on its own, as for the ladder below,
+before bundling it with a width push.
 
 ### Staged widening — Linux (2026-10-21)
 
@@ -2220,7 +2277,11 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
 - Find the job. After a re-run, `gh api repos/DevNullLtd/Yuzu/actions/runs/<run>/attempts/<n>/jobs`
   gives the new job id.
 - Step duration: `gh api repos/DevNullLtd/Yuzu/actions/jobs/<id>`, the step named
-  `Test (non-pg suites)` (`started_at`, `completed_at`).
+  `Test (non-pg suites)` (`started_at`, `completed_at`). Since 2026-11-10 that step
+  is the non-pg half of `Test (non-pg + pg halves, concurrent)` (section above),
+  so the jobs API no longer times it: read the half's wall seconds from the
+  step log line `non-pg half: exit N in Ss` or the job summary's "Linux test
+  half" table.
 - Per-entry times: `gh run view --repo DevNullLtd/Yuzu --job <id> --log`, then
   take the lines matching `[0-9]+/[0-9]+ .* - yuzu:` up to the first `Ok:` line
   (that is the first invocation, 105 entries today; the second prints `N/8`).
@@ -2251,7 +2312,7 @@ triggers. A `priority:` on `gateway eunit` is a separate, later axis (Push 2b be
   and counts as a new sample.
 
 *Decision rule.* The one under "Windows test-phase concurrency gate" above,
-applied to this step: (a) the `Test (non-pg suites)` median improves by 10% or
+applied to this step (now the non-pg half, timed as above): (a) the `Test (non-pg suites)` median improves by 10% or
 more (about 40 s); (b) no entry of 5 s or more at np=2 takes more than 1.5x the
 mean of its two np=2 times (shorter entries have no stable ratio); (c) no entry
 reaches 80% of its own meson timeout (480 s for `gateway eunit` and `gateway ct`,
@@ -2264,7 +2325,9 @@ guardian case failing (a `spin_until` that never resolves, an
 `blocked log sink SIGTERM harness` failing (it asserts a fixed 8 s exit after
 SIGTERM and is not scaled for load); a `gateway eunit` or `gateway ct` failure;
 any red cheap-suites invocation. To revert, set `--num-processes` on the first
-`flake-retry.py` call of the Linux job's `Test (non-pg suites)` step back to 2.
+`flake-retry.py` call of the Linux job's `Test (non-pg suites)` step back to 2
+(since 2026-11-10: the first call in `nonpg_half` of `Test (non-pg + pg halves,
+concurrent)`).
 Before the next rung, add a flake-rate check: two green samples cannot tell a 10%
 flake rate from none, so require 10 or more push runs on the leg with no
 non-timing red.
@@ -2423,7 +2486,8 @@ priority. Eunit's duration on the first nightlies after merge is still to be
 read (see above).
 
 **Push 2c (Linux pg-shards step only, `--num-processes 2 → 4`).** The width of the
-`Test (pg shards, full)` step; the slot count (3), the 14 shards, their priorities
+`Test (pg shards, full)` step (since 2026-11-10 the `pg_mode=full` branch of the pg
+half of `Test (non-pg + pg halves, concurrent)`); the slot count (3), the 14 shards, their priorities
 and timeouts, and the other invocations are unchanged. The step runs only on the
 `gcc-15`/`debug` leg (`pg_mode=full`), on PR runs and dev pushes; the other three
 Linux legs do not run it. The 14 shards of one job share that job's single
@@ -2550,7 +2614,10 @@ here (as Push 2a did) and (a) to (c) pass. After the merge 2c stays open until t
 next 10 or more dev-push `gcc-15`/`debug` runs show no pg-shard TIMEOUT, no
 repeated 560 s watchdog warning (two or more in the 10 runs, on one shard or
 scattered across several) and no red of the `Test (pg shards, full)` step itself
-(a red elsewhere in the run, such as the Windows legs, is not one). The np=2 red
+(a red elsewhere in the run, such as the Windows legs, is not one). Since
+2026-11-10 that step is the pg half of `Test (non-pg + pg halves, concurrent)`:
+read "red of the step" as the line `::error::pg half (pg_mode=full) failed`, not
+the step's own conclusion, which is also red when only the non-pg half fails. The np=2 red
 rate of that step is the control: 0 of the 20 dev-push runs from 2026-10-23 11:05Z
 to 2026-10-25 17:52Z (counted on 2026-10-25; the run before them had a cancelled
 step) had a red pg step. A red of the step that also occurs at np=2 at a

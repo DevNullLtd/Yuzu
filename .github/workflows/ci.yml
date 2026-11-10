@@ -638,6 +638,7 @@ jobs:
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
           bash tests/shell/test_release_legs_issue.sh         # release-legs-broken open/comment/close decision (Tier 2b)
+          bash tests/shell/test_linux_concurrent_step.sh      # Linux test step: both halves' verdicts, kill switch, cancel trap (~30 s)
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
@@ -1344,17 +1345,35 @@ jobs:
         #     --num-processes 4 (unchanged); pg_mode=smoke -> 'server pg smoke' by
         #     name, ungated (unchanged). pg_mode was asserted by 'Resolve pg_mode
         #     + assert Postgres DSN' above; an unexpected value fails here too.
-        # Expected saving is the shorter half (~7 min off the ~20-min gcc-15/debug
-        # leg) — an estimate, not yet measured; watch the step's wall time and the
-        # #2093 per-shard watchdog (both halves now share the job's 16 CPUs: 4
-        # non-pg workers + 4 pg shards, where it used to be one or the other).
+        # Expected saving is roughly the shorter half, on the pg_mode=full leg only
+        # (smoke legs' pg half takes seconds) — an estimate, not yet measured; the
+        # measurement plan and the revert triggers are in docs/ci-architecture.md
+        # "Linux test step: concurrent non-pg and pg halves". Both halves now
+        # share the job's 16 CPUs: up to 4 non-pg workers (the cheap suites; the
+        # server-shard invocation runs 2) alongside up to 4 pg shards, where it
+        # used to be one or the other — watch the #2093 per-shard watchdog and
+        # the spin_until timing flakes.
         #
-        # Failure semantics: BOTH halves always run to completion (a red non-pg
-        # half does not cancel the pg half — the extra signal is worth the minutes
-        # on a run that is red anyway). Within the non-pg half the cheap-first
-        # fail-fast still holds (each half runs under bash -e). The step fails if
-        # EITHER half exits non-zero and prints both exit codes plus each failing
-        # half's log tail (prefixed, so its ::error:: lines are not re-annotated).
+        # Kill switch: repository variable YUZU_CI_SEQUENTIAL_HALVES=1 runs the
+        # non-pg half, then the pg half, skipping the pg half when the non-pg
+        # half failed (the old back-to-back behaviour) — same logs, same files.
+        #
+        # Failure semantics (concurrent mode): BOTH halves always run to
+        # completion (a red non-pg half does not cancel the pg half — the extra
+        # signal is worth the minutes on a run that is red anyway). Within the
+        # non-pg half the cheap-first fail-fast still holds (each half runs under
+        # bash -e). Each half's output is printed, in its own ::group::, the
+        # moment that half ends (a failing half gets an ::error:: line naming it
+        # first), so a red half is visible while the other is still running. The
+        # step fails if EITHER half exits non-zero; both exit codes and wall
+        # seconds are printed and written to the job summary.
+        #
+        # Cancel / timeout: each half runs in its own process group (set -m), so
+        # the runner's SIGINT/SIGTERM to this shell does not reach the halves by
+        # itself; the trap below forwards SIGTERM to both groups and exits 1
+        # (meson test then stops its own per-test sessions). The runner's final
+        # SIGKILL cannot be trapped — if it lands first, its end-of-job orphan
+        # sweep is the backstop.
         #
         # Isolation of the two halves inside one build dir (each is load-bearing):
         #   1. meson-logs/testlog.* — two concurrent `meson test` runs would
@@ -1368,17 +1387,22 @@ jobs:
         #      import take the same names (--logbase). Giving the two non-pg
         #      invocations distinct bases also ends the old loss where only the
         #      LAST invocation's junit/flake report reached the telemetry DB.
+        #      All three bases' files from an earlier run in this persistent
+        #      build dir are removed before either half starts, so a half (or an
+        #      invocation) that never ran cannot upload or import stale ones.
         #   2. ninja — `meson test` runs `ninja` (regen check + meson-test-prereq)
         #      before testing; two of those at once in one build dir race on
         #      .ninja_log/.ninja_deps. The step builds meson-test-prereq ONCE,
         #      serially, then every invocation passes --no-rebuild.
         #   3. Job summary — each half writes its own summary file in meson-logs/
         #      (GITHUB_STEP_SUMMARY redirected per half); both are appended to the
-        #      real job summary after the wait, so the tables never interleave.
+        #      real job summary as each half ends, so the tables never interleave.
         #   4. Step log — each half's output goes to meson-logs/ci-half-{nonpg,pg}.log
-        #      and is printed in full (one ::group:: per half) after the wait; a
-        #      heartbeat prints each half's latest line every 2 min meanwhile. On
-        #      a job timeout/cancel those logs are NOT printed, but they ride the
+        #      and is printed in full (one ::group:: per half) when that half
+        #      ends; a heartbeat prints each running half's latest line every 2
+        #      min meanwhile. The runner's per-line timestamps therefore show
+        #      print time, not when a test line was written. On a job
+        #      timeout/cancel those logs are NOT printed, but they ride the
         #      'Upload meson-logs on test failure or cancel' artifact.
         #
         # ═══ NON-PG half: history (carried over from 'Test (non-pg suites)') ═══
@@ -1545,10 +1569,10 @@ jobs:
         # whole registered test set as of the 2026-08-25 E->E+I / G->G+J split
         # below — re-verified as an exact partition (meson test --list,
         # diffed against the unfiltered full list) at that split, not assumed
-        # carried over from the prior 32. (Since the concurrency change the two
-        # former steps are the two concurrent halves of this one step.) Phase 2 moved the first two
-        # invocations into their own "Test (non-pg suites)" step above; only
-        # the third (this one, now with-test-slot.sh-gated) remains here.
+        # carried over from the prior 32. Phase 2 then moved the first two
+        # invocations into a separate "Test (non-pg suites)" step, leaving the
+        # third (with-test-slot.sh-gated) in "Test (pg shards, full)"; since the
+        # concurrency change those are the non-pg and pg halves of this one step.
         #
         # Root cause, corrected after Gate 3 governance re-derived it from the
         # actual failing run's timestamps rather than the first-draft guess this
@@ -1619,8 +1643,8 @@ jobs:
         # Telemetry note — SUPERSEDED by the concurrency change: every
         # invocation now has its own --logbase, so each one's junit AND its
         # flake-retry report survive and all three are imported by 'Finish
-        # persistent CI telemetry' (--logbase x3). Kept for the record — before
-        # that, each invocation overwrote meson's single
+        # persistent CI telemetry' (--logbase, once per base). Kept for the record
+        # (Linux, before this change) — each invocation overwrote meson's single
         # testlog.junit.xml, so only the LAST one's per-suite ci_test_suites
         # rows survive the "Finish persistent CI telemetry" step's unmodified
         # default import — the pg-gated call runs last on purpose, since that's
@@ -1741,6 +1765,8 @@ jobs:
           YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+          # Kill switch (repository variable): "1" runs the halves back to back.
+          YUZU_CI_SEQUENTIAL_HALVES: ${{ vars.YUZU_CI_SEQUENTIAL_HALVES }}
         run: |
           LOGS="$BUILDDIR/meson-logs"
           mkdir -p "$LOGS"
@@ -1748,10 +1774,20 @@ jobs:
             full|smoke) ;;
             *) echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke'"; exit 1 ;;
           esac
+          # A measurement-only knob (docs/testing/unit-test-conventions.md); if the
+          # runner's environment leaks it in, every [pg] template clone uses it.
+          if [[ -n "${YUZU_TEST_PG_CLONE_STRATEGY:-}" ]]; then
+            echo "::warning::YUZU_TEST_PG_CLONE_STRATEGY='${YUZU_TEST_PG_CLONE_STRATEGY//[^A-Za-z0-9_]/?}' is set in this step's environment; [pg] template clones use it (a measurement knob, not a CI setting)"
+          fi
           # Isolation 2: build every test prerequisite once, serially, so the
           # concurrent invocations below can all run with --no-rebuild.
           ninja -C "$BUILDDIR" ${YUZU_BUILD_JOBS:+-j "$YUZU_BUILD_JOBS"} meson-test-prereq
           REAL_SUMMARY="${GITHUB_STEP_SUMMARY:-}"
+          # Isolation 1: no file of an earlier run in this persistent build dir may
+          # be read back as this run's (a half or invocation that never ran).
+          for base in testlog-nonpg-cheap testlog-nonpg-server testlog-pg; do
+            rm -f "$LOGS/$base.txt" "$LOGS/$base.json" "$LOGS/$base.junit.xml" "$LOGS/$base"-flake-retry*
+          done
 
           nonpg_half() {
             set -e
@@ -1761,15 +1797,12 @@ jobs:
             rm -f "$YUZU_TEST_PROGRESS_FILE"
             # docs suite is OS-independent and runs on the Linux leg only; OS-contract
             # entries carry suite platform (tests/meson.build) and run on every leg.
-            # Duration summary per invocation, not end-of-job: each invocation's
-            # <logbase>.json is removed first (a run that selects no tests then warns
-            # and skips instead of re-reporting a stale log). On a red invocation
-            # bash -e stops before its summary; use the uploaded meson-logs artifact
-            # locally (#4884).
-            rm -f "$LOGS/testlog-nonpg-cheap.json"
+            # Duration summary per invocation, not end-of-job (its <logbase>.json was
+            # removed above, so a run that selects no tests warns and skips instead of
+            # re-reporting a stale log). On a red invocation bash -e stops before its
+            # summary; use the uploaded meson-logs artifact locally (#4884).
             python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-nonpg-cheap --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite echo --suite gateway --suite platform
             python3 scripts/ci/test-durations-summary.py --builddir "$BUILDDIR" --label "Linux non-pg (cheap suites)" --logbase testlog-nonpg-cheap
-            rm -f "$LOGS/testlog-nonpg-server.json"
             python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-nonpg-server --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
             python3 scripts/ci/test-durations-summary.py --builddir "$BUILDDIR" --label "Linux non-pg (server shards)" --logbase testlog-nonpg-server
           }
@@ -1777,7 +1810,6 @@ jobs:
           pg_half() {
             set -e
             export GITHUB_STEP_SUMMARY="$LOGS/ci-half-pg.summary.md"
-            rm -f "$LOGS/testlog-pg.json"
             if [[ "$PG_MODE" == "full" ]]; then
               bash scripts/ci/with-test-slot.sh 3 -- \
                 python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-pg --print-errorlogs --num-processes 4 --suite server-pg
@@ -1788,52 +1820,101 @@ jobs:
             fi
           }
 
-          nonpg_log="$LOGS/ci-half-nonpg.log"
-          pg_log="$LOGS/ci-half-pg.log"
-          rm -f "$nonpg_log" "$pg_log" "$LOGS/ci-half-nonpg.summary.md" "$LOGS/ci-half-pg.summary.md"
-          nonpg_half >"$nonpg_log" 2>&1 &
-          nonpg_pid=$!
-          pg_half >"$pg_log" 2>&1 &
-          pg_pid=$!
-          echo "started non-pg half (pid $nonpg_pid) and pg half, pg_mode=$PG_MODE (pid $pg_pid)"
-          (
-            # The TERM trap reaps the in-flight sleep too, so no orphan outlives the step.
-            trap 'kill "$s" 2>/dev/null; exit 0' TERM
-            while :; do
-              sleep 120 &
-              s=$!
-              wait "$s"
-              echo "[heartbeat $(date -u +%H:%M:%S)] non-pg: $(tail -n 1 "$nonpg_log" 2>/dev/null | cut -c1-200)"
-              echo "[heartbeat $(date -u +%H:%M:%S)] pg:     $(tail -n 1 "$pg_log" 2>/dev/null | cut -c1-200)"
+          declare -A pid=([nonpg]="" [pg]="") rc=() secs=() t0=()
+          label() { if [[ "$1" == pg ]]; then echo "pg half (pg_mode=$PG_MODE)"; else echo "non-pg half"; fi; }
+          for h in nonpg pg; do rm -f "$LOGS/ci-half-$h.log" "$LOGS/ci-half-$h.summary.md"; done
+          tick=""
+          # Cancel / timeout (see the step comment): the halves are in their own
+          # process groups, so forward the signal to both groups, then fail.
+          on_signal() {
+            trap - INT TERM
+            echo "::error::test step interrupted; sending SIGTERM to both halves' process groups"
+            for p in "${pid[nonpg]}" "${pid[pg]}" "$tick"; do
+              if [[ -n "$p" ]]; then kill -TERM -- "-$p" 2>/dev/null || true; fi
             done
-          ) &
-          hb_pid=$!
-          nonpg_rc=0
-          wait "$nonpg_pid" || nonpg_rc=$?
-          pg_rc=0
-          wait "$pg_pid" || pg_rc=$?
-          kill "$hb_pid" 2>/dev/null || true
-          wait "$hb_pid" 2>/dev/null || true
-
-          for half in nonpg pg; do
-            echo "::group::${half} half — full output"
-            cat "$LOGS/ci-half-${half}.log" || true
+            exit 1
+          }
+          trap on_signal INT TERM
+          set -m   # every background job below gets its own process group (pgid = its pid)
+          launch() {
+            t0[$1]=$SECONDS
+            "$1_half" >"$LOGS/ci-half-$1.log" 2>&1 &
+            pid[$1]=$!
+            echo "started $(label "$1") (pid ${pid[$1]})"
+          }
+          finish() {  # reap a half that has ended, record it, print its whole log now
+            local h=$1 r=0
+            wait "${pid[$h]}" || r=$?
+            pid[$h]=""
+            rc[$h]=$r
+            secs[$h]=$(( SECONDS - t0[$h] ))
+            if [[ "$r" -ne 0 ]]; then
+              echo "::error::$(label "$h") failed (exit $r, ${secs[$h]}s); its full output is the next group"
+              echo "::group::$(label "$h") FAILED (exit $r, ${secs[$h]}s) — full output"
+            else
+              echo "::group::$(label "$h") passed (${secs[$h]}s) — full output"
+            fi
+            cat "$LOGS/ci-half-$h.log" || true
             echo "::endgroup::"
-            if [[ -n "$REAL_SUMMARY" && -f "$LOGS/ci-half-${half}.summary.md" ]]; then
-              cat "$LOGS/ci-half-${half}.summary.md" >> "$REAL_SUMMARY" || true
+            if [[ -n "$REAL_SUMMARY" && -f "$LOGS/ci-half-$h.summary.md" ]]; then
+              cat "$LOGS/ci-half-$h.summary.md" >> "$REAL_SUMMARY" || true
+            fi
+          }
+
+          sequential=0
+          if [[ "${YUZU_CI_SEQUENTIAL_HALVES:-}" == 1 ]]; then
+            sequential=1
+            echo "::notice::YUZU_CI_SEQUENTIAL_HALVES=1: running the non-pg half, then the pg half (kill switch)"
+          fi
+          launch nonpg
+          if [[ "$sequential" -eq 0 ]]; then launch pg; fi
+          next_beat=$(( SECONDS + 120 ))
+          while [[ -n "${pid[nonpg]}${pid[pg]}" ]]; do
+            sleep 2 &
+            tick=$!
+            wait "$tick" || true
+            tick=""
+            for h in nonpg pg; do
+              if [[ -n "${pid[$h]}" ]] && ! kill -0 "${pid[$h]}" 2>/dev/null; then
+                finish "$h"
+                if [[ "$h" == nonpg && "$sequential" -eq 1 ]]; then
+                  if [[ "${rc[nonpg]}" -eq 0 ]]; then
+                    launch pg
+                  else
+                    echo "pg half skipped: the non-pg half failed (sequential mode)"
+                  fi
+                fi
+              fi
+            done
+            if (( SECONDS >= next_beat )); then
+              next_beat=$(( SECONDS + 120 ))
+              for h in nonpg pg; do
+                if [[ -n "${pid[$h]}" ]]; then
+                  echo "[heartbeat $(date -u +%H:%M:%S)] $h: $(tail -n 1 "$LOGS/ci-half-$h.log" 2>/dev/null | cut -c1-200)"
+                fi
+              done
             fi
           done
+          set +m
+          trap - INT TERM
 
-          echo "non-pg half exit: $nonpg_rc; pg half (pg_mode=$PG_MODE) exit: $pg_rc"
-          if [[ "$nonpg_rc" -ne 0 ]]; then
-            echo "::error::non-pg half failed (exit $nonpg_rc); last 60 lines of $nonpg_log:"
-            tail -n 60 "$nonpg_log" | sed 's/^/  nonpg| /'
+          show() { if [[ -n "${rc[$1]:-}" ]]; then echo "exit ${rc[$1]} in ${secs[$1]}s"; else echo "skipped"; fi; }
+          echo "non-pg half: $(show nonpg); pg half (pg_mode=$PG_MODE): $(show pg)"
+          if [[ -n "$REAL_SUMMARY" ]]; then
+            {
+              echo ""
+              echo "| Linux test half | result | wall s |"
+              echo "|---|---|---|"
+              for h in nonpg pg; do
+                if [[ -n "${rc[$h]:-}" ]]; then
+                  echo "| $(label "$h") | exit ${rc[$h]} | ${secs[$h]} |"
+                else
+                  echo "| $(label "$h") | skipped | - |"
+                fi
+              done
+            } >> "$REAL_SUMMARY" || true
           fi
-          if [[ "$pg_rc" -ne 0 ]]; then
-            echo "::error::pg half (pg_mode=$PG_MODE) failed (exit $pg_rc); last 60 lines of $pg_log:"
-            tail -n 60 "$pg_log" | sed 's/^/  pg| /'
-          fi
-          if [[ "$nonpg_rc" -ne 0 || "$pg_rc" -ne 0 ]]; then
+          if [[ "${rc[nonpg]:-1}" -ne 0 || "${rc[pg]:-1}" -ne 0 ]]; then
             exit 1
           fi
 
@@ -2043,9 +2124,9 @@ jobs:
           fi
           exit 0
 
-      # --logbase x3: the Linux test step runs its invocations concurrently, each
-      # under its own meson --logbase (see 'Test (non-pg + pg halves,
-      # concurrent)'); each base's junit + flake-retry report is imported.
+      # --logbase, once per base: the Linux test step's three meson test
+      # invocations each run under their own --logbase (see 'Test (non-pg + pg
+      # halves, concurrent)'); each base's junit + flake-retry report is imported.
       - name: Finish persistent CI telemetry
         if: always()
         continue-on-error: true
