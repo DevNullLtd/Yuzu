@@ -3929,7 +3929,7 @@ TEST_CASE("EchoDatabase: a busy echo.db is refused and never quarantined (#7286)
 // classifier open() uses is a pure function, pinned here: codes that say nothing about the file's
 // health are "unreadable" and make open() refuse without moving anything (rationale:
 // check_integrity, echo_db.cpp).
-TEST_CASE("classify_integrity_rc: only CORRUPT and NOTADB quarantine, BUSY refuses, the rest is unreadable (#7286)",
+TEST_CASE("classify_integrity_rc: only CORRUPT and NOTADB quarantine while BUSY refuses and the rest is unreadable (#7286)",
           "[echo][store][corruption]") {
     // Busy: the holder's problem, not the file's -- including the extended codes.
     CHECK(classify_integrity_rc(SQLITE_BUSY) == IntegrityCheck::busy);
@@ -3978,7 +3978,7 @@ TEST_CASE("EchoDatabase: an unreadable integrity check refuses and quarantines n
     CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
 }
 
-TEST_CASE("EchoDatabase: a genuinely corrupt echo.db is still quarantined, and its handle is closed (#7286, #6698)",
+TEST_CASE("EchoDatabase: a genuinely corrupt echo.db is still quarantined and its handle is closed (#7286 and #6698)",
           "[echo][store][lifecycle][corruption]") {
     yuzu::test::TempDir dir{"yuzu_test_echo_stillcorrupt_"};
     const auto db = make_healthy_echo_db(dir.path);
@@ -4116,11 +4116,15 @@ TEST_CASE("EchoDatabase: a link swapped in at echo.db between the verdict and th
     CHECK(fs::is_symlink(db));                                      // left for the operator
 }
 
+// Identity is lstat device+inode, which Windows does not have here; there the regular-file swap
+// is a recorded residual (header of sqlite_quarantine.hpp), so the next two cases are POSIX only.
+#ifndef _WIN32
 // A REGULAR file swapped for another regular file passes every no-follow regular-file test, so
 // only the identity compare (device + inode read right after the open) can catch it. The seam
 // runs between the pre-claim checks and the post-link re-check, where a second recovery or a
-// planter can replace the name; the claim must be released and Echo must fail closed.
-TEST_CASE("EchoDatabase: a regular file swapped in at echo.db between the verdict and the claim is refused, fail closed (#1527)",
+// planter can replace the name. The claim landed on the judged file, so that file keeps its
+// claimed name (its only name now), the planted file keeps the name, and Echo fails closed.
+TEST_CASE("EchoDatabase: a regular file swapped in at echo.db between the verdict and the claim is refused and fails closed (#1527)",
           "[echo][store][lifecycle][corruption][hardening]") {
     yuzu::test::TempDir dir{"yuzu_test_echo_preclaim_reg_"};
     REQUIRE(fs::create_directories(dir.path));
@@ -4141,14 +4145,17 @@ TEST_CASE("EchoDatabase: a regular file swapped in at echo.db between the verdic
     CHECK(refused.error().find("corrupt and unmovable") != std::string::npos); // fail closed
     CHECK(slurp_file(db) == "planted regular file"); // the file at the name is left alone
     CHECK(fs::hard_link_count(db) == 1);
-    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty()); // the claim was released
+    // The judged (corrupt) file is the evidence and the claim is its only name: it is kept.
+    const auto kept = names_with_prefix(dir.path, "echo.db.corrupt-");
+    REQUIRE(kept.size() == 1);
+    CHECK(slurp_file(dir.path / kept[0]) == "this is not a SQLite database");
 }
 
 // The identity is read right after the open, not after the integrity check: a name swapped while
 // the check runs (it can wait the busy timeout and scan every page) is not the file SQLite judged,
 // so the quarantine must refuse it. Before the read was hoisted, the planted file was quarantined
 // and a fresh database opened over its name.
-TEST_CASE("EchoDatabase: a regular file swapped in at echo.db while the integrity check runs is refused, fail closed (#1527)",
+TEST_CASE("EchoDatabase: a regular file swapped in at echo.db while the integrity check runs is refused and fails closed (#1527)",
           "[echo][store][lifecycle][corruption][hardening]") {
     yuzu::test::TempDir dir{"yuzu_test_echo_midcheck_"};
     REQUIRE(fs::create_directories(dir.path));
@@ -4169,6 +4176,7 @@ TEST_CASE("EchoDatabase: a regular file swapped in at echo.db while the integrit
     CHECK(slurp_file(db) == "planted while the check ran");                   // left in place
     CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());            // nothing moved
 }
+#endif // !_WIN32
 
 TEST_CASE("EchoDatabase: a link swapped in at echo.db-wal before the claim travels as a link and its target is never chmodded (#1527)",
           "[echo][store][lifecycle][corruption][hardening]") {
@@ -4560,7 +4568,7 @@ TEST_CASE("adopt_legacy_echo_db: a lone echo.db-wal is the resume state and is n
     CHECK(db->get_config("wal_marker", "") == "x");
 }
 
-TEST_CASE("adopt_legacy_echo_db: two foreign files are both moved aside, one at a time (#6695)",
+TEST_CASE("adopt_legacy_echo_db: two foreign files are both moved aside one at a time (#6695)",
           "[echo][store][adopt]") {
     ScratchDir d;
     make_legacy_tar_db_with_wal(d.path());
@@ -4591,7 +4599,7 @@ TEST_CASE("adopt_legacy_echo_db: two foreign files are both moved aside, one at 
 // interruption leaves "echo.db still planted" (re-detected next start), never a stranded sidecar.
 // A read-only directory makes the hard-link claim fail at the first attempt, so the file the error
 // names IS the first one tried: the sidecar. POSIX only (Windows ignores a directory's write bit).
-TEST_CASE("adopt_legacy_echo_db: a failed move stops the heal, sidecar first, nothing moved (#6695)",
+TEST_CASE("adopt_legacy_echo_db: a failed move stops the heal: sidecar first and nothing moved (#6695)",
           "[echo][store][adopt]") {
     if (::geteuid() == 0)
         SKIP("root bypasses directory permissions; cannot make the claim fail");

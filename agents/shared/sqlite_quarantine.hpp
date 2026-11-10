@@ -19,8 +19,9 @@
 /// the plain exists-then-rename step used for sidecars cannot collide with another recovery.
 /// An interruption between the link and the remove (a crash, or a failed undo) leaves the file
 /// under both names: a POSIX open quarantines it again under the next free name, while the
-/// Windows Echo open refuses until one of the two names is removed (the second link reads as a
-/// planted file; docs/user-manual/upgrading.md gives the remedy).
+/// Windows Echo open refuses until the `.corrupt-<epoch>` name is removed (the second link reads
+/// as a planted file; never remove the original name, the file is corrupt and its -wal would be
+/// stranded; docs/user-manual/upgrading.md gives the remedy).
 ///
 /// BINDING: a claim moves only the REGULAR FILE that was judged, never a name. `link(2)` follows
 /// a symbolic link at the source on macOS (the claim would link the link's target) and moves the
@@ -30,7 +31,8 @@
 /// directory or an absent name is refused), the claimed name is examined the same way after the
 /// link and must be the same inode (POSIX: device + inode by `lstat`), the original name is
 /// re-examined right before it is dropped, and every mode change is applied only to a regular
-/// file and without following a link. A mismatch releases the claim and fails closed. The
+/// file and without following a link. A mismatch releases the claim, or keeps it when it is the
+/// judged file's only remaining name, and fails closed. The
 /// identity the claim is held to is the caller's `judged` when it passes one, else the name as
 /// read here at claim time: the Echo caller reads it right after SQLite opened the file and before
 /// the integrity check, so the move is bound to the file that was open when the verdict was taken
@@ -49,7 +51,9 @@
 /// planter does not own, and the packaged POSIX data directory is root-owned). And a name in the
 /// quarantine set swapped for a hard link to a third file between the move and the mode change
 /// (`secure` below) has that file's mode tightened to 0600: tighten-only, and it needs write
-/// access to the data directory. The link count is deliberately not checked there, because an
+/// access to the data directory. The same holds for a hard link planted at a live sidecar name
+/// (`<file>-wal`): it travels into the set as a regular file and its target's mode is tightened
+/// the same way. The link count is deliberately not checked there, because an
 /// interrupted earlier claim legitimately leaves the re-quarantined file under two names (above),
 /// and skipping the change would leave that evidence at its live mode.
 ///
@@ -150,7 +154,10 @@ struct QuarantineResult {
 /// new path, or nullopt (original untouched) when no name could be claimed, the filesystem has no
 /// hard links, the name is not a regular file, the claim did not land on the file that was judged
 /// (see BINDING above), or the original name could not be dropped; `notes`, when given, receives
-/// why and anything left behind. `judged`, when given, is the identity the caller read at the
+/// why and anything left behind. One of those refusals is NOT "original untouched": if the original
+/// name is replaced or removed only AFTER the claim landed on the judged file, the claimed name is
+/// that file's only remaining name, so it is KEPT (the file is not unlinked), the note says so, and
+/// the result is still nullopt (fail closed: the name now holds a file nobody judged). `judged`, when given, is the identity the caller read at the
 /// name right after it opened the file (`file_identity`); otherwise the name is read here, just
 /// before the claim. `epoch_seconds` is clamped to >= 0 (a pre-1970 clock would otherwise write
 /// `.corrupt--5`, which the dedup prune parser rejects, so the file could never be pruned).
@@ -187,7 +194,7 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
         return std::nullopt;
     }
     // The claimed name, and the original right before it is dropped, must both still be the judged
-    // regular file; otherwise the claim is released and nothing is moved.
+    // regular file; otherwise the claim is released, unless it is the judged file's only name.
     const auto still_judged = [&](const fs::path& p) {
         return is_regular_file_no_follow(p) && file_identity(p) == expected;
     };
@@ -211,9 +218,21 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
         }
         // The name is ours, atomically. It must be the judged file (not a link's target, not a
         // link, not a fresh file another recovery put at the name), and so must the original at
-        // the moment it is dropped. On a mismatch release the claim: the judged file, if it is
-        // still there, stays at `file`.
-        if (!still_judged(dest) || !still_judged(file)) {
+        // the moment it is dropped. Four schedules reach a mismatch: A the original was replaced
+        // and D it was removed (the claim IS the judged file), B the claim is not the judged file
+        // while the original still is, C neither is. In B and C release the claim: it is our name
+        // for something that was not judged. In A and D the claim is the judged file's only
+        // remaining name, so releasing it would free the evidence: keep it and fail closed.
+        const bool dest_ok = still_judged(dest);
+        const bool file_ok = still_judged(file);
+        if (dest_ok && !file_ok) {
+            note(std::format("{} no longer holds the file that was judged (replaced or removed after "
+                             "the claim); the judged file is kept at {}; the name {} and any "
+                             "sidecars beside it were left as found",
+                             file.string(), dest.string(), file.string()));
+            return std::nullopt;
+        }
+        if (!dest_ok) {
             std::error_code undo;
             rm(dest, undo);
             note(std::format("{} is not the file that was judged (a link was swapped in, or "
@@ -297,10 +316,13 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
         const int fd = ::open(p.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0)
             return;
+        struct FdCloser {
+            int fd;
+            ~FdCloser() { ::close(fd); }
+        } closer{fd};
         struct stat st {};
         if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
             ::fchmod(fd, S_IRUSR | S_IWUSR);
-        ::close(fd);
 #endif
     };
     secure(dest);
@@ -309,7 +331,15 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
         fs::path side = path;
         side += std::string{sfx};
         std::error_code ec;
-        const bool present = fs::exists(side, ec);
+        // symlink_status, not exists(): exists() follows a link, so a DANGLING link at the sidecar
+        // name would read as absent and be left at the live name. It is present and travels into
+        // the set as a link (file_size on it errors, so the empty-sidecar shortcut below is
+        // skipped). The clear mirrors exists(p, ec): a name that is simply not there is a known
+        // status, not an error, but libc++ leaves ec set to ENOENT for it.
+        const auto side_status = fs::symlink_status(side, ec);
+        if (fs::status_known(side_status))
+            ec.clear();
+        const bool present = fs::exists(side_status);
         if (ec) {
             // Cannot tell whether it is there: drop it rather than leave a possibly stale sidecar
             // beside the fresh database. Best effort, and the caller is told.

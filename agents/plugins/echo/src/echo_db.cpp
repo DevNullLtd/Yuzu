@@ -962,6 +962,17 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // read is a recorded residual of the binding (sqlite_quarantine.hpp, BINDING, which records
     // the others: the drop of the original by name, and a planted hard link).
     const auto judged = yuzu::shared::sqlite_quarantine::file_identity(path);
+#ifndef _WIN32
+    // An lstat that fails on a path SQLite just opened by that path means the name changed under
+    // us: refuse like every other unknown here (the next start retries) rather than let the claim
+    // bind to whatever is at the name when it is taken. Windows reads no identity (nullopt always).
+    if (!judged) {
+        return std::unexpected(std::format(
+            "echo.db could not be checked (its identity could not be read after the open): not "
+            "quarantined and not opened; retried on the next start: {}",
+            path.string()));
+    }
+#endif
     if (seams.before_integrity_check)
         seams.before_integrity_check(); // the swap-during-check test's fault point
 
