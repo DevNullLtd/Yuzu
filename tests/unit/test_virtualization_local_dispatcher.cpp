@@ -414,13 +414,14 @@ TEST_CASE("virtualization descriptor advertises host, wsl and runtime_posture at
     CHECK(wsl->windows_leg.support == YUZU_SUPPORT_CONSTRAINED);
     CHECK(wsl->windows_leg.rung == 1);
 
-    // runtime_posture is Linux-only: supported at rung 1 there, unsupported at rung 0 elsewhere.
+    // runtime_posture is Linux-only: constrained at rung 1 there (no containers without the opt-in,
+    // containerd presence only), unsupported at rung 0 elsewhere.
     const YuzuActionDescriptor* rt = nullptr;
     for (std::size_t i = 0; i < d.action_descriptor_count; ++i)
         if (std::string{d.action_descriptors[i].action} == "runtime_posture")
             rt = &d.action_descriptors[i];
     REQUIRE(rt != nullptr);
-    CHECK(rt->linux_leg.support == YUZU_SUPPORT_SUPPORTED);
+    CHECK(rt->linux_leg.support == YUZU_SUPPORT_CONSTRAINED);
     CHECK(rt->linux_leg.rung == 1);
     CHECK(rt->macos_leg.support == YUZU_SUPPORT_UNSUPPORTED);
     CHECK(rt->macos_leg.rung == 0);
@@ -501,6 +502,52 @@ TEST_CASE("virtualization plugin: runtime_posture without an endpoint reports de
 #endif
     plugin->descriptor->shutdown(ctx.get());
 }
+
+#if defined(__linux__)
+TEST_CASE("virtualization plugin: init() plumbs agent.runtime_endpoint into runtime_posture",
+          "[virtualization][dispatcher][runtime][endpoint]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    // The endpoint is process-global in the plugin: whatever happens below, re-init with an empty
+    // config so the `endpoint|unset` case above cannot be poisoned by test order.
+    struct ResetEndpoint {
+        const YuzuPluginDescriptor* d;
+        ~ResetEndpoint() {
+            yuzu::agent::StandalonePluginContext empty("virtualization", {});
+            d->init(empty.get());
+        }
+    } reset{plugin->descriptor};
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    // Both values are refused on the path alone, so no socket is ever opened, whatever this host runs.
+    struct Case {
+        const char* endpoint;
+        const char* reason;
+    };
+    for (const Case c : {Case{"relative.sock", "relative"}, Case{"/run/docker.sock", "default_socket"}}) {
+        INFO(c.endpoint);
+        yuzu::agent::StandalonePluginContext ctx("virtualization",
+                                                 {{"agent.runtime_endpoint", c.endpoint}});
+        REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+        const auto result = dispatcher.run(plugin->descriptor, "runtime_posture");
+        CHECK(result.rc == 0);
+        const auto rows = captured_rows(result.captured);
+        REQUIRE(rows.size() >= 5);
+        // the value reached the leg: a typed refusal, never `unset`, and the path is never echoed
+        CHECK(rows[1] == std::string{"endpoint|endpoint_refused|"} + c.reason + "|-");
+        CHECK(starts_with(rows[0], "status|runtime_posture|constrained|"));
+        CHECK(rows[0].find(std::string{"endpoint:"} + c.reason) != std::string::npos);
+        for (const auto& r : rows) {
+            CHECK_FALSE(starts_with(r, "container|"));
+            CHECK(r.find(c.endpoint) == std::string::npos);
+        }
+        plugin->descriptor->shutdown(ctx.get());
+    }
+}
+#endif
 
 TEST_CASE("virtualization execute seam: every action routes to its own leg and an unknown one is "
           "still refused",

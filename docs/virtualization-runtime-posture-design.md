@@ -59,7 +59,7 @@ constructor of a request, `build_request(Verb, container_id)`, and the method is
 
 | Verb | Request | Used for | Keys read from the reply (no other key is accessed) |
 |---|---|---|---|
-| `version` | `GET /version` | endpoint liveness, runtime dialect (docker or podman), version and API version | `Version`, `ApiVersion`, `Components[].Name` |
+| `version` | `GET /version` | endpoint liveness, runtime dialect (docker or podman, only when the reply names one), version and API version | `Version`, `ApiVersion`, `Components[].Name` |
 | `info` | `GET /info` | runtime-reported posture facts, emitted as `config` rows from a fixed key allow-list (section 6) | `CgroupDriver`, `SecurityOptions` (count, and whether one entry is `name=rootless`) |
 | `containers_list` | `GET /containers/json?all=1` | the container list | `Id`, `Names`, `Image`, `State` |
 | `container_inspect` | `GET /containers/{id}/json` | privileged flag, network mode, socket-mount flag for one container | `HostConfig.Privileged`, `HostConfig.NetworkMode`, `Mounts[].Source` |
@@ -137,7 +137,12 @@ transport is never invoked):
   `open(O_PATH | O_NOFOLLOW)` and inspects the opened object with `fstat`: it must be a socket, owned by
   uid 0, group equal to the agent's effective gid, mode exactly `0660`. It then walks the ancestors
   (`/run/yuzu-agent`, `/run`, `/`) and requires each to be a directory owned by uid 0 and not writable
-  by group or other. A symlink at the leaf is not followed: with `O_PATH`, `O_NOFOLLOW` returns a
+  by group or other. The walk is lexical and `stat`-based: it names each ancestor of the normalised
+  path and `stat`s it, following links, so an ancestor that is itself a link is judged by its target.
+  That is sound because the object that matters is the leaf, which is already held as a checked
+  descriptor that the agent connects through, so an ancestor swapped for a link after the check cannot
+  change which object is connected to; the walk only refuses a layout in which a user other than root
+  could replace the socket before the next run. A symlink at the leaf is not followed: with `O_PATH`, `O_NOFOLLOW` returns a
   descriptor for the link itself rather than failing with `ELOOP` (`open(2)`), so `fstat` reports a
   link and the refusal reason is `symlink`. A wrong type, owner, group or mode, or an insecure
   ancestor is `endpoint_refused` with that reason. A `stat`/`open` error other than `ENOENT`
@@ -186,8 +191,8 @@ privilege model forbids (pointing the agent at the real socket). It is not the s
 | Read inactivity timeout | `min(5 s, remaining)` | the request fails |
 | Response body | 1 MiB, enforced by a declared-length check before the body is read and by a receiver that stops reading; the client's own payload cap sits one read buffer above it as a backstop | token `version:response_oversized`, `info:response_oversized` or `list:response_oversized`; no rows from that verb |
 | JSON nesting | 32 levels; a parse callback discards anything deeper as it starts, so it is never built, and records the breach | the whole reply is `malformed` (`<verb>:malformed`); no field of it is read |
-| Container rows | at most 256 | token `rows_capped` |
-| Inspections | at most 64, taken from the first 64 listed | token `inspect_capped`; the rest read `unknown` |
+| Container rows | at most 256, running containers first (each group in the runtime's own newest-first order); the 1 MiB body cap is the effective ceiling, because `all=1` lists exited containers too (about 2 to 3 KB each): a list reply over 1 MiB, roughly 350 to 500 containers, is `list:response_oversized` with no rows, so 256 applies to a reply that fit | token `rows_capped` |
+| Inspections | at most 64, taken from the first 64 rows, so the running containers are inspected before any exited one | token `inspect_capped`; the rest read `unknown` |
 | `daemon.json` | read at most 256 KiB | token `oversized` |
 | Free-text field | charset-checked (section 8), then truncated to 256 bytes before escaping | `invalid` on a charset miss; truncation is silent |
 | Concurrency | one dispatch in flight per process | a second dispatch returns at once with one status row (`constrained`, token `busy`) and no other row |
@@ -295,7 +300,7 @@ Attribution is split in two so every outcome has exactly one owner.
 | `permission_denied` | `connect` failed with `EACCES` or `EPERM` |
 | `unreachable` | `ENOENT` at the endpoint path, `ECONNREFUSED`, a connect timeout, or no complete `/version` reply within the budget (token `version:timeout`) |
 | `not_http` | connected, but `/version` was not a parseable HTTP reply with a JSON body within 1 MiB (token `version:not_http` or `version:response_oversized`; for example a containerd socket) |
-| `ok` | `/version` answered; `dialect` is `docker` or `podman` when the reply identified one (from the `Components[].Name` of the reply; `Podman Engine` means podman), `-` when it answered non-200 or malformed (section 7, per-response recovery) |
+| `ok` | `/version` answered; `dialect` is `docker` or `podman` when the reply identified one, from the `Components[].Name` of the reply (`Podman Engine` means podman, `Engine` means docker) or, for older daemons that send no components, a string `ApiVersion` (docker); `-` when it answered non-200 or malformed, or when a well-typed reply named no runtime (`{}`, `{"message":"ok"}`, a bare `Version`): that is neither malformed nor a token, and no runtime row reads `served` (section 7, per-response recovery) |
 
 Every state other than `unset` and `ok` is also a failed read, so each adds one token to the status as
 well as being named by the endpoint row: `endpoint:<reason>` for a refusal (`endpoint:default_socket`,
@@ -312,12 +317,14 @@ changes a runtime row.
 | Detection | Meaning |
 |---|---|
 | `not_detected` | none of that runtime's standard-path artefacts exists (socket, config, data root) |
-| `detected` | at least one standard-path artefact exists |
+| `detected` | at least one standard-path artefact exists; for podman these include `/etc/containers/{storage,registries}.conf` and `/var/lib/containers`, which CRI-O, buildah and skopeo create too |
 | `served` | the endpoint's `/version` identified this runtime; `version` and `api_version` are filled only on this row |
 
 `not_detected` is a statement about the standard paths, not proof of absence. A stopped runtime, a
 rootless runtime and a custom-root install can all read `not_detected`, and the contract text in the
-README says so. An endpoint failure never changes any runtime row.
+README says so. `detected` is a statement about the same paths in the other direction: podman
+`detected` means the shared `containers` configuration or storage artefacts exist, which a node with
+only CRI-O, buildah or skopeo also has. An endpoint failure never changes any runtime row.
 
 The result status is `OK` and `FULL` unless a read failed (a refused `stat` or `daemon.json` read, a
 configured endpoint that was refused, absent, denied, unreachable or not a runtime API
@@ -338,15 +345,17 @@ null element inside an array the parser walks is still wrong-typed). The keys re
 first element, `Image` and `State`. A wrong-typed key withholds its own field and the reply reads
 `malformed` while the well-typed keys still report; a list entry keeps its row with `-` or `invalid` for the
 field. A list entry that is not an object or carries no valid id is skipped and counted in the token
-`list:entries_skipped`. When `/version` answers non-200, is not an object or carries a malformed
-`Components` the dialect is not known: the later verbs still run and their `config` and `container` rows
+`list:entries_skipped`. When `/version` answers non-200, is not an object, carries a malformed
+`Components` or names no runtime the dialect is not known: the later verbs still run and their `config` and `container` rows
 carry `-` as the runtime, while the runtime rows are unchanged. A `/version` request that fails at the transport (refused, timed out, oversized, not HTTP)
 or answers 200 with a body that is not JSON stops the action: the endpoint row says which and the
 `version:<cause>` token says it was a failed read. A failed inspection (a transport or HTTP failure, a body that is not JSON, or a
 wrong-typed `HostConfig.Privileged`, `NetworkMode`, `Mounts` or `Mounts[].Source`) keeps the list-derived
 row with the three inspect fields `unknown` and continues; the failures are counted in one token
 `inspect:failed:<n>`. An HTTP 404 on inspect (the container was removed between list and inspect) is
-expected churn: fields `unknown`, no token and no constraint.
+expected churn: fields `unknown`, no token and no constraint, unless every inspection that ran answered
+404, which is an endpoint that admits the list but not the inspect and is one token,
+`inspect:not_found:<n>` (`constrained`).
 
 **Exceptions.** The plugin's entry point is one `try/catch(...)` at the ABI seam (the existing
 `execute_action` in `virtualization_legs.hpp`, which `runtime_posture` joins as a further leg); the
@@ -377,11 +386,11 @@ admitted only when it matches its allow-list, and otherwise reads `invalid`:
 | Field | Allow-list |
 |---|---|
 | `state` | closed docker enum: `created`, `running`, `paused`, `restarting`, `removing`, `exited`, `dead`; anything else `invalid` |
-| `name` | the first `Names` entry, `^[A-Za-z0-9][A-Za-z0-9_.-]{0,255}$` after the leading `/` is stripped |
-| `image` | `^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$` |
-| `network_mode` | `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$` |
-| `version`, `api_version` | `^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$` |
-| `config` values | booleans render `yes`/`no`; counts are digits; string values (`data-root`, `log-driver`, `storage-driver`, `userns-remap`, `cgroup_driver`) `^[A-Za-z0-9][A-Za-z0-9/._:@+-]{0,255}$` |
+| `name` | the first `Names` entry, `^[A-Za-z0-9][A-Za-z0-9_.-]*$` after the leading `/` is stripped |
+| `image` | `^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$` |
+| `network_mode` | `^[A-Za-z0-9][A-Za-z0-9_.:-]*$` |
+| `version`, `api_version` | `^[A-Za-z0-9][A-Za-z0-9._+-]*$` |
+| `config` values | booleans render `yes`/`no`; counts are digits; string values (`data-root`, `log-driver`, `storage-driver`, `userns-remap`, `cgroup_driver`) `^[A-Za-z0-9][A-Za-z0-9/._:@+-]*$` |
 | `privileged`, `host_runtime_socket_mounted` | `yes`, `no`, `unknown` only |
 | `id12` | the first 12 of an id that matched `^[0-9a-f]{12,64}$` |
 
@@ -391,6 +400,8 @@ states a real podman answers with, and the enum is amended in this note, with th
 record. Until then a podman state outside the set reads `invalid`, which is a visible gap and not a
 wrong value.
 
+The allow-lists bound the characters, not the length: a value that matches is then truncated to 256 bytes
+(64 for `network_mode`, `version` and `api_version`), so an over-long name is cut, never `invalid`.
 The check runs before truncation and before `wire_field`. `privileged` and `network_mode` come from the
 inspect reply. `host_runtime_socket_mounted` is `yes` when any mount source of the container equals one
 of the four default socket paths or is a parent directory of one (`/`, `/run`, `/var/run`, `/run/podman`,

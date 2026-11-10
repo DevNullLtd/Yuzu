@@ -440,6 +440,8 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
             if (containers.size() > kMaxInspections)
                 acc.add_failure(rt_token("inspect_capped"));
             std::size_t failed = 0;
+            std::size_t answered = 0;
+            std::size_t not_found = 0;
             const std::size_t n = std::min(containers.size(), kMaxInspections);
             for (std::size_t i = 0; i < n; ++i) {
                 const auto req = build_request(Verb::container_inspect, containers[i].id);
@@ -448,8 +450,11 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
                 const auto r = send(*req);
                 if (!r)
                     break;
-                if (r->outcome == Outcome::ok && r->http_status == 404)
-                    continue; // removed between list and inspect: expected churn, no constraint
+                ++answered;
+                if (r->outcome == Outcome::ok && r->http_status == 404) {
+                    ++not_found; // removed between list and inspect: expected churn, no constraint
+                    continue;
+                }
                 if (r->outcome != Outcome::ok || r->http_status != 200) {
                     ++failed;
                     continue;
@@ -460,6 +465,11 @@ inline Posture runtime_posture_linux(const RuntimeFs& fs, const Transport& trans
             }
             if (failed > 0)
                 acc.add_failure(rt_token("inspect:failed:" + std::to_string(failed)));
+            // Churn is some containers going away; EVERY inspection answering 404 is an endpoint
+            // that admits the list but not the inspect (a proxy denying it), which must not read
+            // as a clean supported with unknown rows.
+            if (answered > 0 && not_found == answered)
+                acc.add_failure(rt_token("inspect:not_found:" + std::to_string(not_found)));
         }
     }
 

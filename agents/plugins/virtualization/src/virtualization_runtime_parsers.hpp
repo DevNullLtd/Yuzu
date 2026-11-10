@@ -250,9 +250,12 @@ inline std::string_view endpoint_reason_token(EndpointVerdict v) {
         return "insecure_ancestor";
     case EndpointVerdict::stat_error:
         return "stat_error";
-    default:
+    case EndpointVerdict::unset:
+    case EndpointVerdict::ok:
+    case EndpointVerdict::absent:
         return "-";
     }
+    return "-";
 }
 
 /// The cause segment of the `endpoint:<cause>` constraint token for an endpoint that could not be
@@ -428,9 +431,12 @@ inline std::string failure_cause(Outcome o) {
         return "response_oversized";
     case Outcome::not_http:
         return "not_http";
-    default:
+    case Outcome::ok:
+    case Outcome::enoent:
+    case Outcome::other:
         return "unreachable";
     }
+    return "unreachable";
 }
 
 /// How long before the read timeout still counts as the timeout having fired.
@@ -671,10 +677,13 @@ struct VersionInfo {
     std::string api_version = "-";
 };
 
-/// `Components[].Name == "Podman Engine"` means podman; a docker-shaped or component-less object
-/// means docker. The dialect comes from a well-typed Components only: a malformed Components, and a
-/// non-object reply, give Dialect::none. A wrong-typed Version or ApiVersion stays `-` and the
-/// reply is malformed; the dialect is unaffected by them.
+/// A reply must IDENTIFY the runtime: `Components[].Name == "Podman Engine"` means podman, and
+/// docker needs a component named `Engine` or, for the older daemons that send no Components, a
+/// string `ApiVersion`. A well-typed object that names neither (`{}`, `{"message":"ok"}`, a bare
+/// `Version`) is Dialect::none and not malformed: nothing was misread, nothing was identified. The
+/// dialect comes from a well-typed Components only: a malformed Components, and a non-object reply,
+/// give Dialect::none too. A wrong-typed Version or ApiVersion stays `-` and the reply is
+/// malformed; a well-typed `ApiVersion` identifies docker whatever Version holds.
 inline VersionInfo parse_version(const nlohmann::json& j) {
     VersionInfo v;
     if (!j.is_object()) {
@@ -683,6 +692,7 @@ inline VersionInfo parse_version(const nlohmann::json& j) {
     }
     bool comps_malformed = false;
     bool podman = false;
+    bool docker = false;
     if (const auto* comps =
             typed_member(j, "Components", nlohmann::json::value_t::array, comps_malformed)) {
         for (const auto& c : *comps) {
@@ -691,17 +701,23 @@ inline VersionInfo parse_version(const nlohmann::json& j) {
                 continue;
             }
             if (const auto* n =
-                    typed_member(c, "Name", nlohmann::json::value_t::string, comps_malformed))
-                podman = podman || n->get_ref<const std::string&>() == "Podman Engine";
+                    typed_member(c, "Name", nlohmann::json::value_t::string, comps_malformed)) {
+                const auto& name = n->get_ref<const std::string&>();
+                podman = podman || name == "Podman Engine";
+                docker = docker || name == "Engine";
+            }
         }
     }
     v.malformed = comps_malformed;
-    v.dialect = comps_malformed ? Dialect::none : (podman ? Dialect::podman : Dialect::docker);
     if (const auto* s = typed_member(j, "Version", nlohmann::json::value_t::string, v.malformed))
         v.version = checked_version(s->get_ref<const std::string&>());
     if (const auto* s =
-            typed_member(j, "ApiVersion", nlohmann::json::value_t::string, v.malformed))
+            typed_member(j, "ApiVersion", nlohmann::json::value_t::string, v.malformed)) {
         v.api_version = checked_version(s->get_ref<const std::string&>());
+        docker = true; // a string ApiVersion: the older daemons name no component
+    }
+    if (!comps_malformed)
+        v.dialect = podman ? Dialect::podman : (docker ? Dialect::docker : Dialect::none);
     return v;
 }
 
@@ -831,25 +847,41 @@ struct ContainerList {
 };
 
 /// Reads Id, Names, Image and State of each entry and nothing else (Command, Labels, Mounts and
-/// Ports are never read). At most kMaxContainerRows rows are kept.
+/// Ports are never read). Running containers come first, each group in the runtime's own
+/// (newest-first) order, so the row cap here and the inspection cap after it keep the live
+/// containers rather than the newest exited ones. At most kMaxContainerRows rows are kept; an entry
+/// past the cap had only its Id checked (it is counted as skipped if invalid) and is never read.
 inline ContainerList containers_from_list(const nlohmann::json& j) {
     ContainerList out;
     if (!j.is_array()) {
         out.malformed = true;
         return out;
     }
+    struct Entry {
+        const nlohmann::json* json;
+        const std::string* id;
+    };
+    std::vector<Entry> entries; // running first
+    std::vector<Entry> others;
     for (const auto& e : j) {
         const auto* id = member_of_type(e, "Id", nlohmann::json::value_t::string);
         if (!id || !valid_container_id(id->get_ref<const std::string&>())) {
             ++out.skipped;
             continue;
         }
-        if (out.rows.size() >= kMaxContainerRows) {
-            out.rows_capped = true;
-            break;
-        }
+        const auto* st = member_of_type(e, "State", nlohmann::json::value_t::string);
+        const bool running = st && st->get_ref<const std::string&>() == "running";
+        (running ? entries : others).push_back({&e, &id->get_ref<const std::string&>()});
+    }
+    entries.insert(entries.end(), others.begin(), others.end());
+    if (entries.size() > kMaxContainerRows) {
+        out.rows_capped = true;
+        entries.resize(kMaxContainerRows);
+    }
+    for (const auto& [ep, id] : entries) {
+        const auto& e = *ep;
         ContainerRow r;
-        r.id = id->get_ref<const std::string&>();
+        r.id = *id;
         r.id12 = r.id.substr(0, 12);
         if (const auto* names =
                 typed_member(e, "Names", nlohmann::json::value_t::array, out.malformed);

@@ -313,12 +313,12 @@ spec:
         platforms: [linux]
       - name: field_2
         type: string
-        description: 'status: supported, constrained or unsupported (a leg that threw). endpoint: the refusal reason for endpoint_refused (relative, dotdot, too_long, default_socket, same_inode, not_socket, symlink, owner, group, mode, insecure_ancestor, stat_error), otherwise "-". runtime: not_detected, detected or served. config: the setting name. container: the first 12 characters of the container id.'
+        description: 'status: supported, constrained or unsupported (a leg that threw). endpoint: the refusal reason for endpoint_refused (relative, dotdot, too_long, default_socket, same_inode, not_socket, symlink, owner, group, mode, insecure_ancestor, stat_error), otherwise "-". runtime: not_detected, detected or served. config: the setting name, or daemon_json on the one pseudo-row config|docker|daemon_json|malformed that says daemon.json was not usable JSON or held an allow-listed key of the wrong type. container: the first 12 characters of the container id.'
         example: detected
         platforms: [linux]
       - name: field_3
         type: string
-        description: 'status: reason token(s) for a non-supported read, "-" when complete; every token is linux:virtualization:runtime_posture:<source>:<cause>, where <source> is endpoint, version, info, list, inspect, daemon_json or a runtime name; tokens look like linux:virtualization:runtime_posture:endpoint:default_socket, linux:virtualization:runtime_posture:version:timeout, linux:virtualization:runtime_posture:info:malformed, linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, "-" when it did not answer. runtime: the default socket, present:<mode>:<uid>:<gid>, absent or unreadable (its stat failed). config: the setting value. container: the container name.'
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; every token is linux:virtualization:runtime_posture:<source>:<cause>, where <source> is endpoint, version, info, list, inspect, mountinfo, daemon_json or a runtime name; the source segment is omitted for the action-wide tokens busy, rows_capped, inspect_capped and deadline_exhausted, and inspect:failed:<n> and inspect:not_found:<n> carry a count in place of a cause; tokens look like linux:virtualization:runtime_posture:endpoint:default_socket, linux:virtualization:runtime_posture:version:timeout, linux:virtualization:runtime_posture:info:malformed, linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, "-" when it did not answer or its /version named no runtime. runtime: the default socket, present:<mode>:<uid>:<gid>, absent or unreadable (its stat failed). config: the setting value (malformed on the daemon_json pseudo-row). container: the container name.'
         example: present:0660:0:998
         platforms: [linux]
       - name: field_4
@@ -333,17 +333,17 @@ spec:
         platforms: [linux]
       - name: field_6
         type: string
-        description: 'runtime: the API version, filled only on the served row, otherwise "-". container: privileged, yes, no or unknown (inspection skipped or failed). Not used by the other kinds.'
+        description: 'runtime: the API version, filled only on the served row, otherwise "-". container: privileged, yes, no or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds.'
         example: 'no'
         platforms: [linux]
       - name: field_7
         type: string
-        description: 'container: the network mode, or unknown. Not used by the other kinds.'
+        description: 'container: the network mode, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds.'
         example: bridge
         platforms: [linux]
       - name: field_8
         type: string
-        description: 'container: host_runtime_socket_mounted, yes (a mount source is a default runtime socket path or a parent directory of one), no, or unknown. The check covers the default socket paths only. Not used by the other kinds.'
+        description: 'container: host_runtime_socket_mounted, yes (a mount source is a default runtime socket path or a parent directory of one), no, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). The check covers the default socket paths only. Not used by the other kinds.'
         example: 'no'
         platforms: [linux]
     aggregation:
@@ -361,7 +361,7 @@ spec:
     mode: auto
 
   permissions:
-    executeRoles: [endpoint-admin, endpoint-operator]
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
     authorRoles: [content-author]
 
   compatibility:

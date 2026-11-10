@@ -68,6 +68,9 @@ class VirtualizationDefinitionColumns(unittest.TestCase):
         self.assertEqual(d["spec"]["platforms"], ["linux"])
         self.assertEqual(d["spec"]["approval"]["mode"], "auto")
         self.assertEqual(d["spec"]["gather"]["ttlSeconds"], 3600)
+        # advisory (the catalogue row is the control); a posture read like system_hardening's
+        self.assertEqual(d["spec"]["permissions"]["executeRoles"],
+                         ["endpoint-admin", "endpoint-operator", "security-admin"])
         self.assertEqual(d["spec"]["compatibility"]["requiredPlugins"], ["virtualization"])
         cols = d["spec"]["result"]["columns"]
         self.assertEqual([c["name"] for c in cols], RUNTIME_COLUMNS)

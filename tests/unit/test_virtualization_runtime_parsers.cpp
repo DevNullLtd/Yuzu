@@ -472,7 +472,7 @@ TEST_CASE("runtime daemon.json: wrong types read malformed, withhold their row a
     CHECK(d.rows.empty());
 }
 
-TEST_CASE("runtime /version: the dialect comes from Components, a wrong type is malformed",
+TEST_CASE("runtime /version: the dialect must be identified, a wrong type is malformed",
           "[virtualization][runtime][version]") {
     const auto podman = parse_version(json::parse(
         R"({"Version":"5.2.0","ApiVersion":"1.41","Components":[{"Name":"Podman Engine","Version":"5.2.0"}]})"));
@@ -485,11 +485,31 @@ TEST_CASE("runtime /version: the dialect comes from Components, a wrong type is 
         R"({"Version":"27.3.1","ApiVersion":"1.47","Components":[{"Name":"Engine"}]})"));
     CHECK(docker.dialect == Dialect::docker);
 
+    // a reply that names no runtime identifies none: well-typed, so not malformed, and no dialect
     const auto bare = parse_version(json::parse(R"({"Version":"27.3.1"})"));
     CHECK_FALSE(bare.malformed);
-    CHECK(bare.dialect == Dialect::docker);
+    CHECK(bare.dialect == Dialect::none);
     CHECK(bare.version == "27.3.1");
     CHECK(bare.api_version == "-");
+    for (const char* body : {"{}", R"({"message":"ok"})", R"({"Components":[]})",
+                             R"({"Components":[{"Name":"containerd"},{"x":1}]})"}) {
+        const auto none = parse_version(json::parse(body));
+        INFO(body);
+        CHECK_FALSE(none.malformed);
+        CHECK(none.dialect == Dialect::none);
+    }
+    // what does identify docker: a component named Engine, or a string ApiVersion (older daemons)
+    const auto api_only = parse_version(json::parse(R"({"ApiVersion":"1.47"})"));
+    CHECK_FALSE(api_only.malformed);
+    CHECK(api_only.dialect == Dialect::docker);
+    CHECK(api_only.api_version == "1.47");
+    const auto engine_only = parse_version(json::parse(R"({"Components":[{"Name":"Engine"}]})"));
+    CHECK_FALSE(engine_only.malformed);
+    CHECK(engine_only.dialect == Dialect::docker);
+    // podman wins over an Engine component or an ApiVersion (podman's compat reply carries both)
+    CHECK(parse_version(json::parse(
+                            R"({"ApiVersion":"1.41","Components":[{"Name":"Engine"},{"Name":"Podman Engine"}]})"))
+              .dialect == Dialect::podman);
 
     // every key read is wrong-typed: malformed, no dialect (Components is not an array), `-` fields
     const auto odd = parse_version(json::parse(R"({"Version":27,"ApiVersion":true,"Components":"x"})"));
@@ -498,8 +518,8 @@ TEST_CASE("runtime /version: the dialect comes from Components, a wrong type is 
     CHECK(odd.version == "-");
     CHECK(odd.api_version == "-");
 
-    // a wrong-typed Version or ApiVersion alone: malformed, the dialect from the well-typed
-    // Components still stands, the field stays `-`
+    // a wrong-typed Version or ApiVersion alone: malformed, the field stays `-`; a string ApiVersion
+    // still identifies docker, and a wrong-typed one identifies nothing
     const auto wrong_version = parse_version(json::parse(R"({"Version":27,"ApiVersion":"1.47"})"));
     CHECK(wrong_version.malformed);
     CHECK(wrong_version.dialect == Dialect::docker);
@@ -509,6 +529,7 @@ TEST_CASE("runtime /version: the dialect comes from Components, a wrong type is 
     CHECK(wrong_api.malformed);
     CHECK(wrong_api.version == "1");
     CHECK(wrong_api.api_version == "-");
+    CHECK(wrong_api.dialect == Dialect::none);
 
     // a Components element that is not an object, or a Name that is not a string: malformed and no
     // dialect, even beside a "Podman Engine" element
@@ -529,7 +550,7 @@ TEST_CASE("runtime /version: the dialect comes from Components, a wrong type is 
     CHECK_FALSE(missing.malformed);
     CHECK(missing.dialect == Dialect::podman);
     CHECK_FALSE(parse_version(json::parse(R"({"Components":[]})")).malformed);
-    CHECK(parse_version(json::parse(R"({"Components":[]})")).dialect == Dialect::docker);
+    CHECK(parse_version(json::parse(R"({"Components":[]})")).dialect == Dialect::none);
 
     // a non-object reply
     for (const char* body : {"[1]", "\"s\"", "7", "null"}) {
@@ -693,6 +714,39 @@ TEST_CASE("runtime list: caps, skips and wrong types never throw", "[virtualizat
     CHECK(mixed.rows[0].state == "invalid");
 }
 
+TEST_CASE("runtime list: running containers come first, so both caps keep the live ones",
+          "[virtualization][runtime][containers]") {
+    // 280 exited containers listed first (newest-first, as a runtime sends them), 20 running last
+    const auto cid = [](int i) { return std::format("{:016x}", i) + std::string(48, 'a'); };
+    json list = json::array();
+    for (int i = 0; i < 300; ++i) {
+        list.push_back({{"Id", cid(i)},
+                        {"Names", {"/n"}},
+                        {"Image", "i"},
+                        {"State", i < 280 ? "exited" : "running"}});
+    }
+    const auto l = containers_from_list(list);
+    REQUIRE(l.rows.size() == kMaxContainerRows);
+    CHECK(l.rows_capped);
+    for (std::size_t i = 0; i < 20; ++i) {
+        INFO("row " << i);
+        CHECK(l.rows[i].state == "running");
+    }
+    CHECK(l.rows[20].state == "exited");
+    // each group keeps the runtime's order
+    CHECK(l.rows[0].id == cid(280));
+    CHECK(l.rows[19].id == cid(299));
+    CHECK(l.rows[20].id == cid(0));
+    CHECK(l.rows[kMaxContainerRows - 1].id == cid(235));
+
+    // a wrong-typed State is not `running`: its row keeps its place among the rest
+    const auto odd = containers_from_list(json::parse(
+        R"([{"Id":")" + id('a') + R"(","State":5},{"Id":")" + id('b') + R"(","State":"running"}])"));
+    REQUIRE(odd.rows.size() == 2);
+    CHECK(odd.rows[0].id12 == id('b', 12));
+    CHECK(odd.rows[1].id12 == id('a', 12));
+}
+
 TEST_CASE("runtime list: a wrong-typed key of a valid entry keeps the row and reads malformed",
           "[virtualization][runtime][containers]") {
     const std::string valid_id = id('e');
@@ -840,14 +894,15 @@ TEST_CASE("runtime readers: a key whose value is JSON null is a missing key, nev
     // array a reader walks is not a key and stays wrong-typed (covered beside each reader).
 
     // /version
+    // (a null key names nothing, so no runtime is identified either)
     const auto version = parse_version(json::parse(R"({"Version":null,"ApiVersion":null,"Components":null})"));
     CHECK_FALSE(version.malformed);
-    CHECK(version.dialect == Dialect::docker);
+    CHECK(version.dialect == Dialect::none);
     CHECK(version.version == "-");
     CHECK(version.api_version == "-");
     const auto name = parse_version(json::parse(R"({"Version":"1","Components":[{"Name":null}]})"));
     CHECK_FALSE(name.malformed);
-    CHECK(name.dialect == Dialect::docker);
+    CHECK(name.dialect == Dialect::none);
     CHECK(name.version == "1");
 
     // /info: a null SecurityOptions emits neither `rootless` nor the count (never `rootless no`)
@@ -865,12 +920,13 @@ TEST_CASE("runtime readers: a key whose value is JSON null is a missing key, nev
         R"({"Id":")" + id('b') + R"(","Names":null,"Image":"i","State":"running"}])"));
     CHECK_FALSE(list.malformed);
     REQUIRE(list.rows.size() == 2);
+    // the running entry (`b`) is listed first; the all-null entry (`a`) keeps its row after it
     CHECK(list.rows[0].name == "-");
-    CHECK(list.rows[0].image == "-");
-    CHECK(list.rows[0].state == "invalid");
+    CHECK(list.rows[0].image == "i"); // the well-typed keys still report
+    CHECK(list.rows[0].state == "running");
     CHECK(list.rows[1].name == "-");
-    CHECK(list.rows[1].image == "i"); // the well-typed keys still report
-    CHECK(list.rows[1].state == "running");
+    CHECK(list.rows[1].image == "-");
+    CHECK(list.rows[1].state == "invalid");
 
     // inspect: every field stays unknown, and a well-typed key still reports beside a null one
     const auto make = [] {
@@ -957,7 +1013,7 @@ TEST_CASE("runtime tokens: every token matches the plugin grammar", "[virtualiza
     const std::regex grammar{"^linux:virtualization:runtime_posture(:[a-z0-9_]+)+$"};
     for (const char* tail : {"busy", "deadline_exhausted", "rows_capped", "inspect_capped",
                              "daemon_json:malformed", "docker:overprivileged", "version:http_403",
-                             "inspect:failed:3", "docker:network_fs_skipped", "mountinfo:unreadable",
+                             "inspect:failed:3", "inspect:not_found:3", "docker:network_fs_skipped", "mountinfo:unreadable",
                              "endpoint:default_socket", "endpoint:unreachable", "version:timeout",
                              "version:response_oversized", "info:malformed", "list:entries_skipped"})
         CHECK(std::regex_match(rt_token(tail), grammar));

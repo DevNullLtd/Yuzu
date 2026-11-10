@@ -91,7 +91,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "runtime_posture",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1,
+        {YUZU_SUPPORT_CONSTRAINED, 1,
          "stat of the docker, podman and containerd default sockets, config files and data roots "
          "(no subprocess, no PATH walk), /etc/docker/daemon.json read through a key allow-list "
          "(nlohmann::json), /etc/containers and /etc/containerd presence only, and, only when "

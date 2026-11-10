@@ -822,6 +822,10 @@ int main(int argc, char* argv[]) {
     // SLE (ADR-0024 D11): echo the effective user_ref mode ONCE at startup — the
     // per-agent HMAC key (k_agent) is NEVER logged (roadmap R16), only the mode.
     spdlog::info("software_licensing user_ref mode: {}", cfg.license_scan_user_ref);
+    // virtualization.runtime_posture: record the opt-in ONCE at startup, never the path and no I/O
+    // (the plugin validates the value and reports a refusal on its own endpoint row).
+    spdlog::info("container runtime endpoint: {}",
+                 cfg.runtime_endpoint.empty() ? "unset" : "configured");
     // #5249: say which OTA update-signature mode this process actually loaded
     // (off / bundle / bundle+require) and the bundle path, and warn on any
     // YUZU_UPDATE_* variable this agent does not read (a misspelt name is
