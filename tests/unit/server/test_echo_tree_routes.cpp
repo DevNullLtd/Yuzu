@@ -14,6 +14,7 @@
 #include "authz_model.hpp"
 #include "secure_random.hpp"
 #include "echo_tree_routes.hpp"
+#include "openapi_spec_access.hpp"
 #include "source_scan.hpp"
 #include "test_route_sink.hpp"
 
@@ -1863,6 +1864,19 @@ TEST_CASE("echo_retention_paused_json: rows carry hourly_rows and no live_rows",
     CHECK(rows[0]["agent_id"] == "dev-a");
     CHECK(rows[0]["hourly_rows"] == 42);
     CHECK(rows[1]["hourly_rows"] == -1);
+}
+
+// The OpenAPI row schema is the machine-readable twin of the builder above.
+TEST_CASE("OpenAPI EchoRetentionPausedRow names hourly_rows and not live_rows",
+          "[echo][tree][openapi]") {
+    const auto spec = nlohmann::json::parse(openapi_spec_json(), nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& row = spec.at("components").at("schemas").at("EchoRetentionPausedRow");
+    CHECK(row.at("properties").contains("hourly_rows"));
+    CHECK_FALSE(row.at("properties").contains("live_rows"));
+    const auto required = row.at("required").dump();
+    CHECK(required.find("\"hourly_rows\"") != std::string::npos);
+    CHECK(required.find("live_rows") == std::string::npos);
 }
 
 // #4644: `node` is ONE non-negative base-10 integer. `stoul` accepted "-1" (wrapping to
