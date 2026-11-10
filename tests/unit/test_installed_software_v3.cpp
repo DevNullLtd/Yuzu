@@ -327,9 +327,9 @@ const std::vector<std::string> kBlankedSpellings = {
         "c:/documents and settings/x", "\\Users\\alice\\x", "/Documents and Settings/x", "\\x",
         // On the POSIX shape `\` is a filename byte, not a separator: a `\..` inside a segment
         // never pops a real segment, so a per-user path cannot be rewritten into a machine root
-        // (`/Users/a/x\..\..\..\opt/Foo.app` is `/Users/a/<name>/Foo.app`, blanked, never
+        // (`/Users/jsmith/x\..\..\..\opt/Foo.app` is `/Users/jsmith/<name>/Foo.app`, blanked, never
         // `/opt/Foo.app`); and a path that leads with `\` and has no drive letter has no shape.
-        "/Users/a/x\\..\\..\\..\\opt/Foo.app", "/home/a/x\\..\\..\\..\\usr/bin", "\\opt\\x",
+        "/Users/jsmith/x\\..\\..\\..\\opt/Foo.app", "/home/jsmith/x\\..\\..\\..\\usr/bin", "\\opt\\x",
         "\\opt/Foo.app", "\\Applications\\Tool.app",
         // A control byte is not a path; DEL (0x7F) counts as one.
         std::string("C:\\Program Files\\Tool\x01"), "/Applications/\tTool.app",
