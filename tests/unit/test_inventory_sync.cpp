@@ -5281,11 +5281,13 @@ TEST_CASE("collector: a token that is only the source prefix, or a lookalike wit
     fake_all_supported();
     Collector c(every_plugin());
     REQUIRE(c.collect_forced().has_value());
-    // The scheduler never passes either (it matches the name or `name:`), but the hook is public:
-    // a bare `installed_software:` names no facet, and a lookalike whose 19th byte is not `:`
-    // must not be read as `installed_software:<facet>` from byte 20 on.
+    // The scheduler never passes any of these (it matches the name or `name:`), but the hook is
+    // public: a bare `installed_software:` names no facet, a lookalike whose 19th byte is not `:`
+    // must not be read as `installed_software:<facet>` from byte 20 on, and neither may a foreign
+    // token that merely has its `:` in the 19th place.
     c.ack({"installed_software:",
-           std::string("installed_softwareX") + kFacetApps});
+           std::string("installed_softwareX") + kFacetApps,
+           std::string("XXXXXXXXXXXXXXXXXX:") + kFacetApps});
     REQUIRE(c.kv.count(acked_key(kFacetApps)) == 1);
     for (const auto& [key, value] : c.kv) {
         CAPTURE(key);
@@ -5779,8 +5781,9 @@ TEST_CASE("collector: a plugin whose execute throws is constrained rc=-1 and lea
 
 TEST_CASE("collector: a FULL answer whose typed status is not OK is constrained, never rows",
           "[sync][collector][v3][completeness]") {
-    // No in-tree plugin pairs a non-OK status with FULL; the gate is on both so a future one
-    // cannot ship rows the plugin itself says it could not read cleanly.
+    // No in-tree sync-source action pairs a non-OK status with FULL (windows_optional_features
+    // `info` does, and the collector never reads it); the gate is on both so a future one cannot
+    // ship rows the plugin itself says it could not read cleanly.
     reset_fakes();
     g_fake[0].out["list_inventory"] = "inv|alpha|1.0|Acme\n";
     SECTION("with a provenance token: the token") {

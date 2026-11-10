@@ -45,7 +45,8 @@ struct SyncSource {
 
     /// Why the most recent collect() returned nullopt — a bounded token the
     /// scheduler persists as sync.<name>.last_skip; sources that cannot classify
-    /// leave it unset.
+    /// leave it unset. No in-tree source sets it at present, and emit_sync_skip_tags
+    /// publishes the skip tags only with a reason, so none are published.
     std::function<std::string()> skip_reason;
 
     /// Retry a skipped cycle on the bounded phase-aligned backoff

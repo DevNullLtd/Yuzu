@@ -167,7 +167,9 @@ void append_section_header(std::string& out, const SectionPlan& p) {
 
 // The planner's rows are written as planned: `adds` is already the normal form the section hash
 // and the row hashes were taken over, so this is a byte copy, not a second normalisation (one
-// would hash one record and transmit another whenever a pass is not a fixed point).
+// would hash one record and transmit another whenever a pass is not a fixed point). Slot 13's
+// allowlist therefore rests on plan_section being the ONE producer of a SectionPlan that reaches
+// the wire: a plan built any other way is written as given.
 std::string serialise_section(const SectionPlan& p) {
     std::string out;
     append_section_header(out, p);
@@ -266,27 +268,31 @@ std::string canonical_location_once(std::string_view p) {
     if (p.empty())
         return {}; // a bare prefix
     // 3. Shape. A drive letter followed by a separator is a Windows absolute path; a single
-    //    leading separator a POSIX one. Anything else (UNC `\\host\share`, drive-relative
-    //    `C:Users`, `\??\`, `%ProgramFiles%\X`, a bare name) is not recognised and is blanked:
-    //    the writer cannot tell a home share from an application share, nor resolve an
-    //    environment variable or an NT object name, so it fails closed.
+    //    leading `/` a POSIX one. Anything else (UNC `\\host\share`, drive-relative `C:Users`,
+    //    `\??\`, `%ProgramFiles%\X`, a bare name, a leading `\` with no drive: on a POSIX
+    //    filesystem `\` is a filename byte, so `\opt\x` names nothing the writer can place) is
+    //    not recognised and is blanked: the writer cannot tell a home share from an application
+    //    share, nor resolve an environment variable or an NT object name, so it fails closed.
     char drive = 0;
     if (p.size() >= 3 && ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) &&
         p[1] == ':' && is_sep(p[2])) {
         drive = static_cast<char>(p[0] >= 'a' ? p[0] - 'a' + 'A' : p[0]);
         p.remove_prefix(3);
-    } else if (is_sep(p[0]) && !(p.size() >= 2 && is_sep(p[1]))) {
+    } else if (p[0] == '/' && !(p.size() >= 2 && is_sep(p[1]))) {
         p.remove_prefix(1);
     } else {
         return {};
     }
-    // 4. Segments: both separators split, runs collapse, `.` is dropped, `..` pops (one that
-    //    would climb past the root is an escape and is blanked), and on the Windows shape each
-    //    segment loses the trailing dots and spaces Win32 itself ignores. Case is kept.
+    // 4. Segments: the shape's separators split (both under a drive letter; `/` alone on the
+    //    POSIX shape, where `\` is an ordinary byte of a name and must not let a `\..` climb),
+    //    runs collapse, `.` is dropped, `..` pops (one that would climb past the root is an
+    //    escape and is blanked), and on the Windows shape each segment loses the trailing dots
+    //    and spaces Win32 itself ignores. Case is kept.
+    const auto splits = [drive](char c) { return c == '/' || (drive != 0 && c == '\\'); };
     std::vector<std::string_view> segs;
     std::size_t start = 0;
     for (std::size_t i = 0; i <= p.size(); ++i) {
-        if (i < p.size() && !is_sep(p[i]))
+        if (i < p.size() && !splits(p[i]))
             continue;
         std::string_view seg = p.substr(start, i - start);
         start = i + 1;
@@ -358,14 +364,18 @@ std::string machine_install_location(std::string_view raw) {
     // The stored form is the FIXED POINT of the pass, so the planned row, the wire and any later
     // normalisation of the same value agree byte for byte. The loop ends: a pass that changes
     // anything other than case or separators shortens the string, and the pass after one that
-    // changed only those changes nothing.
+    // changed only those changes nothing. It is also capped: nested quote-and-dot padding
+    // (`/opt/x"/."/."/.`...) sheds one layer per pass, so a hostile value would otherwise cost
+    // a pass over the whole string per layer; a value still moving at the cap is blanked, fail
+    // closed (blank is itself a fixed point).
     std::string cur(raw);
-    for (;;) {
+    for (int pass = 0; pass < kV3MaxCanonicalPasses; ++pass) {
         std::string next = canonical_location_once(cur);
         if (next == cur)
             return cur;
         cur = std::move(next);
     }
+    return {};
 }
 
 SwEntry v3_normal_form(const SwEntry& in) {

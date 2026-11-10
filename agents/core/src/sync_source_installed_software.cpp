@@ -930,8 +930,9 @@ struct CollectorState {
             // Only a plugin that declares OK and FULL is believed to have read everything. PARTIAL
             // overrides rows the plugin did hand over (a partial roster); an answer that declares
             // nothing (UNKNOWN) is not FULL either and is the one counted and persisted at once
-            // (rare). A non-OK status paired with FULL (no in-tree plugin does it) is read as
-            // the status says: constrained, under its provenance token.
+            // (rare). A non-OK status paired with FULL (no in-tree sync-source action does it;
+            // windows_optional_features `info` does, and is not one) is read as the status
+            // says: constrained, under its provenance token.
             const bool partial = r.result_completeness != YUZU_RESULT_COMPLETENESS_UNKNOWN;
             if (partial) {
                 spdlog::warn("sync: {} typed result {} — reported constrained", source,
@@ -1018,7 +1019,8 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
             // `installed_software:<facet>`.
             if (t == kName)
                 whole = true;
-            else if (t.size() > kName.size() + 1 && t[kName.size()] == ':') // the hook is public
+            else if (t.starts_with(kName) && t.size() > kName.size() + 1 &&
+                     t[kName.size()] == ':') // the hook is public: a foreign token names no facet
                 nacked.insert(t.substr(kName.size() + 1));
         }
         for (auto& f : st->facets) {

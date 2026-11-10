@@ -1123,8 +1123,11 @@ map, and the wire, the KV keys and the heartbeat tags are unchanged.
   within four hours rather than across twenty-four: about 70 `ReportInventory` calls a second per
   million agents at the peak, against about 12 for the uniform spread (six times), and zones
   overlap less than a uniform spread would. Hash-skip is unchanged, so most of those calls carry
-  a hash only; the blob goes out for a changed source, at the 7 to 8 day floor and for an
-  operator-forced sync. The handler takes a per-agent lock and no fleet-wide one, and nothing
+  a hash only; the blob goes out for a changed source, at the 7 to 8 day floor (except
+  `installed_software`, which has no floor: the server's per-section checks heal it) and for an
+  operator-forced sync. A device's first contact sends its installed-software report in full (every
+  section, up to 20,000 rows or 3 MiB per call, further calls 30 s apart), which the mass-enrollment
+  figure below, a hash-only count, does not include. The handler takes a per-agent lock and no fleet-wide one, and nothing
   rate-limits it; these figures are arithmetic from the window length, not measurements, and
   pool sizing against them has not been measured.
 - **Catch-up.** A persisted `next_fire` more than `kMaxTickSeconds` (15 minutes) in the past,
@@ -1473,7 +1476,7 @@ any `need_full`, then a `delta` against the last acknowledged set, and no sectio
 is unchanged; any other answer is a status-only section (`constrained`, `timeout`, `oversize`,
 `not_collected`) that costs only that source. A status-only section is sent when its status and token
 differ from the ones the server last acknowledged for that source, and not again while they stay the same
-(memory only: a restart costs one resend, which the server's upsert makes harmless), so a host with
+(memory only: a restart, or a reconnect, which rebuilds the collector, costs one resend, which the server's upsert makes harmless), so a host with
 sources its OS cannot collect still sends the report hash alone on a quiet day. The sources run one at a
 time, in the collector's table order, and the daily sync never starts a second detached worker inside a
 plugin (an operator dispatch of the same plugin is not held by this flag): the single-flight slot is per
@@ -1565,7 +1568,7 @@ guard inside the worker when it physically returns. Every source of a plugin who
 is `timeout` with token `busy` (each facet still reports for itself). That is a status-only section, and a status-only
 acknowledgement erases a facet's acknowledged set, so a healthy sibling of a hung action is sent in full once the
 plugin answers again (an accepted cost). A bounded call that could not start (the outstanding-call ceiling or thread creation)
-is `timeout` with token `rejected` and the caller clears the flag. **Teardown:** after the worker threads
+is `timeout` with token `rejected`; the ticket inside the never-invoked closure ends the flag (below). **Teardown:** after the worker threads
 are joined and before any plugin `shutdown()` or unload, on both teardown paths of the agent, the agent
 waits `kOrphanDrainGrace` (3 s) for the count to reach zero and otherwise logs and exits with code 3
 (`hard_exit.hpp`), the F3 precedent for a detached worker: a plugin is never shut down under a
@@ -1576,7 +1579,10 @@ watchdog (exit code 4), exactly as an unbounded in-process collection did before
 reconnect joins the sync thread, and the pass runs its sources in sequence with no stop check between
 them, so a reconnect waits for the SUM of the limits of the plugins that newly stall in that pass (up to
 about 600 s when every one does: three at 120 s and four at 60 s; a plugin already `busy` costs nothing),
-with the agent disconnected meanwhile. On Windows the hard exit precedes the service's stopped report, so
+with the agent disconnected meanwhile (no Subscribe stream, no commands). That wait is a recorded limit,
+not fixed here: it needs a plugin hang AND a disconnect inside the same pass, it is bounded by the sum
+above, and a stop check between facets would be a new `SyncSource` hook, so the seam is left as it is.
+On Windows the hard exit precedes the service's stopped report, so
 the Service Control Manager's recovery action restarts the agent after 60 s even on an operator stop
 (three restarts a day at most; systemd and launchd honour an operator stop). The single-flight flag is
 RAII: `CollectorWorkers::admit` returns a ticket that rides in the worker closure and is moved into a
@@ -1607,9 +1613,13 @@ only on a 32-bit OS.
 
 **No per-user paths (ADR-0016 section 8): slot 13 is an allowlist.** The writer
 (`machine_install_location`, `installed_software_v3.cpp`) canonicalises the collector's value first (quotes and
-padding trimmed; the Win32 `\\?\` and `\\.\` prefixes dropped; `\` and `/` both separators, runs collapsed;
+padding trimmed; the Win32 `\\?\` and `\\.\` prefixes dropped; `\` and `/` both separators under a drive
+letter, `/` alone on a POSIX path (where `\` is a filename byte, so `x\..` never climbs, and a path that
+leads with `\` and has no drive letter has no recognised shape and is blanked), runs collapsed;
 `.` dropped and `..` resolved, an escape past the root refused; trailing dots and spaces stripped per
-Windows segment; the macOS `/System/Volumes/Data` firmlink folded; compared without regard to case) and
+Windows segment; the macOS `/System/Volumes/Data` firmlink folded; compared without regard to case; the
+pass is repeated to a fixed point, at most `kV3MaxCanonicalPasses` (8) times, and a value still moving at
+the cap is blanked) and
 then KEEPS it, in one spelling (the segments' own case is kept), only when it sits under a root of the one table `kMachineRoots`: Windows
 `Program Files`, `Program Files (x86)`, `ProgramData` and `Windows` under any drive letter; macOS
 `/Applications`, `/Library`, `/System/Applications`, `/Developer`; `/opt` and `/usr` (macOS and Linux);
@@ -1650,5 +1660,12 @@ later change if a measurement asks for it.
 applies no machine-root allowlist to them, so SAM-40 must canonicalise each component once, apply the allowlist
 there and pin planner-vs-wire equality for component sections as the installed-software tests do), the settings
 push of the 2026-11-05 Update, the binary-evidence plugin and its two-at-once pairing, the
-`software_evidence.list_inventory` source row 1.3a names (no such plugin exists; it is deferred with the component
-facet), and the `disabled` status (nothing in the agent turns a facet off yet).
+`software_evidence.list_inventory` source (no such plugin exists; it is deferred with the component
+facet), the `disabled` status (nothing in the agent turns a facet off yet), and a per-source off switch: drivers
+can be stopped only by the `hardware` plugin's kill switch, and the collection-settings document
+(`collection_settings_resolve.hpp`, six plugin keys, a missing key is a 400) does not carry a `hardware` key,
+because adding one changes the PUT contract for every existing client and belongs with the settings push.
+Two recorded limits of the writer: component records are still normalised inside `serialise_section`
+(idempotent, and unreachable until a producer exists; the component change plans them pre-normalised and
+drops that call), and the agent tests' server oracle is a test-local copy of the server recipe (the agent
+tests cannot link the store), so the server's golden vectors stay the cross-pin and both change together.

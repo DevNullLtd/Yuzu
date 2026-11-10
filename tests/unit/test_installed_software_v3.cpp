@@ -325,6 +325,12 @@ const std::vector<std::string> kBlankedSpellings = {
         "/System/Volumes/Data/root/bin", "/System/Volumes/Data",
         "/users/alice/App", "/System/Volumes/Data/users/x", "C:\\Documents and Settings\\alice\\x",
         "c:/documents and settings/x", "\\Users\\alice\\x", "/Documents and Settings/x", "\\x",
+        // On the POSIX shape `\` is a filename byte, not a separator: a `\..` inside a segment
+        // never pops a real segment, so a per-user path cannot be rewritten into a machine root
+        // (`/Users/a/x\..\..\..\opt/Foo.app` is `/Users/a/<name>/Foo.app`, blanked, never
+        // `/opt/Foo.app`); and a path that leads with `\` and has no drive letter has no shape.
+        "/Users/a/x\\..\\..\\..\\opt/Foo.app", "/home/a/x\\..\\..\\..\\usr/bin", "\\opt\\x",
+        "\\opt/Foo.app", "\\Program Files\\Tool", "\\Applications\\Tool.app",
         // A control byte is not a path; DEL (0x7F) counts as one.
         std::string("C:\\Program Files\\Tool\x01"), "/Applications/\tTool.app",
         std::string("C:\\Program Files\\Tool\x7f"), std::string("/opt/\x7fTool")};
@@ -356,6 +362,10 @@ const std::vector<std::pair<std::string, std::string>> kKeptSpellings = {
     {"/nix/store/abc-foo", "/nix/store/abc-foo"},
     {"/app/bin", "/app/bin"},
     {"/opt//x/./y/../z", "/opt/x/z"},
+    // A backslash under a POSIX root is part of the name (kept as spelled); under a drive letter
+    // it is a separator, as `/` is, and the one spelling uses `\`.
+    {"/opt/a\\b", "/opt/a\\b"},
+    {"C:/Program Files\\Tool/Sub", "C:\\Program Files\\Tool\\Sub"},
     // The rule is lexical (ADR-0016 section 8): under a machine root a segment that merely
     // looks like a profile folder is kept; nothing below the root is inspected.
     {"/opt/users/alice/app", "/opt/users/alice/app"},
@@ -421,6 +431,38 @@ TEST_CASE("install_location is an allowlist: every spelling outside a machine ro
     SwEntry b = alpha();
     b.install_location = "\"C:\\Program Files\\Tool\\\"";
     CHECK(v3_row_hash(a) == v3_row_hash(b));
+}
+
+namespace {
+
+// `/opt/foo` under `n` layers of quote-and-dot padding. A pass strips one exposed trailing quote
+// (step 1) and drops one dot segment (step 4), so each layer costs one pass and `n` layers settle
+// on pass n + 2 (the first pass only drops the outer dot; the last confirms the fixed point).
+std::string quote_dot_layers(std::size_t n) {
+    std::string s = "/opt/foo";
+    for (std::size_t i = 0; i < n; ++i)
+        s += "\"/.";
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("machine_install_location is capped at kV3MaxCanonicalPasses passes and blanks past them",
+          "[v3][writer][privacy]") {
+    static_assert(kV3MaxCanonicalPasses >= 5,
+                  "the kept corpus needs five passes for its deepest installer junk");
+    // Pass behaviour, not wall-clock: the deepest value that settles inside the cap is kept, the
+    // next layer is blanked (fail closed), whatever the host's speed.
+    const std::size_t settles = static_cast<std::size_t>(kV3MaxCanonicalPasses - 2);
+    CHECK(machine_install_location(quote_dot_layers(settles)) == "/opt/foo");
+    CHECK(machine_install_location(quote_dot_layers(settles + 1)).empty());
+    // A hostile registry value of about 20,000 bytes (one layer per three bytes) is blanked at
+    // the cap rather than canonicalised once per layer over the whole string.
+    const std::string hostile = quote_dot_layers(6666);
+    REQUIRE(hostile.size() > 20000);
+    CHECK(machine_install_location(hostile).empty());
+    // Blank is a fixed point, so the stored form of a blanked value re-normalises to itself.
+    CHECK(machine_install_location("").empty());
 }
 
 TEST_CASE("canonical epoch and release spelling are stable across two collections",

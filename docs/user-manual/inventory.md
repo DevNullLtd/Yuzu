@@ -43,12 +43,15 @@ cadences.
   `timeout` with token `busy` and none is started again; when a
   worker cannot be started the token is `rejected`; a source whose rows exceed 20,000, or whose full
   section cannot fit in one report, is `oversize` (`rows=<n>`, `bytes=<n>`) and sends no rows. A
-  status-only section is sent when its status or token changes, and again after Sync now or a server
-  request for the source, not every day it persists: a host with sources its OS cannot collect still
+  status-only section is sent when its status or token changes, and again after Sync now, a server
+  request for the source, or a restart or reconnect of the agent (the last acknowledged status is held
+  in memory only), not every day it persists: a host with sources its OS cannot collect still
   sends the report hash alone on a quiet day. The
   source no longer skips a report, so it no longer publishes the
   `yuzu.sync.installed_software.skip_streak` and `yuzu.sync.installed_software.last_skip` heartbeat
-  tags (the other sources still do); a failing source is its section's status and token instead. Every row's
+  tags; a failing source is its section's status and token instead. It was the only source that set a
+  skip reason, and the agent publishes the skip tags only with one, so no source publishes them on this
+  build (the gauge below reads 0). Every row's
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
@@ -371,7 +374,10 @@ cadences.
   account's home directory (`/Users/<account>/...` on macOS,
   `C:/Users/<name>/...` on Windows) and is stored as an ordinary Response (90-day
   default retention, no per-subject erasure), outside this sync and outside
-  `--inventory-disable`. The sync blob also has `install_location` and
+  `--inventory-disable`. The same holds for `list_inventory` dispatched directly
+  as a command (it has no instruction definition, but the catalogue admits it at
+  `Inventory:Read`): its fourteenth token is the raw location, minimised only by
+  the daily-sync writer, and the Response store keeps it as sent. The sync blob also has `install_location` and
   `uninstall_string` slots. In the v2 blob they are reserved: the server ignores
   them and stores neither, and an agent that fills them gets a full-resend request
   every cycle. The sectioned v3 blob stores `install_location` and keeps
@@ -1200,9 +1206,11 @@ APIs, which return the system code page (cp1252 on Western installs), so any
 non-ASCII character in an app or publisher name was stored as `?` (e.g. `Café` →
 `Caf?`). This is fixed in the release containing #1662 (the plugin now reads via
 `Reg*W` + UTF-8). After upgrading an agent, the corrected names land on that
-agent's **next daily sync** — typically within hours, as a delta of the changed
-rows (the old `?`-mangled rows leave the section and their corrected twins
-arrive); this source has no weekly full resend to wait for. Until then, an
+agent's **next daily sync** — typically within hours. The first report of an agent of
+this build sends every source in full (it holds no acknowledged set yet); a later
+correction lands as a delta of the changed rows (the old `?`-mangled rows leave the
+section and their corrected twins arrive); this source has no weekly full resend to
+wait for. Until then, an
 exact-match query (`WHERE name = 'Café'`) returns zero rows for that device. To
 force the refresh immediately on a device, use **Sync now** for it (or the REST
 or MCP sync request), which sends every section in full; restarting the agent
@@ -1301,10 +1309,11 @@ ingest is failing. Four further series sharpen the picture:
   heartbeating whose `source` skipped its latest collection cycle(s), from the agent
   heartbeat tag `yuzu.sync.<source>.skip_streak` (written by agents that include the skip-visibility
   change, #5327). `installed_software` no longer skips a report on an agent of this build (a failing
-  source is a status-only section instead), so the gauge no longer counts it; the sources that still skip a
-  cycle (device CI, licensing) are the ones it can show. The cause is in the agent's own log (the
-  `sync: … — skipping this cycle` warning); the agent also publishes it as the
-  `yuzu.sync.<source>.last_skip` heartbeat tag, which no server page or API returns yet.
+  source is a status-only section instead), and the gauge's label is fixed to `source="installed_software"`,
+  so on a fleet of this build it reads 0 (it is kept, not removed). The sources that can still skip a
+  cycle (device CI, licensing) set no skip reason, and the agent publishes the skip tags only with
+  one, so on this build no source publishes them. The cause is in the agent's own log (the
+  `sync: … — skipping this cycle` warning).
   Published every sweep, 0 included. The gauge only counts agents that emit the
   skip-streak heartbeat tag: an agent that does not emit it (older agents, during a
   rollout, or in a mixed-version fleet) contributes zero even when its collector is
@@ -1381,7 +1390,16 @@ catalogue stays "building" until the rollup is made incremental; a fleet that ou
 later keeps serving the last-good rollup while its "updated N ago" stamp ages. A Windows endpoint
 that also reports MSI products adds roughly 120 rows (118 in one capture) to that 450-row basis, about a
 quarter more, so a fleet of such endpoints reaches the same limit at about 4,700 endpoints rather than
-6,000 (arithmetic from the figures above, not re-measured). The server's
+6,000 (arithmetic from the figures above, not re-measured). The `hardware.drivers_inventory` source adds
+one row per signed driver on Windows and per loaded kernel module on Linux. The collector stops at 4,096
+rows and reports the source `constrained` (token `windows:drivers_inventory:row_cap` or
+`linux:drivers_inventory:row_cap`) rather than send a partial list. The typical
+counts are not measured (about 100 to 200 kernel modules on Linux is an estimate, and a Windows count
+has none yet), so read the figures as a bound, not a forecast: on the 450-row basis plus 120 MSI rows, a
+Windows endpoint with 300 to 600 drivers would reach the limit at about 2,300 to 3,100 endpoints, one at
+the cap at about 600, and a Linux endpoint with 150 modules at about 4,500 (arithmetic from these
+assumed counts, not measured; there is no per-source off switch, only the `hardware` plugin's kill
+switch). The server's
 database role needs the `TEMPORARY` privilege (the default `PUBLIC` grant; re-grant it after
 a `REVOKE TEMP` hardening), because the refresh uses a transaction-scoped temporary table;
 without it every refresh fails with a permission-denied error (SQLSTATE 42501) and the

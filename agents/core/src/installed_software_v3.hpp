@@ -93,10 +93,17 @@ enum class V3Status { full, delta, constrained, timeout, oversize, not_collected
 /// a real release and is kept.
 [[nodiscard]] YUZU_EXPORT std::string canonical_release(std::string_view release);
 
+/// The most canonicalisation passes machine_install_location runs before it gives up and blanks
+/// the value (fail closed). Installer junk settles in two or three; a value still moving after
+/// this many is nested quote-and-dot padding, which would otherwise cost one pass over the whole
+/// string per layer (quadratic on a hostile registry value, on the sync thread).
+inline constexpr int kV3MaxCanonicalPasses = 8;
+
 /// The install_location the writer sends for a raw collector value, or empty. Slot 13 is an
 /// ALLOWLIST (ADR-0016 section 8: machine-scope data only; the server stores it as sent and
 /// keeps a copy in the change ledger for 400 days): the value is canonicalised first (quotes
-/// and padding trimmed, the Win32 `\\?\` and `\\.\` prefixes dropped, separator runs collapsed,
+/// and padding trimmed, the Win32 `\\?\` and `\\.\` prefixes dropped, separator runs collapsed
+/// (`\` and `/` under a drive letter, `/` alone on the POSIX shape, where `\` is a filename byte),
 /// `.` and `..` resolved, trailing dots and spaces stripped per Windows segment, the macOS
 /// `/System/Volumes/Data` firmlink folded) and KEPT, in one spelling with the segments' own
 /// case (`C:\Program Files\X`, `/Applications/X.app`), only when it sits under a root of `kMachineRoots` in
@@ -108,9 +115,11 @@ enum class V3Status { full, delta, constrained, timeout, oversize, not_collected
 /// from an application share), a drive-relative path, an unexpanded `%ProgramFiles%`, an NT
 /// object name (`\??\`, `Volume{...}`, `GLOBALROOT`), an 8.3 name, a `..` that escapes the
 /// root, anything with a control byte (DEL included). Fails closed: an unrecognised shape is
-/// blank. The row's name, version, publisher and hash are reported whatever this returns. The
-/// result is a fixed point (`machine_install_location(x) == machine_install_location(
-/// machine_install_location(x))`): a stored form normalised again is the same bytes.
+/// blank (a leading `\` with no drive letter is one), and so is a value that has not settled
+/// after kV3MaxCanonicalPasses passes. The row's name, version, publisher and hash are reported
+/// whatever this returns. The result is a fixed point (`machine_install_location(x) ==
+/// machine_install_location(machine_install_location(x))`): a stored form normalised again is
+/// the same bytes.
 [[nodiscard]] YUZU_EXPORT std::string machine_install_location(std::string_view raw);
 
 /// The stored form of one row, exactly what the server holds after its own field step: every
