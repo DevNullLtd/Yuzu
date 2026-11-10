@@ -31,12 +31,12 @@
 //
 // TOKEN CLASSES. (a) constraint tokens from the sources,
 //   ^(windows|macos|linux):virtualization:[a-z0-9_]+(:[a-z0-9_]+)*$
-// (b) the seam exception token `<os>:leg:exception`, written only by execute_host's catch arm;
+// (b) the seam exception token `<os>:leg:exception`, written only by execute_action's catch arm;
 // (c) evidence strings in the container row's third field (`/.dockerenv`, `/run/systemd/container`,
 // a matched cgroup token, `macos:no_container_runtime`), which are not tokens and never reach
 // set_result_status.
 //
-// The `status|host|...` row is NOT built here; report_host in virtualization_legs.hpp owns it.
+// The `status|<action>|...` row is NOT built here; report in virtualization_legs.hpp owns it.
 
 #include <smbios_parsers.hpp>
 #include <wire_utf8.hpp>

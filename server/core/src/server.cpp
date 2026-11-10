@@ -242,6 +242,7 @@
 #include "device_containment_routes.hpp"
 #include "device_estate_routes.hpp"
 #include "hardware_routes.hpp"
+#include "hardware_section_integrity.hpp"
 #include "software_collection_settings_routes.hpp"
 #include "software_collection_settings_store.hpp"
 #include "software_curation_routes.hpp"
@@ -2446,6 +2447,8 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
+                          "sections_query_error for device_ci: the record read answered but its "
+                          "v2 hardware sections did not, and "
                           "admission_full for installed_software and ca_issued: a /crypto read "
                           "refused by its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
@@ -2454,6 +2457,9 @@ public:
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
+        // Hardware record section integrity (#7159): describe + pre-seed the three series
+        // (hardware_section_integrity.cpp owns the metric name, help and label set).
+        register_section_integrity_metrics(metrics_);
         // /crypto admission refusals (reason=admission_full): pre-seeded so the series is
         // present on a healthy server (the three store-side reasons are emitted on demand).
         metrics_.counter("yuzu_inventory_read_degrade_total",
@@ -9442,19 +9448,27 @@ public:
             // never a fabricated "no leader"). Published at /metrics scrape time.
             seed_leader_metrics(metrics_);
             if (!leader_elector_->is_open()) {
-                // Do NOT fail boot. On the single-replica deployment the loop below
-                // re-acquires within one cycle and the gated loops resume; the pause
-                // touches ONLY the FencedLeaderOnly loops, which is the fail-closed
-                // posture (never double-dispatch), not a data-loss one. A persistent
-                // failure is a coordination-substrate problem (§10) — loud, never
-                // silent. WS-11 (#4014) surfaces it as the yuzu_server_leader_* metrics
+                // Do NOT fail boot. A transient connect failure on the single-replica
+                // deployment is retried by the loop below, so the gated loops resume
+                // within one cycle; the pause touches ONLY the FencedLeaderOnly loops,
+                // which is the fail-closed posture (never double-dispatch), not a
+                // data-loss one. A persistent failure is a coordination-substrate
+                // problem (§10) — loud, never silent. One cause does NOT self-heal: a
+                // recorded migration that differs from this build (#7158). Every retry
+                // re-runs PgMigrationRunner::run(), which refuses the same way each
+                // time, so the loops stay paused until the database is repaired (the
+                // "PgMigrationRunner: store 'leader_elector' recorded migration" error
+                // line names the version; upgrading.md has the recovery). WS-11 (#4014)
+                // surfaces both as the yuzu_server_leader_* metrics
                 // (acquire_failures_total{cause="connect"} rising, is_leader 0) and the
                 // YuzuLeaderNoLeader alert. It is deliberately NOT a /readyz condition:
                 // a replica that cannot lead is a ready follower (health_routes.cpp).
                 spdlog::error("[HA] leader_elector could not open its coordination connection; "
                               "FencedLeaderOnly background loops are PAUSED until leadership is "
-                              "acquired (single-replica: self-heals within one election cycle; "
-                              "persistent: a coordination-substrate fault, ADR-2002 §10)");
+                              "acquired (a transient connect failure is retried every election "
+                              "cycle; a coordination-substrate fault persists, ADR-2002 §10; a "
+                              "recorded-migration refusal persists until the database is "
+                              "repaired: see the PgMigrationRunner error above)");
             }
             leader_thread_ = std::thread([this]() {
                 using namespace std::chrono;
@@ -20265,14 +20279,14 @@ private:
         // twin (via ToolDeps::ci_detail_fn), so the three can never drift on what
         // "the CI record" means.
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id,
-                                                      bool with_sections) -> HardwareCiDetail {
+                                                      CiRead ci_read) -> HardwareCiDetail {
             HardwareCiDetail detail;
             apply_identity_read(detail, hw_identity_fn(agent_id));
             if (auto sess = registry_.get_session(agent_id))
                 detail.agent_version = sess->agent_version; // immutable identity field, lock-free
             if (!device_inventory_store_) {
                 detail.ci = std::unexpected(CiReadError::kDegraded);
-            } else if (with_sections) {
+            } else if (ci_read == CiRead::WithSections) {
                 // The v2 per-section statuses and rows (H.7): ONLY the REST record route and the
                 // MCP tool ask for them (the dashboard fragment, its sync-now poll and the actions
                 // lens do not render them). The record and its sections come from ONE
@@ -20280,6 +20294,12 @@ private:
                 // replace generation; the pure mapping keeps a failed sections read as the error
                 // (the REST route 503s and the MCP tool answers a retryable error on it).
                 apply_ci_with_sections_read(detail, device_inventory_store_->get_device_ci_with_sections(agent_id));
+                // Count (and sample-log) every integrity fault this read SERVES, once per
+                // section per read. Here, and only here: this closure is the one composition
+                // both the REST record route and the MCP tool share, and the dashboard (which
+                // asks CiRead::RecordOnly) never reaches it.
+                if (detail.ci_sections && *detail.ci_sections)
+                    record_section_integrity(**detail.ci_sections, agent_id, &metrics_);
             } else {
                 detail.ci = device_inventory_store_->get_device_ci(agent_id);
             }
@@ -21134,9 +21154,10 @@ private:
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
         // untracked dispatch (execution_id="" → not in the executions drawer, like the
         // device live-info + DEX-perf reads) and the narrow ResponseStore seam. It
-        // dispatches two canned read-only echo.sql ($Process_Live + $TCP_Live) to ONE
-        // host and reconstructs the tree server-side (recursive CTEs are blocked on the
-        // agent). Per-host only; data from the agent's local echo.db only.
+        // dispatches three canned read-only echo.sql (the window's hour list, then
+        // $Process_Hourly + $TCP_Hourly for one hour) to ONE host and reconstructs the
+        // tree server-side (recursive CTEs are blocked on the agent). Per-host only;
+        // data from the agent's local echo.db only.
         echo_tree_routes_ = std::make_unique<EchoTreeRoutes>();
         echo_tree_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,

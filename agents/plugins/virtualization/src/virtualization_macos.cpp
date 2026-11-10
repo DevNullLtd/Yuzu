@@ -72,6 +72,11 @@ int run_macos(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+int run_macos_wsl(yuzu::CommandContext& ctx) {
+    report_unavailable(ctx, "wsl", "macos:virtualization:wsl:unsupported");
+    return 0;
+}
+
 } // namespace yuzu::virtualization
 
 #endif // defined(__APPLE__)
