@@ -103,32 +103,10 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         }
         session->scopable_tags[k] = v;
     }
-    // Upgrade-window shim, removed with the other legacy-name shims: an agent that has not
-    // upgraded still reports the pre-rename plugin name `tar`. Normalise it so every inventory
-    // consumer (presence gate, help catalogue) sees `echo`, and remember to write `tar` back on
-    // the wire (wire_for). An inventory advertising BOTH names is not a pre-rename agent (an
-    // upgraded agent rejects a stale tar plugin at load; an old agent has no echo): leave `tar`
-    // un-normalised and the session on the new wire name, so the real echo plugin still receives
-    // its commands instead of the retired binary.
-    bool advertises_tar = false;
-    bool advertises_echo = false;
     for (const auto& p : info.plugins()) {
-        advertises_tar = advertises_tar || p.name() == "tar";
-        advertises_echo = advertises_echo || p.name() == "echo";
-    }
-    if (advertises_tar && advertises_echo) {
-        spdlog::warn("AgentRegistry::register_agent({}): inventory advertises both 'tar' and "
-                     "'echo' - not treating the session as a pre-rename agent",
-                     safe_agent_id);
-    }
-    for (const auto& p : info.plugins()) {
-        const bool legacy_name = p.name() == "tar" && !advertises_echo;
-        if (legacy_name)
-            session->legacy_echo_wire_name = true;
-        const std::string name = legacy_name ? std::string{"echo"} : p.name();
-        session->plugin_names.push_back(name);
+        session->plugin_names.push_back(p.name());
         PluginMeta pm;
-        pm.name = name;
+        pm.name = p.name();
         pm.version = p.version();
         pm.description = p.description();
         for (const auto& cap : p.capabilities()) {
@@ -783,13 +761,11 @@ bool AgentRegistry::send_to(const std::string& agent_id, const ClassifiedCommand
         std::optional<std::string> cluster_id =
             session->cluster_id.empty() ? std::nullopt : std::make_optional(session->cluster_id);
         std::lock_guard glock(gw_pending_mu_);
-        gw_pending_.push_back(
-            {agent_id, wire_for(session->legacy_echo_wire_name, cmd), std::move(cluster_id)});
+        gw_pending_.push_back({agent_id, cmd.wire(), std::move(cluster_id)});
         return true;
     }
     if (session->stream)
-        return session->stream->Write(wire_for(session->legacy_echo_wire_name, cmd),
-                                      grpc::WriteOptions());
+        return session->stream->Write(cmd.wire(), grpc::WriteOptions());
     return false;
 }
 
@@ -823,11 +799,9 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
             std::optional<std::string> cluster_id =
                 s->cluster_id.empty() ? std::nullopt : std::make_optional(s->cluster_id);
             std::lock_guard glock(gw_pending_mu_);
-            gw_pending_.push_back(
-                {s->agent_id, wire_for(s->legacy_echo_wire_name, cmd), std::move(cluster_id)});
+            gw_pending_.push_back({s->agent_id, cmd.wire(), std::move(cluster_id)});
             ++count;
-        } else if (s->stream &&
-                   s->stream->Write(wire_for(s->legacy_echo_wire_name, cmd), grpc::WriteOptions())) {
+        } else if (s->stream && s->stream->Write(cmd.wire(), grpc::WriteOptions())) {
             ++count;
         }
     }
@@ -835,14 +809,14 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
 }
 
 bool AgentRegistry::send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
-                                       const std::string& cluster_id, bool legacy_wire) {
+                                       const std::string& cluster_id) {
     // Same defensive belt-and-braces check `send_to`/`send_to_all` apply —
     // this path has no session to have already validated anything, so it is
     // the ONLY check this method makes before queuing.
     if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
         return false;
     std::lock_guard glock(gw_pending_mu_);
-    gw_pending_.push_back({agent_id, wire_for(legacy_wire, cmd), cluster_id});
+    gw_pending_.push_back({agent_id, cmd.wire(), cluster_id});
     return true;
 }
 
@@ -2332,15 +2306,7 @@ void AgentHealthStore::upsert(const std::string& agent_id,
         snap.agent_id = agent_id;
         snap.status_tags.clear();
         for (const auto& [k, v] : tags) {
-            // Upgrade-window shim, removed with the other legacy-name shims: an agent that has
-            // not upgraded still publishes its Echo heartbeat tags under the pre-rename
-            // `yuzu.plugin.tar.` prefix. Normalise at ingest so the corruption gate and every tag
-            // reader see one spelling.
-            constexpr std::string_view kLegacyPrefix = "yuzu.plugin.tar.";
-            if (std::string_view{k}.starts_with(kLegacyPrefix))
-                snap.status_tags["yuzu.plugin.echo." + k.substr(kLegacyPrefix.size())] = v;
-            else
-                snap.status_tags[k] = v;
+            snap.status_tags[k] = v;
         }
         snap.last_seen = std::chrono::steady_clock::now();
 
