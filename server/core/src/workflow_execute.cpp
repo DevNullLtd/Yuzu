@@ -1369,8 +1369,12 @@ WorkflowExecuteOutcome drive_run(const WorkflowExecutePorts& ports, const Workfl
             note.reason = std::string(zero_reach_token(cause));
             note.retryable = zero_reach_retryable(cause);
             notes.push_back(note);
-            return std::unexpected("no agents reached for " + instruction_id + " (" + note.reason +
-                                   ")");
+            // The step's retry policy follows the cause's own flag: a permanent cause (a
+            // chokepoint refusal, quarantine, an absent plugin, a per-OS kill switch) is not
+            // retried, so the run reports that cause and never a later deadline_exceeded.
+            return std::unexpected(StepDispatchError{
+                "no agents reached for " + instruction_id + " (" + note.reason + ")",
+                /*is_permanent=*/!note.retryable});
         }
         notes.push_back(note);
         return nlohmann::json({{"status", "dispatched"},

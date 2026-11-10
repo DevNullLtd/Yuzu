@@ -15,10 +15,11 @@
 // Pure: no I/O, no logging, no store access. Reads only a
 // `ConfinedDispatchOutcome` and one bool.
 //
-// FIXED priority order (first match wins). Copied from the MCP
+// FIXED priority order (first match wins). Entries 1-8 are copied from the MCP
 // `execute_instruction` cascade (mcp_server.cpp, the zero-reach block that
 // tests `dispatch_outcome.scope_parse_error` first; find it by that symbol, not
-// by line number):
+// by line number); entry 0 (`dispatch_denied`, #7114) is this classifier's own
+// and that cascade does not have it:
 //
 //   0. dispatch_denied          outcome.denied set (#7114)        permanent
 //   1. invalid_scope            outcome.scope_parse_error set     permanent
@@ -72,8 +73,11 @@
 //   - denied (#7114): the classifier reads it first. Of the five legacy cascades
 //     only dashboard_routes.cpp checks `outcome.denied` (the exec console, the
 //     Echo re-enable and purge arms, and the echo-execute and echo.status scan
-//     arms), because it runs no pre-send dry run; the other four run the dry run,
-//     so a denial there is only a race. See `ConfinedDispatchOutcome::denied`.
+//     arms), because it runs no pre-send dry run; mcp_server.cpp,
+//     command_routes.cpp and server.cpp run the dry run, so a denial there is
+//     only a race; workflow_routes.cpp runs no dry run and reads no cause, so a
+//     denial there is the generic no-agents 503. See
+//     `ConfinedDispatchOutcome::denied`.
 
 #include "dispatch_confined_arms.hpp"
 

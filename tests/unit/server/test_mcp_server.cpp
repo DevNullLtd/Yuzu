@@ -47401,7 +47401,7 @@ TEST_CASE("MCP execute_instruction_definition: a chokepoint denial names the def
 }
 
 TEST_CASE("MCP execute_instruction_definition: the description lists the machine-branchable approval "
-          "and dispatch refusals and the five wiring gaps that write no audit row",
+          "and dispatch refusals and the six wiring gaps that write no audit row",
           "[mcp][integration][execute][idef]") {
     McpTestServer ts;
     ts.start();
@@ -47418,9 +47418,12 @@ TEST_CASE("MCP execute_instruction_definition: the description lists the machine
         INFO(token);
         CHECK(desc.find(token) != std::string::npos);
     }
-    // The five unwired components that write no row, exactly as the docs list them.
-    CHECK(desc.find("unwired definition lookup, authorizer, validator cache, classifier or "
-                    "dispatch write none") != std::string::npos);
+    // The six unwired components that write no row, exactly as the docs list them (#7110 added the
+    // post-row recheck: an unset readmit port is refused before the requested row).
+    CHECK(desc.find("unwired definition lookup, authorizer, validator cache, classifier, post-row "
+                    "recheck or dispatch write none") != std::string::npos);
+    // The post-row refusal is a machine-branchable error.data.reason, named with its meaning.
+    CHECK(desc.find("permission_revoked (-32003, permanent)") != std::string::npos);
 }
 
 TEST_CASE("MCP execute_instruction_definition: an unknown definition is -32602 and dispatches nothing",

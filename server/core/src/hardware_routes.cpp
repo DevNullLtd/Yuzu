@@ -525,10 +525,14 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // #7110: the `requested` row is stored, so decide the per-device gate AGAIN: a grant or a
         // JIT elevation withdrawn while the row was being written dispatches nothing. The dispatch
         // below authorizes as the system caller, so no layer past this one can see the operator's
-        // grant. The gate has written its own 403; the row that exists gets its outcome.
+        // grant. On a false return the gate has written its own refusal (403, or the 404 an
+        // out-of-scope id collapses to); the row that exists gets its outcome, flagged with
+        // `Sec-Audit-Failed` when it cannot be stored, since it is the only evidence the sync was
+        // NOT requested of the agent. This recheck has no catch: a gate that throws (a store
+        // fault) unwinds to the generic 500 and leaves the `requested` row with no outcome row.
         if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) {
-            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "failure",
-                                            "Agent", id, "permission_revoked");
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.sync.request",
+                                                "failure", "Agent", id, "permission_revoked");
             return;
         }
         const auto r = deps_.sync_dispatch_fn(id, source);

@@ -4524,12 +4524,14 @@ void RestApiV1::register_routes(
                 return;
             }
             // The `requested` row exists, so every refusal below gives it a `failure` outcome
-            // row. (The `requested` write above stays unrouted: its result gates the dispatch.)
+            // row; it is the only evidence the command was NOT sent, so a lost one is flagged
+            // on the answer (`Sec-Audit-Failed`). (The `requested` write above stays unrouted:
+            // its result gates the dispatch.)
             const auto fail = [&](const std::string& prefix) {
-                if (audit_fn)
-                    audit_fn(req, "echo.source.purge", "failure", "command", device_id,
-                             prefix + " device=" + audit_token(device_id) + " source=" + source +
-                                 " cid=" + cid);
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "echo.source.purge",
+                                                    "failure", "command", device_id,
+                                                    prefix + " device=" + audit_token(device_id) +
+                                                        " source=" + source + " cid=" + cid);
             };
             // #7110: the `requested` row is stored, so decide the per-device gate AGAIN: a
             // grant or a JIT elevation withdrawn while the row was being written dispatches
@@ -18950,10 +18952,12 @@ void RestApiV1::register_routes(
             // or a visible set shrunk, while the row was being written dispatches nothing. Both
             // kinds classify `Inventory:Read` with no execute gate, so the chokepoint repeats
             // neither named grant: this is the only place they are re-decided. Each gate has
-            // written its own 403; the row that exists gets its outcome.
+            // written its own 403; the row that exists gets its outcome, and because that row
+            // is the only evidence the probe was NOT sent, a lost one is flagged on the answer
+            // (`Sec-Audit-Failed`).
             const auto fail = [&](const std::string& why) {
-                if (audit_fn)
-                    audit_fn(req, audit_action, "failure", "Agent", agent_id, why + " cid=" + cid);
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, audit_action, "failure",
+                                                    "Agent", agent_id, why + " cid=" + cid);
             };
             if (!gate("GuaranteedState", "Read") || !gate("Execution", "Execute")) {
                 fail("permission_revoked");

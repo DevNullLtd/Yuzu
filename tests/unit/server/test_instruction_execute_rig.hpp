@@ -148,6 +148,8 @@ struct Rig {
     bool create_fails{false};
     std::vector<ExecutionRow> rows;
     std::vector<std::string> cancelled;
+    bool cancel_fails{false};  ///< mark_cancelled answers false (the row stays running)
+    bool cancel_throws{false}; ///< ... or throws (a store fault inside the cancel)
     std::vector<std::pair<std::string, int>> targeted;
     std::vector<std::string> refreshed;
     bool set_targeted_ok{true};
@@ -332,7 +334,9 @@ struct Rig {
             };
             p.mark_cancelled = [this](const std::string& id, const std::string&) {
                 cancelled.push_back(id);
-                return true;
+                if (cancel_throws)
+                    throw std::runtime_error("cancel boom");
+                return !cancel_fails;
             };
             p.set_agents_targeted = [this](const std::string& id, int n) {
                 targeted.emplace_back(id, n);

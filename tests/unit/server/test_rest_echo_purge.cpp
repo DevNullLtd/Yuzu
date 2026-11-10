@@ -56,6 +56,9 @@ struct PurgeHarness {
     std::vector<AuditRow> audits;
     bool scope_allow{true}; // scoped_perm_fn verdict
     bool audit_ok{true};    // AuditFn return (false → fail-closed 503, no dispatch)
+    /// The `failure` outcome row alone is lost (the `requested` row persisted): the answer must
+    /// carry `Sec-Audit-Failed`, since that row is the only evidence nothing was sent.
+    bool drop_failure_row{false};
     /// #7110: withdraw the per-device grant INSIDE the `requested` row write, the window in which
     /// production lets a grant move.
     bool revoke_on_requested{false};
@@ -103,6 +106,8 @@ struct PurgeHarness {
                 scope_allow = false;
             if (r == "requested" && drop_session_on_requested)
                 session_gone = true;
+            if (r == "failure" && drop_failure_row)
+                return false;
             return audit_ok;
         };
         RestApiV1::ScopedPermFn scoped =
@@ -368,6 +373,24 @@ TEST_CASE("POST /api/v1/echo/retention-paused/purge: Infrastructure:Delete withd
     CHECK(h.metrics.counter("yuzu_echo_source_purge_total", {{"result", "denied"}}).value() == 1.0);
 }
 
+// Kills: reverting the recheck's `fail` lambda to a bare audit_fn call (the lost outcome row would
+// leave `requested` reading as "dispatched, outcome unknown" with nothing on the answer).
+TEST_CASE("REST purge: a lost failure row after a recheck refusal is flagged Sec-Audit-Failed; the "
+          "403 and the no-dispatch hold (#7110)",
+          "[server][echo][purge][rest][security][7110]") {
+    PurgeHarness h;
+    h.revoke_on_requested = true;
+    h.drop_failure_row = true;
+    auto res = h.sink.dispatch("POST", "/api/v1/echo/retention-paused/purge",
+                               R"({"device_id":"dev-A","source":"process"})");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.calls.empty());
+    REQUIRE(h.audits.size() == 2); // the write was attempted ...
+    CHECK(h.audits[1].result == "failure"); // ... and its loss is on the answer, not silent
+}
+
 TEST_CASE("REST purge: a caller that stops resolving inside the requested-row write dispatches nothing "
           "and writes failure caller_unresolved (#7110)",
           "[server][echo][purge][rest][security][7110]") {
@@ -395,17 +418,25 @@ TEST_CASE("REST purge: a denied outcome is reported as dispatch_denied reason=<t
         detail::DispatchDenial denial;
         int status;
         const char* token;
+        const char* hint; // the remediation names the cause (403 rows only)
     };
     const std::vector<Denial> denials = {
         {"Forbidden answers 403",
          {detail::DispatchDenialReason::Forbidden, "Infrastructure",
           yuzu::server::authz::Operation::Delete},
-         403, "forbidden"},
+         403, "forbidden", "lacks this grant"},
+        {"KillSwitched answers 403",
+         {detail::DispatchDenialReason::KillSwitched, "Infrastructure",
+          yuzu::server::authz::Operation::Delete},
+         403, "kill_switched", "emergency stop"},
         // 500, not the 400 describe_dispatch_denial gives a caller-named pair: the pair is a
-        // server literal, so an Unclassified one is a server catalogue fault.
+        // server literal, so an Unclassified or Ambiguous one is a server catalogue fault.
         {"Unclassified answers 500 (server-literal pair)",
          {detail::DispatchDenialReason::Unclassified, {}, yuzu::server::authz::Operation::Read},
-         500, "unclassified"},
+         500, "unclassified", ""},
+        {"Ambiguous answers 500 (server-literal pair)",
+         {detail::DispatchDenialReason::Ambiguous, {}, yuzu::server::authz::Operation::Read},
+         500, "ambiguous", ""},
     };
     for (const auto& d : denials) {
         DYNAMIC_SECTION(d.name) {
@@ -423,7 +454,7 @@ TEST_CASE("REST purge: a denied outcome is reported as dispatch_denied reason=<t
                 CHECK(remediation.find("server catalogue fault") != std::string::npos);
                 CHECK(remediation.find("confirm the plugin/action name") == std::string::npos);
             } else {
-                CHECK(remediation.find("lacks this grant") != std::string::npos);
+                CHECK(remediation.find(d.hint) != std::string::npos);
             }
             REQUIRE(h.audits.size() == 2);
             CHECK(h.audits[1].result == "failure");

@@ -372,7 +372,13 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
     const auto cancel_execution = [&] {
         if (execution_id.empty() || !d.execution.mark_cancelled)
             return;
-        if (!d.execution.mark_cancelled(execution_id, session.username)) {
+        bool ok = false;
+        try {
+            ok = d.execution.mark_cancelled(execution_id, session.username);
+        } catch (...) { // a throwing cancel is a failed cancel: the refusal still answers
+            ok = false;
+        }
+        if (!ok) {
             spdlog::error("POST /api/v1/commands: mark_cancelled failed for execution_id={}",
                           execution_id);
             count_bookkeeping_failed(d.metrics, "mark_cancelled");

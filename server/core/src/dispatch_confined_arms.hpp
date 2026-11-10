@@ -382,16 +382,21 @@ struct ConfinedDispatchOutcome {
     /// anonymous operator, forbidden, approval required, kill switched) BEFORE
     /// any targeting; a denial never reaches an agent, so `sent` is 0. Carried
     /// so a surface that reports a zero-reach can name the real cause instead of
-    /// folding it into "the agent is not connected". EVERY zero-reach consumer
-    /// must handle it: the shared `classify_zero_reach` ranks it first
-    /// (`ZeroReachCause::Denied`). Of the five hand-copied legacy cascades,
-    /// four (mcp_server.cpp, command_routes.cpp, server.cpp legacy forward,
-    /// workflow_routes.cpp) run an authorize dry run before dispatching, so a
-    /// denial there is only a race and they are left on their existing order;
-    /// dashboard_routes.cpp runs no dry run, so all five of its readers check
-    /// this field before their cascade: the execute console, the Echo
-    /// re-enable and purge arms, the echo-execute (SQL) arm and the echo.status
-    /// scan.
+    /// folding it into "the agent is not connected". Every zero-reach consumer
+    /// that names a cause must handle it: the shared `classify_zero_reach` ranks
+    /// it first (`ZeroReachCause::Denied`). Of the five hand-copied legacy
+    /// cascades, three (mcp_server.cpp, command_routes.cpp, server.cpp legacy
+    /// forward) run an authorize dry run before dispatching, so a denial there
+    /// is only a race and they are left on their existing order;
+    /// workflow_routes.cpp's legacy execute runs no dry run and still folds a
+    /// denial into its generic no-agents answer (it re-decides its route gate
+    /// and the definition's approval mode after its execution row, #7110, but
+    /// reads no cause); dashboard_routes.cpp runs no dry run, so all five of
+    /// its readers check this field before their cascade: the execute console,
+    /// the Echo re-enable and purge arms, the echo-execute (SQL) arm and the
+    /// echo.status scan. The sibling fragments in echo_tree_routes.cpp,
+    /// dex_routes.cpp and device_routes.cpp, and the REST result-set producers,
+    /// still fold a denial into no-agents.
     std::optional<detail::DispatchDenial> denied;
 };
 

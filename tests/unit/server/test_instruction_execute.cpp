@@ -3074,6 +3074,36 @@ TEST_CASE("instruction execute: a readmit that withdraws (nullopt, or throws = f
             CHECK(r.audits[1].result == "failure");
             CHECK(r.audits[1].detail.find("reason=permission_revoked") != std::string::npos);
             CHECK(r.audits[1].detail.find("execution_id=exec-1") != std::string::npos);
+            // A throw is told apart from a real revoke on the row (the caller's answer is the same).
+            const bool threw = flag != &Rig::readmit_withdrawn;
+            CHECK((r.audits[1].detail.find("gate=exception") != std::string::npos) == threw);
+        }
+    }
+}
+
+// Kills: a cancel that fails or throws after a recheck refusal escaping the refusal (a generic
+// 500 over a row the caller was told is cancelled) or going uncounted.
+TEST_CASE("instruction execute: a cancel that fails or throws after a recheck refusal still answers "
+          "the refusal, is logged and counted; the row is left for the reaper",
+          "[instruction_execute][security]") {
+    const std::vector<std::pair<const char*, bool Rig::*>> faults = {
+        {"mark_cancelled answers false", &Rig::cancel_fails},
+        {"mark_cancelled throws", &Rig::cancel_throws},
+    };
+    for (const auto& [name, flag] : faults) {
+        DYNAMIC_SECTION(name) {
+            Rig r;
+            r.defs["d"] = make_def("d");
+            r.*flag = true;
+            r.on_create = [&] { r.readmit_withdrawn = true; };
+            auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+            const auto* ref = as_refusal(out);
+            REQUIRE(ref);
+            CHECK(ref->kind == RefusalKind::kPermissionRevoked);
+            CHECK(r.calls.empty());
+            CHECK(r.cancelled == std::vector<std::string>{"exec-1"}); // attempted once
+            CHECK(r.counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                            {{"op", "mark_cancelled"}, {"surface", "rest"}}) == 1);
         }
     }
 }

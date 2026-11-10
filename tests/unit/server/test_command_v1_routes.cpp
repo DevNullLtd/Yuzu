@@ -117,6 +117,8 @@ struct Rig {
     int throw_on_nth_send = 0;
     bool set_targeted_ok = true;
     bool set_targeted_throws = false; ///< the count write THROWS (the success path's bookkeeping)
+    bool cancel_fails = false;  ///< mark_cancelled answers false after a recheck refusal
+    bool cancel_throws = false; ///< ... or throws (a store fault inside the cancel)
     bool create_throws = false;
     bool create_throws_nonstd = false;
     bool create_fails = false; ///< the tracker answers an error: the dispatch runs with execution_id ""
@@ -260,7 +262,9 @@ struct Rig {
         };
         d.execution.mark_cancelled = [this](const std::string& id, const std::string&) {
             cancelled.push_back(id);
-            return true;
+            if (cancel_throws)
+                throw std::runtime_error("cancel boom");
+            return !cancel_fails;
         };
         d.execution.set_targeted = [this](const std::string& id, int n) {
             targeted.emplace_back(id, n);
@@ -1543,6 +1547,35 @@ TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the execution-ro
                       .value() == (w.counted ? 1 : 0));
             for (const auto& [pair, n] : w.perm_counts)
                 CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), pair) == n);
+        }
+    }
+}
+
+// Kills: `cancel_execution` letting a throwing mark_cancelled escape (a generic 500 over a row
+// the refusal says is closed) or a failed one go uncounted.
+TEST_CASE("POST /api/v1/commands: a cancel that fails or throws after a recheck refusal still answers "
+          "403 permission_revoked, is counted, and the row is left for the reaper",
+          "[server][command_v1][dispatch][security][7110]") {
+    const std::vector<std::pair<const char*, bool Rig::*>> faults = {
+        {"mark_cancelled answers false", &Rig::cancel_fails},
+        {"mark_cancelled throws", &Rig::cancel_throws},
+    };
+    for (const auto& [name, flag] : faults) {
+        DYNAMIC_SECTION(name) {
+            Rig rig;
+            rig.facts = {.legacy_open = true};
+            rig.*flag = true;
+            rig.on_create = [&] { rig.perm_denied.insert("Execution:Execute"); };
+            const auto res = rig.post(kRead);
+            CHECK(res->status == 403);
+            CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
+            CHECK(rig.dispatch_calls == 0);
+            CHECK(rig.cancelled == std::vector<std::string>{"exec-1"}); // attempted once
+            CHECK(rig.has_audit("failure", "reason=permission_revoked gate=route"));
+            CHECK(rig.metrics
+                      .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                               {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                      .value() == 1);
         }
     }
 }

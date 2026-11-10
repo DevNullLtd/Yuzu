@@ -923,6 +923,28 @@ TEST_CASE("route: POST .../sync — the device grant withdrawn inside the reques
     CHECK(h.audits[0] == "inventory.sync.request|requested");
     CHECK(h.audits[1] == "inventory.sync.request|failure");
     CHECK(h.audit_details[1] == "permission_revoked");
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed")); // control: the failure row persisted
+}
+
+// Kills: reverting the recheck's failure row to try_persist_audit. That row is the only evidence
+// the sync was NOT requested of the agent, so its loss must be on the answer.
+TEST_CASE("route: POST .../sync — a lost failure row after the recheck refusal is flagged "
+          "Sec-Audit-Failed; the 403 and the no-dispatch hold (#7110)",
+          "[hardware][route][rest][security][7110]") {
+    HwHarness h;
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.allow_scoped_perm = false; // withdrawn INSIDE the row write
+        if (result == "failure")
+            h.audit_should_fail = true; // the outcome row alone is lost
+    };
+    auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", R"({"source":"app_perf"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.sync_dispatch_calls == 0);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1] == "inventory.sync.request|failure");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
 }
 
 // #4644: offset/limit/await_since are ONE base-10 integer or a 400. `await_since` is

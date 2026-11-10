@@ -862,6 +862,37 @@ TEST_CASE("workflow execute: a refusal at send time is a PERMANENT step failure,
         REQUIRE(f.step_errors.size() == 1);
         CHECK_FALSE(f.step_errors[0].permanent);
     }
+    // Kills: the zero-reach return building a transient StepDispatchError from a bare string
+    // (the engine then retried a refusal the note itself records as retryable=false, and a
+    // bounded run could report deadline_exceeded instead of the real cause).
+    SECTION("a zero-reach whose cause is permanent is a PERMANENT step failure (no retry)") {
+        struct Row {
+            const char* token;
+            std::function<void(ConfinedDispatchOutcome&)> set;
+        };
+        const Row rows[] = {
+            {"dispatch_denied",
+             [](auto& o) {
+                 o.denied = detail::DispatchDenial{detail::DispatchDenialReason::Forbidden,
+                                                   "Infrastructure", authz::Operation::Write};
+             }},
+            {"quarantined", [](auto& o) { o.denied_quarantined_count = 1; }},
+            {"plugin_not_found", [](auto& o) { o.unknown_plugin_count = 1; }},
+            {"kill_switched_os", [](auto& o) { o.kill_switched_os_count = 1; }},
+        };
+        for (const auto& r : rows) {
+            INFO(r.token);
+            Fx f;
+            ConfinedDispatchOutcome out{.sent = 0};
+            r.set(out);
+            f.outcomes["i-ro"] = out;
+            const auto o = f.run();
+            REQUIRE(f.step_errors.size() == 1);
+            CHECK(f.step_errors[0].permanent);
+            CHECK(o.reason == r.token); // the cause, never a later deadline
+            CHECK_FALSE(o.retryable);
+        }
+    }
 }
 
 TEST_CASE("workflow execute: a run that THROWS after the requested row is a failed run with its "
@@ -4583,7 +4614,7 @@ TEST_CASE("replay parity: an onFailure:continue step that reached nobody leaves 
         f.step_ids = {"i-ro", "i-ro2"};
         f.defs["i-ro2"] = def("i-ro2", "os_info", "os_version");
         ConfinedDispatchOutcome zero;
-        zero.denied_quarantined_count = 1;
+        zero.sent = 0; // the transient miss, the same outcome the real-engine parity test scripts
         f.outcomes["i-ro"] = zero;
         f.outcomes["i-ro2"] = zero;
         const auto p = run_then_replay(f, f.request());
@@ -4625,7 +4656,8 @@ TEST_CASE("replay parity: a step retried to success is `completed` with run_outc
         ConfinedDispatchOutcome out;
         out.command_id = "cmd-" + d.id;
         if (d.id == "i-ro" && ++calls_for_first_step == 1)
-            out.denied_quarantined_count = 1; // attempt 1 reaches nobody
+            out.sent = 0; // attempt 1 reaches nobody (no_agents_reached: the one transient cause
+                          // besides the unreadable gates; a quarantine is permanent, never retried)
         else
             out.sent = 1;
         return out;
@@ -4652,7 +4684,7 @@ TEST_CASE("replay parity: a step retried to success is `completed` with run_outc
         Fx g;
         g.engine_retries = 1;
         ConfinedDispatchOutcome zero;
-        zero.denied_quarantined_count = 1;
+        zero.sent = 0; // no_agents_reached: transient, so the stand-in engine does retry it
         g.outcomes["i-ro"] = zero;
         const auto q = run_then_replay(g, g.request());
         CHECK(q.first.steps.size() == 2);

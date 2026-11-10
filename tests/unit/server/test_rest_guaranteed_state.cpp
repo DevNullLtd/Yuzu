@@ -4570,6 +4570,30 @@ TEST_CASE("REST dex/devices/{id}/live: a scoped gate or the caller withdrawn ins
     }
 }
 
+// Kills: reverting the recheck's `fail` lambda to a bare audit_fn call. The failure row is the
+// only evidence the probe was NOT sent (the success path writes no outcome row), so its loss
+// must be on the answer.
+TEST_CASE("REST dex/devices/{id}/live: a lost failure row after a recheck refusal is flagged "
+          "Sec-Audit-Failed; the 403 and the no-dispatch hold (#7110)",
+          "[pg][rest][dex][device][live][scope][7110]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.deny_scoped_op = "Execute"; // withdrawn INSIDE the row write
+        if (result == "failure")
+            h.audit_succeeds = false; // the outcome row alone is lost
+    };
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_live_plugin.empty());
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].result == "failure");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
 TEST_CASE("REST dex/devices/{id}/live: a chokepoint refusal is a dispatch_denied answer, never a "
           "retryable 'device offline' (#7114)",
           "[pg][rest][dex][device][live][7114]") {

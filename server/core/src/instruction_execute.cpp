@@ -716,6 +716,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     //     docs/user-manual/rest-api.md 'Refused after the audit row'.
     std::optional<DispatchCaller> readmitted;
     std::optional<detail::DispatchDenial> denial;
+    bool recheck_threw = false;
     try {
         readmitted = p.readmit();
         if (readmitted)
@@ -723,6 +724,12 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                 denial = decision.error();
     } catch (...) { // fail closed: a throwing recheck (or authorizer) is a withdrawn permission
         readmitted = std::nullopt;
+        recheck_threw = true;
+        // Told apart from a real revoke in the log and the audit row (`gate=exception`): the
+        // caller's 403 is the same, the operator's diagnosis is not (a store fault, not a grant).
+        spdlog::error("instruction execute: the post-row recheck threw for '{}' execution_id={}; "
+                      "refused as permission_revoked",
+                      def_token, execution_id);
     }
     // Both refusals close the rows alike: a `failure` outcome, the execution cancelled.
     const auto refuse_after_rows = [&](Refusal r, const std::string& detail) {
@@ -737,7 +744,8 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                          "this request was not dispatched; the permission it needs was withdrawn "
                          "while it was being recorded, and retrying will not help until it is "
                          "granted again"),
-            "reason=permission_revoked definition=" + def_token);
+            std::string("reason=permission_revoked") + (recheck_threw ? " gate=exception" : "") +
+                " definition=" + def_token);
     const DispatchCaller& caller = *readmitted; // the fresh caller is the one dispatched
     if (denial) {
         Refusal r = dispatch_denied_refusal(p, def, *denial);
