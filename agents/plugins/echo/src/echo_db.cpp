@@ -902,22 +902,6 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         return std::unexpected(std::format("failed to create Echo schema: {}", err));
     }
 
-    // Set default retention if not already configured
-    {
-        const char* check_sql = "SELECT value FROM echo_config WHERE key = 'retention_days'";
-        sqlite3_stmt* raw_stmt = nullptr;
-        rc = sqlite3_prepare_v2(raw_db, check_sql, -1, &raw_stmt, nullptr);
-        if (rc == SQLITE_OK) {
-            StmtPtr stmt(raw_stmt);
-            if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
-                // No retention_days configured -- set default
-                const char* insert_sql =
-                    "INSERT INTO echo_config (key, value) VALUES ('retention_days', '7')";
-                sqlite3_exec(raw_db, insert_sql, nullptr, nullptr, nullptr);
-            }
-        }
-    }
-
     auto db = EchoDatabase{raw_db};
     db.fold_ = std::make_unique<EchoFold>();
 
@@ -1469,25 +1453,6 @@ EchoStats EchoDatabase::stats() {
     {
         const StorageBytes sb = storage_bytes_locked();
         s.db_size_bytes = sb.data_bytes() + sb.wal_bytes;
-    }
-
-    // Retention days from config
-    {
-        const char* sql = "SELECT value FROM echo_config WHERE key = 'retention_days'";
-        sqlite3_stmt* raw_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
-            StmtPtr stmt(raw_stmt);
-            if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-                auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-                if (text) {
-                    try {
-                        s.retention_days = std::stoi(text);
-                    } catch (...) {
-                        s.retention_days = 7;
-                    }
-                }
-            }
-        }
     }
 
     return s;

@@ -654,7 +654,8 @@ TEST_CASE("v10 migration: every source converts exactly (differential against a 
     // one dictionary row per distinct key text, exactly what the fresh fold interned
     CHECK(n(migrated, "SELECT COUNT(*) FROM echo_dict") == n(fresh, "SELECT COUNT(*) FROM echo_dict"));
 
-    // the retired tables are gone, the shims and the tables the roll-up does not own remain
+    // the retired tables are gone and nothing takes their names; the tables the roll-up does not
+    // own remain
     Db check;
     migrated.checkpoint(CheckpointMode::kTruncate);
     open_raw(check, seeded.tmp.path);
@@ -662,7 +663,7 @@ TEST_CASE("v10 migration: every source converts exactly (differential against a 
         if (def.own_tables)
             continue;
         CHECK(!has_table(check.db, std::format("{}_live", def.name)));
-        CHECK(has_table(check.db, std::format("{}_live", def.name), "view"));
+        CHECK(!has_table(check.db, std::format("{}_live", def.name), "view"));
         for (const auto tier : def.tiers) {
             CHECK(!has_table(check.db, fold_view_name(def.name, tier)));
             CHECK(has_table(check.db, fold_view_name(def.name, tier), "view"));
@@ -782,32 +783,28 @@ TEST_CASE("v10 migration: a retired average comes back as a sum",
     CHECK(n(db, "SELECT samples FROM perf_daily") == 4);
 }
 
-TEST_CASE("v10 migration: shim views answer a retired $X_Live query with no rows and no error",
-          "[echo][v10][migration][shim]") {
+TEST_CASE("v10 migration: a retired $X_Live name is an unknown table after the migration",
+          "[echo][v10][migration]") {
     Seeded seeded;
     seed(seeded, [&](sqlite3* db) {
         insert_raw(db, "process", {I(kT0), I(1), T("started"), I(1), I(0), T("a.exe"), T(""), T("u")});
     });
     auto db = open_ok(seeded.tmp.path);
 
+    // the name does not translate
     const auto sql = validate_and_translate_sql("SELECT * FROM $Process_Live");
-    REQUIRE(sql.has_value());
-    const auto r = db.execute_user_query(*sql);
-    REQUIRE(r.has_value()); // not an error
-    CHECK(r->rows.empty());
-    // the legacy columns, `id` first, in the order the raw table declared them
-    std::vector<std::string> want{"id"};
-    for (const auto& c : legacy_live_columns("process"))
-        want.emplace_back(c.name);
-    CHECK(r->columns == want);
-    CHECK(columns_for_table("process_live") == want);
+    REQUIRE_FALSE(sql.has_value());
+    CHECK(sql.error() == "unknown table: $Process_Live");
+    CHECK(columns_for_table("process_live").empty());
 
-    // every one of the 16 names, a COUNT(*) as well
-    for (const auto& name : legacy_live_shim_names()) {
-        const auto r2 = db.execute_user_query(std::format("SELECT COUNT(*) FROM {}", name));
+    // and the bare table name is refused to operator SQL too, for every one of the 16 names
+    for (const auto& def : fold_sources()) {
+        if (def.own_tables)
+            continue;
+        const auto name = std::format("{}_live", def.name);
         INFO(name);
-        REQUIRE(r2.has_value());
-        CHECK(r2->rows[0][0] == "0");
+        CHECK(!is_queryable_table(name));
+        CHECK(!db.execute_user_query(std::format("SELECT COUNT(*) FROM {}", name)).has_value());
     }
     // usage_live is still a table, and still denied to operator SQL (#4260)
     Db check;

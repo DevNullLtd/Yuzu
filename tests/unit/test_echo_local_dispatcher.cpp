@@ -567,8 +567,8 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
         CHECK(status_value("db_budget_bytes") == std::optional<std::string>{"262144000"});
         CHECK(status_value("budget_over_bytes") == std::optional<std::string>{"0"});
         CHECK(status_value("budget_evicted_hourly_rows_total") == std::optional<std::string>{"0"});
-        // The retired raw-row counter is still printed (one release), at its stored value.
-        CHECK(status_value("budget_evicted_raw_rows_total") == std::optional<std::string>{"0"});
+        // There are no raw rows, so there is no raw-row eviction counter.
+        CHECK_FALSE(status_value("budget_evicted_raw_rows_total").has_value());
         CHECK(status_value("db_auto_vacuum") == std::optional<std::string>{"incremental"});
         CHECK(status_value("module_dedup_overflow_total") == std::optional<std::string>{"0"});
         CHECK(status_value("tcp_closing_dedup_overflow_total") == std::optional<std::string>{"0"});
@@ -599,10 +599,10 @@ TEST_CASE("echo plugin: db_budget_bytes validates, persists and shows in status 
     }
 
     SECTION("an invalid budget in a request with a valid change rejects the whole request") {
-        const YuzuParam params[] = {{"retention_days", "30"}, {"db_budget_bytes", "5"}};
+        const YuzuParam params[] = {{"process_enabled", "false"}, {"db_budget_bytes", "5"}};
         const auto r = d.run(desc, "configure", params);
         CHECK(r.rc == 1);
-        CHECK(status_value("retention_days") == std::optional<std::string>{"7"}); // nothing written
+        CHECK(status_value("config|process_enabled") == std::optional<std::string>{"true"}); // nothing written
     }
 
     SECTION("a maintenance pass on a small database is a clean no-op for the budget") {
@@ -983,10 +983,13 @@ TEST_CASE("echo plugin: status counts each source's finest tier and query and ex
         "(363600, (SELECT id FROM echo_dict WHERE text = 'a.exe'), "
         " (SELECT id FROM echo_dict WHERE text = 'u'), (SELECT id FROM echo_dict WHERE text = 'p.exe'), 1, 0);");
 
-    SECTION("status: rows and oldest bucket of the finest tier, the old name as an alias") {
+    SECTION("status: rows and oldest bucket of the finest tier, under the one name") {
         CHECK(plugin_status_value(d, desc, "config|process_rows") == std::optional<std::string>{"2"});
-        CHECK(plugin_status_value(d, desc, "config|process_live_rows") ==
-              std::optional<std::string>{"2"});
+        // The retired spelling of the row count, and the retired settings and counters, are gone.
+        CHECK_FALSE(plugin_status_value(d, desc, "config|process_live_rows").has_value());
+        CHECK_FALSE(plugin_status_value(d, desc, "retention_days").has_value());
+        CHECK_FALSE(plugin_status_value(d, desc, "config|usage_gap_count").has_value());
+        CHECK_FALSE(plugin_status_value(d, desc, "config|usage_lag_events").has_value());
         CHECK(plugin_status_value(d, desc, "config|process_oldest_ts") ==
               std::optional<std::string>{"360000"});
         // A source with nothing folded reports 0 / 0, and the plain baseline table has its own key.
@@ -1244,11 +1247,11 @@ TEST_CASE("echo plugin: a closing tcp socket whose insert failed is recorded on 
     CHECK(rows[0][0] == "1");
 }
 
-TEST_CASE("echo plugin: a query over a retired $X_Live name answers no rows and a CONSTRAINED status",
-          "[echo][local_dispatcher][sql][shim]") {
-    // The empty shim view makes a stored query succeed with `__total__|0`; the typed result status
-    // is what tells a schedule, a result-set producer or an operator that the table is retired,
-    // not that nothing happened. A query over a tier view carries no such status.
+TEST_CASE("echo plugin: a query over a retired $X_Live name fails as an unknown table",
+          "[echo][local_dispatcher][sql]") {
+    // The sixteen raw capture tables are gone and no view answers for their names, so a stored
+    // query, schedule or result-set producer gets an error, never an empty answer that reads as
+    // "nothing happened". A query over a tier view still answers.
     const auto plugin_path = find_echo_plugin();
     if (plugin_path.empty()) {
         if (std::getenv("MESON_BUILD_ROOT") != nullptr)
@@ -1262,7 +1265,7 @@ TEST_CASE("echo plugin: a query over a retired $X_Live name answers no rows and 
     REQUIRE(desc != nullptr);
     REQUIRE(desc->init != nullptr);
 
-    yuzu::test::TempDir dir_guard{"yuzu_test_echo_shim_sql_"};
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_retired_sql_"};
     std::error_code ec;
     fs::create_directories(dir_guard.path, ec);
     auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
@@ -1275,14 +1278,14 @@ TEST_CASE("echo plugin: a query over a retired $X_Live name answers no rows and 
 
     const YuzuParam retired[] = {{"sql", "SELECT * FROM $Process_Live"}};
     const auto r = d.run(desc, "sql", retired);
-    CHECK(r.rc == 0);
+    CHECK(r.rc == 1);
     const auto rows = rows_of(r.captured);
-    CHECK(row_with_prefix(rows, "__schema__|id|ts|").has_value()); // the old column shape
-    CHECK(row_with_prefix(rows, "__total__|0") == std::optional<std::string>{"__total__|0"});
-    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(row_with_prefix(rows, "error|unknown table: $Process_Live").has_value());
+    CHECK_FALSE(row_with_prefix(rows, "__schema__").has_value());
+    CHECK_FALSE(row_with_prefix(rows, "__total__").has_value());
 
     const YuzuParam live[] = {{"sql", "SELECT * FROM $Process_Hourly"}};
     const auto ok = d.run(desc, "sql", live);
     CHECK(ok.rc == 0);
-    CHECK(ok.result_status != YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(row_with_prefix(rows_of(ok.captured), "__total__|0").has_value()); // empty, not an error
 }

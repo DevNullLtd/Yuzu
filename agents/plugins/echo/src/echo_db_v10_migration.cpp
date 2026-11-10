@@ -39,9 +39,9 @@
  *        usage fold loses nothing it would have credited (one id-ordered walk over every row past
  *        the cursor, whatever its ts, so a run that straddles the mark pairs start first); a usage source that is
  *        disabled or awaiting its baseline would not have credited them either, and gets nothing;
- *     5. drop the 16 raw tables and every `_legacy` table, create the `$X_Live` shim views (empty,
- *        with the old columns), delete the rollup marks and the usage cursor from echo_config, and
- *        stamp schema_version 10.
+ *     5. drop the 16 raw tables and every `_legacy` table, delete the rollup marks and the usage
+ *        cursor from echo_config, and stamp schema_version 10 (no view takes a dropped raw table's
+ *        name: a query over one fails as an unknown table).
  *
  * AFTER the commit: the connection must be in autocommit (B3), the WAL is checkpointed to zero
  * (secure_delete=ON zeroes every dropped raw page into the WAL, so the WAL after COMMIT is as
@@ -1303,8 +1303,6 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
         } else if (!h.exec(generate_fold_ddl())) {
             return std::unexpected(h.error()); // a fresh database: just the roll-up schema
         }
-        if (!h.exec(legacy_live_shim_ddl()))
-            return std::unexpected(h.error());
         if (!h.exec(R"(DELETE FROM echo_config WHERE key LIKE 'rollup\_%\_at' ESCAPE '\' OR key IN ('usage_hwm_id', 'usage_lag_events'))"))
             return std::unexpected(h.error());
         if (!h.exec("INSERT INTO echo_config (key, value) VALUES ('schema_version', '10') "

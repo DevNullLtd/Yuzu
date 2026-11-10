@@ -310,13 +310,11 @@ TEST_CASE("procperf version: resolve_proc_versions is a no-op when there is no r
 
 TEST_CASE("procperf: registry declares both tiers, dollar names translate",
           "[echo][procperf][schema]") {
-    auto live = translate_dollar_name("$ProcPerf_Live");
-    REQUIRE(live.has_value());
-    CHECK(*live == "procperf_live");
+    CHECK_FALSE(translate_dollar_name("$ProcPerf_Live").has_value()); // retired raw name
     auto hourly = translate_dollar_name("$ProcPerf_Hourly");
     REQUIRE(hourly.has_value());
     CHECK(*hourly == "procperf_hourly");
-    CHECK(is_queryable_table("procperf_live"));
+    CHECK_FALSE(is_queryable_table("procperf_live"));
     CHECK(is_queryable_table("procperf_hourly"));
 }
 
@@ -356,7 +354,7 @@ TEST_CASE("procperf: the tiers carry name but never a cmdline", "[echo][procperf
     CHECK(cols.find("cmdline") == std::string::npos);
     CHECK(cols.find("user") == std::string::npos);
     CHECK(cols.find("path") == std::string::npos); // never the image PATH (privacy)
-    // and the retired raw table's shim answers with no more than it ever did
+    // and the retired raw table never held one either
     for (const auto& c : legacy_live_columns("procperf"))
         CHECK(c.name != "cmdline");
 }
