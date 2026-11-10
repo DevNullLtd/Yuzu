@@ -4552,6 +4552,207 @@ TEST_CASE("windows release over the driver: a GPO-locked rule completes; a stuck
     CHECK(release(stuck.env, ReleaseRequest{}, dl).status == "inactive");
 }
 
+namespace {
+WinRuleInfo stock_rule(std::string name, bool enabled, std::string program = "C:\\Windows\\a.exe") {
+    return WinRuleInfo{.name = std::move(name), .group = "Stock", .enabled = enabled, .direction = 1,
+                       .profiles = 7, .protocol = 6, .action = 1, .local_ports = "3389",
+                       .remote_ports = "*", .application = std::move(program), .service = "svc"};
+}
+} // namespace
+
+TEST_CASE("windows release: the identity a stored key was built from is recoverable from the key",
+          "[agent][firewall_quarantine]") {
+    auto r = stock_rule("Remote Desktop (TCP-In)", true);
+    CHECK(win_key_identity(win_rule_key(r)) == win_rule_identity(r));
+    CHECK(win_rule_identity(r) == "Remote Desktop (TCP-In)|1|7");
+    // a name with a bar in it does not move the split, and an unreadable property (empty) does not either
+    auto bar = stock_rule("a|b|c", true, "");
+    bar.service.clear();
+    CHECK(win_key_identity(win_rule_key(bar)) == win_rule_identity(bar));
+    // the identity ignores every edited property, and nothing else
+    auto edited = r;
+    edited.application = "C:\\other.exe";
+    edited.local_ports = "1";
+    edited.action = 0;
+    CHECK(win_rule_key(edited) != win_rule_key(r));
+    CHECK(win_rule_identity(edited) == win_rule_identity(r));
+    edited.profiles = 1;
+    CHECK(win_rule_identity(edited) != win_rule_identity(r));
+    // text that is not a key is returned whole, so it never equals a rule's identity
+    CHECK(win_key_identity("not|a|key") == "not|a|key");
+    CHECK(win_key_identity("").empty());
+}
+
+TEST_CASE("windows release: an exact key match comes back on, and nothing else does",
+          "[agent][firewall_quarantine]") {
+    const auto a = stock_rule("Rule A", false);
+    const auto b = stock_rule("Rule B", false, "C:\\b.exe");
+    auto twin = stock_rule("Rule A", false); // off before the quarantine, differs by a port
+    twin.local_ports = "3390";
+    const auto already_off = stock_rule("Rule C", false);
+    const std::vector<WinRuleInfo> rules{a, b, twin, already_off};
+
+    const auto plan = win_release_plan({win_rule_key(a), win_rule_key(b)}, rules);
+    CHECK(plan.reenable == std::vector<std::size_t>{0, 1}); // the twin and Rule C stay off
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.unmatched == 0);
+    CHECK(plan.unmatched_keys.empty());
+
+    // a listed key duplicated by hand counts once; the rules of ours are never candidates
+    auto ours = stock_rule("YuzuFirewall_Quarantine_1", false);
+    ours.group = std::string{kWinGroup};
+    const auto dup = win_release_plan({win_rule_key(a), win_rule_key(a), win_rule_key(ours)}, {a, ours});
+    CHECK(dup.reenable == std::vector<std::size_t>{0});
+    CHECK(dup.unmatched == 1); // the listed key of ours matches no candidate and no identity
+}
+
+TEST_CASE("windows release: a retried release finds the rules a first attempt already switched on",
+          "[agent][firewall_quarantine]") {
+    const auto a = stock_rule("Rule A", true); // back on since the first attempt
+    const auto b = stock_rule("Rule B", false, "C:\\b.exe");
+    const auto plan = win_release_plan({win_rule_key(a), win_rule_key(b)}, {a, b});
+    CHECK(plan.reenable == std::vector<std::size_t>{1});
+    CHECK(plan.unmatched == 0); // a listed rule that is on again is accounted for, not unmatched
+}
+
+TEST_CASE("windows release: an edited rule falls back to its identity only when exactly one disabled rule carries it",
+          "[agent][firewall_quarantine]") {
+    const auto before = stock_rule("Rule A", true, "C:\\old.exe");
+    const auto listed = win_rule_key(before);
+    auto edited = before; // the program changed between the disable and the release
+    edited.enabled = false;
+    edited.application = "C:\\new.exe";
+
+    // program changed -> the fallback switches it back on, and says it guessed
+    auto plan = win_release_plan({listed}, {edited});
+    CHECK(plan.reenable == std::vector<std::size_t>{0});
+    CHECK(plan.by_identity == 1);
+    CHECK(plan.unmatched == 0);
+
+    // an enabled rule with the same identity is not a candidate (nothing to switch on)
+    auto enabled_twin = edited;
+    enabled_twin.enabled = true;
+    plan = win_release_plan({listed}, {enabled_twin, edited});
+    CHECK(plan.reenable == std::vector<std::size_t>{1});
+    CHECK(plan.by_identity == 1);
+
+    // two disabled candidates: no way to tell which was ours, so neither is touched
+    auto other = edited;
+    other.application = "C:\\third.exe";
+    plan = win_release_plan({listed}, {edited, other});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.unmatched == 1);
+    REQUIRE(plan.unmatched_keys.size() == 1);
+    CHECK(plan.unmatched_keys[0] == listed);
+
+    // no rule with that identity at all (deleted, or renamed): unmatched, nothing switched on
+    plan = win_release_plan({listed}, {stock_rule("Unrelated", false)});
+    CHECK(plan.reenable.empty());
+    CHECK(plan.unmatched == 1);
+
+    // a candidate an exact match has claimed is not a candidate for another key's fallback:
+    // two same-named rules were disabled, one was edited, the other is untouched
+    const auto second = stock_rule("Rule A", true, "C:\\second.exe");
+    plan = win_release_plan({listed, win_rule_key(second)},
+                            {edited, [&] { auto r = second; r.enabled = false; return r; }()});
+    CHECK(plan.reenable.size() == 2);
+    CHECK(plan.by_identity == 1); // the edited one, once the untouched one is spoken for
+    CHECK(plan.unmatched == 0);
+
+    // two keys, one candidate: the rule is switched on once and the other key is unmatched
+    auto sibling = before;
+    sibling.application = "C:\\sibling.exe";
+    plan = win_release_plan({listed, win_rule_key(sibling)}, {edited});
+    CHECK(plan.reenable == std::vector<std::size_t>{0});
+    CHECK(plan.by_identity == 1);
+    CHECK(plan.unmatched == 1);
+}
+
+TEST_CASE("windows release: the twin protection still holds beside the fallback",
+          "[agent][firewall_quarantine]") {
+    // A rule that was OFF before the quarantine (never listed) is not switched on because an
+    // enabled twin of it was listed and is still present: the exact match accounts for the key,
+    // so the fallback never runs.
+    const auto on = stock_rule("Remote Assistance (TCP-In)", false);
+    auto off_before = on;
+    off_before.local_ports = "3390";
+    auto enabled_before = on;
+    enabled_before.enabled = true;
+    const auto plan = win_release_plan({win_rule_key(enabled_before)}, {on, off_before});
+    CHECK(plan.reenable == std::vector<std::size_t>{0});
+    CHECK(plan.by_identity == 0);
+    CHECK(plan.unmatched == 0);
+}
+
+TEST_CASE("windows release: unmatched is a note on a completed, partial release; the fallback is only a note",
+          "[agent][firewall_quarantine]") {
+    WinReleaseTally t;
+    t.reenabled_by_identity = 1;
+    auto d = win_release_decision(t);
+    CHECK_FALSE(d.incomplete); // a guess that was taken completes the release
+    CHECK_FALSE(d.partial);    // and is reported, not a reason to call it partial
+    REQUIRE(d.notes.size() == 1);
+    CHECK(d.notes[0] == "rules_reenabled_by_identity=1");
+
+    t.unmatched = 2;
+    d = win_release_decision(t);
+    CHECK_FALSE(d.incomplete); // must never be incomplete: no retry can match it, the record would wedge
+    CHECK(d.partial);
+    CHECK(contains(d.notes, "rules_unmatched=2"));
+    CHECK(contains(d.notes, "rules_reenabled_by_identity=1"));
+
+    WinReleaseTally clean;
+    CHECK_FALSE(win_release_decision(clean).partial);
+}
+
+TEST_CASE("windows release over the driver: an unmatched rule completes the release as partial and drops the record",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    Deadline dl;
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    FakeTriggers trig;
+
+    rig.leg.on_remove = [](OsPayload&) {
+        auto r = StepResult::success();
+        r.partial = true;
+        r.notes.emplace_back("rules_unmatched=1");
+        return r;
+    };
+    auto o = release(rig.env, ReleaseRequest{}, dl);
+    CHECK(o.status == "partial");
+    CHECK(o.reason == "rules_unmatched");
+    CHECK(contains(o.notes, "rules_unmatched=1"));
+    CHECK(o.rc() == 0);
+    CHECK_FALSE(rig.store.state()); // erased: the next quarantine is not wedged behind release_in_progress
+    CHECK_FALSE(o.state);
+    // the record is gone like an `inactive` release's, so are its triggers
+    settle_triggers(o, trig, rig.store);
+    CHECK(trig.unregistered_count(kRepairTriggerId) == 1);
+    CHECK(trig.unregistered_count(kTtlTriggerId) == 1);
+}
+
+TEST_CASE("windows release: a default action that will not restore names its profile",
+          "[agent][firewall_quarantine]") {
+    // the leg's note for the release_incomplete cause that used to name nothing
+    for (const auto label : kWinProfileLabels)
+        CHECK(is_safe_token(label)); // the value the leg appends to `policy_restore_failed=`
+    ScriptRig rig;
+    Deadline dl;
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    rig.leg.on_remove = [](OsPayload&) {
+        auto r = StepResult::fail("release_incomplete");
+        r.notes.emplace_back("policy_restore_failed=Private");
+        return r;
+    };
+    const auto o = release(rig.env, ReleaseRequest{}, dl);
+    CHECK(o.status == "partial");
+    CHECK(o.reason == "release_failed:release_incomplete");
+    CHECK(contains(o.notes, "policy_restore_failed=Private"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::releasing);
+}
+
 TEST_CASE("iptables: our jump must be FIRST in every built-in chain; a Docker re-insert is repaired",
           "[agent][firewall_quarantine]") {
     const auto l = parse_iptables_listing("-P INPUT ACCEPT\n-N yuzu-fwq-1\n-A INPUT -j yuzu-fwq-1\n"
@@ -5393,6 +5594,50 @@ TEST_CASE("gpo_override: what the policy store holds for one profile decides whe
         CHECK(win_gpo_profile_overridden({std::nullopt, std::nullopt, v}));
         CHECK(win_gpo_profile_overridden({1u, v, v}));
     }
+}
+
+TEST_CASE("gpo_override: Group Policy and the MDM store fold into one reading per profile",
+          "[agent][firewall_quarantine]") {
+    using R = std::optional<bool>;
+    const R yes = true, no = false, unread = std::nullopt;
+    // an override in the MDM store alone controls the profile
+    CHECK(win_policy_stores_overridden(no, yes) == yes);
+    CHECK(win_policy_stores_overridden(yes, no) == yes);
+    // a definite override outranks an unreadable sibling store, in either order
+    CHECK(win_policy_stores_overridden(yes, unread) == yes);
+    CHECK(win_policy_stores_overridden(unread, yes) == yes);
+    // an unreadable store keeps the profile unreadable: never read as no policy
+    CHECK(win_policy_stores_overridden(unread, no) == unread);
+    CHECK(win_policy_stores_overridden(no, unread) == unread);
+    CHECK(win_policy_stores_overridden(unread, unread) == unread);
+    // no policy in either store is the only way to read false
+    CHECK(win_policy_stores_overridden(no, no) == no);
+
+    // through the verdict: an MDM-only override (local rules do not merge) refuses and names
+    // whichever profile it is
+    const WinSwitchReading on{true, true, true};
+    const R clean = win_gpo_profile_overridden({});
+    const R mdm_locked = win_gpo_profile_overridden({0u, std::nullopt, std::nullopt});
+    REQUIRE(mdm_locked == yes);
+    for (std::size_t i = 0; i < kWinProfileLabels.size(); ++i) {
+        INFO("profile " << kWinProfileLabels[i]);
+        WinGpoReading gpo{false, false, false};
+        gpo[i] = win_policy_stores_overridden(clean, mdm_locked);
+        const auto v = win_firewall_switch_verdict(on, gpo, false);
+        CHECK(v.kind == WinSwitchVerdict::Kind::gpo_override);
+        CHECK(v.profile == i);
+        CHECK(win_firewall_switch_token(v) == "gpo_override:" + std::string{kWinProfileLabels[i]});
+    }
+    // Group Policy controlled plus an unreadable MDM store still refuses as an override
+    const auto mixed = win_policy_stores_overridden(true, std::nullopt);
+    CHECK(win_firewall_switch_verdict(on, {false, mixed, false}, false).kind ==
+          WinSwitchVerdict::Kind::gpo_override);
+    // an unreadable MDM store beside clean Group Policy is unreadable, not a pass
+    const auto unclear = win_policy_stores_overridden(false, std::nullopt);
+    CHECK(win_firewall_switch_verdict(on, {false, unclear, false}, false).kind ==
+          WinSwitchVerdict::Kind::unreadable);
+    // both stores absent: no policy
+    CHECK(win_firewall_switch_verdict(on, {false, false, false}, false).kind == WinSwitchVerdict::Kind::ok);
 }
 
 TEST_CASE("gpo_override: the verdict, its token and the status read are one decision",
@@ -6308,6 +6553,42 @@ TEST_CASE("repair: a live peer that would push the control set past the cap is l
     REQUIRE(rig.store.state());
     CHECK(rig.store.state()->allow.control == full->control); // never past the cap
     CHECK(rig.world.table);                                  // the repair still re-applied
+}
+
+TEST_CASE("repair: a live peer already listed but not first is left where it is -- no note, no reorder",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    PeerProbe net;
+    net.world = &rig.world;
+    net.up = {"198.51.100.7:50051", "198.51.100.8:50051"};
+    rig.env.probe = net.fn();
+    const auto two = build_allow_set("198.51.100.7,198.51.100.8", "198.51.100.7:50051", {"203.0.113.53"}, {});
+    REQUIRE(two);
+    REQUIRE(two->control.size() == 2);
+    ApplyRequest req;
+    req.allow = *two;
+    req.probe_target = kProbeTarget;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, req, dl).status == "active");
+    const auto stored = rig.store.state()->allow;
+
+    // the agent is connected through the SECOND listed endpoint; the table is flushed
+    rig.env.live_control = parse_live_peer("198.51.100.8:50051");
+    REQUIRE(rig.env.live_control);
+    REQUIRE(stored.control[1] == *rig.env.live_control);
+    rig.world.table = false;
+    const auto o = repair(rig.env, dl);
+    CHECK(o.status == "active");
+    CHECK(contains(o.notes, "repaired=1"));
+    CHECK(contains(o.notes, "control_proved=live")); // the proof connects to it wherever it sits
+    CHECK_FALSE(contains(o.notes, "control_live_peer=198.51.100.8:50051"));
+    CHECK_FALSE(contains(o.notes, "control_live_peer_over_cap=1"));
+    const auto rec = rig.store.state();
+    REQUIRE(rec);
+    CHECK(rec->allow.control == stored.control); // byte-identical, order included
+    CHECK(rec->allow.resolvers == stored.resolvers);
+    CHECK(rec->generation == 2); // advanced by the repair itself, nothing else
+    CHECK(rig.world.table);
 }
 
 TEST_CASE("repair: a failed proof keeps what it applied -- one load, no revert, never `active`",

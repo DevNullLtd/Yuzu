@@ -47,6 +47,8 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1495,17 +1497,40 @@ struct WinRuleInfo {
     std::string service;      // INetFwRule::ServiceName
 };
 
-/// The identity of one stock rule across a quarantine. Windows ships rules that
-/// share a NAME and differ by direction, profile or any other property (File and
-/// Printer Sharing, WinRM HTTP-In, and an admin's own same-named copies), one on
-/// and one off. The disable list and the release match on every property that can
-/// tell two rules apart, so a rule that was OFF before is never switched on by a
-/// release because an ENABLED twin of it was disabled. A property that cannot be
-/// read is empty/-1 on BOTH the disable and the release side, so a rule is still
-/// matched consistently.
+/// What survives an edit of a rule: name, direction and profile mask.
+[[nodiscard]] inline std::string win_rule_identity(const WinRuleInfo& r) {
+    return std::format("{}|{}|{}", r.name, r.direction, r.profiles);
+}
+
+/// The key of one stock rule across a quarantine. Windows ships rules that share a
+/// NAME and differ by direction, profile or any other property (File and Printer
+/// Sharing, WinRM HTTP-In, and an admin's own same-named copies), one on and one
+/// off. The disable list and the release match on every property the key carries
+/// (win_rule_identity, then protocol, action, local and remote ports, program and
+/// service), so a rule that was OFF before is never switched on by a release because
+/// an ENABLED twin of it was disabled. A property that cannot be read is empty/-1 on
+/// BOTH the disable and the release side, so a rule is still matched consistently.
+/// Two rules differing only in addresses, interface types or edge traversal share a
+/// key and are re-enabled together (README caveat 3). The key is also what an edit
+/// breaks: win_release_plan falls back to the identity for that case.
 [[nodiscard]] inline std::string win_rule_key(const WinRuleInfo& r) {
-    return std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}", r.name, r.direction, r.profiles, r.protocol,
-                       r.action, r.local_ports, r.remote_ports, r.application, r.service);
+    return std::format("{}|{}|{}|{}|{}|{}|{}", win_rule_identity(r), r.protocol, r.action,
+                       r.local_ports, r.remote_ports, r.application, r.service);
+}
+
+/// The identity a stored key was built from: everything before its last six
+/// fields (protocol, action, local ports, remote ports, program, service; none of
+/// them can hold a `|`, a rule name can). A string with fewer fields is not a key
+/// and is returned whole, so it matches no rule.
+[[nodiscard]] inline std::string win_key_identity(std::string_view key) {
+    std::size_t end = key.size();
+    for (int i = 0; i < 6; ++i) {
+        const auto bar = key.substr(0, end).rfind('|');
+        if (bar == std::string_view::npos)
+            return std::string{key};
+        end = bar;
+    }
+    return std::string{key.substr(0, end)};
 }
 
 /// The keys of every ENABLED rule outside our group (an Allow RULE beats a
@@ -1522,10 +1547,86 @@ win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
     return out;
 }
 
+/// Which rules a release switches back on. `listed` is the stored disable list (win_rule_key
+/// strings); `rules` is every rule the release enumerated, enabled or not. A rule of ours
+/// is never a candidate.
+///
+/// 1. EXACT: every disabled rule whose key is listed comes back on. A listed key that
+///    matches a rule at all, enabled or not, is accounted for: a retry of an incomplete
+///    release finds the rules the first attempt already switched on.
+/// 2. IDENTITY FALLBACK, for a listed key no rule carries any more (someone edited its
+///    program, ports, service or action during the quarantine, which changes the key): the
+///    rule comes back on when exactly ONE still-disabled rule not already claimed carries
+///    the key's name|direction|profiles. A best guess, so the shell reports how often it
+///    was taken. Residual, cannot be told apart: a listed rule DELETED during the quarantine
+///    beside a same-identity rule that was off before looks like an edit, and that one is
+///    switched on.
+/// 3. Otherwise the key is unmatched: more than one candidate, or none. The release still
+///    completes (nothing of ours is left behind); it is reported, never silent.
+struct WinReleasePlan {
+    std::vector<std::size_t> reenable;        // indices into `rules`, each a disabled rule
+    int by_identity = 0;                      // how many of those the fallback chose
+    int unmatched = 0;                        // listed keys with no unique rule to switch on
+    std::vector<std::string> unmatched_keys;  // those keys, for the agent's log
+};
+
+[[nodiscard]] inline WinReleasePlan win_release_plan(const std::vector<std::string>& listed,
+                                                     const std::vector<WinRuleInfo>& rules) {
+    WinReleasePlan plan;
+    std::unordered_map<std::string, std::vector<std::size_t>> by_key;
+    std::unordered_map<std::string, std::vector<std::size_t>> disabled_by_identity;
+    for (std::size_t i = 0; i < rules.size(); ++i) {
+        if (is_our_win_rule(rules[i].name, rules[i].group))
+            continue;
+        by_key[win_rule_key(rules[i])].push_back(i);
+        if (!rules[i].enabled)
+            disabled_by_identity[win_rule_identity(rules[i])].push_back(i);
+    }
+    std::vector<bool> claimed(rules.size(), false);
+    std::unordered_set<std::string> seen;
+    std::vector<const std::string*> orphans;
+    for (const auto& key : listed) {
+        if (!seen.insert(key).second)
+            continue;
+        const auto it = by_key.find(key);
+        if (it == by_key.end()) {
+            orphans.push_back(&key);
+            continue;
+        }
+        for (const auto i : it->second)
+            if (!rules[i].enabled && !claimed[i]) {
+                claimed[i] = true;
+                plan.reenable.push_back(i);
+            }
+    }
+    for (const auto* key : orphans) {
+        std::optional<std::size_t> only;
+        int candidates = 0;
+        if (const auto it = disabled_by_identity.find(win_key_identity(*key));
+            it != disabled_by_identity.end())
+            for (const auto i : it->second)
+                if (!claimed[i]) {
+                    only = i;
+                    ++candidates;
+                }
+        if (candidates == 1) {
+            claimed[*only] = true;
+            plan.reenable.push_back(*only);
+            ++plan.by_identity;
+        } else {
+            ++plan.unmatched;
+            plan.unmatched_keys.push_back(*key);
+        }
+    }
+    return plan;
+}
+
 /// What one Windows release found, as counts the COM leg tallies.
 struct WinReleaseTally {
     bool reenable_unread = false;     // the rule enumeration failed part-way: unknown
     int not_reenabled = 0;            // rules the policy store refused to switch back on
+    int reenabled_by_identity = 0;    // rules switched on by the identity fallback (a guess)
+    int unmatched = 0;                // listed rules with no unique rule to switch on
     int policy_restore_failed = 0;    // profile default actions that would not restore
     bool our_rules_left = false;      // a rule of ours would not go
     bool images_not_deleted = false;  // a restore image or the disabled list would not delete
@@ -1533,23 +1634,32 @@ struct WinReleaseTally {
 
 struct WinReleaseDecision {
     bool incomplete = false;
+    bool partial = false;  // completed, but a listed rule could not be accounted for
     std::vector<std::string> notes;
 };
 
 /// Complete or not. A rule a GPO will not let us switch back on is the GPO's, not
 /// our containment: it is a note on a COMPLETED release (the record is erased and
-/// the next quarantine is not wedged behind `release_in_progress`). Anything that
-/// leaves our block, our rules, a default action or a stale restore image behind
-/// stays incomplete, so the record stays `releasing` and the next release or
-/// start retries (the removal is idempotent on a clean host).
+/// the next quarantine is not wedged behind `release_in_progress`). So is a listed rule
+/// no unique rule answers to (`rules_unmatched`), but that one also makes the completed
+/// release `partial`: the release cannot vouch that everything it switched off is on
+/// again. Anything that leaves our block, our rules, a default action or a stale restore
+/// image behind stays incomplete, so the record stays `releasing` and the next release
+/// or start retries (the removal is idempotent on a clean host). An unmatched rule must
+/// never be incomplete: no retry can match it, and the record would wedge for good.
 [[nodiscard]] inline WinReleaseDecision win_release_decision(const WinReleaseTally& t) {
     WinReleaseDecision d;
     if (t.not_reenabled > 0)
         d.notes.push_back(std::format("rules_not_reenabled={}", t.not_reenabled));
+    if (t.unmatched > 0)
+        d.notes.push_back(std::format("rules_unmatched={}", t.unmatched));
+    if (t.reenabled_by_identity > 0)
+        d.notes.push_back(std::format("rules_reenabled_by_identity={}", t.reenabled_by_identity));
     if (t.images_not_deleted)
         d.notes.emplace_back("images_not_deleted=1");
     d.incomplete = t.reenable_unread || t.policy_restore_failed > 0 || t.our_rules_left ||
                    t.images_not_deleted;
+    d.partial = t.unmatched > 0;
     return d;
 }
 
@@ -1773,16 +1883,17 @@ using WinSwitchReading = std::array<std::optional<bool>, 3>;
 // kWinProfileLabels[profile] lookups below and in read_status in range.
 static_assert(std::tuple_size_v<WinSwitchReading> == kWinProfileLabels.size());
 
-/// The Group Policy side of the same question, per profile (same order again): `true`
-/// = that profile's local rules or default actions take no effect because policy owns
-/// them, `false` = no policy there, nullopt = the policy store could not be read (never
-/// a guess in either direction).
+/// The policy side of the same question, per profile (same order again): `true`
+/// = that profile's local rules or default actions take no effect because policy (Group Policy
+/// or MDM) owns them, `false` = no policy there, nullopt = a policy store could not be read
+/// (never a guess in either direction).
 using WinGpoReading = std::array<std::optional<bool>, 3>;
 static_assert(std::tuple_size_v<WinGpoReading> == kWinProfileLabels.size());
 
-/// What the policy store holds for ONE profile
-/// (HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\<Profile>Profile); nullopt = the
-/// value is absent. The shell reads the three DWORDs; the decision lives here.
+/// What ONE policy store holds for ONE profile: Group Policy
+/// (HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\<Profile>Profile) or the MDM store
+/// the Firewall CSP writes; nullopt = the value is absent. The shell reads the three
+/// DWORDs; the decision lives here.
 struct WinGpoProfile {
     std::optional<std::uint32_t> allow_local_policy_merge;
     std::optional<std::uint32_t> default_inbound_action;
@@ -1799,6 +1910,21 @@ struct WinGpoProfile {
            p.default_inbound_action.has_value() || p.default_outbound_action.has_value();
 }
 
+/// One profile across the two policy stores, each already folded through
+/// win_gpo_profile_overridden (nullopt = that store could not be read). A definite override in
+/// EITHER store wins, even beside an unreadable sibling: it is what no local action can
+/// change, the same ordering win_firewall_switch_verdict gives an override over an
+/// unreadable profile. Otherwise an unreadable store keeps the profile unreadable, and only
+/// two readable stores that both found no override read as no policy.
+[[nodiscard]] constexpr std::optional<bool>
+win_policy_stores_overridden(std::optional<bool> group_policy, std::optional<bool> mdm) noexcept {
+    if ((group_policy && *group_policy) || (mdm && *mdm))
+        return true;
+    if (!group_policy || !mdm)
+        return std::nullopt;
+    return false;
+}
+
 struct WinSwitchVerdict {
     enum class Kind : std::uint8_t { ok, disabled, unreadable, gpo_override } kind = Kind::ok;
     std::size_t profile = 0;    // index into kWinProfileLabels; meaningful when profile_named
@@ -1812,13 +1938,13 @@ struct WinSwitchVerdict {
 /// another product turned off is not ours to undo on release. A definite "off"
 /// outranks an unreadable profile: it is the actionable fact.
 ///
-/// A host under Group Policy is refused the same way. Microsoft documents that a rule
+/// A host under Group Policy or MDM is refused the same way. Microsoft documents that a rule
 /// or default written locally "will not take effect because the firewall is controlled
 /// by Group Policy", so containment there would be a lie too (owner decision
 /// 2026-11-10: refuse, never apply and report partial; any of the three profiles, since
 /// the quarantine writes default-block on every one). Two signals, both of which refuse:
-/// `gpo` is the per-profile policy-store reading (win_gpo_profile_overridden) and names the
-/// profile; `com_policy_overridden` is `INetFwPolicy2::LocalPolicyModifyState` ==
+/// `gpo` is the per-profile policy-store reading (win_policy_stores_overridden over Group Policy
+/// and MDM) and names the profile; `com_policy_overridden` is `INetFwPolicy2::LocalPolicyModifyState` ==
 /// `GP_OVERRIDE`, a definite S_OK reading about the CURRENT profile only, so on its own it
 /// names none. A policy-store reading that failed (as opposed to found nothing) is
 /// unreadable, never "no policy". Override outranks both other kinds: it is what no local
@@ -2641,7 +2767,7 @@ struct LegStatus {
 /// The master-switch part of a Windows status read. A verdict other than `ok`
 /// settles the status and returns true: a switched-off profile makes every rule
 /// and the default block inert, so nothing is enforced and re-applying cannot help
-/// (it refuses the same way); a host under Group Policy enforces nothing of ours
+/// (it refuses the same way); a host under Group Policy or MDM enforces nothing of ours
 /// and re-applying cannot help either (`gpo_override`, `reapply_helps=false` keeps
 /// the repair tick from looping); an unreadable switch or policy store is
 /// unreadable, never a guess either way. Every verdict that names a profile adds
@@ -3754,12 +3880,18 @@ namespace detail {
     // would push the set past the cap is left out, and said.
     AllowSet target = next;
     if (repaired && env.live_control) {
-        lead_with_live_peer(target.control, *env.live_control);
-        if (target.control.size() > kMaxControlIps) {
-            target.control = next.control;
-            o.notes.emplace_back("control_live_peer_over_cap=1");
-        } else if (target.control != next.control) {
-            o.notes.push_back(live_peer_note(*env.live_control));
+        // Membership, not order: the proof connects to the live peer wherever it sits in the
+        // set, so one already listed is left where it is (no reorder, no note, no new
+        // generation for a pure reorder). build_allow_set's front-of-set rule is the contract
+        // of a NEW set only.
+        const auto& live = *env.live_control;
+        if (std::find(next.control.begin(), next.control.end(), live) == next.control.end()) {
+            if (next.control.size() >= kMaxControlIps) {
+                o.notes.emplace_back("control_live_peer_over_cap=1");
+            } else {
+                target.control.insert(target.control.begin(), live);
+                o.notes.push_back(live_peer_note(live));
+            }
         }
     }
     QuarantineState cand = prev;
@@ -3988,7 +4120,11 @@ struct ReleaseRequest {
         o.reason = "state_not_erased";
         return o;
     }
-    o.status = "inactive";
+    // Completed, but the leg could not vouch for every rule it was meant to switch back on
+    // (Windows `rules_unmatched`): the record is gone either way, so the caller is told here.
+    o.status = rm.partial ? "partial" : "inactive";
+    if (rm.partial)
+        o.reason = "rules_unmatched";
     o.state.reset();
     return o;
 }
@@ -4208,7 +4344,9 @@ public:
 /// each time. A poll that found no record (`inactive`) unregisters both, so a trigger
 /// that outlived a release stops.
 inline void settle_triggers(Outcome& o, TriggerRegistry& triggers, StateStore& store) {
-    if (o.status == "inactive") {
+    // A release that completed with rules it could not account for is `partial`, but its
+    // record is gone like an `inactive` one's, so its triggers go too.
+    if (o.status == "inactive" || (o.status == "partial" && o.reason == "rules_unmatched")) {
         (void)triggers.unregister_trigger(kRepairTriggerId);
         (void)triggers.unregister_trigger(kTtlTriggerId);
         return;
