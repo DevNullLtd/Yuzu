@@ -531,6 +531,9 @@ TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the au
     const std::string d403 = rsp["403"].value("description", "");
     CHECK(d403.find("permission_revoked") != std::string::npos);
     CHECK(d403.find("dispatch_denied") != std::string::npos);
+    // Every chokepoint token the route maps to 403, and the approval-mode arm of permission_revoked.
+    CHECK(d403.find("anonymous_operator") != std::string::npos);
+    CHECK(d403.find("role-gated") != std::string::npos);
     CHECK(d503.find("permission_revoked") == std::string::npos);
     CHECK(d503.find("dispatch_denied") == std::string::npos);
     const std::string d500 = rsp["500"].value("description", "");

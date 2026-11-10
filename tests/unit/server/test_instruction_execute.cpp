@@ -3125,6 +3125,75 @@ TEST_CASE("instruction execute: the dry run repeats for the re-derived caller",
     CHECK(r.audits[1].result == "failure"); // the requested row exists: a failure, not a denied
 }
 
+TEST_CASE("instruction execute: a role-gated definition over an ExecuteGate::None pair is refused "
+          "permission_revoked when the admin standing lapses inside the execution-row write",
+          "[instruction_execute][security][7110]") {
+    // `ping` is ExecuteGate::None: the pair re-decision admits a non-admin, so only a re-decision of
+    // the definition's own approval_mode on the fresh caller can catch the lapse. The control (the
+    // standing kept) proves the same definition dispatches for an administrator.
+    for (const bool lapse : {false, true}) {
+        DYNAMIC_SECTION((lapse ? "elevation lapsed inside the write" : "control: still admin")) {
+            Rig r;
+            r.defs["d"] = make_def("d", "ping", "role-gated");
+            r.on_create = [&] { r.readmit_caller = make_caller("u", !lapse); };
+            auto out = run(r.request("d", json::object(), make_caller("u", true)), r.ports(), r.audit());
+            if (!lapse) {
+                REQUIRE(as_dispatched(out));
+                CHECK(r.calls.size() == 1);
+                CHECK(r.cancelled.empty());
+                continue;
+            }
+            const auto* ref = as_refusal(out);
+            REQUIRE(ref);
+            CHECK(ref->kind == RefusalKind::kPermissionRevoked);
+            CHECK(ref->reason == "permission_revoked");
+            CHECK_FALSE(ref->denial);
+            CHECK_FALSE(ref->retry_after_ms);
+            CHECK(r.calls.empty());
+            CHECK(r.approvals.empty()); // refused, not queued: the rows already exist
+            CHECK(r.rows.size() == 1);
+            CHECK(r.cancelled == std::vector<std::string>{"exec-1"});
+            REQUIRE(r.audits.size() == 2);
+            CHECK(r.audits[0].result == "requested");
+            CHECK(r.audits[1].result == "failure");
+            CHECK(r.audits[1].detail.find("reason=permission_revoked gate=approval_mode mode=role-gated") !=
+                  std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("REST execute: a role-gated definition over an ExecuteGate::None pair is 403 "
+          "permission_revoked when the admin standing lapses inside the execution-row write",
+          "[instruction_execute][rest][security][7110]") {
+    for (const bool lapse : {false, true}) {
+        DYNAMIC_SECTION((lapse ? "elevation lapsed inside the write" : "control: still admin")) {
+            RouteRig r;
+            r.core.defs["d"] = make_def("d", "ping", "role-gated");
+            r.caller = make_caller("u", true);
+            // The same principal, re-derived after the rows without the admin bit.
+            r.core.on_create = [&] { r.caller = make_caller("u", !lapse); };
+            auto res = r.post("d", "{}");
+            REQUIRE(res);
+            if (!lapse) {
+                CHECK(res->status == 200);
+                CHECK(r.core.calls.size() == 1);
+                continue;
+            }
+            REQUIRE(res->status == 403); // a 200 body has no `error` object to read below
+            const auto j = json::parse(res->body);
+            CHECK(j["error"]["reason"] == "permission_revoked");
+            CHECK(j["error"]["retry_after_ms"].is_null());
+            CHECK(r.caller_derivations == 2);
+            CHECK(r.core.calls.empty());
+            CHECK(r.core.cancelled == std::vector<std::string>{"exec-1"});
+            REQUIRE(r.core.audits.size() == 2);
+            CHECK(r.core.audits[0].result == "requested");
+            CHECK(r.core.audits[1].result == "failure");
+            CHECK(r.core.audits[1].detail.find("gate=approval_mode") != std::string::npos);
+        }
+    }
+}
+
 TEST_CASE("instruction execute: a dispatch denial on the outcome is zero-reach dispatch_denied (403)",
           "[instruction_execute][rest][security]") {
     RouteRig r([](Rig& core) {

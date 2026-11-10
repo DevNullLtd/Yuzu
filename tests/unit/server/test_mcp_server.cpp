@@ -47708,6 +47708,48 @@ TEST_CASE("MCP execute_instruction_definition: a role demoted inside the executi
     }
 }
 
+TEST_CASE("MCP execute_instruction_definition: a role-gated definition over an ExecuteGate::None pair "
+          "is permission_revoked when the admin standing lapses inside the execution-row write (#7110)",
+          "[mcp][integration][execute][idef][audit][security][7110]") {
+    // `ping` is ExecuteGate::None, so the pair re-decision admits a non-admin: only a re-decision of
+    // the definition's own approval_mode on the re-authenticated caller catches the lapse.
+    for (const bool lapse : {false, true}) {
+        DYNAMIC_SECTION((lapse ? "elevation lapsed inside the write" : "control: still admin")) {
+            McpTestServer ts;
+            Rig rig;
+            rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "role-gated");
+            ts.instr_exec_ports_for_test = rig.ports();
+            ts.caller_fn_for_test = [](const yuzu::server::auth::Session& s) {
+                return yuzu::test::instr_exec::make_caller(
+                    s.username, s.role == yuzu::server::auth::Role::admin);
+            };
+            ts.mock_role = yuzu::server::auth::Role::admin;
+            if (lapse)
+                rig.on_create = [&] { ts.mock_role = yuzu::server::auth::Role::user; };
+            ts.start("operator");
+            auto res = ts.call(idef_call({{"definition_id", "d"}}));
+            REQUIRE(res);
+            const auto body = nlohmann::json::parse(res->body);
+            if (!lapse) {
+                CHECK_FALSE(body.contains("error"));
+                CHECK(rig.calls.size() == 1);
+                CHECK(rig.cancelled.empty());
+            } else {
+                REQUIRE(body.contains("error"));
+                CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+                CHECK(body["error"]["data"]["reason"] == "permission_revoked");
+                CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+                CHECK(rig.calls.empty());
+                CHECK(rig.approvals.empty()); // refused, not queued
+                CHECK(rig.rows.size() == 1);
+                CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
+                CHECK(idef_audited(ts, "requested"));
+                CHECK(idef_audited(ts, "failure"));
+            }
+        }
+    }
+}
+
 TEST_CASE("MCP execute_instruction_definition: a throwing dispatch (std or non-std) is -32603 "
           "with NO retry hint and a failure audit row",
           "[mcp][integration][execute][idef][audit][security]") {
@@ -47824,6 +47866,14 @@ TEST_CASE("MCP execute_instruction_definition: every zero-reach cause is a statu
         return o;
     };
     const Case cases[] = {
+        // #7114: the chokepoint's own refusal, first in the classifier's order, permanent.
+        {"dispatch_denied",
+         mk([](auto& o) {
+             o.denied = yuzu::server::detail::DispatchDenial{
+                 yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                 yuzu::server::authz::Operation::Write};
+         }),
+         false},
         {"invalid_scope", mk([](auto& o) { o.scope_parse_error = "bad"; }), false},
         {"containment_unreadable", mk([](auto& o) { o.containment_unreadable = true; }), true},
         {"route_unreadable", mk([](auto& o) { o.route_unreadable = true; }), true},

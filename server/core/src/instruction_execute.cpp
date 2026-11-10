@@ -744,6 +744,23 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
         const std::string detail = "reason=" + r.reason + " definition=" + def_token;
         return refuse_after_rows(std::move(r), detail);
     }
+    // The definition's OWN approval_mode, decided again on the fresh caller. Step 6 admitted a
+    // `role-gated` definition on the entry caller's administrator standing, and that standing (a
+    // JIT elevation) can lapse while the rows are written; the pair re-decision above does not
+    // cover it, because an ExecuteGate::None pair asks nothing of the caller's admin bit. The rows
+    // exist, so this is a refusal that closes them, never a pending approval (a ticket minted here
+    // would stand beside a `requested` row that was never dispatched). Only the admin bit decides
+    // `role-gated` (no ticket or provenance clears step 6), so the recheck reads nothing else.
+    if (definition_needs_approval(def.approval_mode, caller.principal_is_admin)) {
+        return refuse_after_rows(
+            make_refusal(RefusalKind::kPermissionRevoked, "permission_revoked",
+                         "the administrator standing this definition's approval mode requires "
+                         "lapsed after the request was recorded",
+                         "this request was not dispatched and no approval was queued; re-call to "
+                         "request approval, or elevate again and re-call"),
+            "reason=permission_revoked gate=approval_mode mode=" +
+                ::yuzu::log_token(def.approval_mode) + " definition=" + def_token);
+    }
 
     // OMITTED agent_ids + OMITTED scope is a deliberate broadcast and is NAMED, never inferred
     // from "both happen to be empty" (the shape check guarantees that arriving here empty means
