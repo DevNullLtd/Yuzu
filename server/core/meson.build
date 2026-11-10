@@ -842,6 +842,7 @@ yuzu_server_core_lib = static_library(
     'src/group_agent_count_preview.cpp',
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
+    'src/hardware_section_integrity.cpp', # #7159: section-integrity counter + sampled WARN (the pure model stays metrics-free)
     'src/device_containment_render.cpp',
     'src/device_estate_render.cpp',
     'src/software_catalog_rollup.cpp',

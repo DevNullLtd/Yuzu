@@ -73,19 +73,35 @@ TEST_CASE("step-up policy: the gated set is exactly the 41 routes with an in-han
 
 TEST_CASE("step-up policy: the table's total and per-class row counts are pinned",
           "[stepup][policy]") {
-    // Executable pins for the table counts (248 mutating REST routes: 41 required, 3 own-gate,
-    // 131 exempt, 73 pending; #2146 batch B added the two v1 execution cancel/rerun rows, the v1
+    // Executable pins for the table counts (251 mutating REST routes: 41 required, 3 own-gate,
+    // 134 exempt, 73 pending; #2146 batch B added the two v1 execution cancel/rerun rows, the v1
     // commands row, the v1 instruction-definition execute row and the v1 workflow execute row,
-    // the software-title curation routes added the aliases, reject and pack rows, the per-group
-    // collection settings added its PUT row, and ADR-0070 R1 added four revocation-source
-    // rows). A row added or reclassified without these numbers moving together fails here.
-    CHECK(kStepUpPolicyCount == 248);
-    CHECK(count_class(StepUpClass::kExempt) == 131);
+    // the software-title curation routes added the aliases, reject and pack rows, the
+    // per-group collection settings added its PUT row, ADR-0070 R1 added four revocation-source
+    // rows, and the DEX Scoring tab added its save, preview and reset rows). A row added or
+    // reclassified without these numbers moving together fails here.
+    CHECK(kStepUpPolicyCount == 251);
+    CHECK(count_class(StepUpClass::kExempt) == 134);
     CHECK(count_class(StepUpClass::kPendingRuling) == 73);
     CHECK(count_class(StepUpClass::kRequired) + count_class(StepUpClass::kOwnGate) +
               count_class(StepUpClass::kStrong) + count_class(StepUpClass::kExempt) +
               count_class(StepUpClass::kPendingRuling) ==
           kStepUpPolicyCount);
+}
+
+TEST_CASE("step-up policy: the DEX Scoring tab's three POSTs are exempt operational data",
+          "[stepup][policy]") {
+    // The counts above only move together; this pins the three exact keys and their class, the
+    // same classification as PUT/DELETE /api/v1/dex/score-policy.
+    for (const char* path : {R"(/api/settings/dex-scoring/save)",
+                             R"(/api/settings/dex-scoring/preview)",
+                             R"(/api/settings/dex-scoring/reset)"}) {
+        INFO(path);
+        const auto* e = step_up_policy_for("POST", path);
+        REQUIRE(e != nullptr);
+        CHECK(e->cls == StepUpClass::kExempt);
+        CHECK(e->reason == step_up_detail::kOperationalData);
+    }
 }
 
 TEST_CASE("step-up policy: kOwnGate is the three elevation routes", "[stepup][policy]") {
