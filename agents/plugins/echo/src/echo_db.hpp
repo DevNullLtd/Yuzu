@@ -41,6 +41,8 @@
 #include <string_view>
 #include <vector>
 
+#include <sqlite_quarantine.hpp> // FsOps, the quarantine's filesystem seam carried by OpenSeams
+
 struct sqlite3; // Forward declaration
 
 namespace yuzu::echo {
@@ -541,6 +543,11 @@ struct OpenSeams {
     /// the last name check, which is what SQLITE_OPEN_NOFOLLOW closes (#1527). Production never
     /// sets it.
     std::function<void()> before_sqlite_open;
+    /// The filesystem steps of the quarantine that follows a corrupt verdict (the hard-link
+    /// claim, a sidecar move, a remove), forwarded to `quarantine_corrupt_db`. An empty member is
+    /// the real call. A test's `link` runs between the verdict and the claim, which is where a
+    /// swapped-in link has to be caught (#1527). Production never sets one.
+    yuzu::shared::sqlite_quarantine::FsOps quarantine_ops;
 };
 
 /// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the

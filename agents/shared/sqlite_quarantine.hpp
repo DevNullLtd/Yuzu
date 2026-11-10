@@ -22,6 +22,28 @@
 /// Windows Echo open refuses until one of the two names is removed (the second link reads as a
 /// planted file; docs/user-manual/upgrading.md gives the remedy).
 ///
+/// BINDING: a claim moves only the REGULAR FILE that was judged, never a name. `link(2)` follows
+/// a symbolic link at the source on macOS (the claim would link the link's target) and moves the
+/// link itself on Linux (a following chmod would then reach the target), and a second recovery
+/// racing this one can replace the name with a fresh healthy file between the verdict and the
+/// move. So the source is examined without following links before the claim (a link, a
+/// directory or an absent name is refused), the claimed name is examined the same way after the
+/// link and must be the same inode (POSIX: device + inode by `lstat`; the caller may pass the
+/// identity it read while its connection was still open, which binds the move to the verdict
+/// itself), the original name is re-examined right before it is dropped, and every mode change
+/// is applied only to a regular file and without following a link. A mismatch releases the claim
+/// and fails closed. Windows has no `lstat`-style identity here (this header includes no
+/// windows.h), so there only the no-follow regular-file checks bind the claim: a replaced regular
+/// file is a recorded residual on that platform (SQLite holds its files without
+/// FILE_SHARE_DELETE, so a live database another process has open cannot lose its name there).
+/// Two residuals remain on POSIX. The original is re-examined and then dropped by name, and
+/// POSIX has no unlink-if-same-inode, so a second recovery that drops the name AND creates a new
+/// file at it inside that gap loses its file (two agent processes on one data directory are
+/// unsupported). And a HARD link planted at the name is a regular file with its target's
+/// identity, so it is judged, claimed and secured as that target: the open that judged it had
+/// already used it as the database (pre-existing; Linux protected_hardlinks refuses a link to a
+/// file the planter does not own, and the packaged POSIX data directory is root-owned).
+///
 /// Names have the exact form `<file><suffix><epoch>[-<n>]` (suffix `.corrupt-` or `.planted-`),
 /// which the dedup store's prune parser relies on.
 
@@ -36,6 +58,12 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace yuzu::shared::sqlite_quarantine {
 
@@ -53,8 +81,39 @@ inline std::int64_t now_epoch_seconds() {
         .count();
 }
 
-/// Test seam for the two filesystem steps whose failure is hard to provoke on a real disk. An
-/// empty member means the real `std::filesystem` call; production never sets one.
+/// The identity of a directory entry read WITHOUT following a link: device and inode on POSIX.
+/// On Windows there is none (no `lstat` without windows.h): `file_identity` is nullopt there and
+/// two nullopts compare equal, so the regular-file checks are the whole binding on that platform.
+struct FileIdentity {
+    std::uintmax_t device = 0;
+    std::uintmax_t inode = 0;
+    bool operator==(const FileIdentity&) const = default;
+};
+
+/// `lstat` identity of `p`, or nullopt when it cannot be read (absent, unreadable, or Windows).
+inline std::optional<FileIdentity> file_identity(const std::filesystem::path& p) noexcept {
+#ifdef _WIN32
+    (void)p;
+    return std::nullopt;
+#else
+    struct stat st {};
+    if (::lstat(p.c_str(), &st) != 0)
+        return std::nullopt;
+    return FileIdentity{static_cast<std::uintmax_t>(st.st_dev),
+                        static_cast<std::uintmax_t>(st.st_ino)};
+#endif
+}
+
+/// True only for a regular file examined without following a link (a symlink, a directory, an
+/// absent name or an unreadable one is false).
+inline bool is_regular_file_no_follow(const std::filesystem::path& p) noexcept {
+    std::error_code ec;
+    const auto st = std::filesystem::symlink_status(p, ec);
+    return !ec && std::filesystem::is_regular_file(st);
+}
+
+/// Test seam for the filesystem steps whose failure is hard to provoke on a real disk. An empty
+/// member means the real `std::filesystem` call; production never sets one.
 struct FsOps {
     /// Claim `to` as a new name for `from` (default: `std::filesystem::create_hard_link`).
     std::function<void(const std::filesystem::path& from, const std::filesystem::path& to,
@@ -64,6 +123,9 @@ struct FsOps {
     std::function<void(const std::filesystem::path& from, const std::filesystem::path& to,
                        std::error_code&)>
         move;
+    /// Drop a name: the original after a claim, or the claim itself when it is given back
+    /// (default: `std::filesystem::remove`).
+    std::function<void(const std::filesystem::path& name, std::error_code&)> remove;
 };
 
 struct QuarantineResult {
@@ -77,18 +139,48 @@ struct QuarantineResult {
 
 /// Move ONE file (no sidecars) to `<file><suffix><epoch>[-<n>]`, never overwriting. Returns the
 /// new path, or nullopt (original untouched) when no name could be claimed, the filesystem has no
-/// hard links, or the original name could not be dropped; `notes`, when given, receives why and
-/// anything left behind. `epoch_seconds` is clamped to >= 0 (a pre-1970 clock would otherwise
-/// write `.corrupt--5`, which the dedup prune parser rejects, so the file could never be pruned).
+/// hard links, the name is not a regular file, the claim did not land on the file that was judged
+/// (see BINDING above), or the original name could not be dropped; `notes`, when given, receives
+/// why and anything left behind. `judged`, when given, is the identity the caller read while it
+/// still held the file open (`file_identity`); otherwise the name is read here, just before the
+/// claim. `epoch_seconds` is clamped to >= 0 (a pre-1970 clock would otherwise write
+/// `.corrupt--5`, which the dedup prune parser rejects, so the file could never be pruned).
 [[nodiscard]] inline std::optional<std::filesystem::path>
 claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seconds,
                       std::string_view suffix, std::vector<std::string>* notes = nullptr,
-                      const FsOps& ops = {}) {
+                      const FsOps& ops = {},
+                      const std::optional<FileIdentity>& judged = std::nullopt) {
     namespace fs = std::filesystem;
     const std::int64_t epoch = epoch_seconds < 0 ? 0 : epoch_seconds;
     const auto note = [&](std::string text) {
         if (notes)
             notes->push_back(std::move(text));
+    };
+    const auto rm = [&](const fs::path& name, std::error_code& ec) {
+        if (ops.remove)
+            ops.remove(name, ec);
+        else
+            fs::remove(name, ec);
+    };
+    // Only a regular file is ever claimed: a link here would be linked through (macOS) or carried
+    // as a link and chmodded through (Linux); a directory cannot be hard-linked anyway.
+    if (!is_regular_file_no_follow(file)) {
+        note(std::format("{} is not a regular file (a link, a directory, or gone), so it was not "
+                         "claimed and was left in place",
+                         file.string()));
+        return std::nullopt;
+    }
+    const std::optional<FileIdentity> expected = judged ? judged : file_identity(file);
+    if (judged && file_identity(file) != judged) {
+        note(std::format("{} is no longer the file that was judged (replaced between the check "
+                         "and the move), so it was not claimed and was left in place",
+                         file.string()));
+        return std::nullopt;
+    }
+    // The claimed name, and the original right before it is dropped, must both still be the judged
+    // regular file; otherwise the claim is released and nothing is moved.
+    const auto still_judged = [&](const fs::path& p) {
+        return is_regular_file_no_follow(p) && file_identity(p) == expected;
     };
     for (int n = 0; n < kMaxClaimAttempts; ++n) {
         fs::path dest = file;
@@ -108,13 +200,31 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
                              file.string(), lec.message()));
             return std::nullopt;
         }
-        // The name is ours, atomically. Drop the original name; if that fails the file is still at
-        // `file` (also at `dest`), so give the claim back and report "could not move".
+        // The name is ours, atomically. It must be the judged file (not a link's target, not a
+        // link, not a fresh file another recovery put at the name), and so must the original at
+        // the moment it is dropped. On a mismatch release the claim: the judged file, if it is
+        // still there, stays at `file`.
+        if (!still_judged(dest) || !still_judged(file)) {
+            std::error_code undo;
+            rm(dest, undo);
+            note(std::format("{} is not the file that was judged (a link was swapped in, or "
+                             "another recovery replaced it between the check and the move); the "
+                             "claim {} was released and nothing was moved",
+                             file.string(), dest.string()));
+            if (undo) {
+                note(std::format("could not release the claim {} ({}); the stray name is left in "
+                                 "place",
+                                 dest.string(), undo.message()));
+            }
+            return std::nullopt;
+        }
+        // Drop the original name; if that fails the file is still at `file` (also at `dest`), so
+        // give the claim back and report "could not move".
         std::error_code rec;
-        fs::remove(file, rec);
+        rm(file, rec);
         if (rec) {
             std::error_code undo;
-            fs::remove(dest, undo);
+            rm(dest, undo);
             note(std::format("could not drop {} after claiming {} ({})", file.string(),
                              dest.string(), rec.message()));
             if (undo) {
@@ -148,21 +258,39 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
 /// read-only attribute; a rename keeps the source's DACL), so a copied sidecar is as readable as
 /// the directory's inherited ACL makes it. A caller that protects its database with its own DACL
 /// re-applies it to the quarantine set itself, as the Echo caller does (echo_db.cpp,
-/// secure_quarantined_sidecars); this header does not.
-[[nodiscard]] inline QuarantineResult quarantine_corrupt_db(const std::filesystem::path& path,
-                                                           std::int64_t epoch_seconds,
-                                                           const FsOps& ops = {}) {
+/// secure_quarantined_sidecars); this header does not. `judged` is the main file's identity the
+/// caller read while it still held the file open (BINDING above); nullopt reads it here.
+[[nodiscard]] inline QuarantineResult
+quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seconds,
+                      const FsOps& ops = {},
+                      const std::optional<FileIdentity>& judged = std::nullopt) {
     namespace fs = std::filesystem;
     QuarantineResult result;
-    result.dest = claim_quarantine_name(path, epoch_seconds, ".corrupt-", &result.notes, ops);
+    result.dest =
+        claim_quarantine_name(path, epoch_seconds, ".corrupt-", &result.notes, ops, judged);
     if (!result.dest)
         return result;
     const fs::path& dest = *result.dest;
-    const auto owner_only = fs::perms::owner_read | fs::perms::owner_write;
+    // Only a regular file, examined and changed without following a link: a sidecar that was a
+    // symlink travels as a link and its target's mode is never touched. POSIX opens the name
+    // O_NOFOLLOW and changes the mode through that handle (fchmodat's AT_SYMLINK_NOFOLLOW is
+    // ENOTSUP on glibc before 2.32, which would silently skip the change).
     const auto secure = [&](const fs::path& p) {
+        if (!is_regular_file_no_follow(p))
+            return;
+#ifdef _WIN32
         std::error_code pec;
-        if (fs::is_regular_file(p, pec))
-            fs::permissions(p, owner_only, fs::perm_options::replace, pec);
+        fs::permissions(p, fs::perms::owner_read | fs::perms::owner_write,
+                        fs::perm_options::replace | fs::perm_options::nofollow, pec);
+#else
+        const int fd = ::open(p.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0)
+            return;
+        struct stat st {};
+        if (::fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
+            ::fchmod(fd, S_IRUSR | S_IWUSR);
+        ::close(fd);
+#endif
     };
     secure(dest);
 

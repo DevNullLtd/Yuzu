@@ -1080,49 +1080,42 @@ TEST_CASE("sqlite_quarantine: when every quarantine name is taken the claim give
 
 TEST_CASE("sqlite_quarantine: a failed drop of the original gives the claim back",
           "[command_dedup][corruption][quarantine_fs]") {
-    // The link succeeds but the original cannot be removed: `file` is a NON-EMPTY directory, which
-    // std::filesystem::remove refuses on every OS (and the link seam lets us claim a regular file
-    // over it). The claim must be released, so the file is at ONE name, not two.
+    // The real link succeeds but the original name cannot be dropped (the injected remove refuses
+    // it, as a read-only directory or a Windows sharing violation would). The claim must be
+    // released, so the file is at ONE name, not two.
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
     const auto file = dir.path / "x.db";
-    std::error_code ec;
-    fs::create_directories(file, ec);
-    REQUIRE_FALSE(ec);
-    write_bytes(file / "child", "keeps the directory non-empty");
+    write_bytes(file, "main");
     fs::path dest = file;
     dest += ".corrupt-5";
     sq::FsOps ops;
-    ops.link = [](const fs::path&, const fs::path& to, std::error_code& lec) {
-        write_bytes(to, "claimed");
-        lec.clear();
+    ops.remove = [&](const fs::path& name, std::error_code& ec) {
+        if (name == file)
+            ec = std::make_error_code(std::errc::permission_denied);
+        else
+            fs::remove(name, ec);
     };
     std::vector<std::string> notes;
     CHECK_FALSE(sq::claim_quarantine_name(file, 5, ".corrupt-", &notes, ops).has_value());
     REQUIRE(notes.size() == 1);
     CHECK(notes[0].find("could not drop") != std::string::npos);
-    CHECK_FALSE(fs::exists(dest));                  // the claim was given back
-    CHECK(fs::is_directory(file));                  // the original is untouched
-    CHECK(read_bytes(file / "child") == "keeps the directory non-empty");
+    CHECK_FALSE(fs::exists(dest));      // the claim was given back
+    CHECK(read_bytes(file) == "main");  // the original is untouched
+    CHECK(fs::hard_link_count(file) == 1);
 }
 
 TEST_CASE("sqlite_quarantine: a claim that cannot be given back is reported as a stray name",
           "[command_dedup][corruption][quarantine_fs]") {
-    // As above, but the claimed name is itself a NON-EMPTY directory, so the undo remove fails
-    // too: the caller is told which stray name is left behind.
+    // As above, but the undo remove fails too: the caller is told which stray name is left
+    // behind, and both names still refer to the one file (nothing was lost).
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
     const auto file = dir.path / "x.db";
-    std::error_code ec;
-    fs::create_directories(file, ec);
-    REQUIRE_FALSE(ec);
-    write_bytes(file / "child", "keeps the directory non-empty");
+    write_bytes(file, "main");
     fs::path dest = file;
     dest += ".corrupt-5";
     sq::FsOps ops;
-    ops.link = [](const fs::path&, const fs::path& to, std::error_code& lec) {
-        std::error_code mk;
-        fs::create_directories(to, mk);
-        write_bytes(to / "child", "keeps the claim non-empty");
-        lec = mk;
+    ops.remove = [](const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
     };
     std::vector<std::string> notes;
     CHECK_FALSE(sq::claim_quarantine_name(file, 5, ".corrupt-", &notes, ops).has_value());
@@ -1130,9 +1123,141 @@ TEST_CASE("sqlite_quarantine: a claim that cannot be given back is reported as a
     CHECK(notes[0].find("could not drop") != std::string::npos);
     CHECK(notes[1].find("could not release the claim") != std::string::npos);
     CHECK(notes[1].find("stray name") != std::string::npos);
-    CHECK(fs::is_directory(dest));                  // the stray name is still there
-    CHECK(fs::is_directory(file));                  // the original is untouched
+    CHECK(read_bytes(dest) == "main"); // the stray name is still there, the same file
+    CHECK(read_bytes(file) == "main"); // the original is untouched
+    CHECK(fs::hard_link_count(file) == 2);
 }
+
+// #1527. The claim is bound to the regular file that was judged, not to a name. The three cases
+// below drive the binding directly: a link already at the name is refused before any link; a
+// link the link step leaves at the claimed name (what Linux link(2) does to a symlink source) is
+// released, its target untouched; and a claim that lands on a DIFFERENT regular file than the one
+// judged (a second recovery put a fresh healthy file at the name, the two-process race) is
+// released and that file left alone. Identity is lstat device+inode, so POSIX only; Windows has
+// the no-follow regular-file checks and no identity (a recorded residual there).
+#ifndef _WIN32
+TEST_CASE("sqlite_quarantine: a symlink at the name is never claimed and its target untouched",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto victim = dir.path / "victim.bin";
+    write_bytes(victim, "victim");
+    const auto victim_mode = fs::status(victim).permissions();
+    const auto file = dir.path / "x.db";
+    std::error_code ec;
+    fs::create_symlink(victim, file, ec);
+    if (ec == std::errc::operation_not_permitted || ec == std::errc::permission_denied)
+        SKIP("cannot create a symlink here: " << ec.message());
+    REQUIRE_FALSE(ec);
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(file, 5, ".corrupt-", &notes).has_value());
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("not a regular file") != std::string::npos);
+    CHECK(fs::hard_link_count(victim) == 1);
+    CHECK(fs::status(victim).permissions() == victim_mode);
+    CHECK(fs::is_symlink(file));
+    for (const auto& e : fs::directory_iterator(dir.path))
+        CHECK((e.path() == file || e.path() == victim));
+}
+
+TEST_CASE("sqlite_quarantine: a link left at the claimed name is released and its target never secured",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto victim = dir.path / "victim.bin";
+    write_bytes(victim, "victim");
+    std::error_code pec;
+    fs::permissions(victim, fs::perms::owner_all | fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace, pec);
+    REQUIRE_FALSE(pec);
+    const auto victim_mode = fs::status(victim).permissions();
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    std::error_code planted;
+    sq::FsOps ops;
+    ops.link = [&](const fs::path&, const fs::path& to, std::error_code& lec) {
+        fs::create_symlink(victim, to, planted); // Linux link(2) over a symlink source
+        lec = planted;
+    };
+    const auto r = sq::quarantine_corrupt_db(db, 5, ops);
+    if (planted == std::errc::operation_not_permitted || planted == std::errc::permission_denied)
+        SKIP("cannot create a symlink here: " << planted.message());
+    REQUIRE_FALSE(planted);
+    CHECK_FALSE(r.dest.has_value());
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("not the file that was judged") != std::string::npos);
+    CHECK(fs::status(victim).permissions() == victim_mode); // secure() never reached it
+    CHECK(read_bytes(db) == "corrupt");                     // the original is untouched
+    fs::path dest = db;
+    dest += ".corrupt-5";
+    CHECK(fs::symlink_status(dest).type() == fs::file_type::not_found); // released
+}
+
+TEST_CASE("sqlite_quarantine: a claim landing on a file other than the one judged is released",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    const auto judged = sq::file_identity(db);
+    REQUIRE(judged.has_value());
+    sq::FsOps ops;
+    ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& lec) {
+        // Another recovery finished first: the corrupt file is gone and a fresh one sits at the
+        // name. The real link then claims THAT file.
+        fs::remove(from);
+        write_bytes(from, "fresh healthy rows");
+        fs::create_hard_link(from, to, lec);
+    };
+    const auto r = sq::quarantine_corrupt_db(db, 5, ops, judged);
+    CHECK_FALSE(r.dest.has_value());
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("not the file that was judged") != std::string::npos);
+    CHECK(read_bytes(db) == "fresh healthy rows"); // the other recovery's file is left alone
+    CHECK(fs::hard_link_count(db) == 1);           // the claim on it was released
+    fs::path dest = db;
+    dest += ".corrupt-5";
+    CHECK_FALSE(fs::exists(dest));
+}
+
+TEST_CASE("sqlite_quarantine: an original replaced after the claim is released, never dropped",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    const auto judged = sq::file_identity(db);
+    REQUIRE(judged.has_value());
+    sq::FsOps ops;
+    ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& lec) {
+        // The claim lands on the judged file, then another recovery replaces the original name
+        // with a fresh file before it is dropped: that fresh file must keep its name.
+        fs::create_hard_link(from, to, lec);
+        fs::remove(from);
+        write_bytes(from, "fresh healthy rows");
+    };
+    const auto r = sq::quarantine_corrupt_db(db, 5, ops, judged);
+    CHECK_FALSE(r.dest.has_value());
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("not the file that was judged") != std::string::npos);
+    CHECK(read_bytes(db) == "fresh healthy rows");
+    CHECK(fs::hard_link_count(db) == 1);
+}
+
+TEST_CASE("sqlite_quarantine: a name replaced before the claim is refused when the judged identity is given",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    const auto judged = sq::file_identity(db);
+    REQUIRE(judged.has_value());
+    fs::remove(db);
+    write_bytes(db, "fresh healthy rows");
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(db, 5, ".corrupt-", &notes, {}, judged).has_value());
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("no longer the file that was judged") != std::string::npos);
+    CHECK(read_bytes(db) == "fresh healthy rows");
+    for (const auto& e : fs::directory_iterator(dir.path))
+        CHECK(e.path() == db);
+}
+#endif
 
 #ifndef _WIN32
 TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replaced",
@@ -1160,11 +1285,13 @@ TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replac
     CHECK(read_bytes(*dest) == "corrupt");
 }
 
-TEST_CASE("dedup_quarantine: when the hard link fails the claim fails closed and nothing moves",
+TEST_CASE("dedup_quarantine: a directory at the database name is refused before any link, nothing moves",
           "[command_dedup][corruption][quarantine_fs]") {
-    // link(2) on a DIRECTORY fails with EPERM (not EEXIST), which is the "hard links are unavailable
-    // here" arm. There is no check-then-rename fallback any more (it could overwrite evidence), so
-    // the claim returns nullopt, names the cause, and the original is untouched.
+    // Only a regular file is ever claimed: a DIRECTORY is refused by the no-follow regular-file
+    // check before link(2) runs (a directory cannot be hard-linked anyway). There is no
+    // check-then-rename fallback (it could overwrite evidence), so the claim returns nullopt, names
+    // the cause, and the original and the earlier quarantine are untouched. The hard-links-
+    // unavailable arm itself is driven by the injected link above.
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
     const auto db = dir.path / "command_dedup.db";
     std::error_code ec;
@@ -1178,7 +1305,7 @@ TEST_CASE("dedup_quarantine: when the hard link fails the claim fails closed and
     const auto r = dq::quarantine_corrupt_db(db, 1234);
     CHECK_FALSE(r.dest.has_value());
     REQUIRE(r.notes.size() == 1);
-    CHECK(r.notes[0].find("hard links") != std::string::npos);
+    CHECK(r.notes[0].find("not a regular file") != std::string::npos);
     CHECK(read_bytes(db / "inside.txt") == "payload");
     CHECK(read_bytes(taken) == "earlier");
 }

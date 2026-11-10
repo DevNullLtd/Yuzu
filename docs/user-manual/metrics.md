@@ -1857,7 +1857,9 @@ heartbeat as the status tags `yuzu.dedup_degraded` (0 or 1), `yuzu.dedup_replays
 **When `YuzuDedupStoreDegraded` fires.** There is no page or API yet that lists which endpoints are
 affected (tracked in #6931), so the count tells you how many to find. Check the agent log on
 suspect endpoints for `Failed to open command dedup store` (the usual causes are a full or
-read-only data directory or a permissions fault on `command_dedup.db`), fix the cause, and restart
+read-only data directory, a permissions fault on `command_dedup.db`, or a corrupt `command_dedup.db`
+on a data directory without hard links, where the corrupt file cannot be moved aside and stays in
+place), fix the cause, and restart
 the agent. The count drops within about 45 seconds of the restart (the agent sends its first
 heartbeat one interval, 30 s by default, after it starts, then the server sweeps every 15 s), and
 the alert resolves about 5 minutes after that, so it can still fire for an agent that was just fixed.

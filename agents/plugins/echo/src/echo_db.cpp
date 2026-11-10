@@ -906,7 +906,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     EchoDbDacl dacl;
     if (!dacl.ok()) {
         // Without the DACL there is no token user to compare owners against, so the foreign-owner
-        // and hard-link checks on echo.db and its sidecars are skipped as well (U-11).
+        // and hard-link checks on echo.db and its sidecars are skipped as well.
         spdlog::warn("EchoDatabase: owner-only DACL not built (error {}); echo.db keeps the "
                      "directory's inherited ACL, and the owner and hard-link checks are skipped",
                      dacl.build_error());
@@ -965,8 +965,8 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     case IntegrityCheck::ok:
         break;
     case IntegrityCheck::unreadable:
-        // Not corruption (I/O, permission, space, lock contention): refuse and let the next start
-        // retry; quarantine nothing. Rationale: check_integrity's comment (#7286).
+        // Not corruption (I/O, permission, space, a WAL protocol fault): refuse and let the next
+        // start retry; quarantine nothing. Rationale: check_integrity's comment (#7286).
         return std::unexpected(std::format(
             "echo.db could not be checked (sqlite rc {}): not quarantined and not opened; "
             "retried on the next start: {}",
@@ -981,10 +981,15 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
             "and not opened; it is retried on the next start: {}",
             kBusyTimeoutMs, path.string()));
     case IntegrityCheck::corrupt: {
+        // The identity of the file the verdict was taken on, read while the connection still holds
+        // it: the quarantine moves only that inode, so a link swapped in or a fresh file another
+        // process put at the name between this check and the move is left alone (#1527).
+        const auto judged = yuzu::shared::sqlite_quarantine::file_identity(path);
         guard.reset();
         // One clock read: the persisted epoch is the one in the on-disk quarantine name.
         const std::int64_t epoch = now_epoch_seconds();
-        const auto quarantine = yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(path, epoch);
+        const auto quarantine = yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(
+            path, epoch, seams.quarantine_ops, judged);
         for (const auto& note : quarantine.notes)
             spdlog::warn("EchoDatabase: {}", note);
         const auto& quarantined = quarantine.dest;

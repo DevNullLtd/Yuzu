@@ -3893,7 +3893,7 @@ TEST_CASE("EchoDatabase: a busy echo.db is refused and never quarantined (#7286)
     // A lower bound on a wait that already happens; load can only lengthen it, never shorten it.
     CHECK(std::chrono::steady_clock::now() - started >= std::chrono::seconds{4});
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().find("busy") != std::string::npos);
+    CHECK(refused.error().find("echo.db is busy") != std::string::npos);
     CHECK(refused.error().find("not quarantined") != std::string::npos);
     CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty()); // nothing moved aside
     CHECK(fs::exists(db));
@@ -4054,6 +4054,91 @@ TEST_CASE("EchoDatabase: a link planted after a quarantine is refused before the
         CHECK(fs::is_symlink(link));                                        // not replaced
         CHECK(slurp_file(target) == "target bytes");                        // never opened through
     }
+}
+
+// #1527. The window the two cases below cover is the one between the corrupt verdict and the
+// hard-link claim, which no name check reaches: `quarantine_ops.link` runs exactly there, so the
+// seam swaps a symlink in before the real create_hard_link. On macOS link(2) follows the link and
+// would claim its TARGET (then chmod it 0600); on Linux the link itself would travel and the
+// following chmod would reach the target. Either way the victim must keep its mode, its single
+// name and its bytes, and nothing of the victim's may appear under a quarantine name.
+TEST_CASE("EchoDatabase: a link swapped in at echo.db between the verdict and the claim is caught and its target untouched (#1527)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_preclaim_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    spit_file(db, "this is not a SQLite database");
+    const fs::path victim = dir.path / "victim.bin";
+    spit_file(victim, "victim bytes");
+    std::error_code pec;
+    fs::permissions(victim, fs::perms::owner_all | fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace, pec);
+    REQUIRE_FALSE(pec);
+    const auto victim_mode = fs::status(victim).permissions();
+    std::error_code planted;
+    bool fired = false;
+    OpenSeams seams;
+    seams.quarantine_ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& ec) {
+        fired = true;
+        fs::remove(from);
+        fs::create_symlink(victim, from, planted);
+        if (planted) {
+            ec = planted;
+            return;
+        }
+        fs::create_hard_link(from, to, ec); // the real claim, now over the planted link
+    };
+
+    auto refused = EchoDatabase::open(db, seams);
+    REQUIRE(fired);
+    skip_unless_symlink_capable(planted);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("corrupt and unmovable") != std::string::npos); // fail closed
+    CHECK(fs::status(victim).permissions() == victim_mode);                   // never chmodded
+    CHECK(fs::hard_link_count(victim) == 1);                                   // never linked
+    CHECK(slurp_file(victim) == "victim bytes");
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty()); // the claim was released
+    CHECK(fs::is_symlink(db));                                      // left for the operator
+}
+
+TEST_CASE("EchoDatabase: a link swapped in at echo.db-wal before the claim travels as a link and its target is never chmodded (#1527)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_preclaim_wal_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    spit_file(db, "this is not a SQLite database");
+    const fs::path victim = dir.path / "victim.bin";
+    spit_file(victim, "victim bytes"); // non-empty: an empty sidecar is simply removed
+    std::error_code pec;
+    fs::permissions(victim, fs::perms::owner_all | fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace, pec);
+    REQUIRE_FALSE(pec);
+    const auto victim_mode = fs::status(victim).permissions();
+    const fs::path wal{db.string() + "-wal"};
+    std::error_code planted;
+    bool fired = false;
+    OpenSeams seams;
+    seams.quarantine_ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& ec) {
+        fired = true;
+        fs::create_symlink(victim, wal, planted);
+        fs::create_hard_link(from, to, ec);
+    };
+
+    auto opened = EchoDatabase::open(db, seams);
+    REQUIRE(fired);
+    skip_unless_symlink_capable(planted);
+    CHECK(fs::status(victim).permissions() == victim_mode); // the sidecar chmod did not follow
+    CHECK(fs::hard_link_count(victim) == 1);
+    CHECK(slurp_file(victim) == "victim bytes");
+    const auto quarantined = names_with_prefix(dir.path, "echo.db.corrupt-");
+    REQUIRE(opened.has_value()); // the main claim stood and the fresh file reopened clean
+    // The link itself travelled under the quarantine name (one entry is the main file, one the
+    // moved -wal), still a link, never resolved.
+    REQUIRE(quarantined.size() == 2);
+    const fs::path moved_wal = dir.path / (quarantined[0].ends_with("-wal") ? quarantined[0]
+                                                                            : quarantined[1]);
+    CHECK(fs::is_symlink(moved_wal));
+    CHECK_FALSE(fs::is_symlink(wal)); // the fresh database's own -wal, not the planted link
 }
 
 // The recheck after a quarantine names the sqlite rc that ended it, so an operator can tell a file
