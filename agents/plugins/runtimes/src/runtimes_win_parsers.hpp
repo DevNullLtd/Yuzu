@@ -33,14 +33,20 @@
  * file exists but cannot be read (denied, a reparse point, over the cap, a non-local path) is still
  * a row (version = the registry's version tag, flavour `unmodelled`) and records
  * `windows:runtimes:jvm:release_unreadable`; a home with no `release` file at all is the same row
- * without a token. The release file is opened as itself (FILE_FLAG_OPEN_REPARSE_POINT) and a
- * reparse point is refused, and each ancestor directory of the file below the drive root is
- * checked not to be a reparse point first (refused as unreadable) -- a BEST-EFFORT check
- * (GetFileAttributesW per ancestor, then a separate CreateFileW): a check-then-open race by a
- * local writer of a user-writable ancestor is a disclosed residual. A
- * JVM key whose home value is present but empty, mistyped or oversized records
+ * without a token. The release file is opened by ONE kernel name resolution relative to an open
+ * handle on the drive root (yuzu::win::open_file_no_reparse, agents/shared/win_no_reparse_open.hpp:
+ * NtCreateFile with OBJ_DONT_REPARSE), so no component below the drive root is a reparse point that
+ * gets followed: a junction or symlink in any ancestor, or on the leaf, is refused as unreadable
+ * before it is followed (a link to a UNC path never makes the service connect outbound), and there
+ * is no check-then-open window. A name with a `.`, `..` or empty segment or a component ending in
+ * '.' or ' ' (spellings the Win32 layer would rewrite and the NT open does not) is refused as
+ * unreadable rather than resolved. A Windows build that rejects OBJ_DONT_REPARSE (the open answers
+ * STATUS_INVALID_PARAMETER) reads every release file as unreadable, never through a path-based
+ * fallback, and logs that cause once per process. The open has been exercised on Windows 11 only
+ * and no Windows floor is claimed. A JVM key whose home value is present but empty, mistyped or
+ * oversized records
  * `windows:runtimes:jvm:home_unusable` (an absent value stays silent). The read has no deadline,
- * a disclosed residual on a dead FIXED volume, beside the ancestor-check race above.
+ * a disclosed residual on a dead FIXED volume.
  *
  * BOUNDED. One kMaxEntriesVisited counter per walk across both views (every enumerated name and
  * value counts, an over-long one too) and ONE RowByteBudget of kMaxEntriesVisited rows and
@@ -52,6 +58,7 @@
 #include "runtimes_parsers.hpp"
 
 #include <row_byte_budget.hpp> // yuzu::shared::RowByteBudget (agents/shared)
+#include <win_no_reparse_open.hpp> // yuzu::win::drive_relative_name (every OS) + open_file_no_reparse (Windows)
 
 #include <algorithm>
 #include <array>
@@ -230,6 +237,10 @@ inline void add_jvm_home(std::vector<JvmHome>& homes, std::string home, std::str
 
 #include <win_str.hpp> // yuzu::win::from_wide / to_wide (agents/shared)
 
+#include <spdlog/spdlog.h>
+
+#include <atomic>
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -316,51 +327,38 @@ struct RealRegOps {
         *data = yuzu::win::reg_sz_to_utf8(buf.c_str(), got);
         return ERROR_SUCCESS;
     }
-    /// One bounded read of a local-drive file, opened as itself (the leaf by
-    /// FILE_FLAG_OPEN_REPARSE_POINT; every ancestor below the drive root by a BEST-EFFORT attribute
-    /// check, then a separate CreateFileW: a check-then-open race by a local writer of a
-    /// user-writable ancestor is a disclosed residual). It has no deadline: CreateFileW / ReadFile on a dead FIXED volume (iSCSI, USB, VHD)
-    /// can block the sync thread, a disclosed residual shared with the other Windows readers.
-    /// engaged-and-empty: the file does not exist. nullopt: it exists (or may) but is not read -- not
-    /// a plain `X:\...` path, not on a fixed local drive (remote, removable, optical, RAM or
-    /// unknown), a reparse point, a directory, not a disk file, over `cap` bytes, or an open / read
-    /// failure.
+    /// One bounded read of a local-drive file, opened by ONE kernel name resolution relative to the
+    /// drive-root handle with no reparse point followed below the root (yuzu::win::
+    /// open_file_no_reparse: NtCreateFile + OBJ_DONT_REPARSE, so a junction or symlink swapped into
+    /// an ancestor is never followed and there is no check-then-open window). It has no deadline:
+    /// the open and ReadFile on a dead FIXED volume (iSCSI, USB, VHD) can block the sync thread, a
+    /// disclosed residual shared with the other Windows readers.
+    /// engaged-and-empty: the file does not exist. nullopt: it exists (or may) but is not read --
+    /// not a plain `X:\...` path (a `.`/`..`/empty segment or a component ending in '.' or ' ' is
+    /// refused too), not on a fixed local drive (remote, removable, optical, RAM or unknown), a
+    /// reparse point anywhere below the root, a directory, not a disk file, over `cap` bytes, an
+    /// open / read failure, or a Windows build that rejects OBJ_DONT_REPARSE (logged once).
     std::optional<std::string> read_file_bounded(const std::wstring& path, std::size_t cap) const {
         if (path.size() < 3 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/'))
             return std::nullopt;
         const wchar_t root[] = {path[0], L':', L'\\', L'\0'};
         if (GetDriveTypeW(root) != DRIVE_FIXED) return std::nullopt;
-        // CreateFileW follows a reparse point in any ANCESTOR directory (the flag below covers only
-        // the leaf), and a directory link to a UNC path would make it connect outbound with the
-        // service identity. So each directory between the drive root and the leaf must itself not be
-        // a reparse point. A missing ancestor is a missing file, as CreateFileW would answer.
-        for (std::size_t sep = path.find_first_of(L"\\/", 3); sep != std::wstring::npos;
-             sep = path.find_first_of(L"\\/", sep + 1)) {
-            const DWORD attrs = GetFileAttributesW(path.substr(0, sep).c_str());
-            if (attrs == INVALID_FILE_ATTRIBUTES) {
-                const DWORD e = GetLastError();
-                if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return std::string{};
-                return std::nullopt;
-            }
-            if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) return std::nullopt;
-        }
-        struct Handle {
-            HANDLE h;
-            ~Handle() {
-                if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-            }
-        } file{CreateFileW(path.c_str(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                           OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
-        if (file.h == INVALID_HANDLE_VALUE) {
-            const DWORD e = GetLastError();
-            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return std::string{};
+        auto opened = yuzu::win::open_file_no_reparse(path);
+        if (opened.status == yuzu::win::NoReparseOpen::absent) return std::string{};
+        if (opened.status == yuzu::win::NoReparseOpen::unsupported) {
+            static std::atomic_flag warned;
+            if (!warned.test_and_set())
+                spdlog::warn("runtimes: JVM release open returned STATUS_INVALID_PARAMETER or "
+                             "NtCreateFile is unavailable -- OBJ_DONT_REPARSE unsupported on this "
+                             "Windows build? every JVM release file reads as unreadable");
             return std::nullopt;
         }
+        if (opened.status != yuzu::win::NoReparseOpen::ok) return std::nullopt;
+        const HANDLE file = opened.file.get();
         BY_HANDLE_FILE_INFORMATION info{};
-        if (!GetFileInformationByHandle(file.h, &info) ||
+        if (!GetFileInformationByHandle(file, &info) ||
             (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
-            GetFileType(file.h) != FILE_TYPE_DISK)
+            GetFileType(file) != FILE_TYPE_DISK)
             return std::nullopt;
         const std::uint64_t size =
             (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
@@ -369,7 +367,7 @@ struct RealRegOps {
         std::size_t got = 0;
         while (got < out.size()) {
             DWORD n = 0;
-            if (!ReadFile(file.h, out.data() + got, static_cast<DWORD>(out.size() - got), &n,
+            if (!ReadFile(file, out.data() + got, static_cast<DWORD>(out.size() - got), &n,
                           nullptr) ||
                 n == 0)
                 return std::nullopt; // failed, or the file shrank under the read

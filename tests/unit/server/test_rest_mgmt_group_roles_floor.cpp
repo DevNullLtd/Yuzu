@@ -41,6 +41,7 @@
 #include <nlohmann/json.hpp>
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -66,6 +67,11 @@ struct GroupRolesHarness {
     /// fallback is skipped for a service-scoped token.
     std::string mock_token_scope_service;
 
+    /// Owner-arm eligibility inputs (mgmt_group_owner_gate.hpp): the MCP tier and the
+    /// principal class the mock session carries. Defaults are an ordinary human session.
+    std::string mock_mcp_tier;
+    std::string mock_principal_kind{"human"};
+
     GroupRolesHarness() {
         REQUIRE(rbac.is_open());
 
@@ -75,6 +81,8 @@ struct GroupRolesHarness {
             s.username = "tester";
             s.role = auth::Role::user;
             s.token_scope_service = mock_token_scope_service;
+            s.mcp_tier = mock_mcp_tier;
+            s.principal_kind = mock_principal_kind;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -422,4 +430,143 @@ TEST_CASE("DELETE /management-groups/{id}/roles: a service-scoped token is denie
                                "application/json");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+// ---------------------------------------------------------------------------
+// One owner-arm predicate (mgmt_group_owner_gate.hpp): the ITServiceOwner-of-this-group
+// fallback on GET/POST/DELETE refuses MCP-tier and engine-classed sessions, and DELETE limits
+// a caller admitted ONLY by that arm to the roles POST can delegate.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct OwnerArmFixture {
+    GroupRolesHarness h;
+    std::string gid;
+
+    OwnerArmFixture(const char* group_name, bool caller_is_owner = true) {
+        ManagementGroup g;
+        g.name = group_name;
+        g.membership_type = "static";
+        g.created_by = "tester";
+        auto grp = h.mgmt_bundle->create_group(g);
+        REQUIRE(grp.has_value());
+        gid = *grp;
+        if (caller_is_owner) {
+            REQUIRE(h.mgmt_bundle
+                        ->assign_role(GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"})
+                        .has_value());
+        }
+    }
+
+    // The fleet-wide arm is denied for every case below, so only the owner arm can admit.
+    void deny_fleet_wide() {
+        h.perm_override = [](const std::string& securable, const std::string& op) {
+            return !((securable == "ManagementGroup" && op == "Write") ||
+                     (securable == "UserManagement" && op == "Read"));
+        };
+    }
+
+    std::unique_ptr<httplib::Response> del(const std::string& body) {
+        return h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/roles", body,
+                               "application/json");
+    }
+};
+
+constexpr const char* kViewerRow = R"({"principal_id":"someone","role_name":"Viewer"})";
+
+} // namespace
+
+TEST_CASE("management-group roles routes: the owner arm refuses an MCP-tier session on REST",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-tier");
+    f.deny_fleet_wide();
+    f.h.mock_mcp_tier = "readonly";
+
+    auto get = f.h.sink.Get("/api/v1/management-groups/" + f.gid + "/roles");
+    REQUIRE(get);
+    CHECK(get->status == 403);
+
+    auto post = f.h.sink.Post("/api/v1/management-groups/" + f.gid + "/roles", kViewerRow);
+    REQUIRE(post);
+    CHECK(post->status == 403);
+
+    auto del = f.del(kViewerRow);
+    REQUIRE(del);
+    CHECK(del->status == 403);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).size() == 1); // only the owner row
+
+    // The same caller without a tier is still admitted: the refusal is the tier.
+    f.h.mock_mcp_tier.clear();
+    auto ok = f.h.sink.Get("/api/v1/management-groups/" + f.gid + "/roles");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("management-group roles routes: the owner arm refuses an engine-classed session",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-engine");
+    f.deny_fleet_wide();
+    f.h.mock_principal_kind = "engine";
+
+    auto get = f.h.sink.Get("/api/v1/management-groups/" + f.gid + "/roles");
+    REQUIRE(get);
+    CHECK(get->status == 403);
+
+    auto post = f.h.sink.Post("/api/v1/management-groups/" + f.gid + "/roles", kViewerRow);
+    REQUIRE(post);
+    CHECK(post->status == 403);
+
+    auto del = f.del(kViewerRow);
+    REQUIRE(del);
+    CHECK(del->status == 403);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).size() == 1);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/roles: an owner-arm caller removes only Operator and "
+          "Viewer rows",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-delete");
+    REQUIRE(f.h.mgmt_bundle->assign_role(GroupRoleAssignment{f.gid, "user", "peer", "ITServiceOwner"})
+                .has_value());
+    REQUIRE(f.h.mgmt_bundle->assign_role(GroupRoleAssignment{f.gid, "user", "op1", "Operator"})
+                .has_value());
+    f.deny_fleet_wide();
+
+    // A peer owner row is refused with the same wording POST uses; nothing is removed.
+    auto refused = f.del(R"({"principal_id":"peer","role_name":"ITServiceOwner"})");
+    REQUIRE(refused);
+    CHECK(refused->status == 403);
+    CHECK(refused->body.find("only Operator and Viewer roles can be delegated") !=
+          std::string::npos);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).size() == 3);
+
+    // An Operator row is removed.
+    auto removed = f.del(R"({"principal_id":"op1","role_name":"Operator"})");
+    REQUIRE(removed);
+    CHECK(removed->status == 200);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).size() == 2);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/roles: a fleet-wide ManagementGroup:Write holder may "
+          "still remove an ITServiceOwner row",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-delete-fleet", /*caller_is_owner=*/false);
+    REQUIRE(f.h.mgmt_bundle->assign_role(GroupRoleAssignment{f.gid, "user", "peer", "ITServiceOwner"})
+                .has_value());
+
+    auto res = f.del(R"({"principal_id":"peer","role_name":"ITServiceOwner"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).empty());
+}
+
+TEST_CASE("GET /management-groups/{id}/roles: a human session without a tier is still admitted "
+          "by the owner arm (positive pin)",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-positive");
+    f.deny_fleet_wide();
+    auto res = f.h.sink.Get("/api/v1/management-groups/" + f.gid + "/roles");
+    REQUIRE(res);
+    CHECK(res->status == 200);
 }

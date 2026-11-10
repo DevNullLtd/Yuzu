@@ -1,0 +1,14 @@
+# Resource Ledger: 20261110-input-validation-hardening
+
+Every owning boundary the diff adds or changes in C++ (agents/shared/win_no_reparse_open.hpp, agents/plugins/runtimes/src/runtimes_win_parsers.hpp, tests/unit/win_junction_test_support.hpp, server/core/src/mgmt_group_owner_gate.hpp, software_catalogue_model.{hpp,cpp}, installed_apps_inventory.hpp and their unit tests).
+
+| ID | Resource / construct | Owner type | Acquired | Released | Transfer | Failure cleanup |
+|---|---|---|---|---|---|---|
+| R1 | Volume-root directory HANDLE (`X:\`) | `yuzu::win::NoReparseHandle` (move-only, `CloseHandle` in the destructor) | `CreateFileW` in `open_volume_root`, owned at the declaration that receives it (one retry without FILE_TRAVERSE on access denied) | end of `open_file_no_reparse`, after `NtCreateFile` returns | none (the root never leaves the function) | RAII; a root that is not a directory or is a reparse point returns an empty owner, which closes the handle on the way out |
+| R2 | Opened release-file HANDLE | `NoReparseHandle` inside `NoReparseOpenResult::file` | `NtCreateFile` (RootDirectory = R1, OBJ_DONT_REPARSE), moved into the result in the statement that follows a success status | scope exit of `RealRegOps::read_file_bounded`, which reads it by handle (`GetFileInformationByHandle`, `ReadFile`) | by move, from `open_file_no_reparse` to the caller's local `opened` | RAII on every early return (reparse/directory/non-disk/over-cap/read failure); no raw HANDLE survives past the status check |
+| R3 | `UNICODE_STRING` over the relative name | non-owning borrow of the local `std::optional<std::wstring> relative` | built just before `NtCreateFile` (USHORT byte-length bound checked first; `const_cast` proof comment at the site) | not owned; `relative` outlives the call | none | none needed; a name longer than USHORT is refused before the call |
+| R4 | `NtCreateFile` function pointer | function-local `static const` resolved by `GetProcAddress` on `GetModuleHandleW(L"ntdll.dll")` | first call (thread-safe static init) | not owned (no `LoadLibrary`, no module reference taken) | none | a null symbol is `unsupported`, never a path-based fallback |
+| R5 | Log-once flag | `static std::atomic_flag` in `read_file_bounded` | static storage | program exit | none | none |
+| R6 | Test junction directory handle and link | local RAII struct (`CloseHandle`) in `create_junction`; `JunctionCleanup` (`RemoveDirectoryW` removes the link, never the target) | `CreateFileW` on the new directory; `FSCTL_SET_REPARSE_POINT` | scope exit | none | a failed junction build returns false before any handle is held; the cleanup removes only the link |
+
+No thread, descriptor, socket, `FILE*`, SQLite handle, callback or temp path is added. The server-side changes (`mgmt_group_owner_gate.hpp` predicate, the cursor ceiling) and the rpm/dpkg parsers are pure functions over values and own nothing.

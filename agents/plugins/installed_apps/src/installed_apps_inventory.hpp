@@ -243,9 +243,13 @@ inline std::string parse_os_release(std::string_view content, std::string_view k
 // action's "install ok installed" substring filter excludes held, this does
 // not. "rc" (removed, config-files) and "un" (unknown) are correctly
 // excluded. nullopt for a structurally wrong or not-installed line.
+//
+// Maintainer is free text and the LAST field, so a tab inside it never drops the
+// row: the publisher is its head segment (the text before the first tab). The
+// first four fields are tab/newline-free by the dpkg grammar.
 inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
     const auto tok = detail::split_tabs(line);
-    if (tok.size() != 5 || tok[1].size() < 2 || tok[1][1] != 'i')
+    if (tok.size() < 5 || tok[1].size() < 2 || tok[1][1] != 'i')
         return std::nullopt;
     InvRecord r;
     r.name = std::string(tok[0]);
@@ -260,10 +264,18 @@ inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
     return r;
 }
 
-// One rpm line (10 tab-separated tokens):
-//   NAME EPOCH VERSION RELEASE ARCH PACKAGER INSTALLTIME:date SIGPGP RSAHEADER VENDOR
+// One rpm line (at least 9 tab-separated tokens):
+//   NAME EPOCH VERSION RELEASE ARCH INSTALLTIME:date SIGPGP RSAHEADER VENDOR PACKAGER
 // The publisher is the declared VENDOR when set, else PACKAGER (a person, kept only as the
 // fallback), else empty (the agent core then labels the row `via:rpm`). `(none)` = unset.
+//
+// The two free-text tags (VENDOR, PACKAGER) are LAST so a tab inside either never drops the
+// row: the first eight tags are fixed by position and the publisher is the head segment of
+// VENDOR, else of PACKAGER (a tab inside VENDOR shifts PACKAGER right; only its head is read
+// as a fallback when VENDOR is empty or its first byte is the tab). The first eight tags are
+// tab/newline-free because rpmbuild enforces it at build time; the rpmdb does not, so a
+// hand-built header with a tab in one of them can still shift a field (disclosed residual,
+// as is a newline inside a free-text tag, which rpm prints as a second line).
 // SIGPGP is the payload (v3 OpenPGP) signature tag; RSAHEADER is the header
 // signature tag. Both are checked (via rpm_sig_present) because modern
 // RHEL/Fedora packages are frequently header-signed only -- SIGPGP alone
@@ -285,7 +297,7 @@ inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
 //      fleet -- now reads "unsigned" where the old scheme read "signed".
 inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     const auto tok = detail::split_tabs(line);
-    if (tok.size() != 10)
+    if (tok.size() < 9)
         return std::nullopt;
     InvRecord r;
     r.name = std::string(tok[0]);
@@ -293,12 +305,12 @@ inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
     r.version = std::string(tok[2]);
     r.release = map_rpm_none(tok[3]);
     r.arch = map_rpm_none(tok[4]); // gpg-pubkey pseudo-packages have (none) arch
-    r.publisher = rpm_text_value(tok[9]); // VENDOR: the declared vendor
-    if (r.publisher.empty())
-        r.publisher = rpm_text_value(tok[5]); // PACKAGER: a person, fallback only
-    r.install_date = map_rpm_none(tok[6]);
+    r.publisher = rpm_text_value(tok[8]); // VENDOR: the declared vendor (head segment)
+    if (r.publisher.empty() && tok.size() >= 10)
+        r.publisher = rpm_text_value(tok[9]); // PACKAGER: a person, fallback only
+    r.install_date = map_rpm_none(tok[5]);
     r.signature_status =
-        (rpm_sig_present(tok[7]) || rpm_sig_present(tok[8])) ? "signed" : "unsigned";
+        (rpm_sig_present(tok[6]) || rpm_sig_present(tok[7])) ? "signed" : "unsigned";
     r.kind = "package";
     r.ecosystem = "rpm";
     return r;

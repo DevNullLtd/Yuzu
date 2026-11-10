@@ -4546,11 +4546,11 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
         // rpm: a Rocky Linux 9 row (PACKAGER is the build system, VENDOR the org) -> VENDOR; a row
         // with only PACKAGER -> PACKAGER; a row with neither -> no publisher (labelled by the core)
         inv_row_of(ia_inv::parse_rpm_inv_line(
-            "libgcc\t(none)\t11.4.1\t2.1.el9\taarch64\tRocky Linux Build System (Peridot) "
-            "<releng@rockylinux.org>\tSun Nov 19 22:25:36 2023\t(none)\t89024a04\t"
-            "Rocky Enterprise Software Foundation")),
+            "libgcc\t(none)\t11.4.1\t2.1.el9\taarch64\tSun Nov 19 22:25:36 2023\t(none)\t89024a04\t"
+            "Rocky Enterprise Software Foundation\t"
+            "Rocky Linux Build System (Peridot) <releng@rockylinux.org>")),
         inv_row_of(ia_inv::parse_rpm_inv_line(
-            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\tFedora (43) Signing\td\t(none)\t(none)\t(none)")),
+            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\td\t(none)\t(none)\t(none)\tFedora (43) Signing")),
         inv_row_of(ia_inv::parse_rpm_inv_line("bare\t0\t1\t1\tnoarch\t(none)\td\t(none)\t(none)\t(none)")),
         inv_row_of(ia_inv::parse_pacman_inv_line("zlib 1:1.3.1-2")),
         inv_row_of(ia_inv::parse_apk_inv_line("musl-1.2.5-r0")),

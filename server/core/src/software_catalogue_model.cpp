@@ -368,12 +368,20 @@ std::string audit_target(const SoftwareFleetQuery& q) {
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
 
+// The kScanLimit text below quotes both numbers.
+static_assert(kWideScopeMaxSkip == 100000 && kScopePushdownMaxIds == 10000,
+              "update the kScanLimit message when either bound changes");
+
 std::string_view cursor_error_message(CursorError e) {
     switch (e) {
     case CursorError::kMalformed:
         return "invalid cursor";
     case CursorError::kFilterMismatch:
         return "cursor was issued for a different filter set";
+    case CursorError::kScanLimit:
+        return "cursor refused: more than 100000 rows outside the caller's scope were passed since "
+               "the last row served; narrow the filter (name, version or agent_id) and restart "
+               "from the first page, or page with a scope of at most 10000 devices";
     case CursorError::kStale:
         break;
     }
@@ -456,6 +464,8 @@ std::expected<DevicesCursor, CursorError> decode_devices_cursor(std::string_view
         return std::unexpected(CursorError::kMalformed);
     if (parts[1] != fp)
         return std::unexpected(CursorError::kFilterMismatch);
+    if (*skip > kWideScopeMaxSkip)
+        return std::unexpected(CursorError::kScanLimit);
     return DevicesCursor{SoftwareCursor{std::string((*fields)[0]), std::string((*fields)[1]), *id},
                          *skip};
 }
