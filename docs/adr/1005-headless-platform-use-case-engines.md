@@ -1546,8 +1546,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked as
        delivery row **SAM-21** of the software estate roadmap (the MCP twin of
        the lookup fields, filters, totals and the components route); the
-       tracking issue is **#TBD** (filing was not possible from the authoring
-       session; the PR records it as owed until the number exists). **Revisit by
+       tracking issue is **#7396**. **Revisit by
        2026-12-31.** The twin takes the same pure model (`software_list_model.hpp`:
        one parser, one totals rule, one status derivation, one version-range
        resolver) and the same store reads, so no second copy of any rule is
