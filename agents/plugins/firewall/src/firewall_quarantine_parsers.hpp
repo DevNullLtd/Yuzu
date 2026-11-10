@@ -1601,10 +1601,14 @@ win_rules_to_disable(const std::vector<WinRuleInfo>& rules) {
 ///    and is reported, never silent.
 ///
 /// Residual, cannot be told apart: a listed rule that was the only carrier of its name,
-/// direction and profile when it was disabled, then DELETED during the quarantine, beside
-/// exactly one rule of that identity that appeared during the quarantine (created, or renamed
-/// or re-profiled into it) and is off, reads as an edit of it and is switched on (accounted
-/// for if it is on). Exact twins (identical in every key property), both enabled when the
+/// direction and profile when it was disabled and then LEFT that identity during the
+/// quarantine (deleted, renamed, or moved to another direction or profile), beside exactly
+/// one rule that ENTERED that identity during the quarantine (created, or renamed or
+/// re-profiled into it). The entering rule reads as an edit of the listed one: if it is off
+/// it is switched on (`by_identity`), although it may have been off before the quarantine
+/// under another name; if it is on it is accounted for (`accounted_enabled`). A listed key
+/// leaving by rename or re-profile is no safer than one leaving by deletion: the key's prefix
+/// IS the identity, so the fallback cannot see why nothing carries it any more. Exact twins (identical in every key property), both enabled when the
 /// quarantine switched them off, share one key and the list holds it once: if one is then
 /// edited, the untouched twin matches the key and comes back, the edited one stays off and
 /// nothing is reported (fail safe: a rule left off is never more open than before).

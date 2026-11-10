@@ -4948,11 +4948,12 @@ TEST_CASE("windows release: a key flagged sole-carrier at disable is still found
     CHECK(plan.unmatched == 1);
 }
 
-TEST_CASE("windows release: the residual the flag cannot close is exactly the one the docs name",
+TEST_CASE("windows release: a sole carrier that left its identity beside one rule that entered it is the disclosed residual",
           "[agent][firewall_quarantine]") {
-    // A was its identity's only carrier when listed and was DELETED during the quarantine; a
-    // rule C of the same name, direction and profiles appeared meanwhile (created, or renamed
-    // or re-profiled into that identity) and is off. C reads as an edit of A and is switched on.
+    // A was its identity's only carrier when listed and LEFT it during the quarantine (here
+    // deleted; the rename swap below is the other shape); a rule C of the same name, direction
+    // and profiles entered it meanwhile (created, or renamed or re-profiled into it) and is off.
+    // C reads as an edit of A and is switched on.
     const auto a = stock_rule("Admin rule", true);
     const auto list = win_rules_to_disable({a});
     REQUIRE(list.size() == 1);
@@ -4970,6 +4971,30 @@ TEST_CASE("windows release: the residual the flag cannot close is exactly the on
     CHECK(plan.reenable.empty());
     CHECK(plan.accounted_enabled == 1);
     CHECK(plan.unmatched == 0);
+
+    // The same residual by a rename swap, with nothing deleted: A is renamed out of its identity
+    // while B, off before the quarantine under another name (so not listed), is renamed into it.
+    // B is the one carrier left, reads as an edit of A, and is switched on although it was off
+    // before the quarantine.
+    {
+        const auto admin = stock_rule("Admin rule", true);
+        auto other = admin;
+        other.name = "Other rule";
+        other.local_ports = "81";
+        other.enabled = false;
+        const auto swap_list = win_rules_to_disable({admin, other});
+        REQUIRE(swap_list.size() == 1);
+        CHECK(swap_list[0].sole_carrier);
+        auto admin_out = admin;
+        admin_out.name = "Admin rule (renamed)";
+        admin_out.enabled = false; // the quarantine's disable still holds
+        auto other_in = other;
+        other_in.name = "Admin rule";
+        const auto swapped = win_release_plan(swap_list, {admin_out, other_in});
+        CHECK(swapped.reenable == std::vector<std::size_t>{1}); // B, off before the quarantine
+        CHECK(swapped.by_identity == 1);
+        CHECK(swapped.unmatched == 0);
+    }
 }
 
 TEST_CASE("windows release: a key that was not flagged sole-carrier never falls back to its identity",
