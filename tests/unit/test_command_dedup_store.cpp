@@ -988,6 +988,35 @@ TEST_CASE("dedup_quarantine: a sidecar whose rename fails is copied before the o
     CHECK(r.notes[0].find("copied") != std::string::npos);
 }
 
+#ifndef _WIN32
+TEST_CASE("dedup_quarantine: a sidecar that is a link and cannot be renamed is removed, never copied through",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // copy_file follows a symlink, so without the no-follow gate a link planted at the sidecar
+    // name would have its TARGET's bytes copied into the quarantine set as evidence.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const auto victim = dir.path / "victim.bin";
+    write_bytes(victim, "victim bytes");
+    const fs::path wal{db.string() + "-wal"};
+    std::error_code lec;
+    fs::create_symlink(victim, wal, lec);
+    REQUIRE_FALSE(lec);
+
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied); // the injected rename failure
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(r.dest.has_value());
+    CHECK_FALSE(fs::exists(fs::path(r.dest->string() + "-wal"))); // nothing copied through
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);     // link removed
+    CHECK(read_bytes(victim) == "victim bytes");                              // target untouched
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+}
+#endif
+
 TEST_CASE("dedup_quarantine: a sidecar quarantine name that is taken is never overwritten",
           "[command_dedup][corruption][quarantine_fs]") {
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};

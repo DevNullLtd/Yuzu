@@ -543,6 +543,11 @@ struct OpenSeams {
     /// the last name check, which is what SQLITE_OPEN_NOFOLLOW closes (#1527). Production never
     /// sets it.
     std::function<void()> before_sqlite_open;
+    /// Called after the main connection opened and its file's identity was read, right before
+    /// `PRAGMA integrity_check` runs. It stands in for a name swapped while the check runs: the
+    /// quarantine must then refuse, because the file at the name is not the one SQLite judged
+    /// (#1527). Production never sets it.
+    std::function<void()> before_integrity_check;
     /// The filesystem steps of the quarantine that follows a corrupt verdict (the hard-link
     /// claim, a sidecar move, a remove), forwarded to `quarantine_corrupt_db`. An empty member is
     /// the real call. A test's `link` runs between the verdict and the claim, which is where a

@@ -1881,6 +1881,11 @@ TEST_CASE("EchoDatabase: a corrupt echo.db is quarantined and re-initialised fre
     for (const auto& entry : fs::directory_iterator(tmp.parent_path())) {
         if (entry.path().filename().string().rfind(prefix, 0) == 0) {
             ++quarantine_files;
+#ifndef _WIN32
+            // The quarantined evidence ends owner-only (0600): it was written 0644 above.
+            CHECK((fs::status(entry.path()).permissions() & fs::perms::mask) ==
+                  (fs::perms::owner_read | fs::perms::owner_write));
+#endif
             std::error_code ec;
             fs::remove(entry.path(), ec); // tidy up the quarantine artifact
         }
@@ -4101,6 +4106,60 @@ TEST_CASE("EchoDatabase: a link swapped in at echo.db between the verdict and th
     CHECK(fs::is_symlink(db));                                      // left for the operator
 }
 
+// A REGULAR file swapped for another regular file passes every no-follow regular-file test, so
+// only the identity compare (device + inode read right after the open) can catch it. The seam
+// runs between the pre-claim checks and the post-link re-check, where a second recovery or a
+// planter can replace the name; the claim must be released and Echo must fail closed.
+TEST_CASE("EchoDatabase: a regular file swapped in at echo.db between the verdict and the claim is refused, fail closed (#1527)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_preclaim_reg_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    spit_file(db, "this is not a SQLite database");
+    bool fired = false;
+    OpenSeams seams;
+    seams.quarantine_ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& ec) {
+        fired = true;
+        fs::create_hard_link(from, to, ec); // the real claim lands on the judged file
+        fs::remove(from);
+        spit_file(from, "planted regular file"); // then the name is replaced by a plain file
+    };
+
+    auto refused = EchoDatabase::open(db, seams);
+    REQUIRE(fired);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("corrupt and unmovable") != std::string::npos); // fail closed
+    CHECK(slurp_file(db) == "planted regular file"); // the file at the name is left alone
+    CHECK(fs::hard_link_count(db) == 1);
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty()); // the claim was released
+}
+
+// The identity is read right after the open, not after the integrity check: a name swapped while
+// the check runs (it can wait the busy timeout and scan every page) is not the file SQLite judged,
+// so the quarantine must refuse it. Before the read was hoisted, the planted file was quarantined
+// and a fresh database opened over its name.
+TEST_CASE("EchoDatabase: a regular file swapped in at echo.db while the integrity check runs is refused, fail closed (#1527)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_midcheck_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    spit_file(db, "this is not a SQLite database");
+    bool fired = false;
+    OpenSeams seams;
+    seams.before_integrity_check = [&] {
+        fired = true;
+        fs::remove(db);
+        spit_file(db, "planted while the check ran");
+    };
+
+    auto refused = EchoDatabase::open(db, seams);
+    REQUIRE(fired);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("corrupt and unmovable") != std::string::npos); // fail closed
+    CHECK(slurp_file(db) == "planted while the check ran");                   // left in place
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());            // nothing moved
+}
+
 TEST_CASE("EchoDatabase: a link swapped in at echo.db-wal before the claim travels as a link and its target is never chmodded (#1527)",
           "[echo][store][lifecycle][corruption][hardening]") {
     yuzu::test::TempDir dir{"yuzu_test_echo_preclaim_wal_"};
@@ -4288,6 +4347,14 @@ TEST_CASE("EchoDatabase: a non-empty -wal held open by another connection travel
     REQUIRE(fs::file_size(wal) > 0);
     const std::string wal_bytes = slurp_file(wal);
     spit_file(db, "this is not a SQLite database -- corrupt main file beside a live WAL");
+#ifndef _WIN32
+    // Seed the live -wal group/other-readable so the quarantined copy's mode proves the sidecar
+    // was re-secured, not inherited.
+    std::error_code pec;
+    fs::permissions(wal, fs::perms::owner_all | fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace, pec);
+    REQUIRE_FALSE(pec);
+#endif
 
     auto reopened = EchoDatabase::open(db);
     REQUIRE(reopened.has_value());
@@ -4296,6 +4363,13 @@ TEST_CASE("EchoDatabase: a non-empty -wal held open by another connection travel
     REQUIRE_FALSE(qfile.empty());
     REQUIRE(fs::exists(dir.path / (qfile + "-wal")));
     CHECK(slurp_file(dir.path / (qfile + "-wal")) == wal_bytes); // byte for byte
+#ifndef _WIN32
+    for (const std::string name : {qfile, qfile + "-wal"}) {
+        INFO("quarantined=" << name);
+        CHECK((fs::status(dir.path / name).permissions() & fs::perms::mask) ==
+              (fs::perms::owner_read | fs::perms::owner_write)); // owner-only (0600)
+    }
+#endif
     CHECK((!fs::exists(wal) || slurp_file(wal) != wal_bytes));   // not replayed by the fresh file
 }
 
@@ -4626,8 +4700,8 @@ TEST_CASE("EchoDatabase (Windows): a quarantined sidecar that had to be copied i
 // is predictable (the current epoch second, n = 0), so a local user can squat `<claimed>-wal`
 // ahead of a corruption with a hard link to a file of theirs, or to any file the service holds
 // WRITE_DAC on. A hard link shares its target's security descriptor: without the owner and link
-// tests the pass would rewrite the TARGET's DACL. The squat covers now and the ten seconds after it
-// so the claim lands on one of them without a seam into the clock; the live sidecar that could
+// tests the pass would rewrite the TARGET's DACL. The squat covers now and the thirty seconds after
+// it so the claim lands on one of them without a seam into the clock (a slower landing skips); the live sidecar that could
 // not take the squatted name is removed by the quarantine (the first recorded limit in
 // sqlite_quarantine.hpp, the squatted-sidecar name), which is not
 // what this case is about: here there is none.
@@ -4645,7 +4719,7 @@ TEST_CASE("EchoDatabase (Windows): a hard link squatted at a quarantine sidecar 
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-    constexpr int kSquats = 11; // now .. now + 10 s
+    constexpr int kSquats = 31; // now .. now + 30 s; a slower landing skips below, never fails
     for (int i = 0; i < kSquats; ++i) {
         std::error_code ec;
         fs::create_hard_link(decoy, d.dir.path / std::format("echo.db.corrupt-{}-wal", now + i), ec);
@@ -4659,6 +4733,8 @@ TEST_CASE("EchoDatabase (Windows): a hard link squatted at a quarantine sidecar 
     // The claim landed inside the squatted window, so the pass met a squatted `-wal` name.
     const fs::path squatted =
         d.dir.path / std::format("echo.db.corrupt-{}-wal", *opened->quarantined_this_open());
+    if (*opened->quarantined_this_open() >= now + kSquats)
+        SKIP("the claim landed outside the squatted window (stalled runner)");
     REQUIRE(fs::exists(squatted));
     REQUIRE(fs::exists(d.dir.path / std::format("echo.db.corrupt-{}", *opened->quarantined_this_open())));
 
@@ -4682,7 +4758,7 @@ TEST_CASE("EchoDatabase (Windows): a foreign-owned file squatted at a quarantine
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-    constexpr int kSquats = 11; // now .. now + 10 s
+    constexpr int kSquats = 31; // now .. now + 30 s; a slower landing skips below, never fails
     for (int i = 0; i < kSquats; ++i) {
         const fs::path squat = d.dir.path / std::format("echo.db.corrupt-{}-wal", now + i);
         spit_file(squat, "not a wal");
@@ -4694,6 +4770,8 @@ TEST_CASE("EchoDatabase (Windows): a foreign-owned file squatted at a quarantine
     REQUIRE(opened->quarantined_this_open().has_value());
     const fs::path squatted =
         d.dir.path / std::format("echo.db.corrupt-{}-wal", *opened->quarantined_this_open());
+    if (*opened->quarantined_this_open() >= now + kSquats)
+        SKIP("the claim landed outside the squatted window (stalled runner)");
     REQUIRE(fs::exists(squatted));
     REQUIRE(fs::exists(d.dir.path / std::format("echo.db.corrupt-{}", *opened->quarantined_this_open())));
 

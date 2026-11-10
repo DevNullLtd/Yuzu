@@ -955,6 +955,14 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     };
     if (auto opened = open_main(); !opened)
         return std::unexpected(std::format("failed to open echo.db: {}", opened.error()));
+    // The identity of the file SQLite just opened, read at the name right after the open (not
+    // after the integrity check, which can run for seconds and wait the busy timeout): the
+    // quarantine below moves only this inode, so a link or a different file put at the name while
+    // the check runs is refused and nothing is moved (#1527). The gap between the open and this
+    // read is the one recorded residual of the binding (sqlite_quarantine.hpp, BINDING).
+    const auto judged = yuzu::shared::sqlite_quarantine::file_identity(path);
+    if (seams.before_integrity_check)
+        seams.before_integrity_check(); // the swap-during-check test's fault point
 
     // #559 — corruption self-test BEFORE we trust the DB. A fresh/empty file
     // passes trivially; an existing corrupt one is quarantined aside and a clean
@@ -981,10 +989,9 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
             "and not opened; it is retried on the next start: {}",
             kBusyTimeoutMs, path.string()));
     case IntegrityCheck::corrupt: {
-        // The identity of the file the verdict was taken on, read while the connection still holds
-        // it: the quarantine moves only that inode, so a link swapped in or a fresh file another
-        // process put at the name between this check and the move is left alone (#1527).
-        const auto judged = yuzu::shared::sqlite_quarantine::file_identity(path);
+        // `judged` (read right after the open above) binds the move to the file the verdict was
+        // taken on: a link swapped in or a fresh file another process put at the name since is
+        // left alone and the open fails closed (#1527).
         guard.reset();
         // One clock read: the persisted epoch is the one in the on-disk quarantine name.
         const std::int64_t epoch = now_epoch_seconds();

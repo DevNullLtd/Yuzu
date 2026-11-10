@@ -28,14 +28,18 @@
 /// racing this one can replace the name with a fresh healthy file between the verdict and the
 /// move. So the source is examined without following links before the claim (a link, a
 /// directory or an absent name is refused), the claimed name is examined the same way after the
-/// link and must be the same inode (POSIX: device + inode by `lstat`; the caller may pass the
-/// identity it read while its connection was still open, which binds the move to the verdict
-/// itself), the original name is re-examined right before it is dropped, and every mode change
-/// is applied only to a regular file and without following a link. A mismatch releases the claim
-/// and fails closed. Windows has no `lstat`-style identity here (this header includes no
-/// windows.h), so there only the no-follow regular-file checks bind the claim: a replaced regular
-/// file is a recorded residual on that platform (SQLite holds its files without
-/// FILE_SHARE_DELETE, so a live database another process has open cannot lose its name there).
+/// link and must be the same inode (POSIX: device + inode by `lstat`), the original name is
+/// re-examined right before it is dropped, and every mode change is applied only to a regular
+/// file and without following a link. A mismatch releases the claim and fails closed. The
+/// identity the claim is held to is the caller's `judged` when it passes one, else the name as
+/// read here at claim time: the Echo caller reads it right after SQLite opened the file and before
+/// the integrity check, so the move is bound to the file that was open when the verdict was taken
+/// (short of the gap between that open and the read, a few instructions with no I/O between
+/// them); the command-dedup store passes none, so there the binding starts at the claim. Windows
+/// has no `lstat`-style identity here (this header includes no windows.h), so there only the
+/// no-follow regular-file checks bind the claim: a replaced regular file is a recorded residual on
+/// that platform (SQLite holds its files without FILE_SHARE_DELETE, so a live database another
+/// process has open cannot lose its name there; unproven until the MSVC leg runs).
 /// Two residuals remain on POSIX. The original is re-examined and then dropped by name, and
 /// POSIX has no unlink-if-same-inode, so a second recovery that drops the name AND creates a new
 /// file at it inside that gap loses its file (two agent processes on one data directory are
@@ -141,9 +145,9 @@ struct QuarantineResult {
 /// new path, or nullopt (original untouched) when no name could be claimed, the filesystem has no
 /// hard links, the name is not a regular file, the claim did not land on the file that was judged
 /// (see BINDING above), or the original name could not be dropped; `notes`, when given, receives
-/// why and anything left behind. `judged`, when given, is the identity the caller read while it
-/// still held the file open (`file_identity`); otherwise the name is read here, just before the
-/// claim. `epoch_seconds` is clamped to >= 0 (a pre-1970 clock would otherwise write
+/// why and anything left behind. `judged`, when given, is the identity the caller read at the
+/// name right after it opened the file (`file_identity`); otherwise the name is read here, just
+/// before the claim. `epoch_seconds` is clamped to >= 0 (a pre-1970 clock would otherwise write
 /// `.corrupt--5`, which the dedup prune parser rejects, so the file could never be pruned).
 [[nodiscard]] inline std::optional<std::filesystem::path>
 claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seconds,
@@ -258,8 +262,10 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
 /// read-only attribute; a rename keeps the source's DACL), so a copied sidecar is as readable as
 /// the directory's inherited ACL makes it. A caller that protects its database with its own DACL
 /// re-applies it to the quarantine set itself, as the Echo caller does (echo_db.cpp,
-/// secure_quarantined_sidecars); this header does not. `judged` is the main file's identity the
-/// caller read while it still held the file open (BINDING above); nullopt reads it here.
+/// secure_quarantined_sidecars); this header does not. A sidecar that is a link is never copied
+/// (`copy_file` would read its target): it is removed and its content not kept, like a failed
+/// copy. `judged` is the main file's identity the caller read at the name right after it opened
+/// the file (BINDING above); nullopt reads it here.
 [[nodiscard]] inline QuarantineResult
 quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seconds,
                       const FsOps& ops = {},
@@ -336,8 +342,10 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
             continue;
         }
         // Rename failed: preserve by copy (fails rather than overwrite), then drop the original.
-        std::error_code cec;
-        fs::copy_file(side, side_dest, fs::copy_options::none, cec);
+        // Never through a link: copy_file follows one, and a link's target is not the evidence.
+        std::error_code cec = std::make_error_code(std::errc::not_supported);
+        if (is_regular_file_no_follow(side))
+            fs::copy_file(side, side_dest, fs::copy_options::none, cec);
         if (cec) {
             result.notes.push_back(std::format(
                 "could not preserve {} as {} ({}); its content is not kept", side.string(),

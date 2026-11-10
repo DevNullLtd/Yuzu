@@ -17,7 +17,10 @@
 ///    wall-clock cutoff, and NEVER throws and never removes the file the same recovery just made.
 ///  - Both only ever touch names of the exact form
 ///    `<db filename>.corrupt-<digits>[-<digits>][-wal|-shm|-journal]` in the db's own directory.
-///  - The move itself is shared with agents/plugins/echo/src/echo_db.cpp (#559, #6914).
+///  - The move itself is shared with agents/plugins/echo/src/echo_db.cpp (#559, #6914). This
+///    store passes no judged identity (the connection that failed is already closed), so the
+///    shared move binds the claim to the file at the name at claim time (POSIX); Echo passes
+///    the identity it read right after its open. Windows has no identity in either caller.
 
 #include <spdlog/spdlog.h>
 
