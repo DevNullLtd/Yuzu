@@ -1015,7 +1015,7 @@ Assign a role to a principal within this management group. Only the `Operator` a
 
 Remove a role assignment from this management group.
 
-**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group. Same service-scoped-token, MCP-tier and engine-session denial as `POST` above. A caller admitted only as `ITServiceOwner` on this group can remove only `Operator` and `Viewer` rows (the roles `POST` can delegate), otherwise the response is `403` with `an ITServiceOwner of this group can remove only Operator and Viewer roles`; a caller holding the global permission can remove any role.
+**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group. Same service-scoped-token, MCP-tier and engine-session denial as `POST` above. A caller admitted only as `ITServiceOwner` on this group can remove only `Operator` and `Viewer` rows (the roles `POST` can delegate), otherwise the response is `403` with `an ITServiceOwner of this group can remove only Operator and Viewer roles`; a caller holding the global permission can remove any role. An owner therefore cannot remove an `ITServiceOwner` row, their own included: to step an owner down, a holder of the global `ManagementGroup:Write` permission removes that row with this same `DELETE`. `POST` accepts only `Operator` and `Viewer` from every caller, so this API does not assign `ITServiceOwner` to a successor.
 
 **Request body:**
 
@@ -1150,7 +1150,7 @@ The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in
 | `expires_at` | integer | No | Unix epoch seconds, in the future. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). Must be one JSON integer: a string, float, boolean, `null`, a negative or past value, or one above 9223372036854775807 is `400` and mints nothing. |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
-`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at`; the 90-day cap applies to tiered (`mcp_tier` set) tokens only, so a service-scoped token without a tier may expire later than that. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
+`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at`; the 90-day cap applies to tiered (`mcp_tier` set) tokens only, so a service-scoped token without a tier may expire later than that. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens). The `ITServiceOwner` arm is refused for an engine-classed session and, on this REST route, for any MCP-tier session (the same shared predicate as the management-group role routes); those callers need the global grant. A service-scoped token cannot mint a token at all.
 
 **Validation errors (`400`):**
 

@@ -26716,7 +26716,8 @@ TEST_CASE("MCP query_installed_software: a cursor whose skip passes the wide-sco
     const auto past = with_skip(swc::kWideScopeMaxSkip + 1);
     REQUIRE(past.contains("error"));
     CHECK(past["error"]["code"] == yuzu::server::mcp::kInvalidParams);
-    CHECK(past["error"]["message"].get<std::string>().find("cursor refused") != std::string::npos);
+    CHECK(past["error"]["message"].get<std::string>() ==
+          swc::cursor_error_message(swc::CursorError::kScanLimit));
 
     // Honest paging is untouched: a skip AT the ceiling is still served.
     const auto at = with_skip(swc::kWideScopeMaxSkip);
@@ -29264,13 +29265,12 @@ TEST_CASE("MCP management-group roles tools: the owner arm refuses an engine-cla
         ts.start("readonly");
         auto res = ts.call(list_call);
         REQUIRE(res);
-        if (res->status == 200) {
-            auto body = nlohmann::json::parse(res->body);
-            REQUIRE(body.contains("error"));
-            CHECK(body["error"]["message"] == "forbidden");
-        } else {
-            CHECK(res->status == 403);
-        }
+        // The owner arm's own refusal: a JSON-RPC permission error in a 200 response.
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(body["error"]["message"] == "forbidden");
     }
 
     SECTION("assign: engine session holding ITServiceOwner is refused, nothing written") {
@@ -29284,13 +29284,12 @@ TEST_CASE("MCP management-group roles tools: the owner arm refuses an engine-cla
         ts.start();
         auto res = ts.call(assign_call);
         REQUIRE(res);
-        if (res->status == 200) {
-            auto body = nlohmann::json::parse(res->body);
-            REQUIRE(body.contains("error"));
-            CHECK(body["error"]["message"] == "forbidden");
-        } else {
-            CHECK(res->status == 403);
-        }
+        // The owner arm's own refusal: a JSON-RPC permission error in a 200 response.
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(body["error"]["message"] == "forbidden");
         CHECK(store.get_group_roles(*created).size() == 1); // only the owner row
     }
 

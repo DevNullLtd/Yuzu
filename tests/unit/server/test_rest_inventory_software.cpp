@@ -1363,7 +1363,8 @@ TEST_CASE("REST inventory/software: a cursor whose skip passes the wide-scope ce
     auto past = with_skip(swc::kWideScopeMaxSkip + 1);
     REQUIRE(past);
     CHECK(past->status == 400);
-    CHECK(past->body.find("cursor refused") != std::string::npos);
+    CHECK(nlohmann::json::parse(past->body).at("error").at("message").get<std::string>() ==
+          swc::cursor_error_message(swc::CursorError::kScanLimit));
 
     // Honest paging is untouched: a skip AT the ceiling is still served.
     auto at = with_skip(swc::kWideScopeMaxSkip);
