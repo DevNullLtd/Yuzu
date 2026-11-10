@@ -3923,14 +3923,6 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::string dispatch_scope = (agent_ids.empty() && scope_expr.empty())
                                                    ? std::string(kBroadcastScope)
                                                    : scope_expr;
-            // K-R7-02 / PLAN-006: confine to AND identify the operator via the
-            // shared dispatch_confined seam. `session` is already resolved
-            // above; re-derive from the request (fail CLOSED on visibility if
-            // the callback is unwired — present-empty set → reaches nobody).
-            const yuzu::server::DispatchCaller caller =
-                caller_fn ? caller_fn(req)
-                          : yuzu::server::DispatchCaller{
-                                .exec_visible = yuzu::server::authz::deny_all()};
             // #7110: the execution row above is this route's last own write before the send,
             // and the route gate and the definition's `approval_mode` were decided on the
             // entry session; a grant, or the administrator standing a `role-gated` definition
@@ -3941,6 +3933,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // moving inside the chokepoint's own provenance write is not caught here (the
             // recorded limit of the dispatch chokepoint, docs/user-manual/rest-api.md
             // 'Refused after the audit row').
+            // The `denied` row is a raw `audit_fn` call on purpose: this file's AuditFn is
+            // void-returning (see the #4030 note on the detail route above), the handler
+            // writes no `requested` row, and every other row it writes is the same raw
+            // call, so there is no `Sec-Audit-Failed` posture here to keep.
             const auto refuse_after_row = [&](const std::string& gate) {
                 if (audit_fn)
                     audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
@@ -3957,13 +3953,40 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                      "is granted again"}),
                     "application/json");
             };
-            if (!perm_fn(req, res, "Execution", "Execute")) {
-                refuse_after_row("route");
-                return;
+            // K-R7-02 / PLAN-006: confine to AND identify the operator via the
+            // shared dispatch_confined seam. `session` is already resolved
+            // above; re-derive from the request (fail CLOSED on visibility if
+            // the callback is unwired — present-empty set → reaches nobody).
+            // The derivation and both decisions are one recheck: a throw inside any of
+            // them (a store fault) is a withdrawn permission, refused like the twins
+            // (`gate=exception` on the row), never the generic 500 of the dispatch catch
+            // below, which would close the row with no audit row. Only the decisions sit
+            // in this try (the refusal is written after it, as the twins do), so a fault
+            // while writing the refusal is not re-labelled `gate=exception` and written twice.
+            std::optional<std::string> withdrawn_gate; // the gate that refused; empty == both held
+            yuzu::server::DispatchCaller caller;
+            try {
+                caller = caller_fn ? caller_fn(req)
+                                   : yuzu::server::DispatchCaller{
+                                         .exec_visible = yuzu::server::authz::deny_all()};
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    withdrawn_gate = "route";
+                else if (instruction_execute::definition_needs_approval(
+                             def.approval_mode, caller.principal_is_admin))
+                    withdrawn_gate = "approval_mode mode=" + ::yuzu::log_token(def.approval_mode);
+            } catch (const std::exception& e) {
+                spdlog::error("instruction execute: the post-row recheck threw for '{}' "
+                              "execution_id={}; refused as permission_revoked: {}",
+                              ::yuzu::log_token(def_id), execution_id, e.what());
+                withdrawn_gate = "exception";
+            } catch (...) {
+                spdlog::error("instruction execute: the post-row recheck threw for '{}' "
+                              "execution_id={}; refused as permission_revoked: unknown exception",
+                              ::yuzu::log_token(def_id), execution_id);
+                withdrawn_gate = "exception";
             }
-            if (instruction_execute::definition_needs_approval(def.approval_mode,
-                                                               caller.principal_is_admin)) {
-                refuse_after_row("approval_mode mode=" + ::yuzu::log_token(def.approval_mode));
+            if (withdrawn_gate) {
+                refuse_after_row(*withdrawn_gate);
                 return;
             }
             // ADR-1007: per-device concurrency gate, when wired.

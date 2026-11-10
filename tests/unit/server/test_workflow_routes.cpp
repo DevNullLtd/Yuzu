@@ -4095,6 +4095,36 @@ TEST_CASE("legacy instruction execute: the administrator standing a role-gated d
     CHECK(h.dispatch_calls == 1);
 }
 
+TEST_CASE("legacy instruction execute: a recheck that throws after the execution row is refused "
+          "like a withdrawn permission; 403, denied row gate=exception, row cancelled, nothing "
+          "dispatched (#7110)",
+          "[pg][workflow][executions][execute][security][7110]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-RECHECK-THROW", "rt");
+    h.dispatch_cmd_override = "cmd-never";
+    h.dispatch_sent_override = 1;
+    // The fresh-caller derivation is the first step of the recheck; a store fault there used to
+    // fall to the dispatch catch (500, row cancelled, NO audit row). Kills: dropping the recheck's
+    // own catch (the outer catch answers 500 and writes no row).
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        throw std::runtime_error("caller store unavailable");
+    };
+    auto res = h.sink.Post("/api/instructions/def-RECHECK-THROW/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.dispatch_calls == 0);
+    REQUIRE_FALSE(h.audit_calls.empty());
+    const auto& row = h.audit_calls.back();
+    CHECK(row.action == "instruction.execute");
+    CHECK(row.result == "denied");
+    CHECK(row.detail.rfind("reason=permission_revoked gate=exception execution_id=", 0) == 0);
+    auto exec = h.tracker->get_execution(execution_id_of(row.detail));
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+}
+
 // -- Stored parameter_schema enforcement on POST /api/instructions/{id}/execute --
 
 namespace {
