@@ -9,7 +9,9 @@
 #include "installed_software_v3.hpp"
 #include "sync_canonical.hpp"
 
-#include "inventory_blob_v3.hpp" // the server's parser (header-only): the oracle for the wire
+// The server's parser (header-only): the oracle for the wire. Reached by path, not by putting
+// server/core/src on the agent tests' include path, so no server header can shadow an agent one.
+#include "../../server/core/src/inventory_blob_v3.hpp"
 
 #include <algorithm>
 #include <string>
@@ -881,6 +883,16 @@ TEST_CASE("write_v3_blob: the section count is capped at kV3MaxSections; the one
     CHECK(out.sent.size() == kV3MaxSections);
     CHECK(out.deferred == std::vector<std::string>{facets.back()});
     CHECK(parse_like_server(out.blob).sections.size() == kV3MaxSections);
+
+    // A status-only section past the cap is dropped, not deferred: waiting cannot make it fit
+    // and a deferral would hold `more` up for a section that carries no rows.
+    std::vector<SectionPlan> statuses;
+    for (const auto& f : facets)
+        statuses.push_back(status_section(f, V3Status::timeout, "t"));
+    const auto only_status = write_v3_blob(statuses);
+    CHECK(only_status.sent.size() == kV3MaxSections);
+    CHECK(only_status.deferred.empty());
+    CHECK(parse_like_server(only_status.blob).sections.size() == kV3MaxSections);
 }
 
 TEST_CASE("the acked value round-trips and anything torn reads as no acked set", "[v3][kv]") {
@@ -908,4 +920,10 @@ TEST_CASE("the acked value round-trips and anything torn reads as no acked set",
     std::string nonhex = v;
     nonhex[70] = 'g';
     CHECK_FALSE(acked_decode(nonhex).has_value());
+    // The row cap on the stored value: a KV row no plan could have written is torn, not trusted.
+    std::string over = std::string(kEmptyHash) + "\n";
+    for (std::size_t i = 0; i <= kV3MaxRows; ++i)
+        over += kEmptyHash;
+    CHECK_FALSE(acked_decode(over).has_value());
+    CHECK(acked_decode(over.substr(0, over.size() - 64)).has_value()); // exactly kV3MaxRows reads
 }

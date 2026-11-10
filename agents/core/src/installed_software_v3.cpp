@@ -508,6 +508,10 @@ SectionPlan plan_section(std::string facet, std::vector<SwEntry> rows,
     hdr.status = V3Status::full;
     std::string probe;
     append_section_header(probe, hdr);
+    // The probe renders duration_ms and bytes_read as "0", so the written header can be up to 36
+    // bytes (two int64 digit runs) longer than measured. Safe: the budget already holds back a
+    // 256-byte status reserve for this section's own slot, so a FULL section admitted at the
+    // budget still fits the blob alone (write_v3_blob measures the real bytes anyway).
     p.full_bytes = full_bytes + probe.size();
     if (p.full_bytes > kV3SectionByteBudget) {
         p.status = V3Status::oversize;

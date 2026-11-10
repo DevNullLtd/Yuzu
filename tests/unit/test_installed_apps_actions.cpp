@@ -384,19 +384,16 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     CHECK(bad_field_count == 0);
     CHECK(bad_sig_value == 0);
     CHECK(publisher_without_signature == 0);
-    // A location is whatever system_profiler reported for the host's apps (the sync writer keeps
-    // it only under a machine root), so how many rows carry one depends on the host and is only
-    // reported; the shape every one must have is the contract.
+    // How many rows carry a location depends on the host (the sync writer later keeps it only
+    // under a machine root); the shape every one must have is the contract.
     INFO("apps with an install_location: " << apps_with_location);
-    // system_profiler reports a Location for the bundles it lists, so any host with an app row has
-    // at least one. Without this the check below passes when every token is empty, and dropping
-    // the assignment of the .app path (the row's primary value, row 1.4) would go unnoticed.
-    // HOST-GATED: this mutation claim holds only on a healthy Mac. A degraded or empty
-    // system_profiler run reaches the SKIP above (or `app_rows == 0` here) and reports skipped, not
-    // red, so a CI Mac with a degraded profiler proves nothing about the assignment; the pure
-    // record build has no fixture test yet.
-    if (app_rows > 0)
-        CHECK(apps_with_location >= 1);
+    // The parser's Location capture (test_installed_apps_parsers.cpp) and the 14th-token layout
+    // (test_installed_apps_inventory.cpp, format_inv_row) are fixture-pinned. The one line between
+    // them, the plugin's copy of the parsed path into the record (row 1.4), is only reachable
+    // through a real dispatch, so it is asserted here: a healthy system_profiler run (anything
+    // else SKIPped above) lists at least one bundle with a Location. Unconditional on purpose:
+    // `app_rows == 0` is already red at the CHECK below, so a gate here would only hide this one.
+    CHECK(apps_with_location >= 1);
     CHECK(relative_locations == 0);
 
     // The #2273 enrichment actually ran and populated the previously
