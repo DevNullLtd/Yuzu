@@ -1,28 +1,40 @@
 name: Release legs (daily dispatch)
 
-# Daily release/LTO coverage of `dev` (CI speed programme, PR 1).
+# Daily release/LTO coverage of `dev` (docs/ci-architecture.md, Tier 2b).
 #
 # A push to `dev` no longer builds ci.yml's release legs (Linux gcc-15 release
 # LTO, Linux clang-21 release, Windows MSVC release LTO, macOS release LTO):
 # they cost 9-23 min of self-hosted runner time per push and gate nothing (no
 # release leg is a required check). This workflow puts them back on a daily
 # cadence instead: it dispatches ci.yml against dev's tip with `legs=release`,
-# which expands to the release legs only (the debug legs already ran on that
-# commit's push). A push to `main` (release promotion) still runs the whole
+# which expands to the release legs only (the debug legs normally already ran
+# on that commit's push). This is the only place the test suite runs in
+# release/NDEBUG mode between promotions: release.yml builds with
+# -Dbuild_tests=false. A push to `main` (release promotion) still runs the whole
 # matrix, so every release candidate is built in release mode before it tags.
 #
-# It skips when dev's tip already has a release-legs dispatch run that
-# succeeded or is still in flight, so a quiet day costs nothing.
+# It skips when dev's tip already has a ci.yml dispatch run (legs=release or
+# all) that succeeded or is still in flight, so a quiet day costs nothing. Two
+# known limits of that check, both accepted: a dispatch run counts as covered
+# even if a pool was unhealthy (that run fails preflight-gate, so it is not a
+# `success` and is retried); and the run checks out `refs/heads/dev` when its
+# jobs start, so if dev moves in between it builds a newer commit than the one
+# recorded here — the next day's check then sees an uncovered tip and runs.
+#
+# A red dispatch opens (or comments on) a `release-legs-broken` issue and the
+# next green one closes it — ci.yml's release-legs-alert / -close-on-green
+# jobs — because a run started by github-actions[bot] emails nobody.
 #
 # LIVE ONLY FROM `main`: a `schedule:` trigger fires from the default branch
 # alone, so this cron starts at the first dev -> main promotion carrying this
 # file. Until then, run it by hand:
-#   gh workflow run release-legs-nightly.yml --ref dev
+#   gh workflow run release-legs-daily.yml --ref dev
 # or dispatch ci.yml directly:
 #   gh workflow run ci.yml --ref dev -f legs=release
 #
-# 02:30 UTC sits clear of Big Tam's 01:00 Postgres restart and nightly.yml's
-# 06:00 run. The dispatched run lands in ci.yml's own `-dispatch` concurrency
+# 02:30 UTC is NOMINAL: GitHub starts scheduled runs late under load (hours,
+# per codeql.yml's notes), so it can overlap the nightly/CodeQL window; a delay
+# cannot pull it back before Big Tam's 01:00 Postgres restart. The dispatched run lands in ci.yml's own `-dispatch` concurrency
 # group, so it never displaces a queued dev push run.
 #
 # The dispatch uses GITHUB_TOKEN: a workflow_dispatch event is one of the two
@@ -37,7 +49,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-legs-nightly
+  group: release-legs-daily
   cancel-in-progress: false
 
 jobs:

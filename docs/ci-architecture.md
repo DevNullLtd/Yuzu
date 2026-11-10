@@ -42,27 +42,52 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `docs-required-checks` stubs instead of the matrix, so the required contexts
   still appear on the `main` commit a release tags. See "Docs-only changes
   (#1978, #5320)" below.
-- **Tier 2b — daily release legs on dev** (`release-legs-nightly.yml`, cron
-  `30 2 * * *` UTC + `workflow_dispatch`): dispatches `ci.yml` against dev's tip
-  with `legs=release`, which expands to the four release legs only (Linux
-  gcc-15 release LTO, Linux clang-21 release, Windows MSVC release LTO, macOS
-  release LTO) — the debug legs already ran on that commit's push. It skips when
-  dev's tip already has a dispatch run that succeeded or is in flight. No
+- **Tier 2b — daily release legs on dev** (`release-legs-daily.yml`, cron
+  `30 2 * * *` UTC — nominal, GitHub starts scheduled runs late under load —
+  plus `workflow_dispatch`): dispatches `ci.yml` against dev's tip with
+  `legs=release`, which expands to the four release legs only (Linux gcc-15
+  release LTO, Linux clang-21 release, Windows MSVC release LTO, macOS release
+  LTO); the debug legs normally already ran on that commit's push. It skips
+  when dev's tip already has a dispatch run that succeeded or is in flight. No
   release leg is a required check, so moving them off the per-push path costs
-  no gating; it saves 9–23 min of self-hosted runner time per dev push, and a
-  release-only defect now surfaces within a day instead of within one push
-  (`main` pushes still build release, so nothing tags untested in release
-  mode). The dispatched run uses its own `-dispatch` concurrency group: GitHub
-  keeps one pending run per group, so sharing the dev push group would let a
-  dispatch evict a queued push run and strip that commit of its required
-  contexts. A direct dispatch is told apart from the trusted-fork
-  `workflow_call` path by `inputs.head_sha` (a reusable workflow inherits its
-  caller's `workflow_dispatch` event name), so trusted-fork runs still expand
-  the full debug + release matrix. **The cron fires only from `main`**, so it
-  goes live at the first dev → main promotion carrying the file; until then run
-  `gh workflow run release-legs-nightly.yml --ref dev` (or
-  `gh workflow run ci.yml --ref dev -f legs=release`) by hand. `-f legs=all`
-  runs the full matrix on any branch.
+  no gating; it saves 9–23 min of self-hosted runner time per leg per dev push.
+  These legs are the only place the test suite runs in release/NDEBUG mode
+  between promotions (`release.yml` builds with `-Dbuild_tests=false`), so a
+  release-only defect now surfaces within about a day instead of on the push
+  that caused it; `main` pushes still build release, so nothing tags untested
+  in release mode.
+  - **Failure signal.** A dispatched run is started by `github-actions[bot]`,
+    which emails nobody, so `ci.yml`'s `release-legs-alert` job opens (or
+    comments on) a `release-legs-broken` issue when a direct dispatch fails,
+    and `release-legs-close-on-green` closes it on the next fully green one.
+    There is no merge discipline attached, unlike `nightly-broken`.
+  - **Mechanism.**
+    - **Concurrency.** The dispatched run uses its own `-dispatch` concurrency
+      group. GitHub keeps one pending run per group, so sharing the dev push
+      group would let a dispatch evict a queued push run and strip that
+      commit of its required contexts.
+    - **Matrix.** The `include:` lists are conditional on a `legs=release`
+      dispatch, since GitHub applies `include:` after `exclude:`.
+    - **Refs.** A direct dispatch is accepted on `dev` and `main` only:
+      `trusted_inputs` fails it closed on any other ref. A dispatch posts the
+      ruleset's required job names built from the bare branch head, and on a
+      PR branch that could shadow the merge-result checks. A refused dispatch
+      turns "Preflight (runner health)" red, so it blocks rather than
+      unblocks.
+    - **Trusted-fork path.** A direct dispatch is told apart from the
+      trusted-fork `workflow_call` path by `inputs.head_sha`, because a
+      reusable workflow inherits its caller's `workflow_dispatch` event name.
+      Trusted-fork runs still expand the full debug + release matrix.
+  - **Go-live.** The cron fires only from `main`, so it goes live at the first
+    dev → main promotion carrying the file. Until then, run
+    `gh workflow run release-legs-daily.yml --ref dev` (or
+    `gh workflow run ci.yml --ref dev -f legs=release`) by hand.
+    `-f legs=all` runs the full matrix on `dev` or `main`.
+  - **Bisecting a red day.** A direct dispatch is accepted on `dev`/`main`
+    only, and PR runs never build release, so CI cannot bisect it. Bisect
+    locally instead: check out each candidate commit and build the release
+    configuration (`./scripts/setup.sh --buildtype release --lto --tests`),
+    then run the failing test.
 - **Tier 3 — nightly cron** (`nightly.yml`, `0 6 * * *` UTC +
   `workflow_dispatch`): ASan+UBSan, TSan, coverage on the Big Tam pool
   (`yuzu-bigtam-linux`, gated on `bigtam_pool_healthy`), plus a Windows ASan
@@ -1319,8 +1344,9 @@ cross-job contention explicitly unmeasured at merge time, and it turned out
 NOT to be a rare edge case: the post-split E/G pair was still measured at
 86–96% of that ceiling across several runs the same week `--num-processes 2`
 shipped, and a subsequent push to `dev` timed E out again at exactly 600.01s.
-The mechanism: a single push to `dev` launches its own 4-way Linux matrix
-(gcc-15/clang-21 × debug/release) **simultaneously**, saturating all 4 Big Tam
+The mechanism: a single push to `dev` launched its own 4-way Linux matrix
+(gcc-15/clang-21 × debug/release; since Tier 2b a `dev` push expands only the
+2 debug legs, a `main` push is still 4-way) **simultaneously**, saturating all 4 Big Tam
 runners by itself — so Big Tam was never suffering primarily from OTHER
 unrelated jobs the way Wee Tam does, but its OWN push-triggered matrix is
 enough on its own. A concurrently-queued PR's Linux job was directly observed
@@ -1710,14 +1736,19 @@ all 4 Linux legs, ~85% of each job's time, vs 2 Windows legs both running
 the same full set on their own 4-runner box) is cut by narrowing what the
 non-primary legs run on both platforms: Linux's 3 non-primary legs and
 Windows' release leg (a `main` push or the Tier 2b daily dispatch only; PRs
-and `dev` pushes are debug-only, so only one Windows leg runs there) now run the `[pg-smoke]` subset instead. The Linux `matrix:` carries a
+and `dev` pushes are debug-only, so only one Windows leg runs there) now run
+the `[pg-smoke]` subset instead. The Linux `matrix:` carries a
 `pg_mode: full|smoke` key, added via `include:` on the existing
 compiler/build_type combinations — never a third axis (would double the
 matrix and break `max-parallel`'s 4-runner arithmetic) and never in the
 job `name:` (job names are the branch-protection ruleset's required-check
 contexts; `docs-required-checks` mirrors them). `full` resolves on
 gcc-15/debug only (every PR, plus that leg's push); the other three push
-legs (clang-21/debug, gcc-15/release, clang-21/release) resolve to `smoke`.
+legs (clang-21/debug, gcc-15/release, clang-21/release) resolve to `smoke`
+(the release legs run only on a `main` push or the Tier 2b dispatch). The
+`include:` list is conditional: on a `legs=release` dispatch it is the smoke
+default alone, because GitHub applies `include:` after `exclude:` and a static
+gcc-15/debug entry would re-add the excluded debug leg as a new combination.
 
 The smoke set is 11 hand-picked `[pg-smoke]`-tagged existing cases (no new
 test bodies) covering: libpq connection/RAII (`test_pg_raii.cpp`),
@@ -1813,8 +1844,8 @@ fix earlier in this section (`with-test-slot.sh`) gates contention only
 cannot START because no runner is free. That is a structurally lower-level
 gap than any of the three fixes above address, and the 35-minute-wait
 incident that paragraph cites is actually an instance of THIS gap, not one
-`with-test-slot.sh` closes: a `dev`/`main` push's own 4-way Linux matrix
-could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
+`with-test-slot.sh` closes: a `main` push's (and, before Tier 2b, a `dev`
+push's) own 4-way Linux matrix could claim all 4 Big Tam runners simultaneously, leaving nothing reserving
 a runner for a concurrently-queued PR job. Fix: `ci.yml`'s Linux job's
 `strategy.max-parallel: 3` (3 at the time; 4 since 2026-10-21, see the update
 below) caps how many legs of that SAME matrix run
@@ -1834,7 +1865,7 @@ which needs direct access to the Big Tam box and is tracked as a follow-up
 on #3443, not done here.
 
 **Update 2026-10-21 — `max-parallel` 3 → 4.** The cap is now 4 (all four Big
-Tam runners): a `dev`/`main` push's 2x2 matrix runs in one wave instead of two,
+Tam runners): a `main` push's 2x2 matrix (a `dev` push's before Tier 2b) runs in one wave instead of two,
 which shortens the push's wall. The trade is the one named above, accepted by
 the owner: that push now claims every runner at once, so a concurrently-queued
 PR's Linux leg waits for a runner. `with-test-slot.sh 3` still caps the heavy
@@ -2818,7 +2849,7 @@ value sets it itself.
 | Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
 | Linux (other push legs) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
 | Windows (debug, every PR + push) | full (14 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
-| Windows (release, push only) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR |
+| Windows (release, `main` push or Tier 2b dispatch) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR or `dev` push |
 | macOS | none (ADR-0035) | n/a | server is Linux-only |
 
 **#3508 (moving pg shards off Windows PRs entirely) is deliberately NOT

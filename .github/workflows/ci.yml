@@ -44,16 +44,17 @@ on:
     # a docs-only PR skips them, and a *skipped* required check is satisfied
     # whereas an *absent* one is not. The `push:` trigger above now does the
     # same (#5320).
-  # Release-leg schedule (CI speed programme, PR 1). A push to `dev` no longer
+  # Release-leg schedule (docs/ci-architecture.md, Tier 2b). A push to `dev` no longer
   # builds the release/LTO legs (see the matrix excludes below); they run
-  # instead from a daily dispatch, `release-legs-nightly.yml`, against dev's
+  # instead from a daily dispatch, `release-legs-daily.yml`, against dev's
   # tip, and on every push to `main` (release promotion) as before. The input
   # picks which build_type legs a direct dispatch expands to. A dispatch is
   # told apart from the trusted-fork `workflow_call` path by `inputs.head_sha`
   # (empty here, always set by trusted-fork-ci.yml), because a reusable
   # workflow inherits its caller's `github.event_name` — and that caller is
   # itself a workflow_dispatch. The trusted-fork path is unchanged: it still
-  # expands the full debug + release matrix.
+  # expands the full debug + release matrix. A direct dispatch is accepted on
+  # `dev` and `main` only; trusted_inputs refuses any other ref (see there).
   workflow_dispatch:
     inputs:
       legs:
@@ -89,7 +90,7 @@ permissions:
 
 concurrency:
   # The `-dispatch` suffix keeps a scheduled release-legs dispatch on dev
-  # (release-legs-nightly.yml) out of the dev PUSH group. GitHub keeps at most
+  # (release-legs-daily.yml) out of the dev PUSH group. GitHub keeps at most
   # one PENDING run per group and a newer one replaces it, so sharing the group
   # would let a dispatch evict a queued push run — that push commit would then
   # carry no required contexts, and the next push's codegate (which needs the
@@ -173,6 +174,25 @@ jobs:
           # inputs.head_sha — which only the trusted wrapper supplies — is the
           # call-boundary discriminator. Do not use github.event_name here.
           if [[ -z "$APPROVED_SHA" ]]; then
+            # A DIRECT workflow_dispatch (no head_sha: not the trusted-fork
+            # call) is accepted on `dev` and `main` only, and FAILS CLOSED on
+            # any other ref. A dispatch builds the bare branch head and posts
+            # the same job names the branch-protection ruleset requires
+            # ("Preflight (runner health)", "Linux gcc-15 debug", ...). On a
+            # same-repo PR branch that would let an Actions-write user put a
+            # green required context, computed from the head rather than the
+            # refs/pull/N/merge result the PR gate builds, onto the PR's head
+            # SHA with nothing reviewable in the diff (governance Gate 2,
+            # 2026-11-10). The daily release-legs dispatch targets dev, and a
+            # by-hand dispatch on main is the only other use this trigger has.
+            # Same github.event_name expression form as the two checks below; this
+            # is already inside the not-a-trusted-call branch, so the event
+            # name is safe to read here (the discriminator above is head_sha).
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" \
+                  && "$GITHUB_REF" != "refs/heads/dev" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "::error::ci.yml may be dispatched directly only on refs/heads/dev or refs/heads/main (got '$GITHUB_REF'). A dispatch posts the ruleset's required check names; on any other ref it could shadow a PR's merge-result checks. Open a PR, or use trusted-fork-ci.yml for a fork."
+              exit 1
+            fi
             echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
             # PIN the checkout to the event's own commit, exactly as the trusted
             # path below does with $head_sha. NOT ${GITHUB_REF}: on a
@@ -775,9 +795,10 @@ jobs:
       # exactly 4 yuzu-bigtam-linux runner agents on one box, so a `main` push's
       # (or a `legs=all` dispatch's) whole 2x2 matrix runs in one wave instead of
       # two; a `dev` push expands to the 2 debug legs only, and the daily
-      # release-legs dispatch to the 2 release legs only. That cuts
-      # the push's wall time. The price: that push claims all 4 runners at once,
-      # so a concurrently-queued PR's single Linux leg waits at the
+      # release-legs dispatch to the 2 release legs only. Running a whole
+      # matrix in one wave cuts the push's wall time. The price: that push
+      # claims all 4 runners at once, so a concurrently-queued PR's single
+      # Linux leg waits at the
       # RUNNER-ACQUISITION level — below with-test-slot.sh, which only gates
       # contention *inside* a job that already has a runner (docs/ci-architecture.md
       # "Cross-job"). That is the case the former cap of 3 was added for: with all 4
@@ -797,10 +818,11 @@ jobs:
         exclude:
           # PRs: only gcc-15 debug (fast feedback).
           # Release/LTO legs: not on a PR and not on a push to dev; they run on a
-          # push to main and from the daily dispatch (release-legs-nightly.yml).
+          # push to main and from the daily dispatch (release-legs-daily.yml).
           # A direct dispatch with legs=release (the default) drops the debug
-          # legs, which every dev push already ran. Same three expressions in
-          # the windows and macos matrices below — keep them in lockstep.
+          # legs, which every dev push normally already ran. The two build_type
+          # excludes are repeated in the windows and macos matrices below —
+          # keep all three in lockstep.
           - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
           - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-21' || 'NONE' }}
@@ -819,10 +841,11 @@ jobs:
         # then the gcc-15/debug override to full. On a PR the exclude above has
         # already trimmed the matrix to the single gcc-15/debug leg, so both
         # include entries match that one leg and the net result is pg_mode=full
-        # — PR coverage is unaffected. Wherever it expands, gcc-15/debug ends up
+        # — PR coverage is unaffected. Wherever gcc-15/debug expands, it ends up
         # full and the other three legs (clang-21/debug, gcc-15/release,
         # clang-21/release) stay smoke; a dev push now expands only the two debug
-        # legs, the release legs come from main pushes and the daily dispatch. Item 4 of the original plan (a periodic full clang-release
+        # legs, the release legs come from main pushes and the daily dispatch.
+        # Item 4 of the original plan (a periodic full clang-release
         # PG run to cover the optimizer/NDEBUG-sensitive residual smoke can't
         # reach) is deliberately DEFERRED — Phase 6A (the nightly slot-gate
         # narrowing this would need to join) is shelved and nightly.yml only
@@ -830,11 +853,16 @@ jobs:
         # now; landing an ungated periodic leg would reintroduce exactly the
         # uncoordinated-contention problem Phase 6A exists to close. Tracked on
         # #3443, not silently dropped.
-        include:
-          - pg_mode: smoke
-          - compiler: gcc-15
-            build_type: debug
-            pg_mode: full
+        #
+        # The include list is CONDITIONAL. GitHub applies include: after
+        # exclude:, and an include entry that matches no surviving combination
+        # is ADDED as a new one — so on a `legs=release` dispatch, where the
+        # exclude above has removed both debug legs, a static gcc-15/debug entry
+        # would silently add the most expensive leg (full PG shards) back. On
+        # that dispatch the list is just the smoke default; everywhere else it
+        # is the two entries described above. The Resolve-pg_mode step asserts
+        # that a `legs=release` dispatch never expands a debug leg.
+        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && '[{"pg_mode":"smoke"}]' || '[{"pg_mode":"smoke"},{"compiler":"gcc-15","build_type":"debug","pg_mode":"full"}]') }}
 
     steps:
       # PR-5 of the CI overhaul plan: normal CI keeps clean:false to preserve
@@ -1153,6 +1181,7 @@ jobs:
           PG_MODE: ${{ matrix.pg_mode }}
           MATRIX_COMPILER: ${{ matrix.compiler }}
           MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
+          DISPATCH_RELEASE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'true' || 'false' }}
         run: |
           case "$PG_MODE" in
             full|smoke) ;;
@@ -1176,8 +1205,16 @@ jobs:
           # 4-leg PG-shard contention this change exists to fix silently
           # returns. GITHUB_EVENT_NAME is one of GitHub Actions' own default
           # step env vars, set on every run - no extra wiring needed.
-          if [[ "$GITHUB_EVENT_NAME" == "push" && ! ( "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" ) && "$PG_MODE" != "smoke" ]]; then
-            echo "::error::$MATRIX_COMPILER/$MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces the 4-leg full-PG-shard contention #3443 Phase 2 exists to fix"
+          # Since the daily release-legs dispatch (release-legs-daily.yml) the
+          # release legs mostly run from a workflow_dispatch, so the guard
+          # covers that event too; and a `legs=release` dispatch must never
+          # expand a debug leg at all (the conditional include: above).
+          if [[ "$DISPATCH_RELEASE_ONLY" == "true" && "$MATRIX_BUILD_TYPE" == "debug" ]]; then
+            echo "::error::$MATRIX_COMPILER/debug expanded on a legs=release dispatch — the conditional matrix include: is broken; this re-runs a debug leg the dispatch exists to skip"
+            exit 1
+          fi
+          if [[ ( "$GITHUB_EVENT_NAME" == "push" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ) && ! ( "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" ) && "$PG_MODE" != "smoke" ]]; then
+            echo "::error::$MATRIX_COMPILER/$MATRIX_BUILD_TYPE on a $GITHUB_EVENT_NAME resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces the 4-leg full-PG-shard contention #3443 Phase 2 exists to fix"
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
@@ -1857,10 +1894,10 @@ jobs:
         # PR coverage is unchanged by this); release runs the pg smoke
         # subset instead, on a push to main or the daily release-legs
         # dispatch (the only events that build release on Windows).
-        include:
-          - pg_mode: smoke
-          - build_type: debug
-            pg_mode: full
+        # Conditional for the same reason as the linux include (a static
+        # debug entry would re-add the excluded debug leg on a `legs=release`
+        # dispatch); keep the two in lockstep.
+        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && '[{"pg_mode":"smoke"}]' || '[{"pg_mode":"smoke"},{"build_type":"debug","pg_mode":"full"}]') }}
 
     steps:
       # PR-5 of the CI overhaul plan: normal CI keeps clean:false on the persistent
@@ -2115,6 +2152,7 @@ jobs:
         env:
           PG_MODE: ${{ matrix.pg_mode }}
           MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
+          DISPATCH_RELEASE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'true' || 'false' }}
         run: |
           case "$PG_MODE" in
             full|smoke) ;;
@@ -2136,8 +2174,14 @@ jobs:
           # resolve to smoke, or a future include: edit could silently send
           # every leg back to full and reintroduce full-PG-shard contention
           # on every push.
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$MATRIX_BUILD_TYPE" != "debug" && "$PG_MODE" != "smoke" ]]; then
-            echo "::error::Windows $MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces full-PG-shard contention on every Windows push"
+          # Dispatch-aware, as in the Linux step (the daily release-legs
+          # dispatch is now where the release leg usually runs).
+          if [[ "$DISPATCH_RELEASE_ONLY" == "true" && "$MATRIX_BUILD_TYPE" == "debug" ]]; then
+            echo "::error::Windows debug expanded on a legs=release dispatch — the conditional matrix include: is broken"
+            exit 1
+          fi
+          if [[ ( "$GITHUB_EVENT_NAME" == "push" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ) && "$MATRIX_BUILD_TYPE" != "debug" && "$PG_MODE" != "smoke" ]]; then
+            echo "::error::Windows $MATRIX_BUILD_TYPE on a $GITHUB_EVENT_NAME resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces full-PG-shard contention on every Windows push"
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
@@ -2362,9 +2406,10 @@ jobs:
               "${suites[@]}"
           python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows pg shards"
 
-      # if: matrix.pg_mode == 'smoke' — only the release leg on a push (PRs
-      # are debug-only, so this step never runs on a PR; verified post-merge
-      # by the first dev push, not pre-merge). Deliberately UNGATED, mirroring
+      # if: matrix.pg_mode == 'smoke' — only the release leg, which runs on a
+      # `main` push or the daily release-legs dispatch (PRs and `dev` pushes
+      # are debug-only, so this step never runs on either; it was verified
+      # post-merge by the first push that built release, not pre-merge). Deliberately UNGATED, mirroring
       # the Linux smoke step: the smoke set costs seconds, far cheaper than
       # the slot-wait it would otherwise pay.
       - name: Test (pg smoke)
@@ -2891,8 +2936,8 @@ jobs:
   # Since #5320 the same holds for a docs-only PUSH to main/dev, so the commit a
   # release tags carries every required context even when it changed only
   # CHANGELOG.md. On a push the real matrix has more legs (clang-21, and
-  # release builds on main); only the three required names are stubbed, because only they
-  # gate anything.
+  # release builds on main); only the three required names are stubbed,
+  # because only they gate anything.
   docs-required-checks:
     name: ${{ matrix.check }}
     needs: [preflight-gate]
@@ -3436,3 +3481,142 @@ jobs:
         with:
           path: ~/.cache/ccache
           key: ${{ steps.cache-ccache-canary.outputs.cache-primary-key }}
+
+  # ── Daily release-legs dispatch: failure signal ─────────────────────────
+  # The daily dispatch (release-legs-daily.yml) runs as github-actions[bot],
+  # so a red run notifies nobody — unlike a red release leg on a dev push,
+  # which emailed the pusher. These two jobs restore the signal with the
+  # nightly-broken pattern (nightly.yml `alert:` / `close-on-green:`): open or
+  # comment on a `release-legs-broken` issue when the dispatch fails, close it
+  # when a later dispatch is green. Unlike nightly-broken it carries no merge
+  # discipline of its own; it exists so a release-only regression is seen
+  # within a day. Direct dispatches only (`!inputs.head_sha` excludes the
+  # trusted-fork call, which inherits workflow_dispatch as its event name).
+  # `!cancelled()` keeps an operator's whole-run cancel from opening an issue;
+  # a job that ended cancelled while the run went on (a timeout or a lost
+  # runner) still counts, as in nightly.yml. preflight-gate is in `needs` so
+  # an unhealthy runner pool, which fails it and skips every leg, also alerts.
+  release-legs-alert:
+    name: "Open release-legs-broken on failure"
+    needs: [preflight-gate, linux, windows, macos]
+    # The ref clause keeps a dispatch REFUSED by trusted_inputs (any ref but
+    # dev/main; it fails, so failure() is true) from opening an alert.
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && !inputs.head_sha && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') && (failure() || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write  # open/comment the release-legs-broken alert issue
+    steps:
+      - name: Open or update release-legs-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          LEGS: ${{ inputs.legs }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        with:
+          script: |
+            const label = 'release-legs-broken';
+            const failedJobs = [];
+            const ctx = JSON.parse(process.env.NEEDS_JSON);
+            for (const [name, job] of Object.entries(ctx)) {
+              if (job.result === 'failure') failedJobs.push(name);
+              else if (job.result === 'cancelled') failedJobs.push(`${name} (timed out/cancelled)`);
+            }
+            const summary = failedJobs.length
+              ? failedJobs.join(', ')
+              : 'unknown (alert fired without specific job failures)';
+            const body = [
+              `Release-legs dispatch (\`legs=${process.env.LEGS}\`) failed on \`${process.env.REF_NAME}\` @ \`${process.env.SHA.substring(0, 7)}\`.`,
+              ``,
+              `**Failed jobs:** ${summary}`,
+              ``,
+              `**Run:** ${process.env.RUN_URL}`,
+              ``,
+              `A release-only regression landed on dev since the last green dispatch. Bisect recipe: docs/ci-architecture.md, Tier 2b.`,
+              ``,
+              `(auto-posted by .github/workflows/ci.yml — closed automatically by the next green dispatch.)`,
+            ].join('\n');
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 5,
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body,
+              });
+              core.notice(`Commented on existing release-legs-broken issue #${existing.data[0].number}`);
+            } else {
+              const created = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Release legs broken on ${process.env.REF_NAME}: ${summary}`,
+                labels: [label],
+                body,
+              });
+              core.notice(`Opened release-legs-broken issue #${created.data.number}`);
+            }
+
+  # Symmetric counterpart: a fully green direct dispatch closes every open
+  # release-legs-broken issue. `success()` with these needs means every leg job
+  # ran and passed — a leg skipped by an unhealthy pool keeps the job skipped,
+  # so a run that built nothing in release never closes the alert.
+  release-legs-close-on-green:
+    name: "Close release-legs-broken on green"
+    needs: [preflight-gate, linux, windows, macos]
+    if: ${{ success() && github.event_name == 'workflow_dispatch' && !inputs.head_sha && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write  # comment on and close the release-legs-broken alert issue
+    steps:
+      - name: Close any open release-legs-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        with:
+          script: |
+            const label = 'release-legs-broken';
+            const body = [
+              `Release-legs dispatch on \`${process.env.REF_NAME}\` @ \`${process.env.SHA.substring(0, 7)}\` is **green**.`,
+              ``,
+              `**Run:** ${process.env.RUN_URL}`,
+              ``,
+              `(auto-closed by .github/workflows/ci.yml — re-opened by the alert job if a later dispatch fails.)`,
+            ].join('\n');
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 100,
+            });
+            if (open.data.length === 0) {
+              core.notice('No open release-legs-broken issues to close.');
+              return;
+            }
+            for (const issue of open.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.notice(`Closed release-legs-broken issue #${issue.number}`);
+            }
