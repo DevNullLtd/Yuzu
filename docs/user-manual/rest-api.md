@@ -1015,7 +1015,7 @@ Assign a role to a principal within this management group. Only the `Operator` a
 
 Remove a role assignment from this management group.
 
-**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group. Same service-scoped-token, MCP-tier and engine-session denial as `POST` above. A caller admitted only as `ITServiceOwner` on this group can remove only `Operator` and `Viewer` rows (the roles `POST` can delegate), otherwise the response is `403` with `only Operator and Viewer roles can be delegated`; a caller holding the global permission can remove any role.
+**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group. Same service-scoped-token, MCP-tier and engine-session denial as `POST` above. A caller admitted only as `ITServiceOwner` on this group can remove only `Operator` and `Viewer` rows (the roles `POST` can delegate), otherwise the response is `403` with `an ITServiceOwner of this group can remove only Operator and Viewer roles`; a caller holding the global permission can remove any role.
 
 **Request body:**
 

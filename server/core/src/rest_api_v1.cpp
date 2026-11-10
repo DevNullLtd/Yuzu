@@ -5078,8 +5078,10 @@ void RestApiV1::register_routes(
             // it delegate (Operator, Viewer): it cannot remove a peer owner's row.
             if (owner_only && role_name != "Operator" && role_name != "Viewer") {
                 res.status = 403;
-                res.set_content(detail::a4_error(res, "only Operator and Viewer roles can be delegated"),
-                                "application/json");
+                res.set_content(
+                    detail::a4_error(res, "an ITServiceOwner of this group can remove only Operator and "
+                                          "Viewer roles"),
+                    "application/json");
                 return;
             }
 

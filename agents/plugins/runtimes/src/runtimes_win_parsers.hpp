@@ -42,9 +42,11 @@
  * '.' or ' ' (spellings the Win32 layer would rewrite and the NT open does not) is refused as
  * unreadable rather than resolved. A Windows build that rejects OBJ_DONT_REPARSE (the open answers
  * STATUS_INVALID_PARAMETER) reads every release file as unreadable, never through a path-based
- * fallback, and logs that cause once per process. The open has been exercised on Windows 11 only
- * and no Windows floor is claimed. A JVM key whose home value is present but empty, mistyped or
- * oversized records
+ * fallback, and logs that cause once per process. The open is exercised by the Windows-only cases
+ * `runtimes win: read_file_bounded follows no reparse point below the drive root` and
+ * `runtimes win: drive_relative_name*` (tests/unit/test_runtimes_win_walk.cpp) on the Windows test
+ * leg, and no Windows floor is claimed. A JVM key whose home value is present but empty, mistyped
+ * or oversized records
  * `windows:runtimes:jvm:home_unusable` (an absent value stays silent). The read has no deadline,
  * a disclosed residual on a dead FIXED volume.
  *

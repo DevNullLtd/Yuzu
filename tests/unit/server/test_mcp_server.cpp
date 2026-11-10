@@ -26683,6 +26683,46 @@ TEST_CASE("MCP query_installed_software: a wide-scope cursor never names an out-
     CHECK_FALSE(unflagged.contains("audit_persisted"));
 }
 
+TEST_CASE("MCP query_installed_software: a cursor whose skip passes the wide-scope ceiling is "
+          "invalid params; the ceiling itself is served",
+          "[mcp][pg][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<yuzu::server::SoftwareEntry> rows = {{"A", "1.0", "", ""}};
+    REQUIRE(store.apply_installed_software(
+                "agent-1", yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+            yuzu::server::InventoryIngestOutcome::kStored);
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+
+    namespace swc = yuzu::server::software_catalogue;
+    // A well-formed cursor for the unfiltered query whose only defect is its skip.
+    const auto with_skip = [&](std::int64_t skip) {
+        const auto token = swc::encode_devices_cursor(
+            {yuzu::server::SoftwareCursor{}, skip},
+            swc::devices_fingerprint(yuzu::server::SoftwareFleetQuery{}));
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                           R"("params":{"name":"query_installed_software","arguments":)"
+                           R"({"limit":1,"cursor":")" +
+                           token + R"("}}})");
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body);
+    };
+
+    const auto past = with_skip(swc::kWideScopeMaxSkip + 1);
+    REQUIRE(past.contains("error"));
+    CHECK(past["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(past["error"]["message"].get<std::string>().find("cursor refused") != std::string::npos);
+
+    // Honest paging is untouched: a skip AT the ceiling is still served.
+    const auto at = with_skip(swc::kWideScopeMaxSkip);
+    CHECK_FALSE(at.contains("error"));
+}
+
 TEST_CASE("MCP query_installed_software: an explicit out-of-scope agent_id is audited as one denied "
           "row",
           "[mcp][pg][inventory][security]") {

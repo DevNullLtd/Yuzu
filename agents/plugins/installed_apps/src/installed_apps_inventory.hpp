@@ -264,6 +264,13 @@ inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
     return r;
 }
 
+// The rpm `--queryformat` whose output parse_rpm_inv_line reads: ONE copy, passed to rpm by the
+// plugin and fed back through the parser by the unit test, so the producer and the parser cannot
+// drift apart. The two free-text tags (VENDOR, PACKAGER) stay last (see below).
+inline constexpr std::string_view kRpmInvQueryFormat =
+    "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t"
+    "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\t%{VENDOR}\t%{PACKAGER}\n";
+
 // One rpm line (at least 9 tab-separated tokens):
 //   NAME EPOCH VERSION RELEASE ARCH INSTALLTIME:date SIGPGP RSAHEADER VENDOR PACKAGER
 // The publisher is the declared VENDOR when set, else PACKAGER (a person, kept only as the

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <string>
+#include <string_view>
 
 using namespace yuzu::installed_apps::inventory;
 
@@ -355,6 +356,58 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR 
         CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\td\tonly-seven-tokens").has_value());
         CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\td\t(none)\t(none)").has_value());
     }
+}
+
+
+TEST_CASE("kRpmInvQueryFormat feeds parse_rpm_inv_line: every tag lands in its slot",
+          "[installed_apps][inventory]") {
+    // The producer half of the rpm contract. Each tag of the REAL query format expands to a
+    // distinct value and the resulting line is parsed, so reordering the format moves a value
+    // out of the slot the parser reads it from.
+    const auto value_for = [](std::string_view tag) -> std::string {
+        if (tag == "%{NAME}") return "pkg";
+        if (tag == "%{EPOCH}") return "7";
+        if (tag == "%{VERSION}") return "1.2";
+        if (tag == "%{RELEASE}") return "3.el9";
+        if (tag == "%{ARCH}") return "aarch64";
+        if (tag == "%{INSTALLTIME:date}") return "Mon 01 Jan 2026";
+        if (tag == "%{SIGPGP}") return "sigpgpblob";
+        if (tag == "%{RSAHEADER}") return "(none)";
+        if (tag == "%{VENDOR}") return "VendorCo";
+        if (tag == "%{PACKAGER}") return "Jane Packager";
+        return {};
+    };
+
+    std::string fmt{kRpmInvQueryFormat};
+    REQUIRE_FALSE(fmt.empty());
+    REQUIRE(fmt.back() == '\n');
+    fmt.pop_back();
+    const auto tags = detail::split_tabs(fmt);
+    REQUIRE(tags.size() == 10);
+    // The two free-text tags are the last two, in this order.
+    CHECK(tags[8] == "%{VENDOR}");
+    CHECK(tags[9] == "%{PACKAGER}");
+
+    std::string line;
+    for (std::size_t i = 0; i < tags.size(); ++i) {
+        const std::string v = value_for(tags[i]);
+        INFO("unmapped rpm tag: " << tags[i]);
+        REQUIRE_FALSE(v.empty());
+        if (i != 0)
+            line += '\t';
+        line += v;
+    }
+
+    const auto r = parse_rpm_inv_line(line);
+    REQUIRE(r.has_value());
+    CHECK(r->name == "pkg");
+    CHECK(r->epoch == "7");
+    CHECK(r->version == "1.2");
+    CHECK(r->release == "3.el9");
+    CHECK(r->arch == "aarch64");
+    CHECK(r->install_date == "Mon 01 Jan 2026");
+    CHECK(r->signature_status == "signed");
+    CHECK(r->publisher == "VendorCo"); // VENDOR, not PACKAGER
 }
 
 TEST_CASE("parse_pacman_inv_line splits name and EVR", "[installed_apps][inventory]") {

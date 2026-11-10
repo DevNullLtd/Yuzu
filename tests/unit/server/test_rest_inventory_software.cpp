@@ -1341,6 +1341,36 @@ TEST_CASE("REST inventory/software: cursor refusals — tampered; wrong filter s
     CHECK(count_audit(h, "inventory.software.query", "success", "page=continuation") == before + 1);
 }
 
+TEST_CASE("REST inventory/software: a cursor whose skip passes the wide-scope ceiling is 400; "
+          "the ceiling itself is served",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"A", "1", "", ""}});
+
+    InvHarness h{&store};
+    namespace swc = software_catalogue;
+    // A well-formed cursor for the unfiltered query whose only defect is its skip.
+    const auto with_skip = [&](std::int64_t skip) {
+        const auto token = swc::encode_devices_cursor(
+            {SoftwareCursor{}, skip}, swc::devices_fingerprint(SoftwareFleetQuery{}));
+        return h.sink.Get("/api/v1/inventory/software?limit=1&cursor=" + token);
+    };
+
+    auto past = with_skip(swc::kWideScopeMaxSkip + 1);
+    REQUIRE(past);
+    CHECK(past->status == 400);
+    CHECK(past->body.find("cursor refused") != std::string::npos);
+
+    // Honest paging is untouched: a skip AT the ceiling is still served.
+    auto at = with_skip(swc::kWideScopeMaxSkip);
+    REQUIRE(at);
+    CHECK(at->status == 200);
+}
+
 TEST_CASE("REST inventory/software: push-down returns COMPLETE pages of the caller's own scope",
           "[pg][rest][inventory_software][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);

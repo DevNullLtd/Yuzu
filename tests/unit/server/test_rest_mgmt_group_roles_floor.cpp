@@ -28,6 +28,7 @@
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePgShared
 #include "test_mgmt_group_pg_helper.hpp"
 #include "test_rbac_store_pg_helper.hpp" // PG-backed RbacStore (ADR-0041)
 #include "test_route_sink.hpp"
@@ -40,6 +41,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <ctime>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -54,6 +56,9 @@ struct GroupRolesHarness {
     yuzu::test::ManagementGroupStorePg mgmt_bundle; // SKIPs without a PG DSN
     yuzu::test::RbacStorePg rbac_bundle;             // SKIPs without a PG DSN
     RbacStore& rbac = *rbac_bundle;
+    /// Only the token-mint cases wire a token store (CRUD-only, so the process-wide shared clone
+    /// is enough); every other case leaves the route's token_store null as before.
+    std::optional<yuzu::test::ApiTokenStorePgShared> api_tokens;
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
@@ -72,8 +77,10 @@ struct GroupRolesHarness {
     std::string mock_mcp_tier;
     std::string mock_principal_kind{"human"};
 
-    GroupRolesHarness() {
+    explicit GroupRolesHarness(bool with_token_store = false) {
         REQUIRE(rbac.is_open());
+        if (with_token_store)
+            api_tokens.emplace();
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
@@ -101,7 +108,7 @@ struct GroupRolesHarness {
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac,
                             /*mgmt_store=*/&*mgmt_bundle,
-                            /*token_store=*/nullptr,
+                            /*token_store=*/api_tokens ? api_tokens->get() : nullptr,
                             /*quarantine_store=*/nullptr,
                             /*response_store=*/nullptr,
                             /*instruction_store=*/nullptr,
@@ -444,7 +451,9 @@ struct OwnerArmFixture {
     GroupRolesHarness h;
     std::string gid;
 
-    OwnerArmFixture(const char* group_name, bool caller_is_owner = true) {
+    OwnerArmFixture(const char* group_name, bool caller_is_owner = true,
+                    bool with_token_store = false)
+        : h(with_token_store) {
         ManagementGroup g;
         g.name = group_name;
         g.membership_type = "static";
@@ -533,12 +542,13 @@ TEST_CASE("DELETE /management-groups/{id}/roles: an owner-arm caller removes onl
                 .has_value());
     f.deny_fleet_wide();
 
-    // A peer owner row is refused with the same wording POST uses; nothing is removed.
+    // A peer owner row is refused with removal wording (not POST's "delegated" text);
+    // nothing is removed.
     auto refused = f.del(R"({"principal_id":"peer","role_name":"ITServiceOwner"})");
     REQUIRE(refused);
     CHECK(refused->status == 403);
-    CHECK(refused->body.find("only Operator and Viewer roles can be delegated") !=
-          std::string::npos);
+    CHECK(refused->body.find("can remove only Operator and Viewer roles") != std::string::npos);
+    CHECK(refused->body.find("can be delegated") == std::string::npos);
     CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).size() == 3);
 
     // An Operator row is removed.
@@ -569,4 +579,80 @@ TEST_CASE("GET /management-groups/{id}/roles: a human session without a tier is 
     auto res = f.h.sink.Get("/api/v1/management-groups/" + f.gid + "/roles");
     REQUIRE(res);
     CHECK(res->status == 200);
+}
+
+// ---------------------------------------------------------------------------
+// The REST service-scoped token mint (POST /api/v1/tokens with scope_service) decides the SAME
+// owner arm, against the "Service: <name>" group, with the fleet-wide ManagementGroup:Write
+// denied. The arm is reached only with RBAC enabled.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kServiceGroup = "Service: payroll";
+
+struct MintFixture : OwnerArmFixture {
+    explicit MintFixture(bool caller_is_owner = true)
+        : OwnerArmFixture(kServiceGroup, caller_is_owner, /*with_token_store=*/true) {
+        REQUIRE(h.rbac.set_rbac_enabled(true).has_value());
+        deny_fleet_wide();
+    }
+};
+
+auto mint_service_token(MintFixture& f) {
+    const auto expires_at = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+    return f.h.sink.Post("/api/v1/tokens",
+                         R"({"name":"owner-gate-mint","scope_service":"payroll","expires_at":)" +
+                             std::to_string(expires_at) + "}");
+}
+
+} // namespace
+
+TEST_CASE("POST /tokens: an ITServiceOwner of the service group mints a service-scoped token",
+          "[pg][rest][token][authz][owner_gate]") {
+    MintFixture f;
+    auto res = mint_service_token(f);
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    const auto tokens = f.h.api_tokens.value()->list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK(tokens->size() == 1);
+}
+
+TEST_CASE("POST /tokens: a caller who does not own the service group is refused",
+          "[pg][rest][token][authz][owner_gate]") {
+    MintFixture f(/*caller_is_owner=*/false);
+    auto res = mint_service_token(f);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("ITServiceOwner authority required") != std::string::npos);
+    const auto tokens = f.h.api_tokens.value()->list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK(tokens->empty());
+}
+
+TEST_CASE("POST /tokens: the owner arm refuses an MCP-tier session on REST",
+          "[pg][rest][token][authz][owner_gate]") {
+    MintFixture f;
+    f.h.mock_mcp_tier = "readonly";
+    auto res = mint_service_token(f);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("ITServiceOwner authority required") != std::string::npos);
+
+    // The same caller without a tier is admitted: the refusal above is the tier.
+    f.h.mock_mcp_tier.clear();
+    auto ok = mint_service_token(f);
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+}
+
+TEST_CASE("POST /tokens: the owner arm refuses an engine-classed session",
+          "[pg][rest][token][authz][owner_gate]") {
+    MintFixture f;
+    f.h.mock_principal_kind = "engine";
+    auto res = mint_service_token(f);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("ITServiceOwner authority required") != std::string::npos);
 }
