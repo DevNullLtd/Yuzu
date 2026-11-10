@@ -862,7 +862,7 @@ public:
             }
         }
 
-        // 1b''. Upgrade-window step (removed with the other legacy-name shims): the activity-record
+        // 1b''. Pre-rename install step (kept while a pre-rename tar.db can still exist): the activity-record
         // feature was renamed from TAR to Echo. Adopt a pre-rename tar.db as echo.db and re-key its
         // KV namespace, BEFORE any plugin init or dispatch (the plugin scan above only registers
         // descriptors and opens no database). This is the ONLY adopter - the plugins never

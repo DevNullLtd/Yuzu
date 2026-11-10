@@ -681,7 +681,7 @@ std::expected<bool, std::string> rename_pending(sqlite3* db, const char* from, c
     return !*have_to;
 }
 
-// Schema v9 (upgrade window, removed with the legacy-name shims): a database written before the
+// Schema v9 (kept while a pre-rename database can still exist): a database written before the
 // rename holds tar_state / tar_config / tar_cursor. Rename whichever of them exist, atomically, in
 // one transaction. Skipped when echo_config already exists (a fresh or already-renamed file).
 // An error return makes the caller refuse the open.
@@ -742,7 +742,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         }
     }
 
-    // Upgrade window (removed with the legacy-name shims): agent core adopts a legacy tar.db as
+    // Pre-rename install (kept while a tar.db can still exist): agent core adopts a legacy tar.db as
     // echo.db at boot, before any plugin initialises (adopt_legacy_echo_db). If echo.db is absent
     // and an unadopted tar.db sits beside it, creating a fresh echo.db here would boot the agent
     // with default config and re-enable operator-paused sources (the #559 class). Fail closed.

@@ -1,6 +1,6 @@
 // echo_db_legacy_rename.hpp -- adopt a pre-rename tar.db as echo.db.
 //
-// Upgrade-window helper (removed with the other legacy-name shims). Before the Echo rename the
+// Pre-rename install helper (kept while a pre-rename tar.db can still exist). Before the Echo rename the
 // activity-record database lived at <data_dir>/tar.db; it now lives at <data_dir>/echo.db. The
 // file keeps its DACL / mode and content, so adoption is a rename, nothing else.
 //
