@@ -79,6 +79,10 @@ inline constexpr std::string_view kPfAnchor = "com.apple/000.yuzu_quarantine";
 
 inline constexpr std::string_view kTtlTriggerId = "firewall.quarantine.ttl";
 inline constexpr int kTtlPollSeconds = 30; // the trigger engine's floor
+/// The agent-local self-check while a record exists: re-reads the leg and re-applies
+/// the STORED set when the host stopped enforcing it (see repair()).
+inline constexpr std::string_view kRepairTriggerId = "firewall.quarantine.repair";
+inline constexpr int kRepairPollSeconds = 60;
 
 inline constexpr std::size_t kMaxResolvers = 8;
 inline constexpr std::size_t kMaxExceptions = 64;
@@ -635,16 +639,45 @@ add_exceptions(AllowSet set, const std::vector<Endpoint>& add) {
     return static_cast<int>(*v);
 }
 
+/// The control endpoint of a live peer literal (`ip:port` / `[v6]:port`) -- what
+/// agents/core publishes as `agent.server_peer` (grpc_peer_literal of the stream the
+/// server actually answered on). The plugin never resolves a name: only an address
+/// literal that parses is an endpoint, and nothing else reaches the allow set.
+[[nodiscard]] inline std::optional<Endpoint> parse_live_peer(std::string_view literal) {
+    if (literal.empty())
+        return std::nullopt;
+    const auto port = extract_server_port(literal);
+    const auto host = yuzu::agent::extract_server_host(literal);
+    if (!port || host.empty())
+        return std::nullopt;
+    const auto ip = parse_ip(host);
+    if (!ip)
+        return std::nullopt;
+    Endpoint e;
+    e.ip = *ip;
+    e.port = *port;
+    e.proto = Proto::tcp;
+    e.dir = Dir::out;
+    return e;
+}
+
 /// loopback + control endpoints + DHCP + DNS resolvers + ICMPv6 ND are the
 /// mandatory part (emitted by flatten()); this builds the variable part.
 /// `control_ips_csv` is the agent's startup-resolved `agent.server_address_
 /// resolved`; a literal host in `server_address` is added when the resolved list
-/// does not already carry it. An empty control set is refused: an allow set that
+/// does not already carry it. `live_peer` is agents/core's `agent.server_peer`, the
+/// address the control channel really uses NOW (a server that moved since start): it
+/// leads the control set (deduplicated against the start-resolved entries; note
+/// `control_live_peer=<ip:port>`), and one that does not parse is dropped with
+/// `live_peer_invalid=1`. The host being contained still never chooses what survives
+/// (#3429 round 4): the start-resolved set was fixed at agent start and the live peer
+/// is the authenticated stream's address published by agents/core, never a name this
+/// plugin or the host resolves. An empty control set is refused: an allow set that
 /// cannot reach the server would strand the host.
 [[nodiscard]] inline std::expected<AllowSet, std::string>
 build_allow_set(std::string_view control_ips_csv, std::string_view server_address,
                 const std::vector<std::string>& resolver_literals,
-                const std::vector<Endpoint>& exceptions) {
+                const std::vector<Endpoint>& exceptions, std::string_view live_peer = {}) {
     AllowSet set;
     const auto port = extract_server_port(server_address);
     if (!port)
@@ -674,6 +707,21 @@ build_allow_set(std::string_view control_ips_csv, std::string_view server_addres
             add_control(*ip);
     if (invalid > 0)
         set.notes.push_back(std::format("control_ips_invalid={}", invalid));
+    if (!live_peer.empty()) {
+        if (const auto live = parse_live_peer(live_peer)) {
+            // Front of the set: the verification proves THIS endpoint first.
+            if (const auto at = std::find(set.control.begin(), set.control.end(), *live);
+                at != set.control.end())
+                std::rotate(set.control.begin(), at, at + 1);
+            else
+                set.control.insert(set.control.begin(), *live);
+            set.notes.push_back(std::format("control_live_peer={}{}:{}", live->ip.v6 ? "[" : "",
+                                            format_ip(live->ip) + (live->ip.v6 ? "]" : ""),
+                                            live->port));
+        } else {
+            set.notes.emplace_back("live_peer_invalid=1");
+        }
+    }
     if (set.control.empty())
         return std::unexpected("control_set_empty");
     if (set.control.size() > kMaxControlIps)
@@ -1003,22 +1051,6 @@ parse_probe_target(std::string_view text) {
     return *v;
 }
 
-/// A time limit is NOT offered in this release: it rides the wall clock (a restored
-/// snapshot or a dead RTC lifts containment early or never, and NTP is not in the
-/// allow set), and an expiry release is invisible to the server (the trigger's
-/// output is discarded). The TTL core, trigger seam and records below stay, so
-/// PRQ.2 flips this one constant once releases are recorded server-side and a time
-/// source is allowed.
-inline constexpr bool kTtlAvailable = false;
-
-/// `refused|ttl_unavailable` for any `ttl_seconds` value while kTtlAvailable is
-/// false; checked before anything else so nothing is validated, probed or written.
-[[nodiscard]] inline std::optional<std::string> ttl_param_refusal(std::string_view param) {
-    if (!kTtlAvailable && !param.empty())
-        return std::string{"ttl_unavailable"};
-    return std::nullopt;
-}
-
 // ── State record ────────────────────────────────────────────────────────────
 
 enum class Phase : std::uint8_t { applying, active, releasing };
@@ -1062,6 +1094,8 @@ struct OsPayload {
     std::uint32_t stale_rules_left = 0;   // Windows: a previous generation's rules that would not delete
     bool state_flush_failed = false;      // macOS: the anchor load committed but its state flush did not
     bool ttl_unregistered = false;        // the TTL trigger could not be registered: nothing will expire it
+    bool repair_unregistered = false;     // the repair trigger could not be registered: nothing re-checks the host
+    bool gpo_override = false;            // Windows: a Group Policy default action beats the profile defaults we write
     friend bool operator==(const OsPayload&, const OsPayload&) = default;
 };
 
@@ -1070,12 +1104,15 @@ struct OsPayload {
 /// the record no longer lists), so each is persisted and read back by every status
 /// until a later apply clears it.
 [[nodiscard]] inline bool has_residue(const OsPayload& os) noexcept {
-    return os.rules_not_disabled > 0 || os.stale_rules_left > 0 || os.state_flush_failed ||
-           os.ttl_unregistered;
+    return os.gpo_override || os.rules_not_disabled > 0 || os.stale_rules_left > 0 ||
+           os.state_flush_failed || os.ttl_unregistered || os.repair_unregistered;
 }
 
 /// The status reason for the first residue, in a fixed order.
 [[nodiscard]] inline std::string_view residue_reason(const OsPayload& os) noexcept {
+    // The default action not being in force outranks a rule that would not disable.
+    if (os.gpo_override)
+        return "gpo_override";
     if (os.rules_not_disabled > 0)
         return "rules_not_disabled";
     if (os.stale_rules_left > 0)
@@ -1084,12 +1121,16 @@ struct OsPayload {
         return "state_flush_failed";
     if (os.ttl_unregistered)
         return "ttl_unregistered";
+    if (os.repair_unregistered)
+        return "repair_unregistered";
     return {};
 }
 
 /// `k=v` notes for every residue present.
 [[nodiscard]] inline std::vector<std::string> residue_notes(const OsPayload& os) {
     std::vector<std::string> n;
+    if (os.gpo_override)
+        n.emplace_back("gpo_override=1");
     if (os.rules_not_disabled > 0)
         n.push_back(std::format("rules_not_disabled={}", os.rules_not_disabled));
     if (os.stale_rules_left > 0)
@@ -1098,6 +1139,8 @@ struct OsPayload {
         n.emplace_back("state_flush_failed=1");
     if (os.ttl_unregistered)
         n.emplace_back("ttl_unregistered=1");
+    if (os.repair_unregistered)
+        n.emplace_back("repair_unregistered=1");
     return n;
 }
 
@@ -1113,6 +1156,8 @@ struct QuarantineState {
     AllowSet allow;
     OsPayload os;
     std::string last_verify;           // free text, sanitized
+    std::uint32_t repairs = 0;         // times the host was re-applied because it stopped enforcing
+    std::int64_t repaired_at = 0;      // epoch seconds of the latest such repair; 0 = never
 };
 
 inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
@@ -1144,6 +1189,14 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
         out += "flush_failed=1\n";
     if (s.os.ttl_unregistered)
         out += "ttl_unreg=1\n";
+    if (s.os.repair_unregistered)
+        out += "repair_unreg=1\n";
+    if (s.os.gpo_override)
+        out += "gpo=1\n";
+    if (s.repairs != 0)
+        out += std::format("repairs={}\n", s.repairs);
+    if (s.repaired_at != 0)
+        out += std::format("repaired_at={}\n", s.repaired_at);
     if (!s.last_verify.empty())
         out += std::format("verify={}\n", detail::sanitize_text(s.last_verify));
     for (const auto& c : s.allow.control)
@@ -1167,7 +1220,8 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
     bool seen_prev = false, seen_applied = false, seen_ttl = false;
     bool seen_probe = false, seen_pf = false, seen_boot = false, seen_ipt = false,
          seen_verify = false, seen_nd = false, seen_v6 = false, seen_stale = false,
-         seen_flush = false, seen_ttl_unreg = false;
+         seen_flush = false, seen_ttl_unreg = false, seen_repair_unreg = false, seen_gpo = false,
+         seen_repairs = false, seen_repaired_at = false;
     for (const auto line : detail::split(text, '\n')) {
         if (line.empty())
             continue;
@@ -1197,7 +1251,7 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
             else
                 return std::nullopt;
         } else if (key == "gen" || key == "prev_gen" || key == "ipt_gen" ||
-                   key == "not_disabled" || key == "stale_left") {
+                   key == "not_disabled" || key == "stale_left" || key == "repairs") {
             const auto v = detail::parse_uint(val, 0x7fffffff);
             if (!v)
                 return std::nullopt;
@@ -1217,12 +1271,16 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
                 if (!once(seen_stale))
                     return std::nullopt;
                 s.os.stale_rules_left = static_cast<std::uint32_t>(*v);
+            } else if (key == "repairs") {
+                if (!once(seen_repairs))
+                    return std::nullopt;
+                s.repairs = static_cast<std::uint32_t>(*v);
             } else {
                 if (!once(seen_nd))
                     return std::nullopt;
                 s.os.rules_not_disabled = static_cast<std::uint32_t>(*v);
             }
-        } else if (key == "applied_at" || key == "ttl_expires") {
+        } else if (key == "applied_at" || key == "ttl_expires" || key == "repaired_at") {
             const auto v = detail::parse_uint(val, std::int64_t{1} << 50);
             if (!v)
                 return std::nullopt;
@@ -1230,6 +1288,10 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
                 if (!once(seen_applied))
                     return std::nullopt;
                 s.applied_at = *v;
+            } else if (key == "repaired_at") {
+                if (!once(seen_repaired_at))
+                    return std::nullopt;
+                s.repaired_at = *v;
             } else {
                 if (!once(seen_ttl))
                     return std::nullopt;
@@ -1268,6 +1330,14 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
             if (!once(seen_ttl_unreg) || val != "1")
                 return std::nullopt;
             s.os.ttl_unregistered = true;
+        } else if (key == "repair_unreg") {
+            if (!once(seen_repair_unreg) || val != "1")
+                return std::nullopt;
+            s.os.repair_unregistered = true;
+        } else if (key == "gpo") {
+            if (!once(seen_gpo) || val != "1")
+                return std::nullopt;
+            s.os.gpo_override = true;
         } else if (key == "boot_time") {
             if (!once(seen_boot) || !is_safe_token(val))
                 return std::nullopt;
@@ -1308,6 +1378,10 @@ inline constexpr std::size_t kMaxStateBytes = 256 * 1024;
     return s;
 }
 
+/// The time limit rides the HOST WALL CLOCK, and the quarantine blocks NTP: a clock
+/// stepped back after the apply keeps `now < ttl_expires` (the limit never fires, and
+/// report_status says so with `clock_before_apply=1`), a clock stepped forward
+/// releases early. Both are disclosed in the README; neither is a code exit.
 [[nodiscard]] constexpr bool ttl_expired(const QuarantineState& s, std::int64_t now_epoch) noexcept {
     return s.ttl_expires > 0 && now_epoch >= s.ttl_expires;
 }
@@ -3221,6 +3295,11 @@ struct Env {
     StateStore& store;
     TcpProbe probe;
     std::function<std::int64_t()> epoch_now;
+    /// The address the agent's control channel really uses now (`agent.server_peer`,
+    /// published by agents/core from the stream the server answered on), or empty when
+    /// no Register has happened yet (agent start). When set, the verification proves THIS
+    /// endpoint and nothing else; when empty it falls back to the listed scan.
+    std::optional<Endpoint> live_control;
 };
 
 struct Outcome {
@@ -3266,18 +3345,34 @@ namespace detail {
     return ap.partial || has_residue(st.os);
 }
 
-[[nodiscard]] inline bool control_reachable(Env& env, const AllowSet& set, Deadline& dl) {
+/// What the control check proved and against which endpoints: `live` is the endpoint the
+/// agent is connected through right now (the only one that matters: a listed endpoint that
+/// still answers says nothing about the path in use), `listed` is the scan of the allow set
+/// used when no live peer is known (agent start).
+struct ControlProof {
+    bool ok = false;
+    std::string_view proved = "listed";
+};
+
+[[nodiscard]] inline ControlProof control_reachable(Env& env, const AllowSet& set, Deadline& dl) {
+    if (env.live_control) {
+        const auto& c = *env.live_control;
+        return {!dl.expired() && env.probe(format_ip(c.ip), c.port, dl.cap(kProbeTimeout)) ==
+                                     ProbeOutcome::connected,
+                "live"};
+    }
     int tried = 0;
     for (const auto& c : set.control) {
         if (tried++ >= 4 || dl.expired())
             break;
         if (env.probe(format_ip(c.ip), c.port, dl.cap(kProbeTimeout)) == ProbeOutcome::connected)
-            return true;
+            return {true, "listed"};
     }
-    return false;
+    return {false, "listed"};
 }
 
 struct VerifyResult {
+    std::string_view proved = "listed"; // ControlProof::proved
     bool control_ok = false;
     std::optional<ProbeOutcome> before, after;
     VerifyOutcome outcome = VerifyOutcome::unproven;
@@ -3290,7 +3385,9 @@ struct VerifyResult {
                                              std::optional<ProbeOutcome> before, Deadline& dl) {
     auto vdl = dl.fresh(kVerifyBudget);
     VerifyResult v;
-    v.control_ok = control_reachable(env, st.allow, vdl);
+    const auto proof = control_reachable(env, st.allow, vdl);
+    v.control_ok = proof.ok;
+    v.proved = proof.proved;
     v.before = before;
     if (const auto t = parse_probe_target(st.probe_target))
         v.after = env.probe(format_ip(t->ip), t->port, vdl.cap(kProbeTimeout));
@@ -3305,8 +3402,22 @@ struct VerifyResult {
                        probe_word(v.before, v.after));
 }
 
+[[nodiscard]] inline bool has_note(const Outcome& o, std::string_view note) {
+    return std::find(o.notes.begin(), o.notes.end(), note) != o.notes.end();
+}
+
+/// A note the outcome already carries is not repeated: a leg's live read and the
+/// record's residue can name the same fact (`gpo_override=1`), and one row says it once.
 inline void add_notes(Outcome& o, const std::vector<std::string>& n) {
-    o.notes.insert(o.notes.end(), n.begin(), n.end());
+    for (const auto& note : n)
+        if (!has_note(o, note))
+            o.notes.push_back(note);
+}
+
+/// `control_proved=live|listed`: which endpoint the verification's control check
+/// connected to (the verify row and `last_verify` keep their shape).
+inline void note_proof(Outcome& o, const VerifyResult& v) {
+    o.notes.push_back(std::format("control_proved={}", v.proved));
 }
 
 /// `active` only when the record's proof STARTS with `verified`. Every other
@@ -3354,6 +3465,12 @@ inline void status_from_record(Outcome& o, const QuarantineState& st, const LegS
     } else {
         o.status = std::string{active_token(st)};
     }
+    // The unattended self-check's work is never invisible: a record that was ever
+    // re-applied by it says how often and when, on every read.
+    if (st.repairs > 0) {
+        o.notes.push_back(std::format("repairs={}", st.repairs));
+        o.notes.push_back(std::format("last_repair_at={}", st.repaired_at));
+    }
 }
 
 /// Undo an initial apply. The release intent is saved FIRST, exactly as an explicit
@@ -3388,7 +3505,7 @@ inline Outcome roll_back(Env& env, QuarantineState st, std::string reason, std::
 }
 
 [[nodiscard]] inline Outcome converge(Env& env, QuarantineState prev, const AllowSet& next,
-                                      Deadline& dl);
+                                      Deadline& dl, bool repaired = false);
 
 } // namespace detail
 
@@ -3434,7 +3551,7 @@ struct ApplyRequest {
             const auto ls = env.leg.read_status(cur.os, dl);
             Outcome o;
             if (ls.state == OsState::not_enforcing && ls.reapply_helps) {
-                o = detail::converge(env, cur, cur.allow, dl);
+                o = detail::converge(env, cur, cur.allow, dl, /*repaired=*/true);
                 if (o.status == "active" || o.status == "active_unproven" || o.status == "partial")
                     o.notes.emplace_back("repaired=1");
             } else {
@@ -3516,6 +3633,7 @@ struct ApplyRequest {
 
     const auto v = detail::run_verify(env, st, before, dl);
     o.verify = v.row;
+    detail::note_proof(o, v);
     if (verify_action(v.outcome, VerifyMode::initial) == VerifyAction::rollback_to_absence)
         return detail::roll_back(env, st, std::string{to_string(v.outcome)}, {}, dl, std::move(o));
 
@@ -3535,9 +3653,12 @@ namespace detail {
 
 /// Move from `prev` (active, or an incomplete `applying`) to `next` as a new
 /// generation: the previous generation stays effective until the new one has
-/// committed and verified; a failure removes only what the update added.
+/// committed and verified; a failure removes only what the update added. `repaired`
+/// marks a convergence that repairs a host which stopped enforcing the stored set:
+/// the record then counts it (repairs, repaired_at) -- on success only, so a failed
+/// attempt never reads as a repair.
 [[nodiscard]] inline Outcome converge(Env& env, QuarantineState prev, const AllowSet& next,
-                                      Deadline& dl) {
+                                      Deadline& dl, bool repaired) {
     Outcome o;
     QuarantineState cand = prev;
     cand.phase = Phase::applying;
@@ -3594,6 +3715,7 @@ namespace detail {
         before = ProbeOutcome::connected;
     const auto v = run_verify(env, cand, before, dl);
     o.verify = v.row;
+    note_proof(o, v);
     if (verify_action(v.outcome, VerifyMode::update) == VerifyAction::revert_to_previous) {
         QuarantineState back = cand;
         back.generation = cand.generation + 1;
@@ -3623,6 +3745,11 @@ namespace detail {
 
     cand.phase = Phase::active;
     cand.last_verify = verify_text(v);
+    if (repaired) {
+        if (cand.repairs < 0x7fffffff)
+            ++cand.repairs;
+        cand.repaired_at = env.epoch_now();
+    }
     finish_status(o, cand, ap, v);
     if (!env.store.save(cand)) {
         o.status = "partial";
@@ -3729,6 +3856,10 @@ struct ReleaseRequest {
             o.notes.emplace_back("ttl_deferred_legacy=1");
             return o;
         }
+        // The limit lapsed and nothing defers it: this release is the expiry. The note
+        // rides the outcome into the agent's one log line for it, the ONLY record of an
+        // expiry release until the server records them (the trigger's output is dropped).
+        o.notes.emplace_back("ttl_expired=1");
     }
     OsPayload os;
     if (loaded.kind == StateLoad::Kind::ok) {
@@ -3840,6 +3971,7 @@ struct ReleaseRequest {
         before = ProbeOutcome::connected;
     const auto v = detail::run_verify(env, st, before, dl);
     o.verify = v.row;
+    detail::note_proof(o, v);
     if (st.last_verify.empty() && !v.control_ok) {
         // The record's initial apply never completed (no proof was ever recorded) and
         // the control set does not answer: promoting it to `active` would present an
@@ -3858,14 +3990,81 @@ struct ReleaseRequest {
     }
     st.phase = Phase::active;
     st.last_verify = detail::verify_text(v);
+    // A host the leg reads as enforcing but PARTIAL (a Group Policy default action beats
+    // ours, perhaps arrived while the agent was down) is not `active` here either: the
+    // start-time summary says what the next status read will.
+    if (enforcing && ls.partial)
+        ap.partial = true;
     detail::finish_status(o, st, ap, v);
+    if (o.status == "partial" && o.reason.empty() && enforcing && ls.partial)
+        o.reason = ls.reason;
     if (!env.store.save(st))
         o.notes.emplace_back("state_not_persisted=1");
     o.state = st;
     return o;
 }
 
-// ── TTL enforcement ─────────────────────────────────────────────────────────
+// ── Unattended self-check ───────────────────────────────────────────────────
+
+/// The agent-local periodic check (kRepairTriggerId, every kRepairPollSeconds) that
+/// notices a host which stopped enforcing its stored containment -- a flushed table, a
+/// restored profile default, pf switched off -- without waiting for a status read or a
+/// restart. It is NOT a bare `quarantine`: that would start a fresh containment with no
+/// record (a trigger outliving a release would re-contain the host) and converge an
+/// `applying` record every minute. It only ever moves an `active` record forward, with
+/// the record's own STORED allow set (a repair never rewrites a contained host's list),
+/// through the same converge a retried `quarantine` uses, and the shell calls it
+/// inside the MutationGate (busy answers, never waits behind another mutation).
+///
+/// Never acts on an unreadable store (a fault is not "no record"), never converges a
+/// record that is not `active`, never re-applies over a read that says a re-apply
+/// cannot help, and defers (no mutation) to a legacy containment that appeared
+/// underneath -- the single-token rule release() uses for an expired limit. One leg
+/// read per call; every outcome carries `repair_tick=1` and every mutation is counted
+/// on the record and says `repaired=1`.
+[[nodiscard]] inline Outcome repair(Env& env, Deadline& dl) {
+    Outcome o;
+    o.notes.emplace_back("repair_tick=1");
+    const auto loaded = env.store.load();
+    if (loaded.kind == StateLoad::Kind::unreadable) {
+        o.status = "degraded";
+        o.reason = "state_unreadable";
+        return o;
+    }
+    if (loaded.kind == StateLoad::Kind::absent) {
+        o.status = "inactive";
+        o.notes.emplace_back("nothing_to_repair=1");
+        return o;
+    }
+    const auto& st = loaded.state;
+    o.state = st;
+    if (st.phase != Phase::active) {
+        o.status = "partial";
+        o.reason = st.phase == Phase::applying ? "operation_in_progress" : "release_incomplete";
+        o.notes.emplace_back("repair_skipped=1");
+        return o;
+    }
+    const auto ls = env.leg.read_status(st.os, dl);
+    if (ls.state == OsState::not_enforcing && ls.reapply_helps) {
+        if (const auto why = env.leg.preflight(dl); why && *why == "legacy_quarantine_active") {
+            detail::add_notes(o, ls.notes);
+            o.status = "partial";
+            o.reason = "legacy_quarantine_active";
+            o.notes.emplace_back("repair_deferred_legacy=1");
+            return o;
+        }
+        auto r = detail::converge(env, st, st.allow, dl, /*repaired=*/true);
+        if (r.status == "active" || r.status == "active_unproven" || r.status == "partial")
+            r.notes.emplace_back("repaired=1");
+        r.notes.emplace_back("repair_tick=1");
+        return r;
+    }
+    detail::add_notes(o, ls.notes);
+    detail::status_from_record(o, st, ls);
+    return o;
+}
+
+// ── Trigger enforcement (the time limit and the repair self-check) ──────────
 
 /// The agent's trigger engine as the core sees it; the plugin implements it over
 /// its PluginContext. Two methods, each a plain success flag.
@@ -3877,7 +4076,7 @@ public:
     [[nodiscard]] virtual bool unregister_trigger(std::string_view id) = 0;
 };
 
-/// The trigger's config: every `kTtlPollSeconds` the agent dispatches
+/// The TTL trigger's config: every `kTtlPollSeconds` the agent dispatches
 /// `firewall.release` with `if_ttl_expired=1`, a no-op until the record's TTL has
 /// passed. The shape agents/core's parse_trigger_config accepts.
 [[nodiscard]] inline std::string ttl_trigger_config() {
@@ -3886,45 +4085,74 @@ public:
         kTtlPollSeconds);
 }
 
-/// A TTL is enforced by that interval trigger. Any outcome that leaves a record
-/// with a TTL behind keeps the trigger registered (a failed boot-time re-apply
-/// included: the TTL still bounds the quarantine, and the expiry release works on
-/// a record in any phase); a completed release removes it. A failed registration
-/// keeps the quarantine (lifting containment is never the safe response to a
-/// bookkeeping failure) and says so PERSISTENTLY: it is recorded as residue on the
-/// state record (`ttl_unregistered`), so every later status reads
-/// `partial|ttl_unregistered` until a registration succeeds, instead of `active`
-/// over a time limit nothing enforces. A no-op poll (`ttl_not_expired`) skips the
-/// registration: it is already in place and re-registering every 30 s logs a
-/// replace and a fire each time.
-inline void settle_ttl(Outcome& o, TriggerRegistry& triggers, StateStore& store) {
-    if (o.state && o.state->ttl_expires > 0 && o.status != "inactive") {
-        if (std::find(o.notes.begin(), o.notes.end(), "ttl_not_expired=1") != o.notes.end())
-            return;
-        auto& st = *o.state;
-        if (!triggers.register_trigger(kTtlTriggerId, "interval", ttl_trigger_config())) {
-            o.notes.emplace_back("ttl_trigger_unregistered=1");
-            if (!st.os.ttl_unregistered) {
-                st.os.ttl_unregistered = true;
-                if (!store.save(st))
-                    o.notes.emplace_back("state_not_persisted=1");
-            }
-            if (o.status == "active" || o.status == "active_unproven")
-                o.status = "partial";
-            if (o.status == "partial" && o.reason.empty())
-                o.reason = "ttl_unregistered";
-        } else if (st.os.ttl_unregistered) {
-            st.os.ttl_unregistered = false;
-            if (!store.save(st))
-                o.notes.emplace_back("state_not_persisted=1");
-            std::erase(o.notes, "ttl_unregistered=1");
-            if (o.status == "partial" && o.reason == "ttl_unregistered") {
-                o.reason.clear();
-                o.status = std::string{detail::active_token(st)};
-            }
-        }
-    } else if (o.status == "inactive") {
+/// The repair trigger's config: every `kRepairPollSeconds` the agent dispatches
+/// `firewall.quarantine` with `repair=1`, which the plugin routes to repair() ahead
+/// of every other parameter (no allow set is built, no limit parsed).
+[[nodiscard]] inline std::string repair_trigger_config() {
+    return std::format(
+        R"({{"interval_seconds":{},"plugin":"firewall","action":"quarantine","parameters":{{"repair":"1"}}}})",
+        kRepairPollSeconds);
+}
+
+/// A time limit is enforced by the TTL interval trigger, and every containment record
+/// is watched by the repair trigger. Any outcome that leaves a record behind keeps
+/// them registered (a failed boot-time re-apply included: the limit still bounds the
+/// quarantine, and the expiry release works on a record in any phase); a completed
+/// release removes both. A failed registration keeps the quarantine (lifting
+/// containment is never the safe response to a bookkeeping failure) and says so
+/// PERSISTENTLY: it is recorded as residue on the state record (`ttl_unregistered`,
+/// `repair_unregistered`), so every later status reads `partial|<reason>` until a
+/// registration succeeds, instead of `active` over a safeguard nothing runs. A no-op
+/// poll of either trigger (`ttl_not_expired`, `repair_tick`) registers nothing: both
+/// are already in place, and re-registering every 30 or 60 s logs a replace and a fire
+/// each time. A poll that found no record (`inactive`) unregisters both, so a trigger
+/// that outlived a release stops.
+inline void settle_triggers(Outcome& o, TriggerRegistry& triggers, StateStore& store) {
+    if (o.status == "inactive") {
+        (void)triggers.unregister_trigger(kRepairTriggerId);
         (void)triggers.unregister_trigger(kTtlTriggerId);
+        return;
+    }
+    if (!o.state || detail::has_note(o, "ttl_not_expired=1") || detail::has_note(o, "repair_tick=1"))
+        return;
+    auto& st = *o.state;
+    bool failed = false;
+    bool changed = false;
+    const auto settle = [&](std::string_view id, const std::string& config, bool& flag,
+                            std::string fail_note, const std::string& residue_note) {
+        if (!triggers.register_trigger(id, "interval", config)) {
+            o.notes.push_back(std::move(fail_note));
+            failed = true;
+            changed = changed || !flag;
+            flag = true;
+        } else if (flag) {
+            flag = false;
+            changed = true;
+            std::erase(o.notes, residue_note); // no longer a residue note of this reply
+        }
+    };
+    settle(kRepairTriggerId, repair_trigger_config(), st.os.repair_unregistered,
+           "repair_trigger_unregistered=1", "repair_unregistered=1");
+    if (st.ttl_expires > 0)
+        settle(kTtlTriggerId, ttl_trigger_config(), st.os.ttl_unregistered,
+               "ttl_trigger_unregistered=1", "ttl_unregistered=1");
+    if (changed && !store.save(st))
+        o.notes.emplace_back("state_not_persisted=1");
+    if (failed && (o.status == "active" || o.status == "active_unproven"))
+        o.status = "partial";
+    // The reason follows the record: a failure names the first residue it left, and a
+    // reason that was one of the two trigger residues is recomputed once one cleared.
+    const auto trigger_reason = [](std::string_view r) {
+        return r == "ttl_unregistered" || r == "repair_unregistered";
+    };
+    if (o.status == "partial" && (o.reason.empty() ? failed : trigger_reason(o.reason))) {
+        const auto why = residue_reason(st.os);
+        if (why.empty()) {
+            o.reason.clear();
+            o.status = std::string{detail::active_token(st)};
+        } else {
+            o.reason = std::string{why};
+        }
     }
 }
 
@@ -3966,6 +4194,10 @@ inline void settle_ttl(Outcome& o, TriggerRegistry& triggers, StateStore& store)
     }
     const auto& st = loaded.state;
     o.state = st;
+    // The limit rides the host wall clock (NTP is blocked): a clock behind the apply
+    // time means it will not fire until the clock catches up. Said, not acted on.
+    if (st.ttl_expires > 0 && env.epoch_now() < st.applied_at)
+        o.notes.emplace_back("clock_before_apply=1");
     if (st.phase == Phase::applying) {
         o.status = "partial";
         o.reason = "operation_in_progress";
@@ -4038,6 +4270,53 @@ struct ResultKind {
         r.partial = true;
     }
     return r;
+}
+
+// ── The agent's log line for an outcome ─────────────────────────────────────
+
+enum class LogLevel : std::uint8_t { none, info, warn, error };
+
+/// What the agent logs for an outcome (the core logs nothing itself; the plugin maps
+/// this onto spdlog). A thrown action is `error`. The two unattended ticks are quiet
+/// unless they did or found something: the 30 s time-limit poll before expiry logs
+/// nothing; a repair tick logs when it re-applied the host (`info`, `repaired=1`) or
+/// when it found the host degraded, deferred to a legacy containment or failed to
+/// repair (`warn`), and stays silent for a healthy host, an operation in progress and a
+/// residue the record already carries (a persistent partial must not warn every
+/// minute). Every other action logs a state change at `info` (`quarantine_status` is a
+/// read and logs nothing when it is fine) and anything not OK at `warn`.
+[[nodiscard]] inline LogLevel log_level(std::string_view action, const Outcome& o) {
+    if (o.status == "degraded" && o.reason == "exception")
+        return LogLevel::error;
+    if (detail::has_note(o, "ttl_not_expired=1"))
+        return LogLevel::none;
+    if (detail::has_note(o, "repair_tick=1")) {
+        if (detail::has_note(o, "repaired=1"))
+            return LogLevel::info;
+        const bool quiet = (o.status == "active" || o.status == "active_unproven" ||
+                            o.status == "inactive" || o.status == "partial") &&
+                           !detail::has_note(o, "repair_deferred_legacy=1");
+        return quiet ? LogLevel::none : LogLevel::warn;
+    }
+    if (o.status == "active" || o.status == "inactive")
+        return action == "quarantine_status" ? LogLevel::none : LogLevel::info;
+    return LogLevel::warn;
+}
+
+/// `firewall: <action> -> <status>[:<reason>][ <note>...]`. The notes ride the line:
+/// an expiry release reads `firewall: release -> inactive ttl_expired=1`, and that line
+/// is the only record of it until the server records expiry releases. Notes are `k=v`
+/// tokens built by the core and the legs (free text is sanitised at its source).
+[[nodiscard]] inline std::string log_line(std::string_view action, const Outcome& o) {
+    if (o.status == "degraded" && o.reason == "exception")
+        return std::format("firewall: {} threw; outcome degraded:exception", action);
+    auto line = std::format("firewall: {} -> {}{}{}", action, o.status, o.reason.empty() ? "" : ":",
+                            o.reason);
+    for (const auto& n : o.notes) {
+        line += ' ';
+        line += n;
+    }
+    return line;
 }
 
 } // namespace yuzu::firewall::quarantine

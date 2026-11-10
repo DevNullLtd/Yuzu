@@ -396,6 +396,21 @@ struct PluginRig {
     void put_record(const fq::QuarantineState& s) {
         REQUIRE(kv->set("firewall", std::string{fq::kStateKey}, fq::serialize_state(s)));
     }
+    /// `status|<token>` for a containment that is in force, `active` or `active_unproven`.
+    /// This harness (StandalonePluginContext) has no trigger engine, so the repair trigger
+    /// can never register and a contained host answers `partial|repair_unregistered` where
+    /// the daemon answers `active`: the containment is what `active` says, plus the
+    /// unregistered self-check. That one reason is accepted and read back to the verdict the
+    /// record's own proof gives (`verified...` is `active`, anything else `active_unproven`);
+    /// every other `partial` is a failure here, as it is everywhere.
+    [[nodiscard]] bool has_status(const std::string& captured, std::string_view token) {
+        if (has_row(captured, "status|" + std::string{token}))
+            return true;
+        if (!has_row(captured, "status|partial|repair_unregistered"))
+            return false;
+        const auto rec = record();
+        return rec && token == (rec->last_verify.starts_with("verified") ? "active" : "active_unproven");
+    }
 };
 
 /// The live rig: releases whatever a case left applied, then shuts the plugin down.
@@ -540,11 +555,11 @@ TEST_CASE("quarantine: the plugin action checks its parameters before it touches
           "[agent][firewall_quarantine]") {
     PLUGIN_RIG_OR_RETURN(rig);
 
-    // A time limit is not offered in this release: ANY ttl_seconds is refused first,
-    // in range or not, before a value is even validated (the wall clock cannot be
-    // trusted and an expiry release is invisible to the server).
-    for (const char* v : {"5", "59", "60", "3600", "2592001", "soon", "0"})
-        check_refused(rig.run("quarantine", {{"ttl_seconds", v}}), "ttl_unavailable");
+    // ttl_seconds is validated before anything is probed or written: a value outside
+    // 60..2592000 (or not a number) is refused with no record started. Only refused
+    // values are run here, never a valid one, which would reach the OS.
+    for (const char* v : {"5", "59", "2592001", "soon", "0", "-5"})
+        check_refused(rig.run("quarantine", {{"ttl_seconds", v}}), "ttl_out_of_bounds");
     const auto bad = rig.run("quarantine", {{"exceptions", "garbage"}});
     CHECK(has_prefix(bad.captured, "status|refused|exceptions_invalid:"));
     CHECK(bad.rc == 1);
@@ -566,6 +581,31 @@ TEST_CASE("release if_ttl_expired: with nothing contained, the trigger's firing 
     CHECK_FALSE(rig.record().has_value());
 }
 
+TEST_CASE("quarantine repair=1: with nothing contained, the self-check's firing is a clean no-op",
+          "[agent][firewall_quarantine]") {
+    PLUGIN_RIG_OR_RETURN(rig);
+
+    // what the repair trigger dispatches every 60 s: with no record it answers inactive,
+    // touches nothing and starts nothing -- and no other parameter steers it, a bad time
+    // limit and a bad exception list included (it never builds an allow set)
+    const auto r = rig.run("quarantine", {{"repair", "1"}, {"ttl_seconds", "soon"},
+                                          {"exceptions", "garbage"}, {"probe_target", "nope"}});
+    INFO(r.captured);
+    CHECK(r.rc == 0);
+    CHECK(has_row(r.captured, "status|inactive"));
+    CHECK(has_row(r.captured, "note|repair_tick=1"));
+    CHECK(has_row(r.captured, "note|nothing_to_repair=1"));
+    CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
+    CHECK(r.result_provenance == "firewall:inactive");
+    CHECK_FALSE(rig.record().has_value()); // a trigger that outlives a release never re-contains the host
+
+    // an unreadable record is never read as "no record": degraded, nothing touched
+    REQUIRE(rig.kv->set("firewall", std::string{fq::kStateKey}, "not a record"));
+    const auto bad = rig.run("quarantine", {{"repair", "1"}});
+    CHECK(has_row(bad.captured, "status|degraded|state_unreadable"));
+    CHECK(bad.result_provenance == "firewall:degraded");
+}
+
 TEST_CASE("live: apply, verify the block, release restores the host byte-identical",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
@@ -577,12 +617,12 @@ TEST_CASE("live: apply, verify the block, release restores the host byte-identic
     const auto q = rig.run("quarantine", env.quarantine_params());
     INFO(q.captured);
     CHECK(q.rc == 0);
-    CHECK(has_row(q.captured, "status|active"));
+    CHECK(rig.has_status(q.captured, "active"));
     CHECK(has_row(q.captured, "verify|control=ok|probe=blocked"));
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout); // blocked by the host itself
 
     const auto st = rig.run("quarantine_status");
-    CHECK(has_row(st.captured, "status|active"));
+    CHECK(rig.has_status(st.captured, "active"));
 
     const auto rel = rig.run("release");
     INFO(rel.captured);
@@ -606,7 +646,7 @@ TEST_CASE("live: a pre-established prohibited stream stops carrying data on appl
         SKIP("the stream target is not an HTTP server that answers a keep-alive request");
 
     const auto q = rig.run("quarantine", env.quarantine_params());
-    REQUIRE(has_row(q.captured, "status|active"));
+    REQUIRE(rig.has_status(q.captured, "active"));
     // The stream was ESTABLISHED before the apply; a second request on it must go unanswered.
     CHECK_FALSE(stream.answers(3000));
 }
@@ -635,7 +675,7 @@ TEST_CASE("live: an unrelated enabled allow rule is disabled for the duration an
     REQUIRE(probe(env.probe_target) != fq::ProbeOutcome::timeout);
     const auto q = rig.run("quarantine", env.quarantine_params());
     INFO(q.captured);
-    CHECK((has_row(q.captured, "status|active") || has_row(q.captured, "status|partial")));
+    CHECK((rig.has_status(q.captured, "active") || has_row(q.captured, "status|partial")));
     // blocked although an Allow rule names it: the rule was disabled
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
     CHECK(netsh_rule_enabled(capture({netsh, "advfirewall", "firewall", "show", "rule",
@@ -661,7 +701,7 @@ TEST_CASE("live: a control-channel stream open before the apply keeps carrying d
         SKIP("the control endpoint is not an HTTP server that answers a keep-alive request");
 
     const auto q = rig.run("quarantine", env.quarantine_params());
-    REQUIRE(has_row(q.captured, "status|active"));
+    REQUIRE(rig.has_status(q.captured, "active"));
     // The stream predates the apply and, on macOS, the `pfctl -F states` that follows the load.
     // The control rules are stateless in both directions, so the flush cannot touch it: no
     // reconnect, the reply still arrives. (A rebuilt state would lose the TCP window scale.)
@@ -688,7 +728,7 @@ TEST_CASE("live: quarantine_allow adds and removes an exception through the plug
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
 
-    REQUIRE(has_row(rig.run("quarantine", env.quarantine_params()).captured, "status|active"));
+    REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     REQUIRE(rig.record().has_value());
     const auto gen0 = rig.record()->generation;
     const std::string exception = "198.18.0.9:22/tcp/in";
@@ -697,7 +737,7 @@ TEST_CASE("live: quarantine_allow adds and removes an exception through the plug
     const auto add = rig.run("quarantine_allow", {{"op", "add"}, {"exceptions", exception}});
     INFO(add.captured);
     CHECK(add.rc == 0);
-    CHECK(has_row(add.captured, "status|active"));
+    CHECK(rig.has_status(add.captured, "active"));
     CHECK(has_prefix(add.captured, "allow|exception|198.18.0.9"));
     REQUIRE(rig.record().has_value());
     CHECK(rig.record()->generation == gen0 + 1);
@@ -708,7 +748,7 @@ TEST_CASE("live: quarantine_allow adds and removes an exception through the plug
     const auto rm = rig.run("quarantine_allow", {{"op", "remove"}, {"exceptions", exception}});
     INFO(rm.captured);
     CHECK(rm.rc == 0);
-    CHECK(has_row(rm.captured, "status|active"));
+    CHECK(rig.has_status(rm.captured, "active"));
     CHECK_FALSE(has_prefix(rm.captured, "allow|exception|198.18.0.9"));
     REQUIRE(rig.record().has_value());
     CHECK(rig.record()->generation == gen0 + 2);
@@ -727,9 +767,9 @@ TEST_CASE("live: quarantine_status shapes", "[.][firewall_quarantine_live]") {
 
     // no probe target: contained, but the block is reported as not proven
     const auto q = rig.run("quarantine", env.quarantine_params(/*with_probe=*/false));
-    CHECK(has_row(q.captured, "status|active_unproven"));
+    CHECK(rig.has_status(q.captured, "active_unproven"));
     CHECK(has_row(q.captured, "verify|control=ok|probe=unproven"));
-    CHECK(has_row(rig.run("quarantine_status").captured, "status|active_unproven"));
+    CHECK(rig.has_status(rig.run("quarantine_status").captured, "active_unproven"));
 
     // a record that remembers rules the policy store refused to disable is partial, never active
     auto rec = rig.record();
@@ -761,7 +801,7 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
 
-    REQUIRE(has_row(rig.run("quarantine", env.quarantine_params()).captured, "status|active"));
+    REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     auto rec = rig.record();
     REQUIRE(rec.has_value());
 
@@ -774,7 +814,7 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
     CHECK(firewall_snapshot() == before);
 
     // a reboot: the record says active, the OS lost the rules; init restores them before any dispatch
-    REQUIRE(has_row(rig.run("quarantine", env.quarantine_params()).captured, "status|active"));
+    REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     rec = rig.record();
     REQUIRE(rec.has_value());
 #if defined(__linux__)
@@ -790,27 +830,82 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
     (void)capture({"/sbin/pfctl", "-d"});
 #endif
     rig.restart();
-    CHECK(has_row(rig.run("quarantine_status").captured, "status|active"));
+    CHECK(rig.has_status(rig.run("quarantine_status").captured, "active"));
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
 
-    // A record that carries a time limit (a time limit cannot be requested in this
-    // release, so one is written the way a later build would), then a restart: init
-    // retries the TTL trigger (the standalone harness has no trigger engine, so it
-    // fails again, deterministically) and the failure is recorded as residue. This is
-    // the only place the init-time retry line executes against the built plugin.
-    REQUIRE(has_row(rig.run("quarantine_status").captured, "status|active"));
+    // A record that carries a time limit, then a restart: init retries both triggers
+    // (the standalone harness has no trigger engine, so each fails again,
+    // deterministically) and the failures are recorded as residue. This is the only
+    // place the init-time retry line executes against the built plugin.
+    REQUIRE(rig.has_status(rig.run("quarantine_status").captured, "active"));
     rec = rig.record();
     REQUIRE(rec.has_value());
     auto timed = *rec;
     timed.ttl_expires = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
     rig.put_record(timed);
     rig.restart();
-    CHECK(has_row(rig.run("quarantine_status").captured,
-                  "note|init_recovery=partial:ttl_unregistered,ttl_trigger_unregistered=1"));
+    // Both triggers are refused in this harness: the first residue in the fixed order
+    // names the status, and both notes ride the summary.
+    const auto recovered = rig.run("quarantine_status").captured;
+    CHECK(has_prefix(recovered, "note|init_recovery=partial:ttl_unregistered,"));
+    CHECK(recovered.find("ttl_trigger_unregistered=1") != std::string::npos);
+    CHECK(recovered.find("repair_trigger_unregistered=1") != std::string::npos);
     rec = rig.record();
     REQUIRE(rec.has_value());
     CHECK(rec->ttl_expires > 0);
     CHECK(rec->os.ttl_unregistered); // recorded: every later status reads it
+}
+
+TEST_CASE("live: the repair self-check re-applies a containment the host lost, from the stored set",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    LiveRig rig(env.server, env.server_ip());
+    Watchdog dog(120s, [&] { (void)rig.run("release"); });
+
+    REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
+    const auto stored = rig.record();
+    REQUIRE(stored.has_value());
+
+    // a healthy host: the tick only reads (no new generation, no repair)
+    const auto healthy = rig.run("quarantine", {{"repair", "1"}});
+    INFO(healthy.captured);
+    CHECK(has_row(healthy.captured, "note|repair_tick=1"));
+    CHECK_FALSE(has_row(healthy.captured, "note|repaired=1"));
+    REQUIRE(rig.record().has_value());
+    CHECK(rig.record()->generation == stored->generation);
+
+    // another actor undoes the containment
+#if defined(__linux__)
+    (void)capture({"/usr/sbin/nft", "delete", "table", "inet", "yuzu_quarantine"});
+#elif defined(_WIN32)
+    (void)capture({"C:\\Windows\\System32\\netsh.exe", "advfirewall", "set", "allprofiles",
+                   "firewallpolicy", "blockinbound,allowoutbound"});
+#elif defined(__APPLE__)
+    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "rules"});
+    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "nat"});
+#endif
+    CHECK(probe(env.probe_target) != fq::ProbeOutcome::timeout); // honestly uncontained
+
+    // the tick notices and re-applies the STORED set; the parameters it is handed are ignored
+    const auto fixed = rig.run("quarantine", {{"repair", "1"}, {"exceptions", "198.18.0.9"}});
+    INFO(fixed.captured);
+    CHECK(fixed.rc == 0);
+    CHECK(has_row(fixed.captured, "note|repair_tick=1"));
+    CHECK(has_row(fixed.captured, "note|repaired=1"));
+    CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
+    CHECK(contained_rules_text().find("198.18.0.9") == std::string::npos);
+    const auto after = rig.record();
+    REQUIRE(after.has_value());
+    CHECK(after->phase == fq::Phase::active);
+    CHECK(after->allow == stored->allow);
+    CHECK(after->generation == stored->generation + 1);
+    CHECK(after->repairs == 1);
+    CHECK(after->repaired_at > 0);
+    // quarantine_status shows the repair
+    CHECK(has_prefix(rig.run("quarantine_status").captured, "note|repairs=1"));
+
+    CHECK(has_row(rig.run("release").captured, "status|inactive"));
+    CHECK_FALSE(rig.record().has_value());
 }
 
 TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
@@ -819,9 +914,10 @@ TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
 
-    // No ttl_seconds parameter is accepted in this release, so the time limit is
-    // written onto the record directly (what a later build's `quarantine` would do).
-    REQUIRE(has_row(rig.run("quarantine", env.quarantine_params()).captured, "status|active"));
+    // The time limit is written onto the record directly: the standalone harness has no
+    // trigger engine, so a real `ttl_seconds` could never be enforced here, but its
+    // tick (what the trigger would dispatch) is driven by hand below.
+    REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     auto rec = rig.record();
     REQUIRE(rec.has_value());
     rec->ttl_expires = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
@@ -836,6 +932,7 @@ TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
     rig.put_record(expired);
     const auto late = rig.run("release", {{"if_ttl_expired", "1"}});
     CHECK(has_row(late.captured, "status|inactive"));
+    CHECK(has_row(late.captured, "note|ttl_expired=1")); // the expiry is a visible, logged event
     CHECK_FALSE(rig.record().has_value());
 }
 
@@ -985,7 +1082,7 @@ TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release resto
     const auto q = rig.run("quarantine", env.quarantine_params());
     INFO(q.captured);
     // `active` means pfctl accepted the whole anchor, `no nat all` and `no rdr all` included
-    REQUIRE(has_row(q.captured, "status|active"));
+    REQUIRE(rig.has_status(q.captured, "active"));
 
     // Captured for the PR narrative: design-note open questions 3 (References layout),
     // 6 (Anchors layout) and 7 (a flush of an anchor that does not exist).
@@ -998,7 +1095,7 @@ TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release resto
     CHECK(fq::pf_siblings_before(anchors).empty()); // nothing is evaluated before us
     CHECK(fq::pf_anchor_referenced(capture({"/sbin/pfctl", "-s", "rules"})));
     CHECK(fq::pf_anchor_enforcing(pf_anchor_capture("rules")));
-    CHECK(has_row(rig.run("quarantine_status").captured, "status|active"));
+    CHECK(rig.has_status(rig.run("quarantine_status").captured, "active"));
 
     const auto rel = rig.run("release");
     INFO(rel.captured);
@@ -1015,7 +1112,7 @@ TEST_CASE("live (macOS pf): pf switched off behind the plugin's back is reported
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
 
-    REQUIRE(has_row(rig.run("quarantine", env.quarantine_params()).captured, "status|active"));
+    REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     const auto old_token = rig.record() ? rig.record()->os.pf_token : std::string{};
     REQUIRE_FALSE(old_token.empty());
 
@@ -1027,7 +1124,7 @@ TEST_CASE("live (macOS pf): pf switched off behind the plugin's back is reported
 
     const auto fixed = rig.run("quarantine", env.quarantine_params());
     INFO(fixed.captured);
-    CHECK(has_row(fixed.captured, "status|active"));
+    CHECK(rig.has_status(fixed.captured, "active"));
     CHECK(has_row(fixed.captured, "note|repaired=1"));
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
     REQUIRE(rig.record().has_value());

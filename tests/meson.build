@@ -4193,6 +4193,19 @@ test('agent trigger-register bridge wiring lexical gate',
   timeout: 30,
 )
 
+# UP-8 (firewall containment): static lexical gate pinning how agent.cpp publishes the live control
+# peer to plugins as "agent.server_peer" (PluginContextImpl and AgentImpl are TU-local, no seam): the
+# atomic member, the get_config branch that reads it (never the unsynchronised config map), the
+# conversion of ClientContext::peer() through grpc_peer_literal before any per-plugin store, and the
+# Register-success call. Carries its own in-memory mutation self-test. No build required; one process,
+# well under a second.
+test('agent server-peer publish wiring lexical gate (UP-8)',
+  _python3_test,
+  args: [files('test_agent_server_peer_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # UP-14: static lexical gate pinning WHERE the Guardian wire emit pair (boot_epoch, emit_seq) is
 # stamped: every Spark outbox enqueue is preceded by stamp_seq_locked() under outbox_mu_, the
 # page-time stamp is the only wire_ordered=false call, stamp_emit_pair() has exactly two homes

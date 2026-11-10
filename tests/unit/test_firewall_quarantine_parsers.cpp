@@ -738,10 +738,18 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     s.os.rules_not_disabled = 3;
     s.os.stale_rules_left = 2;
     s.os.state_flush_failed = true;
+    s.os.gpo_override = true;
+    s.os.repair_unregistered = true;
+    s.repairs = 4;
+    s.repaired_at = 1'700'000'900;
     s.last_verify = "verified control_ok probe_blocked";
     const auto text = serialize_state(s);
     const auto back = parse_state(text);
     REQUIRE(back);
+    CHECK(back->repairs == 4);
+    CHECK(back->repaired_at == 1'700'000'900);
+    CHECK(back->os.gpo_override);
+    CHECK(back->os.repair_unregistered);
     CHECK(back->phase == Phase::active);
     CHECK(back->generation == 7);
     CHECK(back->prev_generation == 6);
@@ -783,16 +791,34 @@ TEST_CASE("state record: round trip and strict parsing", "[agent][firewall_quara
     CHECK_FALSE(parse_state(text + "flush_failed=1\n"));
     CHECK_FALSE(parse_state(replace(text, "flush_failed=1", "flush_failed=0")));
     CHECK_FALSE(parse_state(replace(text, "stale_left=2", "stale_left=many")));
+    CHECK_FALSE(parse_state(text + "gpo=1\n"));          // duplicate keys of this round
+    CHECK_FALSE(parse_state(text + "repairs=5\n"));
+    CHECK_FALSE(parse_state(text + "repaired_at=1\n"));
+    CHECK_FALSE(parse_state(text + "repair_unreg=1\n"));
+    CHECK_FALSE(parse_state(replace(text, "gpo=1", "gpo=0")));
+    CHECK_FALSE(parse_state(replace(text, "repair_unreg=1", "repair_unreg=yes")));
+    CHECK_FALSE(parse_state(replace(text, "repairs=4", "repairs=lots")));
+    CHECK_FALSE(parse_state(replace(text, "repaired_at=1700000900", "repaired_at=-1")));
     // a clean record carries none of the residue keys
     QuarantineState clean = s;
     clean.os.rules_not_disabled = 0;
     clean.os.stale_rules_left = 0;
     clean.os.state_flush_failed = false;
+    clean.os.gpo_override = false;
+    clean.os.repair_unregistered = false;
+    clean.repairs = 0;
+    clean.repaired_at = 0;
     const auto clean_text = serialize_state(clean);
     CHECK(clean_text.find("stale_left") == std::string::npos);
     CHECK(clean_text.find("flush_failed") == std::string::npos);
+    CHECK(clean_text.find("gpo=") == std::string::npos);
+    CHECK(clean_text.find("repair") == std::string::npos);
     CHECK_FALSE(has_residue(parse_state(clean_text)->os));
-    CHECK(residue_reason(back->os) == "rules_not_disabled");
+    // a record written before this round (none of its keys) still loads, with none of them set
+    CHECK(parse_state(clean_text)->repairs == 0);
+    CHECK_FALSE(parse_state(clean_text)->os.gpo_override);
+    // the default action not being in force outranks every other residue
+    CHECK(residue_reason(back->os) == "gpo_override");
     CHECK_FALSE(parse_state(replace(text, "exc=10.0.0.5:22/tcp/in", "exc=10.0.0.5;rm")));
     // no control endpoint: not a record we could ever have written
     std::string no_ctl;
@@ -2426,30 +2452,46 @@ struct FakeTriggers final : TriggerRegistry {
         unregistered.emplace_back(id);
         return true;
     }
+    [[nodiscard]] std::size_t count(std::string_view id) const {
+        return static_cast<std::size_t>(std::count_if(
+            registered.begin(), registered.end(), [&](const Reg& r) { return r.id == id; }));
+    }
+    [[nodiscard]] const Reg* find(std::string_view id) const {
+        for (const auto& r : registered)
+            if (r.id == id)
+                return &r;
+        return nullptr;
+    }
+    [[nodiscard]] std::size_t unregistered_count(std::string_view id) const {
+        return static_cast<std::size_t>(std::count(unregistered.begin(), unregistered.end(), id));
+    }
 };
 
 } // namespace
 
-TEST_CASE("ttl trigger: the registration the core emits is what the engine's own parser accepts",
+TEST_CASE("triggers: the registrations the core emits are what the engine's own parser accepts",
           "[agent][firewall_quarantine]") {
     NftRig rig;
     auto dl = rig.dl();
     auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
     REQUIRE(o.status == "active");
     FakeTriggers trig;
-    settle_ttl(o, trig, rig.store);
+    settle_triggers(o, trig, rig.store);
 
-    REQUIRE(trig.registered.size() == 1);
+    // a time-limited containment arms BOTH: the time-limit tick and the repair self-check
+    REQUIRE(trig.registered.size() == 2);
     CHECK(trig.unregistered.empty());
-    const auto& reg = trig.registered[0];
-    CHECK(reg.id == kTtlTriggerId);
-    CHECK(reg.id == "firewall.quarantine.ttl");
-    CHECK(reg.type == "interval");
+    REQUIRE(trig.count(kTtlTriggerId) == 1);
+    REQUIRE(trig.count(kRepairTriggerId) == 1);
     // a successful registration changes nothing about the result
     CHECK(o.status == "active");
     CHECK_FALSE(contains(o.notes, "ttl_trigger_unregistered=1"));
+    CHECK_FALSE(contains(o.notes, "repair_trigger_unregistered=1"));
 
     // the contract with the trigger engine, proven against the engine's own parser
+    const auto& reg = *trig.find(kTtlTriggerId);
+    CHECK(reg.id == "firewall.quarantine.ttl");
+    CHECK(reg.type == "interval");
     const auto cfg = yuzu::agent::parse_trigger_config(reg.id, reg.type, reg.json);
     REQUIRE(cfg.has_value());
     CHECK(cfg->id == "firewall.quarantine.ttl");
@@ -2462,6 +2504,24 @@ TEST_CASE("ttl trigger: the registration the core emits is what the engine's own
     CHECK(cfg->parameters.at("if_ttl_expired") == "1");
     // and the action it fires is the no-op-until-expiry release
     CHECK(reg.json == ttl_trigger_config());
+
+    // the repair trigger fires `quarantine` with only `repair=1`: the plugin routes that
+    // to repair() ahead of every other parameter
+    const auto& rep = *trig.find(kRepairTriggerId);
+    CHECK(rep.id == "firewall.quarantine.repair");
+    CHECK(rep.type == "interval");
+    const auto rcfg = yuzu::agent::parse_trigger_config(rep.id, rep.type, rep.json);
+    REQUIRE(rcfg.has_value());
+    CHECK(rcfg->id == "firewall.quarantine.repair");
+    CHECK(rcfg->type == yuzu::agent::TriggerType::Interval);
+    CHECK(rcfg->plugin == "firewall");
+    CHECK(rcfg->action == "quarantine");
+    CHECK(rcfg->interval_seconds == kRepairPollSeconds);
+    CHECK(rcfg->interval_seconds == 60);
+    CHECK(rcfg->interval_seconds >= 30);
+    REQUIRE(rcfg->parameters.size() == 1);
+    CHECK(rcfg->parameters.at("repair") == "1");
+    CHECK(rep.json == repair_trigger_config());
 }
 
 TEST_CASE("ttl trigger: a failed registration keeps the quarantine and says PARTIAL",
@@ -2473,9 +2533,10 @@ TEST_CASE("ttl trigger: a failed registration keeps the quarantine and says PART
 
     auto verified = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
     REQUIRE(verified.status == "active");
-    settle_ttl(verified, trig, rig.store);
+    settle_triggers(verified, trig, rig.store);
     CHECK(verified.status == "partial");
     CHECK(contains(verified.notes, "ttl_trigger_unregistered=1"));
+    CHECK(contains(verified.notes, "repair_trigger_unregistered=1")); // the self-check is missing too
     CHECK(contains(render_rows(verified), "status|partial|ttl_unregistered"));
     CHECK(contains(render_rows(verified), "note|ttl_trigger_unregistered=1"));
     CHECK(result_kind(verified).partial);
@@ -2488,7 +2549,7 @@ TEST_CASE("ttl trigger: a failed registration keeps the quarantine and says PART
     Outcome unproven;
     unproven.status = "active_unproven";
     unproven.state = rig.store.state();
-    settle_ttl(unproven, trig, rig.store);
+    settle_triggers(unproven, trig, rig.store);
     CHECK(unproven.status == "partial");
     CHECK(contains(unproven.notes, "ttl_trigger_unregistered=1"));
 
@@ -2497,12 +2558,12 @@ TEST_CASE("ttl trigger: a failed registration keeps the quarantine and says PART
     degraded.status = "degraded";
     degraded.reason = "reapply_failed:nft_load_failed";
     degraded.state = rig.store.state();
-    settle_ttl(degraded, trig, rig.store);
+    settle_triggers(degraded, trig, rig.store);
     CHECK(degraded.status == "degraded");
     CHECK(contains(degraded.notes, "ttl_trigger_unregistered=1"));
 }
 
-TEST_CASE("ttl trigger: no ttl registers nothing; a completed release unregisters",
+TEST_CASE("triggers: no ttl registers only the repair check; a completed release unregisters both",
           "[agent][firewall_quarantine]") {
     NftRig rig;
     auto dl = rig.dl();
@@ -2510,29 +2571,32 @@ TEST_CASE("ttl trigger: no ttl registers nothing; a completed release unregister
 
     auto no_ttl = apply_and_verify(rig.env, rig.request(), dl);
     REQUIRE(no_ttl.status == "active");
-    settle_ttl(no_ttl, trig, rig.store);
-    CHECK(trig.registered.empty());
+    settle_triggers(no_ttl, trig, rig.store);
+    CHECK(trig.registered.size() == 1); // the repair self-check watches every record
+    CHECK(trig.count(kRepairTriggerId) == 1);
+    CHECK(trig.count(kTtlTriggerId) == 0); // there is no time limit to enforce
     CHECK(trig.unregistered.empty());
     CHECK(no_ttl.status == "active");
 
-    // a ttl'd quarantine, then released: the trigger goes with it
+    // a ttl'd quarantine, then released: both triggers go with it
     REQUIRE(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
     auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 90), dl);
     REQUIRE(o.status == "active");
-    settle_ttl(o, trig, rig.store);
-    CHECK(trig.registered.size() == 1);
+    settle_triggers(o, trig, rig.store);
+    CHECK(trig.count(kTtlTriggerId) == 1);
+    CHECK(trig.registered.size() == 3);
     auto rel = release(rig.env, ReleaseRequest{}, dl);
     REQUIRE(rel.status == "inactive");
-    settle_ttl(rel, trig, rig.store);
-    REQUIRE(trig.unregistered.size() == 1);
-    CHECK(trig.unregistered[0] == kTtlTriggerId);
-    CHECK(trig.registered.size() == 1); // not re-registered
+    settle_triggers(rel, trig, rig.store);
+    CHECK(trig.unregistered_count(kTtlTriggerId) == 1);
+    CHECK(trig.unregistered_count(kRepairTriggerId) == 1);
+    CHECK(trig.registered.size() == 3); // not re-registered
 
-    // a refused action leaves the trigger alone
+    // a refused action leaves the triggers alone
     auto refused_o = refused("op_invalid");
-    settle_ttl(refused_o, trig, rig.store);
-    CHECK(trig.registered.size() == 1);
-    CHECK(trig.unregistered.size() == 1);
+    settle_triggers(refused_o, trig, rig.store);
+    CHECK(trig.registered.size() == 3);
+    CHECK(trig.unregistered.size() == 2);
 }
 
 TEST_CASE("ttl trigger: a release that did not complete keeps the trigger; the expiry path releases",
@@ -2546,8 +2610,9 @@ TEST_CASE("ttl trigger: a release that did not complete keeps the trigger; the e
     rig.world.fail_delete = true;
     auto failed = release(rig.env, ReleaseRequest{}, dl);
     REQUIRE(failed.status == "partial");
-    settle_ttl(failed, trig, rig.store);
-    CHECK(trig.registered.size() == 1);
+    settle_triggers(failed, trig, rig.store);
+    CHECK(trig.count(kTtlTriggerId) == 1);
+    CHECK(trig.count(kRepairTriggerId) == 1);
     CHECK(trig.unregistered.empty());
     rig.world.fail_delete = false;
 
@@ -2563,8 +2628,9 @@ TEST_CASE("ttl trigger: a release that did not complete keeps the trigger; the e
     auto late = release(rig.env, due, dl);
     REQUIRE(late.status == "inactive");
     CHECK_FALSE(rig.world.table);
-    settle_ttl(late, trig, rig.store);
-    CHECK(trig.unregistered.size() == 1);
+    settle_triggers(late, trig, rig.store);
+    CHECK(trig.unregistered_count(kTtlTriggerId) == 1);
+    CHECK(trig.unregistered_count(kRepairTriggerId) == 1);
 }
 
 TEST_CASE("ttl trigger: a boot-time recovery re-registers it, and retries a failed registration",
@@ -2574,7 +2640,7 @@ TEST_CASE("ttl trigger: a boot-time recovery re-registers it, and retries a fail
     FakeTriggers trig;
     trig.accept = false;
     auto first = apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl);
-    settle_ttl(first, trig, rig.store);
+    settle_triggers(first, trig, rig.store);
     REQUIRE(first.status == "partial"); // registration failed at quarantine time
 
     // agent restart: the OS still enforces, the record says active with a ttl
@@ -2582,9 +2648,10 @@ TEST_CASE("ttl trigger: a boot-time recovery re-registers it, and retries a fail
     auto boot = recover_at_init(rig.env, dl);
     REQUIRE(boot.state);
     CHECK(boot.state->ttl_expires > 0);
-    settle_ttl(boot, trig, rig.store);
-    REQUIRE(trig.registered.size() == 1);
-    CHECK(trig.registered[0].id == kTtlTriggerId);
+    settle_triggers(boot, trig, rig.store);
+    REQUIRE(trig.registered.size() == 2);
+    CHECK(trig.count(kTtlTriggerId) == 1);
+    CHECK(trig.count(kRepairTriggerId) == 1);
     CHECK(boot.status == "active"); // registered this time: nothing partial left to say
 
     // a reboot with a failed re-apply (degraded) still keeps the ttl bounded
@@ -2593,8 +2660,8 @@ TEST_CASE("ttl trigger: a boot-time recovery re-registers it, and retries a fail
     rig.world.fail_load = true;
     auto failed = recover_at_init(rig.env, dl);
     REQUIRE(failed.status == "degraded");
-    settle_ttl(failed, again, rig.store);
-    CHECK(again.registered.size() == 1);
+    settle_triggers(failed, again, rig.store);
+    CHECK(again.count(kTtlTriggerId) == 1);
     CHECK(failed.status == "degraded");
 }
 
@@ -4099,21 +4166,6 @@ TEST_CASE("packaged Linux: a non-root agent under no_new_privs is refused, nothi
     CHECK_FALSE(linux_privilege_refusal(false, -1)); // unreadable is not a refusal: sudo will say so
 }
 
-TEST_CASE("ttl_seconds is refused in this release, whatever its value; the core keeps its bounds",
-          "[agent][firewall_quarantine]") {
-    static_assert(!kTtlAvailable);
-    CHECK_FALSE(ttl_param_refusal(""));
-    for (const char* v : {"0", "5", "59", "60", "3600", "2592001", "soon"}) {
-        INFO("ttl_seconds=" << v);
-        const auto r = ttl_param_refusal(v);
-        REQUIRE(r);
-        CHECK(*r == "ttl_unavailable");
-    }
-    // the TTL core stays for the day the constant flips
-    CHECK(parse_ttl_param("60").value() == 60);
-    CHECK_FALSE(parse_ttl_param("59"));
-}
-
 TEST_CASE("kv presence: only 0 and 1 are answers; a fault is never 'absent'",
           "[agent][firewall_quarantine]") {
     CHECK(kv_presence(0) == KvPresence::present);
@@ -4794,7 +4846,7 @@ TEST_CASE("CH-3: a failed ttl registration is residue on the record until a sett
     trig.accept = false; // the trigger table is full
     auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl);
     REQUIRE(o.status == "active");
-    settle_ttl(o, trig, rig.store);
+    settle_triggers(o, trig, rig.store);
     CHECK(o.status == "partial");
     CHECK(o.reason == "ttl_unregistered");
     REQUIRE(rig.store.state());
@@ -4818,7 +4870,7 @@ TEST_CASE("CH-3: a failed ttl registration is residue on the record until a sett
 
     // a registration that finally succeeds clears it
     trig.accept = true;
-    settle_ttl(st, trig, rig.store);
+    settle_triggers(st, trig, rig.store);
     CHECK(st.status == "active");
     CHECK(st.reason.empty());
     CHECK_FALSE(contains(st.notes, "ttl_unregistered=1"));
@@ -4828,7 +4880,7 @@ TEST_CASE("CH-3: a failed ttl registration is residue on the record until a sett
     // a no-op poll never re-registers (it logs a replace and a fire every 30 s otherwise)
     FakeTriggers quiet;
     auto tick = release(rig.env, due, dl);
-    settle_ttl(tick, quiet, rig.store);
+    settle_triggers(tick, quiet, rig.store);
     CHECK(quiet.registered.empty());
 }
 
@@ -4850,8 +4902,9 @@ TEST_CASE("CH-3: a throw out of an action is degraded|exception, never refused, 
     REQUIRE(o.state);
     CHECK(o.state->phase == Phase::applying);
     FakeTriggers trig;
-    settle_ttl(o, trig, rig.store); // the trigger of a time-limited applying record is registered
-    CHECK(trig.registered.size() == 1);
+    settle_triggers(o, trig, rig.store); // the triggers of a time-limited applying record are registered
+    CHECK(trig.count(kTtlTriggerId) == 1);
+    CHECK(trig.count(kRepairTriggerId) == 1);
 
     const auto rows = render_rows(o);
     CHECK(rows.front() == "status|degraded|exception");
@@ -4868,7 +4921,7 @@ TEST_CASE("CH-3: a throw out of an action is degraded|exception, never refused, 
     CHECK_FALSE(bare.state);
     FakeTriggers quiet;
     FakeStore store;
-    settle_ttl(bare, quiet, store);
+    settle_triggers(bare, quiet, store);
     CHECK(quiet.registered.empty());
 }
 
@@ -4895,7 +4948,7 @@ TEST_CASE("CH-4: a store fault is never read as an absent record -- nothing is s
     CHECK(tick.status == "degraded");
     CHECK(tick.reason == "state_unreadable");
     FakeTriggers trig;
-    settle_ttl(tick, trig, rig.store);
+    settle_triggers(tick, trig, rig.store);
     CHECK(trig.unregistered.empty());
     CHECK(trig.registered.empty());
     // start recovery and an update: nothing re-applied, nothing changed
@@ -5102,4 +5155,947 @@ TEST_CASE("a reply that names residue carries its reason; repair notes appear on
         CHECK(bad.status == "update_failed");
         CHECK_FALSE(contains(bad.notes, "incomplete_apply_converged=1"));
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Governance gate 7, round 2: the owner's three decisions (a time limit that
+// works and says what it cannot promise; a Group Policy-managed Windows host
+// that is contained and reported partial; an unattended self-check) and the
+// test-only folds (con-5, qe-1, qe-2).
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── the time limit: honest about the two things it cannot promise ───────────
+
+TEST_CASE("ttl: an expiry release says so, and the one logged line it leaves carries the note",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl).status == "active");
+    ReleaseRequest due;
+    due.if_ttl_expired = true;
+
+    // before the deadline: a no-op that logs nothing (it would log every 30 s otherwise)
+    rig.now += 119;
+    const auto early = release(rig.env, due, dl);
+    CHECK(contains(early.notes, "ttl_not_expired=1"));
+    CHECK_FALSE(contains(early.notes, "ttl_expired=1"));
+    CHECK(log_level("release", early) == LogLevel::none);
+
+    // the expiry itself: inactive, the note, and an info line that reads like this
+    rig.now += 2;
+    const auto late = release(rig.env, due, dl);
+    REQUIRE(late.status == "inactive");
+    CHECK(contains(late.notes, "ttl_expired=1"));
+    CHECK(log_level("release", late) == LogLevel::info);
+    CHECK(log_line("release", late) == "firewall: release -> inactive ttl_expired=1");
+
+    SECTION("a limit that lapsed while the agent was down is released at start with the same note") {
+        NftRig down;
+        auto d2 = down.dl();
+        REQUIRE(apply_and_verify(down.env, down.request(kProbeTarget, 120), d2).status == "active");
+        down.now += 500;
+        const auto boot = recover_at_init(down.env, d2);
+        CHECK(boot.status == "inactive");
+        CHECK(contains(boot.notes, "ttl_expired=1"));
+        CHECK(log_line("start recovery", boot) == "firewall: start recovery -> inactive ttl_expired=1");
+    }
+    SECTION("a manual release is not an expiry") {
+        NftRig manual;
+        auto d3 = manual.dl();
+        REQUIRE(apply_and_verify(manual.env, manual.request(kProbeTarget, 120), d3).status == "active");
+        CHECK_FALSE(contains(release(manual.env, ReleaseRequest{}, d3).notes, "ttl_expired=1"));
+    }
+    SECTION("a lapsed limit deferred to a legacy containment has not expired anything yet") {
+        ScriptRig script;
+        auto rec = make_record();
+        rec.ttl_expires = script.now - 1;
+        REQUIRE(script.store.save(rec));
+        script.leg.refuse = "legacy_quarantine_active";
+        const auto deferred = release(script.env, due, dl);
+        CHECK(contains(deferred.notes, "ttl_deferred_legacy=1"));
+        CHECK_FALSE(contains(deferred.notes, "ttl_expired=1"));
+    }
+}
+
+TEST_CASE("ttl: a wall clock stepped behind the apply time is reported, and adds no way to expire",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(kProbeTarget, 3600), dl).status == "active");
+    const auto applied = rig.store.state()->applied_at;
+    REQUIRE(applied == rig.now);
+
+    CHECK_FALSE(contains(report_status(rig.env, dl).notes, "clock_before_apply=1")); // clock as it was
+    rig.now = applied + 100;
+    CHECK_FALSE(contains(report_status(rig.env, dl).notes, "clock_before_apply=1")); // forward is normal
+
+    // NTP is blocked by the containment: a clock that steps back is the host's own
+    rig.now = applied - 10;
+    const auto st = report_status(rig.env, dl);
+    CHECK(contains(st.notes, "clock_before_apply=1"));
+    CHECK(st.status == "active"); // said, never acted on
+    CHECK(contains(render_rows(st), "note|clock_before_apply=1"));
+
+    // and the limit cannot fire while the clock is behind: no new exit, by construction
+    QuarantineState s = *rig.store.state();
+    CHECK_FALSE(ttl_expired(s, applied - 10));
+    CHECK_FALSE(ttl_expired(s, applied));
+    ReleaseRequest due;
+    due.if_ttl_expired = true;
+    const auto tick = release(rig.env, due, dl);
+    CHECK(contains(tick.notes, "ttl_not_expired=1"));
+    CHECK(rig.world.table);
+
+    // a containment with no time limit has no clock to be behind
+    NftRig plain;
+    auto dl2 = plain.dl();
+    REQUIRE(apply_and_verify(plain.env, plain.request(), dl2).status == "active");
+    plain.now -= 1000;
+    CHECK_FALSE(contains(report_status(plain.env, dl2).notes, "clock_before_apply=1"));
+}
+
+TEST_CASE("log: what is logged for an outcome, at which level; the ticks stay quiet unless they did something",
+          "[agent][firewall_quarantine]") {
+    struct Row {
+        const char* action;
+        const char* status;
+        const char* reason;
+        std::vector<std::string> notes;
+        LogLevel level;
+        const char* line; // nullptr: not logged, so not compared
+    };
+    const std::vector<Row> rows{
+        {"quarantine", "active", "", {}, LogLevel::info, "firewall: quarantine -> active"},
+        {"release", "inactive", "", {"ttl_expired=1"}, LogLevel::info,
+         "firewall: release -> inactive ttl_expired=1"},
+        {"quarantine_status", "active", "", {}, LogLevel::none, nullptr},
+        {"quarantine_status", "partial", "state_flush_failed", {"state_flush_failed=1"}, LogLevel::warn,
+         "firewall: quarantine_status -> partial:state_flush_failed state_flush_failed=1"},
+        {"quarantine", "rolled_back", "control_unreachable", {}, LogLevel::warn,
+         "firewall: quarantine -> rolled_back:control_unreachable"},
+        {"quarantine", "refused", "ttl_out_of_bounds", {}, LogLevel::warn,
+         "firewall: quarantine -> refused:ttl_out_of_bounds"},
+        {"containment", "busy", "", {}, LogLevel::warn, "firewall: containment -> busy"},
+        {"containment", "degraded", "exception", {}, LogLevel::error,
+         "firewall: containment threw; outcome degraded:exception"},
+        // the 30 s time-limit poll: silent whatever the record carries
+        {"release", "active", "", {"ttl_not_expired=1"}, LogLevel::none, nullptr},
+        {"release", "partial", "stale_rules_left", {"stale_rules_left=2", "ttl_not_expired=1"},
+         LogLevel::none, nullptr},
+        // the 60 s repair tick
+        {"repair", "active", "", {"repair_tick=1"}, LogLevel::none, nullptr},
+        {"repair", "active_unproven", "", {"repair_tick=1"}, LogLevel::none, nullptr},
+        {"repair", "inactive", "", {"repair_tick=1", "nothing_to_repair=1"}, LogLevel::none, nullptr},
+        {"repair", "partial", "rules_not_disabled", {"repair_tick=1", "rules_not_disabled=2"},
+         LogLevel::none, nullptr}, // a residue the record already carries
+        {"repair", "partial", "operation_in_progress", {"repair_tick=1", "repair_skipped=1"},
+         LogLevel::none, nullptr},
+        {"repair", "active", "", {"repair_tick=1", "repaired=1", "repairs=1"}, LogLevel::info,
+         "firewall: repair -> active repair_tick=1 repaired=1 repairs=1"},
+        {"repair", "partial", "legacy_quarantine_active", {"repair_tick=1", "repair_deferred_legacy=1"},
+         LogLevel::warn, "firewall: repair -> partial:legacy_quarantine_active repair_tick=1 repair_deferred_legacy=1"},
+        {"repair", "degraded", "policy_not_blocking", {"repair_tick=1"}, LogLevel::warn,
+         "firewall: repair -> degraded:policy_not_blocking repair_tick=1"},
+        {"repair", "degraded", "state_unreadable", {"repair_tick=1"}, LogLevel::warn,
+         "firewall: repair -> degraded:state_unreadable repair_tick=1"},
+        {"repair", "update_failed", "nft_load_failed", {"repair_tick=1"}, LogLevel::warn,
+         "firewall: repair -> update_failed:nft_load_failed repair_tick=1"},
+    };
+    for (const auto& r : rows) {
+        INFO(r.action << " " << r.status << " " << r.reason);
+        Outcome o;
+        o.status = r.status;
+        o.reason = r.reason;
+        o.notes = r.notes;
+        CHECK(log_level(r.action, o) == r.level);
+        if (r.line)
+            CHECK(log_line(r.action, o) == r.line);
+    }
+}
+
+// ── Windows hosts under Group Policy: contained by the rules, reported partial ──
+
+TEST_CASE("gpo_override: residue outranks the others, is persisted, and every later read repeats it",
+          "[agent][firewall_quarantine]") {
+    OsPayload os;
+    CHECK_FALSE(has_residue(os));
+    os.rules_not_disabled = 2;
+    CHECK(residue_reason(os) == "rules_not_disabled");
+    os.gpo_override = true;
+    CHECK(has_residue(os));
+    CHECK(residue_reason(os) == "gpo_override"); // the default action not in force outranks a rule that would not disable
+    const auto notes = residue_notes(os);
+    REQUIRE(notes.size() == 2);
+    CHECK(notes[0] == "gpo_override=1");
+    CHECK(notes[1] == "rules_not_disabled=2");
+
+    // alone, it is the reason; it round-trips through the record text and a legacy
+    // record without the key still loads
+    QuarantineState rec = make_record();
+    rec.os.gpo_override = true;
+    const auto text = serialize_state(rec);
+    CHECK(text.find("gpo=1\n") != std::string::npos);
+    const auto back = parse_state(text);
+    REQUIRE(back);
+    CHECK(back->os.gpo_override);
+    CHECK(residue_reason(back->os) == "gpo_override");
+    QuarantineState plain = make_record();
+    CHECK_FALSE(parse_state(serialize_state(plain))->os.gpo_override);
+
+    SECTION("status_from_record over a record that carries the residue") {
+        LegStatus ls;
+        ls.state = OsState::enforcing;
+        Outcome o;
+        detail::status_from_record(o, rec, ls);
+        CHECK(o.status == "partial");
+        CHECK(o.reason == "gpo_override");
+        CHECK(contains(o.notes, "gpo_override=1"));
+        CHECK(result_kind(o).partial);
+    }
+    SECTION("status_from_record over a live read that says so, before the residue is recorded") {
+        // a policy that arrived mid-quarantine: the record is clean, the leg is not
+        LegStatus ls;
+        ls.state = OsState::enforcing;
+        ls.partial = true;
+        ls.reason = "gpo_override";
+        Outcome o;
+        detail::status_from_record(o, plain, ls);
+        CHECK(o.status == "partial");
+        CHECK(o.reason == "gpo_override");
+        CHECK(o.status != "active");
+    }
+}
+
+TEST_CASE("gpo_override: a Group Policy-managed host is contained and reported partial, never refused or active",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    // the Windows leg's apply writes the rules and the defaults, then reads the policy
+    // state: GP_OVERRIDE is residue and a partial apply
+    rig.leg.on_apply = [](OsPayload& os) {
+        os.gpo_override = true;
+        auto r = StepResult::success();
+        r.partial = true;
+        r.notes.emplace_back("gpo_override=1");
+        return r;
+    };
+    Deadline dl;
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "partial");
+    CHECK(o.reason == "gpo_override");
+    CHECK(render_rows(o).front() == "status|partial|gpo_override");
+    CHECK(contains(o.notes, "gpo_override=1"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::active);
+    CHECK(rig.store.state()->os.gpo_override);
+
+    // every later status repeats it, from the record and from the live read
+    rig.leg.status.partial = true;
+    rig.leg.status.reason = "gpo_override";
+    rig.leg.status.notes = {"gpo_override=1"}; // the Windows leg's live read says it too
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "gpo_override");
+    CHECK(std::count(st.notes.begin(), st.notes.end(), "gpo_override=1") == 1); // said once, not twice
+    CHECK(rig.store.state()->generation == 1);
+
+    // a retried quarantine answers the same and never re-applies (nothing a re-apply fixes)
+    const int applies = rig.leg.applies;
+    const auto again = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(again.status == "partial");
+    CHECK(again.reason == "gpo_override");
+    CHECK(contains(again.notes, "already_active=1"));
+    CHECK(rig.leg.applies == applies);
+
+    // a restart that finds the policy in force says so as well, never `active`
+    const auto boot = recover_at_init(rig.env, dl);
+    CHECK(boot.status == "partial");
+    CHECK(boot.reason == "gpo_override");
+    CHECK(rig.leg.applies == applies);
+
+    // the unattended repair tick does not converge on it either
+    const auto tick = repair(rig.env, dl);
+    CHECK(tick.status == "partial");
+    CHECK(tick.reason == "gpo_override");
+    CHECK(rig.leg.applies == applies);
+    CHECK(log_level("repair", tick) == LogLevel::none);
+
+    // an update re-reads the policy: a policy that is gone clears the residue, one that
+    // stays keeps it
+    rig.leg.on_apply = [](OsPayload& os) {
+        os.gpo_override = false;
+        return StepResult::success();
+    };
+    rig.leg.status.partial = false;
+    rig.leg.status.reason.clear();
+    const auto cleared = update(rig.env, true, {ex("10.0.0.9:22/tcp/in")}, dl);
+    CHECK(cleared.status == "active");
+    CHECK_FALSE(rig.store.state()->os.gpo_override);
+    CHECK(report_status(rig.env, dl).status == "active");
+}
+
+TEST_CASE("gpo_override: a policy default that leaves the probe target reachable still rolls the first apply back",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    rig.leg.on_apply = [](OsPayload& os) {
+        os.gpo_override = true;
+        auto r = StepResult::success();
+        r.partial = true;
+        return r;
+    };
+    rig.probe.blocked = [] { return false; }; // the policy's default action lets the target through
+    Deadline dl;
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "rolled_back");
+    CHECK(o.reason == "probe_still_reachable");
+    CHECK_FALSE(rig.store.state()); // a containment that proved nothing is not left behind
+}
+
+// ── the unattended self-check ───────────────────────────────────────────────
+
+TEST_CASE("repair: a host flushed behind our back is re-applied from the STORED set, counted, and visible",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    const auto stored = rig.store.state()->allow;
+    CHECK(rig.store.state()->repairs == 0);
+
+    rig.world.table = false; // an external flush
+    rig.now += 90;
+    const auto o = repair(rig.env, dl);
+    CHECK(o.status == "active");
+    CHECK(contains(o.notes, "repair_tick=1"));
+    CHECK(contains(o.notes, "repaired=1"));
+    CHECK(rig.world.table); // the table is back
+    const auto rec = rig.store.state();
+    REQUIRE(rec);
+    CHECK(rec->phase == Phase::active);
+    CHECK(rec->generation == 2); // the same converge a retried quarantine uses
+    CHECK(rec->allow == stored); // never a fresh or caller-supplied set
+    CHECK(rec->repairs == 1);
+    CHECK(rec->repaired_at == rig.now);
+    CHECK(log_level("repair", o) == LogLevel::info);
+
+    // quarantine_status shows the repairs, on every read
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "active");
+    CHECK(contains(st.notes, "repairs=1"));
+    CHECK(contains(st.notes, std::format("last_repair_at={}", rig.now)));
+
+    // a second flush is a second repair
+    rig.world.table = false;
+    rig.now += 60;
+    CHECK(repair(rig.env, dl).status == "active");
+    CHECK(rig.store.state()->repairs == 2);
+    CHECK(rig.store.state()->repaired_at == rig.now);
+}
+
+TEST_CASE("repair: a healthy host is only read; nothing is applied, saved or logged",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    const auto calls = rig.world.log.size();
+    const auto saves = rig.store.saves;
+    const auto raw = rig.store.raw;
+
+    const auto o = repair(rig.env, dl);
+    CHECK(o.status == "active");
+    CHECK(contains(o.notes, "repair_tick=1"));
+    CHECK_FALSE(contains(o.notes, "repaired=1"));
+    CHECK(rig.store.saves == saves);
+    CHECK(rig.store.raw == raw);
+    // one leg read per tick (nft list), never a load or a delete
+    REQUIRE(rig.world.log.size() == calls + 1);
+    CHECK(rig.world.log.back()[1] == "list");
+    CHECK(log_level("repair", o) == LogLevel::none);
+}
+
+TEST_CASE("repair: an unreadable store is never acted on; no record means nothing to repair",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    rig.world.table = false; // a repairable gap ...
+    const auto calls = rig.world.log.size();
+    const auto raw = rig.store.raw;
+
+    rig.store.fault = true; // ... but the store cannot ANSWER: a fault is not "no record"
+    const auto o = repair(rig.env, dl);
+    CHECK(o.status == "degraded");
+    CHECK(o.reason == "state_unreadable");
+    CHECK(contains(o.notes, "repair_tick=1"));
+    CHECK(rig.world.log.size() == calls); // not one tool call: the leg was not read, let alone applied
+    CHECK(log_level("repair", o) == LogLevel::warn);
+    rig.store.fault = false;
+    CHECK(rig.store.raw == raw);
+    CHECK_FALSE(rig.world.table);
+
+    // a release since: no record, nothing to repair, and the tick says inactive so both
+    // triggers can be removed
+    REQUIRE(release(rig.env, ReleaseRequest{}, dl).status == "inactive");
+    const auto before = rig.world.log.size();
+    auto none = repair(rig.env, dl);
+    CHECK(none.status == "inactive");
+    CHECK(contains(none.notes, "nothing_to_repair=1"));
+    CHECK(rig.world.log.size() == before);
+    FakeTriggers trig;
+    settle_triggers(none, trig, rig.store);
+    CHECK(trig.unregistered_count(kRepairTriggerId) == 1);
+    CHECK(trig.unregistered_count(kTtlTriggerId) == 1);
+    CHECK(trig.registered.empty());
+}
+
+TEST_CASE("repair: never over a record that is not active, a read that cannot help, or a legacy containment",
+          "[agent][firewall_quarantine]") {
+    ScriptRig rig;
+    Deadline dl;
+    rig.leg.status.state = OsState::not_enforcing; // a repairable gap, every time below
+    rig.leg.status.reason = "policy_not_blocking";
+
+    SECTION("an operation in progress is skipped, never converged") {
+        for (const auto phase : {Phase::applying, Phase::releasing}) {
+            REQUIRE(rig.store.save(make_record(phase)));
+            const auto o = repair(rig.env, dl);
+            CHECK(o.status == "partial");
+            CHECK(o.reason == (phase == Phase::applying ? "operation_in_progress" : "release_incomplete"));
+            CHECK(contains(o.notes, "repair_skipped=1"));
+            CHECK(contains(o.notes, "repair_tick=1"));
+            CHECK(log_level("repair", o) == LogLevel::none);
+        }
+        CHECK(rig.leg.applies == 0);
+        CHECK(rig.store.state()->phase == Phase::releasing); // untouched
+    }
+    SECTION("a gap a re-apply cannot fix is reported, not re-applied every minute") {
+        REQUIRE(rig.store.save(make_record()));
+        rig.leg.status.reapply_helps = false;
+        rig.leg.status.reason = "firewall_disabled";
+        const auto o = repair(rig.env, dl);
+        CHECK(o.status == "degraded");
+        CHECK(o.reason == "firewall_disabled");
+        CHECK(rig.leg.applies == 0);
+        CHECK(log_level("repair", o) == LogLevel::warn);
+    }
+    SECTION("an unreadable host changes nothing") {
+        REQUIRE(rig.store.save(make_record()));
+        rig.leg.status.state = OsState::unreadable;
+        const auto o = repair(rig.env, dl);
+        CHECK(o.status == "degraded");
+        CHECK(o.reason == "os_unreadable");
+        CHECK(rig.leg.applies == 0);
+    }
+    SECTION("a legacy containment that appeared underneath defers, with no mutation") {
+        REQUIRE(rig.store.save(make_record()));
+        const auto raw = rig.store.raw;
+        rig.leg.refuse = "legacy_quarantine_active";
+        const auto o = repair(rig.env, dl);
+        CHECK(o.status == "partial");
+        CHECK(o.reason == "legacy_quarantine_active");
+        CHECK(contains(o.notes, "repair_deferred_legacy=1"));
+        CHECK(rig.leg.applies == 0);
+        CHECK(rig.store.raw == raw);
+        CHECK(log_level("repair", o) == LogLevel::warn);
+
+        // any OTHER preflight answer must not stop a repair: the converge re-checks it itself
+        rig.leg.refuse = "firewall_disabled:Public";
+        const auto fixed = repair(rig.env, dl);
+        CHECK(fixed.status != "partial");
+        CHECK(rig.leg.applies == 1);
+        CHECK(contains(fixed.notes, "repaired=1"));
+    }
+}
+
+TEST_CASE("repair: a failed repair is never counted, and says so",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    rig.world.table = false;
+    rig.world.fail_load = true; // the re-apply cannot load
+    const auto o = repair(rig.env, dl);
+    CHECK(o.status == "update_failed");
+    CHECK_FALSE(contains(o.notes, "repaired=1"));
+    CHECK(contains(o.notes, "repair_tick=1"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->repairs == 0);
+    CHECK(rig.store.state()->repaired_at == 0);
+    CHECK(log_level("repair", o) == LogLevel::warn);
+    // the next tick, with the cause gone, repairs it
+    rig.world.fail_load = false;
+    CHECK(repair(rig.env, dl).status == "active");
+    CHECK(rig.store.state()->repairs == 1);
+}
+
+TEST_CASE("repair: a retried quarantine that re-applies counts too, so status shows every repair",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    rig.world.table = false;
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(contains(o.notes, "repaired=1"));
+    CHECK(rig.store.state()->repairs == 1);
+    CHECK(contains(report_status(rig.env, dl).notes, "repairs=1"));
+}
+
+TEST_CASE("triggers: a refused repair registration is residue until a settle succeeds; a tick never re-registers",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    auto o = apply_and_verify(rig.env, rig.request(), dl);
+    REQUIRE(o.status == "active");
+    FakeTriggers trig;
+    trig.accept = false; // the trigger table is full
+    settle_triggers(o, trig, rig.store);
+    CHECK(o.status == "partial");
+    CHECK(o.reason == "repair_unregistered");
+    CHECK(contains(o.notes, "repair_trigger_unregistered=1"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->os.repair_unregistered);
+    CHECK(rig.store.state()->os.ttl_unregistered == false); // no time limit, so no TTL flag
+    const auto round = parse_state(serialize_state(*rig.store.state()));
+    REQUIRE(round);
+    CHECK(round->os.repair_unregistered);
+    CHECK(rig.store.raw.find("repair_unreg=1") != std::string::npos);
+
+    // every later read says so instead of `active` over a self-check nothing runs
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "repair_unregistered");
+    CHECK(contains(st.notes, "repair_unregistered=1"));
+    const auto noop = update(rig.env, true, {}, dl);
+    CHECK(noop.status == "partial");
+    CHECK(noop.reason == "repair_unregistered");
+
+    // the repair tick itself leaves the flag alone and registers nothing
+    FakeTriggers quiet;
+    auto tick = repair(rig.env, dl);
+    CHECK(tick.status == "partial");
+    CHECK(tick.reason == "repair_unregistered");
+    CHECK(log_level("repair", tick) == LogLevel::none); // a residue the record already carries
+    settle_triggers(tick, quiet, rig.store);
+    CHECK(quiet.registered.empty());
+    CHECK(rig.store.state()->os.repair_unregistered);
+
+    // a registration that finally succeeds clears it
+    FakeTriggers works;
+    auto again = report_status(rig.env, dl);
+    settle_triggers(again, works, rig.store);
+    CHECK(works.count(kRepairTriggerId) == 1);
+    CHECK(again.status == "active");
+    CHECK(again.reason.empty());
+    CHECK_FALSE(contains(again.notes, "repair_unregistered=1"));
+    CHECK_FALSE(rig.store.state()->os.repair_unregistered);
+    CHECK(report_status(rig.env, dl).status == "active");
+}
+
+TEST_CASE("triggers: two refused registrations name the first residue; clearing one names the other",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 600), dl);
+    REQUIRE(o.status == "active");
+    FakeTriggers none;
+    none.accept = false;
+    settle_triggers(o, none, rig.store);
+    CHECK(o.status == "partial");
+    CHECK(o.reason == "ttl_unregistered"); // the first residue in the fixed order
+    CHECK(rig.store.state()->os.ttl_unregistered);
+    CHECK(rig.store.state()->os.repair_unregistered);
+
+    // only the repair trigger registers this time: the time limit's gap is what is left
+    struct OnlyRepair final : TriggerRegistry {
+        FakeTriggers inner;
+        bool register_trigger(std::string_view id, std::string_view t, std::string_view c) override {
+            return id == kRepairTriggerId && inner.register_trigger(id, t, c);
+        }
+        bool unregister_trigger(std::string_view id) override { return inner.unregister_trigger(id); }
+    } only_repair;
+    auto st = report_status(rig.env, dl);
+    REQUIRE(st.reason == "ttl_unregistered");
+    settle_triggers(st, only_repair, rig.store);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "ttl_unregistered");
+    CHECK_FALSE(rig.store.state()->os.repair_unregistered);
+    CHECK(rig.store.state()->os.ttl_unregistered);
+
+    // and the reverse: the time limit registers, the repair trigger does not
+    struct OnlyTtl final : TriggerRegistry {
+        FakeTriggers inner;
+        bool register_trigger(std::string_view id, std::string_view t, std::string_view c) override {
+            return id == kTtlTriggerId && inner.register_trigger(id, t, c);
+        }
+        bool unregister_trigger(std::string_view id) override { return inner.unregister_trigger(id); }
+    } only_ttl;
+    auto s2 = report_status(rig.env, dl);
+    settle_triggers(s2, only_ttl, rig.store);
+    CHECK(s2.status == "partial");
+    CHECK(s2.reason == "repair_unregistered");
+    CHECK_FALSE(rig.store.state()->os.ttl_unregistered);
+    CHECK(rig.store.state()->os.repair_unregistered);
+}
+
+// ── con-5: every status token the core can answer, in one table ─────────────
+
+TEST_CASE("con-5: every status token maps to one typed result, one first row, one return code",
+          "[agent][firewall_quarantine]") {
+    using K = ResultKind::Kind;
+    struct Row {
+        const char* status;
+        const char* reason;
+        K kind;
+        bool partial;
+        int rc;
+    };
+    // The complete set the drivers and the shell produce, with the reasons that change a
+    // verdict: degraded|exception is the one `degraded` that is also a failed action.
+    const std::vector<Row> table{
+        {"active", "", K::ok, false, 0},
+        {"inactive", "", K::ok, false, 0},
+        {"active_unproven", "", K::ok, true, 0},
+        {"partial", "", K::constrained, true, 0},
+        {"partial", "gpo_override", K::constrained, true, 0},
+        {"partial", "repair_unregistered", K::constrained, true, 0},
+        {"partial", "operation_in_progress", K::constrained, true, 0},
+        {"degraded", "", K::constrained, true, 0},
+        {"degraded", "state_unreadable", K::constrained, true, 0},
+        {"degraded", "exception", K::constrained, true, 1},
+        {"refused", "ttl_out_of_bounds", K::unavailable, true, 1},
+        {"rolled_back", "control_unreachable", K::unavailable, true, 1},
+        {"update_failed", "commit_unknown", K::unavailable, true, 1},
+        {"busy", "", K::unavailable, true, 1},
+    };
+    for (const auto& row : table) {
+        INFO(row.status << "|" << row.reason);
+        Outcome o;
+        o.status = row.status;
+        o.reason = row.reason;
+        const auto rk = result_kind(o);
+        CHECK(rk.kind == row.kind);
+        CHECK(rk.partial == row.partial);
+        CHECK(rk.provenance == std::string{"firewall:"} + row.status);
+        CHECK(o.rc() == row.rc);
+        const auto rows = render_rows(o);
+        REQUIRE_FALSE(rows.empty());
+        CHECK(rows.front() == (std::string{"status|"} + row.status +
+                               (o.reason.empty() ? std::string{} : "|" + o.reason)));
+    }
+    // a token this build does not know is unavailable and partial, never ok
+    Outcome unknown;
+    unknown.status = "something_new";
+    CHECK(result_kind(unknown).kind == K::unavailable);
+    CHECK(result_kind(unknown).partial);
+}
+
+// ── qe-1 / qe-2: facts that must survive every re-save of the record ────────
+
+TEST_CASE("qe-1: revert_failed, a failed erase and a failed final save are all pinned",
+          "[agent][firewall_quarantine]") {
+    // These three live beside the cases that drive them: the update that cannot be
+    // reverted, the release whose record will not erase, and the apply/update whose
+    // final save fails. This case drives the one combination none of them reaches: a
+    // revert that fails AND a store that then refuses the record.
+    NftRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    int loads = 0;
+    rig.world.on_call = [&](const Argv& a) {
+        if (a.size() > 1 && a[1] == "-f" && ++loads == 2)
+            rig.world.fail_load = true; // the update commits; its REVERT cannot load
+    };
+    rig.probe.blocked = [] { return false; }; // the new generation fails verification
+    rig.store.fail_save_after = rig.store.saves + 1; // the candidate lands, nothing after it
+    const auto o = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+    CHECK(o.status == "update_failed");
+    CHECK(o.reason.starts_with("revert_failed:"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::applying); // boot recovery retries what IS in force
+    rig.store.fail_save_after = -1;
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "partial");
+    CHECK(st.reason == "operation_in_progress");
+}
+
+TEST_CASE("qe-2: the pf token and the failed-flush fact survive converge's put-back, give_back and the rollback re-save",
+          "[agent][firewall_quarantine]") {
+    // An update that left a pf state flush failed, then a crash left the record `applying`.
+    const auto applying_with_flush_gap = [](PfRig& rig, Deadline& dl) {
+        REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+        rig.world.fail_flush_states = 2;
+        REQUIRE(update(rig.env, true, {ex("10.0.0.9:22/tcp/in")}, dl).status == "partial");
+        auto st = *rig.store.state();
+        REQUIRE(st.os.state_flush_failed);
+        st.phase = Phase::applying;
+        st.prev_generation = st.generation;
+        REQUIRE(rig.store.save(st));
+        return st.os;
+    };
+
+    SECTION("converge's put-back (back.os = cand.os) after a load that fails") {
+        PfRig rig;
+        auto dl = rig.dl();
+        const auto held = applying_with_flush_gap(rig, dl);
+        rig.world.fail_load = true;
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "update_failed");
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::applying); // the previous record, put back
+        CHECK(rig.store.state()->os.pf_token == held.pf_token);
+        CHECK(rig.store.state()->os.boot_time == held.boot_time);
+        CHECK(rig.store.state()->os.state_flush_failed);
+    }
+    SECTION("give_back: a fresh reference taken for a failed attempt is released, the old facts are put back") {
+        PfRig rig;
+        auto dl = rig.dl();
+        const auto held = applying_with_flush_gap(rig, dl);
+        rig.world.external_disable(); // pf off behind our back: the held token is dead
+        rig.world.fail_load = true;   // the repair takes a fresh reference, then the load fails
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "update_failed");
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->os.pf_token == held.pf_token); // what the record held, not the fresh one
+        CHECK(rig.store.state()->os.state_flush_failed);
+        CHECK(rig.world.tokens.empty()); // the fresh reference was given back
+    }
+    SECTION("the rollback re-save keeps the token on the releasing record and invents no flush fact") {
+        PfRig rig;
+        auto dl = rig.dl();
+        rig.world.fail_flush_anchor = true; // the removal cannot empty the anchor
+        rig.probe.control_up = false;       // the first apply fails its own control check
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "rolled_back");
+        CHECK(contains(o.notes, "rollback_incomplete=1"));
+        REQUIRE(rig.store.state());
+        CHECK(rig.store.state()->phase == Phase::releasing);
+        CHECK_FALSE(rig.store.state()->os.pf_token.empty());
+        CHECK_FALSE(rig.store.state()->os.state_flush_failed);
+    }
+}
+
+// ── UP-8: the control set follows the server address the agent really uses ──
+
+TEST_CASE("live peer: only an address literal that parses is an endpoint", "[agent][firewall_quarantine]") {
+    const auto e = parse_live_peer("203.0.113.99:50051");
+    REQUIRE(e);
+    CHECK(format_ip(e->ip) == "203.0.113.99");
+    CHECK(e->port == 50051);
+    CHECK(e->proto == Proto::tcp);
+    CHECK(e->dir == Dir::out);
+    const auto v6 = parse_live_peer("[2001:db8::99]:8443");
+    REQUIRE(v6);
+    CHECK(v6->ip.v6);
+    CHECK(v6->port == 8443);
+    // a name is never resolved here, a bare address has no port to allow, nothing else passes
+    for (const char* bad : {"", "server.example.com:50051", "203.0.113.99", "203.0.113.99:0",
+                            "203.0.113.99:70000", "203.0.113.999:50051", "garbage", ":50051",
+                            "[2001:db8::99]", "203.0.113.99:50051;rm"})
+        CHECK_FALSE(parse_live_peer(bad));
+}
+
+TEST_CASE("live peer: it leads the control set, deduplicated, and never empties or overflows it",
+          "[agent][firewall_quarantine]") {
+    const std::vector<std::string> res{"203.0.113.53"};
+    const auto at = [](const AllowSet& s, std::size_t i) { return format_ip(s.control.at(i).ip); };
+
+    SECTION("a peer outside the start-resolved set is admitted first") {
+        const auto b = build_allow_set("198.51.100.7", "198.51.100.7:50051", res, {}, "203.0.113.99:50051");
+        REQUIRE(b);
+        REQUIRE(b->control.size() == 2);
+        CHECK(at(*b, 0) == "203.0.113.99");
+        CHECK(b->control[0].port == 50051);
+        CHECK(at(*b, 1) == "198.51.100.7");
+        CHECK(contains(b->notes, "control_live_peer=203.0.113.99:50051"));
+        CHECK_FALSE(contains(b->notes, "live_peer_invalid=1"));
+    }
+    SECTION("a peer the start-resolved set already carries moves to the front, never twice") {
+        const auto b = build_allow_set("198.51.100.7,198.51.100.8", "198.51.100.7:50051", res, {},
+                                       "198.51.100.8:50051");
+        REQUIRE(b);
+        REQUIRE(b->control.size() == 2);
+        CHECK(at(*b, 0) == "198.51.100.8");
+        CHECK(at(*b, 1) == "198.51.100.7");
+    }
+    SECTION("the live peer's own port is the one allowed, a v6 peer included") {
+        const auto b = build_allow_set("198.51.100.7", "198.51.100.7:50051", res, {}, "[2001:db8::99]:8443");
+        REQUIRE(b);
+        CHECK(b->control.front().ip.v6);
+        CHECK(b->control.front().port == 8443);
+        CHECK(contains(b->notes, "control_live_peer=[2001:db8::99]:8443"));
+        CHECK(b->control.back().port == 50051); // the configured port keeps governing the listed set
+    }
+    SECTION("a literal that does not parse is dropped with a note, the set is what it was") {
+        for (const char* bad : {"server.example.com:50051", "garbage", "203.0.113.99"}) {
+            const auto b = build_allow_set("198.51.100.7", "198.51.100.7:50051", res, {}, bad);
+            REQUIRE(b);
+            CHECK(b->control.size() == 1);
+            CHECK(contains(b->notes, "live_peer_invalid=1"));
+            CHECK_FALSE(std::any_of(b->notes.begin(), b->notes.end(), [](const std::string& n) {
+                return n.starts_with("control_live_peer=");
+            }));
+        }
+    }
+    SECTION("no live peer: exactly the old behaviour") {
+        const auto none = build_allow_set("198.51.100.7", "198.51.100.7:50051", res, {});
+        const auto empty = build_allow_set("198.51.100.7", "198.51.100.7:50051", res, {}, "");
+        REQUIRE(none);
+        REQUIRE(empty);
+        CHECK(none->control == empty->control);
+        CHECK(none->notes.empty());
+    }
+    SECTION("an empty start-resolved set with a live peer is no longer control_set_empty") {
+        // a hostname that did not resolve at start: before, nothing could be allowed
+        const auto before = build_allow_set("", "server.example.com:50051", res, {});
+        REQUIRE_FALSE(before);
+        CHECK(before.error() == "control_set_empty");
+        const auto b = build_allow_set("", "server.example.com:50051", res, {}, "203.0.113.99:50051");
+        REQUIRE(b);
+        REQUIRE(b->control.size() == 1);
+        CHECK(at(*b, 0) == "203.0.113.99");
+        // an unparsable peer does not rescue it
+        const auto bad = build_allow_set("", "server.example.com:50051", res, {}, "garbage");
+        REQUIRE_FALSE(bad);
+        CHECK(bad.error() == "control_set_empty");
+    }
+    SECTION("the configured-port and cap rules are unchanged") {
+        const auto no_port = build_allow_set("198.51.100.7", "198.51.100.7", res, {}, "203.0.113.99:50051");
+        REQUIRE_FALSE(no_port);
+        CHECK(no_port.error() == "control_port_missing");
+        std::string many;
+        for (std::size_t i = 1; i <= kMaxControlIps; ++i)
+            many += (many.empty() ? "" : ",") + std::format("198.51.100.{}", i);
+        REQUIRE(build_allow_set(many, "198.51.100.1:50051", res, {}));
+        const auto over = build_allow_set(many, "198.51.100.1:50051", res, {}, "203.0.113.99:50051");
+        REQUIRE_FALSE(over);
+        CHECK(over.error() == "control_set_too_large");
+    }
+}
+
+namespace {
+
+/// A probe whose control endpoints answer only while the network path exists AND the loaded
+/// table lets the packet out: `up` is what the network would answer, `allowed` what the
+/// contained host's own rules admit. The probe target answers until the table is loaded.
+struct PeerProbe {
+    std::set<std::string> up;
+    NftWorld* world = nullptr;
+    std::vector<std::string> asked;
+    TcpProbe fn() {
+        return [this](const std::string& ip, int port, std::chrono::milliseconds) {
+            const auto key = std::format("{}:{}", ip, port);
+            asked.push_back(key);
+            if (key == kProbeTarget)
+                return world->table ? ProbeOutcome::timeout : ProbeOutcome::connected;
+            const bool let_out = !world->table || world->text.find(ip) != std::string::npos;
+            return up.count(key) != 0 && let_out ? ProbeOutcome::connected : ProbeOutcome::timeout;
+        };
+    }
+    [[nodiscard]] bool asked_for(std::string_view key) const {
+        return std::find(asked.begin(), asked.end(), key) != asked.end();
+    }
+};
+
+} // namespace
+
+TEST_CASE("live peer: a peer outside the start-resolved set is admitted first and is what verify connects to",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    PeerProbe net;
+    net.world = &rig.world;
+    net.up = {"203.0.113.99:50051"}; // the server moved: only its NEW address answers
+    rig.env.probe = net.fn();
+    const auto allow = build_allow_set("198.51.100.7", "198.51.100.7:50051", {"203.0.113.53"}, {},
+                                       "203.0.113.99:50051");
+    REQUIRE(allow);
+    rig.env.live_control = parse_live_peer("203.0.113.99:50051");
+    ApplyRequest req;
+    req.allow = *allow;
+    req.probe_target = kProbeTarget;
+    auto dl = rig.dl();
+    const auto o = apply_and_verify(rig.env, req, dl);
+    CHECK(o.status == "active");
+    CHECK(contains(o.notes, "control_proved=live"));
+    CHECK_FALSE(contains(o.notes, "control_live_peer=203.0.113.99:50051")); // the allow set's note, added by the shell
+    CHECK(net.asked_for("203.0.113.99:50051"));
+    CHECK_FALSE(net.asked_for("198.51.100.7:50051")); // the listed (dead) endpoint is never the proof
+    REQUIRE(rig.store.state());
+    CHECK(format_ip(rig.store.state()->allow.control.front().ip) == "203.0.113.99");
+    CHECK(rig.world.text.find("203.0.113.99") != std::string::npos); // and the ruleset really admits it
+    CHECK(rig.store.state()->last_verify.starts_with("verified")); // proof text keeps its shape
+
+    // a quarantine_allow update proves the live peer too
+    const auto up = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+    CHECK(up.status == "active");
+    CHECK(contains(up.notes, "control_proved=live"));
+}
+
+TEST_CASE("live peer: a listed endpoint that answers while the live peer does not is control_unreachable",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    PeerProbe net;
+    net.world = &rig.world;
+    net.up = {"198.51.100.7:50051"}; // the stale listed address still answers; the live one does not
+    rig.env.probe = net.fn();
+    const auto allow = build_allow_set("198.51.100.7", "198.51.100.7:50051", {"203.0.113.53"}, {},
+                                       "203.0.113.99:50051");
+    REQUIRE(allow);
+    rig.env.live_control = parse_live_peer("203.0.113.99:50051");
+    ApplyRequest req;
+    req.allow = *allow;
+    req.probe_target = kProbeTarget;
+    auto dl = rig.dl();
+    const auto o = apply_and_verify(rig.env, req, dl);
+    CHECK(o.status == "rolled_back");
+    CHECK(o.reason == "control_unreachable");
+    CHECK(contains(o.notes, "control_proved=live"));
+    CHECK_FALSE(net.asked_for("198.51.100.7:50051")); // the listed scan would have called this green
+    CHECK_FALSE(rig.store.state()); // rolled back to absence
+    CHECK_FALSE(rig.world.table);
+}
+
+TEST_CASE("live peer: with none known the listed scan is the proof, as at agent start",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    PeerProbe net;
+    net.world = &rig.world;
+    net.up = {"198.51.100.7:50051"};
+    rig.env.probe = net.fn();
+    CHECK_FALSE(rig.env.live_control);
+    auto dl = rig.dl();
+    const auto o = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(o.status == "active");
+    CHECK(contains(o.notes, "control_proved=listed"));
+    CHECK_FALSE(contains(o.notes, "control_proved=live"));
+    CHECK(net.asked_for("198.51.100.7:50051"));
+
+    // agent start re-checks the stored set before any Register: nothing live to prove
+    rig.world.table = false; // a reboot
+    const auto boot = recover_at_init(rig.env, dl);
+    CHECK(boot.status == "active");
+    CHECK(contains(boot.notes, "control_proved=listed"));
+}
+
+TEST_CASE("live peer: a server re-addressed AFTER containment still strands the host, and verify says so",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    PeerProbe net;
+    net.world = &rig.world;
+    net.up = {"198.51.100.7:50051", "203.0.113.200:50051"};
+    rig.env.probe = net.fn();
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+
+    // the server moves; the agent learns the new address (a Register over some other path)
+    rig.env.live_control = parse_live_peer("203.0.113.200:50051");
+    const auto gen = rig.store.state()->generation;
+    const auto o = update(rig.env, true, {ex("10.0.0.5:22/tcp/in")}, dl);
+    // the new address is not in the stored set: the host's own rules block it, the update is
+    // refused by its verification and the previous generation is put back (README caveat 2:
+    // the control set follows the peer at QUARANTINE time, never one that appears later)
+    CHECK(o.status == "update_failed");
+    CHECK(o.reason == "control_unreachable");
+    CHECK(contains(o.notes, "control_proved=live"));
+    REQUIRE(rig.store.state());
+    CHECK(rig.store.state()->phase == Phase::active);
+    CHECK(rig.store.state()->allow.exceptions.empty());
+    CHECK(rig.store.state()->generation == gen + 2); // the revert is itself a generation
 }

@@ -1945,11 +1945,8 @@ public:
             fq::win_firewall_switch_verdict(read_switch(*policy.get())));
         if (!why.empty())
             return why;
-        // A Group Policy default action overrides the profile defaults we write: the
-        // block would not be in force, so refuse rather than claim a containment the
-        // reply path cannot prove.
-        if (policy_overridden(*policy.get()))
-            return std::string{fq::kWinGpoOverrideReason};
+        // A Group Policy default action is NOT a refusal: the rules still apply, and
+        // apply() records `gpo_override` as residue (partial, never active).
         return std::nullopt;
     }
 
@@ -1975,8 +1972,6 @@ public:
                 fq::win_firewall_switch_verdict(read_switch(*policy.get())));
             !why.empty())
             return fq::StepResult::fail(why);
-        if (policy_overridden(*policy.get()))
-            return fq::StepResult::fail(std::string{fq::kWinGpoOverrideReason});
 
         // 1. Read the ruleset once: legacy markers, our group, what to disable.
         std::vector<fq::WinRuleInfo> infos;
@@ -2122,6 +2117,13 @@ public:
         }
         undo.committed = true; // this generation is in force; nothing below can fail the update
 
+        // A Group Policy default action beats the profile defaults written above: the
+        // rules are in force, the default block is not. Applied anyway (the owner's
+        // ruling) and recorded as residue like a rule that would not disable, so every
+        // later status repeats `partial|gpo_override`. Re-read on every apply, so a
+        // policy that is gone clears it and one that arrived sets it.
+        const bool gpo = policy_overridden(*policy.get());
+
         // 7. Remove the stale generation's rules LAST. One that will not go is
         //    not a failed update (this generation is in force) but it IS a live
         //    allowance the record no longer lists -- an Allow rule outranks the
@@ -2145,6 +2147,11 @@ public:
         if (refused > 0) {
             ok.partial = true;
             ok.notes.push_back(std::format("rules_not_disabled={}", refused));
+        }
+        os.gpo_override = gpo;
+        if (gpo) {
+            ok.partial = true;
+            ok.notes.emplace_back("gpo_override=1");
         }
         return ok;
     }
@@ -2278,6 +2285,7 @@ public:
         }
         os.rules_not_disabled = 0;
         os.stale_rules_left = 0;
+        os.gpo_override = false;
         result.notes.insert(result.notes.end(), decision.notes.begin(), decision.notes.end());
         return result;
     }
@@ -2320,13 +2328,16 @@ public:
             st.notes.emplace_back("rules_missing=1"); // block/block with no rules of ours
         if (fq::win_switch_status(sw, st))
             return st;
-        if (policy_overridden(*policy.get())) {
-            // A Group Policy default action overrides the local defaults we write:
-            // the block is not in force whatever get_Default*Action says, and a
-            // re-apply writes the same local value.
-            st.state = fq::OsState::not_enforcing;
+        if (group && policy_overridden(*policy.get())) {
+            // A Group Policy default action overrides the local defaults we write: our
+            // rules are in force, the default block is not, whatever get_Default*Action
+            // says. Enforcing but PARTIAL (the status answers partial|gpo_override with
+            // or without the residue recorded: a policy can arrive mid-quarantine), and
+            // never something a re-apply fixes -- it would write the same local value.
+            st.state = fq::OsState::enforcing;
+            st.partial = true;
             st.reason = std::string{fq::kWinGpoOverrideReason};
-            st.reapply_helps = false;
+            st.notes.emplace_back("gpo_override=1");
             return st;
         }
         st.state = (group && all_block) ? fq::OsState::enforcing : fq::OsState::not_enforcing;
@@ -2524,18 +2535,26 @@ private:
 // ── Action handlers (all OSes) ──────────────────────────────────────────────
 
 /// One log line per containment state change (info) and per non-OK outcome (warn),
-/// `degraded|exception` at error: a boot re-apply that failed, a TTL release that
-/// ended partial and an `uncontained after reboot` host otherwise show nothing until
-/// someone polls. Bounded to these call sites; the core logs nothing.
+/// `degraded|exception` at error: a boot re-apply that failed, a TTL release that ended
+/// partial, an unattended repair and an `uncontained after reboot` host otherwise show
+/// nothing until someone polls. The line carries the outcome's notes, so an expiry
+/// release reads `firewall: release -> inactive ttl_expired=1`, the only record of it
+/// until the server records them. What is logged, and at which level, is
+/// fq::log_level (pure, unit-tested); this maps it onto spdlog. The core logs nothing.
 void log_outcome(std::string_view action, const fq::Outcome& o) {
-    const std::string why = o.reason.empty() ? std::string{} : ":" + o.reason;
-    if (o.status == "degraded" && o.reason == "exception")
-        spdlog::error("firewall: {} threw; outcome degraded:exception", action);
-    else if (o.status == "active" || o.status == "inactive") {
-        if (action != "quarantine_status")
-            spdlog::info("firewall: {} -> {}{}", action, o.status, why);
-    } else
-        spdlog::warn("firewall: {} -> {}{}", action, o.status, why);
+    switch (fq::log_level(action, o)) {
+    case fq::LogLevel::none:
+        return;
+    case fq::LogLevel::info:
+        spdlog::info("{}", fq::log_line(action, o));
+        return;
+    case fq::LogLevel::warn:
+        spdlog::warn("{}", fq::log_line(action, o));
+        return;
+    case fq::LogLevel::error:
+        spdlog::error("{}", fq::log_line(action, o));
+        return;
+    }
 }
 
 void emit(yuzu::CommandContext& ctx, const fq::Outcome& o, std::string_view action = "containment") {
@@ -2570,20 +2589,28 @@ int emit_busy(yuzu::CommandContext& ctx) {
 /// backend the record says applied (a host that gained or lost nft since must
 /// still release what it applied); a fresh quarantine picks the best available.
 struct Containment {
+    YuzuPluginContext* raw;
     KvStateStore store;
     std::unique_ptr<fq::Leg> leg;
-    Containment(YuzuPluginContext* raw, bool for_apply) : store(raw) {
+    Containment(YuzuPluginContext* raw_, bool for_apply) : raw(raw_), store(raw_) {
         const auto l = store.load();
-        leg = make_leg(raw, l.kind == fq::StateLoad::Kind::ok ? l.state.backend : fq::BackendKind::none,
+        leg = make_leg(raw_, l.kind == fq::StateLoad::Kind::ok ? l.state.backend : fq::BackendKind::none,
                        for_apply);
     }
-    [[nodiscard]] fq::Env env() {
-        return fq::Env{*leg, store, tcp_probe, epoch_now};
+    /// `live_peer`: the verification proves the address the agent's control channel
+    /// really uses (`agent.server_peer`, published by agents/core from the stream the
+    /// server answered on) instead of scanning the allow set. Agent start passes false:
+    /// no Register has happened yet, so no peer is known and the listed scan is the proof.
+    [[nodiscard]] fq::Env env(bool live_peer = true) {
+        return fq::Env{*leg, store, tcp_probe, epoch_now,
+                       live_peer ? fq::parse_live_peer(config_value(raw, "agent.server_peer"))
+                                 : std::nullopt};
     }
 };
 
-/// The agent's trigger engine, reached through the plugin context. The TTL
-/// decision itself (fq::settle_ttl) is in the core.
+/// The agent's trigger engine, reached through the plugin context. The decision
+/// itself (fq::settle_triggers: the time limit's trigger and the repair self-check) is
+/// in the core.
 class ContextTriggers final : public fq::TriggerRegistry {
 public:
     explicit ContextTriggers(YuzuPluginContext* raw) : ctx_{raw} {}
@@ -2597,19 +2624,19 @@ private:
     yuzu::PluginContext ctx_;
 };
 
-void settle_ttl(fq::Outcome& o, YuzuPluginContext* raw) {
+void settle_triggers(fq::Outcome& o, YuzuPluginContext* raw) {
     if (!raw)
         return;
     ContextTriggers triggers{raw};
     KvStateStore store{raw}; // a failed registration is recorded as residue on the record
-    fq::settle_ttl(o, triggers, store);
+    fq::settle_triggers(o, triggers, store);
 }
 
 /// What a throw out of a containment action answers: `degraded|exception`
 /// (CONSTRAINED, PARTIAL, rc 1), never `refused` -- a throw can follow the
 /// `applying` record and part of the mutation, and consumers key on the provenance
 /// (`firewall:refused` means nothing changed). The stored record, when it loads, is
-/// attached so settle_ttl still registers the trigger of a time-limited `applying`
+/// attached so settle_triggers still registers the triggers of an `applying`
 /// record. Every step is its own guard: this runs inside the one catch at the plugin
 /// seam and must never throw across the ABI.
 int emit_exception(yuzu::CommandContext& ctx, YuzuPluginContext* raw) {
@@ -2621,7 +2648,7 @@ int emit_exception(yuzu::CommandContext& ctx, YuzuPluginContext* raw) {
         }
         auto o = fq::exception_outcome(loaded);
         try {
-            settle_ttl(o, raw);
+            settle_triggers(o, raw);
         } catch (...) {
         }
         emit(ctx, o, "containment");
@@ -2660,11 +2687,49 @@ template <class Body> int gated(yuzu::CommandContext& ctx, Body&& body) {
     return body();
 }
 
+/// The unattended self-check (`firewall.quarantine` with `repair=1`, dispatched by the
+/// repair trigger every 60 s). Runs inside the same MutationGate as every mutating
+/// action (busy answers, never waits). Reads the record and, at most, re-applies the
+/// STORED set of an `active` record the host stopped enforcing (fq::repair); no allow
+/// set is built and no other parameter is read.
+int do_repair(yuzu::CommandContext& ctx, YuzuPluginContext* raw) {
+    if (const auto why = privilege_refusal())
+        return emit_refusal(ctx, std::string{*why}, "repair");
+    Containment containment(raw, /*for_apply=*/false);
+    fq::Outcome o;
+    if (!containment.leg) {
+        // No firewall tool: nothing of ours is in force unless a record says it is, and
+        // a store that cannot answer is still never read as "no record".
+        o.notes.emplace_back("repair_tick=1");
+        switch (containment.store.load().kind) {
+        case fq::StateLoad::Kind::absent:
+            o.status = "inactive";
+            o.notes.emplace_back("nothing_to_repair=1");
+            break;
+        case fq::StateLoad::Kind::unreadable:
+            o.status = "degraded";
+            o.reason = "state_unreadable";
+            break;
+        case fq::StateLoad::Kind::ok:
+            o.status = "degraded";
+            o.reason = "os_unreadable";
+            break;
+        }
+    } else {
+        auto env = containment.env();
+        fq::Deadline dl;
+        o = fq::repair(env, dl);
+    }
+    settle_triggers(o, raw);
+    emit(ctx, o, "repair");
+    return o.rc();
+}
+
 int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext* raw) {
-    // A time limit is not offered in this release (fq::kTtlAvailable): refused before
-    // anything is validated, probed or written.
-    if (const auto why = fq::ttl_param_refusal(params.get("ttl_seconds")))
-        return emit_refusal(ctx, *why, "quarantine");
+    // The repair trigger's dispatch: routed before anything else is read, so no
+    // operator parameter can steer it (it never builds an allow set or starts a record).
+    if (params.get("repair") == "1")
+        return do_repair(ctx, raw);
     const auto ttl = fq::parse_ttl_param(params.get("ttl_seconds"));
     if (!ttl)
         return emit_refusal(ctx, ttl.error(), "quarantine");
@@ -2688,11 +2753,14 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
         return emit_refusal(ctx, "staging_unavailable");
 #endif
 
-    // Read ONCE at agent start (never resolved here: the host being contained
-    // must not choose which address survives its own containment, #3429).
+    // The start-resolved set was read ONCE at agent start and the live peer is the
+    // address agents/core published from the stream the server answered on (never
+    // resolved here: the host being contained must not choose which address survives
+    // its own containment, #3429). The live peer leads the set, so a server that moved
+    // since start is allowed, and it is what the verification connects to.
     auto allow = fq::build_allow_set(config_value(raw, "agent.server_address_resolved"),
                                      config_value(raw, "agent.server_address"), host_resolvers(),
-                                     *exceptions);
+                                     *exceptions, config_value(raw, "agent.server_peer"));
     if (!allow)
         return emit_refusal(ctx, allow.error());
 
@@ -2704,7 +2772,7 @@ int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginCont
     fq::Deadline dl;
     auto o = fq::apply_and_verify(env, req, dl);
     o.notes.insert(o.notes.end(), allow->notes.begin(), allow->notes.end());
-    settle_ttl(o, raw);
+    settle_triggers(o, raw);
     emit(ctx, o, "quarantine");
     return o.rc();
 }
@@ -2731,7 +2799,7 @@ int do_release(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext
     auto env = containment.env();
     fq::Deadline dl;
     auto o = fq::release(env, req, dl);
-    settle_ttl(o, raw);
+    settle_triggers(o, raw);
     emit(ctx, o, "release");
     return o.rc();
 }
@@ -2802,10 +2870,10 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
         Containment containment(raw, /*for_apply=*/true);
         if (!containment.leg)
             return "no_firewall_tool";
-        auto env = containment.env();
+        auto env = containment.env(/*live_peer=*/false); // no Register yet: no live peer is known
         fq::Deadline dl;
         auto o = fq::recover_at_init(env, dl);
-        settle_ttl(o, raw);
+        settle_triggers(o, raw);
         log_outcome("start recovery", o);
         // `status[:reason][,note...]`: a cause that is only a note (a failed state
         // flush, an unregistered TTL trigger) must survive into init_recovery.
@@ -2865,22 +2933,29 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
          "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges; "
          "contains the host's own IP traffic and traffic the host routes (L2-bridged guests and "
-         "macvlan/ipvlan containers are not contained); ttl_seconds is refused (ttl_unavailable)"},
+         "macvlan/ipvlan containers are not contained); a ttl_seconds limit rides the host "
+         "wall clock (NTP is blocked while contained) and its expiry release is logged on the "
+         "agent only"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2,
          "sudo pfctl: own sub-anchor com.apple/000.yuzu_quarantine loaded with -a -f (the main ruleset "
          "is never loaded), a pf enable reference (-E), one global pf state flush (-F states)",
          "needs Apple's anchor com.apple/* in the main ruleset and no sibling anchor sorting before "
          "000.yuzu_quarantine, else the result is partial or degraded; the state flush cuts every pf "
-         "connection once and release does not restore them; ttl_seconds is refused (ttl_unavailable)"},
+         "connection once and release does not restore them; a ttl_seconds limit rides the host "
+         "wall clock (NTP is blocked while contained) and its expiry release is logged on the "
+         "agent only"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "INetFwPolicy2 COM rule group + per-profile default-block; other enabled rules "
          "disabled for the duration",
          "rules the policy store refuses to disable (GPO) leave the result partial; a host whose "
-         "firewall policy is Group Policy-managed (LocalPolicyModifyState GP_OVERRIDE) is refused; "
-         "contains the host's own IP traffic and traffic the host routes (Hyper-V external-switch "
-         "guests are not contained); ttl_seconds is refused (ttl_unavailable)"},
+         "firewall policy is Group Policy-managed (LocalPolicyModifyState GP_OVERRIDE) is contained "
+         "by its rules only and reports partial|gpo_override (a Group Policy default action beats "
+         "the profile default-block); contains the host's own IP traffic and traffic the host "
+         "routes (Hyper-V external-switch guests are not contained); a ttl_seconds limit rides the host "
+         "wall clock (NTP is blocked while contained) and its expiry release is logged on the "
+         "agent only"},
     },
     {
         /* .action      = */ "release",
