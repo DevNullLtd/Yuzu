@@ -282,7 +282,8 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
             spdlog::warn("CommandDedupStore: {}", note);
         const auto& moved = quarantine.dest;
         if (!moved) {
-            // Fail-open, observable (invariant 7): the original file is untouched.
+            // Fail-open, observable (invariant 7): the original file is untouched, except for the
+            // keep outcome in sqlite_quarantine.hpp (the judged file stays under its claimed name).
             return std::unexpected(CommandDedupError{
                 std::format("command_dedup.db is corrupt ({}) and could not be quarantined: {}",
                             reason, db_path.string())});

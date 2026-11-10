@@ -21,7 +21,8 @@
 /// under both names: a POSIX open quarantines it again under the next free name, while the
 /// Windows Echo open refuses until the `.corrupt-<epoch>` name is removed (the second link reads
 /// as a planted file; never remove the original name, the file is corrupt and its -wal would be
-/// stranded; docs/user-manual/upgrading.md gives the remedy).
+/// stranded; docs/user-manual/upgrading.md gives the remedy). That Windows refusal is not yet
+/// verified on a Windows host: unproven until the MSVC leg runs.
 ///
 /// BINDING: a claim moves only the REGULAR FILE that was judged, never a name. `link(2)` follows
 /// a symbolic link at the source on macOS (the claim would link the link's target) and moves the
@@ -32,20 +33,22 @@
 /// link and must be the same inode (POSIX: device + inode by `lstat`), the original name is
 /// re-examined right before it is dropped, and every mode change is applied only to a regular
 /// file and without following a link. A mismatch releases the claim, or keeps it when it is the
-/// judged file's only remaining name, and fails closed. The
-/// identity the claim is held to is the caller's `judged` when it passes one, else the name as
-/// read here at claim time: the Echo caller reads it right after SQLite opened the file and before
-/// the integrity check, so the move is bound to the file that was open when the verdict was taken
-/// (short of the gap between that open and the read, a few instructions with no I/O between
-/// them); the command-dedup store passes none, so there the binding starts at the claim. Windows
-/// has no `lstat`-style identity here (this header includes no windows.h), so there only the
-/// no-follow regular-file checks bind the claim: a replaced regular file is a recorded residual on
-/// that platform (SQLite holds its files without FILE_SHARE_DELETE, so a live database another
-/// process has open cannot lose its name there; unproven until the MSVC leg runs).
+/// judged file's only remaining name, and fails closed. The identity the claim is held to is the
+/// caller's `judged` when it passes one, else the name as read here at claim time: the Echo
+/// caller reads it right after SQLite opened the file and before the integrity check, so the
+/// move is bound to the file that was open when the verdict was taken (short of the gap between
+/// that open and the read, a few instructions with no I/O between them); the command-dedup store
+/// passes none, so there the binding starts at the claim. Windows has no `lstat`-style identity
+/// here (this header includes no windows.h), so there only the no-follow regular-file checks bind
+/// the claim: a replaced regular file is a recorded residual on that platform (SQLite holds its
+/// files without FILE_SHARE_DELETE, so a live database another process has open cannot lose its
+/// name there; unproven until the MSVC leg runs).
 /// Three residuals remain on POSIX. The original is re-examined and then dropped by name, and
 /// POSIX has no unlink-if-same-inode, so a second recovery that drops the name AND creates a new
 /// file at it inside that gap loses its file (two agent processes on one data directory are
-/// unsupported). A HARD link planted at the name is a regular file with its target's identity,
+/// unsupported). The release of a claim that is not the judged file is also by name, so a file a
+/// third party put at the claimed name between the re-check and the release loses that name.
+/// A HARD link planted at the name is a regular file with its target's identity,
 /// so it is judged, claimed and secured as that target: the open that judged it had already used
 /// it as the database (pre-existing; Linux protected_hardlinks refuses a link to a file the
 /// planter does not own, and the packaged POSIX data directory is root-owned). And a name in the
@@ -142,8 +145,11 @@ struct FsOps {
 };
 
 struct QuarantineResult {
-    /// The main file's new path, or nullopt when it could not be moved (the original is then
-    /// untouched).
+    /// The main file's new path, or nullopt when the main file was NOT quarantined (the caller
+    /// must fail closed). The original is then untouched, except for the one keep outcome
+    /// described at `claim_quarantine_name`: there the judged file stays under its claimed
+    /// `.corrupt-` name with the mode it had, and whatever is now at the original name was left
+    /// as found.
     std::optional<std::filesystem::path> dest;
     /// Everything the caller should log: a sidecar that was copied or dropped, a stray name left
     /// behind, why a claim failed.
@@ -154,13 +160,18 @@ struct QuarantineResult {
 /// new path, or nullopt (original untouched) when no name could be claimed, the filesystem has no
 /// hard links, the name is not a regular file, the claim did not land on the file that was judged
 /// (see BINDING above), or the original name could not be dropped; `notes`, when given, receives
-/// why and anything left behind. One of those refusals is NOT "original untouched": if the original
-/// name is replaced or removed only AFTER the claim landed on the judged file, the claimed name is
-/// that file's only remaining name, so it is KEPT (the file is not unlinked), the note says so, and
-/// the result is still nullopt (fail closed: the name now holds a file nobody judged). `judged`, when given, is the identity the caller read at the
-/// name right after it opened the file (`file_identity`); otherwise the name is read here, just
-/// before the claim. `epoch_seconds` is clamped to >= 0 (a pre-1970 clock would otherwise write
-/// `.corrupt--5`, which the dedup prune parser rejects, so the file could never be pruned).
+/// why and anything left behind. One of those refusals is NOT "original untouched": if the
+/// original name is replaced or removed only AFTER the claim landed on the judged file, the
+/// claimed name is that file's only remaining name, so it is KEPT (the file is not unlinked), the
+/// note says so, and the result is still nullopt (fail closed: the name now holds a file nobody
+/// judged). Only the MAIN file is kept: it keeps its previous mode (it is not secured), and its
+/// `-wal`, `-shm` and `-journal` files are left where they were found, at the live names. The
+/// next open may remove them (SQLite deletes a WAL beside an empty database) or replay them into
+/// the file then at the name (the recorded two-process class); there is no copy and no second
+/// quarantine. `judged`, when given, is the identity the caller read at the name right after it
+/// opened the file (`file_identity`); otherwise the name is read here, just before the claim.
+/// `epoch_seconds` is clamped to >= 0 (a pre-1970 clock would otherwise write `.corrupt--5`,
+/// which the dedup prune parser rejects, so the file could never be pruned).
 [[nodiscard]] inline std::optional<std::filesystem::path>
 claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seconds,
                       std::string_view suffix, std::vector<std::string>* notes = nullptr,
@@ -200,7 +211,8 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
     };
     for (int n = 0; n < kMaxClaimAttempts; ++n) {
         fs::path dest = file;
-        dest += n == 0 ? std::format("{}{}", suffix, epoch) : std::format("{}{}-{}", suffix, epoch, n);
+        dest += n == 0 ? std::format("{}{}", suffix, epoch)
+                       : std::format("{}{}-{}", suffix, epoch, n);
         std::error_code lec;
         if (ops.link)
             ops.link(file, dest, lec);
@@ -219,16 +231,17 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
         // The name is ours, atomically. It must be the judged file (not a link's target, not a
         // link, not a fresh file another recovery put at the name), and so must the original at
         // the moment it is dropped. Four schedules reach a mismatch: A the original was replaced
-        // and D it was removed (the claim IS the judged file), B the claim is not the judged file
-        // while the original still is, C neither is. In B and C release the claim: it is our name
-        // for something that was not judged. In A and D the claim is the judged file's only
-        // remaining name, so releasing it would free the evidence: keep it and fail closed.
+        // (the claim IS the judged file), B the claim is not the judged file while the original
+        // still is, C neither is, D the original was removed (the claim IS the judged file). In
+        // B and C release the claim: it is our name for something that was not judged. In A and D
+        // the claim is the judged file's only remaining name, so releasing it would free the
+        // evidence: keep it and fail closed.
         const bool dest_ok = still_judged(dest);
         const bool file_ok = still_judged(file);
         if (dest_ok && !file_ok) {
-            note(std::format("{} no longer holds the file that was judged (replaced or removed after "
-                             "the claim); the judged file is kept at {}; the name {} and any "
-                             "sidecars beside it were left as found",
+            note(std::format("{} no longer holds the file that was judged (replaced or removed "
+                             "after the claim); the judged file is kept at {}; the name {} and "
+                             "any sidecars beside it were left as found",
                              file.string(), dest.string(), file.string()));
             return std::nullopt;
         }
@@ -271,14 +284,18 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
 
 /// Move a corrupt database aside to `<path>.corrupt-<epoch>[-n]` and carry its non-empty
 /// -wal/-shm/-journal sidecars with it (`<that name>-wal`, ...). `dest` nullopt = the main file
-/// could not be moved (the original is untouched and the caller MUST fail closed). An EMPTY
-/// sidecar holds no evidence and is removed. A sidecar that cannot be renamed is COPIED to its
-/// quarantine name (never over an existing file) and the original then removed, so the fresh
-/// database can neither replay a stale WAL nor lose the evidence; if even the copy fails the
-/// original is still removed (a note says the evidence was lost) because replaying it is worse.
-/// If that remove also fails a stale sidecar survives beside the fresh file: the Echo caller's
-/// post-reopen integrity check is the backstop. The moved files are then set owner-only, best
-/// effort (0600 on POSIX; a read-only-attribute toggle on Windows).
+/// was NOT quarantined and the caller MUST fail closed. In every case but one the original is
+/// untouched; the one exception is `claim_quarantine_name`'s keep outcome (schedules A and D),
+/// which leaves the judged file under the claimed `.corrupt-` name WITH THE MODE IT HAD (it is
+/// not set owner-only), its -wal/-shm/-journal at the live names, and whatever is now at the
+/// original name as found. An EMPTY sidecar holds no evidence and is removed. A sidecar that
+/// cannot be renamed is COPIED to its quarantine name (never over an existing file) and the
+/// original then removed, so the fresh database can neither replay a stale WAL nor lose the
+/// evidence; if even the copy fails the original is still removed (a note says the evidence was
+/// lost) because replaying it is worse. If that remove also fails a stale sidecar survives
+/// beside the fresh file: the Echo caller's post-reopen integrity check is the backstop. The
+/// moved files are then set owner-only, best effort (0600 on POSIX; a read-only-attribute
+/// toggle on Windows).
 /// Two recorded limits of the sidecar step. It is exists-then-rename on the derived name, so a
 /// writer of the directory who squats `<claimed>-wal` ahead of time makes the rename and the copy
 /// fail and the sidecar is removed under the rule above, its content not kept. And on Windows the
