@@ -11,7 +11,7 @@ deciders: >-
   incorporated before the ADR merged as `proposed`; (2) a second Fable Enterprise Architect re-read
   against `origin/dev` cd163fe4d on 2026-11-10, verdict ACCEPT-WITH-CHANGES, whose required
   corrections are incorporated in the acceptance change; (3) the review of the acceptance pull
-  request itself, whose number is recorded here on merge.
+  request itself, #7465.
 scope: platform — supported operating systems per deployable, the CI/release matrix, and the platform-specific server code + build/CI plumbing that removal deletes
 amends: >-
   0031-presentation-core-engine-decomposition Gate G10 — the "MSVC static linkage included" clause of
@@ -306,7 +306,9 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
   coherent as Linux-only.
 - **`build_agent` stays a boolean; `build_server` becomes a feature** (Decision 4). `-Dbuild_server=false`
   becomes `-Dbuild_server=disabled` across CI and docs — the CI change is mostly flipping/renaming an
-  option plus the configure guard, not new build plumbing.
+  option plus the configure guard, not new build plumbing. (The option name is subject to the
+  ladder step-3 constraint below: a new name, such as `-Dserver=disabled`, unless every persistent
+  CI build dir is renamed in the same change.)
 
 ## Implementation ladder (follow-up PRs — not this ADR)
 
@@ -324,6 +326,19 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    `pre-release.yml` (its Windows/macOS install jobs are already agent-installer-only, but the
    artifact-name change reaches it). Keep the (non-blocking) gateway canary. Prune now-unused Windows
    server cache scopes (`cache-prune.yml`).
+
+   *Status: in progress — the step-1 CI change (the pull request that adds this note).* As
+   implemented: the Windows and macOS legs of `ci.yml` pass `-Dbuild_server=false` (the boolean;
+   the feature option is step 3) and drop every item listed above for them, and the Windows leg
+   moves to `build-windows-agent-{debug,release}` and deletes the old dirs, so a branch cut
+   before this change never shares a stored `build_server` value with one cut after it.
+   `codeql.yml`'s Windows row is kept, agent-only (`-Dbuild_server=false`) rather than dropped,
+   because it is the only CodeQL coverage of the agent's Windows code.
+   `instructions-windows-validate.yml` is deleted. `vcpkg install` is unchanged (the full
+   manifest, server ports included) until step 3, which changes it on every Windows and macOS
+   workflow at once. `cache-prune.yml` has no Windows-server-only scope to prune: its Windows
+   `sweep-test-databases.sh` step goes with Wee Tam's Postgres in step 4, and until then
+   `Assert-Toolchain.ps1` still health-checks those clusters in the Windows job.
 2. **Release + rename blast radius** — remove the server from the Windows/macOS staging in
    `release.yml` (incl. `install-server-postgres.sh` from the macOS tarball); delete the
    `YuzuServerSetup` / `deploy/packaging/windows/yuzu-server.iss` path; rename the Windows/macOS
@@ -339,7 +354,11 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
 3. **Build guard** — implement Decision 4: convert `build_server` to a feature option, key the guard
    on `host_machine.system()`, make the non-Linux `vcpkg install` paths skip the `server` feature,
    and update `scripts/setup.sh`, the CLAUDE.md quickstarts, and any docs passing
-   `-Dbuild_server=false` in the same PR.
+   `-Dbuild_server=false` in the same PR. **Constraint:** the feature option must use a NEW option
+   name (for example `server`), or the same change must rename every persistent CI build dir.
+   Retyping the existing boolean `build_server` as a feature makes Meson reject a build dir that
+   stored the boolean, on `--reconfigure`, on `-Dbuild_server=disabled` and on `--wipe` alike
+   (probed with Meson 1.11.1), and the self-hosted pools keep their build dirs across runs.
 4. **Code + build/CI plumbing** — remove server-side `_WIN32` / `__APPLE__`-specific branches under
    `server/core/` (retain POSIX/Linux; do not disturb `agents/shared/` or `sdk/`, which stay
    cross-platform); and remove the plumbing that exists only for the non-Linux server: the

@@ -188,6 +188,17 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   WAL/buffer pool (the 2026-07-12 server-suite timeouts). No runner `.env` or
   wrapper change is involved — re-running the provisioning script is the whole
   cutover.
+
+  **No CI job on this box uses these clusters since ADR-0035 ladder step 1.**
+  The server is Linux-only: `ci.yml`'s Windows leg builds the agent only
+  (`-Dbuild_server=false`, into `build-windows-agent-{debug,release}`; the job
+  deletes the older `build-windows-{debug,release}` dirs on every run) and no
+  longer runs `Ensure Postgres` or any server suite. The clusters stay
+  provisioned until ladder step 4 removes them together with the `postgres`
+  pin in `toolchain-contract.json`. Until then `Assert-Toolchain.ps1` still
+  health-checks every cluster, both at provision time and in the Windows job's
+  `Assert toolchain manifest (self-hosted)` step, so a stopped or broken
+  cluster still fails that job even though nothing in it connects.
 - **Per-agent PostgreSQL binaries (#2354).** Each cluster also gets a **private
   copy of the whole PostgreSQL install tree** under `D:\ci\pgbin\agent-<n>`, and
   its Windows-service `ImagePath` is repointed at that copy's `pg_ctl.exe` (the
