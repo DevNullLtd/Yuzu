@@ -1861,6 +1861,16 @@ TEST_CASE("EchoDatabase: a corrupt echo.db is quarantined and re-initialised fre
         REQUIRE(f.is_open());
         f << "this is not a valid sqlite database -- corrupt echo.db for #559";
     }
+#ifndef _WIN32
+    // Seed the corrupt file group/other-readable (the first open left it 0600 and the truncating
+    // rewrite kept that), so the quarantined copy's mode below proves the quarantine re-secured it.
+    {
+        std::error_code pec;
+        fs::permissions(tmp, fs::perms::owner_all | fs::perms::group_read | fs::perms::others_read,
+                        fs::perm_options::replace, pec);
+        REQUIRE_FALSE(pec);
+    }
+#endif
 
     // 3. Re-open: must succeed with a FRESH database (not refuse, not trust the
     //    garbage), and quarantine the corrupt file aside for forensic review.
@@ -1882,7 +1892,7 @@ TEST_CASE("EchoDatabase: a corrupt echo.db is quarantined and re-initialised fre
         if (entry.path().filename().string().rfind(prefix, 0) == 0) {
             ++quarantine_files;
 #ifndef _WIN32
-            // The quarantined evidence ends owner-only (0600): it was written 0644 above.
+            // The quarantined evidence ends owner-only (0600): it was seeded 0644 above.
             CHECK((fs::status(entry.path()).permissions() & fs::perms::mask) ==
                   (fs::perms::owner_read | fs::perms::owner_write));
 #endif
