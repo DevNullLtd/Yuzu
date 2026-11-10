@@ -21154,9 +21154,10 @@ private:
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
         // untracked dispatch (execution_id="" → not in the executions drawer, like the
         // device live-info + DEX-perf reads) and the narrow ResponseStore seam. It
-        // dispatches two canned read-only echo.sql ($Process_Live + $TCP_Live) to ONE
-        // host and reconstructs the tree server-side (recursive CTEs are blocked on the
-        // agent). Per-host only; data from the agent's local echo.db only.
+        // dispatches three canned read-only echo.sql (the window's hour list, then
+        // $Process_Hourly + $TCP_Hourly for one hour) to ONE host and reconstructs the
+        // tree server-side (recursive CTEs are blocked on the agent). Per-host only;
+        // data from the agent's local echo.db only.
         echo_tree_routes_ = std::make_unique<EchoTreeRoutes>();
         echo_tree_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
