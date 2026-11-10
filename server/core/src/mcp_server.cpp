@@ -6458,6 +6458,9 @@ static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
               "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
 static_assert(std::is_same_v<ToolDeps::CryptoAccessFn, McpServer::CryptoAccessFn>,
               "ToolDeps::CryptoAccessFn drifted from McpServer::CryptoAccessFn (mcp_server.hpp)");
+static_assert(std::is_same_v<ToolDeps::AuditAsSessionFn, AuthRoutes::AuditAsSessionFn>,
+              "ToolDeps::AuditAsSessionFn drifted from AuthRoutes::AuditAsSessionFn "
+              "(auth_routes.hpp), the factory server.cpp wires it from");
 
 // ── Merged tool catalogue (registry seam) ────────────────────────────────
 //
@@ -6470,7 +6473,8 @@ std::span<const ToolRecord> registered_tool_records() {
     static const std::vector<ToolRecord> records = [] {
         std::vector<ToolRecord> all;
         for (const auto span : {discovery_tool_records(), hardware_tool_records(),
-                                containment_tool_records(), crypto_tool_records()})
+                                containment_tool_records(), crypto_tool_records(),
+                                dex_tool_records()})
             all.insert(all.end(), span.begin(), span.end());
         return all;
     }();
