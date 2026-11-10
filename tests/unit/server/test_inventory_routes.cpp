@@ -887,6 +887,39 @@ TEST_CASE("software routes: devices paging follows the keyset and tags continuat
     REQUIRE(contains(h.audit_details[1], "page=continuation"));
 }
 
+TEST_CASE("software routes: a default-filter devices page issues the pre-SAM-17 cursor and the next page accepts it",
+          "[inventory][route]") {
+    // The devices fragment, the REST route and the MCP tool share one keyset model. SAM-17 moved
+    // it onto a generic page reader and added filters; a default-filter request must keep the
+    // exact fingerprint it always had, or every in-flight "Load more" cursor flips to a mismatch.
+    InvHarness h;
+    for (int i = 0; i < 100; ++i)
+        h.fleet_rows.push_back(fleet_row(dev_id(i), "git", "1"));
+    auto p1 = h.sink.Get(std::string(kDevices) + "?name=git&total=250");
+    REQUIRE(p1);
+    const std::string url = next_url(p1->body, "dmore");
+    const auto at = url.find("cursor=");
+    REQUIRE(at != std::string::npos);
+    std::string cursor = url.substr(at + 7, url.find('&', at) - at - 7);
+    for (auto p = cursor.find("%3A"); p != std::string::npos; p = cursor.find("%3A", p + 1))
+        cursor.replace(p, 3, ":");
+    // 5b6c14bc... is the fingerprint of name=git computed by the pre-SAM-17 algorithm (the same
+    // golden test_software_list_model.cpp pins).
+    CHECK(cursor.starts_with("d2:5b6c14bc7e221013:"));
+
+    h.last_fleet_query.reset();
+    auto p2 = h.sink.Get(url);
+    REQUIRE(p2);
+    CHECK_FALSE(contains(p2->body, "inv-caveat")); // accepted: no filter mismatch, no refusal
+    REQUIRE(h.last_fleet_query);
+    REQUIRE(h.last_fleet_query->after);
+    CHECK(h.last_fleet_query->after->agent_id == "a099");
+    // The query the fragment hands the store leaves every SAM-17 filter at its default.
+    CHECK(h.last_fleet_query->match == NameMatch::kExact);
+    CHECK(h.last_fleet_query->status.empty());
+    CHECK_FALSE(h.last_fleet_query->versions.has_value());
+}
+
 TEST_CASE("software routes: a full devices page hands the last-synced read its distinct ids",
           "[inventory][route]") {
     InvHarness h;

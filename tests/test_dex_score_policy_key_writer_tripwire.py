@@ -30,10 +30,15 @@ Three checks over server/core/src/*.{cpp,hpp}, comments removed:
      503 wherever the signals store is absent);
      (d) the DEX Scoring tab's copy, `settings_routes_->set_dex_score_policy_writer(`, is one
      active line under the same `if (dex_score_policy_provider_) {` and comes BEFORE the REST
-     setter, which std::moves the deps (a copy taken after the move compiles and leaves the tab
-     answering 503);
+     setter, which is also handed a copy (`*dex_score_policy_deps`) from the one deps object; the
+     order is kept so the tab never depends on state the REST setter changed;
      (e) `settings_routes_->set_dex_apps_fn(` is one active line under exactly `if (dex_api)`
-     (the scorer exists only where the signals store does) and inside that same provider block.
+     (the scorer exists only where the signals store does) and inside that same provider block;
+     (f) #6087: the MCP twins' four ToolDeps assignments, `tool_deps.dex_score_policy_read_fn`,
+     `tool_deps.dex_score_policy_apply_fn`, `tool_deps.session_fn` and
+     `tool_deps.audit_as_session_fn`, are each one active line under exactly
+     `if (dex_score_policy_deps) {` (the tools answer an internal error wherever the deps are
+     absent, and a write tool missing its session binding would refuse every call).
 
 LIMITS. A lexical scan, not a proof: it cannot see a key held in a variable and passed to a
 write call, a write through a helper that takes the key as a parameter, or a spelling built at
@@ -51,6 +56,9 @@ SRC = REPO_ROOT / "server" / "core" / "src"
 WRITER_FILE = "dex_api.cpp"
 SERVER_FILE = "server.cpp"
 LITERAL_FILES = {"dex_score_policy_json.hpp", "runtime_config_store.cpp", "body_cap_policy.hpp"}
+
+MCP_MEMBERS = ("dex_score_policy_read_fn", "dex_score_policy_apply_fn", "session_fn",
+               "audit_as_session_fn")
 
 WRITE_CALL = re.compile(r"\b(compare_and_set|compare_and_remove|set|remove)\s*\(")
 KEY_NAMED = re.compile(r'kDexScorePolicyKey|"dex_score_policy"')
@@ -94,16 +102,18 @@ def wiring_problems(text):
     decl = at("std::shared_ptr<yuzu::server::DexApi> dex_api;")
     tab_writer = at("settings_routes_->set_dex_score_policy_writer(")
     tab_apps = at("settings_routes_->set_dex_apps_fn(")
+    mcp = {m: at(f"tool_deps.{m} =") for m in MCP_MEMBERS}
 
     def nearest_if(i):
         return next(((j, ln) for j, ln in reversed(list(enumerate(lines[:i]))) if ln.startswith("if (")),
                     (-1, ""))
 
     out = []
-    for name, found in (("set_dex_score_policy_writer", setter), ("register_routes", register),
+    for name, found in [("set_dex_score_policy_writer", setter), ("register_routes", register),
                         ("provider construction", provider), ("dex_api declaration", decl),
                         ("Scoring tab set_dex_score_policy_writer", tab_writer),
-                        ("Scoring tab set_dex_apps_fn", tab_apps)):
+                        ("Scoring tab set_dex_apps_fn", tab_apps)] + [
+                            (f"tool_deps.{m} assignment", found) for m, found in mcp.items()]:
         if len(found) != 1:
             out.append(f"{SERVER_FILE}: expected exactly one active {name} line, found {len(found)}")
     if out:
@@ -137,6 +147,10 @@ def wiring_problems(text):
     if tab_guard_at < 0 or tab_apps[0] < tab_guard_at or between.count("{") <= between.count("}"):
         out.append("the Scoring tab's Apps scorer must be set inside the "
                    "`if (dex_score_policy_provider_) {` block that sets its writer deps")
+    for m, found in mcp.items():
+        if nearest_if(found[0])[1] != "if (dex_score_policy_deps) {":
+            out.append(f"tool_deps.{m} must be assigned under exactly `if (dex_score_policy_deps) {{`: "
+                       "the MCP score policy tools need all four members wired together")
     return out
 
 
@@ -155,6 +169,14 @@ if (dex_score_policy_provider_) {
         settings_routes_->set_dex_apps_fn([dex_api](const auto& p) { return dex_api->apps(p); });
 }
 rest_api_v1_->register_routes(*web_server_);
+if (dex_score_policy_deps) {
+    tool_deps.session_fn = [this](const auto& req) { return resolve(req); };
+    tool_deps.audit_as_session_fn = auth_routes_->audit_as_session_fn();
+    tool_deps.dex_score_policy_read_fn = deps->read_stored;
+    tool_deps.dex_score_policy_apply_fn = [deps = *dex_score_policy_deps](auto rq, auto audit) {
+        return apply_dex_score_policy(rq, deps);
+    };
+}
 """
 
 
@@ -204,6 +226,12 @@ def self_test():
     assert apps + "}\n" in GOOD_WIRING
     assert any("inside the" in p for p in wiring_problems(GOOD_WIRING.replace(apps + "}\n", "}\n" + apps))), \
         "Scoring tab scorer outside the provider block"
+    for m in MCP_MEMBERS:
+        line = next(ln for ln in GOOD_WIRING.split("\n") if ln.strip().startswith(f"tool_deps.{m} ="))
+        assert any(m in p for p in wiring_problems(GOOD_WIRING.replace(line + "\n", ""))), \
+            f"missing tool_deps.{m}"
+        assert any(m in p for p in wiring_problems(GOOD_WIRING.replace(
+            "if (dex_score_policy_deps) {", "if (other_deps) {"))), f"tool_deps.{m} under wrong guard"
     nested = """\
 std::shared_ptr<yuzu::server::DexApi> dex_api;
 if (guaranteed_state_store_) {
@@ -211,7 +239,7 @@ if (guaranteed_state_store_) {
         dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(reader, clock);
     dex_api = make_local_dex_api();
 }
-""" + setter + register
+""" + setter + register + GOOD_WIRING[GOOD_WIRING.index("if (dex_score_policy_deps) {"):]
     assert any("scope that declares dex_api" in p for p in wiring_problems(nested)), "nested provider"
 
 

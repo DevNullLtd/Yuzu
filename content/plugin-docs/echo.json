@@ -2842,10 +2842,13 @@
       "changelog.d/2026-11-02-echo-fold-substrate.added.md",
       "changelog.d/2026-11-02-echo-fold-substrate.changed.md",
       "changelog.d/2026-11-02-echo-offline-hive-baselines.added.md",
+      "changelog.d/5033-echo-corruption-audit-gate-per-agent.fixed.md",
       "changelog.d/7037-echo-rollup-only-v10.changed.md",
       "changelog.d/7318-echo-rollup-only-server.changed.md",
       "changelog.d/7371-echo-rollup-only-ui.changed.md",
-      "changelog.d/7371-echo-rollup-only-ui.removed.md"
+      "changelog.d/7371-echo-rollup-only-ui.removed.md",
+      "changelog.d/7420-echo-followups-mixed.changed.md",
+      "changelog.d/7420-echo-followups-mixed.fixed.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",

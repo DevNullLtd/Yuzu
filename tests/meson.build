@@ -1893,6 +1893,7 @@ if build_server
       'unit/server/test_mcp_dispatch_coverage.cpp', # Seam PR1: every served MCP tool has a handler; no orphan or dead tool_name branch in mcp_server.cpp (scanned from server/core/src at run time)
       'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_mcp_tools_crypto.cpp',     # #6558 PR2: the seven /crypto MCP tools (gate, confinement, audit-first layout write, retry hints, unwired providers)
+      'unit/server/test_mcp_tools_dex.cpp',        # #6087: get/set/reset_dex_score_policy registry tools (gates, tiers, approval, If-Match/dry_run, audit-first, audit_persisted, retry hints, unwired providers)
       'unit/server/test_hw_ci_detail_wiring_lexical.cpp', # #7163: LEXICAL pin (not behaviour) that the hw_ci_detail_fn closure in server.cpp is the one handed to the REST routes and the MCP tools, and that CiRead::WithSections selects get_device_ci_with_sections, scanned from server.cpp at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
@@ -1939,6 +1940,7 @@ if build_server
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_software_catalogue.cpp',   # GET /api/v1/inventory/software/catalogue[/versions]
+      'unit/server/test_rest_software_components.cpp',  # GET /api/v1/inventory/software/components (SAM-17)
       'unit/server/test_rest_software_curation.cpp',    # software normalisation curation REST routes
       'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
@@ -2036,6 +2038,7 @@ if build_server
       'unit/server/test_purl_compose.cpp',               # pure purl composer (purl-spec vectors)
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
+      'unit/server/test_software_list_model.cpp',        # pure SAM-17 lookup list model (totals, status, range)
       'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
       'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
       'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
@@ -4774,6 +4777,14 @@ test('forensics tier wiring lexical',
 test('collection settings wiring lexical',
   _python3_test,
   args: [files('test_collection_settings_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# SAM-17: the software lookup routes' hostname roster must be handed to RestApiV1 before
+# register_routes(); an unset function leaves every hostname null with no other signal.
+test('software lookup wiring lexical',
+  _python3_test,
+  args: [files('test_software_lookup_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
