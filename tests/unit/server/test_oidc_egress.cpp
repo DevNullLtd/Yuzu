@@ -1273,7 +1273,8 @@ TEST_CASE("OIDC resolver: a full pool fails closed at once as unresolved, withou
     CHECK(pins.error() == kUnresolved);
     CHECK(elapsed < std::chrono::milliseconds(500)); // refused, not queued and not waited for
     CHECK(other_lookups.load() == 0);                // nothing was started
-    CHECK(cap.text().find("lookup slots") != std::string::npos);
+    CHECK(cap.text().find("was not started: the lookup pool (1 slots) is full") !=
+          std::string::npos);
 
     gate->release();
     holder.join();

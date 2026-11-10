@@ -691,8 +691,9 @@ public:
         metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight").set(0.0);
         metrics_.describe("yuzu_server_oidc_resolver_in_flight",
                           "Name lookups outstanding in the resolver pool the OIDC egress path "
-                          "resolves hosts in, published every 15 s; a value at the pool's cap "
-                          "means new OIDC lookups fail at once until lookups return",
+                          "resolves hosts in, published every 15 s; a value at or above the "
+                          "pool's cap means new OIDC lookups fail at once until lookups return; "
+                          "fed only on POSIX builds, 0 elsewhere",
                           "gauge");
         metrics_.gauge("yuzu_server_oidc_resolver_in_flight").set(0.0);
         // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".

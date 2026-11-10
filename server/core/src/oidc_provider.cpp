@@ -958,10 +958,11 @@ struct ResolvedAddress {
 
 // Name lookups on POSIX run through `net::bounded_resolve` with a pool of their own, so they never
 // share slots with CRL source registration (the process pool). The pool is a leaked function-local
-// static: a detached worker may still hold it at process exit. Not a member of OidcProvider:
-// providers are swapped on Settings save and `vet_egress_target` is a free function.
-std::shared_ptr<net::ResolverPool>& oidc_resolver_pool_ref() {
-    static std::shared_ptr<net::ResolverPool>& p =
+// static, like `detail::process_pool()` in bounded_resolver.hpp: it stays valid for late callers
+// and for the 15 s gauge read during shutdown. Not a member of OidcProvider: providers are swapped
+// on Settings save and `vet_egress_target` is a free function.
+const std::shared_ptr<net::ResolverPool>& oidc_resolver_pool_ref() {
+    static const std::shared_ptr<net::ResolverPool>& p =
         *new std::shared_ptr<net::ResolverPool>(std::make_shared<net::ResolverPool>());
     return p;
 }
@@ -1094,8 +1095,10 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
     return true;
 }
 #else
-bool resolve_host_addresses(const std::string& host, int timeout_sec,
-                            std::vector<ResolvedAddress>& out) {
+// Same as `resolve_host_addresses`, but reports why a lookup failed (kBusy: nothing was started).
+// kOk with no parsable address is kNotFound.
+net::ResolveStatus resolve_host_addresses_status(const std::string& host, int timeout_sec,
+                                                 std::vector<ResolvedAddress>& out) {
     net::LookupFn lookup;
     std::shared_ptr<net::ResolverPool> pool;
     {
@@ -1105,24 +1108,25 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
     }
     if (!pool)
         pool = oidc_resolver_pool_ref();
+    const int pool_cap = pool->cap;
     const auto resolved = net::bounded_resolve(host, std::chrono::seconds(timeout_sec),
                                                std::move(lookup), std::move(pool));
     switch (resolved.status) {
     case net::ResolveStatus::kOk:
         break;
     case net::ResolveStatus::kBusy:
-        spdlog::warn("OIDC egress: the name lookup for '{}' was not started: all {} lookup slots "
-                     "are held by lookups still waiting on the resolver",
-                     ::yuzu::log_key_token(host), net::kMaxInFlightLookups);
-        return false;
+        spdlog::warn("OIDC egress: the name lookup for '{}' was not started: the lookup pool ({} "
+                     "slots) is full or a worker could not be created",
+                     ::yuzu::log_key_token(host), pool_cap);
+        return net::ResolveStatus::kBusy;
     case net::ResolveStatus::kTimeout:
         spdlog::warn("OIDC egress: the name lookup for '{}' did not answer within {} s; its slot "
                      "is held until the resolver returns",
                      ::yuzu::log_key_token(host), timeout_sec);
-        return false;
+        return net::ResolveStatus::kTimeout;
     case net::ResolveStatus::kNotFound:
     case net::ResolveStatus::kTemporary:
-        return false;
+        return resolved.status;
     }
     // The worker returns numeric text; the vetting classifies bytes, so convert back. Text that
     // does not parse is skipped.
@@ -1139,7 +1143,12 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
             out.push_back(address);
         }
     }
-    return out.size() > before;
+    return out.size() > before ? net::ResolveStatus::kOk : net::ResolveStatus::kNotFound;
+}
+
+bool resolve_host_addresses(const std::string& host, int timeout_sec,
+                            std::vector<ResolvedAddress>& out) {
+    return resolve_host_addresses_status(host, timeout_sec, out) == net::ResolveStatus::kOk;
 }
 #endif
 
@@ -1149,7 +1158,8 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 // really translated IPv4 destinations. Process-wide, because the prefix belongs to the network the
 // server sits on and not to one provider. A failed or empty lookup is "none discovered", not a
 // refusal: DNS64 is absent on most networks and a transient resolver error must not break every
-// IPv6 destination.
+// IPv6 destination. A refusal because the lookup pool was full is retried on the next fetch rather
+// than remembered (no negative window is armed for it).
 //
 // LEARNED PREFIXES NEVER SHRINK. The cache is a set that only grows: an answered refresh MERGES
 // (set union, under the cache mutex) into it, so an empty, A-only or different answer adds nothing
@@ -1182,10 +1192,14 @@ Nat64DiscoveryCache& nat64_discovery_cache() {
     return c;
 }
 
-// The IPv6 answers for `ipv4only.arpa`. False when the lookup failed or timed out (no answer at
-// all); an answer with no IPv6 address is true and empty.
-bool lookup_ipv4only_answers(int dns_timeout_ms,
-                             std::vector<::yuzu::server::oidc::egress::Ipv6>& out) {
+// How one `ipv4only.arpa` probe ended. kBusy: the lookup was not started (pool full or no worker),
+// so nothing was learned about the name; kFailed: it was started and gave no answer.
+enum class ProbeOutcome { kAnswered, kFailed, kBusy };
+
+// The IPv6 answers for `ipv4only.arpa`. kFailed when the lookup failed or timed out (no answer at
+// all); an answer with no IPv6 address is kAnswered and empty. kBusy is reported on POSIX only.
+ProbeOutcome lookup_ipv4only_answers(int dns_timeout_ms,
+                                     std::vector<::yuzu::server::oidc::egress::Ipv6>& out) {
     namespace egress = ::yuzu::server::oidc::egress;
     OidcProvider::ResolverForTest test_resolver;
     {
@@ -1197,19 +1211,30 @@ bool lookup_ipv4only_answers(int dns_timeout_ms,
             if (text.find(':') != std::string::npos)
                 if (const auto v6 = egress::parse_ipv6(text))
                     out.push_back(*v6);
-        return true;
+        return ProbeOutcome::kAnswered;
     }
     std::vector<ResolvedAddress> resolved;
-    if (!resolve_host_addresses(kNat64ProbeName, std::max(1, (dns_timeout_ms + 999) / 1000),
-                                resolved))
-        return false;
+    const int timeout_sec = std::max(1, (dns_timeout_ms + 999) / 1000);
+#ifdef _WIN32
+    if (!resolve_host_addresses(kNat64ProbeName, timeout_sec, resolved))
+        return ProbeOutcome::kFailed;
+#else
+    switch (resolve_host_addresses_status(kNat64ProbeName, timeout_sec, resolved)) {
+    case net::ResolveStatus::kOk:
+        break;
+    case net::ResolveStatus::kBusy:
+        return ProbeOutcome::kBusy;
+    default:
+        return ProbeOutcome::kFailed;
+    }
+#endif
     for (const auto& address : resolved)
         if (address.family == AF_INET6) {
             egress::Ipv6 bytes{};
             std::memcpy(bytes.data(), address.bytes.data(), bytes.size());
             out.push_back(bytes);
         }
-    return true;
+    return ProbeOutcome::kAnswered;
 }
 
 // The prefixes learned from `ipv4only.arpa`, from the cache while it is fresh. nullopt = the
@@ -1228,7 +1253,19 @@ discovered_nat64_prefixes(int dns_timeout_ms) {
         }
     }
     std::vector<egress::Ipv6> answers;
-    const bool answered = lookup_ipv4only_answers(dns_timeout_ms, answers);
+    const auto outcome = lookup_ipv4only_answers(dns_timeout_ms, answers);
+    if (outcome == ProbeOutcome::kBusy) {
+        // Not started: no negative window, so the next IPv6 fetch probes again. Learned prefixes
+        // and an earlier overflow stay as they are.
+        spdlog::warn("OIDC egress: the NAT64 prefix lookup (ipv4only.arpa) was not started; it "
+                     "will be retried on the next fetch, and IPv6 destinations are classified "
+                     "without it until then");
+        std::lock_guard lock(cache.mu);
+        if (cache.overflowed)
+            return std::nullopt;
+        return cache.prefixes;
+    }
+    const bool answered = outcome == ProbeOutcome::kAnswered;
     std::vector<egress::Nat64Prefix> found;
     for (const auto& answer : answers)
         if (const auto prefix = egress::discover_prefix_from_ipv4only_answer(answer))

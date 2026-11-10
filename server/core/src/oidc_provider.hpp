@@ -337,12 +337,10 @@ public:
     /// this instance's binding SHA-256 fail exactly as a broken crypto provider would;
     /// `add_test_pending_flow` plants a pending flow with a chosen binding hash (hex), bypassing
     /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
-    /// flow stores. TEST-ONLY: none of the test seams in this block (these two,
-    /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test`,
-    /// `set_resolver_for_test`,
-    /// `clear_nat64_discovery_cache_for_test` and `pending_flow_count_for_test`) has
-    /// a production caller, and tests/unit/server/ test_oidc_provider.cpp pins (source scan) that
-    /// no other file in server/core/src references them.
+    /// flow stores. TEST-ONLY: no `*_for_test` member of this block (the two above and every
+    /// seam declared after them) has a production caller, and
+    /// tests/unit/server/test_oidc_provider.cpp pins (source scan) that no other file in
+    /// server/core/src references them.
     void set_binding_digest_failure_for_test(bool fail);
     void add_test_pending_flow(const std::string& state, std::string binding_hash);
     /// Test-only seam: replaces the 5 s per-operation connect/read/write timeouts of every IdP
@@ -569,7 +567,8 @@ private:
 
 /// Name lookups currently outstanding in the pool the OIDC egress path owns (cap
 /// `net::kMaxInFlightLookups`). A lookup that has timed out for its caller still holds its slot
-/// until the resolver returns. Feeds `yuzu_server_oidc_resolver_in_flight`.
+/// until the resolver returns. Feeds `yuzu_server_oidc_resolver_in_flight`. Fed only on POSIX
+/// builds (the pool is not used elsewhere), so it always reads 0 on other builds.
 [[nodiscard]] int oidc_resolver_in_flight();
 
 } // namespace yuzu::server::oidc
