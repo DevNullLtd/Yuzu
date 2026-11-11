@@ -245,6 +245,11 @@ TEST_CASE("render_echo_retention_paused: each visible agent appears; out-of-scop
     CHECK(contains(html, "agent-B"));
     CHECK_FALSE(contains(html, "agent-C"));
     CHECK(contains(html, "out-of-scope"));
+    CHECK(contains(html, "<th class=\"r\">Hourly rows</th>"));
+    CHECK(contains(html, "<th>Oldest hourly bucket</th>"));
+    CHECK_FALSE(contains(html, "Live rows"));
+    CHECK(contains(html, "A paused source is never pruned, so its hourly rows keep their place "
+                   "until it is re-enabled or purged."));
     // NOTE: the >10,000-responses-from-one-agent global-window starvation the
     // reviewer flagged is the store-side per-(command_id, agent_id) cap tracked
     // in #561 — not reproducible at unit scale and out of scope for this render
@@ -299,7 +304,7 @@ TEST_CASE("gather_echo_retention_paused: extra_scope_is_authoritative bypasses "
     }
 }
 
-TEST_CASE("gather_echo_retention_paused: row count reads <src>_rows then <src>_live_rows",
+TEST_CASE("gather_echo_retention_paused: row count reads <src>_rows only",
           "[pg][server][echo][retention-render]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -310,13 +315,12 @@ TEST_CASE("gather_echo_retention_paused: row count reads <src>_rows then <src>_l
 
     // Only the new key: fails if the <src>_rows lookup is removed.
     rs.store(mk_resp("agent-new", 10, "config|process_enabled|false\nconfig|process_rows|111\n"));
-    // Only the one-release alias: the agent has not moved to the roll-up store; its raw-row figure
-    // is read to flag it, never presented as the hourly count.
+    // Only the retired `<src>_live_rows` spelling: not read, so the count is unknown.
     rs.store(mk_resp("agent-old", 10, "config|process_enabled|false\nconfig|process_live_rows|222\n"));
-    // Both present: the new key wins and the agent is not flagged.
+    // Both present: `<src>_rows` is the count.
     rs.store(mk_resp("agent-both", 10,
                      "config|process_enabled|false\nconfig|process_live_rows|1\nconfig|process_rows|333\n"));
-    // Neither key: unknown, not flagged.
+    // Neither key: unknown.
     rs.store(mk_resp("agent-none", 10, "config|process_enabled|false\n"));
 
     DashboardEchoRetentionTestAccess acc;
@@ -331,23 +335,18 @@ TEST_CASE("gather_echo_retention_paused: row count reads <src>_rows then <src>_l
         return nullptr;
     };
     REQUIRE(row_of("agent-new"));
-    CHECK(row_of("agent-new")->live_rows == 111);
-    CHECK_FALSE(row_of("agent-new")->pre_rollup_agent);
+    CHECK(row_of("agent-new")->hourly_rows == 111);
     REQUIRE(row_of("agent-old"));
-    CHECK(row_of("agent-old")->live_rows == -1);
-    CHECK(row_of("agent-old")->pre_rollup_agent);
+    CHECK(row_of("agent-old")->hourly_rows == -1);
     REQUIRE(row_of("agent-both"));
-    CHECK(row_of("agent-both")->live_rows == 333);
-    CHECK_FALSE(row_of("agent-both")->pre_rollup_agent);
+    CHECK(row_of("agent-both")->hourly_rows == 333);
     REQUIRE(row_of("agent-none"));
-    CHECK(row_of("agent-none")->live_rows == -1);
-    CHECK_FALSE(row_of("agent-none")->pre_rollup_agent);
+    CHECK(row_of("agent-none")->hourly_rows == -1);
 
-    // The rendered table shows the flagged agent a dash with the reason, and never its figure.
+    // The rendered table never shows the retired key's figure.
     const auto html = acc.render(kUser);
     CHECK(html.find("222") == std::string::npos);
-    CHECK(html.find("title=\"This device runs an agent without the roll-up tables; upgrade the "
-                    "agent\">") != std::string::npos);
+    CHECK(html.find("without the roll-up tables") == std::string::npos);
     CHECK(html.find(">111<") != std::string::npos);
     CHECK(html.find(">333<") != std::string::npos);
 }
@@ -473,6 +472,8 @@ TEST_CASE("render_echo_retention_paused: no scan yet renders the placeholder",
     // No stores wired, no scan recorded for this user.
     const std::string html = acc.render("nobody");
     CHECK(contains(html, "No scan data yet"));
+    CHECK(contains(html, "A paused source is never pruned, so its hourly rows keep their place "
+                   "until it is re-enabled or purged."));
 }
 
 // #2691 (Doomgoose finding #7): a degraded response-store read must not

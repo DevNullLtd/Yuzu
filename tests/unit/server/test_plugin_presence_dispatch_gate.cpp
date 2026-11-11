@@ -535,131 +535,61 @@ TEST_CASE("wire_and_dispatch_confined: a plugin-absent id's per-device concurren
     CHECK(reclaim == std::vector<std::string>{"dev-B"});
 }
 
-// ───────── Echo rename, upgrade window: an agent that still reports `tar` ─────────
+// ───────── Echo plugin name: the registry takes an inventory at its word ─────────
 //
-// The registry is the ONE alias surface: it normalises the legacy inventory name `tar` to `echo`
-// at registration, and writes `tar` back on the wire for that session only. The legacy spellings
-// below are the point of these cases, so they stay verbatim.
+// A fresh deployment reports `echo`. An inventory that reports only the retired name `tar` is not
+// treated as having `echo`, and a command for `echo` reaches the wire under its own name.
 
-namespace {
-using yuzu::server::detail::ClassifiedCommandTestAccess;
-
-agent_pb::CommandRequest echo_wire_cmd(const std::string& command_id) {
-    agent_pb::CommandRequest cmd;
-    cmd.set_command_id(command_id);
-    cmd.set_plugin("echo");
-    cmd.set_action("sql");
-    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
-    return cmd;
-}
-} // namespace
-
-TEST_CASE("legacy inventory: an agent reporting `tar` counts as having `echo`",
+TEST_CASE("an agent reporting only the retired `tar` plugin does not count as having `echo`",
           "[server][dispatch][plugin_presence][registry][echo_rename]") {
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    auto info = make_presence_test_info("dev-legacy");
+    auto info = make_presence_test_info("dev-retired-name");
     info.add_plugins()->set_name("os_info");
     info.add_plugins()->set_name("tar");
+    yuzu::test::LogCapture logs;
     (void)registry.register_agent(info);
+    logs.stop();
+    // The operator's only signal that this agent is not an Echo agent here.
+    CHECK(logs.text().find("retired plugin name 'tar' and no 'echo'") != std::string::npos);
 
-    CHECK_FALSE(registry.ids_missing_plugin("echo", "sql").contains("dev-legacy"));
+    CHECK(registry.ids_missing_plugin("echo", "sql").contains("dev-retired-name"));
 
-    const auto session = registry.get_session("dev-legacy");
+    const auto session = registry.get_session("dev-retired-name");
     REQUIRE(session);
-    CHECK(session->legacy_echo_wire_name);
-    CHECK(std::ranges::find(session->plugin_names, "echo") != session->plugin_names.end());
-    CHECK(std::ranges::find(session->plugin_names, "tar") == session->plugin_names.end());
-
-    const auto help = registry.help_json();
-    CHECK(help.find("\"echo\"") != std::string::npos);
-    CHECK(help.find("\"tar\"") == std::string::npos);
+    CHECK(std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end());
+    CHECK(std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end());
 }
 
-TEST_CASE("legacy inventory: an agent reporting `echo` is not flagged legacy",
-          "[server][dispatch][plugin_presence][registry][echo_rename]") {
+TEST_CASE("an agent reporting `echo` has it and send_to / send_to_all write `echo` to the wire",
+          "[server][dispatch][registry][echo_rename]") {
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     auto info = make_presence_test_info("dev-new");
     info.add_plugins()->set_name("echo");
     (void)registry.register_agent(info);
-    const auto session = registry.get_session("dev-new");
-    REQUIRE(session);
-    CHECK_FALSE(session->legacy_echo_wire_name);
-}
+    CHECK_FALSE(registry.ids_missing_plugin("echo", "sql").contains("dev-new"));
+    REQUIRE(registry.set_gateway_route(
+        "dev-new", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
-TEST_CASE("legacy inventory: an agent advertising both `tar` and `echo` is not flagged legacy",
-          "[server][dispatch][plugin_presence][registry][echo_rename]") {
-    EventBus bus;
-    yuzu::MetricsRegistry metrics;
-    AgentRegistry registry(bus, metrics);
-    auto info = make_presence_test_info("dev-both");
-    info.add_plugins()->set_name("tar");
-    info.add_plugins()->set_name("echo");
-    yuzu::test::LogCapture logs;
-    (void)registry.register_agent(info);
-    logs.stop();
-    // The operator's only signal that a stale tar plugin sits beside echo on this agent.
-    CHECK(logs.text().find("advertises both 'tar' and 'echo'") != std::string::npos);
+    agent_pb::CommandRequest cmd;
+    cmd.set_command_id("send-1");
+    cmd.set_plugin("echo");
+    cmd.set_action("sql");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    const auto classified = ClassifiedCommandTestAccess::make(cmd);
 
-    const auto session = registry.get_session("dev-both");
-    REQUIRE(session);
-    // A stale tar plugin beside the real echo one: echo commands must keep the new wire name so
-    // the real echo plugin receives them, and `tar` is not folded into a second `echo` entry.
-    CHECK_FALSE(session->legacy_echo_wire_name);
-    CHECK(std::ranges::count(session->plugin_names, "echo") == 1);
-    CHECK(std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end());
-    CHECK_FALSE(registry.ids_missing_plugin("echo", "sql").contains("dev-both"));
-}
-
-TEST_CASE("wire_for rewrites echo -> tar for a legacy session only and leaves the tag alone",
-          "[server][dispatch][registry][echo_rename]") {
-    const auto classified = ClassifiedCommandTestAccess::make(echo_wire_cmd("wf-1"));
-    const auto legacy = yuzu::server::detail::wire_for(true, classified);
-    const auto current = yuzu::server::detail::wire_for(false, classified);
-    CHECK(legacy.plugin() == "tar");
-    CHECK(current.plugin() == "echo");
-    CHECK(legacy.dispatch_tag() == current.dispatch_tag());
-    CHECK(legacy.action() == "sql");
-
-    agent_pb::CommandRequest other = echo_wire_cmd("wf-2");
-    other.set_plugin("os_info");
-    const auto untouched =
-        yuzu::server::detail::wire_for(true, ClassifiedCommandTestAccess::make(other));
-    CHECK(untouched.plugin() == "os_info"); // only the echo plugin is ever rewritten
-}
-
-TEST_CASE("send_to writes `tar` to a legacy gateway session and `echo` to a current one",
-          "[server][dispatch][registry][echo_rename]") {
-    EventBus bus;
-    yuzu::MetricsRegistry metrics;
-    AgentRegistry registry(bus, metrics);
-    for (const auto& [id, plugin] : {std::pair{"dev-legacy", "tar"}, std::pair{"dev-new", "echo"}}) {
-        auto info = make_presence_test_info(id);
-        info.add_plugins()->set_name(plugin);
-        (void)registry.register_agent(info);
-        REQUIRE(registry.set_gateway_route(
-            id, /*session_id=*/{}, "test-gateway",
-            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
-    }
-    const auto classified = ClassifiedCommandTestAccess::make(echo_wire_cmd("send-1"));
-    REQUIRE(registry.send_to("dev-legacy", classified));
     REQUIRE(registry.send_to("dev-new", classified));
-
     auto pending = registry.drain_gateway_pending();
-    REQUIRE(pending.size() == 2);
-    for (const auto& p : pending) {
-        INFO(p.agent_id);
-        CHECK(p.cmd.plugin() == (p.agent_id == "dev-legacy" ? "tar" : "echo"));
-        CHECK(p.cmd.dispatch_tag() == "v1|ro|none|0123456789abcdef0123456789abcdef");
-    }
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].cmd.plugin() == "echo");
+    CHECK(pending[0].cmd.dispatch_tag() == "v1|ro|none|0123456789abcdef0123456789abcdef");
 
-    // send_to_all takes the same wire_for path.
-    REQUIRE(registry.send_to_all(classified) == 2);
+    REQUIRE(registry.send_to_all(classified) == 1);
     pending = registry.drain_gateway_pending();
-    REQUIRE(pending.size() == 2);
-    for (const auto& p : pending)
-        CHECK(p.cmd.plugin() == (p.agent_id == "dev-legacy" ? "tar" : "echo"));
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].cmd.plugin() == "echo");
 }

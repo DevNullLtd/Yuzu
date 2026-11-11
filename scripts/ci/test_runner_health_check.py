@@ -330,6 +330,67 @@ class WorkflowWiringTests(unittest.TestCase):
     def meson_test_name(chunk: str) -> str:
         return re.match(r"\s*('[^']*')", chunk).group(1)
 
+    # ── Tier 2b release-legs dispatch (docs/ci-architecture.md) ──────────────
+    DIRECT_DISPATCH = "(github.event_name == 'workflow_dispatch' && !inputs.head_sha)"
+
+    def test_release_leg_matrix_predicates_stay_in_lockstep(self) -> None:
+        """The three build matrices carry the same two build_type excludes, and
+        the Linux conditional include: list the same predicate. A drift silently
+        misconfigures one OS (e.g. a dev push building release on one pool).
+        Windows and macOS are agent-only (ADR-0035) and carry no pg_mode
+        include."""
+        rel = ("- build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' "
+               "&& github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}")
+        dbg = ("- build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha "
+               "&& inputs.legs != 'all') && 'debug' || 'NONE' }}")
+        inc = ("include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && !inputs.head_sha "
+               "&& inputs.legs != 'all') && '[{\"pg_mode\":\"smoke\"}]' || ")
+        for job in ("linux", "windows", "macos"):
+            with self.subTest(job=job):
+                body = self.job("ci.yml", job)
+                self.assertIn(rel, body)
+                self.assertIn(dbg, body)
+                if job == "linux":  # only Linux runs the server Postgres suites
+                    self.assertIn(inc, body)
+                else:
+                    self.assertNotIn("matrix.pg_mode", body)
+                    self.assertNotIn('"pg_mode":', body)
+
+    def test_direct_dispatch_never_posts_a_required_context_name(self) -> None:
+        """Every job carrying a ruleset-required context name is suffixed on a
+        direct dispatch, so a dispatch cannot post, satisfy or shadow it —
+        except proto-compat (next test)."""
+        for job in ("preflight", "linux", "windows", "macos"):
+            with self.subTest(job=job):
+                name_line = next(l for l in self.job("ci.yml", job).splitlines()
+                                 if l.startswith("    name:"))
+                self.assertIn(self.DIRECT_DISPATCH, name_line)
+                self.assertIn("[dispatch]", name_line)
+
+    def test_proto_compat_keeps_its_literal_name_and_never_skips_on_dispatch(self) -> None:
+        """proto-compat is routinely skipped (docs-only PRs) and GitHub does not
+        evaluate a skipped job's name expression, so its name must stay the
+        literal required context. On a direct dispatch it must instead never be
+        skipped: it runs, or fails red when preflight-gate did not succeed."""
+        body = self.job("ci.yml", "proto-compat")
+        self.assertIn('    name: "Proto backward-compat"\n', body)
+        self.assertIn(f"if: ${{{{ ({self.DIRECT_DISPATCH} && always()) || (success() && ", body)
+        self.assertIn(f"if: always() && {self.DIRECT_DISPATCH} && (needs.preflight-gate.result != 'success' "
+                      "|| needs.preflight-gate.outputs.linux_pool_healthy != 'true')", body)
+        self.assertIn("runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')) && 'ubuntu-24.04' || fromJSON(", body)
+        self.assertIn("if: always() && " + self.DIRECT_DISPATCH, body)
+        self.assertIn("if: always() && " + self.DIRECT_DISPATCH + " && cancelled()", body)
+        self.assertIn("exit 1", body)
+
+    def test_ci_yml_stays_within_the_trusted_fork_token_ceiling(self) -> None:
+        """trusted-fork-ci.yml calls ci.yml as a reusable workflow with a
+        read-only token; GitHub rejects the whole call at load time if any
+        nested job requests more (before any if:). So ci.yml requests no write
+        permission at all — the release-legs alert lives in its own workflow."""
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        writes = re.findall(r"(?m)^\s+[a-z-]+:\s*write\b", text)
+        self.assertEqual(writes, [], f"ci.yml requests write permission(s): {writes}")
+
     def test_weetam_gate_matches_every_windows_consumer(self) -> None:
         # ci.yml's pool probe lives in the fast `preflight-gate` job (the required
         # `preflight` check carries only the source gates); nightly.yml still has
@@ -370,7 +431,9 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_preflight_context_names_are_unique(self) -> None:
         expected = {
-            "ci.yml": 'name: "Preflight (runner health)"',
+            # ci.yml's name is an expression (` [dispatch]` suffix on a direct
+            # dispatch); this is its non-dispatch arm, the required context.
+            "ci.yml": "|| 'Preflight (runner health)' }}",
             "nightly.yml": 'name: "Nightly preflight (runner health)"',
             "sanitizer-tests.yml": 'name: "Sanitizer preflight (runner health)"',
         }
@@ -415,7 +478,11 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn('name: "Preflight (gate)"', gate)
 
         preflight = self.job("ci.yml", "preflight")
-        self.assertIn('name: "Preflight (runner health)"', preflight)
+        # The required-check name, unchanged on every event except a direct
+        # dispatch, which suffixes it so a dispatch never posts a required
+        # context (docs/ci-architecture.md Tier 2b).
+        self.assertIn("|| 'Preflight (runner health)' }}", preflight)
+        self.assertIn("'Preflight (runner health) [dispatch]'", preflight)
         self.assertIn("needs: [trusted_inputs, preflight-gate]", preflight)
         self.assertIn("if: ${{ !cancelled() }}", preflight)
         self.assertIn("needs.preflight-gate.result", preflight)
@@ -442,9 +509,10 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertNotRegex(text, r"needs\.preflight\.outputs\.")
 
     def test_windows_suite_cover_guards_match_their_selections(self) -> None:
-        """Both Windows Test steps run assert-suite-cover.py over the suites they
-        really select. The pg step must exclude `platform`, or its guard fails the
-        job on every debug/full run (#4884)."""
+        """The one Windows Test step runs assert-suite-cover.py over the suites it
+        really selects. The leg is agent-only (ADR-0035), so no server suite is
+        registered and none may be selected: assert-suite-cover.py fails on a
+        --suite that matches zero entries (#4884)."""
         windows = self.job("ci.yml", "windows")
         steps = [
             step
@@ -452,19 +520,12 @@ class WorkflowWiringTests(unittest.TestCase):
             if "python scripts/ci/assert-suite-cover.py" in step
         ]
         expected = (
-            (
-                {"agent", "platform", "proto", "echo", "gateway", "server-nonpg", "server-checks"},
-                {"server-pg", "server-pg-smoke", "docs"},
-            ),
-            (
-                {"server-pg"},
-                {"agent", "docs", "proto", "echo", "gateway", "server-nonpg", "server-checks",
-                 "server-pg-smoke", "platform"},
-            ),
+            ({"agent", "platform", "proto", "echo", "gateway"}, {"docs"}),
         )
         self.assertEqual(len(expected), len(steps))
         for step, (selected, excluded) in zip(steps, expected):
             with self.subTest(selected=sorted(selected)):
+                self.assertTrue(step.startswith("name: Test (non-pg suites)\n"))
                 suites = re.search(r"suites=\(([^)]*)\)", step)
                 self.assertIsNotNone(suites)
                 self.assertEqual(selected, set(re.findall(r"--suite (\S+)", suites.group(1))))
@@ -475,6 +536,157 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertEqual(excluded, set(re.findall(r"--exclude-suite (\S+)", guard.group(0))))
                 # The guard and flake-retry share one list, so neither can drift.
                 self.assertEqual(2, step.count('"${suites[@]}"'))
+
+    @staticmethod
+    def strip_comments(body: str) -> str:
+        """`body` without the lines whose first non-space character is `#`
+        (YAML comments and bash comments inside run: blocks), so a pin cannot
+        be satisfied by a commented-out copy of the line it pins."""
+        return "\n".join(
+            line for line in body.splitlines() if not line.lstrip().startswith("#")
+        )
+
+    @staticmethod
+    def meson_setups(body: str) -> list[str]:
+        """Each `meson setup` command (not a comment mentioning one) with its
+        backslash continuation lines."""
+        return re.findall(r"(?m)^[ \t]*meson setup (?:[^\n]*\\\n)*[^\n]*", body)
+
+    def assert_agent_only_setup(self, cmd: str) -> None:
+        """Exactly one build_server token, and it is the plain argument
+        -Dbuild_server=false: not =true, not =falsey, not a second token that
+        overrides it, and not inside a ${{ }} expression that can evaluate
+        to something else on some matrix row."""
+        self.assertEqual(1, cmd.count("build_server"), cmd)
+        self.assertEqual(
+            1, len(re.findall(r"(?<!\S)-Dbuild_server=false(?!\S)", cmd)), cmd
+        )
+        for expr in re.findall(r"\$\{\{.*?\}\}", cmd, flags=re.S):
+            self.assertNotIn("build_server", expr, cmd)
+
+    def test_server_build_is_linux_only_in_ci(self) -> None:
+        """ADR-0035 ladder step 1: the Windows and macOS legs (and the CodeQL
+        Windows row) configure with -Dbuild_server=false, and no other leg
+        names build_server at all. The Windows leg builds into agent-only dir
+        names, so a stored build_server value can never be shared with a
+        branch that predates the change (Meson keeps stored options across
+        --reconfigure)."""
+        for job_name in ("windows", "macos"):
+            with self.subTest(job=job_name):
+                found = self.meson_setups(self.job("ci.yml", job_name))
+                self.assertEqual(
+                    1, len(found),
+                    f"{job_name}: expected exactly one `meson setup` (the agent-only "
+                    f"configure); a second setup could configure the server: {found!r}",
+                )
+                self.assert_agent_only_setup(found[0])
+
+        ci_text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        other_jobs = [
+            name
+            for name in re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", ci_text.split("\njobs:\n", 1)[1])
+            if name not in ("windows", "macos")
+        ]
+        self.assertIn("linux", other_jobs)
+        linux_setups = self.meson_setups(self.job("ci.yml", "linux"))
+        self.assertTrue(linux_setups)
+        for job_name in other_jobs:
+            with self.subTest(job=job_name):
+                for cmd in self.meson_setups(self.job("ci.yml", job_name)):
+                    self.assertNotIn("build_server", cmd)
+
+        windows = self.strip_comments(self.job("ci.yml", "windows"))
+        # The one build-dir assignment is the agent-only name, and the
+        # configure, build, test and summary steps all use it.
+        self.assertEqual(
+            ["BUILDDIR=build-windows-agent-${{ matrix.build_type }}"],
+            re.findall(r"BUILDDIR=[^\n]*", windows),
+        )
+        self.assertRegex(windows, r'(?m)^[ \t]*meson setup \$reconfig "\$BUILDDIR" \\$')
+        self.assertNotRegex(windows, r"build-windows-\$\{\{")
+        builddirs = re.findall(r'(?:--builddir|meson compile -C)\s+"?([^\s"]+)', windows)
+        self.assertTrue(builddirs)
+        for builddir in builddirs:
+            self.assertEqual("build-windows-agent-${{", builddir[: len("build-windows-agent-${{")], builddir)
+
+        # The legacy (server-configured) dirs are wiped by the step that
+        # runs BEFORE actions/checkout, on every run, outside the
+        # branch-switch condition (which does not fire on detached-HEAD PR
+        # checkouts).
+        steps = re.split(r"(?m)^      - ", windows)
+        checkout_idx = next(
+            i for i, step in enumerate(steps) if step.startswith("uses: actions/checkout@")
+        )
+        legacy_loop = "for legacy in build-windows build-windows-debug build-windows-release; do"
+        holders = [i for i, step in enumerate(steps) if legacy_loop in step]
+        self.assertEqual(
+            [checkout_idx - 1], holders,
+            "the legacy-dir loop must live in exactly one step, the one immediately "
+            "before actions/checkout",
+        )
+        wipe = steps[checkout_idx - 1]
+        self.assertTrue(
+            wipe.startswith("name: Wipe build-windows/ on branch switch (pre-checkout)\n"),
+            "the step before actions/checkout must be the pre-checkout wipe step",
+        )
+        self.assertRegex(
+            wipe, r'(?m)^ {10}for legacy in ',
+            "the legacy loop must sit at the top level of run:, not inside the "
+            "branch-switch if (which never fires on detached-HEAD PR checkouts)",
+        )
+        # Guarded rm, and best-effort: a file locked by a leftover process
+        # must warn (pointing at the recovery), never red the required check.
+        self.assertRegex(
+            wipe,
+            r'rm -rf "\$\{GITHUB_WORKSPACE:\?\}/\$legacy" \\\n[ \t]*'
+            r'\|\| echo "::warning::could not fully remove legacy \$legacy/[^"\n]*'
+            r'docs/ci-troubleshooting\.md entry 8\.?"\n',
+            "the legacy rm must be guarded by ${GITHUB_WORKSPACE:?} and best-effort "
+            "(`|| echo \"::warning::...\"` naming ci-troubleshooting entry 8)",
+        )
+        self.assertNotRegex(
+            wipe, r'rm -rf "\$GITHUB_WORKSPACE',
+            "every rm -rf in the wipe step must use ${GITHUB_WORKSPACE:?}",
+        )
+
+        codeql = (ROOT / ".github" / "workflows" / "codeql.yml").read_text(encoding="utf-8")
+        codeql_setups = self.meson_setups(codeql)
+        self.assertEqual(2, len(codeql_setups))
+        windows_rows = [cmd for cmd in codeql_setups if "vc++latest" in cmd]
+        self.assertEqual(1, len(windows_rows))
+        for cmd in codeql_setups:
+            if cmd in windows_rows:
+                self.assert_agent_only_setup(cmd)
+            else:
+                self.assertNotIn("build_server", cmd)
+        # The live yuzu-server.exe smoke rig was server-only (ADR-0035).
+        self.assertFalse(
+            (ROOT / ".github" / "workflows" / "instructions-windows-validate.yml").exists()
+        )
+
+    def test_agent_only_legs_carry_no_server_or_postgres_steps(self) -> None:
+        """ADR-0035 ladder step 1 removed every server and Postgres step from
+        the Windows and macOS legs. Checked on the comment-stripped job body,
+        case-insensitively, so a re-added step, env var, matrix key or suite
+        selection fails here while the comments that explain the removal
+        stay legal. No legitimate non-comment occurrence exists today (Wee
+        Tam's Postgres health check lives inside Assert-Toolchain.ps1, not in
+        the job text), so nothing is exempted."""
+        forbidden = (
+            "pg_mode", "postgres", "server-pg", "server-nonpg", "server-checks",
+            "yuzu_pg_canary",
+        )
+        # A second configure route (a post-setup `meson configure`, or the
+        # server re-enabled by any spelling) would undo -Dbuild_server=false.
+        forbidden_patterns = (r"build_server\s*=\s*true", r"meson\s+configure")
+        for job_name in ("windows", "macos"):
+            body = self.strip_comments(self.job("ci.yml", job_name)).lower()
+            for token in forbidden:
+                with self.subTest(job=job_name, token=token):
+                    self.assertNotIn(token, body)
+            for pattern in forbidden_patterns:
+                with self.subTest(job=job_name, pattern=pattern):
+                    self.assertNotRegex(body, pattern)
 
     def test_per_leg_suite_selectors_and_platform_entries(self) -> None:
         """docs runs on the Linux leg only; the OS-contract entries live in suite
@@ -509,10 +721,10 @@ class WorkflowWiringTests(unittest.TestCase):
         """meson overwrites testlog.json on each invocation, so the summary runs
         once per flake-retry Test step, against that step's own build dir."""
         ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertEqual(6, len(re.findall(r"scripts/ci/test-durations-summary\.py --builddir", ci)))
+        self.assertEqual(5, len(re.findall(r"scripts/ci/test-durations-summary\.py --builddir", ci)))
         for job_name, labels in (
             ("linux", ["Linux non-pg (cheap suites)", "Linux non-pg (server shards)", "Linux pg shards"]),
-            ("windows", ["Windows non-pg", "Windows pg shards"]),
+            ("windows", ["Windows non-pg"]),
             ("macos", ["macOS"]),
         ):
             with self.subTest(job=job_name):
@@ -528,10 +740,39 @@ class WorkflowWiringTests(unittest.TestCase):
                     self.assertTrue(runs)
                     self.assertEqual(runs[-1], m.group(1))
 
+    def test_linux_concurrent_halves_isolate_their_logs(self) -> None:
+        """The Linux test step runs its non-pg and pg halves concurrently in one
+        build dir. Every flake-retry invocation there must carry --no-rebuild
+        (one serial meson-test-prereq build precedes them) and its own
+        --logbase, each summary must read the logbase of the invocation it
+        follows, and the telemetry import must name exactly those logbases."""
+        job = self.job("ci.yml", "linux")
+        self.assertIn("meson-test-prereq", job)
+        runs = re.findall(r"flake-retry\.py --builddir \S+ -- (.*)", job)
+        self.assertEqual(4, len(runs))  # cheap, server shards, pg full, pg smoke
+        bases = []
+        for args in runs:
+            with self.subTest(args=args[:60]):
+                self.assertIn("--no-rebuild", args)
+                m = re.search(r"--logbase (\S+)", args)
+                self.assertIsNotNone(m)
+                bases.append(m.group(1))
+        # full and smoke are exclusive branches of the pg half, so they share one.
+        self.assertEqual(
+            ["testlog-nonpg-cheap", "testlog-nonpg-server", "testlog-pg", "testlog-pg"], bases
+        )
+        summary_bases = re.findall(
+            r'test-durations-summary\.py --builddir \S+ --label "[^"]+" --logbase (\S+)', job
+        )
+        self.assertEqual(bases[:3], summary_bases)
+        self.assertEqual(
+            sorted(set(bases)), sorted(re.findall(r"^\s*--logbase (\S+)\s*$", job, re.M))
+        )
+
     def test_every_catch2_entry_carries_durations(self) -> None:
         """The per-case summary reads Catch2's `--durations=yes` (the `=` form is
         required, see docs/ci-architecture.md). Every `*_exe` test() entry is a
-        Catch2 binary. The two exemptions are deliberate: a ~3 s push-only smoke
+        Catch2 binary. The two exemptions are deliberate: a ~3 s non-PR smoke
         entry and the [tsan-heavy] checkpoints entry."""
         exempt = {"'server pg smoke'", "'agent tsan-heavy checkpoints'"}
         seen = set()

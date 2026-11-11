@@ -8,7 +8,7 @@
  *   C. yuzu::mgmt_posture::execute_posture
  *   D. yuzu::shares::execute_list
  *   E. yuzu::remote_access_audit::execute_list
- *   F. yuzu::virtualization::execute_host
+ *   F. yuzu::virtualization::execute_action
  * Their catch arms must build a token, write a status row and set the typed
  * status without letting a second bad_alloc escape. The SDK export wrapper
  * (plugin.hpp) and the test-side LocalDispatcher::run (agent.cpp) do not catch, so an
@@ -253,23 +253,27 @@ TEST_CASE("remote_access_audit execute_list contains a leg that throws under sus
                        g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
 }
 
-TEST_CASE("virtualization execute_host contains a leg that throws under sustained OOM",
+TEST_CASE("virtualization execute_action contains a leg that throws under sustained OOM",
           "[plugin][abi][oom][virtualization]") {
-    yuzu::CommandContext ctx{nullptr};
-    reset_stubs();
-    bool escaped = false;
-    int rc = -1;
-    try {
-        rc = yuzu::virtualization::execute_host(ctx, "host", &oom_leg, "linux:leg:exception");
-    } catch (...) {
-        escaped = true;
-    }
-    g_fail_alloc = false;
+    for (const char* action : {"host", "wsl", "runtime_posture"}) {
+        yuzu::CommandContext ctx{nullptr};
+        reset_stubs();
+        bool escaped = false;
+        int rc = -1;
+        try {
+            rc = yuzu::virtualization::execute_action(
+                ctx, action, yuzu::virtualization::Legs{&oom_leg, &oom_leg, &oom_leg},
+                "linux:leg:exception");
+        } catch (...) {
+            escaped = true;
+        }
+        g_fail_alloc = false;
 
-    REQUIRE_FALSE(escaped);
-    // The recovery's status row must have hit the failing allocator, or this case proves
-    // nothing on a stdlib whose containment is never exercised.
-    REQUIRE(g_injected > 0);
-    CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
-                       g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+        REQUIRE_FALSE(escaped);
+        // The recovery's status row must have hit the failing allocator, or this case proves
+        // nothing on a stdlib whose containment is never exercised.
+        REQUIRE(g_injected > 0);
+        CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
+                           g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+    }
 }

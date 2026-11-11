@@ -132,6 +132,9 @@ parse_echo_retention_tiers(std::string_view tsv) {
 /// Age a record is guaranteed to still be held at. Roll-up rows age from their
 /// bucket START, so a time-based tier guarantees limit - bucket. Row-count
 /// tiers have no fixed time depth (it needs a per-device rows/day reading).
+/// The guarantee holds while the device is within its byte budget (`db_budget_bytes`): a device
+/// over budget evicts hourly rows older than 48 h (5 d for procperf) inside this depth, oldest
+/// first (#6902).
 [[nodiscard]] inline std::optional<std::int64_t>
 guaranteed_depth_seconds(const EchoRetentionTier& t) noexcept {
     if (t.row_count)

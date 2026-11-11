@@ -13,7 +13,7 @@
  *   query         -- Query events by time range with optional type filter
  *   export        -- Export events as JSON array
  *   snapshot      -- Force an immediate full snapshot (all 4 collectors)
- *   configure     -- Update retention_days, intervals, redaction patterns
+ *   configure     -- Update intervals, redaction patterns
  *
  * Data flow:
  *   trigger fires -> enumerate current state -> load previous state from echo_state
@@ -1510,9 +1510,10 @@ private:
     // kPidNameCap, cleared when the process source is confirmed disabled.
     std::unordered_map<std::uint32_t, yuzu::echo::PidName> pid_name_;
     static constexpr std::size_t kPidNameCap = 65536;
-    // Hourly de-duplication sets (echo_hour_dedup.hpp). Each tick filters against a COPY and
-    // keeps it only once the rows are committed, so a rolled-back tick re-derives the same
-    // rows. Guarded by collect_mu_. The overflow counters mirror the committed sets for status.
+    // Hourly de-duplication sets (echo_hour_dedup.hpp). Each tick filters IN PLACE inside a
+    // BatchScope and keeps the admitted keys only once the rows are committed, so a rolled-back
+    // tick re-derives the same rows. Guarded by collect_mu_. The overflow counters mirror the
+    // committed sets for status.
     yuzu::echo::HourlySeenSet tcp_closing_seen_;
     yuzu::echo::HourlySeenSet module_seen_;
     std::atomic<std::uint64_t> tcp_closing_overflows_{0};
@@ -1840,6 +1841,9 @@ private:
                     // remote_host stays empty: nstat is a lifecycle event stream, not the
                     // DNS-resolving poll (resolve_hostnames), the same simplification the ES
                     // process stream makes for cmdline.
+                    // Closing-state opens follow the poll leg's once-per-hour rule (#6899).
+                    flow_events = yuzu::echo::nstat_dedupe_closing_opens(std::move(flow_events),
+                                                                         tcp_closing_seen_);
                     for (const auto& e : flow_events)
                         typed.push_back(yuzu::echo::network_event_from_nstat_flow(e, snap_id));
                     if (!pending_nstat_evs_.empty()) {
@@ -1858,9 +1862,15 @@ private:
                         pending_nstat_evs_ = std::move(typed);
                         if (pending_nstat_evs_.size() > kPendingStreamCap) {
                             const auto excess = pending_nstat_evs_.size() - kPendingStreamCap;
-                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(),
-                                                     pending_nstat_evs_.begin() +
-                                                         static_cast<std::ptrdiff_t>(excess));
+                            const auto cut = pending_nstat_evs_.begin() +
+                                             static_cast<std::ptrdiff_t>(excess);
+                            // The rows cut here are never stored: give their hourly keys back
+                            // so the next closing-state sighting this hour is not read as a
+                            // repeat of a row that was lost (the drain admitted them above).
+                            yuzu::echo::nstat_release_closing_keys(
+                                pending_nstat_evs_.data(), pending_nstat_evs_.data() + excess,
+                                tcp_closing_seen_);
+                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(), cut);
                         }
                     } else {
                         total_events += static_cast<int>(typed.size());
@@ -1901,6 +1911,9 @@ private:
                     // already-typed pending_nstat_evs_ from an earlier failed
                     // insert rather than let it sit stuck-forever bounded.
                     nstat_client_->drain(); // discard — untrustworthy bytes
+                    yuzu::echo::nstat_release_closing_keys(
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                     spdlog::warn("ECHO: nstat layout mismatch on stream death — discarding "
                                  "the buffered tcp lifecycle ring");
@@ -1952,11 +1965,13 @@ private:
             // back fallback tick must re-prime next tick, not diff a udp-only
             // baseline against the full snapshot (#1654).
 
-            // Filter against a COPY of the closing-socket seen set and keep it only once the rows
-            // commit below, so a rolled-back tick re-derives the same rows.
-            yuzu::echo::HourlySeenSet closing_seen = tcp_closing_seen_;
+            // Filter in place inside a batch: the keys it admits are kept once the rows commit
+            // below and erased if they do not (the scope rolls back on any exit without a
+            // commit, an exception included), so a rolled-back tick re-derives the same rows
+            // without copying the whole set every tick.
+            yuzu::echo::BatchScope tcp_batch{tcp_closing_seen_};
             auto typed = yuzu::echo::compute_network_events(*diff_previous, *diff_current, ts,
-                                                            snap_id, closing_seen);
+                                                            snap_id, tcp_closing_seen_);
 
             // While nstat is primary, persist the udp-only view so the next
             // tick's poll diff stays apples-to-apples (never mistakes
@@ -1970,6 +1985,7 @@ private:
                                 : db_->fold_network_events(
                                       typed, yuzu::echo::StateWrite{net_key, state_json});
             if (!ok) {
+                tcp_batch.rollback();
                 const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
                 spdlog::error("ECHO: network {} — nothing persisted, next tick re-diffs", tok);
                 ctx.write_output(typed.empty() ? "error|network state_save_failed"
@@ -1981,7 +1997,7 @@ private:
                 return 1;
             }
             nstat_tcp_primary_prev_ = nstat_primary;
-            tcp_closing_seen_ = std::move(closing_seen);
+            tcp_batch.commit();
             tcp_closing_overflows_.store(tcp_closing_seen_.overflows(), std::memory_order_relaxed);
             total_events += static_cast<int>(typed.size());
             note_health("tcp", yuzu::echo::tcp_tick_status(nstat_insert_failed, "events_recorded"));
@@ -2002,6 +2018,9 @@ private:
             // an unreadable flag skips the tick via the plain branch below and
             // leaves the ring buffering rather than discarding live lifecycle events.
             nstat_client_->drain();
+            yuzu::echo::nstat_release_closing_keys(
+                pending_nstat_evs_.data(), pending_nstat_evs_.data() + pending_nstat_evs_.size(),
+                tcp_closing_seen_);
             pending_nstat_evs_.clear();
         } else {
             note_health("tcp", skip_token(tcp_state));
@@ -2173,10 +2192,11 @@ private:
                     e.process_name = yuzu::echo::pid_name_lookup(pid_name_, e.pid, e.ts_unix);
             }
             // §5 edge filter: unloads dropped, every risky load kept, other loads once per hour
-            // per (action, loader, module, folder). Filter against a COPY of the seen set and
-            // keep it only once the rows commit, so a failed insert re-filters identically.
-            yuzu::echo::HourlySeenSet module_seen = module_seen_;
-            mevs = yuzu::echo::apply_module_risk_filter(std::move(mevs), module_seen);
+            // per (action, loader, module, folder). Filter in place inside a batch and keep the
+            // admitted keys only once the rows commit, so a failed insert re-filters identically
+            // (the scope rolls back on any exit without a commit, an exception included).
+            yuzu::echo::BatchScope module_batch{module_seen_};
+            mevs = yuzu::echo::apply_module_risk_filter(std::move(mevs), module_seen_);
             std::vector<yuzu::echo::ModuleRow> mrows;
             mrows.reserve(mevs.size());
             for (const auto& e : mevs) {
@@ -2199,6 +2219,7 @@ private:
                     // other legs already committed). Re-queue the filtered
                     // batch for the next tick, bounded, and log.
                     module_tok = "insert_failed";
+                    module_batch.rollback();
                     spdlog::error("ECHO: module stream insert failed — re-queuing {} events",
                                   mevs.size());
                     pending_module_evs_ = std::move(mevs);
@@ -2210,9 +2231,11 @@ private:
                     }
                 } else {
                     total_events += static_cast<int>(mrows.size());
-                    module_seen_ = std::move(module_seen);
                 }
             }
+            // Keeps the admitted keys on success or an empty batch; after the rollback above the
+            // scope is already closed, so this is a no-op there.
+            module_batch.commit();
             module_overflows_.store(module_seen_.overflows(), std::memory_order_relaxed);
             if (auto d = module_stream_->dropped(); d > last_module_dropped_) {
                 spdlog::warn("ECHO: module stream ring overflow — {} dropped (+{} since last drain)",
@@ -3091,7 +3114,6 @@ private:
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
         ctx.write_output(std::format("newest_timestamp|{}", s.newest_timestamp));
         ctx.write_output(std::format("db_size_bytes|{}", s.db_size_bytes));
-        ctx.write_output(std::format("retention_days|{}", s.retention_days));
         // Byte budget (db_budget_bytes): db_size_bytes above is used pages + WAL, the figure the
         // budget is enforced against. budget_over_bytes is how far data + WAL sit above it right
         // now (measured here, not cached, so it is true before the first pass too); it can be
@@ -3113,9 +3135,6 @@ private:
             } else {
                 ctx.write_output("budget_over_bytes|unknown");
             }
-            ctx.write_output(std::format(
-                "budget_evicted_raw_rows_total|{}",
-                db_->get_config(std::string{yuzu::echo::kBudgetEvictedRawKey}, "0")));
             ctx.write_output(std::format(
                 "budget_evicted_hourly_rows_total|{}",
                 db_->get_config(std::string{yuzu::echo::kBudgetEvictedHourlyKey}, "0")));
@@ -3141,9 +3160,7 @@ private:
         // see the steady-state behavior. rows / oldest_ts are queried from the source's
         // FINEST physical tier (the roll-up has no raw table to count): `<src>_hourly_r`, or
         // `usage_daily` for usage. A bucket is its hour's (day's) start, not an event's own time.
-        // `<src>_live_rows` is the same figure under its old name for ONE release, so the server
-        // readers (dashboard_routes, device_routes, echo_process_tree) keep working until they
-        // move to `<src>_rows`; an empty table reports 0 / 0.
+        // An empty table reports 0 / 0.
         for (const auto& src : yuzu::echo::capture_sources()) {
             std::string enabled_key = std::format("{}_enabled", src.name);
             // Default to the source's declared default so a fresh agent
@@ -3187,7 +3204,6 @@ private:
                 }
             }
             ctx.write_output(std::format("config|{}_rows|{}", src.name, rows));
-            ctx.write_output(std::format("config|{}_live_rows|{}", src.name, rows)); // one-release alias
             ctx.write_output(std::format("config|{}_oldest_ts|{}", src.name, oldest_ts));
             if (src.name == "netqual") {
                 // The per-boot baseline is a plain table beside the roll-up tiers.
@@ -3238,18 +3254,10 @@ private:
             }
             ctx.write_output(std::format("config|usage_lifecycle_state|{}", lifecycle));
         }
-        ctx.write_output(
-            std::format("config|usage_gap_count|{}", db_->get_config("usage_gap_count", "0")));
-        ctx.write_output(std::format("config|usage_gap_lost_events|{}",
-                                     db_->get_config("usage_gap_lost_events", "0")));
-        ctx.write_output(
-            std::format("config|usage_gap_last_ts|{}", db_->get_config("usage_gap_last_ts", "-")));
         ctx.write_output(std::format("config|usage_expiry_declined_count|{}",
                                      db_->get_config("usage_expiry_declined_count", "0")));
         ctx.write_output(std::format("config|usage_coverage_since|{}",
                                      db_->get_config("usage_coverage_since", "-")));
-        ctx.write_output(
-            std::format("config|usage_lag_events|{}", db_->get_config("usage_lag_events", "0")));
 
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
@@ -3258,7 +3266,7 @@ private:
         // Software source pacing + heartbeat. software_last_run_ts is the wall-clock
         // of the last collect_software tick (0 if it has never run) — the operator's
         // signal that the hourly trigger is alive even on a host with no software
-        // changes (where software_live_rows stays 0).
+        // changes (where software_rows stays 0).
         ctx.write_output(std::format("config|software_interval_seconds|{}",
                                      db_->get_config("software_interval_seconds", "3600")));
         ctx.write_output(std::format("config|software_last_run_ts|{}",
@@ -3915,7 +3923,6 @@ private:
     }
 
     int do_configure(yuzu::CommandContext& ctx, yuzu::Params params) {
-        auto retention = params.get("retention_days");
         auto fast_interval = params.get("fast_interval");
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
@@ -3930,7 +3937,6 @@ private:
         std::optional<int64_t> budget_bytes;
         int fast_secs = 0;
         int slow_secs = 0;
-        int days = 0;
         // Software interval accepts 0 (disable the trigger) or 300–86400, so it
         // needs a "was it provided" flag distinct from the 0 sentinel.
         int software_secs = 0;
@@ -3962,16 +3968,6 @@ private:
         // the "Phase 2" block below; every path before it only reads + validates.
 
         // ── Phase 1: validate everything (no writes) ─────────────────────────
-        if (!retention.empty()) {
-            try {
-                days = std::stoi(std::string{retention});
-            } catch (...) {}
-            if (days < 1 || days > 365) {
-                ctx.write_output("error|retention_days must be 1-365");
-                return 1;
-            }
-        }
-
         if (!db_budget.empty()) {
             budget_bytes = yuzu::echo::parse_budget_bytes(db_budget);
             if (!budget_bytes) {
@@ -4202,18 +4198,13 @@ private:
         if (budget_bytes) {
             // The only checked write, so it goes FIRST: this control gates deletes, a value that
             // did not persist must not be reported as applied, and its failure must leave nothing
-            // else half-applied (retention_days below is unchecked and cannot fail the call).
+            // else half-applied.
             if (!db_->set_config(std::string{yuzu::echo::kDbBudgetKey},
                                  std::to_string(*budget_bytes))) {
                 ctx.write_output("error|db_budget_bytes could not be saved");
                 return 1;
             }
             ctx.write_output(std::format("config|db_budget_bytes|{}", *budget_bytes));
-            changed = true;
-        }
-        if (days > 0) {
-            db_->set_config("retention_days", std::string{retention});
-            ctx.write_output(std::format("config|retention_days|{}", retention));
             changed = true;
         }
         if (fast_secs > 0) {
@@ -4356,6 +4347,11 @@ private:
                 if (transition_ok && src_name == "tcp" && nstat_client_ &&
                     (v == "true") != tcp_prev_enabled) {
                     nstat_client_->drain();
+                    // The backlog rows are dropped unstored: give their hourly keys
+                    // back (the drain's own events were never admitted).
+                    yuzu::echo::nstat_release_closing_keys(
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                 }
                 // Cursor-model sources (echo_cursor.hpp, P-002): forward the
@@ -4848,18 +4844,6 @@ private:
             return 1;
         }
         auto& result = *query_result;
-
-        // A retired `$X_Live` name answers with no rows (an empty shim view, never an error), so
-        // a stored query, schedule or result-set producer would read the empty answer as "nothing
-        // happened". The typed status says what it is: CONSTRAINED, `retired_table:<name>`. The
-        // rows and the __total__ line are unchanged; refusing the name is a separate decision.
-        if (const auto retired = yuzu::echo::referenced_legacy_live_shims(*validated); !retired.empty()) {
-            std::string detail = "retired_table:";
-            for (std::size_t i = 0; i < retired.size(); ++i)
-                detail += (i ? "," : "") + retired[i];
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  detail);
-        }
 
         // Output schema line
         std::string schema_line = "__schema__";

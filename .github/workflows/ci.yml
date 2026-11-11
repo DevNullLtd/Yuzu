@@ -44,6 +44,35 @@ on:
     # a docs-only PR skips them, and a *skipped* required check is satisfied
     # whereas an *absent* one is not. The `push:` trigger above now does the
     # same (#5320).
+  # Release-leg schedule (docs/ci-architecture.md, Tier 2b). A push to `dev` no longer
+  # builds the release/LTO legs (see the matrix excludes below); they run
+  # instead from a daily dispatch, `release-legs-daily.yml`, against dev's
+  # tip, and on every push to `main` (release promotion) as before. The input
+  # picks which build_type legs a direct dispatch expands to. A dispatch is
+  # told apart from the trusted-fork `workflow_call` path by `inputs.head_sha`
+  # (empty here, always set by trusted-fork-ci.yml), because a reusable
+  # workflow inherits its caller's `github.event_name` — and that caller is
+  # itself a workflow_dispatch. The trusted-fork path is unchanged: it still
+  # expands the full debug + release matrix. A direct dispatch is accepted on
+  # `dev` and `main` only (trusted_inputs refuses any other ref), and on it
+  # the jobs that carry a ruleset-required context name are handled so a
+  # dispatch never posts a SKIPPED (= satisfied) required check. Preflight
+  # (runner health) and the Linux/Windows/macOS legs get a ` [dispatch]` name
+  # suffix. Proto backward-compat keeps its literal name (a skipped job's name
+  # expression is not evaluated) and is never skipped on a dispatch: it posts
+  # its real result or a fail-closed red — see that job.
+  # ci.yml requests no permission beyond the trusted-fork caller's ceiling
+  # (contents/pull-requests/actions: read): a called workflow's jobs are
+  # permission-checked against the caller at load time, before any `if:`, so
+  # the dispatch failure alert lives in release-legs-alert.yml instead.
+  workflow_dispatch:
+    inputs:
+      legs:
+        description: "Which build_type legs to run: 'release' (release/LTO legs only, the scheduled default) or 'all'"
+        required: false
+        default: release
+        type: choice
+        options: [release, all]
   workflow_call:
     inputs:
       pr_number:
@@ -70,7 +99,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # The `-dispatch` suffix keeps a scheduled release-legs dispatch on dev
+  # (release-legs-daily.yml) out of the dev PUSH group. GitHub keeps at most
+  # one PENDING run per group and a newer one replaces it, so sharing the group
+  # would let a dispatch evict a queued push run — that push commit would then
+  # carry no required contexts, and the next push's codegate (which needs the
+  # predecessor's push run to have succeeded) would build unconditionally.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'workflow_dispatch' && !inputs.head_sha && '-dispatch' || '' }}
   # PRs cancel-in-progress (rapid iteration — every push obsoletes the last).
   # Pushes to dev / main do NOT cancel — they queue. Mid-flight pushes were
   # killing 10+ min of compile work on rapid landings, and the
@@ -149,6 +184,24 @@ jobs:
           # inputs.head_sha — which only the trusted wrapper supplies — is the
           # call-boundary discriminator. Do not use github.event_name here.
           if [[ -z "$APPROVED_SHA" ]]; then
+            # A DIRECT workflow_dispatch (no head_sha: not the trusted-fork
+            # call) is accepted on `dev` and `main` only, and FAILS CLOSED on
+            # any other ref. Defence in depth: the primary control is that on a
+            # direct dispatch every job carrying a ruleset-required context
+            # name is renamed with a ` [dispatch]` suffix or (proto-compat)
+            # never skipped, so a dispatch never posts a misleading required
+            # check on any SHA — including the dev tip a dev->main promotion
+            # PR uses as its head (governance 2026-11-10). This guard keeps the
+            # trigger to the two refs it exists for: the daily release-legs
+            # dispatch on dev and a by-hand run on main.
+            # Same github.event_name expression form as the two checks below; this
+            # is already inside the not-a-trusted-call branch, so the event
+            # name is safe to read here (the discriminator above is head_sha).
+            if [[ "${{ github.event_name }}" == "workflow_dispatch" \
+                  && "$GITHUB_REF" != "refs/heads/dev" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "::error::ci.yml may be dispatched directly only on refs/heads/dev or refs/heads/main (got '$GITHUB_REF'). Open a PR to run CI on a branch, or use trusted-fork-ci.yml for a fork."
+              exit 1
+            fi
             echo "checkout_repository=$REPOSITORY" >> "$GITHUB_OUTPUT"
             # PIN the checkout to the event's own commit, exactly as the trusted
             # path below does with $head_sha. NOT ${GITHUB_REF}: on a
@@ -498,7 +551,9 @@ jobs:
           --require-pool bigtam --require-pool weetam --require-pool bigmags
 
   preflight:
-    name: "Preflight (runner health)"
+    # ` [dispatch]` suffix on a direct dispatch: see the `workflow_dispatch:`
+    # trigger comment — no dispatch may post a ruleset-required context name.
+    name: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && 'Preflight (runner health) [dispatch]' || 'Preflight (runner health)' }}
     needs: [trusted_inputs, preflight-gate]
     # Always run, even when preflight-gate failed or trusted_inputs did not
     # succeed: the required-check name lives on THIS job, and a skipped
@@ -582,6 +637,8 @@ jobs:
           python3 scripts/ci/test_runner_health_check.py
           bash tests/shell/test_review_driver_substitution.sh  # patsub_replacement prompt corruption (#2644)
           bash tests/shell/test_trusted_inputs_validate.sh    # the step that picks the BUILD COMMIT (#2832)
+          bash tests/shell/test_release_legs_issue.sh         # release-legs-broken open/comment/close decision (Tier 2b)
+          bash tests/shell/test_linux_concurrent_step.sh      # Linux test step: both halves' verdicts, kill switch, cancel/EXIT traps (~45 s)
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
@@ -671,16 +728,54 @@ jobs:
 
   # ── Proto backward-compatibility ───────────────────────────────────────
   proto-compat:
+    # LITERAL name, unlike the other required-context jobs: this job is
+    # routinely SKIPPED (docs-only PRs, #1978), and GitHub does not evaluate a
+    # skipped job's `name:` expression — it would post the raw template and the
+    # required "Proto backward-compat" context would be absent on every
+    # docs-only PR (github.com/orgs/community/discussions/13261). So on a
+    # direct dispatch this job is never skipped instead: it RUNS the real
+    # `buf breaking` check on the branch it checks out (dev, or main on a
+    # by-hand dispatch; the same thing
+    # every dev push posts; if dev moved since the dispatch, its "Record built
+    # commit" step names the commit actually checked), or, when preflight-gate
+    # did not succeed or the
+    # Linux pool reads unhealthy, FAILS red on a hosted runner (a real red
+    # "Proto backward-compat" on that commit: fail-closed, re-run once the
+    # infrastructure is back). A dispatch can therefore never post a SKIPPED
+    # (= satisfied) "Proto backward-compat" (governance 2026-11-10).
     name: "Proto backward-compat"
     needs: [preflight-gate]
     # Pool gate: runs if any [self-hosted, Linux, X64] runner is online
     # (yuzu-bigtam-*). Fail-closed `== 'true'`.
     # `&& code_changed` (issue #1978): a docs-only PR skips this required job
     # (skipped == satisfied), so it no longer blocks the merge on an absent check.
-    if: needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true'
-    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
+    # The explicit success() keeps the non-dispatch arm exactly as before: the
+    # status function in the dispatch arm would otherwise drop the implicit one.
+    # The dispatch arm is `always()`, not `!cancelled()`: a dispatch cancelled
+    # while preflight runs must still not leave a SKIPPED literal required
+    # context; with the gate cancelled it takes the hosted fail-closed arm
+    # (ends red). If the run is cancelled while this job runs, its final
+    # check step (`always() && cancelled()`, just before the trusted-fork
+    # purge) fails it red, so no cancel path can end it
+    # green-without-checking; a force-cancel ends it `cancelled`, which never
+    # satisfies a required check.
+    if: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && always()) || (success() && needs.preflight-gate.outputs.linux_pool_healthy == 'true' && needs.preflight-gate.outputs.code_changed == 'true') }}
+    # The pool clause is defence in depth: today a successful gate implies the
+    # Big Tam (= Linux) pool is healthy (--require-pool bigtam), so it only
+    # matters if that coupling ever changes. A pool that dies AFTER the probe
+    # still leaves this job queued on the self-hosted label.
+    runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')) && 'ubuntu-24.04' || fromJSON('["self-hosted","Linux","X64","yuzu-bigtam-linux"]') }}
     timeout-minutes: 5
     steps:
+      - name: Fail closed when preflight-gate did not succeed (dispatch)
+        # always(): never skipped by an implicit success() after a run cancel.
+        if: always() && (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')
+        env:
+          GATE_RESULT: ${{ needs.preflight-gate.result }}
+          LINUX_POOL: ${{ needs.preflight-gate.outputs.linux_pool_healthy }}
+        run: |
+          echo "::error::preflight-gate result '$GATE_RESULT', Linux pool healthy '$LINUX_POOL' on a direct dispatch — failing closed rather than posting a skipped (= satisfied) Proto backward-compat"
+          exit 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ needs.preflight-gate.outputs.checkout_repository }}
@@ -690,6 +785,18 @@ jobs:
           # A trusted fork never reuses a prior self-hosted workspace.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+      # Direct dispatch only: proto-compat checks out the dev BRANCH, which may
+      # have moved since the dispatch; record the commit actually checked.
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Checked commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: proto-compat checked $built, not the dispatched $DISPATCHED_SHA"
+          fi
       - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           version: "1.50.0"
@@ -697,6 +804,17 @@ jobs:
         run: buf lint proto
       - name: Check backward compatibility
         run: buf breaking proto --against '.git#subdir=proto,ref=origin/main'
+
+      # Direct dispatch only: if the run was cancelled at any point, end RED
+      # whatever happened above. Whether GitHub runs or skips implicit-success()
+      # steps after a run cancel must not decide this: a skipped lint/breaking
+      # with no failed step would otherwise conclude this job green without
+      # checking anything, on a literal required context.
+      - name: Fail closed if the dispatch was cancelled
+        if: always() && (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && cancelled()
+        run: |
+          echo "::error::the dispatch was cancelled — failing closed rather than posting an unchecked Proto backward-compat"
+          exit 1
 
       - name: Purge trusted-fork workspace
         if: ${{ always() && needs.preflight-gate.outputs.trusted_execution == 'true' }}
@@ -706,7 +824,7 @@ jobs:
 
   # ── Linux (GCC + Clang, self-hosted yuzu-bigtam-linux) ────────────────
   linux:
-    name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
+    name: "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && ' [dispatch]' || '' }}"
     needs: [preflight-gate]
     # Pinned to the Big Tam sub-pool: the GCC 15 / Clang 21 toolchain is
     # 26.04-only (the retired Shulgi runners were 24.04), so gate on
@@ -748,10 +866,13 @@ jobs:
     strategy:
       fail-fast: false
       # max-parallel: 4 (raised from 3 on 2026-10-21, owner's call) — Big Tam has
-      # exactly 4 yuzu-bigtam-linux runner agents on one box, so a `dev`/`main`
-      # push's whole 2x2 matrix now runs in one wave instead of two, which cuts
-      # the push's wall time. The price: that push claims all 4 runners at once,
-      # so a concurrently-queued PR's single Linux leg waits at the
+      # exactly 4 yuzu-bigtam-linux runner agents on one box, so a `main` push's
+      # (or a `legs=all` dispatch's) whole 2x2 matrix runs in one wave instead of
+      # two; a `dev` push expands to the 2 debug legs only, and the daily
+      # release-legs dispatch to the 2 release legs only. Running a whole
+      # matrix in one wave cuts the push's wall time. The price: that push
+      # claims all 4 runners at once, so a concurrently-queued PR's single
+      # Linux leg waits at the
       # RUNNER-ACQUISITION level — below with-test-slot.sh, which only gates
       # contention *inside* a job that already has a runner (docs/ci-architecture.md
       # "Cross-job"). That is the case the former cap of 3 was added for: with all 4
@@ -769,8 +890,15 @@ jobs:
         compiler: [gcc-15, clang-21]
         build_type: [debug, release]
         exclude:
-          # PRs: only gcc-15 debug (fast feedback)
-          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          # PRs: only gcc-15 debug (fast feedback).
+          # Release/LTO legs: not on a PR and not on a push to dev; they run on a
+          # push to main and from the daily dispatch (release-legs-daily.yml).
+          # A direct dispatch with legs=release (the default) drops the debug
+          # legs, which every dev push normally already ran. The two build_type
+          # excludes are repeated in the windows and macos matrices below —
+          # keep all three in lockstep.
+          - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
+          - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
           - compiler: ${{ github.event_name == 'pull_request' && 'clang-21' || 'NONE' }}
         # pg_mode (#3443 Phase 2) is a DERIVED per-leg key via include:, never a
         # third axis (2x matrix, breaks max-parallel's 4-runner arithmetic) and
@@ -787,9 +915,11 @@ jobs:
         # then the gcc-15/debug override to full. On a PR the exclude above has
         # already trimmed the matrix to the single gcc-15/debug leg, so both
         # include entries match that one leg and the net result is pg_mode=full
-        # — PR coverage is unaffected. On a push, gcc-15/debug ends up full and
-        # the other three legs (clang-21/debug, gcc-15/release, clang-21/release)
-        # stay smoke. Item 4 of the original plan (a periodic full clang-release
+        # — PR coverage is unaffected. Wherever gcc-15/debug expands, it ends up
+        # full and the other three legs (clang-21/debug, gcc-15/release,
+        # clang-21/release) stay smoke; a dev push now expands only the two debug
+        # legs, the release legs come from main pushes and the daily dispatch.
+        # Item 4 of the original plan (a periodic full clang-release
         # PG run to cover the optimizer/NDEBUG-sensitive residual smoke can't
         # reach) is deliberately DEFERRED — Phase 6A (the nightly slot-gate
         # narrowing this would need to join) is shelved and nightly.yml only
@@ -797,11 +927,16 @@ jobs:
         # now; landing an ungated periodic leg would reintroduce exactly the
         # uncoordinated-contention problem Phase 6A exists to close. Tracked on
         # #3443, not silently dropped.
-        include:
-          - pg_mode: smoke
-          - compiler: gcc-15
-            build_type: debug
-            pg_mode: full
+        #
+        # The include list is CONDITIONAL. GitHub applies include: after
+        # exclude:, and an include entry that matches no surviving combination
+        # is ADDED as a new one — so on a `legs=release` dispatch, where the
+        # exclude above has removed both debug legs, a static gcc-15/debug entry
+        # would silently add the most expensive leg (full PG shards) back. On
+        # that dispatch the list is just the smoke default; everywhere else it
+        # is the two entries described above. The Resolve-pg_mode step asserts
+        # that a `legs=release` dispatch never expands a debug leg.
+        include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && '[{"pg_mode":"smoke"}]' || '[{"pg_mode":"smoke"},{"compiler":"gcc-15","build_type":"debug","pg_mode":"full"}]') }}
 
     steps:
       # PR-5 of the CI overhaul plan: normal CI keeps clean:false to preserve
@@ -843,6 +978,23 @@ jobs:
           # runner-reset.sh.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      # Direct dispatch only: a dispatched run's legs check out the BRANCH
+      # (refs/heads/dev), not github.sha — pinning a SHA would detach HEAD and
+      # disarm the branch-switch wipe sentinel (trusted_inputs comment). Legs
+      # queue for a while, so dev can move first. Record the commit actually
+      # built, and warn when it is not the dispatched one, so an alert or a
+      # bisect starts from the right commit (governance UP-1, 2026-11-10).
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Built commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: this leg built $built, not the dispatched $DISPATCHED_SHA"
+          fi
 
       - name: Isolate trusted-fork build caches
         if: needs.preflight-gate.outputs.trusted_execution == 'true'
@@ -1120,6 +1272,7 @@ jobs:
           PG_MODE: ${{ matrix.pg_mode }}
           MATRIX_COMPILER: ${{ matrix.compiler }}
           MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
+          DISPATCH_RELEASE_ONLY: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'true' || 'false' }}
         run: |
           case "$PG_MODE" in
             full|smoke) ;;
@@ -1143,8 +1296,16 @@ jobs:
           # 4-leg PG-shard contention this change exists to fix silently
           # returns. GITHUB_EVENT_NAME is one of GitHub Actions' own default
           # step env vars, set on every run - no extra wiring needed.
-          if [[ "$GITHUB_EVENT_NAME" == "push" && ! ( "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" ) && "$PG_MODE" != "smoke" ]]; then
-            echo "::error::$MATRIX_COMPILER/$MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces the 4-leg full-PG-shard contention #3443 Phase 2 exists to fix"
+          # Since the daily release-legs dispatch (release-legs-daily.yml) the
+          # release legs mostly run from a workflow_dispatch, so the guard
+          # covers that event too; and a `legs=release` dispatch must never
+          # expand a debug leg at all (the conditional include: above).
+          if [[ "$DISPATCH_RELEASE_ONLY" == "true" && "$MATRIX_BUILD_TYPE" == "debug" ]]; then
+            echo "::error::$MATRIX_COMPILER/debug expanded on a legs=release dispatch — the conditional matrix include: is broken; this re-runs a debug leg the dispatch exists to skip"
+            exit 1
+          fi
+          if [[ ( "$GITHUB_EVENT_NAME" == "push" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ) && ! ( "$MATRIX_COMPILER" == "gcc-15" && "$MATRIX_BUILD_TYPE" == "debug" ) && "$PG_MODE" != "smoke" ]]; then
+            echo "::error::$MATRIX_COMPILER/$MATRIX_BUILD_TYPE on a $GITHUB_EVENT_NAME resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces the 4-leg full-PG-shard contention #3443 Phase 2 exists to fix"
             exit 1
           fi
           echo "pg_mode=$PG_MODE"
@@ -1165,16 +1326,94 @@ jobs:
           echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
           echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
 
-      # Verified NOT to select the #3443 Phase 2 'server pg smoke' entry: the
-      # --suite list below omits server-pg-smoke, and the by-name line
-      # matches none of its six names against it — meson's positional
+      # Verified NOT to select the #3443 Phase 2 'server pg smoke' entry in the
+      # NON-PG half: its --suite list omits server-pg-smoke, and the by-name
+      # line matches none of its six names against it — meson's positional
       # test-name matching is an EXACT match (fnmatch with no glob characters
       # in a literal name, mtest.py's tests_from_args), not a substring one.
-      # See 'Test (pg shards, full)' below for the full #3443 concurrency-
-      # tuning history (with-test-slot.sh slot counts, --num-processes,
-      # shard timeouts) — kept there since it's about the PG-shard
-      # invocation specifically, not this non-PG one.
-      - name: Test (non-pg suites)
+      # The pg half (below, in the same step) selects it by name on smoke legs.
+      - name: Test (non-pg + pg halves, concurrent)
+        # ═══ CONCURRENCY (this step's shape) ═══
+        # Until this change the Linux leg ran three steps back to back:
+        # 'Test (non-pg suites)' (~6.6-7 min), then 'Test (pg shards, full)' (~10
+        # min, gcc-15/debug only) or 'Test (pg smoke)' (the other push legs).
+        # They share no state but the build dir, so they now run as two
+        # background halves of ONE step and the step `wait`s on both:
+        #   - NON-PG half: the two cheap-first flake-retry.py invocations,
+        #     unchanged in selection and width, still OUTSIDE with-test-slot.sh;
+        #   - PG half: pg_mode=full -> with-test-slot.sh 3 + --suite server-pg at
+        #     --num-processes 4 (unchanged); pg_mode=smoke -> 'server pg smoke' by
+        #     name, ungated (unchanged). pg_mode was asserted by 'Resolve pg_mode
+        #     + assert Postgres DSN' above; an unexpected value fails here too.
+        # Expected saving is roughly the shorter half, on the pg_mode=full leg only
+        # (smoke legs' pg half takes seconds) — an estimate, not yet measured; the
+        # measurement plan and the revert triggers are in docs/ci-architecture.md
+        # "Linux test step: concurrent non-pg and pg halves". Both halves now
+        # share the job's 16 CPUs: up to 4 non-pg workers (the cheap suites; the
+        # server-shard invocation runs 2) alongside up to 4 pg shards, where it
+        # used to be one or the other — watch the #2093 per-shard watchdog and
+        # the spin_until timing flakes.
+        #
+        # Kill switch: repository variable YUZU_CI_SEQUENTIAL_HALVES=1 runs the
+        # non-pg half, then the pg half, skipping the pg half when the non-pg
+        # half failed (the old back-to-back behaviour) — same logs, same files.
+        # Only the exact value 1 does; any other non-empty value prints a
+        # ::warning:: and the halves stay concurrent.
+        #
+        # Failure semantics (concurrent mode): BOTH halves always run to
+        # completion (a red non-pg half does not cancel the pg half — the extra
+        # signal is worth the minutes on a run that is red anyway). Within the
+        # non-pg half the cheap-first fail-fast still holds (each half runs under
+        # bash -e). Each half's output is printed, in its own ::group::, the
+        # moment that half ends (a failing half gets an ::error:: line naming it
+        # first), so a red half is visible while the other is still running. The
+        # step fails if EITHER half exits non-zero; both exit codes and wall
+        # seconds are printed and written to the job summary.
+        #
+        # Cancel / timeout: each half runs in its own process group (set -m), so
+        # the runner's SIGINT/SIGTERM to this shell does not reach the halves by
+        # itself; the trap below sends SIGTERM to the group of every half bash
+        # still tracks as a running job (never a reaped PID), waits up to ~5 s
+        # for those groups to empty so meson can write its logs, then exits 1
+        # (meson test stops its own per-test sessions on SIGTERM). An EXIT trap
+        # does the same SIGTERM (no wait) if this shell exits non-zero any other
+        # way while a half runs. When a half ends, its group is also sent SIGTERM,
+        # so children that outlive a killed half's shell do not keep running. The
+        # runner's final SIGKILL cannot be trapped — if it lands first, its
+        # end-of-job orphan sweep is the backstop.
+        #
+        # Isolation of the two halves inside one build dir (each is load-bearing):
+        #   1. meson-logs/testlog.* — two concurrent `meson test` runs would
+        #      overwrite each other's testlog.{txt,json,junit.xml}; each
+        #      invocation passes its own --logbase (testlog-nonpg-cheap,
+        #      testlog-nonpg-server, testlog-pg). flake-retry.py reads --logbase
+        #      back from its passthrough args and keys its junit classification,
+        #      its retry report (<logbase>-flake-retry.json) and its preserved
+        #      enumeration junit + stale-file sweep (<logbase>-flake-retry-enum-*)
+        #      on it; the duration summary and the 'Finish persistent CI telemetry'
+        #      import take the same names (--logbase). Giving the two non-pg
+        #      invocations distinct bases also ends the old loss where only the
+        #      LAST invocation's junit/flake report reached the telemetry DB.
+        #      All three bases' files (and the legacy default testlog.*) from an
+        #      earlier run in this persistent build dir are removed first thing in
+        #      the step, so a half (or an invocation) that never ran cannot
+        #      upload or import stale ones.
+        #   2. ninja — `meson test` runs `ninja` (regen check + meson-test-prereq)
+        #      before testing; two of those at once in one build dir race on
+        #      .ninja_log/.ninja_deps. The step builds meson-test-prereq ONCE,
+        #      serially, then every invocation passes --no-rebuild.
+        #   3. Job summary — each half writes its own summary file in meson-logs/
+        #      (GITHUB_STEP_SUMMARY redirected per half); both are appended to the
+        #      real job summary as each half ends, so the tables never interleave.
+        #   4. Step log — each half's output goes to meson-logs/ci-half-{nonpg,pg}.log
+        #      and is printed in full (one ::group:: per half) when that half
+        #      ends; a heartbeat prints each running half's latest line every 2
+        #      min meanwhile. The runner's per-line timestamps therefore show
+        #      print time, not when a test line was written. On a job
+        #      timeout/cancel those logs are NOT printed, but they ride the
+        #      'Upload meson-logs on test failure or cancel' artifact.
+        #
+        # ═══ NON-PG half: history (carried over from 'Test (non-pg suites)') ═══
         # Split into 2 invocations, cheap-first (fail-fast — bash -e aborts
         # the remaining lines on the first non-zero exit): the cheap suites
         # (agent/docs/proto/echo/gateway/platform) run first, then the 6
@@ -1238,9 +1477,11 @@ jobs:
         # still short, so the within-job cap is the single-axis fix shipped
         # first, per this file's own "ship and measure one axis at a time"
         # practice - watch ci-suite-stats for this leg before adding the
-        # cross-job gate too. The pg-tagged invocations (full shards or
-        # smoke, #3443 Phase 2) still separately go through with-test-slot.sh
-        # below; this step does not.
+        # cross-job gate too. Only the pg half's full branch (--suite
+        # server-pg) goes through with-test-slot.sh; the non-pg half does not,
+        # and neither does the smoke branch (see its own note below). Since the
+        # halves became concurrent, the non-pg half also runs while the pg half
+        # is still WAITING for a slot, so a slot wait no longer delays it.
         # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): previously only
         # enabled on the nightly windows-asan leg, so a hang in this leg's agent
         # suite - the exact class #2345/#4018 recurred as - had no per-test
@@ -1251,31 +1492,13 @@ jobs:
         # default test workdir is the build directory itself. flake-retry.py's
         # subprocess calls inherit the full parent environment (verified against
         # its source), so this reaches every invocation including isolated retries.
-        run: |
-          export YUZU_TEST_PROGRESS=1
-          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/progress.log"
-          mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
-          rm -f "$YUZU_TEST_PROGRESS_FILE"
-          # docs suite is OS-independent and runs on the Linux leg only; OS-contract
-          # entries carry suite platform (tests/meson.build) and run on every leg.
-          # Duration summary per invocation, not end-of-job: meson overwrites
-          # meson-logs/testlog.json on every run, so it is removed first (a run
-          # that selects no tests then warns and skips instead of re-reporting a
-          # stale log). On a red run bash -e stops before the summary; use the
-          # uploaded meson-logs artifact locally (#4884).
-          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite echo --suite gateway --suite platform
-          python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (cheap suites)"
-          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
-          python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux non-pg (server shards)"
-
-      - name: Test (pg shards, full)
-        if: matrix.pg_mode == 'full'
-        # #3443 Phase 2: this step now runs ONLY on the leg(s) whose pg_mode
+        #
+        # ═══ PG half, pg_mode=full: history (carried over from 'Test (pg shards, full)') ═══
+        # #3443 Phase 2: this branch runs ONLY on the leg(s) whose pg_mode
         # resolved to 'full' (today: gcc-15/debug, every PR and its matching
-        # push leg) — the other 3 push legs run 'Test (pg smoke)' below
-        # instead. Everything from here down is the pre-Phase-2 concurrency-
+        # push leg) — every other leg takes the smoke branch (formerly the
+        # separate 'Test (pg smoke)' step, note below) instead. Everything
+        # from here down is the pre-Phase-2 concurrency-
         # tuning history for THIS invocation (with-test-slot.sh, --num-
         # processes, shard timeouts) — unchanged by Phase 2, kept in full.
         #
@@ -1311,8 +1534,9 @@ jobs:
         # F=262.81s C=359.42s — E and G both already well past HALF the then-
         # 600s ceiling on their own, with no contention at all. --num-processes
         # 2 was held at 2 here, not a higher number: this mirrored Windows' own
-        # starting `--num-processes 2` on its "Test (pg shards, full)" step
-        # (#3443) rather than deriving a Linux-specific value — the two
+        # starting `--num-processes 2` on its then "Test (pg shards, full)" step
+        # (#3443; removed by ADR-0035 ladder step 1) rather than deriving a
+        # Linux-specific value — the two
         # platforms have since DIVERGED: PR #3677's staged Windows
         # measurement protocol (docs/ci-architecture.md, current value
         # there, not restated here to avoid this comment going stale every
@@ -1327,8 +1551,9 @@ jobs:
         # simultaneously, saturating all 4 Big Tam runners by itself, and a
         # concurrently-queued PR's Linux job was observed waiting 35 minutes for
         # a free runner while shard E timed out at exactly 600.01s under that
-        # same load. Mirrors Windows' own already-proven pattern (#3443, its
-        # "Test (non-pg suites)" / "Test (pg shards, full)" steps): caps
+        # same load. Mirrors Windows' then already-proven pattern (#3443, its
+        # then "Test (non-pg suites)" / "Test (pg shards, full)" steps; the pg
+        # step was removed by ADR-0035 ladder step 1): caps
         # concurrent heavy test PHASES to 2 per box (crash-safe
         # flock; the build phase stays 4-wide, unaffected). YUZU_TEST_SLOT_DIR
         # is set explicitly because Big Tam's RUNNER_TOOL_CACHE is PER-AGENT
@@ -1354,9 +1579,10 @@ jobs:
         # whole registered test set as of the 2026-08-25 E->E+I / G->G+J split
         # below — re-verified as an exact partition (meson test --list,
         # diffed against the unfiltered full list) at that split, not assumed
-        # carried over from the prior 32. Phase 2 moved the first two
-        # invocations into their own "Test (non-pg suites)" step above; only
-        # the third (this one, now with-test-slot.sh-gated) remains here.
+        # carried over from the prior 32. Phase 2 then moved the first two
+        # invocations into a separate "Test (non-pg suites)" step, leaving the
+        # third (with-test-slot.sh-gated) in "Test (pg shards, full)"; since the
+        # concurrency change those are the non-pg and pg halves of this one step.
         #
         # Root cause, corrected after Gate 3 governance re-derived it from the
         # actual failing run's timestamps rather than the first-draft guess this
@@ -1424,7 +1650,11 @@ jobs:
         # pairing variance, margin against the 90-min job ceiling under 2 minutes
         # worst-case).
         #
-        # Telemetry note: each invocation overwrites meson's single
+        # Telemetry note — SUPERSEDED by the concurrency change: every
+        # invocation now has its own --logbase, so each one's junit AND its
+        # flake-retry report survive and all three are imported by 'Finish
+        # persistent CI telemetry' (--logbase, once per base). Kept for the record
+        # (Linux, before this change) — each invocation overwrote meson's single
         # testlog.junit.xml, so only the LAST one's per-suite ci_test_suites
         # rows survive the "Finish persistent CI telemetry" step's unmodified
         # default import — the pg-gated call runs last on purpose, since that's
@@ -1490,7 +1720,7 @@ jobs:
         # NOT starvation-proof: this script has no FIFO or PR-aware admission
         # — a freed slot goes to whichever waiter's 5s poll tick (see
         # scripts/ci/with-test-slot.sh) happens to fire next, not to
-        # whichever waiter arrived first. If 3 dev-push legs hold all 3
+        # whichever waiter arrived first. If 3 push/dispatch legs hold all 3
         # slots, a 4th job (a PR's or otherwise) still waits the full 30
         # minutes, same as before. Raising the count reduces how OFTEN that
         # happens, it doesn't eliminate it. Also unenforced: nightly.yml's
@@ -1526,16 +1756,224 @@ jobs:
         # not assumed done here. Response to either trigger is
         # rebalancing/splitting the affected shard(s) or reverting to
         # slots=2, never another timeout increase. Tracked: #3443.
+        #
+        # ═══ PG half, pg_mode=smoke (carried over from 'Test (pg smoke)') ═══
+        # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
+        # this small tagged subset INSTEAD of the 14-shard server-pg suite
+        # above — see tests/meson.build's 'server pg smoke' entry for the full
+        # rationale (tag membership, why --allow-running-no-tests is REQUIRED
+        # here unlike Correction 1's original "no flag" wording, why it's a
+        # separate suite from server-pg, why by-name invocation). Deliberately
+        # UNGATED by with-test-slot.sh: ~11 cases / ~2.8s measured locally
+        # (280 assertions, all passed) is far cheaper than the up-to-30-minute
+        # slot wait the gate exists to bound — gating it would make the wait
+        # dominate the work. The DSN/pg_mode correctness this depends on was
+        # already asserted above, before any PG invocation ran.
         env:
+          BUILDDIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          PG_MODE: ${{ matrix.pg_mode }}
           YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+          # Kill switch (repository variable): exactly "1" runs the halves back to back.
+          YUZU_CI_SEQUENTIAL_HALVES: ${{ vars.YUZU_CI_SEQUENTIAL_HALVES }}
         run: |
-          rm -f build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/testlog.json
-          bash scripts/ci/with-test-slot.sh 3 -- \
-            python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 --suite server-pg
-          # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
-          python3 scripts/ci/test-durations-summary.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --label "Linux pg shards"
+          LOGS="$BUILDDIR/meson-logs"
+          mkdir -p "$LOGS"
+          # Isolation 1: no file of an earlier run in this persistent build dir may
+          # be read back as this run's (a half or invocation that never ran, or a
+          # step that fails before either half starts). First, before anything
+          # here can fail. The default-base testlog.* (written by this leg before
+          # the per-invocation --logbase names existed) goes too, so the uploaded
+          # meson-logs artifact never carries a months-old run's log.
+          for base in testlog-nonpg-cheap testlog-nonpg-server testlog-pg testlog; do
+            rm -f "$LOGS/$base.txt" "$LOGS/$base.json" "$LOGS/$base.junit.xml" "$LOGS/$base"-flake-retry*
+          done
+          case "$PG_MODE" in
+            full|smoke) ;;
+            *) echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke'"; exit 1 ;;
+          esac
+          # A measurement-only knob (docs/testing/unit-test-conventions.md); if the
+          # runner's environment leaks it in, every [pg] template clone uses it.
+          if [[ -n "${YUZU_TEST_PG_CLONE_STRATEGY:-}" ]]; then
+            echo "::warning::YUZU_TEST_PG_CLONE_STRATEGY='${YUZU_TEST_PG_CLONE_STRATEGY//[^A-Za-z0-9_]/?}' is set in this step's environment; [pg] template clones use it (a measurement knob, not a CI setting)"
+          fi
+          # Isolation 2: build every test prerequisite once, serially, so the
+          # concurrent invocations below can all run with --no-rebuild.
+          ninja -C "$BUILDDIR" ${YUZU_BUILD_JOBS:+-j "$YUZU_BUILD_JOBS"} meson-test-prereq
+          REAL_SUMMARY="${GITHUB_STEP_SUMMARY:-}"
+
+          nonpg_half() {
+            set -e
+            export GITHUB_STEP_SUMMARY="$LOGS/ci-half-nonpg.summary.md"
+            export YUZU_TEST_PROGRESS=1
+            export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/$LOGS/progress.log"
+            rm -f "$YUZU_TEST_PROGRESS_FILE"
+            # docs suite is OS-independent and runs on the Linux leg only; OS-contract
+            # entries carry suite platform (tests/meson.build) and run on every leg.
+            # Duration summary per invocation, not end-of-job (its <logbase>.json was
+            # removed above, so a run that selects no tests warns and skips instead of
+            # re-reporting a stale log). On a red invocation bash -e stops before its
+            # summary; use the uploaded meson-logs artifact locally (#4884).
+            python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-nonpg-cheap --print-errorlogs --num-processes 4 --suite agent --suite docs --suite proto --suite echo --suite gateway --suite platform
+            python3 scripts/ci/test-durations-summary.py --builddir "$BUILDDIR" --label "Linux non-pg (cheap suites)" --logbase testlog-nonpg-cheap
+            python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-nonpg-server --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "guardian cache allocation-failure sweep" "server pg shard partition invariant" "dex link no presentation symbols"
+            python3 scripts/ci/test-durations-summary.py --builddir "$BUILDDIR" --label "Linux non-pg (server shards)" --logbase testlog-nonpg-server
+          }
+
+          pg_half() {
+            set -e
+            export GITHUB_STEP_SUMMARY="$LOGS/ci-half-pg.summary.md"
+            if [[ "$PG_MODE" == "full" ]]; then
+              bash scripts/ci/with-test-slot.sh 3 -- \
+                python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-pg --print-errorlogs --num-processes 4 --suite server-pg
+              # Outside the slot: pure parsing plus a --list-tests spawn per Catch2 entry.
+              python3 scripts/ci/test-durations-summary.py --builddir "$BUILDDIR" --label "Linux pg shards" --logbase testlog-pg
+            else
+              python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-pg --print-errorlogs "server pg smoke"
+            fi
+          }
+
+          declare -A pid=([nonpg]="" [pg]="") rc=() secs=() t0=()
+          label() { if [[ "$1" == pg ]]; then echo "pg half (pg_mode=$PG_MODE)"; else echo "non-pg half"; fi; }
+          for h in nonpg pg; do rm -f "$LOGS/ci-half-$h.log" "$LOGS/ci-half-$h.summary.md"; done
+          tick=""
+          # Cancel / timeout (see the step comment): the halves are in their own
+          # process groups, so forward the signal to them, then fail.
+          # live_groups: the groups of the halves (and the poll sleep) that bash
+          # still tracks as RUNNING jobs (`jobs -rp`). A reaped PID is never
+          # signalled: it may already belong to an unrelated process. `jobs` is
+          # read here, never through `$(live_groups)` (a function run inside a
+          # command substitution sees an empty job table).
+          live=()
+          live_groups() {
+            local running p
+            running=" $(jobs -rp | tr '\n' ' ') "
+            live=()
+            for p in "${pid[nonpg]}" "${pid[pg]}" "$tick"; do
+              if [[ -n "$p" && "$running" == *" $p "* ]]; then live+=("$p"); fi
+            done
+          }
+          on_signal() {
+            trap - INT TERM
+            echo "::error::test step interrupted; sending SIGTERM to the running halves' process groups"
+            live_groups
+            local p alive
+            for p in "${live[@]}"; do kill -TERM -- "-$p" 2>/dev/null || true; done
+            # Bounded wait (~5 s, inside the runner's 7.5 s SIGINT-to-SIGTERM
+            # grace) so meson can stop its tests and write its logs before the
+            # upload and telemetry steps read them. Never longer: exit 1 regardless.
+            for _ in $(seq 1 25); do
+              alive=""
+              for p in "${live[@]}"; do
+                if kill -0 -- "-$p" 2>/dev/null; then alive=1; fi
+              done
+              if [[ -z "$alive" ]]; then break; fi
+              sleep 0.2
+            done
+            exit 1
+          }
+          # Any other abnormal exit of this shell (a failing command under -e)
+          # must not leave a half running either.
+          on_exit() {
+            local r=$? p
+            if [[ "$r" -ne 0 ]]; then
+              live_groups
+              for p in "${live[@]}"; do kill -TERM -- "-$p" 2>/dev/null || true; done
+            fi
+          }
+          trap on_signal INT TERM
+          trap on_exit EXIT
+          set -m   # every background job below gets its own process group (pgid = its pid)
+          launch() {
+            t0[$1]=$SECONDS
+            "$1_half" >"$LOGS/ci-half-$1.log" 2>&1 &
+            pid[$1]=$!
+            echo "started $(label "$1") (pid ${pid[$1]})"
+          }
+          finish() {  # reap a half that has ended, record it, print its whole log now
+            local h=$1 r=0
+            wait "${pid[$h]}" || r=$?
+            # A half's shell can end (killed, say) while its children still run in
+            # its process group; stop them now. Linux does not hand out a PID that
+            # is still some process's group id, so while leftovers exist this
+            # reaches only them; with none it is ESRCH (ignored), barring the PID
+            # being reissued to a new group leader in the instant since the reap.
+            kill -TERM -- "-${pid[$h]}" 2>/dev/null || true
+            pid[$h]=""
+            rc[$h]=$r
+            secs[$h]=$(( SECONDS - t0[$h] ))
+            if [[ "$r" -ne 0 ]]; then
+              echo "::error::$(label "$h") failed (exit $r, ${secs[$h]}s); its full output is the next group"
+              echo "::group::$(label "$h") FAILED (exit $r, ${secs[$h]}s) — full output"
+            else
+              echo "::group::$(label "$h") passed (${secs[$h]}s) — full output"
+            fi
+            cat "$LOGS/ci-half-$h.log" || true
+            echo "::endgroup::"
+            if [[ -n "$REAL_SUMMARY" && -f "$LOGS/ci-half-$h.summary.md" ]]; then
+              cat "$LOGS/ci-half-$h.summary.md" >> "$REAL_SUMMARY" || true
+            fi
+          }
+
+          sequential=0
+          if [[ "${YUZU_CI_SEQUENTIAL_HALVES:-}" == 1 ]]; then
+            sequential=1
+            echo "::notice::YUZU_CI_SEQUENTIAL_HALVES=1: running the non-pg half, then the pg half (kill switch)"
+          elif [[ -n "${YUZU_CI_SEQUENTIAL_HALVES:-}" ]]; then
+            echo "::warning::YUZU_CI_SEQUENTIAL_HALVES='${YUZU_CI_SEQUENTIAL_HALVES//[^A-Za-z0-9_]/?}' is not '1'; only the exact value 1 enables sequential mode, so the halves run concurrently"
+          fi
+          launch nonpg
+          if [[ "$sequential" -eq 0 ]]; then launch pg; fi
+          next_beat=$(( SECONDS + 120 ))
+          while [[ -n "${pid[nonpg]}${pid[pg]}" ]]; do
+            sleep 2 &
+            tick=$!
+            wait "$tick" || true
+            tick=""
+            for h in nonpg pg; do
+              if [[ -n "${pid[$h]}" ]] && ! kill -0 "${pid[$h]}" 2>/dev/null; then
+                finish "$h"
+                if [[ "$h" == nonpg && "$sequential" -eq 1 ]]; then
+                  if [[ "${rc[nonpg]}" -eq 0 ]]; then
+                    launch pg
+                  else
+                    echo "pg half skipped: the non-pg half failed (sequential mode)"
+                  fi
+                fi
+              fi
+            done
+            if (( SECONDS >= next_beat )); then
+              next_beat=$(( SECONDS + 120 ))
+              for h in nonpg pg; do
+                if [[ -n "${pid[$h]}" ]]; then
+                  echo "[heartbeat $(date -u +%H:%M:%S)] $h: $(tail -n 1 "$LOGS/ci-half-$h.log" 2>/dev/null | cut -c1-200)"
+                fi
+              done
+            fi
+          done
+          set +m
+          trap - INT TERM
+
+          show() { if [[ -n "${rc[$1]:-}" ]]; then echo "exit ${rc[$1]} in ${secs[$1]}s"; else echo "skipped"; fi; }
+          echo "non-pg half: $(show nonpg); pg half (pg_mode=$PG_MODE): $(show pg)"
+          if [[ -n "$REAL_SUMMARY" ]]; then
+            {
+              echo ""
+              echo "| Linux test half | result | wall s |"
+              echo "|---|---|---|"
+              for h in nonpg pg; do
+                if [[ -n "${rc[$h]:-}" ]]; then
+                  echo "| $(label "$h") | exit ${rc[$h]} | ${secs[$h]} |"
+                else
+                  echo "| $(label "$h") | skipped | - |"
+                fi
+              done
+            } >> "$REAL_SUMMARY" || true
+          fi
+          if [[ "${rc[nonpg]:-1}" -ne 0 || "${rc[pg]:-1}" -ne 0 ]]; then
+            exit 1
+          fi
 
       # Sizes the tmpfs PGDATA cap (#4884): host RAM and the
       # persistent cluster's on-disk size after a full pg run, printed to the
@@ -1550,20 +1988,6 @@ jobs:
             timeout 60 docker exec "$c" du -sm /var/lib/postgresql || true
           done
 
-      # #3443 Phase 2: the 3 non-primary Linux push legs (pg_mode=smoke) run
-      # this small tagged subset INSTEAD of the 14-shard server-pg suite
-      # above — see tests/meson.build's 'server pg smoke' entry for the full
-      # rationale (tag membership, why --allow-running-no-tests is REQUIRED
-      # here unlike Correction 1's original "no flag" wording, why it's a
-      # separate suite from server-pg, why by-name invocation). Deliberately
-      # UNGATED by with-test-slot.sh: ~11 cases / ~2.8s measured locally
-      # (280 assertions, all passed) is far cheaper than the up-to-30-minute
-      # slot wait the gate exists to bound — gating it would make the wait
-      # dominate the work. The DSN/pg_mode correctness this depends on was
-      # already asserted above, before any PG invocation ran.
-      - name: Test (pg smoke)
-        if: matrix.pg_mode == 'smoke'
-        run: python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server pg smoke"
 
       # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
       # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
@@ -1711,6 +2135,9 @@ jobs:
       # the failing test name when an Erlang eunit run reports
       # `Failed: 1. Passed: 144.` with no surviving `*failed*` marker.
       # Without this artifact we cannot identify which gateway test failed.
+      # Carries the per-invocation testlog-{nonpg-cheap,nonpg-server,pg}.* files
+      # and each concurrent half's full output (ci-half-{nonpg,pg}.log), which
+      # is the only copy of that output when the job is cancelled or times out.
       - name: Upload meson-logs on test failure or cancel
         if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1754,6 +2181,9 @@ jobs:
           fi
           exit 0
 
+      # --logbase, once per base: the Linux test step's three meson test
+      # invocations each run under their own --logbase (see 'Test (non-pg + pg
+      # halves, concurrent)'); each base's junit + flake-retry report is imported.
       - name: Finish persistent CI telemetry
         if: always()
         continue-on-error: true
@@ -1765,6 +2195,9 @@ jobs:
           --job-name "Linux ${{ matrix.compiler }} ${{ matrix.build_type }}"
           --triplet x64-linux
           --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          --logbase testlog-nonpg-cheap
+          --logbase testlog-nonpg-server
+          --logbase testlog-pg
           --conclusion "$YUZU_CI_CONCLUSION"
 
       - name: Purge trusted-fork workspace
@@ -1777,7 +2210,7 @@ jobs:
 
   # ── Windows (MSVC, self-hosted Wee Tam pool) ────────────────────────────
   windows:
-    name: "Windows MSVC ${{ matrix.build_type }}"
+    name: "Windows MSVC ${{ matrix.build_type }}${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && ' [dispatch]' || '' }}"
     needs: [preflight-gate]
     # Skip if the exact Wee Tam job pool is unhealthy/empty. Fail-closed
     # `== 'true'`; the generic Shulgi testbed label cannot satisfy this job.
@@ -1811,20 +2244,14 @@ jobs:
       matrix:
         build_type: [debug, release]
         exclude:
-          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
-        # pg_mode mirrors the Linux job's own matrix shape (#3443): an
-        # include:-derived key, never a real axis (would double this
-        # matrix and break the runner-pool arithmetic) and never in
-        # `name:` above (job names are required-check contexts,
-        # docs-required-checks). debug keeps full pg-shard coverage on
-        # every PR and push (PRs are debug-only via the exclude: above, so
-        # PR coverage is unchanged by this); release runs the pg smoke
-        # subset on a push instead (the only event that builds release on
-        # Windows).
-        include:
-          - pg_mode: smoke
-          - build_type: debug
-            pg_mode: full
+          # Release legs: push to main + daily dispatch only (see the linux
+          # matrix for the full rule; keep the three matrices in lockstep).
+          - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
+          - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
+        # No pg_mode include: (ADR-0035 ladder step 1). This leg builds the
+        # agent only (-Dbuild_server=false at Configure below) and runs no
+        # server or Postgres test, so the Linux job's pg_mode key has nothing
+        # to select here.
 
     steps:
       # PR-5 of the CI overhaul plan: normal CI keeps clean:false on the persistent
@@ -1832,8 +2259,8 @@ jobs:
       # MSYS2 bash configured by `defaults.run.shell` above (so $GITHUB_*
       # env vars and bash test syntax both work).
       #
-      # Per-variant build dirs (build-windows-debug, build-windows-release)
-      # mirror the Linux pattern at lines 265-274. Sharing one build-windows/
+      # Per-variant build dirs (build-windows-agent-debug,
+      # build-windows-agent-release) mirror the Linux pattern. Sharing one dir
       # across debug+release on the same self-hosted runner triggers the same
       # meson --reconfigure variant-leak edge case observed on Linux: when
       # the release build runs first and debug runs second, ninja's link
@@ -1842,8 +2269,17 @@ jobs:
       # mismatches plus LNK1181 truncated-input-path errors. Per-variant
       # dirs eliminate the reconfigure entirely; ccache absorbs the per-TU
       # work across matrix runs so the disk cost is the only added cost.
-      # Also wipe the legacy non-variant dir if it lingers from before
-      # this change.
+      #
+      # The "-agent-" in the dir names (ADR-0035 ladder step 1): this leg
+      # configures with -Dbuild_server=false, while branches cut before that
+      # change still configure the server. Meson keeps a stored option across
+      # `meson setup --reconfigure`, and the branch-switch wipe below does not
+      # fire on detached-HEAD PR checkouts, so a shared dir would hand
+      # build_server=false to an older branch (whose server-suite selection
+      # then matches nothing) or the reverse. Distinct names keep the two
+      # configurations apart. The legacy names are removed unconditionally
+      # below; an older branch that runs after this one rebuilds cold
+      # (ccache-warm) and passes — rebasing onto dev ends that.
       - name: Wipe build-windows/ on branch switch (pre-checkout)
         run: |
           incoming="${GITHUB_REF#refs/heads/}"
@@ -1851,27 +2287,52 @@ jobs:
             current=$(git -C "$GITHUB_WORKSPACE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
             if [[ -n "$current" && "$current" != "HEAD" && "$current" != "$incoming" ]]; then
               echo "branch switch: $current -> $incoming — wiping build-windows*/"
-              rm -rf "$GITHUB_WORKSPACE/build-windows" \
-                     "$GITHUB_WORKSPACE/build-windows-debug" \
-                     "$GITHUB_WORKSPACE/build-windows-release"
+              rm -rf "${GITHUB_WORKSPACE:?}/build-windows" \
+                     "${GITHUB_WORKSPACE:?}/build-windows-agent-debug" \
+                     "${GITHUB_WORKSPACE:?}/build-windows-agent-release"
             fi
           fi
-          # Always remove the legacy single-variant dir so a stale state
-          # from before per-variant dirs landed cannot poison either leg.
-          if [[ -d "$GITHUB_WORKSPACE/build-windows" ]]; then
-            echo "removing legacy build-windows/ (per-variant dirs are now build-windows-{debug,release})"
-            rm -rf "$GITHUB_WORKSPACE/build-windows"
-          fi
+          # Always remove the legacy dirs so a stale state cannot poison
+          # either leg: the single-variant build-windows/ from before
+          # per-variant dirs landed, and the server-configured
+          # build-windows-{debug,release}/ from before ADR-0035 step 1.
+          # Best-effort: no step of this job reads these dirs, so a file
+          # locked by a leftover process must warn, never red the required
+          # check.
+          for legacy in build-windows build-windows-debug build-windows-release; do
+            if [[ -d "$GITHUB_WORKSPACE/$legacy" ]]; then
+              echo "removing legacy $legacy/ (per-variant dirs are now build-windows-agent-{debug,release})"
+              rm -rf "${GITHUB_WORKSPACE:?}/$legacy" \
+                || echo "::warning::could not fully remove legacy $legacy/ (in use, or no permission); this job does not use it. If an older branch's run on this runner then fails with 'already configured', see docs/ci-troubleshooting.md entry 8."
+            fi
+          done
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ needs.preflight-gate.outputs.checkout_repository }}
           ref: ${{ needs.preflight-gate.outputs.checkout_ref }}
           submodules: recursive
-          # clean:false — persist build-windows-{debug,release}/ +
+          # clean:false — persist build-windows-agent-{debug,release}/ +
           # vcpkg_installed/ between runs. Manual recovery: scripts/ci/runner-reset.sh.
           clean: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' }}
           persist-credentials: false
+
+      # Direct dispatch only: a dispatched run's legs check out the BRANCH
+      # (refs/heads/dev), not github.sha — pinning a SHA would detach HEAD and
+      # disarm the branch-switch wipe sentinel (trusted_inputs comment). Legs
+      # queue for a while, so dev can move first. Record the commit actually
+      # built, and warn when it is not the dispatched one, so an alert or a
+      # bisect starts from the right commit (governance UP-1, 2026-11-10).
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Built commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: this leg built $built, not the dispatched $DISPATCHED_SHA"
+          fi
 
       - name: Isolate trusted-fork build caches
         if: needs.preflight-gate.outputs.trusted_execution == 'true'
@@ -2009,13 +2470,19 @@ jobs:
           # Per-variant build dir under PR-5 clean:false — see the
           # pre-checkout wipe step above for the rationale. Branch on
           # existence to satisfy meson's "use --reconfigure" requirement.
-          BUILDDIR=build-windows-${{ matrix.build_type }}
+          # -Dbuild_server=false (ADR-0035 ladder step 1): the server is
+          # Linux-only, so this leg builds and tests the agent only. Passed
+          # explicitly on every configure, including a --reconfigure, so a
+          # stored value can never win. vcpkg above still installs the full
+          # manifest (server ports included) until ladder step 3.
+          BUILDDIR=build-windows-agent-${{ matrix.build_type }}
           reconfig=""
           [[ -d "$BUILDDIR/meson-info" ]] && reconfig="--reconfigure"
           meson setup $reconfig "$BUILDDIR" \
             --buildtype=${{ matrix.build_type }} \
             -Dcpp_std=vc++latest \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
+            -Dbuild_server=false \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
           python scripts/ci/assert-gateway-tests.py "$BUILDDIR"
@@ -2029,88 +2496,8 @@ jobs:
         # job's identical Build step for the full rationale, including why
         # a standalone step tripped CodeQL (CWE-349) here.
         run: |
-          meson compile -C build-windows-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
-          bash scripts/ci/check-plugin-capture-os-guard.sh "build-windows-${{ matrix.build_type }}"
-
-      # Link-provenance assertion (#1331 review HIGH-2): on Windows libpq is
-      # DELIBERATELY dynamic (triplet static override = grpc stack only; the
-      # release zip's vcpkg-DLL sweep ships libpq.dll like sqlite3/openssl —
-      # ADR-0008 "Correction (2026-06-10)"). Assert the import is present so a
-      # silent posture flip in either direction is caught.
-      - name: Assert canary libpq link provenance (DLL import on Windows)
-        run: |
-          bin="build-windows-${{ matrix.build_type }}/server/core/yuzu_pg_canary.exe"
-          test -f "$bin" || { echo "::error::canary binary missing at $bin"; exit 1; }
-          deps="$(dumpbin -dependents "$bin")"
-          if ! echo "$deps" | grep -qi 'libpq.dll'; then
-            echo "::error::canary does not import libpq.dll — Windows linkage posture changed (expected dynamic per ADR-0008 Correction; if flipping to static, update this assert + the triplet override together)"
-            echo "$deps"
-            exit 1
-          fi
-          echo "OK: libpq.dll import present — dynamic linkage as recorded in ADR-0008"
-
-      # Postgres for server tests (ADR-0006 decision 8, #1318).
-      # Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4: each runner
-      # provides a native PostgreSQL 18 service — agent 0's
-      # `postgresql-x64-18-yuzu-ci` on :5433, agents 1-3 their own
-      # `postgresql-x64-18-yuzu-ci-<n>` on :5433+<n> (#2094) — and a
-      # machine-level YUZU_TEST_POSTGRES_DSN (the agent-0 DSN) that the
-      # script's path 1 derives the per-agent port from before exporting it;
-      # required since #1320 PR 1 (SOFT_EXIT=1) — nothing answering fails the
-      # job at this step. See docs/ci-architecture.md "Postgres for server
-      # tests" for the full path-1 mechanism and deploy/windows/ for
-      # provisioning.
-      #
-      # `source`, NOT `bash scripts/...`: inside the step's MSYS2 bash,
-      # PATH puts C:\Windows\system32 before C:\msys64\usr\bin, so a bare
-      # `bash` resolves to the WSL stub, which refuses to run as the
-      # LOCAL SYSTEM service account (Bash/WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED).
-      # Same idiom as `source setup_msvc_env.sh` / `ensure-erlang.sh`.
-      - name: Ensure Postgres (server tests)
-        run: source scripts/ci/ensure-postgres.sh
-
-      # Mirrors the Linux job's own step of the same name (#3443) — see that
-      # step's comment for the full rationale (loud-fail backstop for a
-      # provisioning/matrix-include defect, checked BEFORE any test
-      # invocation runs, not just the PG ones). MATRIX_BUILD_TYPE only:
-      # Windows has no `compiler` axis, so the "primary leg" the Linux
-      # version pins to gcc-15/debug collapses to "debug" alone here.
-      - name: Resolve pg_mode + assert Postgres DSN
-        env:
-          PG_MODE: ${{ matrix.pg_mode }}
-          MATRIX_BUILD_TYPE: ${{ matrix.build_type }}
-        run: |
-          case "$PG_MODE" in
-            full|smoke) ;;
-            *)
-              echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke' — matrix include: may be misconfigured"
-              exit 1
-              ;;
-          esac
-          if [[ -z "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
-            echo "::error::YUZU_TEST_POSTGRES_DSN is unset after Ensure Postgres — refusing to proceed to any PG-tagged test invocation (pg_mode=$PG_MODE) rather than let it silently skip"
-            exit 1
-          fi
-          if [[ "$MATRIX_BUILD_TYPE" == "debug" && "$PG_MODE" != "full" ]]; then
-            echo "::error::Windows debug resolved to pg_mode=$PG_MODE, expected 'full' — the matrix include: mapping is broken; this leg must keep full PG-shard coverage on every PR and push"
-            exit 1
-          fi
-          # Symmetric guard (mirrors the Linux step's own): a push leg that
-          # is NOT debug (i.e. release, the only other Windows leg) must
-          # resolve to smoke, or a future include: edit could silently send
-          # every leg back to full and reintroduce full-PG-shard contention
-          # on every push.
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$MATRIX_BUILD_TYPE" != "debug" && "$PG_MODE" != "smoke" ]]; then
-            echo "::error::Windows $MATRIX_BUILD_TYPE on a push resolved to pg_mode=$PG_MODE, expected 'smoke' — the matrix include: mapping is broken; this reintroduces full-PG-shard contention on every Windows push"
-            exit 1
-          fi
-          echo "pg_mode=$PG_MODE"
-          # Bound every libpq connect in the later steps: same export and
-          # rationale as the Linux job's Resolve step above, and the "Connect
-          # cap on the Linux and Windows test legs" paragraph in
-          # docs/ci-architecture.md.
-          echo "PGCONNECT_TIMEOUT=30" >> "$GITHUB_ENV"
-          echo "PGCONNECT_TIMEOUT=30 appended to GITHUB_ENV for the later steps"
+          meson compile -C build-windows-agent-${{ matrix.build_type }} -j "$YUZU_BUILD_JOBS"
+          bash scripts/ci/check-plugin-capture-os-guard.sh "build-windows-agent-${{ matrix.build_type }}"
 
       # #6488: proves both decisions of the leftover check; see scripts/ci/check-registry-test-leftovers.ps1
       - name: Self-test the registry leftover check
@@ -2178,30 +2565,29 @@ jobs:
         shell: pwsh
         run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase pre-test
 
-      # Windows CI test-phase restructuring (#3443, 2026-08-28): mirrors the
-      # Linux job's non-pg/pg-shards/pg-smoke split — see docs/ci-architecture.md
-      # "PG coverage by platform" for the full rationale and the measured
-      # numbers as the staged protocol produces them. Three differences from
-      # Linux, each with its own reason:
-      #   1. ONE gated non-pg invocation, not two uncapped ones — Wee Tam's
+      # Windows CI test phase. Since ADR-0035 ladder step 1 this leg is
+      # agent-only (-Dbuild_server=false), so ONE invocation runs every suite
+      # the build registers here; the #3443 non-pg/pg-shards/pg-smoke split
+      # it used to carry is gone with the server suites (history:
+      # docs/ci-architecture.md "Windows test-phase concurrency gate" and
+      # "PG coverage by platform"). The step keeps its "non-pg" name
+      # (tests/test_etw_cleanup_wiring.py and the docs refer to it). Two
+      # differences from the Linux non-pg step, each with its own reason:
+      #   1. The invocation is gated by with-test-slot.sh — Wee Tam's
       #      measured contention (docs/ci-architecture.md "Windows test-phase
-      #      concurrency gate") is DRAM/disk/Defender-minifilter, not
-      #      Postgres, so Big Tam's "cheap suites are never the contention
-      #      source, leave them uncapped" reasoning does not transfer; every
-      #      non-pg suite here shares the same box-wide gate.
-      #   2. --suite selection has no by-name fallback (Windows registers no
-      #      per-shard by-name list the way Linux's second invocation does),
-      #      and a bad --suite silently matches zero entries — so
-      #      assert-suite-cover.py runs FIRST, failing loud on a dropped or
-      #      misspelled suite before the real invocation could silently skip
-      #      a whole category.
-      #   3. YUZU_TEST_SLOT_TIMEOUT_MIN: "30" on both gated steps below —
-      #      Wee Tam's with-test-slot.sh default is 115 min; two acquisitions
-      #      per job (non-pg, then pg-shards-full) at that default could
-      #      together exceed this job's own 120-min budget, turning a slot
-      #      wait into an ambiguous job-level kill instead of an attributable
-      #      with-test-slot.sh failure (same reasoning as Big Tam's explicit
-      #      30-min override on its own pg-shards step).
+      #      concurrency gate") is DRAM/disk/Defender-minifilter, so Big
+      #      Tam's "cheap suites are never the contention source, leave them
+      #      uncapped" reasoning does not transfer.
+      #   2. --suite selection has no by-name fallback, and a bad --suite
+      #      silently matches zero entries — so assert-suite-cover.py runs
+      #      FIRST, failing loud on a dropped or misspelled suite before the
+      #      real invocation could silently skip a whole category.
+      # YUZU_TEST_SLOT_TIMEOUT_MIN: "30" — Wee Tam's with-test-slot.sh default
+      # is 115 min, close to this job's own 120-min budget; the explicit cap
+      # turns a long slot wait into an attributable with-test-slot.sh failure
+      # instead of an ambiguous job-level kill (same reasoning as Big Tam's
+      # explicit 30-min override on its merged "Test (non-pg + pg halves,
+      # concurrent)" step).
       - name: Test (non-pg suites)
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
@@ -2225,13 +2611,13 @@ jobs:
           # previously scoped to alone - this step is the one that includes --suite
           # agent. Absolute path, same reason as windows-asan's own comment on this.
           export YUZU_TEST_PROGRESS=1
-          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-windows-${{ matrix.build_type }}/meson-logs/progress.log"
+          export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-windows-agent-${{ matrix.build_type }}/meson-logs/progress.log"
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
           # #4666/#5025: clear any pid-suffixed MI-1b topology report left over from a
           # prior run in this reused (clean:false) build dir, so the "Surface MI-1b..."
           # step below can't present a stale previous run's verdict as this run's own.
-          rm -f "build-windows-${{ matrix.build_type }}/log_handoff_multi_image_topology."*.txt
+          rm -f "build-windows-agent-${{ matrix.build_type }}/log_handoff_multi_image_topology."*.txt
           # Single-sourced: the guard and the real invocation must select the
           # SAME suites, or the guard certifies a list the real run doesn't
           # actually use (sre Gate 6 finding, governance 2026-08-28) — a
@@ -2240,18 +2626,20 @@ jobs:
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and run on every leg, so
           # the selection swaps docs for platform and the guard excludes docs.
-          suites=(--suite agent --suite platform --suite proto --suite echo --suite gateway --suite server-nonpg --suite server-checks)
-          python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
+          # No server suite: the build registers none (-Dbuild_server=false),
+          # and assert-suite-cover.py fails on a --suite that matches nothing.
+          suites=(--suite agent --suite platform --suite proto --suite echo --suite gateway)
+          python scripts/ci/assert-suite-cover.py --builddir build-windows-agent-${{ matrix.build_type }} \
             "${suites[@]}" \
-            --exclude-suite server-pg --exclude-suite server-pg-smoke --exclude-suite docs
-          rm -f build-windows-${{ matrix.build_type }}/meson-logs/testlog.json
+            --exclude-suite docs
+          rm -f build-windows-agent-${{ matrix.build_type }}/meson-logs/testlog.json
           bash scripts/ci/with-test-slot.sh 2 -- \
-            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 \
+            python scripts/ci/flake-retry.py --builddir build-windows-agent-${{ matrix.build_type }} -- --print-errorlogs --num-processes 4 \
               "${suites[@]}"
           # Duration summary per invocation: testlog.json is removed before each run
           # (meson overwrites it), so a run that selects no tests leaves no stale log.
           # On a red run bash -e stops before it, use the meson-logs artifact (#4884).
-          python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows non-pg"
+          python scripts/ci/test-durations-summary.py --builddir build-windows-agent-${{ matrix.build_type }} --label "Windows non-pg"
 
       # #6488: the registry plugin's tests create scratch keys under HKLM\SOFTWARE (and Wow6432Node) and HKCU\Software
       # (HKU\.DEFAULT for LOCAL SYSTEM), and the Echo bam live case (#6898) two under
@@ -2277,76 +2665,6 @@ jobs:
         shell: pwsh
         run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase post-test
 
-      # if: matrix.pg_mode == 'full' — see the Resolve step above; PRs are
-      # debug-only (exclude: above), so PR coverage is unaffected. k=2 was
-      # the STARTING pool width (measured 602s, one sample); push 2 widened
-      # to k=4 and took 2 same-SHA samples per the protocol's own median
-      # rule (358s / 359s — remarkably stable run-to-run despite the
-      # non-pg step swinging 3x on the SAME commit, confirming the pg step
-      # itself isn't the noisy part): a real 40.5% improvement, no shard's
-      # own duration inflated past 1.16x its k=2 value (well under the
-      # 1.5x stop-rule), nowhere near the 700s per-shard timeout. Push 3
-      # widens to k=6 on that same basis — each width change lands in its
-      # own, individually-measured push (docs/ci-architecture.md), never
-      # bundled with a topology change, so a wall-time delta stays
-      # attributable to one axis at a time.
-      - name: Test (pg shards, full)
-        if: matrix.pg_mode == 'full'
-        env:
-          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
-        run: |
-          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
-            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
-          else
-            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
-          fi
-          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          # Same zero-match hazard the non-pg step's guard above exists for
-          # (review finding, PR #3677): --suite server-pg is inline below
-          # with no by-name fallback, so a typo'd/renamed suite label would
-          # silently match zero tests and this step would "pass" having run
-          # nothing. Excludes everything else so the guard also catches a
-          # future suite this step should select but doesn't.
-          # Single-sourced (build-ci Gate 8 finding, governance
-          # 2026-08-28): the guard and the real invocation must select the
-          # SAME suite, mirroring the non-pg step's pattern above — a
-          # future edit to one without the other would let the guard pass
-          # while flake-retry silently selected a different suite.
-          suites=(--suite server-pg)
-          python scripts/ci/assert-suite-cover.py --builddir build-windows-${{ matrix.build_type }} \
-            "${suites[@]}" \
-            --exclude-suite agent --exclude-suite docs --exclude-suite proto --exclude-suite echo \
-            --exclude-suite gateway --exclude-suite server-nonpg --exclude-suite server-checks \
-            --exclude-suite server-pg-smoke --exclude-suite platform
-          # Runs LAST (after the non-pg step above): flake-retry.py /
-          # ci-import-junit only import the LAST invocation's testlog.junit.xml
-          # into CI telemetry per job — ordering it last means the pg-shard
-          # numbers (the ones the staged measurement protocol reads) are what
-          # survives, not the non-pg step's. The non-pg step's own
-          # job-summary "Suite durations vs meson budgets" table (written on
-          # every invocation, not just the last) is where its numbers live.
-          rm -f build-windows-${{ matrix.build_type }}/meson-logs/testlog.json
-          bash scripts/ci/with-test-slot.sh 2 -- \
-            python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs --num-processes 6 \
-              "${suites[@]}"
-          python scripts/ci/test-durations-summary.py --builddir build-windows-${{ matrix.build_type }} --label "Windows pg shards"
-
-      # if: matrix.pg_mode == 'smoke' — only the release leg on a push (PRs
-      # are debug-only, so this step never runs on a PR; verified post-merge
-      # by the first dev push, not pre-merge). Deliberately UNGATED, mirroring
-      # the Linux smoke step: the smoke set costs seconds, far cheaper than
-      # the slot-wait it would otherwise pay.
-      - name: Test (pg smoke)
-        if: matrix.pg_mode == 'smoke'
-        run: |
-          if [[ "${{ matrix.build_type }}" == "debug" ]]; then
-            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/debug/bin"
-          else
-            bin_dir="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/bin"
-          fi
-          export PATH="$bin_dir:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/protobuf:$GITHUB_WORKSPACE/vcpkg_installed/x64-windows/tools/grpc:$PATH"
-          python scripts/ci/flake-retry.py --builddir build-windows-${{ matrix.build_type }} -- --print-errorlogs "server pg smoke"
-
       # meson+ninja truncate test stdout to the last 100 lines in the Actions
       # UI. testlog.txt in meson-logs/ contains the full Catch2 output for
       # every failed test — without this artifact, a multi-assertion failure
@@ -2363,7 +2681,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meson-logs-windows-${{ matrix.build_type }}-${{ github.run_attempt }}
-          path: build-windows-${{ matrix.build_type }}/meson-logs/
+          path: build-windows-agent-${{ matrix.build_type }}/meson-logs/
           if-no-files-found: warn
           retention-days: 14
 
@@ -2392,7 +2710,7 @@ jobs:
         continue-on-error: true
         run: |
           shopt -s nullglob
-          files=(build-windows-${{ matrix.build_type }}/log_handoff_multi_image_topology.*.txt)
+          files=(build-windows-agent-${{ matrix.build_type }}/log_handoff_multi_image_topology.*.txt)
           if [ ${#files[@]} -eq 0 ]; then
             echo "MI-1b: no topology report found (the test case may not have run)." >> "$GITHUB_STEP_SUMMARY"
           else
@@ -2446,7 +2764,7 @@ jobs:
           python scripts/ci/ci-telemetry.py finish
           --job-name "Windows MSVC ${{ matrix.build_type }}"
           --triplet x64-windows
-          --builddir build-windows-${{ matrix.build_type }}
+          --builddir build-windows-agent-${{ matrix.build_type }}
           --conclusion "$YUZU_CI_CONCLUSION"
 
       - name: Purge trusted-fork workspace
@@ -2459,7 +2777,7 @@ jobs:
 
   # ── macOS (Apple Clang) ────────────────────────────────────────────────
   macos:
-    name: "macOS ${{ matrix.build_type }}"
+    name: "macOS ${{ matrix.build_type }}${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha) && ' [dispatch]' || '' }}"
     needs: [preflight-gate]
     # Pinned to the BigMags macOS pool: the Apple-Silicon toolchain exists only
     # on the BigMags Mac Minis; no GitHub-hosted or Shulgi fallback can satisfy
@@ -2476,7 +2794,10 @@ jobs:
       matrix:
         build_type: [debug, release]
         exclude:
-          - build_type: ${{ github.event_name == 'pull_request' && 'release' || 'NONE' }}
+          # Release legs: push to main + daily dispatch only (see the linux
+          # matrix for the full rule; keep the three matrices in lockstep).
+          - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
+          - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2492,6 +2813,23 @@ jobs:
           # ported to macOS (cross-run incrementality is deferred). See the
           # vcpkg-section comment below and docs/ci-architecture.md.
           persist-credentials: false
+
+      # Direct dispatch only: a dispatched run's legs check out the BRANCH
+      # (refs/heads/dev), not github.sha — pinning a SHA would detach HEAD and
+      # disarm the branch-switch wipe sentinel (trusted_inputs comment). Legs
+      # queue for a while, so dev can move first. Record the commit actually
+      # built, and warn when it is not the dispatched one, so an alert or a
+      # bisect starts from the right commit (governance UP-1, 2026-11-10).
+      - name: Record built commit (dispatch)
+        if: github.event_name == 'workflow_dispatch' && !inputs.head_sha
+        env:
+          DISPATCHED_SHA: ${{ github.sha }}
+        run: |
+          built=$(git rev-parse HEAD)
+          echo "Built commit: \`$built\` (dispatched at \`$DISPATCHED_SHA\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$built" != "$DISPATCHED_SHA" ]]; then
+            echo "::warning::dev moved after the dispatch: this leg built $built, not the dispatched $DISPATCHED_SHA"
+          fi
 
       - name: Isolate trusted-fork build caches
         if: needs.preflight-gate.outputs.trusted_execution == 'true'
@@ -2700,11 +3038,16 @@ jobs:
           CC: ccache cc
           CXX: ccache c++
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-osx/lib/pkgconfig
+        # -Dbuild_server=false (ADR-0035 ladder step 1): the server is
+        # Linux-only, so this leg builds and tests the agent only. vcpkg above
+        # still installs the full manifest (server ports included) until
+        # ladder step 3.
         run: |
           meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
+            -Dbuild_server=false \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
           python3 scripts/ci/assert-gateway-tests.py build-macos
@@ -2723,42 +3066,6 @@ jobs:
         run: |
           meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
           bash scripts/ci/check-plugin-capture-os-guard.sh build-macos
-
-      # Link-provenance assertion (#1331 review HIGH-2): hosted macOS images can
-      # carry a system PostgreSQL, so prove the canary linked vcpkg's static
-      # archive rather than a system dylib resolved by cmake's FindPostgreSQL.
-      - name: Assert canary libpq link provenance (static on macOS)
-        run: |
-          bin="build-macos/server/core/yuzu_pg_canary"
-          test -x "$bin" || { echo "::error::canary binary missing at $bin"; exit 1; }
-          if otool -L "$bin" | grep -qi 'libpq'; then
-            echo "::error::canary dynamically links libpq — expected vcpkg static archive (ADR-0008)"
-            otool -L "$bin" | grep -i 'libpq'
-            exit 1
-          fi
-          echo "OK: no dynamic libpq dependency — static archive linked"
-
-      # The server Postgres suite is DELIBERATELY NOT run on macOS (ADR-0035:
-      # the Yuzu server is a Linux-only component; macOS/Windows are agent-only
-      # platforms). macos-15 GHA runners have a SINGLE brew Postgres cluster,
-      # and the auth->Postgres migration (ADR-0006) ~doubled the [pg] test
-      # population to ~660 clone-bound cases (each does CREATE DATABASE ...
-      # TEMPLATE + DROP ... FORCE). One slow cluster cannot service that within
-      # the per-suite meson budget, and sharding does NOT help — parallel shards
-      # contend on the one cluster (both shards hit their 600s timeout, #2394).
-      # So we intentionally do NOT provision Postgres / export
-      # YUZU_TEST_POSTGRES_DSN here: every [pg] server test then SKIPS
-      # (env-unset -> skip, the same contract the Catch2 PG fixtures and
-      # tests/shell/test_mfa_reset.sh use), while the non-PG server suite
-      # (~[pg]), the agent suite, and the Apple-Clang compile all still run.
-      # Linux + Windows keep FULL [pg] coverage (multi-cluster, faster I/O).
-      # Do NOT re-add ensure-postgres here without first solving the
-      # single-cluster capacity problem — see the shard comment in
-      # tests/meson.build and docs/ci-architecture.md.
-      - name: Server Postgres suite skipped on macOS (ADR-0035; no DSN exported)
-        run: |
-          echo "macOS: server [pg] tests SKIP (YUZU_TEST_POSTGRES_DSN intentionally unset)."
-          echo "The Yuzu server is Linux-only (ADR-0035); Linux + Windows CI legs run the full [pg] suite."
 
       - name: Test
         # --timeout-multiplier 2: BigMags is a shared box (2 runner agents, and
@@ -2781,6 +3088,9 @@ jobs:
           rm -f "$YUZU_TEST_PROGRESS_FILE"
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and keep running here.
+          # No server suite is registered (-Dbuild_server=false, ADR-0035), so
+          # this runs the agent, proto, echo, gateway and platform suites; the
+          # server and its Postgres suites run on Linux only.
           rm -f build-macos/meson-logs/testlog.json
           python3 scripts/ci/flake-retry.py --builddir build-macos -- --print-errorlogs --timeout-multiplier 2 --no-suite docs
           python3 scripts/ci/test-durations-summary.py --builddir build-macos --label "macOS"
@@ -2856,9 +3166,9 @@ jobs:
   #
   # Since #5320 the same holds for a docs-only PUSH to main/dev, so the commit a
   # release tags carries every required context even when it changed only
-  # CHANGELOG.md. On a push the real matrix has more legs (release builds,
-  # clang-21); only the three required names are stubbed, because only they
-  # gate anything.
+  # CHANGELOG.md. On a push the real matrix has more legs (clang-21, and
+  # release builds on main); only the three required names are stubbed,
+  # because only they gate anything.
   docs-required-checks:
     name: ${{ matrix.check }}
     needs: [preflight-gate]

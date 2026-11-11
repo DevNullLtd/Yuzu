@@ -284,6 +284,46 @@ inline const char* pg_admin_dsn_env() {
     return (v != nullptr && v[0] != '\0') ? v : nullptr;
 }
 
+/// Measurement-only A/B knob for the template clone (PostgresTestDb's
+/// `CREATE DATABASE ... TEMPLATE`): YUZU_TEST_PG_CLONE_STRATEGY selects the
+/// PostgreSQL 15+ `STRATEGY` clause. Pure parse of the raw env value:
+///   - nullptr or ""                    -> ok, empty clause (SQL byte-identical
+///                                         to the knob not existing; the server
+///                                         default, WAL_LOG on PG 15+, applies);
+///   - "wal_log" / "file_copy", any case -> ok, " STRATEGY WAL_LOG" / " STRATEGY FILE_COPY";
+///   - anything else                     -> NOT ok, with a message naming the
+///                                         variable and the accepted values.
+/// An invalid value fails the fixture (PostgresTestDb::error(), surfaced by the
+/// YUZU_REQUIRE_PG_DB* macros' REQUIRE) rather than being silently ignored, so
+/// a typo can never produce a "measurement" of the default strategy.
+/// No CI job sets it today (docs/testing/unit-test-conventions.md).
+struct PgCloneStrategy {
+    bool ok = true;
+    std::string clause; ///< appended verbatim after the TEMPLATE clause
+    std::string error;  ///< set when !ok
+};
+
+inline PgCloneStrategy parse_pg_clone_strategy(const char* raw) {
+    PgCloneStrategy out;
+    if (raw == nullptr || raw[0] == '\0')
+        return out;
+    std::string v{raw};
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+    });
+    if (v == "wal_log") {
+        out.clause = " STRATEGY WAL_LOG";
+    } else if (v == "file_copy") {
+        out.clause = " STRATEGY FILE_COPY";
+    } else {
+        out.ok = false;
+        out.error = std::string("YUZU_TEST_PG_CLONE_STRATEGY='") + raw +
+                    "' is not a clone strategy; accepted: wal_log or file_copy "
+                    "(case-insensitive), or unset for the server default";
+    }
+    return out;
+}
+
 /// ── Stale test-database sweeping ─────────────────────────────────────────
 ///
 /// An abnormal exit (SIGKILL, OOM, the CI job-timeout kill — i.e. exactly
@@ -668,8 +708,17 @@ private:
             return;
         }
         std::string create = "CREATE DATABASE \"" + db_name_ + "\"";
-        if (tpl_name != nullptr)
+        if (tpl_name != nullptr) {
             create += " TEMPLATE \"" + *tpl_name + "\"";
+            // A/B knob (measurement only): unset -> no clause, SQL unchanged.
+            const PgCloneStrategy strategy =
+                parse_pg_clone_strategy(std::getenv("YUZU_TEST_PG_CLONE_STRATEGY"));
+            if (!strategy.ok) {
+                error_ = strategy.error;
+                return;
+            }
+            create += strategy.clause;
+        }
         // Clone-from-template refuses while ANY connection to the template
         // is open (SQLSTATE 55006). The builder's PgPool has PQfinish()ed by
         // the time ensure() returns, but the backend teardown can lag a

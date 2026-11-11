@@ -38,7 +38,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 |---|---|---|
 | `--config` | *(auto)* | Path to `yuzu-server.cfg`. If omitted, uses the platform default: `/etc/yuzu/yuzu-server.cfg` on Linux (and on macOS as root), `~/Library/Application Support/Yuzu/yuzu-server.cfg` on macOS as a non-root user, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows. |
 | `--data-dir` | *(config dir)* | Directory for runtime state files (auto-approve rules) and the NVD CVE cache `nvd_cves.db`, the one remaining server SQLite store, plus the `agent-updates/` (unless `--update-dir` is set) and `upload-blobs/` file directories, and the `enablement-anchor` continuity file (keep it with backups; see [Enablement continuity anchor](#enablement-continuity-anchor)). All other server data is in PostgreSQL — enrollment tokens and pending agents are PostgreSQL-authoritative (WS-6 6.2), not `--data-dir` files; see the blockquote below. Defaults to the parent directory of `--config`. Use this in containerized deployments where the config file is on a read-only mount but state files need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: `YUZU_DATA_DIR`. |
-| `--postgres-dsn-file` | *(none)* | Read the PostgreSQL connection string from this file instead of `--postgres-dsn`, which puts it, password included, on the command line where every local user can read it. The whole file is the connection string; trailing whitespace (including the final newline) and a UTF-8 byte-order mark are ignored. Fails at startup if the file is missing, empty or larger than 64 KiB, and cannot be combined with `--postgres-dsn` / `YUZU_POSTGRES_DSN`. The file's own permissions are not checked (a Docker or Kubernetes secret is mounted world-readable inside its container): keep it where only the server's account can read it. The Windows installer stores it in the locked `%ProgramData%\Yuzu Server\postgres.dsn` and passes this flag. Env: `YUZU_POSTGRES_DSN_FILE`. |
+| `--postgres-dsn-file` | *(none)* | Read the PostgreSQL connection string from this file instead of `--postgres-dsn`, which puts it, password included, on the command line where every local user can read it. The whole file is the connection string; trailing whitespace (including the final newline) and a UTF-8 byte-order mark are ignored. Fails at startup if the file is missing, empty or larger than 64 KiB, and cannot be combined with `--postgres-dsn` / `YUZU_POSTGRES_DSN`. The file's own permissions are not checked (a Docker or Kubernetes secret is mounted world-readable inside its container): keep it where only the server's account can read it. Env: `YUZU_POSTGRES_DSN_FILE`. |
 | `--web-port` | `8080` | HTTP listen port for the dashboard and REST API. When HTTPS is on this port is the HTTP→HTTPS redirect listener, which still answers `GET`/`HEAD` on the four health-probe paths directly (see [Probing a TLS-enabled server](#probing-a-tls-enabled-server)). |
 | `--web-address` | `127.0.0.1` | Web UI bind address. |
 | `--shutdown-drain-seconds` | `0` | On `SIGTERM`, keep serving for at least this many seconds after `/readyz` turns `503 draining`, so a load balancer stops routing here before the listener closes (HA WS-8). Range 0–60; `0` keeps the listener-closes-at-once behaviour a single server has always had. Set it to at least the load balancer's health-check interval × unhealthy threshold, plus one interval — see "Load balancers and shutdown drain" below. Env: `YUZU_SHUTDOWN_DRAIN_SECONDS`. |
@@ -364,6 +364,71 @@ separately.
 
 > **Fresh deployment only for 0.15.0.** Entries below that tell you to upgrade, roll back or restore an earlier build are historical and not a supported path (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). Entries describing behaviour of the 0.15.0 build still apply.
 
+### vNEXT - role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte; a NUL byte in a database text value is refused (breaking for deployments with such a role or member)
+
+**What changed.** `unassign_rbac_role` (MCP), the engine-role unassign (REST `DELETE /api/v1/engine-principals/{id}/roles/{role}` and MCP `unassign_engine_role`) and the engine-role assign (REST `POST /api/v1/engine-principals/{id}/roles` and MCP `assign_engine_role`) refuse a role name containing a NUL byte, any other control byte (0x01-0x1F) or DEL (0x7F): REST answers `400`, MCP answers invalid params (-32602), and the audit row is `result=denied` with the fixed detail `invalid_role_name`. Every other role name is accepted, including one granted out of band. Separately, a text value containing a NUL byte is now refused rather than shortened before it reaches the database.
+
+**Who is affected.** A deployment holding a role created out of band (direct SQL) whose name contains one of those bytes. Find them with:
+
+```sql
+SELECT name FROM rbac_store.roles WHERE name ~ '[\x01-\x1f\x7f]';
+```
+
+**What to do.** Delete the role in SQL. This form works on the output of the query above, where a control byte shows as `\x01`, without copying the name:
+
+```sql
+DELETE FROM rbac_store.roles WHERE name ~ '[\x01-\x1f\x7f]' RETURNING name;
+```
+
+(With `standard_conforming_strings = on`, the default, the `\x01` in a plain literal is passed to the regular-expression engine, which reads it as a hex escape.) The delete also removes the role's permissions and every FLEET-WIDE grant of it, through the foreign keys' `ON DELETE CASCADE` on the three tables that refer to it (`principal_roles`, `role_permissions` and `revoked_seed_defaults`); a role that has grants cannot be renamed, because those foreign keys have no `ON UPDATE CASCADE`. A grant of the same role on a MANAGEMENT GROUP lives in `management_group_store.management_group_roles`, which has no key into the `rbac_store` schema, so the delete does not touch it: remove those rows with the management-group query below. Then re-create the role under a clean name if it is still needed and grant it again (a deleted role's grants are not restored). A direct SQL delete does not bump the RBAC generation, so restart every serving replica afterwards (cached permissions can keep being served until a restart or another RBAC write). This SQL is unsupported and not audited, so record it in the change ticket.
+
+**Management-group members and roles.** Removing a member or unassigning a role on a management group (REST) refuses a control byte in `agent_id`, `role_name`, `principal_id` or `principal_type` with `400`; adding a member and assigning a role (REST and the MCP tools `add_management_group_member` and `assign_management_group_role`) refuse it too. All four operations (add, assign, remove and unassign) also refuse a value that is not valid UTF-8, in every one of those fields. The MCP tools validate `group_id` the same way and audit it as `invalid_group_id` (MCP only). A missing group answers `404` on add and assign (REST); on MCP it is the `group not found` invalid-params error, and the only audit row is the generic `mcp.<tool>` row with `result=denied`, `detail=group not found`, not a `management_group.*` row. A store fault is `503` (`result=failure`, `detail=store_error`). A member or grant whose stored id already carries a control byte can no longer be removed through the API. Find them with:
+
+```sql
+SELECT group_id, agent_id FROM management_group_store.management_group_members
+ WHERE agent_id ~ '[\x01-\x1f\x7f]';
+SELECT group_id, principal_type, principal_id, role_name FROM management_group_store.management_group_roles
+ WHERE principal_type ~ '[\x01-\x1f\x7f]' OR principal_id ~ '[\x01-\x1f\x7f]'
+    OR role_name ~ '[\x01-\x1f\x7f]';
+```
+
+The second query also finds a grant whose role name carries a control byte, so it covers the management-group half of the role removal above. Remove the rows with these statements, which match by pattern and so work on the query output without copying the value:
+
+```sql
+DELETE FROM management_group_store.management_group_members
+ WHERE agent_id ~ '[\x01-\x1f\x7f]' RETURNING group_id, agent_id;
+DELETE FROM management_group_store.management_group_roles
+ WHERE principal_type ~ '[\x01-\x1f\x7f]' OR principal_id ~ '[\x01-\x1f\x7f]'
+    OR role_name ~ '[\x01-\x1f\x7f]' RETURNING *;
+```
+
+(The pattern form is the one tested on PostgreSQL with `standard_conforming_strings = on`, the default.) This SQL is unsupported and not audited, so record it in the change ticket, and restart every serving replica afterwards (a direct SQL change does not notify the other replicas).
+
+**OTA package delete.** `DELETE /api/settings/updates/{platform}/{arch}/{version}` refuses a control byte (0x01-0x1F or DEL) or invalid UTF-8 in `platform`, `arch` or `version` with `400` (`result=denied`, `detail=invalid_package_field`), as the upload already does. A stored package whose key holds such a byte (written out of band) can no longer be deleted through the API. Find one with:
+
+```sql
+SELECT platform, arch, version FROM update_registry.update_packages
+ WHERE platform ~ '[\x01-\x1f\x7f]' OR arch ~ '[\x01-\x1f\x7f]' OR version ~ '[\x01-\x1f\x7f]';
+```
+
+To remove it, follow these steps in order. Do not remove any file before step 3.
+
+1. Delete the row in SQL and note each `filename` it returns: `DELETE FROM update_registry.update_packages WHERE <the same condition> RETURNING platform, arch, version, filename;`
+2. For each returned `filename`, run `SELECT platform, arch, version FROM update_registry.update_packages WHERE lower(filename) = lower('<filename>');`
+3. Only when that query returns no row, and the `filename` is a plain file name with no path separator, remove that binary and its `.sig` sidecar from the update directory by hand. When it returns a row, leave both files in place. Pause package uploads while you do this.
+4. Restart every serving replica.
+
+This SQL is unsupported and not audited, so record it in the change ticket.
+
+**Other effects.**
+
+- Where an input check exists, a NUL byte is answered as a client error (`400`, or -32602 on MCP). Elsewhere it may surface as a server error that retrying will not fix: treat it as permanent and do not retry. Database logs may show new SQLSTATE `22021` errors from a statement beginning `DO $yuzu_param$`; the value itself is never logged.
+- Directory sync skips and counts a record with a NUL byte in a key field, replaces a NUL byte in a display field with U+FFFD, and refuses a snapshot in which every user (or every group) would be skipped, leaving the stored roster unchanged. An already-synced record that gains a NUL byte in a key field is removed on the next sync, as any record absent upstream is.
+- A gateway that sends a NUL byte in a stream identifier receives `INVALID_ARGUMENT`.
+- OTA package upload puts the previously published binary and signature sidecar of the same filename back when the registry write fails (the answer stays `503`); the previous files are kept as `<file>.yuzu_prev_<suffix>` copies until the write succeeds (see "Leftover `*.yuzu_prev_*` files" under OTA Agent Updates). The upload refuses invalid UTF-8 in the platform, architecture or filename (and the delete route's key fields) with `400`. Schedule enable and disable answer `404` (not visible to the caller) or `503` (store fault) instead of `200` when the change did not apply. Schedule delete answers `503` on a store fault, and a schedule that does not exist stays `200` with `{"deleted":false}` and no audit row. Schedule create answers `400` for a NUL byte or other refused text and `503` for a store fault. The Entra directory sync response and audit row report the counts that sync applied.
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)): every server replica and gateway runs this build. A replica on an earlier build keeps the earlier behaviour, which is outside the deployment contract; mixed-version operation is not supported. See also [Upgrading](upgrading.md).
+
 ### vNEXT — the offline user-hive file check is now the default for autoruns, installed_apps, license_scan, registry and echo (related issue #5291; breaking for fleets with non-standard profile roots)
 
 **What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
@@ -431,7 +496,6 @@ The gateway-upstream service now admits only a gateway whose certificate key (SP
 - **Generated default certificates, TLS on:** nothing to do; the server pins its own `default-gateway.pem`. A gateway on another host that does not present that file is refused until its key is pinned.
 - **Your own certificates:** pin the gateway's key with `--gateway-peer-pin` or `--gateway-peer-pin-file` (env `YUZU_GATEWAY_PEER_PINS` / `YUZU_GATEWAY_PEER_PIN_FILE`) **before** upgrading, or the server will not start. This includes a Linux package install whose unit passes `--gateway-upstream` unconditionally even though you run no gateway: pin, or drop `--gateway-upstream` in a drop-in.
 - **Plaintext (`--no-tls`) rigs:** add `--insecure-gateway-peer` (env `YUZU_INSECURE_GATEWAY_PEER=1`); this disables the check on every port the service is reachable on. It is refused together with a pin.
-- **Windows installer:** `/GATEWAY` with your own gRPC certificates needs `/GATEWAY_PEER_PIN_FILE=<cert.pem>` (preferred) or `/GATEWAY_PEER_PIN=<64 hex>` the first time, and `/GATEWAY /NOTLS` together with either is refused.
 
 Check your own unit, env file, compose file or installer arguments before upgrading; the literal commands, the per-deployment table and the rollback steps are in [Upgrading](upgrading.md) ("Breaking: `--gateway-upstream` now refuses to start without gateway peer authorization"), and the full reference is [Gateway upstream peer authorization](#gateway-upstream-peer-authorization) below. Pins are fixed at boot; changing or withdrawing one is a restart.
 
@@ -496,49 +560,33 @@ See `docs/user-manual/metrics.md` "Execution bookkeeping + stuck-execution reap 
 new `yuzu_exec_tracker_stuck_reap_total{outcome}` counter and `docs/clock-guarded-retention.md`
 for the full design.
 
-### vNEXT — the Windows server installer locks its data directory and keeps secrets off the command line (#5196, #5210, #5272; breaking for unattended installs)
+### vNEXT — the Windows server installer is discontinued (ADR-0035; breaking)
 
-Windows server is not a supported deployment (ADR-0035), and the `YuzuServer` service cannot yet run under the Service Control Manager at all (#5325; see also the open issue #1835, "Windows server binary has the identical SCM control-protocol defect as #1822 (agent)"). This note is for anyone using `YuzuServerSetup-*.exe` anyway.
+The server runs on Linux only (ADR-0035). `YuzuServerSetup-*.exe` is no longer built or published, the Windows and macOS release archives contain the agent only (`yuzu-agent-windows-x64.zip`, `yuzu-agent-macos-arm64.tar.gz`), and the archives no longer carry `yuzu-server` or `install-server-postgres.sh`. Run the server from the container image or the Linux `.deb`/`.rpm` packages.
 
-**What the installer does now.** The secrets it handles are kept in `%ProgramData%\Yuzu Server`, which it locks to exactly Administrators and SYSTEM and verifies before it installs anything:
+The installer never produced a running service: `yuzu-server.exe` has no service entry point, so a `YuzuServer` service registered by the installer or by `sc.exe` could not start under the Service Control Manager (#5325, #1835). A server run under NSSM (or another service wrapper), or by hand, did run.
 
-| File | Holds | Passed to the server as |
-|---|---|---|
-| `yuzu-server.cfg` | dashboard password hashes | `--config` |
-| `postgres.dsn` | the PostgreSQL connection string | `--postgres-dsn-file` |
-| `oidc-client-secret` | the OIDC client secret | `--oidc-client-secret-file` |
-| `certs\` | your TLS certificates and keys | `--https-cert`, `--cert`, … |
-| `data\` | the server's data directory | `--data-dir` |
+**Moving a Windows or macOS server to Linux: start fresh.** There is no supported way to carry a Windows server's database and CA onto Linux. The database records the CA private key by its absolute path (`C:\ProgramData\Yuzu\certs\default-ca.key`, or a path under `~/Library/Application Support/Yuzu/certs` on macOS run as another user), and a Linux server refuses a key outside its own CA directory: a restored server either refuses to start or starts and then cannot enroll or renew agents or publish revocation lists. A macOS server run as root keeps its CA in `/etc/yuzu/certs`, the Linux default, so that particular obstacle does not apply to it, but moving its data to Linux is not supported either: the "Deployment contract (hard cutover)" in [Upgrading](upgrading.md) covers restoring a deployment's own backups into a fresh deployment of the same build, not a move between platforms. So:
 
-The service's command line, which every local user can read, now carries only these paths, and is written with the executable path quoted. Earlier installers meant to pass the OIDC client secret there. In practice, an `sc.exe` quoting fault dropped every argument, so the service they registered ran with no arguments at all, and the directory was readable by local users. The installer reads the command line back after writing it. If it cannot be written, for example because security software blocks the change, the service is disabled and Setup exits with code **10**, rather than leaving the old command line in force.
-
-The server's own CA, default certificates and key-encryption keys stay where the server keeps them: `C:\ProgramData\Yuzu\certs`. The server applies its own Administrators-and-SYSTEM permissions to that folder and to those key files when it writes them. Moving them into the locked directory needs server changes first (#5273).
-
-**Unattended installs:**
-
-- **A connection string is required on a fresh install, and on an upgrade from any earlier version**, because no earlier version stored one. Give `/POSTGRES_DSN_FILE=<file>` (preferred) or `/POSTGRES_DSN=<connection string>`. Without one the install stops with exit code 7. The exception is a `YUZU_POSTGRES_DSN` environment variable, set machine-wide or for the service: the installer then goes ahead and logs a warning that local users can read it. Earlier installers never passed a connection string, so the service they registered could not start.
-- **A `YUZU_POSTGRES_DSN` or `YUZU_OIDC_CLIENT_SECRET` environment variable cannot be combined with a stored secret of the same kind.** The server refuses to start with both, so the installer refuses first and changes nothing. Remove the environment variable, then run the installer again.
-- **An OIDC client secret is not carried from an earlier version:** none stored it anywhere except the service's command line, and their own command line lost its arguments. Give it with `/OIDC_CLIENT_SECRET_FILE=` (preferred) or `/OIDC_CLIENT_SECRET=`. If you had added `--oidc-client-secret` to the service's command line by hand and OIDC is enabled on the upgrade (`/OIDC_ISSUER`), the upgrade refuses until you give the secret again; rotate it in your identity provider afterwards, since local users could read it.
-- **An upgrade keeps the existing accounts; leave out `/ADMIN_USER` and `/ADMIN_PASS`.** An upgrade is any run where `%ProgramData%\Yuzu Server\yuzu-server.cfg` already exists, including an upgrade from an earlier version. The installer can no longer change a stored password: `yuzu-server.cfg` only seeds the first administrator into an empty database and is not consulted for an account the PostgreSQL auth store already holds (#5274), so a new hash written there would be ignored and the old password would stay valid. A non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` on an upgrade is therefore **refused with exit code 11** before anything is stopped or changed, and the interactive wizard skips the account pages on an upgrade. Change or reset passwords in the product instead (Settings → User Management → **Change password** / **Reset password**), or with the direct-SQL fallback in `docs/ops-runbooks/auth-db-recovery.md` if no administrator can sign in. On a fresh install the passwords must be at least 12 characters and at most 1024 bytes of UTF-8 (the server's limit; a character outside ASCII takes 2–4 bytes). The installer's `/OPERATOR_USER` and `/OPERATOR_PASS` were removed in 0.15.0 (#5343): the account they wrote went to `yuzu-server.cfg` only and could never sign in on PostgreSQL. A non-empty value is now **refused with exit code 7** (nothing changed; on an upgrade a non-empty `/OPERATOR_PASS=` is still exit code 11, as above) — create further accounts in Settings → User Management after the install. An upgrade keeps the stored connection string unless a new one is given, and keeps the stored OIDC secret when `/OIDC_ISSUER` is given again. Repeat your other options (`/GATEWAY`, `/OIDC_ISSUER`, `/OIDC_CLIENT_ID`, …) on an upgrade: they are not remembered. `/GATEWAY` with your own gRPC certificates also needs `/GATEWAY_PEER_PIN_FILE=<cert.pem>` (preferred; the leaf certificate only) or `/GATEWAY_PEER_PIN=<64 hex>` the first time (see [Gateway upstream peer authorization](#gateway-upstream-peer-authorization), "Windows service"); `/GATEWAY` with `/NOTLS` starts the service with `--insecure-gateway-peer`, and is refused if a pin parameter is also given.
-- **Upgrade in place; do not uninstall the previous version first.** Uninstalling removes the service and the installation record but keeps the old, unlocked data directory. The new installer then cannot tell that an administrator created that directory, and refuses it.
-- **Exit code 7** means the install was stopped before any file was installed: an input was missing or invalid, or something could not be secured. The reason is in the setup log on a line starting `PrepareToInstall:`. If the existing service had been stopped by then, it is left stopped, and the message says so (and says if it was disabled). The exception is an upgrade from an unsecured directory that stops before the old directory is moved: the service is then started again. On an upgrade of an already-secured install, the message also lists any files in the data directory that had already been replaced.
-- **Exit code 10** means the files were installed but the service could not be registered or its command line could not be written. Setup disables the service if it can, and the message and log say whether it did; if not, disable it yourself (`sc.exe config YuzuServer start= disabled`) until the cause is fixed.
-- **Exit code 11** means an upgrade was given a non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` (see above; `/OPERATOR_PASS=` is itself removed, #5343). Setup stopped before the wizard, before the service was stopped and before anything was written; the reason is in the setup log on a line starting `InitializeSetup:`. Run it again without the account parameters, then change the password in the product. (Setup's own temporary folder in `%TEMP%` is left behind in this case; it holds nothing secret.)
-- **Secrets on the command line are recorded** in the setup log (`/LOG=`) and by deployment tools such as SCCM (AppEnforce.log) and Intune, including any `/ADMIN_PASS=`, `/POSTGRES_DSN=` or `/OIDC_CLIENT_SECRET=` value. Prefer `/POSTGRES_DSN_FILE=` and `/OIDC_CLIENT_SECRET_FILE=`. Stage those files in a pre-step, with permissions only Administrators and SYSTEM can read, and delete them afterwards: the installer copies them and leaves the originals. `/ADMIN_PASS=` has no file form, so treat those logs as secrets: restrict or purge them after the deployment.
-
-**Upgrading from an earlier version.** (This describes what the installer does when it finds an earlier installation's directory. It does not make an upgrade of an earlier build's database supported in 0.15.0: see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md).) Its data directory is not locked, so the installer builds a new, locked one. It copies across only plain files that are owned by Administrators or SYSTEM and that no other account can change, from folders that are owned by Administrators or SYSTEM and in which no other account can delete or rename anything: the configuration, `postgres.dsn`, `oidc-client-secret`, and the files directly in `certs\` and `data\`. Subdirectories stay behind. The old directory is renamed to `%ProgramData%\Yuzu Server.insecure-<date>-<time>`; it is never changed or deleted.
-
-If any file that would be copied, or a folder holding one, fails that check, or a file is a link or a hard link, the upgrade stops and names it, and nothing is changed. This also catches a folder that a standard user created before the original install: they stay its owner, so they could have swapped its files for their own. Inspect what is named. If it is yours, remove it, or make Administrators its owner and reset its permissions (`icacls <path> /setowner *S-1-5-32-544 /L`, then `icacls <path> /reset /L`), then run the installer again. An unlocked `%ProgramData%\Yuzu Server` with no Yuzu Server installation registered on the machine is refused, because it cannot be shown that an administrator created it. A junction or symbolic link at that path is always refused.
-
-> **Fresh deployment only for 0.15.0.** This does not make an upgrade of an earlier build supported (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). If the installer has nevertheless run in upgrade mode over an earlier directory, the exposure described in these steps is real whatever the contract says, so carry them out.
-
-**After upgrading from an earlier version:**
-
-1. **Rotate what the old directory exposed.** Local users could read it, so treat its contents as disclosed: reset the dashboard passwords, re-issue the TLS keys in `certs\`, and rotate the OIDC client secret. Reset the passwords **in the product** (Settings → User Management, or `POST /api/v1/users/me/password` / `POST /api/v1/users/{name}/password`): the installer refuses a new `/ADMIN_PASS` on an upgrade (exit code 11), because the config file only seeds a fresh database and could not change an account that already exists in the PostgreSQL auth store (#5274). The old hashes stay in `yuzu-server.cfg` — the server logs a boot warning naming each account whose stored password no longer matches it.
-2. **Move the server's data subdirectories, if you ran the server.** `data\agent-updates\` and `data\upload-blobs\` (OTA packages and uploads that database rows refer to) stay in the renamed directory. Local users could create files in them, so check their contents. Then stop the server, move them into the new `data\`, make Administrators their owner and reset their permissions: `icacls "%ProgramData%\Yuzu Server\data" /setowner *S-1-5-32-544 /T /L`, then `icacls "%ProgramData%\Yuzu Server\data" /reset /T /L`. If you would rather not trust them, re-upload the packages instead.
-3. **Delete the renamed directory** once the upgrade is confirmed. It still holds the old password hashes and keys.
-
-**Constrained Language Mode** (WDAC script enforcement, or AppLocker script rules for an install run by an administrator) blocks the .NET calls the installer needs to hash new passwords, so a fresh install with `/ADMIN_PASS` stops with a message saying so. An upgrade (which keeps the existing accounts and hashes nothing) works, and so does an install run as SYSTEM, which AppLocker exempts.
+1. **Moving means a new deployment.** Deploy a Linux server from the container image or the Linux packages, with its own database and CA, and recreate the users, roles, policies and instruction definitions you need: nothing is imported from the old server. Install agents and gateways against it as new installations, through the normal procedures ([the agent bundle guide](../agent-bundle.md), [Agent Enrollment](device-management.md#agent-enrollment), [Gateway](gateway.md)). An agent already enrolled with the old server keeps that server's CA, its client certificate and its Guardian policy generation, and there is no supported procedure today for re-pointing an enrolled agent or gateway at a different server, including an agent on the same machine as the old server that shares its `%ProgramData%\Yuzu` directory; plan those as new installations. On the old server's own machine, make the agent's new installation only after step 4: removing the old agent there can delete the directory the old server still uses, and step 4 deletes the old CA certificate the new installation might otherwise pick up (the old agent's own files are removed by the new installation's procedure, not by step 4).
+2. **Before you stop the old server:**
+   - End every quarantine, both the server's quarantine record and the device's firewall rules, as [Device Quarantine](security-hardening.md#device-quarantine) describes. While a record is active the old server re-applies the containment whenever the device reconnects, and once the old server is gone nothing can release a contained device, so do not stop the server while a device with an active record is offline.
+   - Export the audit history you must keep (see [Audit Log](audit-log.md#rest-api)). If you also want a full copy, take a `pg_dump` of the old database and a copy of its CA directory now, store them where only administrators can read them, and delete them when you no longer need them: they hold the CA private key and the keys that decrypt the stored secrets.
+   - Note the old server's command line and environment (`sc.exe qc YuzuServer`, `nssm get YuzuServer AppParameters`, or the launchd `.plist`): they name the configuration file, data directory, CA directory, secret files and database you delete in step 4.
+3. **Remove the old server.**
+   - Installed by `YuzuServerSetup`: run `"C:\Program Files\Yuzu Server\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES` (or the path in its `UninstallString` registry value). Uninstallers from 0.14.0-rc2 and earlier hang on a silent uninstall: run those interactively. If `yuzu-server.exe` was already deleted, the uninstaller cannot remove the service, so also run `sc.exe delete YuzuServer`.
+   - Registered by hand on Windows: `sc.exe stop YuzuServer` then `sc.exe delete YuzuServer`, or `nssm stop YuzuServer` then `nssm remove YuzuServer confirm`.
+   - On macOS: stop the process, and if you made a launchd job for it, unload it (`launchctl bootout system/<label>`, or `gui/<uid>/<label>` for a per-user job) and delete its `.plist`, which may hold the PostgreSQL connection string.
+   - Do not unpack this release's agent archive over a directory a server still runs from: it replaces the DLLs that server loads.
+4. **Delete what is left. All of it holds secrets.** Backups, snapshots and shadow copies of these directories hold the same secrets.
+   - `%ProgramData%\Yuzu Server` (installer installs): the configuration, the TLS keys, the stored PostgreSQL connection string and any OIDC client secret. Treat a directory left by an installer older than 0.14.1, which did not lock it, as disclosed to local users.
+   - Any `%ProgramData%\Yuzu Server.insecure-<date>-<time>` directory: an upgrade by a 0.14.1 or later installer moved the old, unlocked directory aside under that name. It still holds the old password hashes and keys.
+   - The server's CA directory, configuration file and data directory (the paths you noted in step 2; by default `C:\ProgramData\Yuzu` on Windows, `/etc/yuzu` on macOS run as root, otherwise `~/Library/Application Support/Yuzu`). In the CA directory: `default-ca.key`, the other `default-*.key` files, `secrets-kek-v*.key`, any `server-key.pem`, and the old CA certificate `default-ca.pem` (an agent installed later on the same machine would otherwise find and trust it). The configuration file `yuzu-server.cfg` holds the password hashes. In the data directory (`--data-dir`, or, when that was not set, the configuration file's directory): `enrollment-tokens.cfg` and `pending-agents.cfg` (live enrollment credentials; `*.cfg.imported` once imported), `auto-approve.cfg`, `nvd_cves.db`, `enablement-anchor`, `agent-updates/`, `upload-blobs/`, and every `.db` file a previous release of the server left there, with its `-wal`, `-shm` and `-journal` files (for example `auth.db`, which a 0.13 server used for users, password hashes and sessions, `offload_targets.db`, which held offload credentials, `audit.db` and `ca.db`). Keep the agent's own databases, which are exactly `agent.db`, `agent-state.db`, `kv_store.db`, `kv-store.db`, `command_dedup.db`, `echo.db` and `tar.db` (and their `-wal` and `-shm` files). Where a directory is shared with an agent (on Windows the default, `C:\ProgramData\Yuzu`, is also the agent's data directory), delete these files by name, never the whole directory, and leave the agent's own files alone.
+   - Any key or secret file the old server's command line pointed at outside those directories (for example `--https-key`, `--key`, `--saml-sp-key`, `--management-key`, `--postgres-dsn-file` or `--oidc-client-secret-file` at a custom path).
+   - The old server's PostgreSQL database, if nothing else uses it.
+   - On Windows, the machine-wide `YUZU_POSTGRES_DSN` and `YUZU_OIDC_CLIENT_SECRET` environment variables, if you set them: every local user can read them. In an elevated PowerShell, run `[Environment]::SetEnvironmentVariable('YUZU_POSTGRES_DSN', $null, 'Machine')` (and the same for the other).
+   - If the old CA key may have been copied, remove the old CA certificate from anything that still trusts it (gateways, agents, other tools).
+5. **Rotate what may have been read.** Deleting a file does not invalidate a credential that was copied. If other people could sign in to the host, if the directory was left by an installer older than 0.14.1, or if any of it was backed up, change the old database role's password (or drop the role), the OIDC client secret at the identity provider, and the passwords of the old server's local accounts wherever they are reused.
 
 ### vNEXT — a hand-edited config listing local users but none with `role=admin` now fails boot, on every restart (breaking)
 
@@ -971,11 +1019,15 @@ startup log lines — these are routine, not a fault:
 If instead you see `[HA] leader_elector could not open its coordination
 connection; FencedLeaderOnly background loops are PAUSED …`, the server could not
 reach its Postgres coordination connection: it keeps serving and re-tries every
-election cycle (so a transient blip self-heals within seconds), but while the
+election cycle (so a transient connection blip self-heals within seconds; a
+recorded-migration refusal does not, see below), but while the
 message persists the leader-only background loops (the four above, plus command-outbox
 delivery) do not run. This is fail-closed
 by design — a paused loop never double-dispatches — and a persistent occurrence
-is a Postgres-reachability problem to investigate, not a server bug. (The
+is either a Postgres-reachability problem to investigate or a recorded-migration
+refusal: when the log also shows `PgMigrationRunner: store 'leader_elector' recorded
+migration`, the database is not unreachable, the elector will not recover on its own, and
+the way out is the restore described in [Upgrading](upgrading.md), "Behaviour change: a Postgres store refuses to open when its recorded migration differs from this build (the server stops, except for three stores)". (The
 operator-triggered paths are unaffected: a manual policy remediation or evaluation,
 and an operator CRL revoke, run on whichever replica received the request — and a
 remediation/evaluation is also *completed* on that same replica, so it still reaches
@@ -1425,7 +1477,7 @@ HAVING COUNT(*) > 1;
 **What a client sees.**
 
 - **`413`** — the declared `Content-Length` exceeds the resolved class's cap.
-- **`411`** — the body cannot be sized in advance **by framing** (chunked, or no `Content-Length`) and this route's class requires one it can size. Today that is `/mcp/` only; every other class still admits an unmeasurable body up to httplib's 100 MiB backstop, unchanged from before this release.
+- **`411`** — the body cannot be sized in advance **by framing** (chunked, or no `Content-Length`) and this route's class requires one it can size. Six classes refuse one today (`/mcp/`, `upload_session`, `hardware`, `dex_score_policy`, `dex_score_policy_form` and `commands`; the list is in [REST API](rest-api.md)); every other class still admits an unmeasurable body up to httplib's 100 MiB backstop, unchanged from before this release.
 - **`415`** — the request carries a `Content-Encoding` header other than `identity`. Refused on **every** class, unconditionally — this one is new in this release and does not depend on the class opting into anything. No shipped Yuzu route accepts a compressed request body, so this should not affect a conforming client; a client or intermediary that compresses request bodies (`gzip`/`br`/`deflate`) must stop doing so against this server. Send an identity-encoded body by **omitting `Content-Encoding` entirely**. An explicit `Content-Encoding: identity` is admitted (through 0.37.1 httplib answered it with a bare `415` of its own); see the `415` row in [`docs/user-manual/rest-api.md`](rest-api.md#pre-auth-request-body-caps-2407).
 
 **Who this affects.** Any integration that was sending a body larger than its route's new class cap and relying on httplib's 100 MiB backstop to accept it. The most likely surface to notice: a very large `POST /api/v1/guaranteed-state/rules`, `/api/workflows`, or `/api/product-packs` body — those three classes are capped at a generous but explicit 16 MiB (a judgment call, not a measured contract, because no aggregate size limit for that content exists yet) rather than the previous 100 MiB backstop. Most other routes had a smaller handler-level check already (response templates, CA import) — for those, the effect really is just an earlier rejection at the same byte count (before the body is buffered rather than after). Also newly affected: any client or intermediary that sends a **compressed** request body — that is now refused outright with `415` on every class (see "What changed" above); no shipped Yuzu client compresses request bodies, so this is expected to affect only a custom integration or a reverse proxy doing transparent compression. One class is **not** the simple "earlier rejection, same effect" case, and clients should not assume "no behavior change" from it: **Echo queries** (`POST /api/dashboard/echo-execute`, `POST /api/v1/result-sets/from-echo-query`) — these two classes' caps as originally shipped bounded the RAW body at the same byte count their handlers check on a DECODED/PARSED value, which is not the same number; that unit mismatch caused some legitimate queries to be rejected here that the handler would have admitted. Both caps carry a margin now (see [`docs/user-manual/rest-api.md`](rest-api.md#pre-auth-request-body-caps-2407) for the sizing), so this class is now also a clean earlier-rejection-only change going forward. **SCIM is no longer a special case either** (fixed as part of this same change, D7): the pre-routing rejection now publishes SCIM's own RFC 7644 §3.12 `application/scim+json` error shape, matching what a strict SCIM client already expected from the handler's own (now-superseded) check.
@@ -2892,7 +2944,7 @@ The new `/echo` dashboard page (issue #547) surfaces every device × source pair
 
 **Per-operator scan state caveat.** Scan results are held in the server's memory keyed by operator username, with a 30-second per-operator cooldown to defend against retry-storms. Restarting the server clears all scan state; operators will see "No scan data yet — click Scan fleet" after a restart and a fresh scan returns within seconds. Persistence across restarts and multi-server coordination land in Phase 15.G operational hardening.
 
-**Audit log additions.** Two new audit actions emit on operator activity: `echo.status.scan` (every Scan-fleet click; `result=success`/`denied`/`failure` with detail) and `echo.source.reenable` (every Re-enable click; `result=success`/`denied`/`failure`). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the `detail=scope_violation` vs `detail=agent_not_connected` distinction even though the HTTP response body is identical (`Agent not reachable.` 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property.
+**Audit log additions.** Two new audit actions emit on operator activity: `echo.status.scan` (every Scan-fleet click; `result=success`/`denied`/`failure` with detail) and `echo.source.reenable` (every Re-enable click; `result=success`/`denied`/`failure`). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the `detail=scope_violation` vs `detail=agent_not_connected` distinction even though the HTTP response body is identical (`Agent not reachable.` 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property. A command the dispatch chokepoint refuses for the operator is its own token, `dispatch_denied reason=<token>` (answered `403`, or `500` for a server catalogue fault), and a grant withdrawn after the `attempted` row (`Execution:Execute` for a re-enable, `Infrastructure:Delete` for a purge) is `permission_revoked` (#7114, #7110), so a connectivity rule keyed on `agent_not_connected` no longer matches those.
 
 ### vNEXT — Fleet visualization (3D) (`/viz/fleet`)
 
@@ -3801,20 +3853,6 @@ If the gateway was refused only at registration (for example the server started 
 
 **Gateway key custody.** The gateway key file is the credential the pin authorizes, so who can read it decides who can act as a gateway. On the generated defaults it is `default-gateway.key`, group-readable (0640) by the shared `--cert-group` when that is set. Keep it readable only by the server and gateway processes: do not mount the key-bearing certificate volume into other long-running containers (the reference compose's one-shot `ca-export` service below is the one deliberate exception), never widen `--cert-group` membership beyond those two, and when `--cert-group` is set while the generated default gateway key is in use (the automatic pin, or gRPC on the default credentials) the server logs a warning at boot that every process in the group holds gateway authority. The reference gateway compose mounts the key-bearing certificate volume into the server and the gateway, and a third time **read-only** into a one-shot `ca-export` service, which copies only the public CA certificate (`default-ca.pem`) into the `ca-public` volume (it runs with the shared group so it can read the directory, which means it could also read the group-readable gateway key; it runs one `install` command and exits). The agent container mounts `ca-public` and never the key-bearing volume. `ca-export` runs again on every `docker compose up`, so after a CA re-root prefer `docker compose up -d`, which re-runs it after the server is healthy, to refresh `ca-public` (`restart` also restarts the one-shot container but without that ordering); see [PKI architecture](../pki-architecture.md). If anything else ever held read access to the gateway key (for example an agent container from an earlier compose file), replace the gateway certificate or move to a gateway-only certificate with a 0600 key pinned explicitly, and withdraw the old pin: changing mounts cannot invalidate a key that was already copied. Production installs should issue a gateway-only certificate and pin it explicitly.
 
-**Windows service.** The installer rebuilds the service command line from its own state on every run, so a flag appended to the service's command line by hand is lost at the next upgrade. The durable convention is a pin file named `gateway-peer-pin` in the installation's `certs` folder (`%ProgramData%\Yuzu Server\certs`): the installer passes `--gateway-peer-pin-file` for it whenever gateway mode is selected, TLS is not skipped and the file exists.
-
-- **Lead with the certificate file:** `/GATEWAY_PEER_PIN_FILE=<cert.pem>`. Give the **leaf certificate only**: a chain file pins every certificate block in it, not only the leaf. The server computes the SPKI hash itself, so there is no hash to get wrong. Windows operators should use this route; the OpenSSL byte pipeline in "Pinning your own gateway" is not documented for Windows PowerShell 5.1 (its text pipeline may corrupt the binary DER between the two `openssl` commands).
-- **Or give one hash:** `/GATEWAY_PEER_PIN=<64 hex>` (the SPKI SHA-256, not a hash of the whole certificate: see "Lockout diagnostic").
-- The two parameters are mutually exclusive; give one. Either one **replaces** the stored `certs\gateway-peer-pin`, so rotating a pin with an overlap period needs a multi-entry pin file containing both the old and the new pin.
-- **The interactive wizard has no pin page.** A pin can be given only on the command line; a wizard run that would start gateway mode on your own certificates with no pin is refused before anything is changed, and the message says to supply the parameter on the command line.
-- **What the installer checks:** a `/GATEWAY_PEER_PIN` value is exactly 64 hexadecimal characters (either case), else it is refused before anything is changed; for `/GATEWAY_PEER_PIN_FILE` it applies only cheap checks (the file exists, is not empty and contains no NUL byte, as a UTF-16 file does) and does not parse it, so the server's start-time validation remains the full one.
-- **`/GATEWAY` with `/NOTLS`** adds `--insecure-gateway-peer` and does not pass the pin file, because the server refuses the acknowledgement together with a pin. Giving `/GATEWAY /NOTLS` **together with** `/GATEWAY_PEER_PIN` or `/GATEWAY_PEER_PIN_FILE` is **refused** by the installer, with nothing changed: a plaintext server has nothing to pin, and the contradiction would otherwise only surface as a server that refuses to start.
-- **`/GATEWAY` is re-read on every run.** An upgrade that repeats `/GATEWAY` on an install carrying your own gRPC certificate and key, with no stored pin, is refused by the installer before anything is changed rather than leaving a service that cannot start. `/NOTLS` given on a silent install clears any `/GRPC_CERT`, `/GRPC_KEY` and `/CA_CERT` values, as the wizard does, so they are not copied into `certs\` where the service arguments would ignore them.
-- **A refused silent install exits with code 7**, and the reason appears **only** in the setup log (`/LOG=<file>`) on a line starting `PrepareToInstall:`. Nothing was changed, and the existing service is left as it was: these refusals run before the service is stopped. Deployment tools that report only the exit code do not show the reason, so deploy with `/LOG=` and read that file.
-- **A stale pin file outlives the configuration.** If you later move an install back to the generated default certificates, the old `certs\gateway-peer-pin` still exists, is still passed to the server, and **replaces** the automatic pin, so the gateway's generated certificate is refused until you delete the file (`del "%ProgramData%\Yuzu Server\certs\gateway-peer-pin"`) and run the installer again.
-
-**Windows service limits.** When the service fails to start, the Windows service manager reports error 1053, 7000 or 7009 whatever the cause, so the reason (including a gateway peer refusal at boot) is in `<install>\logs\yuzu-server.log`, not in the service manager's message. The installer fixes the gateway-upstream listen address at `0.0.0.0:50055` and does not pass `--ca-dir` (the server then uses the platform default certificate directory), so two server services on one host collide; this is a limitation, not a parameter.
-
 **Proxies in front of the gateway-upstream port.** The gateway's client certificate is what identifies it, so the path from the gateway to the server must be L4 passthrough. A TLS-terminating proxy removes the client certificate, and every call is then refused as `not_authenticated`.
 
 **Observability.**
@@ -3837,7 +3875,7 @@ The gateway-side alerts are scraped from the gateway, so their `instance` is the
 
 **Rolling back.** See the "Rollback / temporary exception" section of [Upgrading](upgrading.md).
 
-**Known limits of the verification.** (1) The guard's wire tests produce `not_authenticated`, `no_server_auth_eku`, `not_pinned` and `outside_validity` over a real mutual-TLS connection and `null_context` by a direct call; `no_cert` and `bad_cert` could not be produced over a real gRPC connection in that harness and are covered at the policy-function level only (`tests/unit/server/test_gateway_peer_policy.cpp`). (2) The integration rig (`scripts/integration-test.sh`) keeps `--insecure-gateway-peer` in its `--tls` branch, so CI never exercises a pinned gateway hop end to end with the real gateway; the guard is exercised by unit tests over a real mutual-TLS harness, and the boot-refusal test presents the default gateway certificate (admitted) and the default server leaf (denied) to the real server binary on its three listeners. (3) The Windows installer change was compiled with Inno Setup 6.7.3 and silent-installed on a Windows 11 test host (34 of 34 silent-install cases at the final tip, including upgrade, refusal and uninstall cases, the refusal of `/NOTLS` with a pin and the wizard-path refusal wording, plus eight direct runs of the server executable). Starting the service under the Windows service manager could not be tested, because the server binary does not implement the service control protocol (pre-existing; open issue #1835, "Windows server binary has the identical SCM control-protocol defect as #1822 (agent)", which prevents the installed service from starting under the Windows service manager). The interactive wizard path was not tested. (4) A pin file's permissions and ownership are not checked by the server (see "Pinning your own gateway"). The decision record, [Gateway peer authorization (minimal), 2026-10-07](../security-reviews/gateway-peer-authz-minimal-2026-10-07.md), states these and the TLS session-resumption question in full.
+**Known limits of the verification.** (1) The guard's wire tests produce `not_authenticated`, `no_server_auth_eku`, `not_pinned` and `outside_validity` over a real mutual-TLS connection and `null_context` by a direct call; `no_cert` and `bad_cert` could not be produced over a real gRPC connection in that harness and are covered at the policy-function level only (`tests/unit/server/test_gateway_peer_policy.cpp`). (2) The integration rig (`scripts/integration-test.sh`) keeps `--insecure-gateway-peer` in its `--tls` branch, so CI never exercises a pinned gateway hop end to end with the real gateway; the guard is exercised by unit tests over a real mutual-TLS harness, and the boot-refusal test presents the default gateway certificate (admitted) and the default server leaf (denied) to the real server binary on its three listeners. (3) The Windows server installer's pin handling, compiled with Inno Setup 6.7.3 and tested on a Windows 11 host, was removed with the installer (ADR-0035 step 2). (4) A pin file's permissions and ownership are not checked by the server (see "Pinning your own gateway"). The decision record, [Gateway peer authorization (minimal), 2026-10-07](../security-reviews/gateway-peer-authz-minimal-2026-10-07.md), states these and the TLS session-resumption question in full.
 
 **What this does not do.** The pin establishes which gateway is calling; it does not restrict which agents a gateway may relay for. A compromised pinned gateway can still assert identities and events for the agents behind it (a documented residual; per-gateway scoping is tracked in #1292). The pin applies to the gateway-upstream service only; direct-connecting agents are not covered by it.
 
@@ -4030,10 +4068,8 @@ tool).
 > **`yuzu-server.cfg` no longer resets a password (#5274).** The config
 > file seeds the first administrator into the PostgreSQL auth store on a
 > fresh database. After that, login checks the auth store only — editing
-> a hash in the config file, regenerating it, or re-running an installer
-> with a new admin password does not change an existing account's
-> password (the Windows installer now refuses `/ADMIN_PASS` on an
-> upgrade, exit code 11). Use the buttons above or the REST routes; if no
+> a hash in the config file or regenerating it does not change an
+> existing account's password. Use the buttons above or the REST routes; if no
 > administrator can sign in at all, see
 > [the recovery runbook](../ops-runbooks/auth-db-recovery.md#password-reset).
 
@@ -4178,6 +4214,16 @@ The server can distribute agent binary updates to enrolled endpoints.
 **Package filenames may not end in `.sig`** (case-insensitive); the upload is
 rejected with a 400. That suffix is reserved for signature sidecars, named
 `<binary>.sig`, so a package called `x.sig` would occupy package `x`'s slot.
+
+**If the registry write fails, the previous package comes back.** Before an upload publishes over an existing file of the same name, the server keeps the previous binary and its `.sig` sidecar as copies named `<file>.yuzu_prev_<suffix>` in the update directory (a hard link where the filesystem allows, otherwise a copy; the live file name is never absent). When the registry write succeeds the copies are deleted; when it fails the new files are removed and the copies are put back, and the upload answers `503`. If a restore itself fails, the upload answers `500` naming any kept copy and the server log records it. If the registry write fails and the row then cannot be read back to tell whether it was written, the outcome is unknown: the upload answers `503` "The registry did not confirm whether the package was recorded" (audit `result=failure`, `detail=outcome_unknown`), and it leaves the new files and the kept copies where they are. Check the package list, then retry the same upload; repeating it is safe. A non-regular file at the binary or sidecar path, or no way to keep a copy, answers `500` "Could not prepare the package directory" with nothing written.
+
+**Leftover `*.yuzu_prev_*` files.** A kept copy can be left behind by a process crash between keeping it and finishing the upload, by a restore that failed (the answer names the copy), or by an upload that answered that the outcome was not confirmed. Nothing removes them. List them with `find <update-dir> -name '*.yuzu_prev_*'` (the update directory is `agent-updates/` under the data directory, or `--update-dir`). **Do not delete or restore a copy because of its age or its name alone.** A copy holds the previous file; the live file may hold the previous file or the new one, and the registry row names one of the two. For each copy, compare the SHA-256 of the live file and of the copy (`sha256sum`) with the `sha256` of the registry row for that file name (`SELECT platform, arch, version, sha256 FROM update_registry.update_packages WHERE filename = '<file>';`):
+
+- The live file matches the row: the copy is not needed, delete it.
+- The copy matches the row and the live file does not: the live file is an upload that was never recorded. Rename the copy over the live file name, and rename the signature copy of the same suffix over the `.sig` file, then delete nothing else.
+- Neither matches, or the row is missing: leave both files and upload the package again.
+
+A crash between publishing a file and recording it leaves that package mismatched, and agents refuse it on the hash check, until it is restored this way or uploaded again. Exclude `*.yuzu_prev_*` from file-level backups of the update directory: the files are transient.
 
 ### Promoting to Production
 
@@ -4902,6 +4948,8 @@ For containerized deployments (Docker Compose), ensure the host volumes backing 
 The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays SQLite). As of the cut-over (#1320 PR 3) the server **requires a reachable database at boot and fails closed without one** — it constructs a shared connection pool at startup and, if `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable, **refuses to start and exits non-zero** (no SQLite fallback for the server). There is a distinct `[PG] Refusing to start` log line so the cause is unambiguous in `systemd` / `kubectl` logs.
 
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
+
+**Database role privileges.** The server's database role needs `USAGE` on the `plpgsql` procedural language, which PostgreSQL grants to every role by default (a deployment that revoked it from `PUBLIC` must grant it back, for example `GRANT USAGE ON LANGUAGE plpgsql TO <role>;` with `<role>` the server's database role): `pg::exec_params` refuses a bound text value that contains a NUL byte with a server-side `DO` block, and without `USAGE` that refusal would surface as a permission error instead of the NUL-byte message.
 
 **Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election, **plus one** for the `/readyz` reachability probe (HA WS-8). (The probe's connection runs one plain query per tick and holds no session state, so unlike the leader-election connection it works through a transaction-mode pooler; it reconnects after any failure.) Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
 
@@ -6004,6 +6052,17 @@ DEX alerting is configured on the **DEX page, Alerts tab** (it moved out of Sett
 | `dex.device.perf.query` | An operator loads a device performance sparkline panel (DEX device drill-down). Execute-gated; detail records the target agent and command id. |
 | `dex.device.procperf.query` | An operator loads a device's per-application panel (usage-class telemetry — deliberately a separate verb from the machine-health `dex.device.perf.query` so usage reads stay separately countable). Execute-gated; detail records the target agent and command id. |
 
+### DEX Scoring
+
+The score policy is viewed and edited on the **DEX page, Scoring tab**: tier edges and names, the four deduction weights, the scoring-model parameters and the per-application overrides, with the validator's refusals shown against the field, a pre-save tier-change preview, a stale-revision refusal and a reset to the shipped defaults. The tab is a form over the same policy document and the same writer as `GET`/`PUT`/`DELETE /api/v1/dex/score-policy`, so validation, the revision check and the audit rows are identical (`dex.score_policy.update` on save, `dex.score_policy.reset` on reset, `dex.score_policy.validate` on preview, which stores nothing). See the user-manual *DEX -> Scoring* section.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/fragments/dex/scoring` | The Scoring tab: DEX sub-nav, the policy in force and the edit form (HTMX). Needs `GuaranteedState:Read`; the form is editable for a reader who also holds `Infrastructure:Write` (asked quietly, no denied row) and every control is disabled for any other reader. |
+| `POST` | `/api/settings/dex-scoring/save` | Save the whole policy. Body: the form (every field plus the hidden `if_match` revision), capped at 512 KiB. Needs `Infrastructure:Write` (the grant `PUT /api/v1/dex/score-policy` requires) and `GuaranteedState:Read`; a refusal of either writes the standing `auth.permission_required` row. A refusal (field error, stale revision) re-renders the form with the error against its field. Audit: `dex.score_policy.update`. |
+| `POST` | `/api/settings/dex-scoring/preview` | Validate the form and show how many applications would change tier, without storing anything. Same body, cap and gates as save. Audit: `dex.score_policy.validate`. |
+| `POST` | `/api/settings/dex-scoring/reset` | Reset the policy to the shipped defaults. Same cap and gates as save. Audit: `dex.score_policy.reset`. |
+
 ### Home (sign-in landing page)
 
 `GET /home` is the landing and sign-in page: the first page a visitor sees, with no sidebar and no header bar because there may be no session yet. Top to bottom it shows a slim bar (the Yuzu mark; the server's host name and the running version are added only once signed in, because the page is reachable without a session), and a headline with the sign-in panel beside it. Signed out, that is all the page shows. Once signed in, the fifteen screens of the product appear below as tiles in five families (Operate, Posture, Estate, Access, System), each saying what the area does. The page fetches no data. It is reached from the Yuzu logo on every other page; it has no sidebar entry, and `/` stays the Console.
@@ -6222,7 +6281,7 @@ On the main listener, a `/health` or `/api/health` request that carries a `Cooki
 | Path | Use case | Body | Draining-aware |
 |---|---|---|---|
 | `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
-| `/readyz` | Readiness probe for load balancers and orchestrators — "stop routing to me". Covers **runtime Postgres reachability** (the `pg_reachable` row), per-store migration completion at startup, AND graceful-shutdown drain. | `{"status":"ready","enablement":{"regression_pending":false,"anchor_unwitnessed_at_boot":false,"report_ahead":false}}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["pg_reachable", ...],"pg":"unreachable","enablement":{...}}` (503). The `enablement` object is present in both the ready and the not-ready body whenever the enablement store is wired; it is detail, never a gate (see below). `pg` appears only when `pg_reachable` fails and names the reason: `unreachable`, `stale`, `read_only` (connected to a standby), or `not_yet_probed`. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049, and the NVD CVE cache `nvd_db`, whose failure leaves vulnerability matching empty) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. The registered-CRL-source store (`revocation_source_store`, ADR-0070 R1) is **gating**: it holds the operator-registered egress targets and the CA keys revocation is judged against, so a node that cannot open it does not start and `/readyz` names it in `failed_stores` if it is ever not open. | **Yes** |
+| `/readyz` | Readiness probe for load balancers and orchestrators — "stop routing to me". Covers **runtime Postgres reachability** (the `pg_reachable` row), per-store migration completion at startup, AND graceful-shutdown drain. | `{"status":"ready","enablement":{"regression_pending":false,"anchor_unwitnessed_at_boot":false,"report_ahead":false}}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["pg_reachable", ...],"pg":"unreachable","enablement":{...}}` (503). The `enablement` object is present in both the ready and the not-ready body whenever the enablement store is wired; it is detail, never a gate (see below). `pg` appears only when `pg_reachable` fails and names the reason: `unreachable`, `stale`, `read_only` (connected to a standby), or `not_yet_probed`. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049, the NVD CVE cache `nvd_db`, whose failure leaves vulnerability matching empty, and `crypto_dashboard_layout_store`, ADR-0071, whose failure leaves operators with the default `/crypto` layout and no saves) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. The registered-CRL-source store (`revocation_source_store`, ADR-0070 R1) is **gating**: it holds the operator-registered egress targets and the CA keys revocation is judged against, so a node that cannot open it does not start and `/readyz` names it in `failed_stores` if it is ever not open. | **Yes** |
 | `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
 | `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
 
@@ -6762,7 +6821,7 @@ bash scripts/start-stack.sh status   # show running processes and ports
 
 ## Windows Service Installation
 
-On Windows, the Yuzu **agent** has a native Windows service wrapper (`yuzu-agent.exe --install-service`); this is what the shipped installer uses, and is the recommended path — see the **Agent: `--install-service`** subsection below. A native wrapper for the Yuzu **server** is still planned for a future release; until then, use `sc.exe` or NSSM (Non-Sucking Service Manager) for the server, as described below.
+On Windows, the Yuzu **agent** has a native Windows service wrapper (`yuzu-agent.exe --install-service`); this is what the shipped installer uses, and is the recommended path — see the **Agent: `--install-service`** subsection below. The Yuzu **server** is not supported on Windows (ADR-0035): run it from the container image or the Linux packages.
 
 ### Agent: `--install-service` (native, recommended)
 
@@ -6791,7 +6850,7 @@ REM Remove it
 yuzu-agent.exe --remove-service
 ```
 
-The service currently registers to run as **LocalSystem** (unchanged by the #1822 SCM-protocol fix — tracked separately as #1442). Moving it to a least-privilege account requires a manual post-install `sc.exe config obj= "NT SERVICE\YuzuAgent"` plus directory ACLs the installer doesn't set today — see `docs/agent-privilege-model.md` and #1442 for the tracked follow-up, and the [Service Account](#service-account) guidance below (written for the server, but the same `obj=` mechanism applies).
+The service currently registers to run as **LocalSystem** (unchanged by the #1822 SCM-protocol fix — tracked separately as #1442). Moving it to a least-privilege account requires a manual post-install `sc.exe config obj= "NT SERVICE\YuzuAgent"` plus directory ACLs the installer doesn't set today — see `docs/agent-privilege-model.md` and #1442 for the tracked follow-up, and the [Service Account](#service-account) guidance below.
 
 Re-running `--install-service` is idempotent — it updates an existing registration's binPath in place rather than failing with "service already exists", so it's safe to re-run after an upgrade. **It resets binPath to the bare exe + `--service` marker** (the same minimal form shown above), dropping any `--server`/`--data-dir`/`--plugin-dir`/`--log-file` a prior `sc config` had applied — always follow it with `sc.exe config` to restore your runtime args, exactly as the installer's own `[Run]` sequence does (`--install-service` then `sc config` then `sc start`). Recovery actions (3 restarts, 60s apart, resetting after 24h) are configured automatically and fire on both crashes and clean-exit-with-error.
 
@@ -6801,63 +6860,36 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 **If `sc.exe start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`), it has the actual reason. `sc.exe query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code: the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303), including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on, **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request, unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher, check the log for the exception message). After a refused token file, specific error 2 followed by the 60 s restart is the expected signature: the log shows "Server permanently rejected registration: invalid, expired, or exhausted enrollment token", then "Removed the enrollment token file ... after the server refused the token", and "Enrollment token source: none" on the restart. None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4/5) described under *Stopping a wedged agent* above; they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) fired while `service_main` is still running happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets; Event Viewer shows it as a generic unexpected termination, not "specific error N". A code-5, a code-4 fired by `run_service()`'s own post-dispatcher drain wait, or a code-3 fired by the EXPLICIT F3 orphan check on `service_main`'s normal path (#4666 PR-2) are stranger still: each fires strictly after `service_main` has already reported one of the buckets above (or a clean `SERVICE_STOPPED`), so it changes none of them and shows up in neither `sc query` nor Event Viewer as anything distinguishable from that already-reported outcome. One exception to that ordering, pre-existing and not introduced by PR-2: `OrphanExitGuard`'s destructor (`hard_exit.hpp`) is ALSO a fail-closed backstop covering an exception that unwinds out of `agent->run()` itself before the explicit F3 check is even reached; on that path a code-3 can fire from the destructor DURING unwind, before any `report_status` call, so this "already reported" property does not hold universally for every possible code-3, only for the ordinary explicit-check case.
 
-### Server: sc.exe (native wrapper not yet available)
+### Using NSSM
+
+[NSSM](https://nssm.cc/) provides a more user-friendly wrapper with a GUI configuration dialog. It is an option for the agent if you prefer NSSM's process-monitoring/log-rotation over the native `--install-service` path — just don't pass `--service` to an NSSM-wrapped agent (see the note above).
 
 ```cmd
-REM Create the Yuzu server service
-sc.exe create YuzuServer binPath= "C:\Yuzu\yuzu-server.exe --https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key" start= auto DisplayName= "Yuzu Server"
+REM Install the service (no --service for the NSSM-wrapped agent)
+nssm install YuzuAgent "C:\Yuzu\yuzu-agent.exe"
+nssm set YuzuAgent AppParameters "--server yuzu.example.com:50051"
 
-REM Set startup type to automatic (delayed start, recommended)
-sc.exe config YuzuServer start= delayed-auto
+REM Configure startup and stdout/stderr logging
+nssm set YuzuAgent Start SERVICE_DELAYED_AUTO_START
+nssm set YuzuAgent AppStdout "C:\Yuzu\logs\agent-stdout.log"
+nssm set YuzuAgent AppStderr "C:\Yuzu\logs\agent-stderr.log"
 
-REM Configure recovery: restart on first, second, and subsequent failures
-sc.exe failure YuzuServer reset= 86400 actions= restart/5000/restart/10000/restart/30000
-
-REM Start / stop the service
-sc.exe start YuzuServer
-sc.exe stop YuzuServer
+REM Start the service
+nssm start YuzuAgent
 ```
 
 > **Note:** With `sc.exe`, spaces after `=` are required (e.g., `start= auto`, not `start=auto`). This is a quirk of the `sc.exe` command parser.
 
-### Using NSSM
-
-[NSSM](https://nssm.cc/) provides a more user-friendly wrapper with a GUI configuration dialog. It remains a valid option for the **server** (no native wrapper yet) and for the **agent** if you prefer NSSM's process-monitoring/log-rotation over the native `--install-service` path — just don't pass `--service` to an NSSM-wrapped agent (see the note above).
-
-```cmd
-REM Install services
-nssm install YuzuServer "C:\Yuzu\yuzu-server.exe"
-nssm install YuzuAgent "C:\Yuzu\yuzu-agent.exe"
-
-REM Set arguments (no --service for the NSSM-wrapped agent)
-nssm set YuzuServer AppParameters "--https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key"
-nssm set YuzuAgent AppParameters "--server yuzu.example.com:50051"
-
-REM Configure startup and recovery
-nssm set YuzuServer Start SERVICE_DELAYED_AUTO_START
-nssm set YuzuAgent Start SERVICE_DELAYED_AUTO_START
-
-REM Configure stdout/stderr logging
-nssm set YuzuServer AppStdout "C:\Yuzu\logs\server-stdout.log"
-nssm set YuzuServer AppStderr "C:\Yuzu\logs\server-stderr.log"
-nssm set YuzuAgent AppStdout "C:\Yuzu\logs\agent-stdout.log"
-nssm set YuzuAgent AppStderr "C:\Yuzu\logs\agent-stderr.log"
-
-REM Start the services
-nssm start YuzuServer
-nssm start YuzuAgent
-```
-
 ### Service Account
 
-For production deployments, create a dedicated service account with minimal permissions rather than running as `LocalSystem`:
+To run the agent under a dedicated service account with minimal permissions rather than `LocalSystem`:
 
 1. Create a local user account (e.g., `YuzuSvc`) with no interactive logon rights.
 2. Grant the account read/write access to the Yuzu installation directory and data directory only.
 3. Assign the "Log on as a service" right via Local Security Policy (`secpol.msc`).
-4. Configure the service to run as this account: `sc.exe config YuzuServer obj= ".\YuzuSvc" password= "PASSWORD"`.
+4. Configure the service to run as this account: `sc.exe config YuzuAgent obj= ".\YuzuSvc" password= "PASSWORD"`.
 
-> **Planned:** A native Windows service wrapper (`yuzu-server --install-service`) is planned for a future release, which will handle service registration, recovery configuration, and Event Log integration automatically.
+Some agent plugins need the privileges `LocalSystem` grants; check `docs/agent-privilege-model.md` before moving the agent to a narrower account.
 
 ---
 

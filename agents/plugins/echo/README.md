@@ -346,7 +346,6 @@ Windows runs an ETW session on provider `Microsoft-Windows-Kernel-Process`
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
 | Definition | Parameter | Type | Required | Default | Constraints | Description |
 |---|---|---|---|---|---|---|
-| `crossplatform.echo.configure` | `retention_days` | string | no | - | pattern: ^[0-9]+$ | Number of days to retain Echo events before automatic purging. Valid range: 1-365. Default: 7. |
 | `crossplatform.echo.configure` | `db_budget_bytes` | string | no | - | pattern: ^[0-9]+$ | Cap on what echo.db holds (used pages plus the write-ahead log), in whole bytes. Minimum 33554432 (32 MiB). Default 262144000 (250 MiB). A value below the minimum, or one that is not a whole number, is refused with an error\| line and nothing changes. When the database is over budget the maintenance pass removes hourly rows older than 48 hours (5 days for procperf), oldest first. Daily and monthly rows are never removed, nor are the usage tables, or paused or errored sources (an unreadable <source>_enabled counts as errored). Requires an agent newer than v0.15.0; an older agent ignores this key beside other keys and refuses it alone (error\|no valid configuration parameters provided). Lowering it permanently deletes the oldest eligible history within 15 minutes, before its tier's retention limit; raising it again does not restore it. |
 | `crossplatform.echo.configure` | `fast_interval` | string | no | - | pattern: ^[0-9]+$ | Interval in seconds for process and network collection. Valid range: 10-3600. Default: 60. |
 | `crossplatform.echo.configure` | `slow_interval` | string | no | - | pattern: ^[0-9]+$ | Interval in seconds for service and user session collection. Valid range: 30-7200. Default: 300. |
@@ -440,7 +439,7 @@ their declared columns at all; see Caveats.
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `key` | string | - | Windows, Linux, macOS | `-` | Name of one configuration setting that was changed by this call (e.g. retention_days, arp_enabled); one row is emitted per persisted key — unchanged keys emit nothing. Values: one of the parameter names listed under Inputs. |
+| `key` | string | - | Windows, Linux, macOS | `-` | Name of one configuration setting that was changed by this call (e.g. db_budget_bytes, arp_enabled); one row is emitted per persisted key — unchanged keys emit nothing. Values: one of the parameter names listed under Inputs. |
 | `value` | string | - | Windows, Linux, macOS | `-` | The new value that was persisted for that key, as a string (post-clamp / post-validation where the parameter defines one). Values: free text, mirrors the parameter's own type/values. |
 
 **`crossplatform.echo.connections_to_ip` — `output`**
@@ -557,7 +556,7 @@ their declared columns at all; see Caveats.
 |---|---|---|---|---|---|
 | `output` | clob | - | Windows, Linux, macOS | `-` | One line per row of the underlying query result (pipe-delimited field values, as produced by `sql`'s row loop). The base `sql` action additionally emits a leading `__schema__\|<col>\|<col>...` line and a trailing `__total__\|<n>` line; this canned query executes through that same action and inherits the identical wire shape. Values: pipe-delimited row text, or the __schema__/__total__ marker lines. |
 
-**`crossplatform.echo.status` — `record_count|oldest_timestamp|newest_timestamp|db_size_bytes|retention_days`**
+**`crossplatform.echo.status` — `record_count|oldest_timestamp|newest_timestamp|db_size_bytes`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
@@ -565,7 +564,6 @@ their declared columns at all; see Caveats.
 | `oldest_timestamp` | int64 | - | Windows, Linux, macOS | `-` | Unix epoch seconds of the oldest event row still retained, or 0 when the warehouse is empty. Values: epoch seconds, or 0. |
 | `newest_timestamp` | int64 | - | Windows, Linux, macOS | `-` | Unix epoch seconds of the newest event row, or 0 when the warehouse is empty. Values: epoch seconds, or 0. |
 | `db_size_bytes` | int64 | - | Windows, Linux, macOS | `-` | Bytes the Echo database holds: used pages (free pages are reusable and not counted) plus the write-ahead log file. This is the figure the byte budget (configure.db_budget_bytes) is enforced against; it is not the size of the file on disk, which can be larger until freed pages are returned. Values: non-negative integer. |
-| `retention_days` | int32 | - | Windows, Linux, macOS | `-` | Currently configured retention window in days (see configure.retention_days). Values: 1-365. |
 
 **`crossplatform.echo.tcp_by_process` — `output`**
 
@@ -658,7 +656,7 @@ guard that every action shares — ever calls the setter, so the agent records t
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 20eab902257c
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6ba36d994237
 
 ```
 == action=status
@@ -726,7 +724,7 @@ error|Echo database not initialized
 [not captured] Destructive/Irreversible: not executed on a live host
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 20eab902257c
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 6ba36d994237
 
 ```
 == action=status
@@ -794,7 +792,7 @@ error|Echo database not initialized
 [not captured] Destructive/Irreversible: not executed on a live host
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 20eab902257c
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 6ba36d994237
 
 ```
 == action=status
@@ -936,5 +934,5 @@ three broken legs; it is one chokepoint. See Caveats item 1.
 - Capability rows: `server/core/src/capability_decls/core_dispatch_capabilities.hpp` · `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
 - Tests: `tests/test_echo_adoption_wiring_lexical.py` · `tests/test_echo_mapdrive_pin_lexical.py` · `tests/test_echo_timeline_script_behaviour.py` · `tests/unit/server/test_echo_process_tree.cpp` · `tests/unit/server/test_echo_rename_migration_pg.cpp` · `tests/unit/server/test_echo_retention_tiers.cpp` · `tests/unit/server/test_echo_timeline_page.cpp` · `tests/unit/server/test_echo_timeline_render.cpp` · `tests/unit/server/test_echo_tree_routes.cpp` · `tests/unit/test_echo_aggregator.cpp` · `tests/unit/test_echo_arp.cpp` · `tests/unit/test_echo_capability_table.cpp` · `tests/unit/test_echo_capture_status.cpp` · `tests/unit/test_echo_cursor.cpp` · `tests/unit/test_echo_diff.cpp` · `tests/unit/test_echo_fold.cpp` · `tests/unit/test_echo_fold_sizing.cpp` · `tests/unit/test_echo_local_dispatcher.cpp` · `tests/unit/test_echo_mapdrive.cpp` · `tests/unit/test_echo_module_etw.cpp` · `tests/unit/test_echo_module_stream.cpp` · `tests/unit/test_echo_netconn.cpp` · `tests/unit/test_echo_netqual_nstat.cpp` · `tests/unit/test_echo_perf.cpp` · `tests/unit/test_echo_power.cpp` · `tests/unit/test_echo_proc_es.cpp` · `tests/unit/test_echo_proc_etw.cpp` · `tests/unit/test_echo_proc_perf.cpp` · `tests/unit/test_echo_registry_bam_live.cpp` · `tests/unit/test_echo_registry_source.cpp` · `tests/unit/test_echo_removable.cpp` · `tests/unit/test_echo_retention_tiers_table.cpp` · `tests/unit/test_echo_schema_registry.cpp` · `tests/unit/test_echo_service.cpp` · `tests/unit/test_echo_software.cpp` · `tests/unit/test_echo_source_health.cpp` · `tests/unit/test_echo_store.cpp` · `tests/unit/test_echo_usage.cpp` · `tests/unit/test_echo_v10_migration.cpp` · `tests/unit/test_echo_warehouse.cpp` · `tests/unit/test_echo_win_raii_guards.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-10-30-echo-db-budget.added.md` · `changelog.d/2026-10-30-echo-db-budget.changed.md` · `changelog.d/2026-10-30-echo-db-budget.fixed.md` · `changelog.d/2026-11-02-echo-fold-substrate.added.md` · `changelog.d/2026-11-02-echo-fold-substrate.changed.md` · `changelog.d/2026-11-02-echo-offline-hive-baselines.added.md` · `changelog.d/6386-echo-tests-windows-honesty.fixed.md` · `changelog.d/7037-echo-rollup-only-v10.changed.md` · `changelog.d/7318-echo-rollup-only-server.changed.md`
+- Changelog: `changelog.d/2026-10-30-echo-db-budget.added.md` · `changelog.d/2026-10-30-echo-db-budget.changed.md` · `changelog.d/2026-10-30-echo-db-budget.fixed.md` · `changelog.d/2026-11-02-echo-fold-substrate.added.md` · `changelog.d/2026-11-02-echo-fold-substrate.changed.md` · `changelog.d/2026-11-02-echo-offline-hive-baselines.added.md` · `changelog.d/5033-echo-corruption-audit-gate-per-agent.fixed.md` · `changelog.d/6386-echo-tests-windows-honesty.fixed.md` · `changelog.d/7037-echo-rollup-only-v10.changed.md` · `changelog.d/7318-echo-rollup-only-server.changed.md` · `changelog.d/7371-echo-rollup-only-ui.changed.md` · `changelog.d/7371-echo-rollup-only-ui.removed.md` · `changelog.d/7420-echo-followups-mixed.changed.md` · `changelog.d/7420-echo-followups-mixed.fixed.md` · `changelog.d/7466-echo-mcp-hourly-rows.changed.md` · `changelog.d/7507-echo-drop-live-shims.removed.md`
 <!-- END GENERATED -->
