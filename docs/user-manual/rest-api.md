@@ -641,7 +641,7 @@ A repeated parameter keeps its first value and an unknown parameter is ignored.
 
 - `hostname` is the hostname in the CI record, which is the last daily sync (up to about a day old), not the live roster's. It is `null` when empty or the literal `unknown`.
 - `ci` has the scalar fields of `GET /api/v1/hardware/{id}` (`manufacturer` through `machine_id_source`, with the same null rules, so a record from an agent that predates the v2 record has `null` chassis, board and machine-id values).
-- `content_hash` is the stored hash of the record (`null` when none is stored). Equal to your copy means unchanged; unequal means re-read. It also covers section rows this route does not return, so it can change while every field you were given is the same, and it changes when an agent moves from the v1 to the v2 record with identical scalars. `ci.first_seen` and `ci.last_seen` can change without a hash change, so read `last_seen` even when the hash matches.
+- `content_hash` is the stored hash of the record (`null` when none is stored). Equal to your copy means the stored record is unchanged apart from `ci.first_seen` and `ci.last_seen`; unequal means re-read. It also covers section rows this route does not return, so it can change while every field you were given is the same, and it changes when an agent moves from the v1 to the v2 record with identical scalars. `ci.first_seen` and `ci.last_seen` can change without a hash change, so read `last_seen` even when the hash matches.
 - `blob_version` is `1` for the older record and `2` for the versioned one.
 
 An example `200` body for a page of one device (the `ci` object is shortened here: a real one carries all 34 scalar keys, and the keys are in alphabetical order on the wire):
