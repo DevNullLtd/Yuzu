@@ -54,6 +54,8 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -72,13 +74,13 @@ struct DirectorySyncTestAccess {
 
     using EntraSyncData = DirectorySync::EntraSyncData;
 
-    std::expected<void, std::string> apply_entra_sync(const EntraSyncData& data) {
+    auto apply_entra_sync(const EntraSyncData& data) {
         return store.apply_entra_sync(data);
     }
-    void update_status(const std::string& provider, const std::string& status,
+    bool update_status(const std::string& provider, const std::string& status,
                        int user_count = 0, int group_count = 0,
                        const std::string& error = {}) {
-        store.update_status(provider, status, user_count, group_count, error);
+        return store.update_status(provider, status, user_count, group_count, error);
     }
     std::expected<void, std::string> fetch_paginated(
         const std::string& initial_url, const std::string& bearer_token,
@@ -1032,4 +1034,676 @@ TEST_CASE("DiscoveryRoutes[pg]: a lost failure row still marks Sec-Audit-Failed 
     REQUIRE(missing);
     CHECK(missing->status == 400);
     CHECK(missing->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+// ── NUL handling: key fields skip the record, display fields are sanitized ──
+//
+// Identity-provider text can carry a NUL (a JSON \u0000 escape decodes to one) and Postgres text
+// cannot hold it. One such record must not abort the whole snapshot: a frozen sync keeps users
+// that were removed upstream in the roster, which delays deprovisioning. A NUL in a KEY field
+// (user id/upn/email, group id, member id) skips the record and counts it; a NUL in a
+// display-only field (user display name, group display name, group description) is replaced
+// with U+FFFD and the record is kept. Everything else is applied, and a skipped record's earlier
+// row (if any) goes the way of any user absent from the snapshot.
+
+TEST_CASE("DirectorySync[pg]: a key-field NUL skips the record, a display-field NUL is "
+          "sanitized and kept, the rest of the snapshot applies and removals still happen",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    DirectorySyncTestAccess::EntraSyncData first;
+    first.users.push_back(make_user("u1", "Alice"));
+    first.users.push_back(make_user("u2", "Bob"));
+    first.users.push_back(make_user("u3", "Carol"));
+    first.users.push_back(make_user("u_gone", "Removed Upstream"));
+    first.groups.push_back(make_group("g1", "Engineering"));
+    first.memberships["g1"] = {"u1", "u2", "u_gone"};
+    REQUIRE(acc.apply_entra_sync(first).has_value());
+    REQUIRE(store->get_user("u_gone").has_value());
+    REQUIRE(store->get_user("u3").has_value());
+    REQUIRE(store->skipped_records() == 0);
+    REQUIRE(store->sanitized_fields() == 0);
+
+    const std::string nul("\0", 1);
+    const std::string fffd("\xEF\xBF\xBD");
+    DirectorySyncTestAccess::EntraSyncData second;
+    second.users.push_back(make_user("u1", "Alice"));
+    second.users.push_back(make_user("u2", "Bob" + nul + "Poisoned"));                 // display
+    second.users.push_back(make_user("u3", "Carol", "carol" + nul + "@example.com"));  // email
+    second.users.push_back(make_user("u4" + nul + "x", "Dana"));                        // id
+    second.users.push_back(make_user("u5", "Erin"));
+    auto bad_group = make_group("g_bad", "Poisoned");
+    bad_group.description = "d" + nul + "x"; // description
+    second.groups.push_back(make_group("g1", "Engineering"));
+    second.groups.push_back(bad_group);
+    second.groups.push_back(make_group("g_bad2" + nul, "Poisoned id")); // id
+    second.memberships["g1"] = {"u1", "u2", "u3", "u5"};
+    second.memberships["g_bad"] = {"u1"};
+    second.memberships["g_bad2" + nul] = {"u1"};
+
+    auto result = acc.apply_entra_sync(second);
+    REQUIRE(result.has_value());
+
+    // Skipped: user u3 (email), user u4 (id), group g_bad2 (id). Sanitized: u2's display name and
+    // g_bad's description.
+    CHECK(store->skipped_records() == 3);
+    CHECK(store->sanitized_fields() == 2);
+    CHECK(store->last_sync_skipped_records() == 3);
+    // The counts returned are what was stored: u1, u2, u5 and g1, g_bad.
+    CHECK(result->users == 3);
+    CHECK(result->groups == 2);
+    CHECK(result->skipped == 3);
+    CHECK(result->sanitized == 2);
+
+    // A display-field NUL is replaced and the record kept, still a member of its group.
+    auto bob = store->get_user("u2");
+    REQUIRE(bob.has_value());
+    CHECK(bob->display_name == "Bob" + fffd + "Poisoned");
+    REQUIRE(bob->groups.size() == 1);
+    CHECK(bob->groups[0] == "Engineering");
+
+    // The good records applied, with their memberships.
+    CHECK(store->get_user("u5").has_value());
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    REQUIRE(alice->groups.size() == 2);
+    CHECK(std::ranges::find(alice->groups, "Engineering") != alice->groups.end());
+    CHECK(std::ranges::find(alice->groups, "Poisoned") != alice->groups.end());
+
+    // A user removed upstream is gone: the sync was not frozen by the poisoned records.
+    CHECK_FALSE(store->get_user("u_gone").has_value());
+    // A key-field skip stores nothing; a row it had before goes like any absent user.
+    CHECK_FALSE(store->get_user("u3").has_value());
+
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 2);
+    std::vector<std::string> group_ids;
+    for (const auto& g : groups)
+        group_ids.push_back(g.id);
+    std::ranges::sort(group_ids);
+    CHECK(group_ids == std::vector<std::string>{"g1", "g_bad"});
+    for (const auto& g : groups) {
+        if (g.id == "g_bad")
+            CHECK(g.description == "d" + fffd + "x");
+    }
+}
+
+TEST_CASE("DirectorySync[pg]: a snapshot whose every user was skipped is refused and the roster "
+          "is left untouched",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    DirectorySyncTestAccess::EntraSyncData seed;
+    seed.users.push_back(make_user("u1", "Alice"));
+    seed.users.push_back(make_user("u2", "Bob"));
+    seed.groups.push_back(make_group("g1", "Engineering"));
+    seed.memberships["g1"] = {"u1", "u2"};
+    REQUIRE(acc.apply_entra_sync(seed).has_value());
+
+    const std::string nul("\0", 1);
+    DirectorySyncTestAccess::EntraSyncData poisoned;
+    poisoned.users.push_back(make_user("u1" + nul, "Alice"));
+    poisoned.users.push_back(make_user("u2" + nul, "Bob"));
+    poisoned.groups.push_back(make_group("g1", "Engineering"));
+    poisoned.memberships["g1"] = {"u1" + nul};
+
+    auto result = acc.apply_entra_sync(poisoned);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() ==
+          "refusing to apply a snapshot in which every user record was skipped");
+    // Two users, plus the one member id that carried a NUL.
+    CHECK(store->skipped_records() == 3);
+
+    // Nothing was deleted or rewritten.
+    auto u1 = store->get_user("u1");
+    auto u2 = store->get_user("u2");
+    REQUIRE(u1.has_value());
+    REQUIRE(u2.has_value());
+    CHECK(u1->groups.size() == 1);
+    CHECK(u2->groups.size() == 1);
+    CHECK(store->get_synced_groups().size() == 1);
+    auto count = store->get_synced_user_count_checked();
+    REQUIRE(count.has_value());
+    CHECK(*count == 2);
+}
+
+TEST_CASE("DirectorySync[pg]: a snapshot whose every group was skipped is refused and the groups "
+          "are left untouched",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    DirectorySyncTestAccess::EntraSyncData seed;
+    seed.users.push_back(make_user("u1", "Alice"));
+    seed.groups.push_back(make_group("g1", "Engineering"));
+    seed.memberships["g1"] = {"u1"};
+    REQUIRE(acc.apply_entra_sync(seed).has_value());
+
+    const std::string nul("\0", 1);
+    DirectorySyncTestAccess::EntraSyncData poisoned;
+    poisoned.users.push_back(make_user("u1", "Alice"));
+    poisoned.groups.push_back(make_group("g1" + nul, "Engineering"));
+
+    auto result = acc.apply_entra_sync(poisoned);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() ==
+          "refusing to apply a snapshot in which every group record was skipped");
+
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0].id == "g1");
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    CHECK(alice->groups.size() == 1);
+}
+
+TEST_CASE("DirectorySync[pg]: a NUL in a membership member id drops that member and is counted",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    const std::string nul("\0", 1);
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", "Alice"));
+    data.users.push_back(make_user("u2", "Bob"));
+    data.groups.push_back(make_group("g1", "Engineering"));
+    data.memberships["g1"] = {"u1", "u2" + nul + "x", "u2"};
+
+    auto result = acc.apply_entra_sync(data);
+    REQUIRE(result.has_value());
+    CHECK(result->users == 2);
+    CHECK(result->groups == 1);
+    // The member id is the only skipped item; no record was removed and no field sanitized.
+    CHECK(result->skipped == 1);
+    CHECK(result->sanitized == 0);
+    CHECK(store->skipped_records() == 1);
+    CHECK(store->sanitized_fields() == 0);
+
+    // The clean members still belong to the group.
+    auto alice = store->get_user("u1");
+    auto bob = store->get_user("u2");
+    REQUIRE(alice.has_value());
+    REQUIRE(bob.has_value());
+    CHECK(alice->groups.size() == 1);
+    CHECK(bob->groups.size() == 1);
+}
+
+TEST_CASE("DirectorySync[pg]: a NUL in a user or group display field keeps the record with U+FFFD "
+          "in place of the NUL",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    const std::string nul("\0", 1);
+    const std::string fffd("\xEF\xBF\xBD");
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", nul + "Alice" + nul));
+    auto group = make_group("g1", "Eng" + nul + "ineering");
+    group.description = "line" + nul + nul + "two";
+    data.groups.push_back(group);
+    data.memberships["g1"] = {"u1"};
+
+    auto result = acc.apply_entra_sync(data);
+    REQUIRE(result.has_value());
+    CHECK(result->skipped == 0);
+    CHECK(result->sanitized == 3); // user display, group display, group description
+    CHECK(store->skipped_records() == 0);
+    CHECK(store->sanitized_fields() == 3);
+
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    CHECK(alice->display_name == fffd + "Alice" + fffd);
+    REQUIRE(alice->groups.size() == 1);
+    CHECK(alice->groups[0] == "Eng" + fffd + "ineering");
+
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0].display_name == "Eng" + fffd + "ineering");
+    CHECK(groups[0].description == "line" + fffd + fffd + "two");
+}
+
+TEST_CASE("DirectorySync[pg]: the status row after a sync with skips reports the stored counts "
+          "and a note",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    // sync_entra reports from the apply result; this drives the same update_status call it makes
+    // with the counts apply_entra_sync returned for a snapshot with one skipped user.
+    const std::string nul("\0", 1);
+    DirectorySyncTestAccess::EntraSyncData data;
+    data.users.push_back(make_user("u1", "Alice"));
+    data.users.push_back(make_user("u2" + nul, "Bob"));
+    data.users.push_back(make_user("u3", "Car" + nul + "ol"));
+    data.groups.push_back(make_group("g1", "Engineering"));
+    auto result = acc.apply_entra_sync(data);
+    REQUIRE(result.has_value());
+    REQUIRE(result->users == 2);
+    REQUIRE(result->groups == 1);
+    REQUIRE(result->skipped == 1);
+    REQUIRE(result->sanitized == 1);
+
+    acc.update_status("entra", "completed", result->users, result->groups,
+                      "1 record(s) skipped, 1 field(s) sanitized (embedded NUL)");
+    auto status = store->get_status();
+    CHECK(status.status == "completed");
+    CHECK(status.user_count == 2); // applied, not the 3 fetched
+    CHECK(status.group_count == 1);
+    CHECK(status.last_error == "1 record(s) skipped, 1 field(s) sanitized (embedded NUL)");
+}
+
+TEST_CASE("DirectorySync[pg]: a status error text with an embedded NUL is still written, with "
+          "U+FFFD in place of the NUL",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+
+    const std::string nul("\0", 1);
+    const std::string fffd("\xEF\xBF\xBD");
+    acc.update_status("entra", "failed", 4, 2,
+                      "fetching members for group Eng" + nul + "ineering failed: boom");
+    auto status = store->get_status();
+    CHECK(status.status == "failed");
+    CHECK(status.user_count == 4);
+    CHECK(status.group_count == 2);
+    CHECK(status.last_error == "fetching members for group Eng" + fffd + "ineering failed: boom");
+}
+
+// ── sync_entra end to end against a local Graph stand-in ─────────────────────
+//
+// These drive `sync_entra` itself (token, users, groups, per-group members, apply, status row)
+// through the test-only Graph base URL and token hooks, so the returned counts, the status row
+// and the stored roster are checked together.
+
+namespace {
+
+nlohmann::json graph_user(const std::string& id, const std::string& display,
+                          const std::string& mail = {}) {
+    nlohmann::json u = nlohmann::json::object();
+    u["id"] = id;
+    u["displayName"] = display;
+    if (!mail.empty())
+        u["mail"] = mail;
+    return u;
+}
+
+nlohmann::json graph_group(const std::string& id, const std::string& display) {
+    nlohmann::json g = nlohmann::json::object();
+    g["id"] = id;
+    g["displayName"] = display;
+    return g;
+}
+
+nlohmann::json graph_ids(const std::vector<std::string>& ids) {
+    nlohmann::json a = nlohmann::json::array();
+    for (const auto& id : ids) {
+        nlohmann::json m = nlohmann::json::object();
+        m["id"] = id;
+        a.push_back(m);
+    }
+    return a;
+}
+
+/// A local server answering the three Graph collections `sync_entra` reads, wired into the
+/// store through its test hooks. Set `users`, `groups` and `members` before calling sync_entra.
+struct GraphStandIn {
+    nlohmann::json users = nlohmann::json::array();
+    nlohmann::json groups = nlohmann::json::array();
+    std::map<std::string, nlohmann::json> members; // group id -> array of {"id": ...}
+    std::mutex mu;
+    std::vector<std::string> member_requests; // group ids a members request was made for
+    // Declared last so it is destroyed first: its handlers read the members above, and must
+    // have stopped before any of them is gone.
+    LocalGraphServer graph;
+
+    explicit GraphStandIn(DirectorySync& store) {
+        graph.svr.Get("/users", [this](const httplib::Request&, httplib::Response& res) {
+            nlohmann::json body = nlohmann::json::object();
+            body["value"] = users;
+            res.set_content(body.dump(), "application/json");
+        });
+        graph.svr.Get("/groups", [this](const httplib::Request&, httplib::Response& res) {
+            nlohmann::json body = nlohmann::json::object();
+            body["value"] = groups;
+            res.set_content(body.dump(), "application/json");
+        });
+        graph.svr.Get(R"(/groups/([^/]+)/members)",
+                      [this](const httplib::Request& req, httplib::Response& res) {
+                          const std::string group_id = req.matches[1];
+                          {
+                              std::lock_guard<std::mutex> lock(mu);
+                              member_requests.push_back(group_id);
+                          }
+                          nlohmann::json body = nlohmann::json::object();
+                          auto it = members.find(group_id);
+                          body["value"] =
+                              it == members.end() ? nlohmann::json::array() : it->second;
+                          res.set_content(body.dump(), "application/json");
+                      });
+        graph.start();
+        store.test_hook_graph_base_url_ = graph.url("");
+        store.test_hook_acquire_token_ =
+            [](const EntraConfig&) -> std::expected<std::string, std::string> {
+            return std::string("test-token");
+        };
+    }
+};
+
+EntraConfig test_entra_config() {
+    EntraConfig cfg;
+    cfg.tenant_id = "tenant-test";
+    cfg.client_id = "client-test";
+    cfg.client_secret = "secret-test";
+    return cfg;
+}
+
+} // namespace
+
+TEST_CASE("DirectorySync[pg]: sync_entra returns, stores and records the same applied counts "
+          "when records carry a NUL",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    GraphStandIn graph{*store};
+    const std::string nul("\0", 1);
+    const std::string fffd("\xEF\xBF\xBD");
+
+    // A user removed upstream, so the sync also has a removal to apply.
+    DirectorySyncTestAccess acc{*store};
+    DirectorySyncTestAccess::EntraSyncData seed;
+    seed.users.push_back(make_user("u_gone", "Removed Upstream"));
+    seed.groups.push_back(make_group("g_old", "Old"));
+    REQUIRE(acc.apply_entra_sync(seed).has_value());
+
+    graph.users.push_back(graph_user("u1", "Alice"));
+    graph.users.push_back(graph_user("u2", "Bob" + nul + "Poisoned")); // display field
+    graph.users.push_back(graph_user("u3", "Carol", "carol" + nul + "@example.com")); // key field
+    graph.users.push_back(graph_user("u4", "Dana"));
+    graph.groups.push_back(graph_group("g1", "Engineering"));
+    graph.groups.push_back(graph_group("g2" + nul, "Poisoned id")); // key field
+    graph.members["g1"] = graph_ids({"u1", "u2", "u3", "u9" + nul}); // the last id has a NUL
+
+    auto result = store->sync_entra(test_entra_config());
+    REQUIRE(result.has_value());
+
+    // Skipped: user u3, group "g2<NUL>", the member id "u9<NUL>". Sanitized: u2's display name.
+    CHECK(result->users == 3);
+    CHECK(result->groups == 1);
+    CHECK(result->skipped == 3);
+    CHECK(result->sanitized == 1);
+
+    // The group whose id has a NUL is never asked for its members.
+    {
+        std::lock_guard<std::mutex> lock(graph.mu);
+        CHECK(graph.member_requests == std::vector<std::string>{"g1"});
+    }
+
+    // The status row reports the same counts and says what was left out.
+    auto status = store->get_status();
+    CHECK(status.status == "completed");
+    CHECK(status.user_count == result->users);
+    CHECK(status.group_count == result->groups);
+    CHECK(status.last_error == "3 record(s) skipped, 1 field(s) sanitized (embedded NUL)");
+
+    // The roster holds exactly what was returned.
+    auto count = store->get_synced_user_count_checked();
+    REQUIRE(count.has_value());
+    CHECK(*count == result->users);
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0].id == "g1");
+    auto bob = store->get_user("u2");
+    REQUIRE(bob.has_value());
+    CHECK(bob->display_name == "Bob" + fffd + "Poisoned");
+    REQUIRE(bob->groups.size() == 1);
+    CHECK(bob->groups[0] == "Engineering");
+    CHECK_FALSE(store->get_user("u3").has_value());
+    CHECK(store->get_user("u4").has_value());
+    CHECK_FALSE(store->get_user("u_gone").has_value());
+
+    CHECK(store->skipped_records() == 3);
+    CHECK(store->sanitized_fields() == 1);
+}
+
+TEST_CASE("DirectorySync[pg]: sync_entra refuses a snapshot in which every record of a kind was "
+          "skipped and leaves the roster unchanged",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    GraphStandIn graph{*store};
+    const std::string nul("\0", 1);
+
+    DirectorySyncTestAccess acc{*store};
+    DirectorySyncTestAccess::EntraSyncData seed;
+    seed.users.push_back(make_user("u1", "Alice"));
+    seed.users.push_back(make_user("u2", "Bob"));
+    seed.groups.push_back(make_group("g1", "Engineering"));
+    seed.memberships["g1"] = {"u1", "u2"};
+    REQUIRE(acc.apply_entra_sync(seed).has_value());
+
+    std::string expected_error;
+    SECTION("every user record") {
+        graph.users.push_back(graph_user("u1" + nul, "Alice"));
+        graph.users.push_back(graph_user("u2" + nul, "Bob"));
+        graph.groups.push_back(graph_group("g1", "Engineering"));
+        expected_error = "refusing to apply a snapshot in which every user record was skipped";
+    }
+    SECTION("every group record") {
+        graph.users.push_back(graph_user("u1", "Alice"));
+        graph.users.push_back(graph_user("u2", "Bob"));
+        graph.groups.push_back(graph_group("g1" + nul, "Engineering"));
+        expected_error = "refusing to apply a snapshot in which every group record was skipped";
+    }
+
+    auto result = store->sync_entra(test_entra_config());
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == expected_error);
+
+    auto status = store->get_status();
+    CHECK(status.status == "failed");
+    CHECK(status.last_error == expected_error);
+
+    // Nothing was deleted or rewritten.
+    auto count = store->get_synced_user_count_checked();
+    REQUIRE(count.has_value());
+    CHECK(*count == 2);
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0].id == "g1");
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    CHECK(alice->groups.size() == 1);
+}
+
+TEST_CASE("DirectorySync[pg]: sync_entra on a clean snapshot returns the incoming counts and "
+          "records no note",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    GraphStandIn graph{*store};
+
+    graph.users.push_back(graph_user("u1", "Alice", "alice@example.com"));
+    graph.users.push_back(graph_user("u2", "Bob"));
+    graph.groups.push_back(graph_group("g1", "Engineering"));
+    graph.members["g1"] = graph_ids({"u1", "u2"});
+
+    auto result = store->sync_entra(test_entra_config());
+    REQUIRE(result.has_value());
+    CHECK(result->users == 2);
+    CHECK(result->groups == 1);
+    CHECK(result->skipped == 0);
+    CHECK(result->sanitized == 0);
+
+    auto status = store->get_status();
+    CHECK(status.status == "completed");
+    CHECK(status.user_count == 2);
+    CHECK(status.group_count == 1);
+    CHECK(status.last_error.empty());
+    CHECK(store->skipped_records() == 0);
+    CHECK(store->sanitized_fields() == 0);
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    CHECK(alice->groups.size() == 1);
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a directory sync audits and answers with the counts that sync "
+          "applied",
+          "[directory_sync][pg][routes][validation]") {
+    DirectorySyncPg store;
+    GraphStandIn graph{*store};
+    DirectoryRouteHarness h{store.get()};
+    const std::string nul("\0", 1);
+
+    graph.users.push_back(graph_user("u1", "Alice"));
+    graph.users.push_back(graph_user("u2", "Bob" + nul + "Poisoned")); // sanitized, kept
+    graph.users.push_back(graph_user("u3" + nul, "Carol"));            // skipped
+    graph.groups.push_back(graph_group("g1", "Engineering"));
+    graph.members["g1"] = graph_ids({"u1", "u2"});
+
+    auto res = h.sink.Post(
+        "/api/directory/sync",
+        R"({"provider":"entra","tenant_id":"t","client_id":"c","client_secret":"s"})",
+        "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["status"] == "completed");
+    CHECK(body["user_count"] == 2);
+    CHECK(body["group_count"] == 1);
+
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "directory.sync");
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].target_id == "entra");
+    CHECK(h.audits[0].detail ==
+          "Entra ID sync completed applied_users=2 applied_groups=1 skipped=1");
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a refused directory sync answers 500, audits a fixed failure and "
+          "leaves the roster alone",
+          "[directory_sync][pg][routes][validation]") {
+    DirectorySyncPg store;
+    GraphStandIn graph{*store};
+    DirectoryRouteHarness h{store.get()};
+    const std::string nul("\0", 1);
+
+    DirectorySyncTestAccess acc{*store};
+    DirectorySyncTestAccess::EntraSyncData seed;
+    seed.users.push_back(make_user("u1", "Alice"));
+    seed.groups.push_back(make_group("g1", "Engineering"));
+    REQUIRE(acc.apply_entra_sync(seed).has_value());
+
+    graph.users.push_back(graph_user("u1" + nul, "Alice"));
+    graph.groups.push_back(graph_group("g1", "Engineering"));
+
+    auto res = h.sink.Post(
+        "/api/directory/sync",
+        R"({"provider":"entra","tenant_id":"t","client_id":"c","client_secret":"s"})",
+        "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"] ==
+          "refusing to apply a snapshot in which every user record was skipped");
+
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].detail == "sync_failed");
+    auto count = store->get_synced_user_count_checked();
+    REQUIRE(count.has_value());
+    CHECK(*count == 1);
+}
+
+TEST_CASE("DirectorySync[pg]: update_status reports whether the status row was written",
+          "[directory_sync][pg][validation]") {
+    DirectorySyncPg store;
+    DirectorySyncTestAccess acc{*store};
+    CHECK(acc.update_status("entra", "completed", 1, 1));
+    CHECK(store->get_status().status == "completed");
+
+    // A closed store cannot write the row, and says so.
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "this is not a valid postgres conninfo!!!", .size = 1}};
+    REQUIRE_FALSE(bad_pool.valid());
+    DirectorySync closed{bad_pool};
+    DirectorySyncTestAccess closed_acc{closed};
+    CHECK_FALSE(closed_acc.update_status("entra", "completed", 1, 1));
+
+    // An open store whose statement fails also reports false.
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult renamed = pg::exec_params(
+            lease.get(), "ALTER TABLE directory_sync.directory_sync_status RENAME TO status_moved",
+            std::vector<std::string>{});
+        REQUIRE(renamed.ok());
+    }
+    CHECK_FALSE(acc.update_status("entra", "failed", 0, 0, "boom"));
+}
+
+TEST_CASE("DiscoveryRoutes[pg]: a directory sync whose status row cannot be written still reports "
+          "the counts it applied",
+          "[directory_sync][pg][routes][validation]") {
+    DirectorySyncPg store;
+    GraphStandIn graph{*store};
+    DirectoryRouteHarness h{store.get()};
+
+    graph.users.push_back(graph_user("u1", "Alice"));
+    graph.users.push_back(graph_user("u2", "Bob"));
+    graph.groups.push_back(graph_group("g1", "Engineering"));
+    graph.members["g1"] = graph_ids({"u1", "u2"});
+
+    // Refuse any write of a 'completed' status row. The 'running' row written at the start of
+    // the sync is unaffected, so after the sync the row still says 'running' with zero counts.
+    {
+        auto lease = store.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "CREATE FUNCTION directory_sync.yuzu_test_refuse_completed() "
+                                "RETURNS trigger LANGUAGE plpgsql AS "
+                                "$$ BEGIN RAISE EXCEPTION 'status write refused'; END $$",
+                                std::vector<std::string>{})
+                    .ok());
+        REQUIRE(pg::exec_params(lease.get(),
+                                "CREATE TRIGGER yuzu_test_refuse_completed "
+                                "BEFORE INSERT OR UPDATE ON directory_sync.directory_sync_status "
+                                "FOR EACH ROW WHEN (NEW.status = 'completed') "
+                                "EXECUTE FUNCTION directory_sync.yuzu_test_refuse_completed()",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+
+    auto res = h.sink.Post(
+        "/api/directory/sync",
+        R"({"provider":"entra","tenant_id":"t","client_id":"c","client_secret":"s"})",
+        "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["status"] == "completed");
+    CHECK(body["user_count"] == 2);
+    CHECK(body["group_count"] == 1);
+
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "directory.sync");
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail ==
+          "Entra ID sync completed applied_users=2 applied_groups=1 skipped=0");
+
+    // The status write failed, so the stored row is not 'completed' and carries no counts.
+    auto status = store->get_status();
+    CHECK(status.status != "completed");
+    CHECK(status.user_count == 0);
+    CHECK(status.group_count == 0);
+
+    // The roster was applied.
+    auto count = store->get_synced_user_count_checked();
+    REQUIRE(count.has_value());
+    CHECK(*count == 2);
+    auto groups = store->get_synced_groups();
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0].id == "g1");
+    auto alice = store->get_user("u1");
+    REQUIRE(alice.has_value());
+    REQUIRE(alice->groups.size() == 1);
+    CHECK(alice->groups[0] == "Engineering");
 }

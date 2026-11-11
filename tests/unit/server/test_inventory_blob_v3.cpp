@@ -703,6 +703,7 @@ TEST_CASE("install_type_for: the source table is total over kSoftwareSources",
     CHECK(install_type_for("runtimes.dotnet", "") == "runtime");
     CHECK(install_type_for("runtimes.jvm", "") == "runtime");
     CHECK(install_type_for("middleware.ibm_mq", "") == "middleware");
+    CHECK(install_type_for("hardware.drivers_inventory", "") == "driver");
 }
 
 TEST_CASE("install_type_for: installed_apps rows read their Linux package ecosystem",

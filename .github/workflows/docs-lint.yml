@@ -273,6 +273,14 @@ jobs:
       - name: Release artifact gate
         run: python3 tests/test_check_release_artifacts.py
 
+      # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): no
+      # server build or server installer in release.yml's Windows/macOS jobs,
+      # no old archive name, and one set of archive names across release.yml,
+      # check-release-artifacts.sh and build-agent-bundle.sh. Mutation-tests
+      # itself. Stdlib only.
+      - name: Agent-only release lint
+        run: python3 -I tests/test_release_agent_only.py
+
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,
       # ratcheted against a by-name baseline that only

@@ -242,7 +242,6 @@ std::expected<DevicesRequest, std::string> parse_devices_params(const Params& p)
 }
 
 std::optional<std::string> strict_args_error(const nlohmann::json& args) {
-    constexpr std::string_view kKinds[] = {"package", "app", "pkg", "feat"};
     if (!args.is_object())
         return std::nullopt;
     struct StrKey {
@@ -260,8 +259,9 @@ std::optional<std::string> strict_args_error(const nlohmann::json& args) {
         if (args[k.key].get_ref<const std::string&>().size() > k.max)
             return std::string(k.key) + " is too long";
     }
-    if (args.contains("kind") &&
-        std::ranges::find(kKinds, args["kind"].get<std::string>()) == std::end(kKinds))
+    if (args.contains("kind") && std::ranges::none_of(sc::kSoftwareKinds, [&](const auto& k) {
+            return k.value == args["kind"].get<std::string>();
+        }))
         return "kind is not one of the published kinds";
     if (args.contains("ecosystem") &&
         std::ranges::none_of(sc::kEcosystemFamilies, [&](const auto& e) {

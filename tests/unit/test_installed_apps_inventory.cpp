@@ -451,7 +451,7 @@ TEST_CASE("pipe_safe deletes framing/separator bytes", "[installed_apps][invento
     CHECK(pipe_safe("").empty());
 }
 
-TEST_CASE("format_inv_row owns the 13-token layout", "[installed_apps][inventory]") {
+TEST_CASE("format_inv_row owns the 14-token layout", "[installed_apps][inventory]") {
     InvRecord r;
     r.name = "bash";
     r.version = "5.2.21";
@@ -467,7 +467,7 @@ TEST_CASE("format_inv_row owns the 13-token layout", "[installed_apps][inventory
     r.distro_version = "40";
     CHECK(format_inv_row(r) ==
           "inv|bash|5.2.21|Fedora Project|Mon 01 Jan 2026|package|rpm|0|3.fc40|x86_64|signed|"
-          "fedora|40");
+          "fedora|40|");
 
     SECTION("empty fields stay empty tokens -- no placeholder synthesis") {
         InvRecord app;
@@ -476,7 +476,15 @@ TEST_CASE("format_inv_row owns the 13-token layout", "[installed_apps][inventory
         app.publisher = "Google LLC";
         app.kind = "app";
         app.ecosystem = "windows";
-        CHECK(format_inv_row(app) == "inv|Google Chrome|126.0|Google LLC||app|windows||||||");
+        CHECK(format_inv_row(app) == "inv|Google Chrome|126.0|Google LLC||app|windows|||||||");
+    }
+    SECTION("install_location is the 14th token") {
+        InvRecord app;
+        app.name = "Alpha";
+        app.kind = "app";
+        app.ecosystem = "windows";
+        app.install_location = "C:\\Program Files\\Alpha";
+        CHECK(format_inv_row(app) == "inv|Alpha||||app|windows|||||||C:\\Program Files\\Alpha");
     }
     SECTION("pipe in a value cannot shift fields") {
         InvRecord bad;
@@ -484,8 +492,17 @@ TEST_CASE("format_inv_row owns the 13-token layout", "[installed_apps][inventory
         bad.kind = "app";
         bad.ecosystem = "windows";
         const std::string row = format_inv_row(bad);
-        CHECK(row == "inv|EvilApp||||app|windows||||||");
-        // Exactly 12 separators after the prefix regardless of input bytes.
-        CHECK(std::count(row.begin(), row.end(), '|') == 12);
+        CHECK(row == "inv|EvilApp||||app|windows|||||||");
+        // Exactly 13 separators after the prefix regardless of input bytes.
+        CHECK(std::count(row.begin(), row.end(), '|') == 13);
+    }
+    SECTION("a pipe in the location becomes U+FFFD (not deleted); tab, CR and LF are dropped") {
+        InvRecord app;
+        app.name = "A";
+        app.install_location = "C:\\Pro|gram\tF\r\nile";
+        const std::string row = format_inv_row(app);
+        CHECK(row.ends_with("|C:\\Pro\xEF\xBF\xBDgramFile"));
+        CHECK(std::count(row.begin(), row.end(), '|') == 13);
+        CHECK(row.find('\n') == std::string::npos);
     }
 }
