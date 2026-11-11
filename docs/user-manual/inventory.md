@@ -741,22 +741,57 @@ curl -H "Authorization: Bearer $TOKEN" \
 # Everything on one device
 curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
+
+# The zero-day question, in one call each. Which devices run an affected version range of a
+# title, still confirmed by their last poll (status=current), with the fleet totals for an
+# unfiltered caller (a version filter reads the totals live, so it is not affected by the
+# catalogue ceiling):
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&status=current"
+# The same for a component bundled inside applications (empty until agents report components):
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software/components?name=log4j-core&version_min=2.0&version_max=2.14.1"
+# Hand the device list over as a file (up to 10,000 rows per call; follow X-Next-Cursor for more):
+curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
+  "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&format=csv"
 ```
 
 - Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
   selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
-  `ecosystem`, `source` (exact), `limit` (max 1000; 10000 with `format`), `cursor` and `format` (`json` or
-  `csv`: an export). Omit `name` and `agent_id` for a fleet-wide scan. The full parameter
-  and error tables are in [rest-api.md](rest-api.md); `q`, `kind`, `ecosystem` and
-  `source` are REST-only (the MCP tool takes `name`, `agent_id`, `version`, `limit` and
-  `cursor`).
-- Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
-  "meta": {"api_version": "v1"}}`. Each row has 14 fields: `{agent_id, name, version,
-  publisher, install_date, kind, ecosystem, epoch, release, arch, signature_status,
-  distro_id, distro_version, source}` — the v2 fields are `""` where the ecosystem does not
-  store them (see the availability matrix above), and `source` is the
-  `<plugin>.<action>` that produced the row. The MCP tool's rows carry the identical
-  field set.
+  `ecosystem`, `source` (exact), `match` (`exact`, `prefix` or `contains` for `name`),
+  `version_min` / `version_max` (inclusive version range), `status`, `limit` (max 1000; 10000
+  with `format`), `cursor` and `format` (`json` or `csv`: an export). Omit `name` and
+  `agent_id` for a fleet-wide scan. The full parameter and error tables are in
+  [rest-api.md](rest-api.md); everything except `name`, `agent_id`, `version`, `limit` and
+  `cursor` is REST-only (the MCP tool takes only those).
+- Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
+  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 22 fields: the 14
+  package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
+  release, arch, signature_status, distro_id, distro_version, source}` — `""` where the
+  ecosystem does not store them (see the availability matrix above); `source` is the
+  `<plugin>.<action>` that produced the row — plus the lookup fields `hostname`, `last_seen`
+  (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
+  `last_confirmed_at`, `install_type`, `install_scope`, `install_location` and
+  `instance_key`. The MCP tool's rows keep the 14 package fields until its twin catches up.
+- **Lookup totals.** For an exact `name`, an unfiltered (global) caller also gets `totals`
+  (install rows and distinct devices); a management-group-confined caller gets its rows and
+  `totals: null` with `totals_omitted: "scope"`: **null means not shown, never zero**. The
+  totals rule, the `totals_omitted` reasons and the version-range limit are in
+  [rest-api.md](rest-api.md#get-apiv1inventorysoftware).
+- **Components.** [`GET /api/v1/inventory/software/components`](rest-api.md#get-apiv1inventorysoftwarecomponents)
+  answers the same question for components found inside applications, under the same gate,
+  scope confinement, status and `totals` rule; its totals come from an hourly rollup on the
+  catalogue rollup's thread (`yuzu_inventory_component_rollup_total{outcome}`, both outcomes
+  seeded at 0 so the first failure is an increase; `yuzu_inventory_component_rollup_duration_seconds`;
+  `yuzu_inventory_component_rollup_last_success_timestamp`, seeded 0 until the first success;
+  watched by the shipped rules `YuzuInventoryComponentRollupStale` and
+  `YuzuInventoryComponentRollupFailing`).
+  The refresh runs at server start and then hourly, with no manual trigger (a restart runs
+  one at once; a restart disconnects that replica's agents, so restart one replica at a
+  time); a failed, cancelled or over-budget refresh keeps the last-good rollup and its
+  stamp, and the figures read `building` until the first refresh completes. The freshness
+  stamp is the single row `component_rollup_meta` (`id = 1`), seeded by the schema: if that
+  row is deleted every refresh fails (keep-last-good) until it is restored, so never delete it.
 - **Carries the same scope push-down as the MCP tool** — the SAME
   `require_fleet_read` gate, so REST and MCP cannot observe a different
   admit/filter decision for the same caller (see the MCP note above). A positive
@@ -1306,12 +1341,16 @@ hourly by the background `SoftwareCatalogRollup` thread) emits three further ser
 
 - `yuzu_inventory_catalog_rollup_total{outcome}` (counter, outcome ∈ `success` / `error`)
   — one per recompute attempt that completes or fails (a shutdown-cancelled attempt is
-  not counted as an error). A rising `error` count with a frozen
+  not counted as an error); both outcome series are seeded at 0 when the rollup thread
+  starts, so the first failure is an increase a rate rule can see. A rising `error` count with a frozen
   `…_last_success_timestamp` means recomputes are failing (PG outage, a statement over
   its 60 s limit, or the 10-minute whole-refresh limit exceeded at scale) and the
   catalogue is going stale; keep-last-good serves the prior rollup meanwhile, except for
-  the first refresh after the v8 upgrade, which has no last-good and leaves the catalogue
-  "building". The failing statement and its cause are in the server log (warning).
+  a first refresh that has no last-good (a fresh deployment whose refresh fails or never
+  fits its limit), which leaves the catalogue "building" for as long as the refreshes keep
+  failing; on a fleet above the ceiling below that is permanent until the rollup is made
+  incremental. The first-boot `building` window and what reads it are described in
+  [upgrading.md](upgrading.md). The failing statement and its cause are in the server log (warning).
 - `yuzu_inventory_catalog_rollup_duration_seconds` (gauge) — the last recompute's
   whole-refresh wall-clock. Compare it with the two compile-time limits (not flags): 60 s
   per statement and 600 s for the whole refresh. A value rising towards either is the

@@ -14,6 +14,7 @@
 #include "execution_event_scope.hpp"
 #include "execution_scope_rules.hpp" // execution_visible / confined_projection (shared with GET /api/v1/executions)
 #include "http_route_sink.hpp"
+#include "instruction_execute.hpp" // instruction_execute::definition_needs_approval (#7110 post-row recheck)
 #include "instruction_param_schema.hpp" // ParamValidatorCache: stored parameter_schema enforcement
 #include "name_lookup_memo.hpp"  // Operate O1: one render's definition-name lookups
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
@@ -33,6 +34,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_token (the post-row recheck's audit detail and log lines)
 
 #include <algorithm>
 #include <cctype>
@@ -3878,6 +3880,30 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 execution_id = *created;
             }
         }
+        // Closes the row above for a command that was never sent (a recheck refusal, a
+        // dispatch that threw, a dispatch that reached nobody); a failed cancel is logged and
+        // counted like every other mark_cancelled failure (#4982 Fix 5). A throwing cancel is a
+        // failed cancel, as on the v1 twins: this lambda also runs inside the dispatch catch
+        // below, where a second throw would escape the handler and leave the row `running`.
+        const auto cancel_execution_row = [&] {
+            if (!execution_tracker || execution_id.empty())
+                return;
+            bool cancelled = false;
+            try {
+                cancelled = execution_tracker->mark_cancelled(execution_id, session->username);
+            } catch (...) {
+                cancelled = false;
+            }
+            if (cancelled)
+                return;
+            spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
+                          execution_id);
+            if (metrics)
+                metrics
+                    ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                              {{"op", "mark_cancelled"}, {"surface", "workflow"}})
+                    .increment();
+        };
 
         // Dispatch
         std::string command_id;
@@ -3907,14 +3933,72 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::string dispatch_scope = (agent_ids.empty() && scope_expr.empty())
                                                    ? std::string(kBroadcastScope)
                                                    : scope_expr;
+            // #7110: the execution row above is this route's last own write before the send,
+            // and the route gate and the definition's `approval_mode` were decided on the
+            // entry session; a grant, or the administrator standing a `role-gated` definition
+            // requires (a JIT elevation), can lapse while that row is written. The chokepoint
+            // re-decides only the pair's own gate on `caller`, so decide both again here on the
+            // fresh caller, with the predicate the v1 twins use (instruction_execute.cpp 8b).
+            // The row exists, so a refusal closes it; it never queues an approval. A grant
+            // moving inside the chokepoint's own provenance write is not caught here (the
+            // recorded limit of the dispatch chokepoint, docs/user-manual/rest-api.md
+            // 'Refused after the audit row').
+            // The `denied` row is a raw `audit_fn` call on purpose: this file's AuditFn is
+            // void-returning (see the #4030 note on the detail route above), the handler
+            // writes no `requested` row, and every other row it writes is the same raw
+            // call, so there is no `Sec-Audit-Failed` posture here to keep.
+            const auto refuse_after_row = [&](const std::string& gate) {
+                if (audit_fn)
+                    audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                             "reason=permission_revoked gate=" + gate +
+                                 " execution_id=" + execution_id);
+                cancel_execution_row();
+                res.status = 403;
+                res.set_content(
+                    detail::a4_error(res, "permission revoked after the request was recorded",
+                                     {.remediation = "this request was not dispatched; the "
+                                                     "permission or administrator standing it "
+                                                     "needs was withdrawn while it was being "
+                                                     "recorded. Retrying will not help until it "
+                                                     "is granted again"}),
+                    "application/json");
+            };
             // K-R7-02 / PLAN-006: confine to AND identify the operator via the
             // shared dispatch_confined seam. `session` is already resolved
             // above; re-derive from the request (fail CLOSED on visibility if
             // the callback is unwired — present-empty set → reaches nobody).
-            const yuzu::server::DispatchCaller caller =
-                caller_fn ? caller_fn(req)
-                          : yuzu::server::DispatchCaller{
-                                .exec_visible = yuzu::server::authz::deny_all()};
+            // The derivation and both decisions are one recheck: a throw inside any of
+            // them (a store fault) is a withdrawn permission, refused like the twins
+            // (`gate=exception` on the row), never the generic 500 of the dispatch catch
+            // below, which would close the row with no audit row. Only the decisions sit
+            // in this try (the refusal is written after it, as the twins do), so a fault
+            // while writing the refusal is not re-labelled `gate=exception` and written twice.
+            std::optional<std::string> withdrawn_gate; // the gate that refused; empty == both held
+            yuzu::server::DispatchCaller caller;
+            try {
+                caller = caller_fn ? caller_fn(req)
+                                   : yuzu::server::DispatchCaller{
+                                         .exec_visible = yuzu::server::authz::deny_all()};
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    withdrawn_gate = "route";
+                else if (instruction_execute::definition_needs_approval(
+                             def.approval_mode, caller.principal_is_admin))
+                    withdrawn_gate = "approval_mode mode=" + ::yuzu::log_token(def.approval_mode);
+            } catch (const std::exception& e) {
+                spdlog::error("instruction execute: the post-row recheck threw for '{}' "
+                              "execution_id={}; refused as permission_revoked: {}",
+                              ::yuzu::log_token(def_id), execution_id, e.what());
+                withdrawn_gate = "exception";
+            } catch (...) {
+                spdlog::error("instruction execute: the post-row recheck threw for '{}' "
+                              "execution_id={}; refused as permission_revoked: unknown exception",
+                              ::yuzu::log_token(def_id), execution_id);
+                withdrawn_gate = "exception";
+            }
+            if (withdrawn_gate) {
+                refuse_after_row(*withdrawn_gate);
+                return;
+            }
             // ADR-1007: per-device concurrency gate, when wired.
             const auto dispatch_outcome =
                 cmd_dispatch_concurrency
@@ -3939,36 +4023,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // forever on dispatch failure. mark_cancelled records the
             // attempt for forensic audit instead of orphaning it as a
             // phantom in-flight run that the LIST handler keeps showing.
-            if (execution_tracker && !execution_id.empty() &&
-                !execution_tracker->mark_cancelled(execution_id, session->username)) {
-                spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
-                              execution_id);
-                // #4982 fix round 2 (Fix 5): log-only swallowed the failure with
-                // no observable signal — count it alongside the log line,
-                // matching Part A's REST/MCP instrumentation pattern.
-                if (metrics)
-                    metrics
-                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                  {{"op", "mark_cancelled"}, {"surface", "workflow"}})
-                        .increment();
-            }
+            cancel_execution_row();
             res.status = 500;
             res.set_content(detail::a4_error(res, "dispatch failed"), "application/json");
             return;
         }
 
         if (sent == 0) {
-            if (execution_tracker && !execution_id.empty() &&
-                !execution_tracker->mark_cancelled(execution_id, session->username)) {
-                spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
-                              execution_id);
-                // #4982 fix round 2 (Fix 5)
-                if (metrics)
-                    metrics
-                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                  {{"op", "mark_cancelled"}, {"surface", "workflow"}})
-                        .increment();
-            }
+            cancel_execution_row();
             // #881/#3424/#3511: "no agents reached" covers several distinct
             // causes this route did not used to discriminate — every target
             // withheld by quarantine, the containment gate failing closed
