@@ -724,7 +724,7 @@ TEST_CASE("resolve_scope_targets: an Unresolvable registry evaluation aborts as 
 }
 
 TEST_CASE("resolve_scope_targets: a ResultSetUnusable registry evaluation aborts as "
-          "result_set_unusable, matched absent",
+          "result_set_unusable and matched is absent",
           "[server][dispatch][scope]") {
     std::string aborted_reason;
     ScopeLadderAudit audit;
