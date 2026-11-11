@@ -367,6 +367,23 @@ async function scenarioDexApps(page) {
     });
     check('dex-apps golden: a 256-character unbroken application name stays inside its cell',
       fit.scroll <= fit.client, JSON.stringify(fit));
+
+    // At the 1000 px breakpoint the table drops to table-layout:auto, where an unset overflow-wrap
+    // lets the first column shrink to its longest break opportunity. An ordinary name must stay on
+    // one line; the anchor is measured against its own nowrap height, so no font metric is assumed.
+    await page.setViewport({ width: 1000, height: DESKTOP.height });
+    const narrow = await page.evaluate(() => {
+      const a = document.querySelector('tbody.dx-app .dx-apphead td:first-child > a');
+      a.textContent = 'msedgewebview2.exe';
+      const wrapped = a.offsetHeight;
+      a.style.whiteSpace = 'nowrap';
+      const oneLine = a.offsetHeight;
+      a.style.whiteSpace = '';
+      return { wrapped, oneLine, layout: getComputedStyle(a.closest('table')).tableLayout };
+    });
+    check('dex-apps golden: at 1000 px an ordinary long application name stays on one line',
+      narrow.wrapped === narrow.oneLine && narrow.layout === 'auto', JSON.stringify(narrow));
+    await page.setViewport(DESKTOP);
   }
   await quiesce(page);
   check('dex-apps golden: no page error and no CSP violation while the stubbed page is exercised',
