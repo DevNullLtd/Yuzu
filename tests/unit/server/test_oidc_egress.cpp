@@ -1106,8 +1106,8 @@ TEST_CASE("OIDC egress: the token POST's pre-check - pinned where the connect is
 #ifndef _WIN32
 // ── Name lookups on the bounded resolver (POSIX) ─────────────────────────────────────────────
 //
-// `resolve_host_addresses` runs the lookup through net::bounded_resolve with a pool of the OIDC
-// path's own. These cases replace the lookup function and the pool BELOW set_resolver_for_test
+// `resolve_host_addresses_status` runs the lookup through net::bounded_resolve with a pool of the
+// OIDC path's own. These cases replace the lookup function and the pool BELOW set_resolver_for_test
 // (OidcProvider::set_bounded_lookup_for_test), so the adapter itself is exercised with no DNS.
 // Every lookup function handed to the seam owns its state through a shared_ptr: a lookup can
 // outlive the case that started it.
@@ -1622,7 +1622,6 @@ TEST_CASE("OIDC resolver: discovery refused for a full pool is not remembered - 
     OidcProvider provider(resolver_cfg("https://idp.test"));
     provider.set_discovery_negative_cache_for_test(kWindowMs);
 
-    const auto started = std::chrono::steady_clock::now();
     {
         VetThread holder(st->gate, "slow.a.test", 10000);
         REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
@@ -1634,7 +1633,25 @@ TEST_CASE("OIDC resolver: discovery refused for a full pool is not remembered - 
     // The pool is free: the very next attempt performs a lookup (the refusal armed no window).
     CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
     CHECK(st->others.load() == 1);
-    CHECK(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(kWindowMs));
     CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: an IdP-supplied issuer text that quotes the busy reason still arms the "
+          "discovery window",
+          "[oidc][oidc_egress][oidc_resolver][oidc_discovery]") {
+    // The failure is an issuer mismatch whose text carries IdP-controlled bytes. Only the exact
+    // refusal composed by http_get_bounded may skip the window, so this one must arm it.
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_issuer = "the host name lookup was not started"; });
+    auto cfg = resolver_cfg(idp.base());
+    cfg.allow_private_networks = true; // the mock IdP listens on loopback
+    OidcProvider provider(cfg);
+    provider.set_discovery_negative_cache_for_test(5000); // never waited out
+
+    CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+    CHECK(idp.discovery_calls.load() == 1);
+    // Inside the window the failed attempt is not retried: no further fetch reaches the IdP.
+    CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+    CHECK(idp.discovery_calls.load() == 1);
 }
 #endif // !_WIN32

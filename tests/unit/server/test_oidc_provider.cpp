@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -4527,12 +4528,18 @@ TEST_CASE("OIDC sign-in start and callback share the per-source login rate-limit
     std::ostringstream ss;
     ss << in.rdbuf();
     const auto text = ss.str();
-    const auto at = text.find("auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;");
+    const auto at =
+        text.find("auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;");
     REQUIRE(at != std::string::npos);
-    const auto window = text.substr(at > 3000 ? at - 3000 : 0, at > 3000 ? 3000 : at);
-    CHECK(window.find("(req.path == \"/auth/oidc/start\" && req.method == \"GET\")") !=
+    // Whitespace-insensitive: column alignment in server.cpp must not break the pin.
+    const auto squash = [](std::string s) {
+        std::erase_if(s, [](unsigned char c) { return std::isspace(c) != 0; });
+        return s;
+    };
+    const auto window = squash(text.substr(at > 3000 ? at - 3000 : 0, at > 3000 ? 3000 : at));
+    CHECK(window.find(squash("(req.path == \"/auth/oidc/start\" && req.method == \"GET\")")) !=
           std::string::npos);
-    CHECK(window.find("(req.path == \"/auth/callback\"   && req.method == \"GET\")") !=
+    CHECK(window.find(squash("(req.path == \"/auth/callback\" && req.method == \"GET\")")) !=
           std::string::npos);
 }
 

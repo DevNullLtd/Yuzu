@@ -929,7 +929,7 @@ constexpr const char* kEgressLookupBusyReason = "the host name lookup was not st
 
 // Decides where ONE fetch may connect, BEFORE any socket exists. A host that is an IP literal is
 // classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver might
-// read differently, such as `127.1`) is resolved here (`resolve_host_addresses`: on POSIX a
+// read differently, such as `127.1`) is resolved here (the OIDC name lookup: on POSIX a
 // detached worker through `net::bounded_resolve`, so the wait ends at the caller's time bound), and
 // EVERY returned address is classified by its bytes. Returns the numeric addresses the connection
 // may be PINNED to (the permitted ones, in resolver order, at most kMaxPinnedAddresses), or an
@@ -984,8 +984,9 @@ BoundedLookupHook& bounded_lookup_hook() {
 
 // Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses. On POSIX the caller
 // stops waiting after `timeout_sec` seconds (the lookup itself may run on until the resolver
-// returns, holding one pool slot). False when the name did not resolve, the lookup timed out or the
-// pool is full. Own function per platform because httplib's helper cannot be consumed
+// returns, holding one pool slot). A failure is reported as false, or on POSIX as a status by
+// `resolve_host_addresses_status` (name did not resolve, lookup timed out, pool full). Own
+// function per platform because httplib's helper cannot be consumed
 // generically: on Windows it returns a GetAddrInfoExW result cast to `addrinfo`, whose layout
 // differs after ai_addr (the blob, blob length and provider fields precede ai_next) and which must
 // be released with FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it
@@ -1098,8 +1099,8 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
     return true;
 }
 #else
-// Same as `resolve_host_addresses`, but reports why a lookup failed (kBusy: nothing was started).
-// kOk with no parsable address is kNotFound.
+// Reports why a lookup failed (kBusy: nothing was started). kOk with no parsable address is
+// kNotFound.
 net::ResolveStatus resolve_host_addresses_status(const std::string& host, int timeout_sec,
                                                  std::vector<ResolvedAddress>& out) {
     net::LookupFn lookup;
@@ -1147,11 +1148,6 @@ net::ResolveStatus resolve_host_addresses_status(const std::string& host, int ti
         }
     }
     return out.size() > before ? net::ResolveStatus::kOk : net::ResolveStatus::kNotFound;
-}
-
-bool resolve_host_addresses(const std::string& host, int timeout_sec,
-                            std::vector<ResolvedAddress>& out) {
-    return resolve_host_addresses_status(host, timeout_sec, out) == net::ResolveStatus::kOk;
 }
 #endif
 
@@ -2626,9 +2622,12 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
             spdlog::error("OidcProvider: discovery failed for issuer {}: {}",
                           ::yuzu::log_key_token(config_.issuer),
                           ::yuzu::log_key_token(doc.error()));
-            // A refusal because the lookup pool was full learned nothing about the issuer, so it
-            // is retried on the next attempt rather than remembered for the window.
-            if (doc.error().find(kEgressLookupBusyReason) == std::string::npos)
+            // A refusal because the lookup pool was full or no worker could be created learned
+            // nothing about the issuer: retried next attempt, not remembered. Matched by equality
+            // with the one text http_get_bounded composes, so IdP-controlled text cannot match.
+            const std::string busy_error =
+                std::string("request failed: ") + kEgressLookupBusyReason;
+            if (doc.error() != busy_error)
                 discovery_retry_after_ = std::chrono::steady_clock::now() + discovery_retry_window_;
             return std::unexpected(std::string(kDiscoveryUnavailable));
         }

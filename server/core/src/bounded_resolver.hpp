@@ -25,7 +25,7 @@
 ///
 /// POOLS IN USE: CRL source registration uses the default process-wide pool (cap
 /// `kMaxInFlightLookups`), which any consumer that passes no pool also gets. OIDC name lookups
-/// (`resolve_host_addresses` in `oidc_provider.cpp`) use their own pool of the same cap, so
+/// (`resolve_host_addresses_status` in `oidc_provider.cpp`) use their own pool of the same cap, so
 /// sign-in and registration do not starve each other.
 ///
 /// CONTRACT FOR CONSUMERS:
