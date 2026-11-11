@@ -879,6 +879,180 @@ TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ap
     CHECK(remediation.find("approval_id") != std::string::npos);
 }
 
+// InstructionDefinition:Write joined the supervised-tier requires_approval() list (#2146 batch C,
+// owner ruling): an unticketed update can flip approval_mode to `auto` or repoint plugin/action,
+// after which a schedule or an operator-tier run needs no human. require_permission mirrors the rule
+// on every non-MCP transport, so a supervised token is refused on the legacy PUT (and the v1 twins);
+// the ticket flow is the MCP update_definition tool. InstructionSet:Write is deliberately not gated.
+TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from approval-gated "
+          "InstructionDefinition:Write on the legacy REST route; InstructionSet:Write unaffected",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-instr-sup", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.path = "/api/instructions/def-1";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_permission(req, res, "InstructionDefinition", "Write"));
+    CHECK(res.status == 403);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["permission"].get<std::string>() == "InstructionDefinition:Write");
+    CHECK(res.body.find("approval") != std::string::npos);
+
+    // Read stays open, and a set carries no authorization consumer so its write is not gated.
+    httplib::Response read_res;
+    CHECK(fix.ar->require_permission(req, read_res, "InstructionDefinition", "Read"));
+    httplib::Response set_res;
+    CHECK(fix.ar->require_permission(req, set_res, "InstructionSet", "Write"));
+}
+
+// ProductPack:Write (POST /api/product-packs) joined the supervised-tier requires_approval() list
+// (owner ruling, batch C fix round): a pack install creates definitions with a pack-supplied
+// approval_mode, so unticketed it bypassed the InstructionDefinition:Write gate. The route has NO
+// MCP tool, so the 403 must not send the caller to a ticket flow that does not exist for it.
+// Turns red if the ProductPack row leaves mcp_policy.hpp (the install then passes) or the
+// remediation goes back to the generic ticket-then-recall text.
+TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from ProductPack:Write on "
+          "the install route; and the hint names no MCP tool",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-pack-sup", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.path = "/api/product-packs";
+    httplib::Response res;
+
+    CHECK_FALSE(fix.ar->require_permission(req, res, "ProductPack", "Write"));
+    CHECK(res.status == 403);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["code"].get<int>() == 403);
+    CHECK(j["error"]["permission"].get<std::string>() == "ProductPack:Write");
+    CHECK(res.body.find("approval") != std::string::npos);
+    const auto remediation = j["error"]["remediation"].get<std::string>();
+    CHECK(remediation.find("no MCP tool") != std::string::npos);
+    CHECK(remediation.find("without an MCP tier") != std::string::npos);
+    CHECK(remediation.find("ticket-then-recall") == std::string::npos);
+    CHECK(remediation.find("_definition") == std::string::npos);
+
+    // Uninstall is the same story (ProductPack:Delete was already gated; its hint was wrong).
+    httplib::Response del_res;
+    req.path = "/api/product-packs/pack-1";
+    CHECK_FALSE(fix.ar->require_permission(req, del_res, "ProductPack", "Delete"));
+    CHECK(nlohmann::json::parse(del_res.body)["error"]["remediation"].get<std::string>().find(
+              "no MCP tool") != std::string::npos);
+
+    // Read stays open.
+    httplib::Response read_res;
+    CHECK(fix.ar->require_permission(req, read_res, "ProductPack", "Read"));
+}
+
+// Gate 8 F10: who else meets the ProductPack:Write approval row, with the real AuthRoutes. The row
+// is keyed on the MCP tier, so a session or token with NO tier (the cookie session, a plain API
+// token) is not touched by it; an engine session is hard-locked to `readonly` and is refused by the
+// tier ladder before the approval row is reached; a service-scoped token is decided by the
+// service-scope branch (RBAC not enforced here: a hard 403), not by the approval row. Turns red if
+// the row starts applying to an untiered caller (a cookie install would 403) or the engine /
+// service-scoped decisions move.
+TEST_CASE("AuthRoutes - ProductPack:Write approval row: untiered and cookie callers pass it; an "
+          "engine session and a service-scoped token are decided by their own branches",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // A plain (untiered) API token: not approval-gated, passes.
+    {
+        auto raw = fix.api_tokens->create_token("pack-plain", "test_user");
+        REQUIRE(raw.has_value());
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        req.path = "/api/product-packs";
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "ProductPack", "Write"));
+    }
+    // A cookie session carries no MCP tier at all: the tier policy has nothing to apply.
+    {
+        auth::Session cookie;
+        cookie.username = "test_user";
+        httplib::Request req;
+        req.path = "/api/product-packs";
+        httplib::Response res;
+        CHECK(fix.ar->require_tier_policy(req, res, cookie, "ProductPack", "Write",
+                                          /*actionable_permission=*/true));
+    }
+    // An engine session (hard-locked to readonly): refused by the tier ladder, 403.
+    {
+        auth::Session engine;
+        engine.username = "engine:svc-1";
+        engine.principal_kind = "engine";
+        engine.mcp_tier = "readonly";
+        httplib::Request req;
+        req.path = "/api/product-packs";
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_tier_policy(req, res, engine, "ProductPack", "Write",
+                                                /*actionable_permission=*/true));
+        CHECK(res.status == 403);
+    }
+    // A service-scoped token: the service-scope branch decides (no RBAC in this fixture), a 403.
+    {
+        auto raw = fix.api_tokens->create_token("pack-svc", "test_user", now + 3600, "finance-svc", "");
+        REQUIRE(raw.has_value());
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        req.path = "/api/product-packs";
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "ProductPack", "Write"));
+        CHECK(res.status == 403);
+    }
+}
+
+// The remediation of an InstructionDefinition:Write 403 depends on the ROUTE: the definition
+// routes have MCP twins and the hint names them; the response-templates routes share the pair and
+// have none, so the hint must not. Turns red if approval_gated_remediation stops reading the path.
+TEST_CASE("AuthRoutes::require_permission - InstructionDefinition 403 hint names the MCP tools only "
+          "where a tool exists",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-instr-hint", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    const auto hint = [&](const char* path, const char* securable, const char* op) {
+        auto req = request_with_header("Authorization", "Bearer " + *raw);
+        req.path = path;
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, securable, op));
+        CHECK(res.status == 403);
+        return nlohmann::json::parse(res.body)["error"]["remediation"].get<std::string>();
+    };
+
+    const auto def_write = hint("/api/v1/instructions", "InstructionDefinition", "Write");
+    CHECK(def_write.find("create_definition") != std::string::npos);
+    CHECK(def_write.find("update_definition") != std::string::npos);
+    CHECK(def_write.find("import_definition") != std::string::npos);
+    CHECK(def_write.find("save_definition_yaml") != std::string::npos);
+    CHECK(def_write.find("approval_id") != std::string::npos);
+    CHECK(def_write.find("expected_updated_at") != std::string::npos);
+
+    const auto def_delete = hint("/api/instructions/def-1", "InstructionDefinition", "Delete");
+    CHECK(def_delete.find("delete_definition") != std::string::npos);
+
+    for (const char* path : {"/api/v1/definitions/def-1/response-templates",
+                             "/api/v1/definitions/def-1/response-templates/t1"}) {
+        INFO(path);
+        const auto rt = hint(path, "InstructionDefinition", "Write");
+        CHECK(rt.find("no MCP tool") != std::string::npos);
+        CHECK(rt.find("without an MCP tier") != std::string::npos);
+        CHECK(rt.find("_definition") == std::string::npos);
+    }
+}
+
 // The "unaffected" side of the rule above: the approval gate is the supervised branch only. An
 // untiered token passes the tier belt for Workflow:Execute (require_tier_policy returns early on an
 // empty tier, so this section guards that early return, not the position of the policy rule; the

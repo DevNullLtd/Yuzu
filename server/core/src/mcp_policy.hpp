@@ -198,6 +198,33 @@ inline bool requires_approval(std::string_view mcp_tier,
         // it here closes both transports via the one shared policy table.
         if (securable_type == "ApiToken" && operation == "Write") return true;
 
+        // InstructionDefinition:Write (create_definition / update_definition / import_definition /
+        // save_definition_yaml, the v1 REST routes and the legacy POST/PUT /api/instructions and
+        // /api/v1/definitions/{id}/response-templates): an unticketed update can flip a
+        // definition's approval_mode from `always` to `auto`, or repoint its plugin/action,
+        // after which an existing schedule (schedule_runner.cpp) or an operator-tier
+        // Execution:Execute run of that definition needs no human. A supervised token therefore
+        // needs a ticket for every definition write, so the write is the one place a human is
+        // asked. That holds only while no sibling path creates definitions unticketed, which is
+        // why ProductPack:Write sits directly below. Because AuthRoutes::require_permission
+        // mirrors this rule on every non-MCP transport, a supervised-tier token is also refused
+        // (403) on those REST routes; the response-templates routes have no MCP tool, so there it
+        // can only use an untiered credential or a browser session. InstructionSet:Write is
+        // deliberately NOT gated: a set carries no authorization consumer. Delete is already
+        // gated by the rule above. validate_definition_yaml is InstructionDefinition:Read and
+        // stays ungated.
+        if (securable_type == "InstructionDefinition" && operation == "Write") return true;
+
+        // ProductPack:Write (POST /api/product-packs; there is no MCP tool for it): a pack install
+        // creates instruction definitions whose approval_mode, plugin and action come from the
+        // pack's own YAML. Unticketed it would be a second way to author a definition with
+        // approval_mode `auto` that bypasses the InstructionDefinition:Write gate above (owner
+        // ruling, batch C fix round). Uninstall is ProductPack:Delete and already gated by the
+        // Delete rule. AuthRoutes::require_permission mirrors this rule, so a supervised-tier
+        // token gets a 403 on the install route and, with no MCP tool to take a ticket, can only
+        // install through an untiered credential or a browser session.
+        if (securable_type == "ProductPack" && operation == "Write") return true;
+
         // ApiToken:Rotate is DELIBERATELY ABSENT — recorded here rather than
         // left silent-by-omission (PR #2974 review).
         //

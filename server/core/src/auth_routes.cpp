@@ -193,13 +193,41 @@ struct AuditProbeScope {
 // The remediation for a supervised-tier token refused on a non-MCP transport. The generic text
 // names the flow; a pair with a named MCP tool also names the tool and what it needs, because
 // the contract (a required idempotency_key, the approval_id on the repeat call) cannot be
-// guessed from "ticket-then-recall". EXTEND this function when a pair gains a tool, never fork.
-std::string approval_gated_remediation(std::string_view securable_type, std::string_view operation) {
+// guessed from "ticket-then-recall". A route with NO MCP twin must not be pointed at a ticket
+// flow that does not exist for it: it says the route needs a credential without an MCP tier or a
+// browser session. That is why the REQUEST PATH is an input: the pair alone cannot tell the
+// definition tools' REST twins from the response-templates routes, which share the pair and have
+// no tool. EXTEND this function when a pair gains a tool, never fork.
+std::string approval_gated_remediation(std::string_view securable_type, std::string_view operation,
+                                       std::string_view path) {
     if (securable_type == "Workflow" && operation == "Execute")
         return "this operation is approval-gated for the supervised MCP tier; call the MCP "
                "execute_workflow tool (POST /mcp/v1/) with an idempotency_key: the first call "
                "returns an approval_id, and once an administrator approves it, repeat the same "
                "call with that approval_id. A person can also run it from the dashboard";
+    // Pairs and routes with no MCP tool: product pack install and uninstall, and the
+    // response-templates routes of a definition (the other InstructionDefinition:Write routes
+    // are twinned by the definition authoring tools below).
+    const bool no_mcp_tool =
+        securable_type == "ProductPack" ||
+        (securable_type == "InstructionDefinition" && operation == "Write" &&
+         path.find("/response-templates") != std::string_view::npos);
+    if (no_mcp_tool)
+        return "this operation is approval-gated for the supervised MCP tier and this route has "
+               "no MCP tool to take an approval ticket; use a credential without an MCP tier or "
+               "a signed-in browser session";
+    if (securable_type == "InstructionDefinition" && operation == "Write")
+        return "this operation is approval-gated for the supervised MCP tier; call the matching "
+               "MCP tool (create_definition, update_definition, import_definition or "
+               "save_definition_yaml, POST /mcp/v1/): the first call returns an approval_id, and "
+               "once an administrator approves it, repeat the same call with that approval_id. "
+               "update_definition and an id-bearing save_definition_yaml must also carry the "
+               "version you read (expected_updated_at / updated_at)";
+    if (securable_type == "InstructionDefinition" && operation == "Delete")
+        return "this operation is approval-gated for the supervised MCP tier; call the MCP "
+               "delete_definition tool (POST /mcp/v1/): the first call returns an approval_id, "
+               "and once an administrator approves it, repeat the same call with that "
+               "approval_id";
     return "this operation is approval-gated for the supervised MCP tier; use the MCP "
            "ticket-then-recall flow (POST /mcp/v1/) or the dashboard";
 }
@@ -1231,7 +1259,8 @@ bool AuthRoutes::require_tier_policy(const httplib::Request& req, httplib::Respo
         // the ticket-then-recall flow regardless of whether an RBAC grant
         // would separately admit the caller).
         // Named local: the A4 options hold views, so the text must outlive the a4_denial call.
-        const std::string remediation = approval_gated_remediation(securable_type, operation);
+        const std::string remediation =
+            approval_gated_remediation(securable_type, operation, req.path);
         res.set_content(
             detail::a4_denial(
                 res, 403, "operation requires approval for this MCP tier on this transport",
@@ -1362,7 +1391,8 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                       "MCP token tier '" + session->mcp_tier + "' requires approval for " +
                           securable_type + ":" + operation + " on a non-MCP transport");
             res.status = 403;
-            const std::string remediation = approval_gated_remediation(securable_type, operation);
+            const std::string remediation =
+                approval_gated_remediation(securable_type, operation, req.path);
             res.set_content(
                 detail::a4_denial(
                     res, 403,

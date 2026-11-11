@@ -225,8 +225,19 @@
       // root (they may still Reject, which is how a designer withdraws a request), or the
       // stored request could not be read (Reject then clears the row).
       field(detail, 'actions').hidden = !(pending && !mine && canDecide);
+      // A scope the page clipped (only an unbound ticket from a tool without its own bound can
+      // exceed the clip) cannot be read in full here: Approve is withheld and the notice says
+      // where the full scope is. Reject stays, so the row can still be cleared.
+      var clipped = d.scopeClipped || '';
+      var clipEl = field(detail, 'scope-clipped');
+      clipEl.hidden = !(pending && !mine && canDecide && clipped);
+      clipEl.textContent = clipped ?
+        'Scope clipped: this request\'s scope is ' + clipped + ' bytes and is shown only in part. ' +
+        'Approve is unavailable here. Read the full scope with GET /api/v1/approvals, then approve ' +
+        'with POST /api/approvals/' + (d.id || '') + '/approve from a signed-in session. ' +
+        'You can still reject it.' : '';
       var approveBtn = $('button[data-act="approve"]', detail);
-      if (approveBtn) approveBtn.hidden = excluded || d.unreadable === '1';
+      if (approveBtn) approveBtn.hidden = excluded || d.unreadable === '1' || !!clipped;
       field(detail, 'n-mcp').hidden = !mcp;
       field(detail, 'n-params').hidden = mcp || !!request;
       field(detail, 'notes').hidden = !pending;
@@ -264,6 +275,7 @@
       var d = row.dataset;
       var id = d.id || '';
       var approve = kind === 'approve';
+      if (approve && d.scopeClipped) return; // the scope was clipped: Approve is withheld
       var facts = doc.createElement('div');
       facts.className = 'kvl dlg-facts';
       facts.appendChild(factRow('Request', (d.name || '') + (d.def ? ' (' + d.def + ')' : '')));

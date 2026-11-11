@@ -95,7 +95,11 @@ inline constexpr std::string_view kScimBearer = "SCIM bearer endpoint: no intera
 inline constexpr std::string_view kMcpTransport =
     "MCP transport endpoint: tool calls are governed by the MCP tier and approval ladder";
 inline constexpr std::string_view kContentAuthoring =
-    "content authoring: running the content is gated separately";
+    "content authoring: writing or deleting content does not itself run it, but running it is "
+    "gated separately only by the Execution securable, the dispatch gate and the definition's "
+    "own approval_mode, which for an ExecuteGate::None pair or an approval_mode=auto definition "
+    "needs no human; authoring can therefore change what a later run does without a further "
+    "approval";
 inline constexpr std::string_view kReferenceDataReplace =
     "fleet-wide software reference data (pack replace, curated aliases): not credentials, "
     "identity or authority, but it steers cpe_product and CVE matching and fleet-wide title "
@@ -438,6 +442,16 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/v1/instructions/([^/]+)/execute)",                                    step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/product-packs)",                                                      step_up_detail::kContentAuthoring),
     step_up_detail::exempt("DELETE",R"(/api/product-packs/([^/]+))",                                              step_up_detail::kContentAuthoring),
+    // instruction_authoring_routes.cpp (#2146 batch C): the v1 twins of the instruction_routes.cpp
+    // rows above, same classes (validate-yaml only validates, like the yaml-preview fragment).
+    step_up_detail::exempt("POST",  R"(/api/v1/instructions)",                                                    step_up_detail::kContentAuthoring),
+    step_up_detail::exempt("PUT",   R"(/api/v1/instructions/([^/]+))",                                            step_up_detail::kContentAuthoring),
+    step_up_detail::exempt("DELETE",R"(/api/v1/instructions/([^/]+))",                                            step_up_detail::kContentAuthoring),
+    step_up_detail::exempt("POST",  R"(/api/v1/instructions/import)",                                             step_up_detail::kContentAuthoring),
+    step_up_detail::exempt("POST",  R"(/api/v1/instructions/yaml)",                                               step_up_detail::kContentAuthoring),
+    step_up_detail::exempt("POST",  R"(/api/v1/instructions/validate-yaml)",                                      step_up_detail::kReadShaped),
+    step_up_detail::exempt("POST",  R"(/api/v1/instruction-sets)",                                                step_up_detail::kContentAuthoring),
+    step_up_detail::exempt("DELETE",R"(/api/v1/instruction-sets/([^/]+))",                                        step_up_detail::kContentAuthoring),
 };
 // clang-format on
 

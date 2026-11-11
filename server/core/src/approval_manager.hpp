@@ -27,6 +27,8 @@
 /// the legacy file so an environment where "no production fleet" turns out
 /// to be locally wrong gets a loud signal instead of silent loss.
 
+#include "approval_request_limits.hpp" // kMaxRequestJsonBytes
+
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -262,11 +264,8 @@ struct Approval {
     std::string row_position;
 };
 
-/// Bounds on a bound ticket's frozen request (#6062). `request_json` is returned by
-/// every list/read of the table and rendered on the Approvals page, so it is capped;
-/// a request that does not fit is refused at mint, never truncated (a truncated
-/// request is a different request than the one that will be redeemed).
-inline constexpr std::size_t kMaxRequestJsonBytes = 16 * 1024;
+/// Bounds on a bound ticket's frozen request (#6062). `kMaxRequestJsonBytes` (the size cap) lives
+/// in approval_request_limits.hpp so the page renderer need not include this header.
 inline constexpr std::size_t kMaxRequestJsonDepth = 16; ///< nesting limit of the frozen request
 inline constexpr std::size_t kMaxExcludedRoots = 32;
 inline constexpr std::size_t kMaxExcludedRootBytes = 256;
