@@ -3370,12 +3370,16 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     {
         constexpr std::size_t kMaxPluginLabels = 64;
         std::size_t n = 0;
-        // Past the label cap the remainder is summed with the unknown names under "unknown"
-        // when a catalogue set is wired (so "other" can never displace a real plugin named
-        // "other"), and under "other" as before when none is.
+        // With a catalogue set wired every label is a name the SERVER knows, so the label set
+        // is bounded by the catalogue (about 75 names) and no agent can fill a cap to displace
+        // a real plugin: the 64 cap applies only to the unwired fallback, where the first 64
+        // names are labelled and the remainder is summed under "other" as before. Unknown
+        // names are summed under "unknown", never "other", so a real plugin named "other"
+        // is never overwritten.
+        const std::size_t label_cap = known_plugins_ ? plugin_init_failed.size() : kMaxPluginLabels;
         int64_t overflow = 0;
         for (const auto& [plugin, count] : plugin_init_failed) {
-            if (n < kMaxPluginLabels) {
+            if (n < label_cap) {
                 metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
                     .set(static_cast<double>(count));
                 ++n;

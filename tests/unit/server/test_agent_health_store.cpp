@@ -1999,9 +1999,9 @@ std::size_t count_init_failed_series(const std::string& out) {
 }
 } // namespace
 
-TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, capped, absent-not-zero",
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, bounded by the catalogue, absent-not-zero",
           "[health_store][echo][corruption][real]") {
-    REQUIRE(catalogue_names().size() > 70); // the 64-label cap below needs a catalogue past it
+    REQUIRE(catalogue_names().size() > 70); // the fleet-wide case below uses 70 distinct names
     const auto others = other_catalogue_names();
     AgentHealthStore store;
     store.set_known_plugins(catalogue_names());
@@ -2031,8 +2031,9 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, c
     // Both the 40-token agent and the all-commas agent were cut at the cap.
     CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 2.0);
 
-    // Fleet-wide label cap: 70 agents each failing a distinct catalogue plugin. The cap holds
-    // even though every name is real; the remainder joins plugin="unknown", never "other".
+    // Fleet-wide, with a catalogue wired: 70 agents each failing a distinct catalogue plugin are
+    // ALL labelled by name (the label set is bounded by the catalogue, so there is no cap an
+    // agent can fill to push a later real plugin into "unknown"), and nothing joins "other".
     AgentHealthStore many;
     many.set_known_plugins(catalogue_names());
     yuzu::MetricsRegistry m2;
@@ -2041,11 +2042,11 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, c
         beat_tags(many, "agent" + std::to_string(i), {{"yuzu.plugins_failed", names[i]}});
     many.recompute_metrics(m2, std::chrono::seconds{300});
     auto out2 = m2.serialize();
-    CHECK(count_init_failed_series(out2) == 65); // 64 named + plugin="unknown"
-    CHECK(series_val(out2, init_failed_series("unknown")) == 6.0);
+    CHECK(count_init_failed_series(out2) == 70);
+    CHECK_FALSE(has_series(out2, init_failed_series("unknown")));
     CHECK_FALSE(has_series(out2, init_failed_series("other")));
     CHECK(has_series(out2, init_failed_series(names[63])));
-    CHECK_FALSE(has_series(out2, init_failed_series(names[64])));
+    CHECK(has_series(out2, init_failed_series(names[69]))); // past the old 64-label cap, still named
 
     // Absent-not-zero: once the reporters are gone the family is cleared.
     for (int i = 0; i < 70; ++i)
