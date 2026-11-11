@@ -14819,7 +14819,9 @@ void RestApiV1::register_routes(
             // A parent that is not materialized has no membership to seed a child from: refuse
             // before the child's scope names it.
             if (!parent_may_seed(*row)) {
-                rs_err(res, 409, parent_not_ready_message(*row));
+                const auto advice = parent_not_ready_advice(*row);
+                rs_err(res, 409, parent_not_ready_message(*row),
+                       {.retry_after_ms = advice.retry_after_ms, .remediation = advice.remediation});
                 return std::nullopt;
             }
             return row; // the caller snapshots its completeness (inherit_completeness)
@@ -15487,7 +15489,10 @@ void RestApiV1::register_routes(
                 if (!lineage_parent)
                     return; // load_owned wrote 404
                 if (!parent_may_seed(*lineage_parent)) {
-                    rs_err(res, 409, parent_not_ready_message(*lineage_parent));
+                    const auto advice = parent_not_ready_advice(*lineage_parent);
+                    rs_err(res, 409, parent_not_ready_message(*lineage_parent),
+                           {.retry_after_ms = advice.retry_after_ms,
+                            .remediation = advice.remediation});
                     return;
                 }
                 // Lineage only: a directly created set's members are the caller's explicit
@@ -15885,7 +15890,10 @@ void RestApiV1::register_routes(
                           if (!parent)
                               return; // load_owned already wrote 404
                           if (!parent_may_seed(*parent)) {
-                              rs_err(res, 409, parent_not_ready_message(*parent));
+                              const auto advice = parent_not_ready_advice(*parent);
+                              rs_err(res, 409, parent_not_ready_message(*parent),
+                                     {.retry_after_ms = advice.retry_after_ms,
+                                      .remediation = advice.remediation});
                               return;
                           }
                           // The child is narrowed from this parent, so it is no more complete
@@ -17076,39 +17084,22 @@ void RestApiV1::register_routes(
             // hint.
             res.status = 503;
             // #4981 fix-round finding: was a raw string comparison against
-            // outcome.detail, which cannot warn if a future 6th
+            // outcome.detail, which cannot warn if a further
             // ScopeEvalError::Kind value lands unclassified. Routed through
-            // the shared, exhaustive scope_abort_is_permanent() classifier
-            // (scope_eval_error.hpp) instead — see that function's doc
-            // comment for why OwnerCheckFailed never actually reaches here
-            // (handled above).
-            const bool permanent =
-                outcome.abort_kind && scope_abort_is_permanent(*outcome.abort_kind);
+            // scope_abort_advice, over the shared, exhaustive
+            // scope_abort_is_permanent() classifier (scope_eval_error.hpp) —
+            // see that function's doc comment for why OwnerCheckFailed never
+            // actually reaches here (handled above).
             // result_set_unusable names the caller's own set and why (owner check passed).
             const std::string message =
                 "scope evaluation unavailable: " + outcome.detail +
                 (outcome.abort_detail.empty() ? "" : " (" + outcome.abort_detail + ")");
-            if (outcome.abort_kind == ScopeEvalError::Kind::ResultSetUnusablePermanent) {
-                // A failed set, or an incomplete one under NOT: retrying cannot change it.
-                res.set_content(
-                    detail::a4_error(res, message,
-                                     {.remediation = "re-run the producer that created the set, "
-                                                     "then use the new set"}),
-                    "application/json");
-            } else if (permanent) {
-                res.set_content(
-                    detail::a4_error(
-                        res, message,
-                        {.remediation = "this is a permanent condition and will NOT clear on "
-                                        "retry; escalate to an operator"}),
-                    "application/json");
-            } else {
-                res.set_content(
-                    detail::a4_error(res, message,
-                                     {.retry_after_ms = 5000,
-                                      .remediation = "retry once the server reports ready"}),
-                    "application/json");
-            }
+            // A pending set is transient (wait for it); a failed or incomplete one is not.
+            const auto advice = scope_abort_advice(outcome.abort_kind, 5000);
+            res.set_content(detail::a4_error(res, message,
+                                             {.retry_after_ms = advice.retry_after_ms,
+                                              .remediation = advice.remediation}),
+                            "application/json");
             return;
         }
         case ScopePreviewOutcome::Kind::kOk:

@@ -15358,38 +15358,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     // null) applies, the transient arm passes a concrete hint.
                     mcp_audit("failure", expression);
                     // #4981 fix-round finding: was a raw string comparison against
-                    // outcome.detail, which cannot warn if a future 6th
-                    // ScopeEvalError::Kind value lands unclassified. Routed
-                    // through the shared, exhaustive scope_abort_is_permanent()
-                    // classifier (scope_eval_error.hpp) instead — see that
-                    // function's doc comment for why OwnerCheckFailed never
-                    // actually reaches here (handled above).
-                    const bool permanent = outcome.abort_kind &&
-                                           yuzu::server::scope_abort_is_permanent(*outcome.abort_kind);
+                    // outcome.detail, which cannot warn if a further ScopeEvalError::Kind
+                    // value lands unclassified. Routed through scope_abort_advice, over the
+                    // shared, exhaustive scope_abort_is_permanent() classifier
+                    // (scope_eval_error.hpp), shared with the REST twin — see that function's
+                    // doc comment for why OwnerCheckFailed never actually reaches here
+                    // (handled above).
                     // result_set_unusable names the caller's own set and why (REST twin).
                     const std::string message =
                         "scope evaluation unavailable: " + outcome.detail +
                         (outcome.abort_detail.empty() ? "" : " (" + outcome.abort_detail + ")");
-                    if (outcome.abort_kind ==
-                        yuzu::server::ScopeEvalError::Kind::ResultSetUnusablePermanent) {
-                        // A failed set, or an incomplete one under NOT: retrying cannot change it.
-                        res.set_content(a4_error(kInternalError, message,
-                                                 "re-run the producer that created the set, "
-                                                 "then use the new set"),
-                                        "application/json");
-                    } else if (permanent) {
-                        res.set_content(
-                            a4_error(kInternalError, message,
-                                     "this is a permanent condition and will NOT clear on "
-                                     "retry; escalate to an operator"),
-                            "application/json");
-                    } else {
-                        res.set_content(
-                            a4_error(kInternalError, message,
-                                     "retry once the server reports ready",
-                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                            "application/json");
-                    }
+                    // A pending set is transient (wait for it); a failed or incomplete one is not.
+                    const auto advice = yuzu::server::scope_abort_advice(
+                        outcome.abort_kind, mcp::kMcpStoreFaultRetryMs);
+                    const long retry_ms =
+                        static_cast<long>(advice.retry_after_ms.value_or(-1));
+                    res.set_content(
+                        a4_error(kInternalError, message, advice.remediation, retry_ms),
+                        "application/json");
                     return;
                 }
                 case yuzu::server::ScopePreviewOutcome::Kind::kOk:
@@ -15434,11 +15420,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!row)
                     return std::nullopt;
                 if (!parent_may_seed(*row)) {
-                    // retry-hint-exempt: a state conflict, not a transient fault: a pending
-                    // parent is waited for and a failed one re-created, as the message says.
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   std::string(parent_not_ready_message(*row))),
-                                    "application/json");
+                    // A pending parent is transient (retry hint), a failed one is not.
+                    const auto advice = parent_not_ready_advice(*row);
+                    const long retry_ms =
+                        static_cast<long>(advice.retry_after_ms.value_or(-1));
+                    res.set_content(
+                        a4_error(kInvalidParams, parent_not_ready_message(*row),
+                                 advice.remediation, retry_ms),
+                        "application/json");
                     return std::nullopt;
                 }
                 return row; // the caller snapshots its completeness (inherit_completeness)
@@ -16132,11 +16121,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return; // rs_load_owned already wrote the error
                     if (!parent_may_seed(*parent)) {
-                        // retry-hint-exempt: a state conflict, not a transient fault: a pending
-                        // parent is waited for and a failed one re-created, as the message says.
-                        res.set_content(error_response(id, kInvalidParams,
-                                                       std::string(parent_not_ready_message(*parent))),
-                                        "application/json");
+                        // A pending parent is transient (retry hint), a failed one is not.
+                        const auto advice = parent_not_ready_advice(*parent);
+                        const long retry_ms =
+                            static_cast<long>(advice.retry_after_ms.value_or(-1));
+                        res.set_content(
+                            a4_error(kInvalidParams, parent_not_ready_message(*parent),
+                                     advice.remediation, retry_ms),
+                            "application/json");
                         return;
                     }
                     // Lineage only: a directly created set's members are the caller's explicit
@@ -16472,11 +16464,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return;
                     if (!parent_may_seed(*parent)) {
-                        // retry-hint-exempt: a state conflict, not a transient fault: a pending
-                        // parent is waited for and a failed one re-created, as the message says.
-                        res.set_content(error_response(id, kInvalidParams,
-                                                       std::string(parent_not_ready_message(*parent))),
-                                        "application/json");
+                        // A pending parent is transient (retry hint), a failed one is not.
+                        const auto advice = parent_not_ready_advice(*parent);
+                        const long retry_ms =
+                            static_cast<long>(advice.retry_after_ms.value_or(-1));
+                        res.set_content(
+                            a4_error(kInvalidParams, parent_not_ready_message(*parent),
+                                     advice.remediation, retry_ms),
+                            "application/json");
                         return;
                     }
                     // The child is narrowed from this parent, so it is no more complete than

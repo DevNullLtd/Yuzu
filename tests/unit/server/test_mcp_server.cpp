@@ -52879,6 +52879,7 @@ TEST_CASE("MCP create_result_set: a pending parent is refused with RESULT_SET_NO
         const auto msg = body["error"]["message"].get<std::string>();
         CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
         CHECK(msg.find("wait until it is materialized") != std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000); // pending: transient
     }
     SECTION("a failed parent is refused and the message says to re-create it") {
         rs_bundle.get()->mark_failed(parent->id, "bound exceeded");
@@ -52890,6 +52891,7 @@ TEST_CASE("MCP create_result_set: a pending parent is refused with RESULT_SET_NO
         const auto msg = body["error"]["message"].get<std::string>();
         CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
         CHECK(msg.find("re-create it") != std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // failed: permanent
     }
     SECTION("control: a materialized parent is accepted as lineage with no inherited counters") {
         REQUIRE(rs_bundle.get()->materialize(parent->id, {"a1"}, 2, 3).has_value());

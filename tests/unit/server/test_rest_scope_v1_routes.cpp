@@ -630,6 +630,7 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview 503s result_set_unusable with an
         const auto msg = body["error"]["message"].get<std::string>();
         CHECK(msg.find("result_set_unusable") != std::string::npos);
         CHECK(msg.find("cause=pending result_set=" + set->id) != std::string::npos);
+        CHECK(body.dump().find("wait until the set is materialized") != std::string::npos);
     }
     SECTION("a failed set is permanent") {
         store.mark_failed(set->id, "bound exceeded");

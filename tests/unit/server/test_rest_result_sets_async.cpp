@@ -5135,6 +5135,7 @@ TEST_CASE("result-set producers refuse a pending parent and inherit an incomplet
               std::string::npos);
         CHECK(j["error"]["message"].get<std::string>().find("wait until it is materialized") !=
               std::string::npos);
+        CHECK(j["error"]["retry_after_ms"] == 5000); // pending: transient
         std::string next;
         CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 1); // the parent only
     }
@@ -5154,6 +5155,8 @@ TEST_CASE("result-set producers refuse a pending parent and inherit an incomplet
         CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
         CHECK(msg.find("re-create it") != std::string::npos);
         CHECK(msg.find("wait until") == std::string::npos);
+        REQUIRE(j["error"].contains("retry_after_ms"));
+        CHECK(j["error"]["retry_after_ms"].is_null()); // failed: permanent
     }
     SECTION("from-inventory-query inherits a partial parent's counters") {
         REQUIRE(h.store->materialize(pending->id, {}, 2, 3).has_value());

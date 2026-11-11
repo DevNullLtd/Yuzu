@@ -264,6 +264,17 @@ inline constexpr std::string_view kParentFailedMessage =
 [[nodiscard]] inline std::string_view parent_not_ready_message(const ResultSet& parent) noexcept {
     return parent.status == ResultSetStatus::Failed ? kParentFailedMessage : kParentPendingMessage;
 }
+/// The A4 hint for that refusal: a pending parent is transient (retry after the hint, once it is
+/// materialized); a failed one is permanent (no retry hint).
+struct ParentNotReadyAdvice {
+    std::string_view remediation;
+    std::optional<std::int64_t> retry_after_ms; ///< nullopt: no retry hint (null on the wire)
+};
+[[nodiscard]] inline ParentNotReadyAdvice parent_not_ready_advice(const ResultSet& parent) noexcept {
+    if (parent.status == ResultSetStatus::Failed)
+        return {"re-create the parent result set", std::nullopt};
+    return {"wait until the set is materialized", std::int64_t{5000}};
+}
 
 /// Carry a parent's completeness onto a child created from its members: a child is never
 /// more complete than the parent it was narrowed from. Every producer whose members come from
