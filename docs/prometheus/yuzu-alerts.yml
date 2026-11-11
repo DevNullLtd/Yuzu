@@ -3916,7 +3916,8 @@ groups:
             grep for "per-agent row cap (" (one line carries the cap, the instruction and the agent).
 
       # Companion: the in-memory record of answers that may be missing
-      # (unverified_frame_registry.hpp) evicted an entry. It fails closed, so
+      # (unverified_frame_registry.hpp) evicted an entry, or refused an
+      # over-long agent id. It fails closed, so
       # no answer is lost from a result set's completeness, but the affected
       # sets read partial. Excluded from YuzuResponseIngestDrops above: no
       # store remediation applies. No long `for`: one increase already means
@@ -3937,22 +3938,26 @@ groups:
             and an answer the store did not keep (for example per_agent_cap,
             malformed_identity_field, a failed terminal finalize) whose
             tracker write failed (closed, or failed twice). Evidence for the
-            second: yuzu_server_response_ingest_dropped_total by reason and
-            the server log line "upsert failed twice"; a failed terminal
+            second: yuzu_server_response_ingest_dropped_total by reason and,
+            for a write that failed twice only, the server log line "upsert
+            failed twice" (a closed tracker, or a response store that is not
+            open, logs nothing and leaves only the store_not_open count); a
+            failed terminal
             finalize is counted in no ingest_dropped reason, and its evidence
             is the finalize_terminal_status log line. Check PostgreSQL
             health and yuzu_exec_correlation_read_degrade_total{reason}
             first. One agent sending many streaming
             frames while the read is degraded only amplifies it. Effect: an
             agent past its own share is marked, and that agent's answers read
-            as not fully stored for an hour after the last record the marker
-            covered, so result sets it contributes to read partial. When the
-            record as a whole is full, the evicted entry's command is
+            as not fully stored for an hour after the last eviction, so
+            result sets it contributes to read partial. When the record as a
+            whole is full, the evicted entry's command is
             remembered and every agent's answer to it reads as not fully
             stored. When the marker set or the command set is full, the
             oldest member is dropped and a global latch is set; an agent id
             longer than 256 bytes (Register and ProxyRegister refuse one) also
-            sets it. For an hour after the last record the latch covered every
+            sets it. For an hour after the last eviction (or after the
+            over-long agent id) that set the latch, every
             terminal answer ingested reads as not fully stored, so result sets
             filled from those answers read partial (sets already filled are
             not changed), and NOT, LEN and STARTSWITH scopes over those sets

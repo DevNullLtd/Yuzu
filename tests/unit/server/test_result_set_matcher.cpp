@@ -1106,6 +1106,8 @@ TEST_CASE("UnverifiedFrameRegistry: the command digest depends on the salt",
           UnverifiedFrameRegistry::default_command_digest(2, "cmd-1"));
     CHECK(UnverifiedFrameRegistry::default_command_digest(1, "cmd-1") ==
           UnverifiedFrameRegistry::default_command_digest(1, "cmd-1"));
+    UnverifiedFrameRegistry reg;
+    CHECK_FALSE(reg.salt_fell_back());
 }
 
 TEST_CASE("UnverifiedFrameRegistry: concurrent note contains and forget stay consistent",

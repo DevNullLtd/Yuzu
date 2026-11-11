@@ -783,8 +783,9 @@ or replayed frame of the pair still reports it. The registry keys on the exact a
 salted digest of the command id, so one agent's frames never read or erase another agent's record.
 It is bounded (about 4 MiB worst case, an estimate) and fails closed: 64 entries per agent, 4,096
 in all, one hour per entry. Markers, remembered commands and the latch are set again on each
-eviction they stand for, so each lasts for an hour after the last record it covered. An agent
-past its own 64 is marked (at most 1,024 markers), and every answer of that agent then reports
+eviction they stand for, so each lasts for an hour after the last eviction (or after the over-long
+agent id, for the latch). An agent past its own 64 is marked (at most 1,024 markers), and every
+answer of that agent then reports
 `response_dropped`: a flooding agent affects only its own answers. An entry evicted by the 4,096
 cap has its command id remembered (at most 1,024 commands), and every agent of that command then
 reports `response_dropped`. When the marker set or the command set is full, the oldest member is
@@ -797,7 +798,9 @@ as `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overfl
 a failed provenance lookup is `yuzu_server_response_provenance_total{outcome="lookup_degraded"}`;
 for an answer the store did not keep (for example `per_agent_cap`, `malformed_identity_field`, a
 failed terminal finalize) whose tracker write failed (closed, or failed twice) it is
-`yuzu_server_response_ingest_dropped_total` by reason and the "upsert failed twice" log line; a
+`yuzu_server_response_ingest_dropped_total` by reason and, for a write that failed twice only, the
+"upsert failed twice" log line (a closed tracker, or a response store that is not open, logs nothing
+and leaves only the `store_not_open` count); a
 failed terminal finalize is counted in no `ingest_dropped` reason, and its evidence is the
 `finalize_terminal_status` log line. Check PostgreSQL health and
 `yuzu_exec_correlation_read_degrade_total{reason}` first. Residual: the

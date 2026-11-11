@@ -70,8 +70,8 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
   under which every pair reads as not fully stored: only the latch and a remembered command reach
   other agents. Each eviction is counted as
   `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Entries last
-  one hour; markers, remembered commands and the latch last for an hour after the last record they
-  covered (set again on each eviction; expired on every `note` and `contains`, against
+  one hour; markers, remembered commands and the latch last for an hour after the last eviction, or
+  after the over-long agent id for the latch (set again on each eviction; expired on every `note` and `contains`, against
   `steady_clock` seconds). `note` inserts into its three indexes or none, sets a marker or
   remembers a command before it erases the entry that stands for it, and refreshes an existing
   marker or remembered command in place (the re-key allocates nothing, and the id is copied only

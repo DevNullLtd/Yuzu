@@ -50,7 +50,8 @@
 /// 256-byte bound (an estimate from allocation sizes measured on one platform, not a guarantee).
 /// Every entry, marker, remembered command and latch is dropped `max_age_s` seconds after it was
 /// last set (a marker, remembered command and the latch are set again on each eviction they stand
-/// for, so they last for `max_age_s` after the last record they covered). The result-set fill runs
+/// for, so they last for `max_age_s` after the last eviction, or after the over-long agent id for
+/// the latch). The result-set fill runs
 /// within minutes of a dispatch, so an older one no longer changes any fill. Lives in process
 /// memory only: a restart, or a terminal frame served by another replica, loses the record
 /// (docs/executions-history-ladder.md, "Response frames the response store did not keep").

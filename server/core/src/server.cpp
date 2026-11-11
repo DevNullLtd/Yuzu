@@ -2578,10 +2578,12 @@ public:
                           "be missing (a streaming frame whose provenance lookup failed, or an "
                           "answer the store did not keep, for example per_agent_cap, "
                           "malformed_identity_field or a failed terminal finalize, whose tracker "
-                          "write failed: closed, or failed twice; a failed terminal finalize is "
+                          "write failed: closed, or failed twice; only the latter logs "
+                          "'upsert failed twice', a closed tracker or store leaves only the "
+                          "store_not_open count; a failed terminal finalize is "
                           "counted in no reason here, its evidence is the "
-                          "finalize_terminal_status log line); the affected answers are reported "
-                          "as not fully stored instead",
+                          "finalize_terminal_status log line), or an over-long agent id; the "
+                          "affected answers are reported as not fully stored instead",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "
