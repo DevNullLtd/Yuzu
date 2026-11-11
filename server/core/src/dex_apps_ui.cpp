@@ -107,7 +107,7 @@ button.gp-chip{line-height:inherit;font-variant-numeric:inherit}
 .dx-apps .dx-ver{display:none}
 .dx-apps tbody:has(.dx-vx[open]) .dx-ver{display:table-row}
 .dx-apps tbody:has(.dx-vx[open]) .dx-apphead td{background:var(--surface2)}
-.dx-vx{display:block;margin-top:2px}
+.dx-vx{margin-top:2px}
 .dx-vx>summary{width:max-content;color:var(--mut);font-size:12.5px;cursor:pointer;border-radius:3px}
 .dx-vx>summary:hover{color:var(--ink)}
 .dx-ver .dx-vn{font-family:var(--mds-font-family-mono);font-size:13px;color:var(--ink2)}
@@ -127,7 +127,6 @@ summary.dx-sc{cursor:pointer;list-style:none}
 summary.dx-sc::-webkit-details-marker{display:none}
 summary.dx-sc::after{content:"";width:5px;height:5px;margin:-3px 0 0 2px;border:solid currentColor;border-width:0 1.5px 1.5px 0;transform:rotate(45deg);transition:transform .12s}
 details[open]>summary.dx-sc::after{margin-top:3px;transform:rotate(-135deg)}
-.dx-score{display:block}
 .dx-scw{display:block;margin-top:6px;font-size:12.5px;color:var(--mut)}
 .dx-ded{margin-top:8px;padding:8px 10px;font-size:12.5px;color:var(--ink2);background:var(--surface2);border:1px solid var(--line);border-radius:var(--rad-ctl)}
 .dx-ded .h{color:var(--mut);margin-bottom:2px}
@@ -201,10 +200,7 @@ Coverage coverage(const std::string& scope) {
 }
 
 std::string edge_text(double e) {
-    std::string s = std::format("{:.1f}", e);
-    if (s.size() > 2 && s.compare(s.size() - 2, 2, ".0") == 0)
-        s.resize(s.size() - 2);
-    return s;
+    return std::format("{:g}", e);
 }
 
 std::string captions(const DexAppsModel& m, const std::string& scope, const std::string& window) {
