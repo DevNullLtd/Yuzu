@@ -71,8 +71,9 @@
 ///      (`approver_assurance:mfa_proof_stale`); an unreadable enrolment or durable
 ///      proof -> 503 (`retry_after_ms` 5000 when a retry may clear it, null for the
 ///      persistent causes) plus an `error` row; an SSO proof dated after the
-///      database clock -> 503 with `retry_after_ms` null (clock skew); no usable factor (not enrolled, no
-///      SSO attestation, SAML, a deactivated or deleted account) -> 403
+///      database clock -> 503 with `retry_after_ms` null (clock skew); no usable
+///      factor (not enrolled, no SSO attestation, SAML, a deactivated or
+///      deleted account) -> 403
 ///      `approver_assurance_required:<reason>` plus a `denied` row. An UNWIRED
 ///      `approver_mfa_fn` is a 503, not a skip: this is the one place a null
 ///      closure must not read as "no step-up required". If a refusal's audit row

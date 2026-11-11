@@ -245,7 +245,8 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
             judge_local_mfa_binding(durable, probe.factor_gen, probe.binding_enforced);
         switch (judgement.kind) {
         case LocalMfaBinding::kUnavailable:
-            return store_unavailable("durable mfa proof", durable.binding_untrusted);
+            return store_unavailable("durable mfa proof",
+                                     durable.binding_untrusted || judgement.persistent);
         case LocalMfaBinding::kUnenforced:
             // Persistent only once a validation OBSERVED the trigger not in force (or a recovery
             // bypass). A catalog check that could not run latches not-enforced for every read

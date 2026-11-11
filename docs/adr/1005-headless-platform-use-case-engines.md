@@ -1110,7 +1110,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
     - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
       exception recorded by the maintainer, #6079; the change now ships as the
-      hard cutover of the 2026-10-28 entry below, which has no rolling window).** The approver gate
+      hard cutover of the 2026-10-28 entry below, a DRAFT pending the maintainer's
+      approval, which has no rolling window).** The approver gate
       (`require_enrolled_fresh_mfa`) runs on each server replica and no
       minimum-version check exists. While a rolling upgrade is in progress, or
       after a replica is rolled back, a replica that predates the gate can admit
@@ -1299,9 +1300,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
     **STATUS: DRAFT, not accepted until the maintainer approves it.**
     The factor-generation binding (`auth` schema v3, `session_store` schema v3)
     is introduced with no upgrade path and no supported carry-over of an earlier
-    build's database: an enrolled account that reads factor generation `0` (only
-    a database an earlier build wrote can hold one) is refused by every gate that
-    compares a proof with the factor. This entry supersedes the operator wording of the
+    build's database: an enrolled account that reads factor generation `0` (a tampered row, or
+    a database an earlier build wrote) is refused by every gate that compares a
+    proof with the factor. This entry supersedes the operator wording of the
     2026-10-28 mixed-version entry above, which described a rolling-upgrade
     window; this build has no such window, and mixed-version operation is
     unsupported. Operator wording: `docs/user-manual/upgrading.md`, the MFA
@@ -1339,14 +1340,21 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
       ruling in the #6079 working session that the change ships as a hard
       cutover. The ruling is accepted for that scope only. Acceptance of the
       Conditions and the Residual exposure is NOT YET GIVEN: they are put
-      forward by this draft. As with the entries above, the ruling is a
+      forward by this draft. In the same working session (2026-11-10) the
+      maintainer ruled that this change documents no carry-over or restore
+      procedure for an earlier build's database; that ruling too is a
+      working-session statement. As with the entries above, the ruling is a
       working-session statement, not a signed decision. The acceptor is also
       the committer of the change that introduces this entry, so independent
       review of this acceptance rests on the pull request review (expected, not
       enforced by tooling), not on a second approver.
-    - **Residual exposure (proposed for acceptance).** Until each enrolled
-      operator is reset, approvals and JIT elevation are unavailable to that
-      operator (an availability cost, not a bypass). A reset account is
+    - **Residual exposure (proposed for acceptance).** The first three
+      exposures below arise for an account that reads generation `0` (a
+      tampered row, or a database outside the supported fresh-database
+      population) or after a break-glass clear of a supported deployment; they
+      are put forward because the executable does not prevent them. Until each
+      such operator is reset, approvals and JIT elevation are unavailable to
+      that operator (an availability cost, not a bypass). A reset account is
       password-only until it enrols again under `--mfa-enforcement=optional`,
       so MFA coverage drops for the window. Under `--auth-mode=sso-only` the
       break-glass account cannot be reset without a time-boxed restart under

@@ -58,10 +58,11 @@ RefusalText refusal_text(const StepUpVerdict& v) {
             return {503,
                     "this account's second-factor state cannot be verified; if it persists, ask "
                     "an administrator to follow the MFA binding enforcement runbook",
-                    "retrying helps only if the read failed transiently; for an account enrolled "
-                    "before the upgrade (factor generation not positive) an administrator resets "
-                    "it with `yuzu-server --mfa-reset <user>` after checking, otherwise they "
-                    "restore the MFA binding triggers and restart per the runbook",
+                    "retrying helps only if the read failed transiently (retry_after_ms is a "
+                    "number); for an account whose factor generation is not positive an "
+                    "administrator resets it with `yuzu-server --mfa-reset <user>` after "
+                    "checking, otherwise they restore the MFA binding triggers and restart per "
+                    "the runbook",
                     {},
                     false};
         }

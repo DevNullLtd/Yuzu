@@ -303,15 +303,18 @@ TEST_CASE("decide_step_up: store failures fail closed and are told apart", "[ste
     const auto s = make_session("alice", "local", Role::admin, ago(10s));
     for (const auto e : {AuthDBError::SecretUnavailable, AuthDBError::QueryFailed,
                          AuthDBError::WriteFailed, AuthDBError::StoreBusy}) {
-        CHECK(decide_matching(s, status_error(e), 300, "optional").decision ==
-              StepUpDecision::kStoreUnavailable);
+        const auto v = decide_matching(s, status_error(e), 300, "optional");
+        CHECK(v.decision == StepUpDecision::kStoreUnavailable);
+        // The plain store outage is the one a retry may clear: it carries the 5000 hint.
+        CHECK(v.retryable);
     }
     // Not a store outage: a missing row and a name the store rejects before any read both fail
     // closed as a 401.
     for (const auto e : {AuthDBError::UserNotFound, AuthDBError::InvalidUsername}) {
         CHECK_FALSE(is_store_unavailable(e));
-        CHECK(decide_matching(s, status_error(e), 300, "optional").decision ==
-              StepUpDecision::kStatusFailed);
+        const auto v = decide_matching(s, status_error(e), 300, "optional");
+        CHECK(v.decision == StepUpDecision::kStatusFailed);
+        CHECK_FALSE(v.retryable); // a 401 challenge: no hint
     }
 }
 

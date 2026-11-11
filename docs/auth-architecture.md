@@ -1112,7 +1112,7 @@ gate applied.
   `AuthRoutes::durable_mfa_proof_for` applies `AuthManager::stored_binding_trustworthy()` to a local
   session. A SIEM rule must key on both tokens. **Sticky versus transient at the approver:** the approver
   `503` carries no `retry_after_ms` and a remediation that points at the MFA binding enforcement runbook
-  (an account enrolled before the upgrade is reset with `yuzu-server --mfa-reset <user>` after checking
+  (an account whose factor generation is not positive is reset with `yuzu-server --mfa-reset <user>` after checking
   `mfa_factor_gen <= 0`; otherwise restore the auth store's MFA binding triggers and restart)
   for the three causes that do not clear by themselves, namely an auth trigger observed not in force (or
   a recovery bypass), the session store's rebind guard latched not in force, and an enrolled row whose
@@ -1141,7 +1141,7 @@ factor, which is the repair for that account and not a documented upgrade step.
 | State | Behaviour |
 |---|---|
 | Fresh database | Full closure on every gate. Every row starts at generation `0` and the trigger assigns a fresh random value at the first enrolment. |
-| Carried-over database with an already-enrolled account | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` (audit `reason=mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). |
+| Enrolled account at generation `0` (a database an earlier build wrote, which is unsupported) | The `auth` v3 migration seeds nothing, so the account reads generation `0` and is refused `503` (audit `reason=mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` clears its factor (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in). |
 | Trigger dropped, disabled, replica-only or body replaced | Boot refuses (only `--mfa-reset` and `--break-glass-arm` open their bootstrap `AuthDB` past it, and report the binding not enforced). While running, a validation that observes it fails every local binding decision closed (sticky). Changes made while it was not firing are not reconstructable: end the affected accounts' sessions (runbook). |
 | Coherent offline restore | The accepted ADR-2002 checkpoint class. After ANY restore of the auth schema end every session (a restart does not). |
 
@@ -1233,7 +1233,7 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   the central check answers first for a SAML session (generic `403`), for a deleted or deactivated local account
   (`401` `MFA step-up required`), for a stale, missing, unbound or other-factor
   proof of a local session (`401`, with the reason token on its `mfa.step_up.required` row) and for an unreadable
-  stored proof, an unreadable local MFA store, an unenforced binding or a non-positive factor generation (`503` without `retry_after_ms`, counted
+  stored proof, an unreadable local MFA store, an unenforced binding or a non-positive factor generation (`503`: `retry_after_ms` 5000 for a failed read, `null` for an unenforced binding or a non-positive factor generation, counted
   `route="mfa_binding"` or `route="mfa_stepup"`). For a local session both gates apply the same millisecond
   database-clock ceiling, so the ticket-specific `approver_assurance:mfa_proof_stale` row exists only when the
   configured window exceeds 300 (or is `0` or less, where the central check is off); an OIDC session is still
@@ -2415,7 +2415,7 @@ session hitting any step-up-gated route (the 41 listed in the REST API
 reference under "Step-up envelope on high-risk endpoints": token, session,
 engine-principal and RBAC lifecycle, Guardian rule and guard writes, software
 deploy, approval approve/reject, user delete/role change, MFA recovery-code regeneration and disable),
-or any of the three JIT-elevation routes (40 routes in all; the elevation routes apply the same check in their own handler),
+or any of the three JIT-elevation routes (44 routes in all; the elevation routes apply the same check in their own handler),
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
 `--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 39 `kRequired` routes enforced by the

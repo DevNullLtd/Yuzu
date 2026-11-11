@@ -7392,8 +7392,8 @@ groups:
             docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503". A
             reason=mfa_proof_unavailable or mfa_binding_unenforced refusal can
             instead be persistent and is not cured by waiting: an enrolled
-            account still at factor generation 0 after the MFA cutover (an
-            administrator must run yuzu-server --mfa-reset for it), or a
+            account at factor generation 0 (only a database an earlier build wrote
+            holds one; an administrator must run yuzu-server --mfa-reset for it), or a
             binding trigger that is not in force (see "Enrolled accounts at
             generation 0" under "Post-restore verification" and "MFA binding
             enforcement failed" in the same runbook). It can also be
@@ -7408,7 +7408,7 @@ groups:
       # is the documented recovery lever (it disables the stale-proof requirement
       # on the 39 ordinary step-up routes, and also lets SAML sessions through
       # them and skips the store read there; engine denials and the unwired-store
-      # 503 still apply; approve and reject are two of the 35, and the central
+      # 503 still apply; approve and reject are two of the 39, and the central
       # check passes them at 0 but the approver gate still refuses for them; the
       # two factor-credential rows and the JIT-elevation routes keep their own
       # windows); it must not be left on.
@@ -7426,7 +7426,7 @@ groups:
             step-up routes: no stale proof is refused (so none is recorded),
             and SAML sessions and the authentication-store read are skipped
             too, while engine denials and unwired-store refusals still apply
-            and are recorded. Approval approve and reject are two of the 35:
+            and are recorded. Approval approve and reject are two of the 39:
             the central check passes them at 0, but the approver gate still
             refuses a stale proof, a SAML session and an unenrolled account.
             The two factor-credential rows and the JIT-elevation routes keep

@@ -760,8 +760,8 @@ every recovery code — or has been locked out by MFA enforcement (the IdP not
 asserting `amr`, a sole admin who could not enroll). The Settings → MFA panel
 is behind login, so the dashboard path is unreachable.
 
-A different symptom with the same remedy: an account that was already enrolled when a database
-carried over to the #6079 build reads factor generation `0` and is refused `503`
+A different symptom with the same remedy: an enrolled account in a database an earlier build wrote (which this build does not support)
+reads factor generation `0` and is refused `503`
 `mfa_proof_unavailable`. See [Enrolled accounts at generation 0](#post-restore-verification)
 for the detection query; `--mfa-reset <user>` below is the fix.
 
@@ -1098,7 +1098,7 @@ ciphertext), so this works even when the KEK is unavailable.
 of `mfa.reset.breakglass` rows against `mfa.enroll.verified` rows per operator finds it. Use the real account you ran
 the SQL as, the change ticket in `detail`, and the INSTANT OF THE CLEAR for `timestamp` (epoch seconds: note
 `date -u +%s` when you run the SQL, or take it from the ticket), not `now()` at the time of the insert. The
-reconciliation query in `docs/user-manual/upgrading.md` lists a reset with no enrolment at or after its `timestamp`, so a row stamped
+reconciliation query below lists a reset with no enrolment at or after its `timestamp`, so a row stamped
 later than a re-enrolment would report a false "no enrolment since":
 
 ```bash
@@ -1117,6 +1117,21 @@ yourself when your retention policy says to, or set `ttl_expires_at` to an epoch
 `detail` (`manual-sql ticket=...` instead of `MFA enrollment cleared via --mfa-reset CLI ...`). It is also self-asserted free text
 (`principal` is whatever you typed) and inserting it by hand does not increment the audit counters, so the change ticket, not this row, is the real evidence
 of the clear.
+
+**Reconciliation query.** This lists every operator with a reset (`success` or `partial`) and no enrolment since. Expect
+entries under `--mfa-enforcement=optional`; under `required` (or `admin-only` for an administrator) the list should empty
+as people sign in. A reset that ended `error` is not listed because its state is unknown (the factor may or may not be
+cleared): find those with "Finding a clear that ended `error` or `partial`" above.
+
+```sql
+SELECT r.target_id AS operator, to_timestamp(max(r.timestamp)) AT TIME ZONE 'UTC' AS last_reset_utc
+  FROM audit_store.audit_events r
+ WHERE r.action = 'mfa.reset.breakglass' AND r.result IN ('success', 'partial')
+   AND NOT EXISTS (SELECT 1 FROM audit_store.audit_events e
+                    WHERE e.action = 'mfa.enroll.verified' AND e.result = 'ok'
+                      AND e.target_id = r.target_id AND e.timestamp >= r.timestamp)
+ GROUP BY r.target_id ORDER BY max(r.timestamp) DESC;
+```
 
 **After a restore the rows and the enrolments disagree.** A restore of the `auth` schema rolls enrolments back to the dump while the
 `audit_store` rows for resets made after the dump remain, so the reconciliation query lists those operators as "reset, not
@@ -1756,7 +1771,7 @@ them. A gated route answers **`503`** and does not run in four cases:
   read or trusted**. Reason `mfa_proof_unavailable`: an ordinary session-store read fault, the
   session store's rebind guard not in force (which also counts
   `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`), or the account is enrolled but its factor
-  generation is not positive (a tampered row, or a data-only restore of a pre-v3 dump, see
+  generation is not positive (a tampered row, or a database an earlier build wrote, which is unsupported; see
   [Post-restore verification](#post-restore-verification)). Reason `mfa_binding_unenforced`: the
   database trigger that binds a proof to the factor generation is **not observed in force** on the
   account store. The ordinary read fault is transient, and so is an inconclusive trigger validation (a
@@ -1788,7 +1803,7 @@ carries `mfa_step_up_required: true`, so a client must treat this `503` as "retr
 shortly" and prompt for a code only on a `401`. **A `503` whose message starts `this account's
 second-factor state cannot be verified` may or may not be transient.** It is the binding refusal (audit
 `reason=mfa_proof_unavailable` or `mfa_binding_unenforced`, and its envelope carries `mfa_step_up_required: false`). It is persistent for an account that
-still reads factor generation `0` after the cutover or for a binding trigger that is not in force, and transient for a failed read, an inconclusive trigger validation (the `binding_inconclusive` latch, which clears on the next valid check) or an unusable database clock reading. The message does not say which: the audit `reason=` token, the server log (a warning once per inconclusive episode), the gauge `yuzu_auth_mfa_binding_enforcement_ok` (it shows only the sticky not-in-force case, not the latch) and the generation query in [Post-restore verification](#post-restore-verification) (`mfa_factor_gen <= 0`, which shows only pre-cutover accounts) tell them apart. The message ends "if it persists, ask an administrator to follow the MFA binding enforcement runbook", and the client remediation says retrying helps only if the read failed transiently; retry once, do not loop on it, and do not run `--mfa-reset` for an account on the strength of the message alone (see [MFA binding enforcement failed](#mfa-binding-enforcement-failed)). Each refusal writes an
+still reads factor generation `0` after the cutover or for a binding trigger that is not in force, and transient for a failed read, an inconclusive trigger validation (the `binding_inconclusive` latch, which clears on the next valid check) or an unusable database clock reading. The message does not say which: the audit `reason=` token, the server log (a warning once per inconclusive episode), the gauge `yuzu_auth_mfa_binding_enforcement_ok` (it shows only the sticky not-in-force case, not the latch) and the generation query in [Post-restore verification](#post-restore-verification) (`mfa_factor_gen <= 0`, which shows only accounts with a non-positive generation) tell them apart. The message ends "if it persists, ask an administrator to follow the MFA binding enforcement runbook", and the client remediation says retrying helps only if the read failed transiently; retry once, do not loop on it, and do not run `--mfa-reset` for an account on the strength of the message alone (see [MFA binding enforcement failed](#mfa-binding-enforcement-failed)). Each refusal writes an
 `mfa.step_up.required` audit row, best effort (every refusal has `result=error`;
 the `reason=` token in `detail` tells them apart: a missing store is
 `reason=auth_store_unwired`, an unreadable enrollment
@@ -1815,7 +1830,7 @@ enforcement procedure below: the account-store trigger observed not in force
 (`mfa_binding_unenforced`), the session store's rebind guard latched not in force
 (`mfa_proof_unavailable`), and an enrolled account whose factor generation is not positive
 (`mfa_proof_unavailable`). None of those three clears by retrying. The remediation text says what to do for each: an
-account enrolled before the upgrade (factor generation not positive) is repaired by an administrator with
+account whose factor generation is not positive is repaired by an administrator with
 `yuzu-server --mfa-reset <user>` after checking `mfa_factor_gen <= 0` (check first, then reset); otherwise restore the
 auth store's MFA binding triggers and restart the server. A different `503` from the same route is the clock-skew refusal of an
 OIDC approver (`retry_after_ms` is null, audit `result=error` with `detail` `approver_assurance:mfa_proof_clock_skew`, not
@@ -2054,7 +2069,7 @@ key on **both** tokens (`mfa_binding_unenforced` and `mfa_proof_unavailable`), a
 `mfa_proof_unavailable` also covers an ordinary session-store read fault and an enrolled account whose
 factor generation is not positive (see [Post-restore verification](#post-restore-verification)), so a rise with both gauges at `1` is not by itself a session-store read fault:
 check the gauges, then the generation query there. The approver routes answer these differently:
-three causes are sticky and carry no `retry_after_ms` (the remediation points here): the account-store
+three causes are sticky and carry no `retry_after_ms` on the approver rule (the remediation points here; the central check answers `null` for the unenforced-trigger case even when it is transient, because it cannot tell the two apart): the account-store
 trigger observed not in force (`mfa_binding_unenforced`), the session store's rebind guard latched not in
 force (`mfa_proof_unavailable`), and an enrolled row whose factor generation is not positive
 (`mfa_proof_unavailable`). A transient cause (an unreadable enrolment or stored-proof read, or an inconclusive trigger validation, a catalog query
@@ -2132,7 +2147,7 @@ alert on the unit being `failed` or on `up == 0` as well.
    space after `END`. Do not run the migrations' `ALTER TABLE ... ADD COLUMN`: in a database the new build has migrated
    the columns exist. If the tables came back from a database an earlier build wrote they do not, and this section
    is the wrong tool: a database in that state was written by an earlier build, which this build does not support
-   (`docs/user-manual/upgrading.md`, "Deployment contract"); recreate it. The full statements for each store are under [Repair statements](#repair-statements) below.
+   (`docs/user-manual/upgrading.md`, "Deployment contract"); deploy a fresh database and re-provision, and do not repair it in place. The full statements for each store are under [Repair statements](#repair-statements) below.
 3. **End the sessions that cannot be trusted.** Factor changes made while the trigger was not
    firing did not change the generation, so a proof bound before such a change still equals the unchanged
    generation. End the sessions of **every account whose factor changed in the window**

@@ -146,8 +146,9 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
-// A refused MFA step-up on an htmx form: `step_up_fn_` (or, on the two factor-credential routes, their
-// own gate) has already written the refusal (a 401/403/503 A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
+// A refused MFA step-up on an htmx form: `step_up_fn_` (or, on the two factor-credential routes,
+// their own gate) has already written the refusal (a 401/403/503 A4 envelope). htmx swaps no
+// 4xx/5xx body, so without a toast the button looks dead. Show the
 // envelope's own `error.message` (never its `remediation`, which names API-caller steps such as a
 // token or a POST route, not something the form can do); fall back to a fixed message if the body is not an envelope.
 // An in-handler refusal (require_mfa_step_up) already toasts on an htmx request via
