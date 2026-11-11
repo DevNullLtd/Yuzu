@@ -204,7 +204,12 @@ std::filesystem::path golden_dir() { return std::filesystem::path(YUZU_TEST_GOLD
 //      -> "><MD><" (the substituted text keeps both boundary characters, so
 //      the surrounding markup — e.g. the following "</small>"/"</div>" close
 //      tag — is untouched).
-// Nothing else is rewritten — no whitespace collapsing, no other
+// Exception: the Apps tab's "Last seen" cell. It splits the stamp at the 'T' into two
+// `<span class="nw">` wrappers, so pattern 1 cannot match; the date half falls to pattern 2
+// (<DATE>) and the time half stays literal ("04:00:00Z"). That is stable only because every
+// Apps fixture stamp is a fixed literal; an Apps stamp derived from the wall clock would need
+// its own pattern.
+// Nothing else is rewritten— no whitespace collapsing, no other
 // substitution. A cell with none of these shapes is unaffected: regex_replace
 // with zero matches returns its input unchanged, so this is safe to call
 // unconditionally rather than threading a per-cell "has timestamps?" flag.
@@ -1583,13 +1588,14 @@ TEST_CASE("DEX apps UI: payload key-set parity, both directions", "[dex][apps_ui
     flatten(payload, "");
 
     std::set<std::string> shown;
+    // population_basis is shown in words, in the Population caption; the test case "DEX apps UI:
+    // population_basis is shown in words in the Population caption, per scope" binds each token to
+    // its caption words.
     for (const char* k : {"window", "apps", "apps_total", "apps_truncated", "population", "population_basis",
                           "crash_source_coverage", "crash_source_coverage.windows",
                           "crash_source_coverage.macos", "crash_source_coverage.linux", "policy",
                           "policy.source", "policy.revision", "policy.fault", "policy.tiers"})
         shown.insert(k);
-    // population_basis is shown in words, in the Population caption: the next case binds each token to
-    // its caption words.
     for (const char* t : {"excellent", "good", "fair"})
         for (const char* f : {"", ".edge", ".name"})
             shown.insert(std::string("policy.tiers.") + t + f);
@@ -1726,7 +1732,7 @@ TEST_CASE("DEX apps UI: agent-reported and customer-authored strings are escaped
 
 TEST_CASE("DEX apps UI: the pre-rendered page stays under its size ceiling", "[dex][apps_ui]") {
     // 100 applications x 20 versions: every version is pre-rendered, so this is the worst page. It
-    // measures about 2.4 MB uncompressed (every row carries its score decomposition and both
+    // measures about 2.5 MB uncompressed (every row carries its score decomposition and both
     // denominators); 3 MiB is the regression lock, and a lazy per-application versions resource is
     // the real fix.
     std::vector<DexAppStabilityRow> rows;
