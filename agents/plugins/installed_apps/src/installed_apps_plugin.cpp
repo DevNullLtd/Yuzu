@@ -6,15 +6,17 @@
  *   "query" — Searches for a specific app by name (partial match).
  *             Params: name (required).
  *   "list_inventory" — machine-scope software inventory for the daily sync
- *             (blob contract v2, ADR-0016). Emits the extended 12-field rows;
+ *             (ADR-0016). Emits the 12 blob fields plus install_location;
  *             fields an ecosystem does not store are EMPTY, never synthesised
- *             (no "-" placeholders, no sentinel row on an empty result).
+ *             (no "-" placeholders, no sentinel row on an empty result). A clean
+ *             pass declares result status OK / completeness FULL; a degraded
+ *             acquisition declares CONSTRAINED / PARTIAL, rc 1 and no rows.
  *
  * Output is pipe-delimited, one record per line via write_output():
  *   app|name|version|publisher|install_date|install_location|bundle_id  (list, every field escape-aware)
  *   app|name|version|publisher                                (query)
  *   inv|name|version|publisher|install_date|kind|ecosystem|epoch|release|arch|
- *       signature_status|distro_id|distro_version                 (list_inventory)
+ *       signature_status|distro_id|distro_version|install_location  (list_inventory)
  *
  * `list`/`query`/`list_per_user` output is a stable operator-facing contract
  * (content/definitions/installed_apps.yaml et al.). `list`'s two trailing
@@ -36,7 +38,7 @@
 #include <tuple>
 #include <vector>
 
-// Pure parse/format helpers for the list_inventory action (v2 rows). In a
+// Pure parse/format helpers for the list_inventory action (blob rows). In a
 // header so the unit test exercises the same code (pattern: #1662).
 #include "installed_apps_inventory.hpp"
 // Pure parse helpers for list/query/list_per_user's acquisition legs, plus
@@ -279,23 +281,29 @@ namespace reg_walk = yuzu::installed_apps::reg_walk;
 const std::wstring kUninstallKey = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
 std::span<const reg_walk::UninstallRoot> windows_roots() {
+    // Columns: root, subkey, extra_sam, absent_ok, degrades_walk. The plugin ships x64 only, so a
+    // 64-bit process always runs on a 64-bit OS and the WoW64 view always exists.
     static const reg_walk::UninstallRoot roots[] = {
-        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, false}, // 64-bit HKLM
-        // 32-bit HKLM (WoW6432Node): absent on a host without WoW64. A key that does not
-        // exist has no entries, so ERROR_FILE_NOT_FOUND cannot under-report (every other
-        // status still degrades). HKLM-64 stays strict: setup always creates it, so its
-        // absence is a broken hive.
-        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, true},
-        {HKEY_CURRENT_USER, kUninstallKey, 0, true}, // current user
+        // 64-bit HKLM: setup always creates it, so its absence is a broken hive.
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, false, true},
+        // 32-bit HKLM (WoW6432Node): absent only on a 32-bit OS (a key that does not exist has no
+        // entries), which this plugin never runs on; on a 64-bit OS a missing view is a broken
+        // one. Every other status degrades.
+        {HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_32KEY, false, true},
+        // The agent identity's OWN HKCU: per-user data. Its absence is normal and its failure
+        // never degrades the machine-scope collection.
+        {HKEY_CURRENT_USER, kUninstallKey, 0, true, false},
     };
     return roots;
 }
 
 void log_failed_root(std::size_t i) {
     static constexpr const char* kRootNames[] = {"HKLM-64", "HKLM-32", "HKCU"};
-    spdlog::warn("installed_apps: Uninstall root {} could not be fully read -- the "
-                 "collection is degraded",
-                 kRootNames[i]);
+    // Row 3 (the agent identity's own HKCU) never degrades the walk (windows_roots()): its
+    // entries may be missing from a section sent as complete, which is what the line says.
+    spdlog::warn("installed_apps: Uninstall root {} could not be fully read -- {}", kRootNames[i],
+                 windows_roots()[i].degrades_walk ? "the collection is degraded"
+                                                  : "its entries may be missing");
 }
 
 AppCollection get_installed_apps_windows() {
@@ -304,11 +312,12 @@ AppCollection get_installed_apps_windows() {
         log_failed_root(i);
     auto apps = std::move(walk.apps);
 
-    // Sort, `list`-only location layer, unique(): one pure pass shared with the
-    // tests (installed_apps_parsers.hpp). The comparator and survivor are the
-    // pre-ADR-0028 code byte-for-byte, so the ADR-0016 `inv|` rows and `query`
+    // Sort, location layer, unique(): one pure pass shared with the tests
+    // (installed_apps_parsers.hpp). The comparator and survivor are the pre-ADR-0028
+    // code byte-for-byte, so the hashed fields of the ADR-0016 `inv|` rows and `query`
     // cannot move; only the survivor's install_location changes (it becomes the
-    // lexicographically smallest populated one in its run).
+    // lexicographically smallest populated one in its run), and that value now feeds
+    // the `inv|` row's 14th token (wire slot 13) as well as `list`.
     parsers::dedupe_uninstall_records(apps);
 
     return AppCollection{std::move(apps), walk.degraded};
@@ -410,7 +419,7 @@ AppCollection get_installed_apps_macos() {
 }
 #endif
 
-// ── list_inventory collectors (blob contract v2) ──────────────────────────
+// ── list_inventory collectors (blob contract v3) ──────────────────────────
 
 namespace inv = yuzu::installed_apps::inventory;
 
@@ -480,8 +489,8 @@ InvCollection get_inventory_linux() {
         collect({path, "info", "-v"}, inv::parse_apk_inv_line);
     }
 
-    // Host-level distro identity, read once and stamped on every row (v2
-    // contract). Honest-empty when /etc/os-release is absent (minimal
+    // Host-level distro identity, read once and stamped on every row (blob
+    // contract v3). Honest-empty when /etc/os-release is absent (minimal
     // containers) or the keys are missing.
     std::string osrel;
     if (std::ifstream f{"/etc/os-release"}; f) {
@@ -594,12 +603,13 @@ InvCollection get_inventory_macos_uncached() {
             r.name = std::move(app.name);
             r.version = std::move(app.version);
             r.install_date = std::move(app.install_date); // Last Modified
+            r.install_location = app.location; // the .app path; read again below for enrichment
             r.kind = "app";
             r.ecosystem = "macos";
             // #2273 native enrichment: CFBundle + SecStaticCode, in-process,
             // no subprocess (installed_apps_macos_enrich.hpp). Fills ONLY the
             // pre-existing, currently-honest-empty publisher/signature_status
-            // fields -- ADR-0016: the hashed 12-field row is NEVER
+            // fields -- ADR-0016: the hashed 13-field row is NEVER
             // added-to/reordered. bundle_id has no home in this row; see that
             // header's comment.
             if (!app.location.empty() && enriched < kMaxEnrichApps) {
@@ -928,8 +938,9 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     // with whatever it receives. The server cannot tell an incomplete snapshot
     // from a complete one -- it hashes bytes, not completeness -- so the only
     // place this can be caught is here. sync_source_installed_software.cpp
-    // already skips the whole cycle on a nonzero rc; this reports into that
-    // existing contract rather than inventing a new signal.
+    // reports the facet constrained (status-only, stored rows kept) on a nonzero
+    // rc; this reports into that existing contract rather than inventing a new
+    // signal.
 #ifdef _WIN32
     // Windows acquires natively (registry). A root that could not be opened or
     // enumerated to the end, or an app key that was denied, marks the walk
@@ -948,11 +959,12 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
 
     if (collected.degraded)
         spdlog::warn("installed_apps: list_inventory acquisition was degraded -- reporting "
-                     "rc=1 so the daily sync skips this cycle instead of committing a "
+                     "rc=1 so the daily sync reports it constrained instead of committing a "
                      "partial inventory as authoritative");
 
     // No sentinel row: an empty result is empty output + rc 0. The sync
-    // source's empty-parse guard skips the cycle rather than wiping state.
+    // source's empty-parse guard reports the facet constrained (`no_rows`)
+    // rather than wiping state.
     return parsers::emit_inventory(ctx, collected.degraded, collected.records,
                                    [](const inv::InvRecord& r) {
                                        return yuzu::util::sanitize_utf8(inv::format_inv_row(r));

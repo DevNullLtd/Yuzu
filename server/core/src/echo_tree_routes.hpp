@@ -4,10 +4,10 @@
 
 /// @file echo_tree_routes.hpp
 /// The Echo process-tree viewer route module — Frame 3 of the `/echo` dashboard page.
-/// Picks ONE live host, dispatches two canned read-only `echo.sql` queries to it
-/// ($Process_Live + $TCP_Live), polls the response store (the device-page "Get live
-/// info" dispatch/poll seam), reconstructs a per-host process tree over a chosen
-/// timescale (echo_process_tree.hpp), and renders the HTMX fragments.
+/// Picks ONE live host, dispatches three canned read-only `echo.sql` queries to it (the
+/// window's hour list, then $Process_Hourly + $TCP_Hourly for ONE hour), polls the response
+/// store (the device-page "Get live info" dispatch/poll seam), builds a per-host name-level
+/// process tree for that hour (echo_process_tree.hpp), and renders the HTMX fragments.
 ///
 /// Product UI: HTMX, server-rendered, dark-theme only; htmx core attrs only (CSP
 /// blocks hx-on). Per-host only; data from the agent's local echo.db only.
@@ -37,17 +37,17 @@
 /// cache `token` is a CSPRNG value minted and cached ONLY by `/result` itself
 /// (`cache_render_detail`/`ReconEntry`, principal-bound) — no other path mints
 /// one, so a `/detail` twin genuinely has no input to accept today. `/result`'s
-/// `pcmd`/`tcmd` command-ids are ordinary `echo sql` dispatch results
+/// `pcmd`/`tcmd`/`hcmd` command-ids are ordinary `echo sql` dispatch results
 /// (`plugin_action_catalogue_a.hpp`: `Infrastructure:Read`, `execute_gate=None`)
 /// and COULD in principle be minted by an operator through the already-twinned
 /// generic dispatch surface (`execute_instruction` / `POST /api/command`) by
-/// reproducing the two canned `$Process_Live`/`$TCP_Live` SELECTs verbatim —
+/// reproducing the three canned `$Process_Hourly`/`$TCP_Hourly` SELECTs verbatim —
 /// there is no dedicated API path, only that indirect route, so shipping a real
 /// `/result` twin would still need a caller to hand-derive those exact queries
 /// AND a new async "not ready yet" polling contract (REST/MCP have no htmx
 /// auto-reissue mechanism to lean on). Deferred as scope for now — see the
 /// #4027 ledger row for the recorded `exception:` reasoning. Revisit once Batch C
-/// lands a `/run` twin that mints pcmd/tcmd (and a token) directly over the API.
+/// lands a `/run` twin that mints pcmd/tcmd/hcmd (and a token) directly over the API.
 
 #include <yuzu/server/auth.hpp>
 
@@ -115,7 +115,8 @@ struct EchoPausedSourceRow {
     std::string agent_display;
     std::string source;
     std::int64_t paused_at = 0;
-    std::int64_t live_rows = -1; ///< -1 = unknown (no `<source>_rows` key)
+    /// Hourly roll-up row count; -1 = unknown (no `<source>_rows` key).
+    std::int64_t hourly_rows = -1;
     /// The agent reported `<source>_live_rows` only: it has not moved to the roll-up store, so
     /// its count is raw capture rows and is rendered as a dash, not as the hourly count.
     bool pre_rollup_agent = false;
@@ -154,7 +155,7 @@ std::string echo_retention_paused_json(const EchoRetentionPausedScan& scan);
 /// now owns THREE operator surfaces, all sharing the same scoped-Read + Execute-probe
 /// + dispatch/poll seam and the eight providers below:
 ///   1. Process-tree viewer   — `/fragments/echo/process-tree[/run|/result|/detail]`
-///   2. Device DNS/ARP panels — `/fragments/echo/process-tree/device-net` (ADR-0015)
+///   2. Device DNS/ARP panels — `/fragments/echo/process-tree/device-net` (ADR-0015), hourly
 ///   3. Capture-sources frame — `/fragments/echo/capture-sources[/load|/push]` (ADR-0015)
 /// (A rename to `EchoFrameRoutes` + a split of the capture-sources surface is tracked
 /// as a deferred follow-up; folding them here avoids a second server.cpp registration.)
@@ -266,7 +267,7 @@ public:
 
 private:
     /// One cached reconstruction. Holds the rendered tree (node-id addressable by the
-    /// detail route) + the host's connection set (filtered per-pid at detail time) +
+    /// detail route) + the shown hour's connection set (filtered per-name at detail time) +
     /// the device_id/os used for the per-detail scoped re-check and the names-only
     /// caption + the originating principal (the detail route fails closed unless the
     /// requesting session matches, so a predicted/leaked token can't be replayed under
@@ -276,13 +277,13 @@ private:
         std::string principal; ///< session->username that created this reconstruction
         std::string os;
         EchoProcTree tree;
-        std::vector<EchoTcpConn> conns;
+        std::vector<EchoTcpHourRow> conns;
         std::int64_t created = 0;
     };
 
     /// Bounded (kCacheCap) + TTL (kCacheTtlSeconds) reconstruction cache. Token is an
     /// unguessable random hex; insertion-ordered for eviction. Guarded by cache_mu_.
-    /// Cap kept modest: each entry can hold up to a 50k-node tree + 5k conns, so 32 ×
+    /// Cap kept modest: each entry can hold up to a 50k-node tree + 20k conns, so 32 ×
     /// worst-case bounds peak cache RSS (~0.8 GB ceiling; typical trees are far smaller).
     /// NOTE (multi-server): this cache is node-local — a future multi-server deployment
     /// must NOT assume a token resolves on another node.

@@ -364,6 +364,71 @@ separately.
 
 > **Fresh deployment only for 0.15.0.** Entries below that tell you to upgrade, roll back or restore an earlier build are historical and not a supported path (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). Entries describing behaviour of the 0.15.0 build still apply.
 
+### vNEXT - role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte; a NUL byte in a database text value is refused (breaking for deployments with such a role or member)
+
+**What changed.** `unassign_rbac_role` (MCP), the engine-role unassign (REST `DELETE /api/v1/engine-principals/{id}/roles/{role}` and MCP `unassign_engine_role`) and the engine-role assign (REST `POST /api/v1/engine-principals/{id}/roles` and MCP `assign_engine_role`) refuse a role name containing a NUL byte, any other control byte (0x01-0x1F) or DEL (0x7F): REST answers `400`, MCP answers invalid params (-32602), and the audit row is `result=denied` with the fixed detail `invalid_role_name`. Every other role name is accepted, including one granted out of band. Separately, a text value containing a NUL byte is now refused rather than shortened before it reaches the database.
+
+**Who is affected.** A deployment holding a role created out of band (direct SQL) whose name contains one of those bytes. Find them with:
+
+```sql
+SELECT name FROM rbac_store.roles WHERE name ~ '[\x01-\x1f\x7f]';
+```
+
+**What to do.** Delete the role in SQL. This form works on the output of the query above, where a control byte shows as `\x01`, without copying the name:
+
+```sql
+DELETE FROM rbac_store.roles WHERE name ~ '[\x01-\x1f\x7f]' RETURNING name;
+```
+
+(With `standard_conforming_strings = on`, the default, the `\x01` in a plain literal is passed to the regular-expression engine, which reads it as a hex escape.) The delete also removes the role's permissions and every FLEET-WIDE grant of it, through the foreign keys' `ON DELETE CASCADE` on the three tables that refer to it (`principal_roles`, `role_permissions` and `revoked_seed_defaults`); a role that has grants cannot be renamed, because those foreign keys have no `ON UPDATE CASCADE`. A grant of the same role on a MANAGEMENT GROUP lives in `management_group_store.management_group_roles`, which has no key into the `rbac_store` schema, so the delete does not touch it: remove those rows with the management-group query below. Then re-create the role under a clean name if it is still needed and grant it again (a deleted role's grants are not restored). A direct SQL delete does not bump the RBAC generation, so restart every serving replica afterwards (cached permissions can keep being served until a restart or another RBAC write). This SQL is unsupported and not audited, so record it in the change ticket.
+
+**Management-group members and roles.** Removing a member or unassigning a role on a management group (REST) refuses a control byte in `agent_id`, `role_name`, `principal_id` or `principal_type` with `400`; adding a member and assigning a role (REST and the MCP tools `add_management_group_member` and `assign_management_group_role`) refuse it too. All four operations (add, assign, remove and unassign) also refuse a value that is not valid UTF-8, in every one of those fields. The MCP tools validate `group_id` the same way and audit it as `invalid_group_id` (MCP only). A missing group answers `404` on add and assign (REST); on MCP it is the `group not found` invalid-params error, and the only audit row is the generic `mcp.<tool>` row with `result=denied`, `detail=group not found`, not a `management_group.*` row. A store fault is `503` (`result=failure`, `detail=store_error`). A member or grant whose stored id already carries a control byte can no longer be removed through the API. Find them with:
+
+```sql
+SELECT group_id, agent_id FROM management_group_store.management_group_members
+ WHERE agent_id ~ '[\x01-\x1f\x7f]';
+SELECT group_id, principal_type, principal_id, role_name FROM management_group_store.management_group_roles
+ WHERE principal_type ~ '[\x01-\x1f\x7f]' OR principal_id ~ '[\x01-\x1f\x7f]'
+    OR role_name ~ '[\x01-\x1f\x7f]';
+```
+
+The second query also finds a grant whose role name carries a control byte, so it covers the management-group half of the role removal above. Remove the rows with these statements, which match by pattern and so work on the query output without copying the value:
+
+```sql
+DELETE FROM management_group_store.management_group_members
+ WHERE agent_id ~ '[\x01-\x1f\x7f]' RETURNING group_id, agent_id;
+DELETE FROM management_group_store.management_group_roles
+ WHERE principal_type ~ '[\x01-\x1f\x7f]' OR principal_id ~ '[\x01-\x1f\x7f]'
+    OR role_name ~ '[\x01-\x1f\x7f]' RETURNING *;
+```
+
+(The pattern form is the one tested on PostgreSQL with `standard_conforming_strings = on`, the default.) This SQL is unsupported and not audited, so record it in the change ticket, and restart every serving replica afterwards (a direct SQL change does not notify the other replicas).
+
+**OTA package delete.** `DELETE /api/settings/updates/{platform}/{arch}/{version}` refuses a control byte (0x01-0x1F or DEL) or invalid UTF-8 in `platform`, `arch` or `version` with `400` (`result=denied`, `detail=invalid_package_field`), as the upload already does. A stored package whose key holds such a byte (written out of band) can no longer be deleted through the API. Find one with:
+
+```sql
+SELECT platform, arch, version FROM update_registry.update_packages
+ WHERE platform ~ '[\x01-\x1f\x7f]' OR arch ~ '[\x01-\x1f\x7f]' OR version ~ '[\x01-\x1f\x7f]';
+```
+
+To remove it, follow these steps in order. Do not remove any file before step 3.
+
+1. Delete the row in SQL and note each `filename` it returns: `DELETE FROM update_registry.update_packages WHERE <the same condition> RETURNING platform, arch, version, filename;`
+2. For each returned `filename`, run `SELECT platform, arch, version FROM update_registry.update_packages WHERE lower(filename) = lower('<filename>');`
+3. Only when that query returns no row, and the `filename` is a plain file name with no path separator, remove that binary and its `.sig` sidecar from the update directory by hand. When it returns a row, leave both files in place. Pause package uploads while you do this.
+4. Restart every serving replica.
+
+This SQL is unsupported and not audited, so record it in the change ticket.
+
+**Other effects.**
+
+- Where an input check exists, a NUL byte is answered as a client error (`400`, or -32602 on MCP). Elsewhere it may surface as a server error that retrying will not fix: treat it as permanent and do not retry. Database logs may show new SQLSTATE `22021` errors from a statement beginning `DO $yuzu_param$`; the value itself is never logged.
+- Directory sync skips and counts a record with a NUL byte in a key field, replaces a NUL byte in a display field with U+FFFD, and refuses a snapshot in which every user (or every group) would be skipped, leaving the stored roster unchanged. An already-synced record that gains a NUL byte in a key field is removed on the next sync, as any record absent upstream is.
+- A gateway that sends a NUL byte in a stream identifier receives `INVALID_ARGUMENT`.
+- OTA package upload puts the previously published binary and signature sidecar of the same filename back when the registry write fails (the answer stays `503`); the previous files are kept as `<file>.yuzu_prev_<suffix>` copies until the write succeeds (see "Leftover `*.yuzu_prev_*` files" under OTA Agent Updates). The upload refuses invalid UTF-8 in the platform, architecture or filename (and the delete route's key fields) with `400`. Schedule enable and disable answer `404` (not visible to the caller) or `503` (store fault) instead of `200` when the change did not apply. Schedule delete answers `503` on a store fault, and a schedule that does not exist stays `200` with `{"deleted":false}` and no audit row. Schedule create answers `400` for a NUL byte or other refused text and `503` for a store fault. The Entra directory sync response and audit row report the counts that sync applied.
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)): every server replica and gateway runs this build. A replica on an earlier build keeps the earlier behaviour, which is outside the deployment contract; mixed-version operation is not supported. See also [Upgrading](upgrading.md).
+
 ### vNEXT — the offline user-hive file check is now the default for autoruns, installed_apps, license_scan, registry and echo (related issue #5291; breaking for fleets with non-standard profile roots)
 
 **What changed.** Agent plugins that mount a logged-out Windows profile's `NTUSER.DAT` offline (to
@@ -2896,7 +2961,7 @@ The new `/echo` dashboard page (issue #547) surfaces every device × source pair
 
 **Per-operator scan state caveat.** Scan results are held in the server's memory keyed by operator username, with a 30-second per-operator cooldown to defend against retry-storms. Restarting the server clears all scan state; operators will see "No scan data yet — click Scan fleet" after a restart and a fresh scan returns within seconds. Persistence across restarts and multi-server coordination land in Phase 15.G operational hardening.
 
-**Audit log additions.** Two new audit actions emit on operator activity: `echo.status.scan` (every Scan-fleet click; `result=success`/`denied`/`failure` with detail) and `echo.source.reenable` (every Re-enable click; `result=success`/`denied`/`failure`). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the `detail=scope_violation` vs `detail=agent_not_connected` distinction even though the HTTP response body is identical (`Agent not reachable.` 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property.
+**Audit log additions.** Two new audit actions emit on operator activity: `echo.status.scan` (every Scan-fleet click; `result=success`/`denied`/`failure` with detail) and `echo.source.reenable` (every Re-enable click; `result=success`/`denied`/`failure`). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the `detail=scope_violation` vs `detail=agent_not_connected` distinction even though the HTTP response body is identical (`Agent not reachable.` 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property. A command the dispatch chokepoint refuses for the operator is its own token, `dispatch_denied reason=<token>` (answered `403`, or `500` for a server catalogue fault), and a grant withdrawn after the `attempted` row (`Execution:Execute` for a re-enable, `Infrastructure:Delete` for a purge) is `permission_revoked` (#7114, #7110), so a connectivity rule keyed on `agent_not_connected` no longer matches those.
 
 ### vNEXT — Fleet visualization (3D) (`/viz/fleet`)
 
@@ -4183,6 +4248,16 @@ The server can distribute agent binary updates to enrolled endpoints.
 rejected with a 400. That suffix is reserved for signature sidecars, named
 `<binary>.sig`, so a package called `x.sig` would occupy package `x`'s slot.
 
+**If the registry write fails, the previous package comes back.** Before an upload publishes over an existing file of the same name, the server keeps the previous binary and its `.sig` sidecar as copies named `<file>.yuzu_prev_<suffix>` in the update directory (a hard link where the filesystem allows, otherwise a copy; the live file name is never absent). When the registry write succeeds the copies are deleted; when it fails the new files are removed and the copies are put back, and the upload answers `503`. If a restore itself fails, the upload answers `500` naming any kept copy and the server log records it. If the registry write fails and the row then cannot be read back to tell whether it was written, the outcome is unknown: the upload answers `503` "The registry did not confirm whether the package was recorded" (audit `result=failure`, `detail=outcome_unknown`), and it leaves the new files and the kept copies where they are. Check the package list, then retry the same upload; repeating it is safe. A non-regular file at the binary or sidecar path, or no way to keep a copy, answers `500` "Could not prepare the package directory" with nothing written.
+
+**Leftover `*.yuzu_prev_*` files.** A kept copy can be left behind by a process crash between keeping it and finishing the upload, by a restore that failed (the answer names the copy), or by an upload that answered that the outcome was not confirmed. Nothing removes them. List them with `find <update-dir> -name '*.yuzu_prev_*'` (the update directory is `agent-updates/` under the data directory, or `--update-dir`). **Do not delete or restore a copy because of its age or its name alone.** A copy holds the previous file; the live file may hold the previous file or the new one, and the registry row names one of the two. For each copy, compare the SHA-256 of the live file and of the copy (`sha256sum`) with the `sha256` of the registry row for that file name (`SELECT platform, arch, version, sha256 FROM update_registry.update_packages WHERE filename = '<file>';`):
+
+- The live file matches the row: the copy is not needed, delete it.
+- The copy matches the row and the live file does not: the live file is an upload that was never recorded. Rename the copy over the live file name, and rename the signature copy of the same suffix over the `.sig` file, then delete nothing else.
+- Neither matches, or the row is missing: leave both files and upload the package again.
+
+A crash between publishing a file and recording it leaves that package mismatched, and agents refuse it on the hash check, until it is restored this way or uploaded again. Exclude `*.yuzu_prev_*` from file-level backups of the update directory: the files are transient.
+
 ### Promoting to Production
 
 1. In the OTA Updates list, locate the uploaded version.
@@ -4906,6 +4981,8 @@ For containerized deployments (Docker Compose), ensure the host volumes backing 
 The server's storage substrate is **PostgreSQL** (ADR-0006/0007; the agent stays SQLite). As of the cut-over (#1320 PR 3) the server **requires a reachable database at boot and fails closed without one** — it constructs a shared connection pool at startup and, if `--postgres-dsn` / `YUZU_POSTGRES_DSN` is unset or the database is unreachable, **refuses to start and exits non-zero** (no SQLite fallback for the server). There is a distinct `[PG] Refusing to start` log line so the cause is unambiguous in `systemd` / `kubectl` logs.
 
 > **Upgrade action (BREAKING):** before upgrading to this release, provision PostgreSQL and set `YUZU_POSTGRES_DSN`. Docker Compose deployments already bundle the `postgres` service and wire the DSN (no action beyond pulling the new images). Native installs must run the provisioning helper below (or point the DSN at a managed PostgreSQL 16+) **first** — otherwise the upgraded server will not boot. Restore pairing (ADR-0010): a database restore must be paired with the matching `--ca-dir` / key-directory restore.
+
+**Database role privileges.** The server's database role needs `USAGE` on the `plpgsql` procedural language, which PostgreSQL grants to every role by default (a deployment that revoked it from `PUBLIC` must grant it back, for example `GRANT USAGE ON LANGUAGE plpgsql TO <role>;` with `<role>` the server's database role): `pg::exec_params` refuses a bound text value that contains a NUL byte with a server-side `DO` block, and without `USAGE` that refusal would surface as a permission error instead of the NUL-byte message.
 
 **Dedicated coordination connection (HA WS-3, ADR-2002 §10).** Beyond the pool, each server holds **one** additional, never-recycled Postgres connection for background-work leader election, **plus one** for the `/readyz` reachability probe (HA WS-8). (The probe's connection runs one plain query per tick and holds no session state, so unlike the leader-election connection it works through a transaction-mode pooler; it reconnects after any failure.) Per §10 it is deliberately outside the pool and must reach the primary directly (an HAProxy-to-primary front is fine; a *transaction-mode* pooler is not, as it breaks the session advisory lock leadership rests on).
 

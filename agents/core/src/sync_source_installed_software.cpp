@@ -1,103 +1,34 @@
 #include "sync_source_installed_software.hpp"
 
+#include "hard_exit.hpp" // wait_for_workers_to_drain
+#include "installed_software_v3.hpp"
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sanitize_utf8_strict / clamp_field / sha256_hex
 
+#include <bounded_wait.hpp>         // bounded_call_ex: the per-action time limit
 #include <inventory_status_row.hpp> // the status-row grammar shared with the producing plugins
 #include <middleware_products.hpp>  // the middleware product table (title/vendor/ecosystem/kind)
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace yuzu::agent {
 
 namespace {
 
-// Must match the server seam's caps (inventory_ingestion.cpp) so the server's
-// parse does not truncate/drop differently from what this source hashed.
-constexpr std::size_t kMaxEntries = 20000;
-constexpr std::size_t kMaxFieldLen = 1024;
-// Total canonical-blob ceiling — MUST equal the server seam's kMaxBlobBytes
-// (inventory_ingestion.cpp); the two are comment-coordinated. Deliberately set
-// BELOW the gRPC default 4 MiB max-receive-message limit (no SetMaxReceiveMessageSize
-// override exists on the agent channel, the server, or the gateway hop), with
-// headroom for the InventoryReport's proto/map framing + content_hashes +
-// collected_at on top of the blob. At 4 MiB the wire message would exceed the
-// 4 MiB receive ceiling and the RPC would be rejected before the handler runs —
-// a permanent tight retry loop (governance UP-6). Real captures measure ~111-113 B
-// per record including the 16-field tail (Mac: 460 records / 51,062 B; Windows:
-// 378 / 42,556 B; tests/unit/test_inventory_sync.cpp); a dense host at ~150 B per
-// 12-field record plus the ~35 B tail (~185 B) hits this byte cap near ~17k
-// records, before kMaxEntries (20k). No real machine reaches either; an over-cap
-// host is dropped (governance UP-4) rather than looping. Lowering this
-// trades "outlier host skips" for "outlier host loops" — the right call for
-// installed software.
-constexpr std::size_t kMaxBlobBytes = 3u * 1024 * 1024;
-
-// The UTF-8 scrub + field clamp (sanitize_utf8_strict / clamp_field) live in
-// sync_canonical.{hpp,cpp} — one agent-side implementation shared by every
-// daily-sync source. The server's copy in inventory_ingestion.cpp
-// (parse_software_blob) must stay byte-for-byte identical, or the agent's and
-// server's canonical hashes diverge → permanent always-full. This source's
-// field cap is kMaxFieldLen above (comment-coordinated with the server seam).
-
-// Sort/dedup key walks the 12 v2 fields then the package_id/source tail, in blob
-// order. MUST mirror the server's entry_less/entry_equal
-// (software_inventory_store.cpp) or the two sides' canonical hashes diverge →
-// permanent always-full.
-bool entry_less(const SwEntry& a, const SwEntry& b) {
-    if (a.name != b.name)
-        return a.name < b.name;
-    if (a.version != b.version)
-        return a.version < b.version;
-    if (a.publisher != b.publisher)
-        return a.publisher < b.publisher;
-    if (a.install_date != b.install_date)
-        return a.install_date < b.install_date;
-    if (a.kind != b.kind)
-        return a.kind < b.kind;
-    if (a.ecosystem != b.ecosystem)
-        return a.ecosystem < b.ecosystem;
-    if (a.epoch != b.epoch)
-        return a.epoch < b.epoch;
-    if (a.release != b.release)
-        return a.release < b.release;
-    if (a.arch != b.arch)
-        return a.arch < b.arch;
-    if (a.signature_status != b.signature_status)
-        return a.signature_status < b.signature_status;
-    if (a.distro_id != b.distro_id)
-        return a.distro_id < b.distro_id;
-    if (a.distro_version != b.distro_version)
-        return a.distro_version < b.distro_version;
-    // Extended tail LAST, package_id then source — byte-for-byte the server's
-    // comparator (software_inventory_store.cpp).
-    if (a.package_id != b.package_id)
-        return a.package_id < b.package_id;
-    return a.source < b.source;
-}
-
-bool entry_equal(const SwEntry& a, const SwEntry& b) {
-    return a.name == b.name && a.version == b.version && a.publisher == b.publisher &&
-           a.install_date == b.install_date && a.kind == b.kind && a.ecosystem == b.ecosystem &&
-           a.epoch == b.epoch && a.release == b.release && a.arch == b.arch &&
-           a.signature_status == b.signature_status && a.distro_id == b.distro_id &&
-           a.distro_version == b.distro_version && a.package_id == b.package_id &&
-           a.source == b.source;
-}
-
-// The single sort + dedup in the server's comparator order, shared by the cap
-// check and the canonical blob.
-void normalize_installed_software(std::vector<SwEntry>& entries) {
-    std::sort(entries.begin(), entries.end(), entry_less);
-    entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
-}
+// The raw-row bound and the field clamp are the writer's caps (kV3MaxRows / kV3MaxFieldLen,
+// installed_software_v3.hpp, which mirror server/core/src/inventory_blob_v3.hpp), so the
+// server's parse neither truncates nor drops differently from what this source hashed. The
+// blob and section byte caps live with the writer too.
 
 // ── shared line/token splitters (installed_apps + the pkg/wof adapters) ──
 
@@ -173,29 +104,21 @@ AdaptedRows failed(std::string reason) {
 // level IS counted but carries no level, so it fails validation as "bad status" too
 // (alone, or as the second row beside a valid one).
 //
-// What a `constrained` level does is the action's `policy` (the table's
-// `constrained` column). ConstrainedPolicy::fail: the action fails the cycle
-// (packages: a constrained listing is an incomplete package list). When
-// keep_rows_if_present_seen (managers, dotnet, jvm) the constraint names facts the presence
-// row does not carry, so the adapted rows are kept (status ok, reason = the status
-// token) -- but ONLY if at least one PRESENT data row of the action's kind was
-// seen, mapped or not (`on_row` returns true for it): constrained with zero such
-// rows is indistinguishable from an absent/unreadable manager and still fails.
-// Counting the row rather than its mapped entry matters on Linux, where a present
-// dpkg/apt row is real evidence but deliberately maps to nothing. Field 4 surfaces
-// as `reason` only under constrained; supported and unsupported leave it empty.
+// A `constrained` level contributes no rows (Status::constrained, reason = field 4): the answer
+// says the read was incomplete, so the collector reports a status-only section and the server
+// keeps the facet's rows (they read as unconfirmed). Field 4 surfaces as `reason` under
+// constrained only; supported and unsupported leave it empty.
 template <class OnRow>
 AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action, OnRow on_row,
-                                ConstrainedPolicy policy, bool escaped = false) {
+                                bool escaped = false, std::size_t max_tokens = 10) {
     AdaptedRows res;
     int status_rows = 0;
     std::optional<yuzu::shared::StatusLevel> level;
     std::string reason;
-    std::size_t seen = 0;
     for_each_line(out, [&](std::string_view line) {
-        // One more than the widest row (store rows are nine tokens) so an over-wide row
-        // fails the `!= N` width checks instead of being truncated to a valid width.
-        const auto tok = split_tokens(line, 10, escaped);
+        // One more than the widest row (store rows are nine tokens, driver rows ten) so an
+        // over-wide row fails the `!= N` width checks instead of being truncated to a valid width.
+        const auto tok = split_tokens(line, max_tokens, escaped);
         if (yuzu::shared::is_status_line(tok)) {
             if (auto row = yuzu::shared::parse_status_row(tok, action)) {
                 ++status_rows;
@@ -204,26 +127,17 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
             }
             return true;
         }
-        if (on_row(tok, res.entries))
-            ++seen;
-        return res.entries.size() <= kMaxEntries;
+        on_row(tok, res.entries);
+        return res.entries.size() <= kV3MaxRows;
     });
     if (status_rows != 1 || !level)
         return failed("bad status");
     if (*level == yuzu::shared::StatusLevel::constrained) {
-        // Keeping rows is the opt-in: any other value (an out-of-range cast too) fails closed.
-        if (policy == ConstrainedPolicy::drop_source) {
-            // A known-incomplete set is never published: no rows, the cycle continues. The
-            // cycle's aggregate replaces the stored inventory, so these rows are
-            // REMOVED from the stored inventory until the source recovers (see the header).
-            res.entries.clear();
-            res.status = AdaptedRows::Status::withheld;
-            res.reason = std::move(reason);
-            return res;
-        }
-        if (policy != ConstrainedPolicy::keep_rows_if_present_seen || seen == 0)
-            return failed(reason);
-        res.reason = reason; // ok + non-empty reason = constrained, rows kept
+        // A known-incomplete set is never published as rows.
+        res.entries.clear();
+        res.status = AdaptedRows::Status::constrained;
+        res.reason = std::move(reason);
+        return res;
     }
     if (*level == yuzu::shared::StatusLevel::unsupported) {
         res.entries.clear();
@@ -286,115 +200,102 @@ constexpr const ManagerEcosystem* find_manager(std::string_view manager) {
     return nullptr;
 }
 
-// One table row per inventory action. Adding an action = one row + one pure adapter.
+// One table row per inventory action. Adding an action = one row + one pure adapter. The facet
+// (and the `source` of every row) is "<plugin>.<action>"; it must be a server kSoftwareSources
+// value (tests/test_software_vocabulary_consistency.py reads this table, so the
+// `{.plugin = "...", .action = ...}` literal shape is a contract).
 struct InventoryAction {
     std::string_view plugin;
     std::string_view action;
-    AdaptedRows (*adapt)(const std::string& captured, ConstrainedPolicy policy);
-    // A typed result_completeness of PARTIAL (sdk/include/yuzu/plugin.h:264-267)
-    // skips the cycle unless the row opts in. managers opts in: it legitimately
-    // reports CONSTRAINED/PARTIAL while still carrying a present row.
-    bool accept_partial{false};
-    // What a `constrained` status answer does to this action (see adapt_pkg_inventory).
-    // Actions with no status row (installed_apps, windows_optional_features) ignore it.
-    ConstrainedPolicy constrained{ConstrainedPolicy::fail};
+    AdaptedRows (*adapt)(const std::string& captured);
+    // How long the sync thread waits for this one action before it reports `timeout` and goes on
+    // (the worker is abandoned, not killed: single-flight keeps it to one per plugin). The agent's
+    // shutdown watchdog is 20 s, so a stop that lands inside a wait longer than that ends in the
+    // watchdog's hard exit: the same outcome an unbounded in-process dispatch had before.
+    std::chrono::seconds time_limit{60};
 };
 
-// UP-IN6 preserved per plugin: installed_apps always reports >= 1 application on a
-// real endpoint, so an empty parse is a plugin hiccup, NOT "everything uninstalled".
-// Sending the other plugins' rows alone would DELETE the stored apps.
-AdaptedRows adapt_installed_apps(const std::string& captured, ConstrainedPolicy /*policy*/) {
+constexpr std::chrono::seconds kSlowActionLimit{120};
+
+// UP-IN6 preserved per plugin: installed_apps always reports >= 1 application on a real
+// endpoint, so an empty parse is a plugin hiccup, NOT "everything uninstalled": a `constrained`
+// section (token `no_rows`), never a deleting `full`.
+AdaptedRows adapt_installed_apps(const std::string& captured) {
     AdaptedRows r;
     r.entries = parse_installed_apps_output(captured);
     if (r.entries.empty())
-        return failed("no inv rows");
+        return failed("no_rows");
     return r;
-}
-
-// windows_optional_features has no status grammar: bound into the table through a wrapper that
-// ignores the policy rather than giving the public one-argument adapter a parameter it never reads.
-AdaptedRows adapt_windows_optional_features(const std::string& captured,
-                                            ConstrainedPolicy /*policy*/) {
-    return parse_windows_optional_features_output(captured);
 }
 
 // runtimes.python is bound through a wrapper that supplies the host's vendor-column rule (the
 // collector runs on the agent's own OS), keeping the public adapter testable on any host.
-AdaptedRows adapt_runtimes_python(const std::string& captured, ConstrainedPolicy policy) {
-    return parse_runtimes_python_output(captured, policy, kPythonVendorColumnIsVendor);
+AdaptedRows adapt_runtimes_python(const std::string& captured) {
+    return parse_runtimes_python_output(captured, kPythonVendorColumnIsVendor);
+}
+
+// drivers_inventory: the ecosystem is the host's (Windows PnP driver, Linux kernel module).
+#if defined(_WIN32)
+constexpr bool kDriversAreKernelModules = false;
+#else
+constexpr bool kDriversAreKernelModules = true;
+#endif
+AdaptedRows adapt_hardware_drivers(const std::string& captured) {
+    return parse_hardware_drivers_inventory_output(captured, kDriversAreKernelModules);
 }
 
 const InventoryAction kInventoryActions[] = {
-    {.plugin = "installed_apps", .action = "list_inventory", .adapt = adapt_installed_apps},
-    {.plugin = "pkg_inventory",
-     .action = kActionManagers,
-     .adapt = parse_pkg_inventory_managers_output,
-     .accept_partial = true,
-     .constrained = ConstrainedPolicy::keep_rows_if_present_seen},
-    {.plugin = "pkg_inventory",
-     .action = kActionPackages,
-     .adapt = parse_pkg_inventory_packages_output},
+    {.plugin = "installed_apps",
+     .action = "list_inventory",
+     .adapt = adapt_installed_apps,
+     .time_limit = kSlowActionLimit},
+    {.plugin = "pkg_inventory", .action = kActionManagers, .adapt = parse_pkg_inventory_managers_output},
+    {.plugin = "pkg_inventory", .action = kActionPackages, .adapt = parse_pkg_inventory_packages_output},
     {.plugin = "pkg_inventory",
      .action = kActionStorePackages,
      .adapt = parse_pkg_inventory_store_packages_output},
     {.plugin = "windows_optional_features",
      .action = "list",
-     .adapt = adapt_windows_optional_features},
+     .adapt = parse_windows_optional_features_output,
+     .time_limit = kSlowActionLimit},
     {.plugin = "msi_packages",
      .action = "list_inventory",
      .adapt = parse_msi_packages_list_inventory_output},
-    // Metadata-only source whose constraint is a host fact (an NFS /usr/local, a cap, an access-
-    // denied registry key): a constrained answer withholds just the python rows, not the cycle.
-    {.plugin = "runtimes",
-     .action = "python",
-     .adapt = adapt_runtimes_python,
-     .constrained = ConstrainedPolicy::drop_source},
-    // Metadata-only source whose steady-state constraint is a permission fact: a constrained
-    // answer drops just that source (rows withheld) instead of failing the whole cycle.
+    {.plugin = "runtimes", .action = "python", .adapt = adapt_runtimes_python},
     {.plugin = "middleware",
      .action = "ibm_mq",
-     .adapt = [](const std::string& o, ConstrainedPolicy pol) {
-         return parse_middleware_output(o, "ibm_mq", pol);
-     },
-     .constrained = ConstrainedPolicy::drop_source},
-    // A constrained answer is per-home or per-root (one JDK on a removable drive, one NFS root, one
-    // oversized release file) and still carries a row for every install it found, so the rows are
-    // KEPT when at least one was seen; a constrained answer with ZERO rows skips the cycle (stored
-    // rows untouched) rather than deleting them. The typed answer is CONSTRAINED + PARTIAL, hence
-    // accept_partial, as for managers.
-    {.plugin = "runtimes",
-     .action = "dotnet",
-     .adapt = parse_runtimes_dotnet_output,
-     .accept_partial = true,
-     .constrained = ConstrainedPolicy::keep_rows_if_present_seen},
-    {.plugin = "runtimes",
-     .action = "jvm",
-     .adapt = parse_runtimes_jvm_output,
-     .accept_partial = true,
-     .constrained = ConstrainedPolicy::keep_rows_if_present_seen},
+     .adapt = [](const std::string& o) { return parse_middleware_output(o, "ibm_mq"); }},
+    {.plugin = "runtimes", .action = "dotnet", .adapt = parse_runtimes_dotnet_output},
+    {.plugin = "runtimes", .action = "jvm", .adapt = parse_runtimes_jvm_output},
+    // LAST: the facet order is the order the sections are planned in, and a driver roster is the
+    // one most likely to be large; the server's vocabulary table follows this order.
+    {.plugin = "hardware",
+     .action = "drivers_inventory",
+     .adapt = adapt_hardware_drivers,
+     .time_limit = kSlowActionLimit},
 };
 
 } // namespace
 
 std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
     std::vector<SwEntry> entries;
-    // Reads ONE PAST kMaxEntries so the collector's per-action raw-count check can
-    // see an over-cap host and skip the cycle rather than hash a silently truncated
+    // Reads ONE PAST kV3MaxRows so the collector's per-action raw-count check can
+    // see an over-cap host and report it oversize rather than hash a silently truncated
     // list.
     for_each_line(out, [&entries](std::string_view line) {
-        // Split on '|' into up to 13 tokens (the `inv` prefix + 12 v2 fields).
-        // Anything past the 13th token is dropped — the same truncation the
-        // server's parse applies past field 12, so fields can never shift.
-        const auto tok = split_tokens(line, 13);
+        // Split on '|' into up to 14 tokens (the `inv` prefix + 12 blob fields + install_location).
+        // Anything past the 14th token is dropped — the same truncation the server's parse
+        // applies past its last field, so fields can never shift.
+        const auto tok = split_tokens(line, 14);
         if (tok.empty() || tok[0] != "inv")
             return true; // skip app|, user_app|, error|, found|, etc.
         if (tok.size() < 2 || tok[1].empty())
             return true; // malformed / empty name
 
-        // Blob contract v2 field order; missing trailing tokens → empty fields.
+        // Blob contract field order; missing trailing tokens → empty fields.
         SwEntry e;
         const auto field = [&tok](std::size_t i) -> std::string {
-            return tok.size() > i ? clamp_field(tok[i], kMaxFieldLen) : std::string{};
+            return tok.size() > i ? clamp_field(tok[i], kV3MaxFieldLen) : std::string{};
         };
         e.name = field(1);
         e.version = field(2);
@@ -408,18 +309,19 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
         e.signature_status = field(10);
         e.distro_id = field(11);
         e.distro_version = field(12);
+        e.install_location = field(13);
         // Drop a name that became empty AFTER clamping (e.g. a separator-only
-        // name). The server's parse_software_blob drops empty-name rows, so the
-        // agent must too or the two canonical hashes diverge → permanent
-        // always-full (governance UP-1). Mirrors the server's `!e.name.empty()`.
+        // name). The server's parse drops empty-name rows, so the agent must too or
+        // the two section hashes diverge → permanent always-full (governance UP-1).
+        // Mirrors the server's `!e.name.empty()`.
         if (!e.name.empty())
             entries.push_back(std::move(e));
-        return entries.size() <= kMaxEntries;
+        return entries.size() <= kV3MaxRows;
     });
     return entries;
 }
 
-AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, ConstrainedPolicy policy) {
+AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
     // package|homebrew|<id>|<version>|<formula|cask>
     // package|chocolatey|<id>|<version or ->|pkg
     // A row whose id carries an escaped `\|` splits wider than five tokens, fails the width
@@ -433,7 +335,7 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, Constrai
         if (!m || m->package_action != kActionPackages)
             return false;
         SwEntry e;
-        e.name = clamp_field(tok[2], kMaxFieldLen);
+        e.name = clamp_field(tok[2], kV3MaxFieldLen);
         if (e.name.empty())
             return true;
         if (tok[4] == "formula")
@@ -446,15 +348,14 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out, Constrai
             return true;
         // `-` is the row grammar's empty-version sentinel (format_package_row), written for a
         // Chocolatey package whose nuspec was unreadable.
-        e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+        e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kV3MaxFieldLen);
         e.ecosystem = std::string(m->ecosystem);
         entries.push_back(std::move(e));
         return true;
-    }, policy);
+    });
 }
 
-AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
-                                                      ConstrainedPolicy policy) {
+AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out) {
     // package|<snap|flatpak|appx>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
     // Appx: <id> is the PackageFullName (Name_Version_Arch_ResourceId_PublisherId); the entry's
     // name is the Name part, its version and arch come from tok[3] / tok[6] (`-` = unknown),
@@ -465,7 +366,7 @@ AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
     // is shared with snap/flatpak and never unescapes (it would store `Weird\|Key` as a name).
     // ACTIVE rows only: an inactive or unknown revision is on disk but is not
     // installed software. A degraded active row (version `-`, kind `unknown`) is
-    // still collected (honest-empty version), never a reason to skip the cycle.
+    // still collected (honest-empty version), never a reason to constrain the facet.
     // Flatpak `version` is deliberately empty: tok[7] is a branch (a ref such as
     // `stable`/`51`), not a version, and SwEntry has no field for it; the commit
     // rides in `release`.
@@ -478,34 +379,34 @@ AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out,
         if (tok[8] != "active" || !m || m->package_action != kActionStorePackages)
             return true; // seen, not mapped
         SwEntry e;
-        e.name = clamp_field(tok[2], kMaxFieldLen);
+        e.name = clamp_field(tok[2], kV3MaxFieldLen);
         if (e.name.empty())
             return true;
         e.kind = tok[4] == "app" ? "app" : "pkg";
         e.ecosystem = std::string(m->ecosystem);
         if (m->manager == "appx") {
             // Name_Version_...: the entry is the package name, never the 5-part identity string.
-            e.name = clamp_field(tok[2].substr(0, tok[2].find('_')), kMaxFieldLen);
+            e.name = clamp_field(tok[2].substr(0, tok[2].find('_')), kV3MaxFieldLen);
             if (e.name.empty())
                 return true;
-            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
-            e.arch = tok[6] == "-" ? std::string{} : clamp_field(tok[6], kMaxFieldLen);
+            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kV3MaxFieldLen);
+            e.arch = tok[6] == "-" ? std::string{} : clamp_field(tok[6], kV3MaxFieldLen);
             entries.push_back(std::move(e));
             return true;
         }
         if (m->manager == "snap")
-            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kV3MaxFieldLen);
         else
-            e.arch = tok[6] == "-" ? std::string{} : clamp_field(tok[6], kMaxFieldLen);
-        e.release = tok[5] == "-" ? std::string{} : clamp_field(tok[5], kMaxFieldLen);
+            e.arch = tok[6] == "-" ? std::string{} : clamp_field(tok[6], kV3MaxFieldLen);
+        e.release = tok[5] == "-" ? std::string{} : clamp_field(tok[5], kV3MaxFieldLen);
         entries.push_back(std::move(e));
         return true;
-    }, policy);
+    });
 }
 
-AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, ConstrainedPolicy policy) {
+AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
     // manager|<name>|<present|unavailable>|<version or ->|<root>|<facts>|<reason>
-    // A PRESENCE row only (the v2 row has no field for the prefix, so two Homebrew
+    // A PRESENCE row only (the row has no field for the prefix, so two Homebrew
     // prefixes collapse to one row after dedup). Only a manager whose kManagerEcosystems row
     // has `presence_row` (homebrew, chocolatey, winget) becomes an entry; any other manager
     // (and any name absent from the table: dpkg/apt/rpm/dnf/pacman/apk) is dropped, so a
@@ -515,8 +416,7 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, Constrai
                                   std::vector<SwEntry>& entries) {
         if (tok[0] != "manager" || tok.size() != 7 || tok[2] != "present")
             return false;
-        // A present row is evidence the manager was read even when it maps to
-        // nothing (a Linux dpkg/apt row): it keeps a constrained answer's cycle.
+        // A present row that maps to nothing (a Linux dpkg/apt row) is dropped below.
         const ManagerEcosystem* m = find_manager(tok[1]);
         if (!m || !m->presence_row) {
             spdlog::debug("sync: pkg_inventory manager '{}' has no installed_software mapping — "
@@ -526,7 +426,7 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, Constrai
         }
         SwEntry e;
         e.name = std::string(m->manager);
-        e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+        e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kV3MaxFieldLen);
         // The vendor the table declares for this presence row (middleware precedent), else
         // empty, which `vendor_or_origin` labels `via:<ecosystem>`.
         e.publisher = std::string(m->presence_publisher);
@@ -534,38 +434,35 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out, Constrai
         e.ecosystem = std::string(m->ecosystem);
         entries.push_back(std::move(e));
         return true;
-    }, policy);
+    });
 }
 
-AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out,
-                                                     ConstrainedPolicy policy) {
+AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out) {
     // inv|<product_code>|<name>|<version>|<publisher>, machine-context MSI products.
     // The producer deletes '|', tab, CR, LF and NUL from the fields (msi_packages_inventory.hpp
     // strip_row_breakers), so no unescape is needed here and an over-wide row can only be
     // malformed. A constrained status (an enumeration error or a failed property
-    // read) fails the cycle (the table row's ConstrainedPolicy::fail): a partial roster
-    // would delete the stored msi rows beyond the failure point.
+    // read) is a status-only `constrained` section: the stored msi rows are kept.
     return adapt_pkg_inventory(out, "list_inventory",
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
         if (tok[0] != "inv" || tok.size() != 5)
             return false;
         SwEntry e;
-        e.name = clamp_field(tok[2], kMaxFieldLen);
+        e.name = clamp_field(tok[2], kV3MaxFieldLen);
         if (e.name.empty())
             return true; // seen, not mapped: the server drops empty names (also the advertised-only shape)
-        e.version = clamp_field(tok[3], kMaxFieldLen);
-        e.publisher = clamp_field(tok[4], kMaxFieldLen);
+        e.version = clamp_field(tok[3], kV3MaxFieldLen);
+        e.publisher = clamp_field(tok[4], kV3MaxFieldLen);
         e.kind = "pkg";
         e.ecosystem = "msi";
-        e.package_id = clamp_field(tok[1], kMaxFieldLen);
+        e.package_id = clamp_field(tok[1], kV3MaxFieldLen);
         entries.push_back(std::move(e));
         return true;
-    }, policy);
+    });
 }
 
-AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPolicy policy,
-                                         bool vendor_column_is_vendor) {
+AdaptedRows parse_runtimes_python_output(const std::string& out, bool vendor_column_is_vendor) {
     // python|<flavour>|<version or ->|<install_path or ->|<vendor or ->, one row per interpreter the
     // runtimes plugin found at the standard machine roots (agents/plugins/runtimes/src/
     // runtimes_python_parsers.hpp). The status row is the shared inventory grammar. Every row
@@ -576,8 +473,7 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
     // CFBundleIdentifier reverse-domain id, an identifier and not a vendor, so it is ignored
     // there (`vendor_column_is_vendor` false) and the collector labels the row `via:python`,
     // the same rule as macos_pkgutil. The flavour and path have no installed_software slot and
-    // are dropped. A constrained status withholds these rows only: see the table row's
-    // ConstrainedPolicy::drop_source.
+    // are dropped.
     // The producer escapes a literal pipe in the free-text fields (runtimes_parsers.hpp
     // field_or_dash -> safe_output_field gives `\|`), so the split is escape-aware: width stays
     // strict (five logical fields); the version is dotted digits by construction on every leg, and
@@ -589,19 +485,19 @@ AdaptedRows parse_runtimes_python_output(const std::string& out, ConstrainedPoli
             return false;
         SwEntry e;
         e.name = "Python";
-        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kV3MaxFieldLen);
         // The vendor column is free text (the producer escapes a literal pipe as `\|`), so it
         // is unescaped here; `-` = unknown, left empty for the collector's via:python label.
         if (vendor_column_is_vendor && tok[4] != "-")
-            e.publisher = clamp_field(unescape_pipes(tok[4]), kMaxFieldLen);
+            e.publisher = clamp_field(unescape_pipes(tok[4]), kV3MaxFieldLen);
         e.kind = "app";
         e.ecosystem = "python";
         entries.push_back(std::move(e));
         return true;
-    }, policy, /*escaped=*/true);
+    }, /*escaped=*/true);
 }
 
-AdaptedRows parse_runtimes_dotnet_output(const std::string& out, ConstrainedPolicy policy) {
+AdaptedRows parse_runtimes_dotnet_output(const std::string& out) {
     // dotnet|<flavour>|<version or ->|<install_path or ->|<vendor or -> (runtimes plugin: runtime
     // /sdk/netfx on Windows, core/sdk/unmodelled on Linux and macOS). Same shape and escape-aware
     // split as the python adapter; the vendor column is dropped, the publisher is always Microsoft.
@@ -619,16 +515,16 @@ AdaptedRows parse_runtimes_dotnet_output(const std::string& out, ConstrainedPoli
             e.name = ".NET Framework";
         else
             e.name = ".NET";
-        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kV3MaxFieldLen);
         e.publisher = "Microsoft";
         e.kind = "app";
         e.ecosystem = "dotnet";
         entries.push_back(std::move(e));
         return true;
-    }, policy, /*escaped=*/true);
+    }, /*escaped=*/true);
 }
 
-AdaptedRows parse_runtimes_jvm_output(const std::string& out, ConstrainedPolicy policy) {
+AdaptedRows parse_runtimes_jvm_output(const std::string& out) {
     // jvm|<flavour>|<version or ->|<install_path or ->|<vendor or ->. The vendor is the release
     // file's IMPLEMENTOR, free text the producer escapes, so the split is escape-aware; the vendor
     // is clamped and stored as the publisher.
@@ -644,17 +540,16 @@ AdaptedRows parse_runtimes_jvm_output(const std::string& out, ConstrainedPolicy 
             e.name = "Java JRE";
         else
             e.name = "Java";
-        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kMaxFieldLen);
-        e.publisher = tok[4] == "-" ? std::string{} : clamp_field(tok[4], kMaxFieldLen);
+        e.version = tok[2] == "-" ? std::string{} : clamp_field(tok[2], kV3MaxFieldLen);
+        e.publisher = tok[4] == "-" ? std::string{} : clamp_field(tok[4], kV3MaxFieldLen);
         e.kind = "app";
         e.ecosystem = "jvm";
         entries.push_back(std::move(e));
         return true;
-    }, policy, /*escaped=*/true);
+    }, /*escaped=*/true);
 }
 
-AdaptedRows parse_middleware_output(const std::string& out, std::string_view action,
-                                    ConstrainedPolicy policy) {
+AdaptedRows parse_middleware_output(const std::string& out, std::string_view action) {
     // <id>|<title>|<name>|<version or ->|<install_path>|<edition or ->  (install_path and
     // edition are not carried). Free-text fields arrive escape-aware (a path may hold `\|`), so
     // the split is too. Name, publisher, kind and ecosystem come from the plugin's own product
@@ -675,14 +570,14 @@ AdaptedRows parse_middleware_output(const std::string& out, std::string_view act
         if (tok[1] == p->title) {
             SwEntry e;
             e.name = p->title;
-            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kV3MaxFieldLen);
             e.publisher = p->vendor;
             e.kind = p->kind;
             e.ecosystem = p->ecosystem;
             entries.push_back(std::move(e));
         }
         return true;
-    }, policy, /*escaped=*/true);
+    }, /*escaped=*/true);
 }
 
 AdaptedRows parse_windows_optional_features_output(const std::string& out) {
@@ -707,15 +602,15 @@ AdaptedRows parse_windows_optional_features_output(const std::string& out) {
         if (tok.size() != 4)
             return true;
         SwEntry e;
-        e.name = clamp_field(tok[1], kMaxFieldLen);
+        e.name = clamp_field(tok[1], kV3MaxFieldLen);
         if (e.name.empty())
             return true;
-        e.version = clamp_field(tok[2], kMaxFieldLen);
+        e.version = clamp_field(tok[2], kV3MaxFieldLen);
         e.publisher = "Microsoft"; // DISM features are Windows components: constant vendor
         e.kind = "feat";
         e.ecosystem = "optional_feature";
         res.entries.push_back(std::move(e));
-        return res.entries.size() <= kMaxEntries;
+        return res.entries.size() <= kV3MaxRows;
     });
     if (sentinel.status != AdaptedRows::Status::ok)
         return sentinel;
@@ -724,10 +619,52 @@ AdaptedRows parse_windows_optional_features_output(const std::string& out) {
     return res;
 }
 
-std::vector<std::pair<std::string_view, std::string_view>> installed_software_actions() {
-    std::vector<std::pair<std::string_view, std::string_view>> out;
+AdaptedRows parse_hardware_drivers_inventory_output(const std::string& out,
+                                                    bool kernel_module_leg) {
+    // driver_inv|<name>|<version>|<date>|<provider>|<class>|<signer>|<signed>|<inf>|<hwid>
+    // (hardware_drivers_inventory.hpp). Every absent value is `-`; free text is escaped by the
+    // producer (`\|`), so the split is escape-aware and each text field is unescaped. The class,
+    // INF and hardware id have no slot and are dropped. A row with no name is seen, not mapped
+    // (the server drops nameless rows).
+    const auto text = [](std::string_view t) {
+        return t == "-" ? std::string{} : clamp_field(unescape_pipes(t), kV3MaxFieldLen);
+    };
+    return adapt_pkg_inventory(out, "drivers_inventory",
+                               [kernel_module_leg, &text](const std::vector<std::string_view>& tok,
+                                                          std::vector<SwEntry>& entries) {
+        if (tok[0] != "driver_inv" || tok.size() != 10)
+            return false;
+        SwEntry e;
+        e.name = text(tok[1]);
+        if (e.name.empty())
+            return true;
+        e.version = text(tok[2]);
+        e.install_date = text(tok[3]);
+        // The Linux provider is the fixed literal `kernel`: a label for the source, not a vendor,
+        // so it is not carried and the row reads `via:kernel_module`. Windows carries the
+        // driver's provider, else its signer.
+        if (!kernel_module_leg) {
+            e.publisher = text(tok[4]);
+            if (e.publisher.empty())
+                e.publisher = text(tok[6]);
+        }
+        if (tok[7] == "signed" || tok[7] == "unsigned")
+            e.signature_status = std::string(tok[7]);
+        e.kind = "driver";
+        if (kernel_module_leg)
+            e.ecosystem = "kernel_module";
+        else
+            e.ecosystem = "windows";
+        entries.push_back(std::move(e));
+        return true;
+    }, /*escaped=*/true, /*max_tokens=*/11);
+}
+
+std::vector<std::tuple<std::string_view, std::string_view, std::chrono::seconds>>
+installed_software_actions() {
+    std::vector<std::tuple<std::string_view, std::string_view, std::chrono::seconds>> out;
     for (const auto& row : kInventoryActions)
-        out.emplace_back(row.plugin, row.action);
+        out.emplace_back(row.plugin, row.action, row.time_limit);
     return out;
 }
 
@@ -737,168 +674,447 @@ void vendor_or_origin(SwEntry& e) {
             std::string(kOriginLabelPrefix) + (e.ecosystem.empty() ? "unknown" : e.ecosystem);
 }
 
-std::string installed_software_canonical_blob(std::vector<SwEntry> entries) {
-    normalize_installed_software(entries);
-    // Blob contract v2: 12 fields, 0x1F-separated, in this exact order, record-
-    // terminated 0x1E — byte-identical to the server's canonical_hash walk
-    // (software_inventory_store.cpp). Append-only: never reorder. The 4-field tail
-    // (reserved install_location, reserved uninstall_string, package_id, source)
-    // is appended whole only when package_id or source is non-empty, so a 12-field
-    // entry hashes exactly as it always did.
-    std::string canon;
-    canon.reserve(entries.size() * 96);
-    for (const auto& e : entries) {
-        canon += e.name;
-        canon += '\x1f';
-        canon += e.version;
-        canon += '\x1f';
-        canon += e.publisher;
-        canon += '\x1f';
-        canon += e.install_date;
-        canon += '\x1f';
-        canon += e.kind;
-        canon += '\x1f';
-        canon += e.ecosystem;
-        canon += '\x1f';
-        canon += e.epoch;
-        canon += '\x1f';
-        canon += e.release;
-        canon += '\x1f';
-        canon += e.arch;
-        canon += '\x1f';
-        canon += e.signature_status;
-        canon += '\x1f';
-        canon += e.distro_id;
-        canon += '\x1f';
-        canon += e.distro_version;
-        if (!e.package_id.empty() || !e.source.empty()) {
-            canon += "\x1f\x1f"; // reserved slots 13-14: always empty
-            canon += '\x1f';
-            canon += e.package_id;
-            canon += '\x1f';
-            canon += e.source;
-        }
-        canon += '\x1e';
-    }
-    return canon;
+bool CollectorWorkers::try_begin(std::string_view plugin) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return busy_.emplace(std::string(plugin)).second;
 }
 
-SyncSource make_installed_software_source(SyncPluginMap plugins) {
+void CollectorWorkers::end(std::string_view plugin) noexcept {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (const auto it = busy_.find(plugin); it != busy_.end())
+        busy_.erase(it);
+}
+
+CollectorWorkers::Ticket CollectorWorkers::admit(std::shared_ptr<CollectorWorkers> self,
+                                                 std::string_view plugin) {
+    if (!self)
+        return {};
+    struct Held {
+        std::shared_ptr<CollectorWorkers> w;
+        std::string plugin;
+        bool held{false};
+        ~Held() {
+            if (held)
+                w->end(plugin);
+        }
+    };
+    // Allocate BEFORE the flag is taken: a bad_alloc here leaves nothing to clean up, and once
+    // try_begin succeeds the flag is already owned by `held`.
+    auto held = std::make_shared<Held>();
+    held->w = std::move(self);
+    held->plugin = std::string(plugin);
+    held->held = held->w->try_begin(held->plugin);
+    if (!held->held)
+        return {};
+    return Ticket{std::shared_ptr<void>(std::move(held))};
+}
+
+std::size_t CollectorWorkers::outstanding() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return busy_.size();
+}
+
+bool drain_collector_workers(const CollectorWorkers& workers, std::chrono::milliseconds grace,
+                             const std::function<void(std::size_t)>& on_stuck) {
+    if (wait_for_workers_to_drain([&workers] { return workers.outstanding(); }, grace))
+        return true;
+    if (on_stuck)
+        on_stuck(workers.outstanding());
+    return false;
+}
+
+namespace {
+
+// Per-call capture cap: the 13-field rows (~200 B each raw) would saturate the shared 2 MiB
+// default around ~14k packages, turning a dense host into a permanently oversize facet. 3.5 MiB
+// re-aligns the capture ceiling with the 3 MiB blob cap (a ~17k-row facet is ~3 MiB; raw rows
+// are larger than their canonical form). The shared default stays 2 MiB. A facet whose rows
+// fill this is `truncated`, and one whose FULL section would exceed the blob is `oversize`.
+constexpr std::size_t kInventoryCaptureCap = 3'670'016; // 3.5 MiB
+
+// One facet's answer for one pass: either rows (status full) or the reason it has none.
+struct Collected {
+    V3Status status{V3Status::not_collected};
+    std::string token;
+    std::vector<SwEntry> rows; // stamped with the source, not yet in normal form
+    std::int64_t duration_ms{0};
+    std::int64_t bytes_read{0};
+};
+
+struct FacetState {
+    std::string source;
+    std::string acked_key;
+    std::string need_full_key;
+    std::optional<AckedSet> acked;
+    bool need_full{false};
+    bool need_full_persisted{false};
+    // What the last collect() put in the blob; committed by on_ack, dropped by the next collect.
+    bool pending_rows{false};
+    AckedSet pending;
+    // A status-only section as the server last acknowledged it. While the facet keeps answering
+    // the same {status, token} the section is left out (an unchanged section is omitted, so a
+    // quiet host sends a hash-only report). Memory only: a restart costs one resend, which the
+    // server's upsert makes harmless. Cleared by a nack, by a forced send and by a row-bearing
+    // section being acknowledged.
+    struct StatusKey {
+        V3Status status{V3Status::not_collected};
+        std::string token;
+        bool operator==(const StatusKey&) const = default;
+    };
+    std::optional<StatusKey> last_status;
+    // The status-only section this collect put in the blob (engaged = one was sent); committed
+    // into last_status by on_ack, dropped by the next collect.
+    std::optional<StatusKey> pending_status;
+    // The cooldown cache (kPassCooldown).
+    std::optional<Collected> cache;
+    std::chrono::steady_clock::time_point cache_at{};
+};
+
+struct CollectorState {
+    SyncPluginMap plugins;
+    SyncScheduler::KvGetFn kv_get;
+    SyncScheduler::KvSetFn kv_set;
+    std::shared_ptr<CollectorWorkers> workers;
+    CollectorClock clock;
+    std::chrono::milliseconds time_limit_override{0};
+    CollectorRunner runner;
+    std::vector<FacetState> facets; // parallel to kInventoryActions
+    // Answers that declared no completeness (UNKNOWN), counted over the agent's life and
+    // published as the heartbeat tag yuzu.sync.installed_software.completeness_unknown_total.
+    std::string unknown_total_key;
+    std::uint64_t unknown_total{0};
+    bool loaded{false};
+    bool emitted{false}; // the last collect() put at least one section in the blob
+    bool more{false};    // ...and left a row-bearing section for the next one
+
+    void ensure_loaded() {
+        if (loaded)
+            return;
+        loaded = true;
+        for (auto& f : facets) {
+            const std::string v = kv_get(f.acked_key);
+            f.acked = acked_decode(v);
+            if (!v.empty() && !f.acked)
+                spdlog::warn("sync: installed_software '{}' acked state is unreadable — "
+                             "that facet is sent in full",
+                             f.source);
+            f.need_full_persisted = kv_get(f.need_full_key) == "1";
+            f.need_full = f.need_full_persisted;
+        }
+        unknown_total = std::strtoull(kv_get(unknown_total_key).c_str(), nullptr, 10);
+    }
+
+    void set_need_full(FacetState& f, bool on) {
+        f.need_full = on;
+        if (on != f.need_full_persisted) {
+            kv_set(f.need_full_key, on ? "1" : "0");
+            f.need_full_persisted = on;
+        }
+    }
+
+    // Dispatch one action under its time limit and turn the answer into a Collected.
+    Collected dispatch(std::size_t i) {
+        const InventoryAction& row = kInventoryActions[i];
+        const std::string& source = facets[i].source;
+        Collected c;
+        const auto it = plugins.find(row.plugin);
+        if (it == plugins.end() || it->second == nullptr) {
+            spdlog::warn("sync: {} plugin not loaded — {} is reported not_collected", row.plugin,
+                         source);
+            c.token = "not_loaded";
+            return c;
+        }
+        // Single-flight per PLUGIN, not per action: a worker of ANY action of this plugin that
+        // outlived its time limit is still inside it, and a plugin is one shared object with
+        // shared state. A second dispatch, of the same action or a sibling, would pile another
+        // thread into the same wedged plugin. Every facet of a busy plugin reports `busy`.
+        CollectorWorkers::Ticket ticket = CollectorWorkers::admit(workers, row.plugin);
+        if (!ticket) {
+            spdlog::warn("sync: plugin {} still has a worker running from an earlier pass — {} is "
+                         "reported timeout:busy",
+                         row.plugin, source);
+            c.status = V3Status::timeout;
+            c.token = "busy";
+            return c;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        // The dispatcher is built INSIDE the worker, and the plugin's single-flight ticket rides
+        // in the closure: at the worker's entry it is moved into a local of the call, so whichever
+        // of Completed and TimedOut the caller sees, the flag ends when the worker physically
+        // returns (or throws), never before. A closure never invoked (Rejected, or a throw while
+        // building it or the strings below) ends the flag when it is destroyed: there is no path
+        // on which the caller has to clear it by hand.
+        using Result = LocalDispatcher::Result;
+        std::function<Result()> fn = [ticket = std::move(ticket), desc = it->second,
+                                      action = std::string(row.action)]() mutable -> Result {
+            const CollectorWorkers::Ticket in_flight = std::move(ticket);
+            try {
+                LocalDispatcher d;
+                return d.run(desc, action, {}, kInventoryCaptureCap);
+            } catch (...) {
+                Result failed_run;
+                failed_run.rc = -1;
+                return failed_run;
+            }
+        };
+        const auto limit = time_limit_override.count() > 0
+                               ? time_limit_override
+                               : std::chrono::duration_cast<std::chrono::milliseconds>(row.time_limit);
+        auto call = runner ? runner(limit, std::move(fn))
+                           : yuzu::shared::bounded_call_ex(limit, std::move(fn));
+        c.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        if (call.status == yuzu::shared::BoundedCallStatus::Rejected) {
+            spdlog::warn("sync: {} could not start a worker (outstanding-call ceiling or thread "
+                         "creation) — reported timeout:rejected",
+                         source);
+            c.status = V3Status::timeout;
+            c.token = "rejected";
+            return c;
+        }
+        if (call.status == yuzu::shared::BoundedCallStatus::TimedOut) {
+            spdlog::warn("sync: {} did not return within {} ms — reported timeout; the worker is "
+                         "left to finish",
+                         source, limit.count());
+            c.status = V3Status::timeout;
+            c.token = "timeout";
+            return c;
+        }
+        const LocalDispatcher::Result& r = *call.value;
+        c.bytes_read = static_cast<std::int64_t>(r.captured.size());
+        if (r.rc != 0 || r.truncated) {
+            // A truncated capture would be a partial roster and a hash that flip-flops: report it,
+            // send no rows.
+            spdlog::warn("sync: {} rc={}{} — reported constrained", source, r.rc,
+                         r.truncated ? " (output truncated at the capture cap)" : "");
+            c.status = V3Status::constrained;
+            c.token = r.rc != 0 ? "rc=" + std::to_string(r.rc) : "truncated";
+            return c;
+        }
+        AdaptedRows rows = row.adapt(r.captured);
+        if (rows.entries.size() > kV3MaxRows) {
+            // Every adapter stops reading at kV3MaxRows + 1 RAW rows, so the post-dedup count
+            // cannot see the overflow once exact duplicates pull it back under the cap — a
+            // truncated inventory would ship as complete.
+            spdlog::warn("sync: {} read more than {} rows — reported oversize", source, kV3MaxRows);
+            c.status = V3Status::oversize;
+            c.token = "rows=" + std::to_string(rows.entries.size());
+            return c;
+        }
+        const auto reason_or = [&rows](const char* fallback) {
+            return (rows.reason.empty() || rows.reason == "-") ? std::string(fallback) : rows.reason;
+        };
+        switch (rows.status) {
+        case AdaptedRows::Status::unsupported:
+            spdlog::debug("sync: {} unsupported on this OS — reported not_collected", source);
+            c.token = reason_or("unsupported");
+            return c;
+        case AdaptedRows::Status::failed:
+            spdlog::warn("sync: {} failed: {} — reported constrained", source, rows.reason);
+            c.status = V3Status::constrained;
+            c.token = reason_or("failed");
+            return c;
+        case AdaptedRows::Status::constrained:
+            spdlog::info("sync: {} constrained ({}) — reported constrained; its stored rows are "
+                         "kept and read as unconfirmed",
+                         source, rows.reason);
+            c.status = V3Status::constrained;
+            c.token = reason_or("constrained");
+            return c;
+        case AdaptedRows::Status::ok:
+            break;
+        }
+        if (r.result_completeness != YUZU_RESULT_COMPLETENESS_FULL ||
+            r.result_status != YUZU_RESULT_STATUS_OK) {
+            // Only a plugin that declares OK and FULL is believed to have read everything. PARTIAL
+            // overrides rows the plugin did hand over (a partial roster); an answer that declares
+            // nothing (UNKNOWN) is not FULL either and is the one counted and persisted at once
+            // (rare). A non-OK status paired with FULL (no in-tree sync-source action does it;
+            // windows_optional_features `info` does, and is not one) is read as the status
+            // says: constrained, under its provenance token.
+            const bool partial = r.result_completeness != YUZU_RESULT_COMPLETENESS_UNKNOWN;
+            if (partial) {
+                spdlog::warn("sync: {} typed result {} — reported constrained", source,
+                             r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL
+                                 ? "completeness PARTIAL"
+                                 : "status not OK");
+            } else {
+                kv_set(unknown_total_key, std::to_string(++unknown_total));
+                spdlog::warn("sync: {} declared no result completeness — reported constrained "
+                             "(unknown), never read as full",
+                             source);
+            }
+            c.status = V3Status::constrained;
+            c.token = !partial                      ? "unknown"
+                      : !r.result_provenance.empty() ? r.result_provenance
+                      : r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL ? "partial"
+                                                                                   : "status";
+            return c;
+        }
+        for (auto& e : rows.entries)
+            e.source = source;
+        c.status = V3Status::full;
+        c.rows = std::move(rows.entries);
+        return c;
+    }
+};
+
+} // namespace
+
+SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::KvGetFn kv_get,
+                                          SyncScheduler::KvSetFn kv_set,
+                                          std::shared_ptr<CollectorWorkers> workers,
+                                          CollectorTuning tuning) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
+    // No weekly blanket resend: the server's per-section checks (a delta over a base that no
+    // longer matches is refused, answered `installed_software:<facet>` and resent in full) heal a
+    // diverged facet on their own.
+    src.no_full_floor = true;
     // Nightly maintenance window, 01:00-05:00 machine-local time (a compile-time default:
     // no settings channel exists yet). Each agent keeps a stable moment inside it.
     src.window = SyncWindow{60, 300};
-    // A retry re-runs at most one call per table action in-process (no fan-out); the backoff
-    // caps that at four extra runs per outage.
-    src.skip_backoff = true;
-    auto last_reason = std::make_shared<std::string>();
-    src.skip_reason = [last_reason] { return *last_reason; };
-    src.collect = [plugins = std::move(plugins), last_reason]()
-        -> std::optional<std::pair<std::string, std::string>> {
-        last_reason->clear();
-        auto skip = [&](const std::string& reason)
-            -> std::optional<std::pair<std::string, std::string>> {
-            // Persisted and published cut at kPluginHeartbeatMaxValueBytes anyway: keep only that
-            // much, so a plugin's oversized status reason is not retained as string capacity.
-            last_reason->assign(reason, 0, kPluginHeartbeatMaxValueBytes);
-            return std::nullopt;
-        };
-        // installed_apps anchors the report (UP-IN6): without it the other
-        // plugins' rows alone would replace the stored inventory.
-        const auto anchor = plugins.find("installed_apps");
-        if (anchor == plugins.end() || anchor->second == nullptr) {
-            spdlog::warn("sync: installed_apps plugin not loaded — installed_software source idle");
-            return skip("installed_apps:not_loaded");
+
+    auto st = std::make_shared<CollectorState>();
+    st->plugins = std::move(plugins);
+    st->kv_get = std::move(kv_get);
+    st->kv_set = std::move(kv_set);
+    st->workers = std::move(workers);
+    st->clock = tuning.clock ? std::move(tuning.clock)
+                             : CollectorClock{[] { return std::chrono::steady_clock::now(); }};
+    st->time_limit_override = tuning.time_limit;
+    st->runner = std::move(tuning.runner);
+    st->unknown_total_key =
+        SyncScheduler::kv_key("installed_software", kCompletenessUnknownTotalKey);
+    for (const auto& row : kInventoryActions) {
+        FacetState f;
+        f.source = std::string(row.plugin) + '.' + std::string(row.action);
+        f.acked_key = SyncScheduler::kv_key("installed_software", (f.source + ".acked").c_str());
+        f.need_full_key =
+            SyncScheduler::kv_key("installed_software", (f.source + ".need_full").c_str());
+        st->facets.push_back(std::move(f));
+    }
+
+    src.on_force_full = [st] {
+        st->ensure_loaded();
+        for (auto& f : st->facets) {
+            f.need_full = true;    // this send is full for every facet; nothing to persist
+            f.last_status.reset(); // ...and carries every status-only section again, so a forced
+                                   // blob is never header-only (the server refuses one)
         }
-        LocalDispatcher dispatcher;
-        // Per-call capture cap: v2's 12-field rows (~200 B each raw) would
-        // saturate the shared 2 MiB default around ~14k packages, turning a
-        // dense host into a permanent silent cycle-skip. 3.5 MiB re-aligns the
-        // capture ceiling with the 3 MiB blob cap (a ~17k-row blob is ~3 MiB; raw rows
-        // are larger than their canonical form). The shared default stays 2 MiB.
-        constexpr std::size_t kInventoryCaptureCap = 3'670'016; // 3.5 MiB
-        std::vector<SwEntry> all;
-        for (const auto& row : kInventoryActions) {
-            const std::string source = std::string(row.plugin) + '.' + std::string(row.action);
-            const auto it = plugins.find(row.plugin);
-            if (it == plugins.end() || it->second == nullptr) {
-                spdlog::warn("sync: {} plugin not loaded — {} rows will be absent from this report "
-                             "(its stored rows are removed server-side)",
-                             row.plugin, row.action);
-                continue;
+    };
+
+    src.wants_blob = [st] { return st->emitted; };
+    src.has_more = [st] { return st->more; };
+
+    src.on_ack = [st](const std::vector<std::string>& tokens) {
+        st->ensure_loaded();
+        constexpr std::string_view kName = "installed_software";
+        bool whole = false;
+        std::set<std::string, std::less<>> nacked;
+        for (const auto& t : tokens) {
+            // The scheduler passes only this source's tokens: `installed_software` or
+            // `installed_software:<facet>`.
+            if (t == kName)
+                whole = true;
+            else if (t.starts_with(kName) && t.size() > kName.size() + 1 &&
+                     t[kName.size()] == ':') // the hook is public: a foreign token names no facet
+                nacked.insert(t.substr(kName.size() + 1));
+        }
+        for (auto& f : st->facets) {
+            const bool facet_nacked = whole || nacked.contains(f.source);
+            if (facet_nacked) {
+                // Nothing of this facet is committed: it is resent in full. A whole-source nack
+                // commits nothing at all (the blob may not have been attributable).
+                st->set_need_full(f, true);
+                f.last_status.reset();
+            } else if (f.pending_rows) {
+                f.acked = f.pending;
+                st->kv_set(f.acked_key, acked_encode(*f.acked)); // ONE value: hash and set together
+                st->set_need_full(f, false);
+                f.last_status.reset();
+            } else if (f.pending_status) {
+                // The server refuses a delta over any facet whose stored status is not full or
+                // delta, so after a status-only section the next row-bearing one must be full.
+                f.acked.reset();
+                st->kv_set(f.acked_key, std::string{});
+                st->set_need_full(f, false);
+                f.last_status = f.pending_status;
             }
-            LocalDispatcher::Result r =
-                dispatcher.run(it->second, row.action, {}, kInventoryCaptureCap);
-            if (r.rc != 0 || r.truncated) {
-                // A truncated capture would yield a partial inventory and a hash that
-                // flip-flops (mirrors the snapshot pump) — drop the cycle.
-                spdlog::warn("sync: {}.{} rc={}{} — skipping this cycle", row.plugin, row.action,
-                             r.rc, r.truncated ? " (output truncated at the capture cap)" : "");
-                return skip(source + (r.rc != 0 ? ":rc=" + std::to_string(r.rc) : ":truncated"));
+            f.pending_rows = false;
+            f.pending_status.reset();
+            f.pending = AckedSet{};
+        }
+    };
+
+    src.collect = [st]() -> std::optional<std::pair<std::string, std::string>> {
+        st->ensure_loaded();
+        const auto now = st->clock();
+        std::vector<SectionPlan> plans;
+        plans.reserve(st->facets.size());
+        for (std::size_t i = 0; i < st->facets.size(); ++i) {
+            FacetState& f = st->facets[i];
+            // A section sent and never acknowledged (the response was lost) leaves the server's
+            // state unknown, so what was last acknowledged proves nothing about it: after a lost
+            // FULL the server may hold rows while the facet answers the status it last had
+            // acknowledged, and that status must be sent again, not read as unchanged.
+            if (f.pending_rows || f.pending_status)
+                f.last_status.reset();
+            f.pending_rows = false;
+            f.pending_status.reset();
+            f.pending = AckedSet{};
+            // A pass inside the cooldown rebuilds from the rows already collected. Everything
+            // else dispatches; a timeout is never cached (it must see the worker's state afresh).
+            std::optional<Collected> local;
+            const Collected* c = nullptr;
+            if (f.cache && now - f.cache_at < kPassCooldown) {
+                c = &*f.cache;
+            } else {
+                local = st->dispatch(i);
+                if (local->status != V3Status::timeout) {
+                    f.cache = std::move(local);
+                    f.cache_at = now;
+                    c = &*f.cache;
+                } else {
+                    f.cache.reset();
+                    c = &*local;
+                }
             }
-            AdaptedRows rows = row.adapt(r.captured, row.constrained);
-            if (rows.entries.size() > kMaxEntries) {
-                // Every adapter stops reading at kMaxEntries + 1 RAW rows, so the post-
-                // dedup merged check below cannot see the overflow once exact
-                // duplicates pull the count back under the cap — a truncated inventory
-                // would ship as complete. Same UP-4 posture as the byte cap.
-                spdlog::warn("sync: {}.{} read more than {} rows — skipping this cycle",
-                             row.plugin, row.action, kMaxEntries);
-                return skip(source + ":row_cap");
-            }
-            if (rows.status == AdaptedRows::Status::unsupported) {
-                spdlog::debug("sync: {}.{} unsupported on this OS — skipped", row.plugin,
-                              row.action);
-                continue;
-            }
-            if (rows.status == AdaptedRows::Status::withheld) {
-                spdlog::warn("sync: {}.{} constrained ({}) — rows withheld this cycle", row.plugin,
-                             row.action, rows.reason);
-                continue;
-            }
-            if (rows.status == AdaptedRows::Status::failed) {
-                spdlog::warn("sync: {}.{} failed: {} — skipping this cycle", row.plugin, row.action,
-                             rows.reason);
-                return skip(source + ':' + rows.reason);
-            }
-            if (r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL && !row.accept_partial) {
-                spdlog::warn("sync: {}.{} typed result completeness PARTIAL — skipping this cycle",
-                             row.plugin, row.action);
-                return skip(source + ":partial");
-            }
-            if (!rows.reason.empty())
-                spdlog::info("sync: {}.{} constrained ({}) — rows kept: anything the read "
-                             "could not see is absent from this cycle's report",
-                             row.plugin, row.action, rows.reason);
-            for (auto& e : rows.entries) {
-                e.source = source;
-                vendor_or_origin(e);
-                all.push_back(std::move(e));
+            SectionPlan plan = c->status == V3Status::full
+                                   ? plan_section(f.source, c->rows, f.acked, f.need_full)
+                                   : status_section(f.source, c->status, c->token);
+            // A status-only answer the server already holds is not sent again.
+            if (!v3_status_carries_rows(plan.status) && f.last_status &&
+                *f.last_status == FacetState::StatusKey{plan.status, plan.token})
+                plan.unchanged = true;
+            plan.duration_ms = c->duration_ms;
+            plan.bytes_read = c->bytes_read;
+            plans.push_back(std::move(plan));
+        }
+        V3Blob out = write_v3_blob(plans);
+        st->emitted = !out.sent.empty();
+        st->more = !out.deferred.empty();
+        std::vector<std::pair<std::string, std::string>> held;
+        for (std::size_t i = 0; i < st->facets.size(); ++i) {
+            FacetState& f = st->facets[i];
+            const SectionPlan& plan = plans[i];
+            const bool sent =
+                std::find(out.sent.begin(), out.sent.end(), plan.facet) != out.sent.end();
+            if (sent && v3_status_carries_rows(plan.status)) {
+                f.pending_rows = true;
+                f.pending = AckedSet{plan.section_hash, plan.row_hashes};
+                held.emplace_back(f.source, plan.section_hash);
+            } else if (sent) {
+                // held no longer: the server drops it from its report hash
+                f.pending_status = FacetState::StatusKey{plan.status, plan.token};
+            } else if (f.acked) {
+                held.emplace_back(f.source, f.acked->section_hash); // unchanged or deferred
             }
         }
-        if (all.empty()) {
-            spdlog::debug("sync: installed_software collected no rows — skipping this cycle");
-            return skip("installed_software:no_rows");
-        }
-        normalize_installed_software(all);
-        if (all.size() > kMaxEntries) {
-            // The server keeps the first kMaxEntries in blob order, so its hash would
-            // diverge from ours → permanent need_full. Same UP-4 posture as the byte cap.
-            spdlog::warn("sync: installed_software {} entries exceed {} cap — skipping this cycle",
-                         all.size(), kMaxEntries);
-            return skip("installed_software:entry_cap");
-        }
-        std::string blob = installed_software_canonical_blob(std::move(all));
-        if (blob.size() > kMaxBlobBytes) {
-            spdlog::warn("sync: installed_software blob {} B exceeds {} B cap — skipping this "
-                         "cycle (won't send an un-storable payload)",
-                         blob.size(), kMaxBlobBytes);
-            return skip("installed_software:blob_cap");
-        }
-        std::string hash = sha256_hex(blob);
-        return std::make_pair(std::move(blob), std::move(hash));
+        std::string hash = v3_report_hash(std::move(held));
+        return std::make_pair(std::move(out.blob), std::move(hash));
     };
     return src;
 }

@@ -132,6 +132,9 @@ struct ExecHarness {
 
     /// What `resolve_fn` maps the typed instruction to. Set per test.
     std::pair<std::string, std::string> resolve_to{};
+    /// #7114: when set, the fake seam refuses every dispatch with this denial (`denied` set,
+    /// nothing sent), as `ServerImpl::dispatch_confined` does when the chokepoint refuses.
+    std::optional<yuzu::server::detail::DispatchDenial> deny;
 
     /// @param mg  the visible-agent store; nullptr exercises the fail-closed
     ///            arm (an absent store reads as "nobody visible", never
@@ -162,6 +165,8 @@ struct ExecHarness {
                    const std::unordered_map<std::string, std::string>&,
                    const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back({plugin, action, scope, ids});
+            if (deny) // #7114: what dispatch_confined returns when the chokepoint refuses
+                return {.command_id = "cmd-" + std::to_string(calls.size()), .denied = deny};
             return {.sent = 1, .command_id = "cmd-" + std::to_string(calls.size())};
         };
 
@@ -318,6 +323,23 @@ TEST_CASE("dashboard execute: a ReadOnly action is unaffected on every fan-out s
         CHECK(h.calls[0].agent_ids.empty());
         CHECK(h.rejected_metric() == 0.0);
     }
+}
+
+TEST_CASE("dashboard execute: a chokepoint denial on the outcome is reported as not permitted, "
+          "never as no agents connected (#7114)",
+          "[server][dashboard][execute][security][7114]") {
+    ExecHarness h;
+    h.resolve_to = {kReadOnly.first, kReadOnly.second};
+    h.deny = yuzu::server::detail::DispatchDenial{
+        yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Execution",
+        yuzu::server::authz::Operation::Execute};
+    auto res = h.post("instruction=version");
+    REQUIRE(h.calls.size() == 1);
+    CHECK(contains(res->body, "Not permitted: approval_required"));
+    CHECK(contains(res->body, "data-reason=\"approval_required\""));
+    CHECK(!contains(res->body, "No agents connected"));
+    CHECK(h.audits_with("reason=dispatch_denied dispatch_reason=approval_required") == 1);
+    CHECK(h.audits_with("no_agents_reached") == 0);
 }
 
 TEST_CASE("dashboard execute: a Mutating action is unaffected on every fan-out shape",

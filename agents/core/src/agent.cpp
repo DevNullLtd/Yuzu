@@ -49,6 +49,8 @@ __declspec(allocate(".CRT$XCB"))
 #include "command_frames.hpp"   // make_output_frame / make_final_frame (CommandResponse.action)
 #include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
+#include "hard_exit.hpp"                 // hard_exit / kOrphanDrainGrace: the detached-collector drain barrier
+#include "log_handoff.hpp"               // drain_log_bounded: breadcrumb before that hard_exit
 #include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
@@ -323,7 +325,7 @@ struct CommandContextImpl {
     // on the server (in-tree convention: same constant in two places
     // until typed proto lands and renders both moot). This is the
     // DEFAULT; a caller that needs a larger bounded payload (the
-    // installed_software sync's v2 rows, blob contract v2) overrides it
+    // installed_software sync's rows, blob contract v3) overrides it
     // per-dispatch via `capture_max_bytes` below — see dispatch_with_capture.
     static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
     std::size_t capture_max_bytes{kCaptureMaxBytes};
@@ -1225,6 +1227,8 @@ public:
             // universal backstop. The reconnect-loop final teardown repeats the
             // pump join to order it ahead of plugins_.clear() on the normal path.
             quiesce_run_workers();
+            // No plugin is shut down or unloaded under a detached installed-software worker.
+            drain_detached_collectors_or_exit();
             // Stop the trigger engine FIRST — before plugins are torn down —
             // so an in-flight interval/file/service trigger can't dispatch
             // into a plugin that's mid-shutdown. stop() joins the worker
@@ -2573,7 +2577,14 @@ public:
                         // Registration order carries NO persisted meaning (KV keys and
                         // request_now()'s name match are both name-keyed, per
                         // sync_scheduler.hpp's own contract), so this reorder is safe.
-                        scheduler.add_source(make_installed_software_source(sync_plugins));
+                        // `kv_get`/`kv_set` are the same __sync__ accessors the scheduler was built
+                        // with: the source persists its per-facet acknowledged sets through them.
+                        // `collector_workers_` is the AGENT's, not this connection's: the source is
+                        // rebuilt on every reconnect while a worker abandoned at its time limit may
+                        // still be inside a plugin, so the single-flight flags and the outstanding
+                        // count must outlive it (drain_detached_collectors_or_exit reads them).
+                        scheduler.add_source(make_installed_software_source(
+                            sync_plugins, kv_get, kv_set, collector_workers_));
                         // Publish AFTER the last add_source: request_now() reads sources_
                         // without the mutex on the append-only-before-publication contract.
                         {
@@ -2748,12 +2759,14 @@ public:
                                     std::lock_guard<std::mutex> lk(sync_sched_mu_);
                                     sched = sync_scheduler_;
                                 }
-                                if (sched && kv_store_)
-                                    yuzu::agent::emit_sync_skip_tags(
-                                        tags, sched->source_names(),
-                                        [this](const std::string& k) {
-                                            return kv_store_->get(kSyncKvNamespace, k);
-                                        });
+                                if (sched && kv_store_) {
+                                    const auto sync_kv = [this](const std::string& k) {
+                                        return kv_store_->get(kSyncKvNamespace, k);
+                                    };
+                                    yuzu::agent::emit_sync_skip_tags(tags, sched->source_names(),
+                                                                     sync_kv);
+                                    yuzu::agent::emit_sync_completeness_unknown_tag(tags, sync_kv);
+                                }
                             } catch (const std::exception& e) {
                                 spdlog::warn("Heartbeat plugin-tag bridge failed: {}", e.what());
                             } catch (...) {
@@ -3890,6 +3903,9 @@ public:
                     // for every early-return/exception exit, and re-invoking the
                     // helper there is a joinable()-guarded no-op.
                     quiesce_run_workers();
+                    // No plugin is shut down or unloaded under a detached installed-software
+                    // worker (the ScopeExit above makes the same call).
+                    drain_detached_collectors_or_exit();
                     // Stop the TRIGGER ENGINE before the plugin shutdown loop, for the same
                     // reason the ScopeExit does (:766) — its workers dispatch into plugins_
                     // from their own threads, so shutting plugins down (and clearing the
@@ -4606,6 +4622,38 @@ private:
         update_thread_.join();
     }
 
+    // The teardown barrier for the installed-software collector. Its actions run on bounded
+    // DETACHED workers (agents/shared/bounded_wait.hpp): a caller that gave up at the time limit
+    // leaves the worker inside a plugin's dispatcher. Call this AFTER quiesce_run_workers() (the
+    // sync thread, the only thing that starts such a worker, is joined by then) and BEFORE any
+    // plugin shutdown() or dlclose: wait the F3 orphan-drain grace for the count to reach zero,
+    // and if it does not, hard_exit(3) (hard_exit.hpp) rather than race shutdown against code the
+    // worker is executing. Same contract as main.cpp's Guardian orphan check; the supervisor
+    // restarts the agent. A plugin that never returns therefore makes that restart a hard exit.
+    void drain_detached_collectors_or_exit() noexcept {
+        try {
+            drain_collector_workers(*collector_workers_,
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        yuzu::agent::kOrphanDrainGrace),
+                                    [](std::size_t n) {
+                                        try {
+                                            spdlog::critical(
+                                                "{} installed-software collector worker(s) still "
+                                                "inside a plugin {}s after shutdown began - forcing "
+                                                "process exit rather than unload a plugin under "
+                                                "them",
+                                                n, yuzu::agent::kOrphanDrainGrace.count());
+                                            yuzu::agent::drain_log_bounded(
+                                                std::chrono::milliseconds{200});
+                                        } catch (...) {
+                                        }
+                                        yuzu::agent::hard_exit(3);
+                                    });
+        } catch (...) {
+            yuzu::agent::hard_exit(3); // could not even check: fail closed
+        }
+    }
+
     Config cfg_;
     PluginContextImpl plugin_ctx_;
     // Per-plugin contexts: each plugin gets its own PluginContextImpl with the
@@ -4919,6 +4967,10 @@ private:
     std::atomic<bool> ota_bundle_probe_logged_{false};
     std::thread heartbeat_thread_;
     std::thread sync_thread_; // ADR-0016 daily-sync thread (per-connection)
+    // The installed-software collector's single-flight flags and outstanding-worker count
+    // (sync_source_installed_software.hpp). Agent-lifetime, NOT per-connection: see the factory
+    // call and drain_detached_collectors_or_exit().
+    std::shared_ptr<CollectorWorkers> collector_workers_ = std::make_shared<CollectorWorkers>();
 
     // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
     //

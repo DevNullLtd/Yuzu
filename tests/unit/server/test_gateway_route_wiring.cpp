@@ -32,6 +32,7 @@
 #include "test_auth_db_pg_helper.hpp" // WS-6 6.2: enrollment state is PG-backed
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <grpcpp/grpcpp.h>
 
@@ -418,6 +419,46 @@ TEST_CASE("ProxyRegister: an inventory reporting the pre-rename plugin tar write
         REQUIRE(row->has_value());
         CHECK((*row)->legacy_echo_wire_name == want_legacy);
     }
+}
+
+TEST_CASE("ProxyRegister: re-announcing a known session whose plugin list changed from tar to "
+          "echo refreshes legacy_echo_wire_name on the adopted route row",
+          "[pg][gateway_route_wiring][grpc]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    auto register_with_plugin = [&](const std::string& agent_id, const std::string& plugin,
+                                    const std::string& presented_session) {
+        auto req = make_gw_register(h.auth_mgr, agent_id);
+        req.mutable_info()->add_plugins()->set_name(plugin);
+        grpc::ClientContext ctx;
+        ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        if (!presented_session.empty())
+            ctx.AddMetadata(std::string(AgentServiceImpl::kSessionMetadataKey), presented_session);
+        apb::RegisterResponse resp;
+        REQUIRE(h.stub_->ProxyRegister(&ctx, req, &resp).ok());
+        REQUIRE(resp.accepted());
+        return resp.session_id();
+    };
+    auto legacy_flag = [&](const std::string& agent_id) {
+        auto row = store.lookup_route(agent_id);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        return (*row)->legacy_echo_wire_name;
+    };
+
+    const std::string agent = "agent-adopt-legacy-flag";
+    const std::string session = register_with_plugin(agent, "tar", {});
+    REQUIRE(legacy_flag(agent));
+    REQUIRE(store.announce_connected(agent, session, "zone-a", "node-a", 90).has_value());
+
+    // Same session id presented again, now reporting the post-rename plugin name: the adopted
+    // branch skips register_fresh, so only set_legacy_echo_wire_name can flip the row.
+    CHECK(register_with_plugin(agent, "echo", session) == session);
+    CHECK_FALSE(legacy_flag(agent));
 }
 
 // ── ProxyRegister: the NEW re-announce-vs-fresh decision branch ─────────────
@@ -4255,4 +4296,139 @@ TEST_CASE("GatewayUpstreamServiceImpl: the #5686 series and HELP lines exist bef
     CHECK(has("yuzu_server_gateway_batch_heartbeat_duration_seconds_count{outcome=\"degraded\"} "
               "0"));
     CHECK(has("\nyuzu_server_agent_presence_upsert_skipped_total 0\n"));
+}
+
+// ── Gateway-asserted identifiers: an embedded NUL is refused at the boundary ─
+//
+// agent_id, session_id, cluster_id and stream_home_id arrive from the gateway and are compared
+// and stored as text. A value with an embedded NUL cannot be stored faithfully (the database
+// would see only its prefix), so NotifyStreamStatus refuses the whole notification before any
+// check, publish or write. The durable row and the agent's registered session stay as they were.
+
+TEST_CASE("NotifyStreamStatus: an identifier with an embedded NUL is refused and publishes "
+          "nothing",
+          "[pg][gateway_route_wiring][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req = make_gw_register(auth_mgr, "agent-nul-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session_id = resp.session_id();
+
+    const std::string nul("\0", 1);
+    const std::string field = GENERATE(std::string("cluster_id"), std::string("session_id"),
+                                       std::string("stream_home_id"), std::string("agent_id"));
+    const auto event = GENERATE(gw::StreamStatusNotification::CONNECTED,
+                                gw::StreamStatusNotification::DISCONNECTED);
+    INFO("field=" << field << " event=" << static_cast<int>(event));
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id(field == "agent_id" ? "agent-nul-1" + nul + "x" : std::string("agent-nul-1"));
+    notif.set_session_id(field == "session_id" ? session_id + nul + "x" : session_id);
+    notif.set_event(event);
+    notif.set_cluster_id(field == "cluster_id" ? "cluster-x" + nul + "y" : std::string("cluster-x"));
+    notif.set_gateway_node("node-a");
+    notif.set_stream_home_id(field == "stream_home_id" ? "home" + nul + "z" : std::string("home-a"));
+    gw::StreamStatusAck ack;
+    const auto status = gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack);
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    CHECK_FALSE(ack.acknowledged());
+
+    // Nothing was published or bound for the real agent: no cluster, no home affinity, and the
+    // session the agent registered with is still the durable one.
+    auto row = store.lookup_route("agent-nul-1");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == session_id);
+    CHECK_FALSE((*row)->cluster_id.has_value());
+    CHECK_FALSE((*row)->home_cluster_id.has_value());
+
+    // The agent's in-memory session was not given a placement either.
+    auto sess = registry.get_session("agent-nul-1");
+    REQUIRE(sess);
+    {
+        std::lock_guard lk(sess->stream_mu);
+        CHECK(sess->cluster_id.empty());
+        CHECK(sess->gateway_node.empty());
+    }
+}
+
+TEST_CASE("NotifyStreamStatus: the same CONNECTED without an embedded NUL is accepted and "
+          "records the placement",
+          "[pg][gateway_route_wiring][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    PgAuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req = make_gw_register(auth_mgr, "agent-nul-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session_id = resp.session_id();
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("agent-nul-1");
+    notif.set_session_id(session_id);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-x");
+    notif.set_gateway_node("node-a");
+    notif.set_stream_home_id("home-a");
+    gw::StreamStatusAck ack;
+    const auto status = gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack);
+    CHECK(status.ok());
+    CHECK(ack.acknowledged());
+
+    auto row = store.lookup_route("agent-nul-1");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == session_id);
+    REQUIRE((*row)->cluster_id.has_value());
+    CHECK(*(*row)->cluster_id == "cluster-x");
+
+    auto sess = registry.get_session("agent-nul-1");
+    REQUIRE(sess);
+    {
+        std::lock_guard lk(sess->stream_mu);
+        CHECK(sess->cluster_id == "cluster-x");
+        CHECK(sess->gateway_node == "node-a");
+    }
+}
+
+// The adopted-session refresh adds a new (op, reason) series to
+// yuzu_server_gateway_route_write_failed_total; it must read 0 before any traffic.
+TEST_CASE("GatewayUpstreamServiceImpl: the set_legacy_echo_wire_name write-failure series exist "
+          "before any traffic",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture f(db.dsn());
+    // No metrics.counter() for these series before serialising: that call would create them
+    // and make the assertion vacuous.
+    const std::string text = f.metrics.serialize();
+    for (const char* reason : {"store_unavailable", "db_error"}) {
+        const std::string series =
+            std::string("yuzu_server_gateway_route_write_failed_total{op=\"set_legacy_echo_wire_name\","
+                        "reason=\"") +
+            reason + "\"} 0";
+        INFO(series);
+        CHECK(text.find(series) != std::string::npos);
+    }
 }
