@@ -1707,8 +1707,9 @@ public:
                           "server_shutdown, credential_revoked, credential_indeterminate (the "
                           "caller's credential was checked before a step), late_denied or "
                           "definition_changed (a step was refused at send time), a zero-reach cause "
-                          "(containment_unreadable, route_unreadable, os_gate_unreadable, "
-                          "no_agents_reached, quarantined, plugin_not_found, kill_switched_os), "
+                          "(dispatch_denied, containment_unreadable, route_unreadable, "
+                          "os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, "
+                          "kill_switched_os), "
                           "run_failed (the engine ended the run before any dispatch), "
                           "dispatch_exception (the run threw after its requested audit row; steps "
                           "may have been sent), or none. A run killed with the process never "
@@ -2648,6 +2649,22 @@ public:
                           "Epoch seconds of the last successful catalogue rollup refresh; alert when "
                           "now - this exceeds the rollup cadence (a stuck/failing thread leaves the "
                           "/inventory catalogue silently stale)",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_component_rollup_total",
+                          "Software components rollup (component_rollup, the totals of "
+                          "GET /api/v1/inventory/software/components) refresh outcomes, by outcome "
+                          "(success/error). Keep-last-good on error; both series are seeded at 0.",
+                          "counter");
+        metrics_.describe("yuzu_inventory_component_rollup_duration_seconds",
+                          "Wall-clock of the last components rollup refresh (one GROUP BY over "
+                          "software_components, off the request path, on the catalogue rollup "
+                          "thread)",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_component_rollup_last_success_timestamp",
+                          "Epoch seconds of the last successful components rollup refresh (0 until "
+                          "the first); alert when now - this exceeds twice the rollup cadence (7200 s), "
+                          "guarded by > 0 (a failing refresh leaves the components totals aging or "
+                          "building)",
                           "gauge");
         metrics_.describe("yuzu_software_normalization_pass_total",
                           "Software-title normalisation ticks by outcome (success/error); hourly, "
@@ -6393,9 +6410,9 @@ public:
                         return;
                     if (!gate->should_log(agent_id, quarantine))
                         return;
-                    // Reservation completes the slot even if AuditEvent construction
+                    // Reservation completes that agent's slot even if AuditEvent construction
                     // or audit_store_->log() throws (log() is not noexcept).
-                    detail::EchoCorruptionAuditGate::Reservation res(*gate);
+                    detail::EchoCorruptionAuditGate::Reservation res(*gate, agent_id);
                     AuditEvent ev;
                     ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
@@ -6408,7 +6425,7 @@ public:
                     ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
                     ev.result = "success";
                     if (audit_store_->log(ev))
-                        res.logged(agent_id, quarantine);
+                        res.logged(quarantine);
                     else
                         res.failed();
                 });
@@ -14196,7 +14213,8 @@ private:
                                      /*payload=*/{}, /*stagger_seconds=*/0, /*delay_seconds=*/0,
                                      std::string(dispatch_arm_label(arm)), execution_id);
         if (!classified)
-            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id};
+            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id,
+                                                         .denied = classified.error()};
 
         agent_service_.record_send_time(command_id);
         // PR 2 / UP2-4: command_id -> (plugin, execution_id) was recorded BEFORE any RPC, inside
@@ -22520,6 +22538,9 @@ private:
         // local-vs-presence mismatch one route over. MUST run BEFORE
         // register_routes(), same timing contract as the setters above.
         rest_api_v1_->set_all_agent_ids_fn([this] { return registry_.all_ids(); });
+        // The device-table roster (the SAME 30-day read the Software devices tables use) behind
+        // the `hostname` field of the software lookup routes; must precede register_routes.
+        rest_api_v1_->set_hostnames_fn(hw_hostnames_fn);
         // #5342 — POST /api/v1/users/me/password + /api/v1/users/{name}/password.
         // The current-password proof is AuthRoutes' lockout-accounted check
         // (the SAME section POST /login runs — never a second copy); it and the

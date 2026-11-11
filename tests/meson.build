@@ -1940,6 +1940,7 @@ if build_server
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_software_catalogue.cpp',   # GET /api/v1/inventory/software/catalogue[/versions]
+      'unit/server/test_rest_software_components.cpp',  # GET /api/v1/inventory/software/components (SAM-17)
       'unit/server/test_rest_software_curation.cpp',    # software normalisation curation REST routes
       'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
@@ -2038,6 +2039,7 @@ if build_server
       'unit/server/test_purl_compose.cpp',               # pure purl composer (purl-spec vectors)
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
+      'unit/server/test_software_list_model.cpp',        # pure SAM-17 lookup list model (totals, status, range)
       'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
       'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
       'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
@@ -3226,7 +3228,8 @@ if build_server
   # GCC/Clang only: the script reads `*.cpp.o` objects with `nm`; MSVC emits
   # `.obj` files and its runners ship no `nm`, so this test() entry does not
   # exist at all on that toolchain — the Windows leg adds nothing here. The
-  # macOS leg runs it (no by-name filter, full `meson test`); the Linux
+  # macOS leg ran it (no by-name filter, full `meson test`) until ADR-0035
+  # made that leg agent-only (it no longer builds the server); the Linux
   # leg's own non-pg Test step selects `server-checks`-suite tests by an
   # explicit NAME list, which had never named this one (CI-2, 2026-09-28,
   # WS-A4 PR-1 Gate 7 fix round build-ci review) — this test silently never
@@ -4580,10 +4583,12 @@ endif
 # #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
 # Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
 # runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
-# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
-# it drives the native binary (`.exe` probe, MSYS2_ARG_CONV_EXCL, cygpath). Suite 'platform', not a bare
-# 'server': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate
-# labelled only 'server' fails that check on the Windows legs.
+# platform: OS-contract test (docs is OS-independent and Linux-only since 2026-10-21). It is registered
+# only when build_server is on, so since ADR-0035 ladder step 1 (Windows and macOS CI configure with
+# -Dbuild_server=false) it runs on the Linux legs only; its `.exe` probe, MSYS2_ARG_CONV_EXCL and cygpath
+# handling now serve local Windows builds alone. Suite 'platform', not a bare 'server':
+# scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate labelled
+# only 'server' would fail that check on any leg that registers it.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server
   test('healthcheck CLI contract (#5906)',
     _bash_test,
@@ -4763,6 +4768,14 @@ test('forensics tier wiring lexical',
 test('collection settings wiring lexical',
   _python3_test,
   args: [files('test_collection_settings_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# SAM-17: the software lookup routes' hostname roster must be handed to RestApiV1 before
+# register_routes(); an unset function leaves every hostname null with no other signal.
+test('software lookup wiring lexical',
+  _python3_test,
+  args: [files('test_software_lookup_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

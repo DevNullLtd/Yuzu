@@ -477,6 +477,43 @@ const std::vector<pg::PgMigration>& migrations() {
          "ON software_components (agent_id, row_hash);"
          "CREATE TABLE IF NOT EXISTS retention_meta ("
          "  key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
+        {12,
+         // SAM-17: the lookup read surface. row_count on the catalogue rollup, the components
+         // rollup, and the components name index.
+         // catalog_rollup.row_count: install ROWS of the group (count(*)), beside device_count
+         // (distinct devices), so a title's totals report the SAME `installs` (rows) rollup-served
+         // and live. A constant-default ADD COLUMN is metadata-only (the v5 precedent). The rows
+         // already there carry 0 until the next refresh recomputes them, so the same statement
+         // sets catalog_rollup_meta.refreshed_at back to 0 ("building", the v8 precedent): a
+         // reader sees `building` for the first refresh interval, never installs = 0 beside a
+         // non-zero device count. The background rollup thread runs its first refresh at start.
+         // component_rollup: one row per (kind, name) with exact instance (row) and
+         // distinct-device counts, replaced whole by refresh_component_rollup. component_rollup_meta is the singleton freshness stamp,
+         // seeded refreshed_at = 0 ("building"). Two new EMPTY tables: online.
+         // software_components_name_idx serves the exact-name component lookups and the totals
+         // aggregate (a prefix match uses it only under the C collation; otherwise it is a
+         // sequential scan under the 5 s bound, see add_name_predicate). software_components is
+         // EMPTY in every deployment until the component producer ships (no agent emits
+         // component rows before SAM-40; the server apply
+         // path is live, so a v3 fixture can fill it), so this plain CREATE INDEX inside the ladder
+         // transaction holds ACCESS EXCLUSIVE on an empty table for no measurable time and needs no
+         // CONCURRENTLY, exactly like software_components_row_hash_idx in v11.
+         "ALTER TABLE catalog_rollup ADD COLUMN IF NOT EXISTS row_count BIGINT NOT NULL DEFAULT 0;"
+         "UPDATE catalog_rollup_meta SET refreshed_at = 0 WHERE id = 1;"
+         "CREATE TABLE IF NOT EXISTS component_rollup ("
+         "  kind                TEXT     NOT NULL,"
+         "  name                TEXT     NOT NULL,"
+         "  instances           BIGINT   NOT NULL,"
+         "  devices             BIGINT   NOT NULL,"
+         "  devices_unconfirmed BIGINT   NOT NULL DEFAULT 0,"
+         "  PRIMARY KEY (kind, name));"
+         "CREATE TABLE IF NOT EXISTS component_rollup_meta ("
+         "  id           INT    PRIMARY KEY,"
+         "  refreshed_at BIGINT NOT NULL DEFAULT 0);"
+         "INSERT INTO component_rollup_meta (id, refreshed_at) VALUES (1, 0) "
+         "ON CONFLICT (id) DO NOTHING;"
+         "CREATE INDEX IF NOT EXISTS software_components_name_idx "
+         "ON software_components (name, agent_id, kind, path_hash);"},
     };
     return kMigrations;
 }
@@ -985,6 +1022,57 @@ std::string q_arms(const std::string& ph, std::string_view name, std::string_vie
            std::string(eco) + pat + " OR " + std::string(src) + pat + ")";
 }
 
+
+// The name predicate of the fleet lookups. exact: `col = $n`; prefix: a LIKE-escaped `col LIKE
+// $n%`; contains: a literal ILIKE. Returns true when the predicate is scan-shaped and the caller
+// must run it under the 5 s bound: contains always, and prefix too, because the btree on name
+// serves a LIKE prefix only under the C collation; under a locale collation (en_US.UTF-8, the
+// common default) it is a sequential scan of the whole table that the row LIMIT does not bound
+// when few or no rows match (measured: parallel seq scan at 2M and 3M rows). Only exact is
+// index-driven everywhere. `name` is parser-validated text (strict UTF-8, no NUL, <= 1024 bytes).
+bool add_name_predicate(std::string& sql, std::vector<std::string>& params, int& p,
+                        std::string_view col, const std::string& name, NameMatch m) {
+    if (name.empty())
+        return false;
+    const std::string ph = "$" + std::to_string(++p);
+    switch (m) {
+    case NameMatch::kExact:
+        sql += " AND " + std::string(col) + " = " + ph;
+        params.push_back(name);
+        return false;
+    case NameMatch::kPrefix:
+        sql += " AND " + std::string(col) + " LIKE " + ph + " ESCAPE '\\'";
+        params.push_back(sc::like_escape(name) + "%");
+        return true;
+    case NameMatch::kContains:
+        sql += " AND " + std::string(col) + " ILIKE '%' || " + ph + " || '%' ESCAPE '\\'";
+        params.push_back(sc::like_escape(name));
+        return true;
+    }
+    return false;
+}
+
+// `col = ANY($n::text[])` over a version set; the caller has already returned for an empty set.
+void add_version_set(std::string& sql, std::vector<std::string>& params, int& p,
+                     std::string_view col, const std::vector<std::string>& versions) {
+    const std::vector<std::string_view> vs(versions.begin(), versions.end());
+    sql += " AND " + std::string(col) + " = ANY($" + std::to_string(++p) + "::text[])";
+    params.push_back(pg::to_text_array(vs));
+}
+
+// The row-status filter over the shared derivation (kRowStatusCaseSql, facet joined as `fs`).
+// Returns true when a filter was added: the derived status is not indexable, so with no name the
+// predicate walks the whole index and must run under the 5 s bound (status=disabled over 2M
+// rows with no match: 2.65 s, linear).
+bool add_status_filter(std::string& sql, std::vector<std::string>& params, int& p,
+                       const std::string& status) {
+    if (status.empty())
+        return false;
+    sql += " AND (" + std::string(kRowStatusCaseSql) + ") = $" + std::to_string(++p);
+    params.push_back(status);
+    return true;
+}
+
 } // namespace
 
 std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> entries) {
@@ -1313,7 +1401,9 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
         {"retention_meta", "key, value"},
         {"catalog_rollup",
          "name, grain, kind, ecosystem, source, publisher, device_count, version_count, "
-         "unsigned_count, ecosystems, kinds, sources, newest_version"},
+         "unsigned_count, ecosystems, kinds, sources, newest_version, row_count"},
+        {"component_rollup", "kind, name, instances, devices, devices_unconfirmed"},
+        {"component_rollup_meta", "id, refreshed_at"},
         {"version_rollup", "name, version, device_count"},
         {"title_triples", "name, publisher, ecosystem, device_count"},
         {"catalog_rollup_meta",
@@ -2197,7 +2287,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     }
     // ADR-0033 present-empty rule: an empty scope set is deny-all -> an empty VALUE with no
     // SQL (nullopt means "unfiltered" and is the only thing that selects the whole fleet).
-    if (q.agent_ids && q.agent_ids->empty())
+    if ((q.agent_ids && q.agent_ids->empty()) || (q.versions && q.versions->empty()))
         return std::vector<SoftwareFleetRow>{};
     // limit is clamped silently — callers page until an EMPTY page, never a short one.
     int limit = q.limit > 0 ? q.limit : 1000;
@@ -2205,65 +2295,70 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         limit = kFleetQueryRowCap;
 
     std::string sql =
-        "SELECT agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, "
-        "release, arch, signature_status, distro_id, distro_version, package_id, source, "
-        "install_id "
-        "FROM software_inventory_store.installed_software WHERE 1=1";
+        "SELECT i.agent_id, i.name, i.version, i.publisher, i.install_date, i.kind, i.ecosystem, "
+        "i.epoch, i.release, i.arch, i.signature_status, i.distro_id, i.distro_version, "
+        "i.package_id, i.source, i.install_id, i.install_type, i.install_scope, "
+        "i.install_location, i.instance_key, fs.status, fs.enabled, fs.last_confirmed_at "
+        "FROM software_inventory_store.installed_software i "
+        "LEFT JOIN software_inventory_store.software_facet_state fs "
+        "ON fs.agent_id = i.agent_id AND fs.facet = i.source WHERE 1=1";
     std::vector<std::string> params;
     int p = 0;
     if (!q.agent_id.empty()) {
-        sql += " AND agent_id = $" + std::to_string(++p);
+        sql += " AND i.agent_id = $" + std::to_string(++p);
         params.push_back(q.agent_id);
     }
-    if (!q.name.empty()) {
-        sql += " AND name = $" + std::to_string(++p);
-        params.push_back(q.name);
-    }
+    bool scan_shaped = add_name_predicate(sql, params, p, "i.name", q.name, q.match);
     if (!q.q.empty()) {
         // One bind reused across the four columns (software_catalog's idiom). The term is
         // clamped and LIKE-escaped, so `%`/`_` in q are literal characters, not wildcards.
-        // Known ceiling: four seq-scan ILIKEs — fine to ~50k rows, bounded by a 5 s
-        // statement timeout below; add a pg_trgm GIN (CREATE EXTENSION is an operator
-        // decision) when the fleet passes that.
+        // Known ceiling: four seq-scan ILIKEs — fine to ~50k rows, bounded by a 5 s statement
+        // timeout below; add a pg_trgm GIN (CREATE EXTENSION is an operator decision) when the
+        // fleet passes that.
         const std::string ph = "$" + std::to_string(++p);
-        sql += q_arms(ph, "name", "publisher", "ecosystem", "source");
+        sql += q_arms(ph, "i.name", "i.publisher", "i.ecosystem", "i.source");
         params.push_back(search_term(q.q));
+        scan_shaped = true;
     }
     if (!q.kind.empty()) {
-        sql += " AND kind = $" + std::to_string(++p);
+        sql += " AND i.kind = $" + std::to_string(++p);
         params.push_back(q.kind);
     }
     if (!q.ecosystem.empty()) {
-        sql += " AND ecosystem = $" + std::to_string(++p);
+        sql += " AND i.ecosystem = $" + std::to_string(++p);
         params.push_back(q.ecosystem);
     }
     if (!q.source.empty()) {
-        sql += " AND source = $" + std::to_string(++p);
+        sql += " AND i.source = $" + std::to_string(++p);
         params.push_back(q.source);
     }
     if (q.version) {
         // Present (even "") is an exact bucket; nullopt = any version.
-        sql += " AND version = $" + std::to_string(++p);
+        sql += " AND i.version = $" + std::to_string(++p);
         params.push_back(*q.version);
     }
+    if (q.versions)
+        add_version_set(sql, params, p, "i.version", *q.versions);
+    if (add_status_filter(sql, params, p, q.status))
+        scan_shaped = true;
     if (q.agent_ids) {
         // Scope push-down: filter in SQL so the last returned row IS the keyset cursor.
         std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
-        sql += " AND agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        sql += " AND i.agent_id = ANY($" + std::to_string(++p) + "::text[])";
         params.push_back(pg::to_text_array(ids));
     }
     if (q.after) {
         // Row-value keyset over the stable sort tuple. install_id alone would reorder on
         // every full replace (DELETE + INSERT), so it is only the tiebreak.
         const int a = p + 1;
-        sql += " AND (name, agent_id, install_id) > ($" + std::to_string(a) + ", $" +
+        sql += " AND (i.name, i.agent_id, i.install_id) > ($" + std::to_string(a) + ", $" +
                std::to_string(a + 1) + ", $" + std::to_string(a + 2) + "::bigint)";
         p += 3;
         params.push_back(q.after->name);
         params.push_back(q.after->agent_id);
         params.push_back(std::to_string(q.after->install_id));
     }
-    sql += " ORDER BY name, agent_id, install_id LIMIT $" + std::to_string(++p) + "::bigint";
+    sql += " ORDER BY i.name, i.agent_id, i.install_id LIMIT $" + std::to_string(++p) + "::bigint";
     params.push_back(std::to_string(limit));
     if (q.skip > 0) {
         sql += " OFFSET $" + std::to_string(++p) + "::bigint";
@@ -2292,13 +2387,29 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
             row.entry.package_id = PQgetvalue(res.get(), i, 13);
             row.entry.source = PQgetvalue(res.get(), i, 14);
             row.install_id = result_i64(res, i, 15);
+            row.entry.install_type = PQgetvalue(res.get(), i, 16);
+            row.entry.install_scope = PQgetvalue(res.get(), i, 17);
+            row.entry.install_location = PQgetvalue(res.get(), i, 18);
+            row.entry.instance_key = PQgetvalue(res.get(), i, 19);
+            // LEFT JOIN: no state row -> NULL cells -> status '' / enabled TRUE / never confirmed.
+            if (!PQgetisnull(res.get(), i, 20))
+                row.facet_status = PQgetvalue(res.get(), i, 20);
+            row.facet_enabled = PQgetisnull(res.get(), i, 21) ||
+                                std::string_view(PQgetvalue(res.get(), i, 21)) == "t";
+            row.last_confirmed_at = PQgetisnull(res.get(), i, 22) ? 0 : result_i64(res, i, 22);
             out.push_back(std::move(row));
         }
         return out;
     };
 
-    if (!q.q.empty()) {
-        // The seq-scan ILIKE arms are the only unbounded-cost path: bound them (5 s).
+    if (scan_shaped) {
+        // The shapes whose cost the name index does not bound (q, match=contains, match=prefix
+        // under a locale collation, a status filter) run under the 5 s statement bound and
+        // degrade to the audited 503, never to a pool lease held to the 30 s pool default. The
+        // reads below keep the bare lease: exact-name and agent_id/scope reads are index-driven;
+        // a kind, ecosystem, source or exact version filter with no name is a filtered walk under
+        // ORDER BY name, bounded only by the pool's 30 s statement_timeout (pre-existing shape,
+        // unchanged by this change; version without a name is new but takes the same path).
         static SiteSamplers samplers;
         return bounded_query(pool_, metrics_, "query_software", samplers, sql, params, parse);
     }
@@ -3126,15 +3237,16 @@ bool SoftwareInventoryStore::refresh_catalog_rollup(const std::function<bool()>&
             return false;
         if (!cmd("INSERT INTO software_inventory_store.catalog_rollup (name, grain, kind, "
                  "ecosystem, source, publisher, device_count, version_count, unsigned_count, "
-                 "ecosystems, kinds, sources, newest_version) "
+                 "ecosystems, kinds, sources, newest_version, row_count) "
                  "SELECT g.name, g.grain, g.kind, g.ecosystem, g.source, g.publisher, "
                  "g.device_count, g.version_count, g.unsigned_count, g.ecosystems, g.kinds, "
-                 "g.sources, coalesce(nt.newest_version, '') "
+                 "g.sources, coalesce(nt.newest_version, ''), g.row_count "
                  "FROM (SELECT name, GROUPING(kind, ecosystem, source)::smallint AS grain, "
                  "coalesce(kind, '') AS kind, coalesce(ecosystem, '') AS ecosystem, "
                  "coalesce(source, '') AS source, " + representative_publisher("publisher") +
                  " AS publisher, "
                  "count(DISTINCT agent_id) AS device_count, "
+                 "count(*) AS row_count, "
                  "count(DISTINCT version) AS version_count, "
                  "count(DISTINCT agent_id) FILTER (WHERE signature_status = 'unsigned') "
                  "AS unsigned_count, "
@@ -3292,6 +3404,415 @@ std::optional<CatalogRollupMeta> SoftwareInventoryStore::catalog_rollup_meta() {
         m.rpm_unsigned = result_i64(res, 0, 14);
     }
     return m;
+}
+
+std::optional<std::vector<SoftwareComponentRow>>
+SoftwareInventoryStore::query_components(const SoftwareComponentQuery& q) {
+    // AUTHORITATIVE read (ADR-0016 §7), the query_software contract for software_components.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: query_components degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    // ADR-0033 present-empty rule: an empty scope (or an empty resolved version set) selects
+    // nothing -> an empty VALUE with no SQL.
+    if ((q.agent_ids && q.agent_ids->empty()) || (q.versions && q.versions->empty()))
+        return std::vector<SoftwareComponentRow>{};
+    int limit = q.limit > 0 ? q.limit : 1000;
+    if (limit > kFleetQueryRowCap)
+        limit = kFleetQueryRowCap;
+
+    std::string sql =
+        "SELECT c.agent_id, c.kind, c.path_hash, c.name, c.version, c.version_source, c.path, "
+        "c.anchor_app, c.first_seen, fs.status, fs.enabled, fs.last_confirmed_at "
+        "FROM software_inventory_store.software_components c "
+        "LEFT JOIN software_inventory_store.software_facet_state fs "
+        "ON fs.agent_id = c.agent_id AND fs.facet = '" +
+        std::string(kComponentInventoryFacet) + "' WHERE 1=1";
+    std::vector<std::string> params;
+    int p = 0;
+    if (!q.agent_id.empty()) {
+        sql += " AND c.agent_id = $" + std::to_string(++p);
+        params.push_back(q.agent_id);
+    }
+    if (!q.kind.empty()) {
+        sql += " AND c.kind = $" + std::to_string(++p);
+        params.push_back(q.kind);
+    }
+    // Every component read runs under the 5 s bound (the table has no per-title fan-out limit),
+    // so the scan-shaped flag the predicate reports is not needed here.
+    add_name_predicate(sql, params, p, "c.name", q.name, q.match);
+    if (!q.q.empty()) {
+        // One clamped, LIKE-escaped bind reused over name | path | anchor_app (literal substring).
+        const std::string ph = "$" + std::to_string(++p);
+        const std::string pat = " ILIKE '%' || " + ph + " || '%' ESCAPE '\\'";
+        sql += " AND (c.name" + pat + " OR c.path" + pat + " OR c.anchor_app" + pat + ")";
+        params.push_back(search_term(q.q));
+    }
+    if (q.versions)
+        add_version_set(sql, params, p, "c.version", *q.versions);
+    add_status_filter(sql, params, p, q.status);
+    if (q.agent_ids) {
+        std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
+        sql += " AND c.agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        params.push_back(pg::to_text_array(ids));
+    }
+    if (q.after) {
+        const int a = p + 1;
+        sql += " AND (c.name, c.agent_id, c.kind, c.path_hash) > ($" + std::to_string(a) + ", $" +
+               std::to_string(a + 1) + ", $" + std::to_string(a + 2) + ", $" +
+               std::to_string(a + 3) + ")";
+        p += 4;
+        params.push_back(q.after->name);
+        params.push_back(q.after->agent_id);
+        params.push_back(q.after->kind);
+        params.push_back(q.after->path_hash);
+    }
+    sql += " ORDER BY c.name, c.agent_id, c.kind, c.path_hash LIMIT $" + std::to_string(++p) +
+           "::bigint";
+    params.push_back(std::to_string(limit));
+    if (q.skip > 0) {
+        sql += " OFFSET $" + std::to_string(++p) + "::bigint";
+        params.push_back(std::to_string(q.skip));
+    }
+
+    auto parse = [](const pg::PgResult& res) {
+        std::vector<SoftwareComponentRow> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            SoftwareComponentRow row;
+            row.agent_id = PQgetvalue(res.get(), i, 0);
+            row.kind = PQgetvalue(res.get(), i, 1);
+            row.path_hash = PQgetvalue(res.get(), i, 2);
+            row.name = PQgetvalue(res.get(), i, 3);
+            row.version = PQgetvalue(res.get(), i, 4);
+            row.version_source = PQgetvalue(res.get(), i, 5);
+            row.path = PQgetvalue(res.get(), i, 6);
+            row.anchor_app = PQgetvalue(res.get(), i, 7);
+            row.first_seen = result_i64(res, i, 8);
+            if (!PQgetisnull(res.get(), i, 9))
+                row.facet_status = PQgetvalue(res.get(), i, 9);
+            row.facet_enabled = PQgetisnull(res.get(), i, 10) ||
+                                std::string_view(PQgetvalue(res.get(), i, 10)) == "t";
+            row.last_confirmed_at = PQgetisnull(res.get(), i, 11) ? 0 : result_i64(res, i, 11);
+            out.push_back(std::move(row));
+        }
+        return out;
+    };
+
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "query_components", samplers, sql, params, parse);
+}
+
+namespace {
+
+// The one-column distinct-version read both version-range resolvers share.
+std::vector<std::string> first_column(const pg::PgResult& res) {
+    std::vector<std::string> out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
+    return out;
+}
+
+} // namespace
+
+namespace {
+// The caller's scope on a distinct-version read: nullopt leaves the whole fleet; an engaged set
+// is `agent_id = ANY($n::text[])` (the query_software push-down), so a confined caller's version
+// set, and the kCatalogRowCap cut that refuses a range, are decided over its own rows only (a
+// fleet-wide cut would tell a confined caller that a title has 2000 or more versions somewhere
+// in the fleet). The caller has already returned an empty value for a present-empty set.
+void add_scope_predicate(std::string& sql, std::vector<std::string>& params, int& p,
+                         std::string_view col, const std::vector<std::string>& agent_ids) {
+    const std::vector<std::string_view> ids(agent_ids.begin(), agent_ids.end());
+    sql += " AND " + std::string(col) + " = ANY($" + std::to_string(++p) + "::text[])";
+    params.push_back(pg::to_text_array(ids));
+}
+} // namespace
+
+std::optional<std::vector<std::string>>
+SoftwareInventoryStore::installed_software_distinct_versions(
+    std::string_view name, const std::optional<std::vector<std::string>>& agent_ids) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: installed_software_distinct_versions degraded — "
+                         "store not open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (name.empty() || (agent_ids && agent_ids->empty()))
+        return std::vector<std::string>{};
+    std::string sql = "SELECT DISTINCT version FROM software_inventory_store.installed_software "
+                      "WHERE name = $1 AND version <> ''";
+    std::vector<std::string> params{std::string(name)};
+    int p = 1;
+    if (agent_ids)
+        add_scope_predicate(sql, params, p, "agent_id", *agent_ids);
+    sql += " ORDER BY version LIMIT " + std::to_string(kCatalogRowCap);
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "installed_software_distinct_versions", samplers, sql,
+                         params, first_column);
+}
+
+std::optional<std::vector<std::string>>
+SoftwareInventoryStore::component_versions(std::string_view kind, std::string_view name,
+                                           const std::optional<std::vector<std::string>>& agent_ids) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: component_versions degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (name.empty() || (agent_ids && agent_ids->empty()))
+        return std::vector<std::string>{};
+    std::string sql = "SELECT DISTINCT version FROM software_inventory_store.software_components "
+                      "WHERE name = $1 AND version <> ''";
+    std::vector<std::string> params{std::string(name)};
+    int p = 1;
+    if (!kind.empty()) {
+        sql += " AND kind = $" + std::to_string(++p);
+        params.emplace_back(kind);
+    }
+    if (agent_ids)
+        add_scope_predicate(sql, params, p, "agent_id", *agent_ids);
+    sql += " ORDER BY version LIMIT " + std::to_string(kCatalogRowCap);
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "component_versions", samplers, sql, params,
+                         first_column);
+}
+
+std::optional<SoftwareTotals> SoftwareInventoryStore::catalog_title_totals(std::string_view name) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: catalog_title_totals degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (name.empty())
+        return SoftwareTotals{};
+    // The name-only grain: (name, grain = 7, '', '', '') is unique, so this is one key lookup.
+    static SiteSamplers samplers;
+    return bounded_query(
+        pool_, metrics_, "catalog_title_totals", samplers,
+        "SELECT row_count, device_count FROM software_inventory_store.catalog_rollup "
+        "WHERE name = $1 AND grain = " +
+            std::to_string(sc::kGrainTitle),
+        std::vector<std::string>{std::string(name)}, [](const pg::PgResult& res) {
+            SoftwareTotals t; // a title absent from the rollup is a genuine zero
+            if (PQntuples(res.get()) == 1) {
+                t.installs = result_i64(res, 0, 0);
+                t.devices = result_i64(res, 0, 1);
+            }
+            return t;
+        });
+}
+
+std::optional<SoftwareTotals>
+SoftwareInventoryStore::installed_software_version_set_totals(
+    std::string_view name, const std::vector<std::string>& versions) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: installed_software_version_set_totals degraded "
+                         "— store not open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (name.empty() || versions.empty())
+        return SoftwareTotals{};
+    const std::vector<std::string_view> vs(versions.begin(), versions.end());
+    static SiteSamplers samplers;
+    return bounded_query(
+        pool_, metrics_, "installed_software_version_set_totals", samplers,
+        "SELECT count(*), count(DISTINCT agent_id) "
+        "FROM software_inventory_store.installed_software "
+        "WHERE name = $1 AND version = ANY($2::text[])",
+        std::vector<std::string>{std::string(name), pg::to_text_array(vs)},
+        [](const pg::PgResult& res) {
+            SoftwareTotals t;
+            if (PQntuples(res.get()) == 1) {
+                t.installs = result_i64(res, 0, 0);
+                t.devices = result_i64(res, 0, 1);
+            }
+            return t;
+        });
+}
+
+std::optional<SoftwareTotals> SoftwareInventoryStore::component_totals(
+    std::string_view kind, std::string_view name,
+    const std::optional<std::vector<std::string>>& versions) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: component_totals degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (name.empty() || (versions && versions->empty()))
+        return SoftwareTotals{};
+    auto parse = [](const pg::PgResult& res) {
+        SoftwareTotals t; // no row / an empty aggregate is a genuine zero
+        if (PQntuples(res.get()) == 1) {
+            t.installs = result_i64(res, 0, 0);
+            t.devices = result_i64(res, 0, 1);
+            t.devices_unconfirmed = result_i64(res, 0, 2);
+        }
+        return t;
+    };
+    static SiteSamplers samplers;
+    if (!kind.empty() && !versions) {
+        return bounded_query(pool_, metrics_, "component_totals", samplers,
+                             "SELECT instances, devices, devices_unconfirmed FROM "
+                             "software_inventory_store.component_rollup "
+                             "WHERE kind = $1 AND name = $2",
+                             std::vector<std::string>{std::string(kind), std::string(name)}, parse);
+    }
+    // Live exact aggregate: a version set, or no kind (distinct devices do not add across kinds).
+    std::string sql =
+        "SELECT count(*), count(DISTINCT c.agent_id), count(DISTINCT c.agent_id) FILTER (WHERE (" +
+        std::string(kRowStatusCaseSql) +
+        ") <> 'current') FROM software_inventory_store.software_components c "
+        "LEFT JOIN software_inventory_store.software_facet_state fs "
+        "ON fs.agent_id = c.agent_id AND fs.facet = '" +
+        std::string(kComponentInventoryFacet) + "' WHERE c.name = $1";
+    std::vector<std::string> params{std::string(name)};
+    int p = 1;
+    if (!kind.empty()) {
+        sql += " AND c.kind = $" + std::to_string(++p);
+        params.emplace_back(kind);
+    }
+    if (versions)
+        add_version_set(sql, params, p, "c.version", *versions);
+    return bounded_query(pool_, metrics_, "component_totals", samplers, sql, params, parse);
+}
+
+bool SoftwareInventoryStore::refresh_component_rollup(const std::function<bool()>& cancelled) {
+    if (!open_)
+        return false;
+    // Same cancellation/budget contract as refresh_catalog_rollup (see the declaration).
+    const auto started = std::chrono::steady_clock::now();
+    const auto deadline = started + sc::kRollupRefreshBudget;
+    auto abort_requested = [&]() -> bool {
+        if (cancelled && cancelled()) {
+            spdlog::info("SoftwareInventoryStore: component rollup refresh cancelled — keeping "
+                         "last-good");
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            spdlog::warn("SoftwareInventoryStore: component rollup refresh over its {} s budget "
+                         "— keeping last-good",
+                         std::chrono::duration_cast<std::chrono::seconds>(sc::kRollupRefreshBudget)
+                             .count());
+            return true;
+        }
+        return false;
+    };
+    auto failed = [](std::string_view label, const pg::PgResult& r) -> bool {
+        const std::string_view err = PQresultErrorMessage(r.get());
+        spdlog::warn("SoftwareInventoryStore: component rollup refresh statement '{}' failed: {}",
+                     label, err.empty() ? "unexpected result shape (no error text)" : err);
+        return false;
+    };
+    // ONE transaction; any failure rolls back and the prior rollup + its stamp survive.
+    return pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* c) -> bool {
+        auto cmd = [&](const std::string& sql) -> bool {
+            if (abort_requested())
+                return false;
+            const pg::PgResult res = pg::exec_params(c, sql.c_str(), std::vector<std::string>{});
+            if (res.status() == PGRES_COMMAND_OK)
+                return true;
+            return failed(std::string_view(sql).substr(0, 48), res);
+        };
+        if (pg::PgResult iso{PQexec(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")};
+            iso.status() != PGRES_COMMAND_OK)
+            return failed("SET TRANSACTION ISOLATION LEVEL", iso);
+        if (!cmd(std::string("SET LOCAL statement_timeout = '")
+                     .append(kRollupStatementTimeout)
+                     .append("'")))
+            return false;
+        // Cluster-wide serialization, as the catalogue rollup: try (not block), and a peer
+        // holding it is already recomputing the shared table -> skip, success. The key has its
+        // own name so a components refresh never blocks (or is blocked by) the catalogue one.
+        if (abort_requested())
+            return false;
+        pg::PgResult lk = pg::exec_params(
+            c,
+            "SELECT pg_try_advisory_xact_lock(hashtextextended("
+            "'software_inventory_store:component_rollup', 0))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK)
+            return failed("advisory lock", lk);
+        if (PQntuples(lk.get()) == 1 && std::string_view(PQgetvalue(lk.get(), 0, 0)) == "f")
+            return true;
+
+        if (!cmd("DELETE FROM software_inventory_store.component_rollup"))
+            return false;
+        // One row per (kind, name). Every figure is an exact count within its own group -
+        // nothing is summed. devices_unconfirmed: distinct devices whose row status is not
+        // `current` (the shared kRowStatusCaseSql; a missing component_inventory state row is
+        // unconfirmed).
+        if (!cmd("INSERT INTO software_inventory_store.component_rollup (kind, name, "
+                 "instances, devices, devices_unconfirmed) "
+                 "SELECT c.kind, c.name, count(*), count(DISTINCT c.agent_id), "
+                 "count(DISTINCT c.agent_id) FILTER (WHERE (" +
+                 std::string(kRowStatusCaseSql) +
+                 ") <> 'current') "
+                 "FROM software_inventory_store.software_components c "
+                 "LEFT JOIN software_inventory_store.software_facet_state fs "
+                 "ON fs.agent_id = c.agent_id AND fs.facet = '" +
+                 std::string(kComponentInventoryFacet) +
+                 "' GROUP BY c.kind, c.name"))
+            return false;
+        if (abort_requested())
+            return false;
+        pg::PgResult m = pg::exec_params(
+            c,
+            "UPDATE software_inventory_store.component_rollup_meta SET "
+            "refreshed_at = EXTRACT(EPOCH FROM now())::bigint "
+            "WHERE id = 1 RETURNING id",
+            std::vector<std::string>{});
+        if (m.status() != PGRES_TUPLES_OK)
+            return failed("component_rollup_meta update", m);
+        if (PQntuples(m.get()) != 1) {
+            spdlog::warn("SoftwareInventoryStore: component rollup refresh found no "
+                         "component_rollup_meta id=1 row to update — keeping last-good");
+            return false;
+        }
+        return true;
+    });
+}
+
+std::optional<ComponentRollupMeta> SoftwareInventoryStore::component_rollup_meta() {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: component_rollup_meta degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "component_rollup_meta", samplers,
+                         "SELECT refreshed_at FROM software_inventory_store.component_rollup_meta "
+                         "WHERE id = 1",
+                         std::vector<std::string>{}, [](const pg::PgResult& res) {
+                             ComponentRollupMeta m; // migration seeds id=1 with refreshed_at=0
+                             if (PQntuples(res.get()) == 1)
+                                 m.refreshed_at = result_i64(res, 0, 0);
+                             return m;
+                         });
 }
 
 bool SoftwareInventoryStore::delete_agent(std::string_view agent_id) {
