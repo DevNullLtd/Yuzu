@@ -21,21 +21,20 @@
 #   Archives / installers (one each):
 #     yuzu-linux-x64.tar.gz
 #     yuzu-gateway-linux-x64.tar.gz
-#     yuzu-windows-x64.zip
-#     yuzu-macos-arm64.tar.gz
+#     yuzu-agent-windows-x64.zip
+#     yuzu-agent-macos-arm64.tar.gz
 #
 #   Glob archives (at least one match each):
 #     *.deb                     (linux server+agent+gateway)
 #     *.rpm                     (linux server+agent+gateway)
 #     YuzuAgentSetup-*.exe      (Windows agent installer)
-#     YuzuServerSetup-*.exe     (Windows server installer)
 #     YuzuAgent-*.pkg           (macOS agent installer)
 #
 #   Per-platform SBOMs (matching the 4 archives above):
 #     yuzu-linux-x64.cdx.json        + .spdx.json
 #     yuzu-gateway-linux-x64.cdx.json + .spdx.json
-#     yuzu-windows-x64.cdx.json       + .spdx.json
-#     yuzu-macos-arm64.cdx.json       + .spdx.json
+#     yuzu-agent-windows-x64.cdx.json + .spdx.json
+#     yuzu-agent-macos-arm64.cdx.json + .spdx.json
 #
 #   Image SBOMs:
 #     yuzu-server-image.cdx.json   + .spdx.json
@@ -75,8 +74,8 @@ fail=0
 REQUIRED_ARCHIVES=(
   "yuzu-linux-x64.tar.gz"
   "yuzu-gateway-linux-x64.tar.gz"
-  "yuzu-windows-x64.zip"
-  "yuzu-macos-arm64.tar.gz"
+  "yuzu-agent-windows-x64.zip"
+  "yuzu-agent-macos-arm64.tar.gz"
 )
 
 for f in "${REQUIRED_ARCHIVES[@]}"; do
@@ -91,7 +90,6 @@ REQUIRED_GLOBS=(
   "*.deb"
   "*.rpm"
   "YuzuAgentSetup-*.exe"
-  "YuzuServerSetup-*.exe"
   "YuzuAgent-*.pkg"
 )
 
@@ -110,8 +108,8 @@ done
 SBOM_BASES=(
   "yuzu-linux-x64"
   "yuzu-gateway-linux-x64"
-  "yuzu-windows-x64"
-  "yuzu-macos-arm64"
+  "yuzu-agent-windows-x64"
+  "yuzu-agent-macos-arm64"
   "yuzu-server-image"
   "yuzu-gateway-image"
   # yuzu-postgres joined the release images in #1318; docker-publish-postgres

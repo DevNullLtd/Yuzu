@@ -27,9 +27,9 @@ SCRIPT = ROOT / "scripts" / "check-release-artifacts.sh"
 VERSION = "0.14.0-rc9"
 
 ARCHIVES = ["yuzu-linux-x64.tar.gz", "yuzu-gateway-linux-x64.tar.gz",
-            "yuzu-windows-x64.zip", "yuzu-macos-arm64.tar.gz"]
+            "yuzu-agent-windows-x64.zip", "yuzu-agent-macos-arm64.tar.gz"]
 PACKAGES = ["yuzu-server_0.14.0-rc9_amd64.deb", "yuzu-server-0.14.0-0.1.rc9.x86_64.rpm",
-            "YuzuAgentSetup-0.14.0_rc9.exe", "YuzuServerSetup-0.14.0_rc9.exe",
+            "YuzuAgentSetup-0.14.0_rc9.exe",
             "YuzuAgent-0.14.0_rc9-arm64.pkg"]
 CHISEL = ["yuzu-server-chisel-image", "yuzu-gateway-chisel-image", "yuzu-agent-chisel-image"]
 
