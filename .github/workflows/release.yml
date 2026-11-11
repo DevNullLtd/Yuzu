@@ -864,7 +864,7 @@ jobs:
           # Runtime DLLs from vcpkg that plugins/binaries need. This copies
           # every DLL vcpkg installed, so until ADR-0035 ladder step 3 drops
           # the server ports from the Windows vcpkg install, the agent archive
-          # still carries server-only DLLs (libpq and its dependencies). They
+          # still carries server-only DLLs (libpq, drogon, trantor, xmlsec). They
           # are unused by the agent; pruning them by hand here, with no RC to
           # prove the list, was judged riskier than one more release with them.
           $vcpkgBin = "${{ github.workspace }}/vcpkg_installed/x64-windows/bin"
@@ -998,8 +998,9 @@ jobs:
       # composite action, which downloads a Windows syft binary.
       # Known limitation: `path: .` scans the whole workspace (the vcpkg
       # ports tree and build trees too), so this SBOM lists components the
-      # agent archive does not ship or load, PostgreSQL client libraries
-      # among them. The release notes and release-verification.md say so.
+      # agent archive does not ship or load (thousands of entries, the
+      # server's dependencies such as libpq among them). The release notes
+      # and release-verification.md say so.
       - name: Generate Windows SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -1301,7 +1302,7 @@ jobs:
             --team-id "${MACOS_NOTARIZATION_TEAM_ID}" \
             --wait \
             --timeout 15m \
-            --output-format plist > "${RESULT}"
+            --output-format plist > "${RESULT}" || true  # the verdict below decides; the plist is printed on failure
           STATUS=$(/usr/libexec/PlistBuddy -c 'Print :status' "${RESULT}" 2>/dev/null || echo unknown)
           if [ "${STATUS}" != "Accepted" ]; then
             echo "::error::Apple notarization status is '${STATUS}', not Accepted. Read the reason with: xcrun notarytool log <id> (the id is below)."
@@ -1388,7 +1389,7 @@ jobs:
       # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
       # Same known limitation as the Windows SBOM: `path: .` covers the
       # whole workspace, so it lists components the agent archive does not
-      # ship, PostgreSQL client libraries among them.
+      # ship, the server's dependencies such as libpq among them.
       - name: Generate macOS SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -2532,11 +2533,11 @@ jobs:
           The server runs on Linux only (ADR-0035): use the container image or
           the Linux packages. \`YuzuServerSetup-*.exe\` is discontinued, and
           the Windows and macOS archives contain the agent only. To move an
-          existing Windows or macOS server to Linux, back up its database and
-          its CA directory together BEFORE removing anything, then follow
-          "Moving a Windows or macOS server to Linux" in
-          \`docs/user-manual/server-admin.md\` (it lists what to back up, how
-          to remove the old service, and which leftover files hold secrets).
+          existing Windows or macOS server to Linux, deploy a new Linux server,
+          enroll the agents with it, then retire the old one as "Moving a
+          Windows or macOS server to Linux" in
+          \`docs/user-manual/server-admin.md\` describes (its data cannot be
+          carried over; the section lists which leftover files hold secrets).
 
           ### Windows silent install (GPO / SCCM / Intune)
           \`\`\`powershell
@@ -2574,12 +2575,13 @@ jobs:
           \`yuzu-windows-x64.zip\` and \`yuzu-macos-arm64.tar.gz\` and also
           held the server; update any script that downloads them by name.
 
-          Known limitation: the Windows archive still carries vcpkg's
-          server-side DLLs (\`libpq.dll\` and other PostgreSQL client
-          libraries), which the agent does not load, and the Windows and
-          macOS SBOMs are generated from the whole build workspace, so a
-          dependency scan of them reports components the agent does not ship
-          or use, PostgreSQL client libraries among them.
+          Known limitations: the Windows archive still carries server-side
+          DLLs (\`libpq.dll\`, \`drogon.dll\`, \`trantor.dll\` and the
+          \`libxmlsec1\` DLLs), present but never loaded by the agent. The
+          Windows and macOS SBOMs are generated from the whole build
+          workspace, so they list thousands of components the archive does
+          not ship or load, the server's dependencies among them; a finding
+          in one of those does not apply to the agent.
 
           ## Compose Wizard
 

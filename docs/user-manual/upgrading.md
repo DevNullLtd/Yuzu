@@ -19,10 +19,10 @@ The top-level directory inside each archive is renamed the same way (`yuzu-agent
 
 **What to do.**
 - Update download and unpack paths to the new names.
-- If you run the server on Windows or macOS, move it to Linux (the container image or the Linux packages) using "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md). Back up the database and the CA directory together first; deleting the old install before that loses the CA key every agent trusts and the keys that decrypt stored secrets.
+- If you run the server on Windows or macOS, deploy a new Linux server (the container image or the Linux packages), enroll the agents with it, and retire the old one as "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md) describes. The old server's data cannot be carried over, and its leftover files hold secrets.
 - Do not unpack the new agent archive over a directory a server still runs from.
 
-**Known limitation until ADR-0035 step 3.** The Windows archive still contains vcpkg's server-side DLLs (`libpq.dll` and the other PostgreSQL client libraries, among others), which the agent does not load, and the Windows and macOS SBOMs still list those components. A dependency scan of either archive therefore reports PostgreSQL client components the agent does not use.
+**Known limitations.** Until a later release removes the server's dependencies from the Windows build (ADR-0035 step 3), the Windows archive still contains `libpq.dll`, `drogon.dll`, `trantor.dll` and the `libxmlsec1` DLLs, which the agent never loads. Separately, the Windows and macOS SBOMs are generated from the whole build workspace, so they list thousands of components the archive does not ship or load, the server's dependencies among them; a dependency scan of an SBOM therefore reports components the agent does not use.
 
 ## ⚠️ Breaking: role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte
 
@@ -7801,7 +7801,7 @@ docker compose -f docker-compose.reference.yml up -d server
 
 ### Windows and macOS
 
-There is no Windows or macOS server to upgrade to: the server runs on Linux only (ADR-0035), and no release after 0.15.0 ships `yuzu-server.exe`, a macOS `yuzu-server` or `YuzuServerSetup`. To move an existing Windows or macOS server to Linux, follow "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md) (under "the Windows server installer is discontinued"). Back up the database and the CA directory as described there before you stop or remove anything: copying `*.db` and `*.cfg` files is not a backup, because the server's data is in PostgreSQL.
+There is no Windows or macOS server to upgrade to: the server runs on Linux only (ADR-0035), and no release after 0.15.0 ships `yuzu-server.exe`, a macOS `yuzu-server` or `YuzuServerSetup`. To move an existing Windows or macOS server to Linux, follow "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md) (under "the Windows server installer is discontinued"): deploy a new Linux server, enroll the agents with it, then retire the old one. Its data cannot be carried over (copying `*.db` and `*.cfg` files never was a backup: the server's data is in PostgreSQL).
 
 ## Upgrading the Gateway
 

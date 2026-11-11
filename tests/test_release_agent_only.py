@@ -99,7 +99,7 @@ def without_forbidden_list(text: str) -> str:
 
 def step_block(job: str, name: str) -> str:
     """One step of a job, from its `- name:` line to the next step."""
-    m = re.search(rf"^(\s*)- name: {re.escape(name)}\n.*?(?=^\1- |\Z)", job, re.S | re.M)
+    m = re.search(rf"^([ ]*)- name: {re.escape(name)}\n.*?(?=^\1- |\Z)", job, re.S | re.M)
     return m.group(0) if m else ""
 
 
@@ -165,6 +165,8 @@ def problems(release: str, check: str, bundle: str) -> list:
     else:
         if "continue-on-error" in verify:
             found.append(f"build-windows: `{VERIFY_STEP}` must gate (no continue-on-error)")
+        if re.search(r"^\s*if:", verify, re.M):
+            found.append(f"build-windows: `{VERIFY_STEP}` must run unconditionally (no `if:`)")
         if not re.search(r"^\s*timeout-minutes:\s*\d+\s*$", verify, re.M):
             found.append(f"build-windows: `{VERIFY_STEP}` has no step timeout")
         if not any(ABSENCE_CHECK.match(l) for l in verify.splitlines()):
@@ -173,9 +175,9 @@ def problems(release: str, check: str, bundle: str) -> list:
             if must not in verify:
                 found.append(f"build-windows: `{VERIFY_STEP}` lost: {must}")
         pos = win.find(f"- name: {VERIFY_STEP}")
-        for later in ("- name: Package archive",):
-            if win.find(later) > pos:
-                found.append(f"build-windows: `{VERIFY_STEP}` runs before `{later[8:]}`")
+        pkg = win.find("- name: Package archive")
+        if not (0 <= pkg < pos):
+            found.append(f"build-windows: `{VERIFY_STEP}` must run after `Package archive`")
         for later in ("- name: Build Windows installers", "- name: Sign installers", "- name: Attest Windows provenance",
                       "- name: Upload archive artifact"):
             if not (0 <= pos < win.find(later)):
@@ -318,6 +320,8 @@ class ReleaseAgentOnly(unittest.TestCase):
             "verify server check inverted": ("release", 'if (Test-Path (Join-Path $bin "yuzu-server.exe")) { Write-Error', 'if (-not (Test-Path (Join-Path $bin "yuzu-server.exe"))) { Write-Error'),
             "verify plugin count dropped": ("release", "          if ($built -lt 1 -or $packed -ne $built) { Write-Error", "          if ($false) { Write-Error"),
             "verify made non-gating": ("release", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n        continue-on-error: true\n"),
+            "verify made conditional": ("release", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n", "      - name: Verify the agent runs from the packaged archive\n        if: ${{ false }}\n        shell: pwsh\n"),
+            "package step renamed": ("release", "      - name: Package archive\n        shell: pwsh", "      - name: Package the zip\n        shell: pwsh"),
             "verify timeout dropped": ("release", "        shell: pwsh\n        timeout-minutes: 5\n", "        shell: pwsh\n"),
             "verify moved after installers": ("release", "      - name: Sign installers (Authenticode)", "      - name: Sign installers (Authenticode)\n        run: echo\n\n      - name: Verify the agent runs from the packaged archive"),
             "macos codesign path reverted": ("release", "for binary in build-macos/agents/core/yuzu-agent; do", "for binary in build-macos/yuzu-agent; do"),

@@ -398,7 +398,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      trees included), so they list PostgreSQL client libraries and other components the agent
      archive does not ship or load (verified against the v0.15.0 SBOMs). That is pre-existing; the
      release notes, `docs/user-manual/release-verification.md` and `upgrading.md` disclose it.
-   - **The macOS notarization step** now reads the notarization status and fails unless it is
+   - **The macOS "Notarize binaries" step** now reads the notarization status and fails unless it is
      `Accepted`. Like the rest of macOS signing it is dormant until a signing secret is set.
    - **The macOS codesign and notarization steps** pointed at `build-macos/yuzu-server` and
      `build-macos/yuzu-agent`, paths that never existed (they never ran: no signing secret is
@@ -416,7 +416,11 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      (server + agent)" archive rows, and the user manual's "Supported Platforms" table (Server is
      now "No" on Windows and macOS). The retirement guidance for an existing Windows or macOS
      server ("Moving a Windows or macOS server to Linux" in `docs/user-manual/server-admin.md`)
-     and an `upgrading.md` breaking-change section land here too.
+     and an `upgrading.md` breaking-change section land here too. That guidance is a fresh Linux
+     deployment plus re-enrollment, not a data migration: the CA store records the CA key's
+     absolute path (`ca_store.ca_root.key_ref`), and a Linux server refuses a key outside its own
+     CA directory, so a Windows server's restored database could not sign agent certificates or
+     publish CRLs. Carrying data over would need a server change, tracked as a follow-up.
    - **#5325 and #1835** are closed as resolved by removal when this change merges.
    - Proof without an RC (owner decision, 2026-11-11): the static pins, plus a Windows rehearsal of
      the agent-only build, packaging and installer on a build box. The first stable tag after this

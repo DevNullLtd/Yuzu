@@ -167,13 +167,15 @@ with `gh attestation download <file> --repo "$SIGNER_REPO" -o
 Each platform archive and Docker image ships SBOMs in both CycloneDX
 and SPDX formats. Use whichever your procurement or SCA tool consumes.
 
-**Known limitation of the platform SBOMs.** They are generated from the whole
-build workspace, not from the archive alone, so they also list components the
-archive does not ship or load. In particular the Windows and macOS agent SBOMs
-list PostgreSQL client libraries (`libpq` and others) that only the server uses;
-the Windows agent archive also still carries those DLLs, unused by the agent,
-until ADR-0035 step 3 removes them from the Windows build. Treat a finding in
-those components as not applying to the agent.
+**Known limitations of the platform SBOMs.** They are generated from the whole
+build workspace (the vcpkg ports tree and build trees included), not from the
+archive alone, so they list thousands of components the archive does not ship
+or load; the Windows and macOS agent SBOMs include the server's dependencies,
+such as `libpq`, `drogon` and `xmlsec`. A finding in a component the archive
+does not contain does not apply to it. Separately, the Windows agent archive
+still contains `libpq.dll`, `drogon.dll`, `trantor.dll` and the `libxmlsec1` DLLs, which the agent never loads, until a later
+release removes the server's dependencies from the Windows build (ADR-0035
+step 3).
 
 ```bash
 # List all components + versions (CycloneDX, pretty-printed)
