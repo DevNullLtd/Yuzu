@@ -27,9 +27,11 @@
  */
 
 #include "agent_registry.hpp"     // the REAL AgentHealthStore (detail namespace)
+#include "capability_fragments.hpp" // the SHIPPED composed catalogue (plugin_init_failed label bound)
 #include "dedup_fleet_tags.hpp"   // #3663: the SHIPPED dedup tag table (no parallel repro)
 #include "guardian_health_fleet_tags.hpp" // #5403: the SHIPPED age-table row (no parallel repro)
 #include "network_perf_rules.hpp" // SHIPPED net-fact validators (no parallel repro)
+#include "plugin_init_failed_labels.hpp" // SHIPPED catalogue bound + rejected-gauge names
 #include "spark_fleet_tags.hpp"   // SHIPPED spark helpers (no parallel repro)
 #include "echo_corruption_audit.hpp" // #1567 SHIPPED audit gate + tag keys
 
@@ -1943,19 +1945,75 @@ TEST_CASE("REAL AgentHealthStore: unrelated tag keys are not normalised",
     CHECK(series_val(metrics.serialize(), "yuzu_fleet_echo_db_corruption_agents ") == 0.0);
 }
 
+// ── yuzu_fleet_plugin_init_failed: the `plugin` label is bounded to the server's catalogue ──
+//
+// The heartbeat tag is agent-supplied, so these tests wire the REAL composed catalogue
+// (YUZU_ALL_CAPABILITY_FRAGMENTS, the set server.cpp wires) and use its plugin names, never
+// invented ones: a name invented here would test the filter against a set no server holds.
+
+namespace {
+const std::vector<std::string>& catalogue_names() {
+    static const yuzu::server::CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    static const auto names = yuzu::server::catalogue_plugin_names(registry);
+    return names;
+}
+
+/// Catalogue plugins that are neither `echo` nor `wmi` (the two the cases below count by name),
+/// in catalogue order, so a list of them cannot add to either count.
+std::vector<std::string> other_catalogue_names() {
+    std::vector<std::string> out;
+    for (const auto& n : catalogue_names())
+        if (n != "echo" && n != "wmi")
+            out.push_back(n);
+    return out;
+}
+
+std::string join_names(const std::vector<std::string>& names, std::size_t count) {
+    std::string out;
+    for (std::size_t i = 0; i < count; ++i)
+        out += (i ? "," : "") + names.at(i);
+    return out;
+}
+
+constexpr const char* kInitFailed = "yuzu_fleet_plugin_init_failed";
+
+std::string init_failed_series(const std::string& plugin) {
+    return std::string{kInitFailed} + "{plugin=\"" + plugin + "\"} ";
+}
+
+std::string rejected_series(const char* reason) {
+    return std::string{yuzu::server::kPluginInitFailedRejectedGauge} + "{reason=\"" + reason +
+           "\"} ";
+}
+
+bool has_series(const std::string& out, const std::string& series) {
+    return out.find("\n" + series) != std::string::npos;
+}
+
+std::size_t count_init_failed_series(const std::string& out) {
+    std::size_t n = 0;
+    const std::string needle = "\n" + std::string{kInitFailed} + "{";
+    for (auto p = out.find(needle); p != std::string::npos; p = out.find(needle, p + 1))
+        ++n;
+    return n;
+}
+} // namespace
+
 TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, capped, absent-not-zero",
           "[health_store][echo][corruption][real]") {
+    REQUIRE(catalogue_names().size() > 70); // the 64-label cap below needs a catalogue past it
+    const auto others = other_catalogue_names();
     AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
     yuzu::MetricsRegistry metrics;
-    std::string forty;
-    for (int i = 0; i < 40; ++i)
-        forty += (i ? ",t" : "t") + std::to_string(i);
+
     beat_tags(store, "a", {{"yuzu.plugins_failed", "echo,wmi"}});
     beat_tags(store, "b", {{"yuzu.plugins_failed", "echo"}});
     beat_tags(store, "c", {});
-    beat_tags(store, "d", {{"yuzu.plugins_failed", forty}});
-    // 40 empty tokens then a valid name: the 32-split cap bites first, no label.
-    beat_tags(store, "e", {{"yuzu.plugins_failed", std::string(40, ',') + "late"}});
+    // 40 real names: only the first 32 are read.
+    beat_tags(store, "d", {{"yuzu.plugins_failed", join_names(others, 40)}});
+    // 40 empty tokens then a real name: the 32-split cap bites first, no label.
+    beat_tags(store, "e", {{"yuzu.plugins_failed", std::string(40, ',') + others.back()}});
     // #1567 round-2: a repeated token from ONE agent counts once, not once per
     // repeat — plugins_failed_ is a set on an honest agent, so this only fires
     // for a malformed/compromised one. MUTATION-TESTED: dropping the
@@ -1964,36 +2022,162 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, c
     beat_tags(store, "f", {{"yuzu.plugins_failed", "echo,echo"}});
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     auto out = metrics.serialize();
-    CHECK(out.find("plugin=\"late\"") == std::string::npos);
-    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"echo\"} ") == 3.0);
-    CHECK(series_val(out, "yuzu_fleet_plugin_init_failed{plugin=\"wmi\"} ") == 1.0);
-    // At most 32 tokens counted from the 40-token agent: t0..t31 present, t32 not.
-    CHECK(out.find("plugin=\"t31\"") != std::string::npos);
-    CHECK(out.find("plugin=\"t32\"") == std::string::npos);
+    CHECK(series_val(out, init_failed_series("echo")) == 3.0);
+    CHECK(series_val(out, init_failed_series("wmi")) == 1.0);
+    // At most 32 tokens counted from the 40-token agent: [31] present, [32] not.
+    CHECK(has_series(out, init_failed_series(others[31])));
+    CHECK_FALSE(has_series(out, init_failed_series(others[32])));
+    CHECK_FALSE(has_series(out, init_failed_series(others.back())));
+    // Both the 40-token agent and the all-commas agent were cut at the cap.
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 2.0);
 
-    // Fleet-wide label cap: 70 agents each failing a distinct plugin.
+    // Fleet-wide label cap: 70 agents each failing a distinct catalogue plugin. The cap holds
+    // even though every name is real; the remainder joins plugin="unknown", never "other".
     AgentHealthStore many;
+    many.set_known_plugins(catalogue_names());
     yuzu::MetricsRegistry m2;
-    for (int i = 0; i < 70; ++i) {
-        const auto name = std::format("plug_{:02d}", i);
-        beat_tags(many, "agent" + std::to_string(i), {{"yuzu.plugins_failed", name}});
-    }
+    const auto& names = catalogue_names();
+    for (int i = 0; i < 70; ++i)
+        beat_tags(many, "agent" + std::to_string(i), {{"yuzu.plugins_failed", names[i]}});
     many.recompute_metrics(m2, std::chrono::seconds{300});
     auto out2 = m2.serialize();
-    size_t named = 0;
-    for (size_t p = out2.find("yuzu_fleet_plugin_init_failed{"); p != std::string::npos;
-         p = out2.find("yuzu_fleet_plugin_init_failed{", p + 1))
-        ++named;
-    CHECK(named == 65); // 64 named + plugin="other"
-    CHECK(series_val(out2, "yuzu_fleet_plugin_init_failed{plugin=\"other\"} ") == 6.0);
-    CHECK(out2.find("plugin=\"plug_63\"") != std::string::npos);
-    CHECK(out2.find("plugin=\"plug_64\"") == std::string::npos);
+    CHECK(count_init_failed_series(out2) == 65); // 64 named + plugin="unknown"
+    CHECK(series_val(out2, init_failed_series("unknown")) == 6.0);
+    CHECK_FALSE(has_series(out2, init_failed_series("other")));
+    CHECK(has_series(out2, init_failed_series(names[63])));
+    CHECK_FALSE(has_series(out2, init_failed_series(names[64])));
 
     // Absent-not-zero: once the reporters are gone the family is cleared.
     for (int i = 0; i < 70; ++i)
         many.remove("agent" + std::to_string(i));
     many.recompute_metrics(m2, std::chrono::seconds{300});
-    CHECK(m2.serialize().find("yuzu_fleet_plugin_init_failed{") == std::string::npos);
+    CHECK(count_init_failed_series(m2.serialize()) == 0);
+}
+
+TEST_CASE("REAL AgentHealthStore: agent-minted plugin names cannot displace a catalogue plugin",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+
+    // Two enrolled agents each report 32 distinct names that sort before lowercase "echo": the
+    // shape that filled the old first-64-in-byte-order label cap and pushed a real echo failure
+    // into plugin="other". Rotating the names every sweep must not change the outcome.
+    for (int sweep = 0; sweep < 2; ++sweep) {
+        std::string fake_a;
+        std::string fake_b;
+        for (int i = 0; i < 32; ++i) {
+            fake_a += std::format("{}A{}{:02d}", i ? "," : "", sweep, i);
+            fake_b += std::format("{}B{}{:02d}", i ? "," : "", sweep, i);
+        }
+        beat_tags(store, "hostile-1", {{"yuzu.plugins_failed", fake_a}});
+        beat_tags(store, "hostile-2", {{"yuzu.plugins_failed", fake_b}});
+        beat_tags(store, "honest", {{"yuzu.plugins_failed", "echo"}});
+        store.recompute_metrics(metrics, std::chrono::seconds{300});
+        const auto out = metrics.serialize();
+
+        CHECK(series_val(out, init_failed_series("echo")) == 1.0);
+        CHECK(series_val(out, init_failed_series("unknown")) == 64.0);
+        CHECK(count_init_failed_series(out) == 2); // echo + unknown, no minted series
+        CHECK(out.find("plugin=\"A") == std::string::npos);
+        CHECK(out.find("plugin=\"B") == std::string::npos);
+        CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 2.0);
+    }
+}
+
+TEST_CASE("REAL AgentHealthStore: a token named other or unknown cannot collide with a label",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+
+    // Neither word is a catalogue plugin, so neither earns a series of its own: both are summed
+    // under "unknown" with the other unknown name, and "other" is never emitted. (Before the
+    // fix a real plugin called "other" was overwritten by the overflow sum.) Matching is exact:
+    // the catalogue set is lowercase, so a case variant of a real name is unknown too.
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "other,unknown,echo"}});
+    beat_tags(store, "b", {{"yuzu.plugins_failed", "ECHO"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+
+    CHECK(series_val(out, init_failed_series("echo")) == 1.0);
+    CHECK(series_val(out, init_failed_series("unknown")) == 3.0);
+    CHECK_FALSE(has_series(out, init_failed_series("other")));
+    CHECK_FALSE(has_series(out, init_failed_series("ECHO")));
+    CHECK(count_init_failed_series(out) == 2);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 2.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: plugin_init_failed_rejected is published every sweep, zero included",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    const auto reasons = {yuzu::server::kRejectUnknownPlugin, yuzu::server::kRejectMalformed,
+                          yuzu::server::kRejectOverCap};
+
+    // No agents at all: every reason is a real 0, not an absent series.
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    for (const char* r : reasons)
+        CHECK(series_val(metrics.serialize(), rejected_series(r)) == 0.0);
+
+    // Clean reporting: still 0, and the failure family is present (the two are independent).
+    beat_tags(store, "clean", {{"yuzu.plugins_failed", "echo"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    for (const char* r : reasons)
+        CHECK(series_val(metrics.serialize(), rejected_series(r)) == 0.0);
+
+    // One agent per reason; an agent is counted once per reason however many tokens it sends.
+    beat_tags(store, "unk", {{"yuzu.plugins_failed", "nosuchplugin_1,nosuchplugin_2"}});
+    beat_tags(store, "bad", {{"yuzu.plugins_failed", "echo,has-dash," + std::string(65, 'x')}});
+    beat_tags(store, "cap", {{"yuzu.plugins_failed", std::string(32, ',') + "echo"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 1.0);
+    // The two unknown names of "unk" are summed, not labelled.
+    CHECK(series_val(out, init_failed_series("unknown")) == 2.0);
+
+    // The reporters go away: back to 0, not stale and not absent.
+    for (const char* id : {"unk", "bad", "cap"})
+        store.remove(id);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    for (const char* r : reasons)
+        CHECK(series_val(metrics.serialize(), rejected_series(r)) == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: plugin_init_failed stays absent-not-zero beside the rejected gauge",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    beat_tags(store, "a", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    // No failure reported: no per-plugin series (and no "unknown" one), but the rejected gauge
+    // is a measured 0.
+    CHECK(count_init_failed_series(out) == 0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 0.0);
+
+    // Only unknown names reported: just the "unknown" series.
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "nosuchplugin"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(count_init_failed_series(out) == 1);
+    CHECK(series_val(out, init_failed_series("unknown")) == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a store with no catalogue wired keeps the unbounded labelling",
+          "[health_store][echo][real]") {
+    AgentHealthStore store; // set_known_plugins never called
+    yuzu::MetricsRegistry metrics;
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "not_in_any_catalogue"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+    CHECK(series_val(out, init_failed_series("not_in_any_catalogue")) == 1.0);
+    CHECK_FALSE(has_series(out, init_failed_series("unknown")));
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 0.0);
 }
 
 TEST_CASE("REAL AgentHealthStore: corruption candidates are surfaced, not deduped",

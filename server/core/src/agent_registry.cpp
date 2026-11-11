@@ -22,6 +22,7 @@
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
+#include "plugin_init_failed_labels.hpp" // catalogue-bounded plugin label for yuzu_fleet_plugin_init_failed
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "echo_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -2371,6 +2372,12 @@ void AgentHealthStore::set_corruption_sink(CorruptionSink sink) {
     corruption_sink_ = std::move(sink);
 }
 
+void AgentHealthStore::set_known_plugins(std::vector<std::string> names) {
+    std::lock_guard lock(mu_);
+    known_plugins_.emplace(std::make_move_iterator(names.begin()),
+                           std::make_move_iterator(names.end()));
+}
+
 void AgentHealthStore::remove(const std::string& agent_id) {
     std::lock_guard lock(mu_);
     snapshots_.erase(agent_id);
@@ -2812,6 +2819,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int ota_signature_refusing = 0;
     int echo_db_corruption_agents = 0;               // #1567
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
+    // Tokens summed under plugin="unknown" (a well-formed name outside the catalogue), and the
+    // AGENTS that sent at least one token the label dropped, per reason (the rejected gauge).
+    int64_t plugin_init_unknown = 0;
+    int plugin_reject_unknown = 0;
+    int plugin_reject_malformed = 0;
+    int plugin_reject_over_cap = 0;
     int sync_skipping = 0; // #5332: agents whose installed_software daily sync is skipping
 
     // #3663: agent command-dedup store telemetry. Counts of AGENTS (not sums of per-process
@@ -2869,22 +2882,42 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             // its repeat count instead of by 1. `seen_this_agent` holds views into
             // `it->second`, which outlives this block.
             std::unordered_set<std::string_view> seen_this_agent;
+            bool agent_unknown = false;
+            bool agent_malformed = false;
             while (!rest.empty() && tokens < 32) {
                 ++tokens; // every split counts toward the cap, valid or not
                 const auto comma = rest.find(',');
                 const auto tok = rest.substr(0, comma);
                 rest = comma == std::string_view::npos ? std::string_view{}
                                                        : rest.substr(comma + 1);
-                if (tok.empty() || tok.size() > 64 ||
+                if (tok.empty())
+                    continue;
+                if (tok.size() > 64 ||
                     !std::all_of(tok.begin(), tok.end(), [](char ch) {
                         return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
                                (ch >= '0' && ch <= '9') || ch == '_';
-                    }))
+                    })) {
+                    agent_malformed = true;
                     continue;
+                }
                 if (!seen_this_agent.insert(tok).second)
                     continue; // already counted for this agent this sweep
+                // The label is server-chosen: a name the catalogue does not know is summed
+                // under "unknown" (not a catalogue name, so it can never collide with one),
+                // never given a series of its own. With no set wired the token is labelled.
+                if (known_plugins_ && !known_plugins_->contains(tok)) {
+                    ++plugin_init_unknown;
+                    agent_unknown = true;
+                    continue;
+                }
                 ++plugin_init_failed[std::string{tok}];
             }
+            // Tokens remain after the 32-split cap: not read, not scanned (an unbounded tag
+            // value is never walked past the cap), reported once per agent.
+            const bool agent_over_cap = !rest.empty();
+            plugin_reject_unknown += agent_unknown;
+            plugin_reject_malformed += agent_malformed;
+            plugin_reject_over_cap += agent_over_cap;
         }
 
         // Non-copying accessor. Every tag VALUE is fully agent-controlled and bounded only
@@ -3337,19 +3370,35 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     {
         constexpr std::size_t kMaxPluginLabels = 64;
         std::size_t n = 0;
-        int64_t other = 0;
+        // Past the label cap the remainder is summed with the unknown names under "unknown"
+        // when a catalogue set is wired (so "other" can never displace a real plugin named
+        // "other"), and under "other" as before when none is.
+        int64_t overflow = 0;
         for (const auto& [plugin, count] : plugin_init_failed) {
             if (n < kMaxPluginLabels) {
                 metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
                     .set(static_cast<double>(count));
                 ++n;
             } else {
-                other += count;
+                overflow += count;
             }
         }
-        if (other > 0)
+        if (known_plugins_) {
+            const int64_t unknown = plugin_init_unknown + overflow;
+            if (unknown > 0)
+                metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", kUnknownPluginLabel}})
+                    .set(static_cast<double>(unknown));
+        } else if (overflow > 0) {
             metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", "other"}})
-                .set(static_cast<double>(other));
+                .set(static_cast<double>(overflow));
+        }
+        // Fixed label set, published every sweep including 0 (no clear needed).
+        metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectUnknownPlugin}})
+            .set(static_cast<double>(plugin_reject_unknown));
+        metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectMalformed}})
+            .set(static_cast<double>(plugin_reject_malformed));
+        metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectOverCap}})
+            .set(static_cast<double>(plugin_reject_over_cap));
     }
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
     metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
