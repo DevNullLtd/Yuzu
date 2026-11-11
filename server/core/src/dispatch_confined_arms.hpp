@@ -12,6 +12,7 @@
 #include <yuzu/protective_actions.hpp>
 
 #include "authz_model.hpp"
+#include "dispatch_denial.hpp"
 #include "dispatch_target_shape.hpp"
 
 /// @file dispatch_confined_arms.hpp
@@ -376,6 +377,27 @@ struct ConfinedDispatchOutcome {
     /// branches below (`dispatch_confined_arms` never calls
     /// `prepare_route_fallback` for Broadcast/None).
     bool route_unreadable = false;
+    /// #7114: set ONLY by `ServerImpl::dispatch_confined` when
+    /// `build_classified_command` refused the pair (unclassified, ambiguous,
+    /// anonymous operator, forbidden, approval required, kill switched) BEFORE
+    /// any targeting; a denial never reaches an agent, so `sent` is 0. Carried
+    /// so a surface that reports a zero-reach can name the real cause instead of
+    /// folding it into "the agent is not connected". Every zero-reach consumer
+    /// that names a cause must handle it: the shared `classify_zero_reach` ranks
+    /// it first (`ZeroReachCause::Denied`). Of the five hand-copied legacy
+    /// cascades, three (mcp_server.cpp, command_routes.cpp, server.cpp legacy
+    /// forward) run an authorize dry run before dispatching, so a denial there
+    /// is only a race and they are left on their existing order;
+    /// workflow_routes.cpp's legacy execute runs no dry run and still folds a
+    /// denial into its generic no-agents answer (it re-decides its route gate
+    /// and the definition's approval mode after its execution row, #7110, but
+    /// reads no cause); dashboard_routes.cpp runs no dry run, so all five of
+    /// its readers check this field before their cascade: the execute console,
+    /// the Echo re-enable and purge arms, the echo-execute (SQL) arm and the
+    /// echo.status scan. The sibling fragments in echo_tree_routes.cpp,
+    /// dex_routes.cpp and device_routes.cpp, and the REST result-set producers,
+    /// still fold a denial into no-agents.
+    std::optional<detail::DispatchDenial> denied;
 };
 
 // The closed quarantine-control predicate lives in the shared pure header so the

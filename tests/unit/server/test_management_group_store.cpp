@@ -19,6 +19,8 @@
 
 #include "management_group_store.hpp"
 
+#include "mgmt_group_error.hpp"
+
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
@@ -145,6 +147,44 @@ TEST_CASE("ManagementGroupStore: duplicate name rejected", "[pg][management_grou
 
     auto r2 = store.create_group(g);
     REQUIRE(!r2.has_value());
+    // The caller's conflict, named as such: not one of the store-fault messages.
+    CHECK(r2.error() == "a group with that name already exists");
+    CHECK_FALSE(mgmt_group_error_is_store_fault(r2.error()));
+}
+
+TEST_CASE("ManagementGroupStore: renaming onto an existing name is a name conflict, not a fault",
+          "[pg][management_group][crud]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+
+    ManagementGroup a;
+    a.name = "First";
+    a.membership_type = "static";
+    REQUIRE(store.create_group(a).has_value());
+    ManagementGroup b;
+    b.name = "Second";
+    b.membership_type = "static";
+    auto bid = store.create_group(b);
+    REQUIRE(bid.has_value());
+
+    auto fetched = store.get_group(*bid);
+    REQUIRE(fetched.has_value());
+    fetched->name = "First";
+    auto r = store.update_group(*fetched);
+    REQUIRE(!r.has_value());
+    CHECK(r.error() == "a group with that name already exists");
+    CHECK_FALSE(mgmt_group_error_is_store_fault(r.error()));
+
+    // A different unique-constraint hit (the generated id) is still a store fault: a retry mints
+    // a new id, so it is the one case where retrying is right.
+    ManagementGroup c;
+    c.id = *bid;
+    c.name = "Third";
+    c.membership_type = "static";
+    auto dup_id = store.create_group(c);
+    REQUIRE(!dup_id.has_value());
+    CHECK(mgmt_group_error_is_store_fault(dup_id.error()));
 }
 
 TEST_CASE("ManagementGroupStore: update group", "[pg][management_group][crud]") {

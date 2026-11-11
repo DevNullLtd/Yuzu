@@ -13,6 +13,8 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <chrono>
+#include <cstdint>
 #include <limits>
 #include <unordered_set>
 #include <utility>
@@ -224,9 +226,11 @@ std::vector<std::string_view> ci_columns(const DeviceCiSectionDef& def) {
 /// `ci.sections`: one entry per section the device reported, in registry order. `complete` is true
 /// only for level `ok` after the row-count and content-digest checks (`verify_section_content`).
 /// Rows are served only for `ok` and `constrained` (a constrained section is a bounded or partial
-/// projection, so its `complete:false` is the whole point); every other level - `unavailable`,
-/// `permission_denied`, or a level this server does not know - renders its reason and no rows,
-/// even if rows were somehow stored.
+/// projection, so its `complete:false` is the whole point), and never for a section whose
+/// server-side integrity check failed (row-count or content-digest mismatch, #7165). Every other
+/// level - `unavailable`, `permission_denied`, or a level this server does not know - renders its
+/// reason and no rows, even if rows were somehow stored. The whole decision is
+/// `section_serves_rows`.
 nlohmann::json ci_sections_json(const DeviceCiRecord& ci,
                                 const std::vector<DeviceCiSection>& sections) {
     nlohmann::json out = nlohmann::json::array();
@@ -243,12 +247,12 @@ nlohmann::json ci_sections_json(const DeviceCiRecord& ci,
         else if (std::string_view(def.section) == "machine_id")
             source = ci_json_ph(ci.machine_id_source);
         // The served level/reason: the stored status reconciled with the rows actually read
-        // (count, then content digest). A downgrade only ever moves ok -> constrained, so the
-        // row-serving test below is unchanged by it.
-        const SectionVerdict verdict = def.table != nullptr ? verify_section_content(*it)
-                                                            : SectionVerdict{it->level, it->reason};
+        // (count, then content digest). A downgrade only ever moves ok -> constrained; the rows of
+        // a section whose count or digest failed are then withheld below (#7165), decided from the
+        // verdict's fault, never from the token text.
+        const SectionVerdict verdict = served_section_verdict(*it);
         nlohmann::json rows = nlohmann::json::array();
-        if (def.table != nullptr && (it->level == "ok" || it->level == "constrained")) {
+        if (section_serves_rows(def.table != nullptr, it->level, verdict.fault)) {
             const auto cols = ci_columns(def);
             for (const auto& r : it->rows) {
                 nlohmann::json row = nlohmann::json::object();
@@ -466,6 +470,10 @@ HardwareCiRead classify_hardware_ci_read(const HardwareCiDetail& detail) {
         return HardwareCiRead::RosterUnreadable; // a failed roster read is never a 404 (#5531)
     if (truly_absent)
         return HardwareCiRead::NotFound;
+    // Fourth arm, after NotFound by design (see the header: a failed sections read implies the
+    // record read returned a record, so it is never "nothing known").
+    if (hardware_ci_sections_unreadable(detail))
+        return HardwareCiRead::SectionsUnreadable;
     return HardwareCiRead::Found;
 }
 
@@ -840,20 +848,26 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
             {"machine_id_hash", ci_json_ph(ci.machine_id_hash)},
             {"machine_id_algorithm", ci_json_ph(ci.machine_id_algorithm)},
             {"machine_id_source", ci_json_ph(ci.machine_id_source)},
-            // [] = nothing stored (or not read). A failed sections read never reaches this
-            // serializer: both surfaces answer their retryable error first
-            // (`hardware_ci_sections_unreadable`), so ci.sections null is not emitted by REST or
-            // MCP today; the null arm only keeps the serializer total.
-            {"sections", detail.ci_sections ? ci_sections_json(ci, *detail.ci_sections) : nlohmann::json(nullptr)},
+            // [] = read and nothing stored. A failed sections read never reaches this serializer:
+            // both surfaces answer their retryable error first (`SectionsUnreadable`), and the
+            // two record-serving surfaces always read the sections, so ci.sections null (a failed
+            // or a not-read state) is not emitted by REST or MCP today; the null arms only keep
+            // the serializer total.
+            {"sections", detail.ci_sections && *detail.ci_sections
+                             ? ci_sections_json(ci, **detail.ci_sections)
+                             : nlohmann::json(nullptr)},
         };
         out["ci_state"] = "found";
     }
 
-    // "degraded": the sections read failed, or `ci` itself could not be read so none was made.
-    // "absent": nothing stored (a v1 agent or no record) - NOT "the device has none".
-    out["sections_state"] = hardware_ci_sections_unreadable(detail) || !detail.ci.has_value() ? "degraded"
-                            : detail.ci_sections->empty()                                      ? "absent"
-                                                                                                : "found";
+    // "degraded": the sections read failed, was never made (`ci_sections` is nullopt: the caller
+    // asked for `CiRead::RecordOnly`), or `ci` itself could not be read. Never "absent" for a
+    // not-read detail: "absent" claims the sections were read and none stored (#7162).
+    // "absent": read, nothing stored (a v1 agent or no record) - NOT "the device has none".
+    out["sections_state"] = !detail.ci.has_value() || !detail.ci_sections || !*detail.ci_sections
+                                ? "degraded"
+                            : (*detail.ci_sections)->empty() ? "absent"
+                                                             : "found";
 
     if (!detail.software) {
         out["software"] = nullptr;
@@ -945,7 +959,7 @@ void apply_ci_with_sections_read(HardwareCiDetail& detail,
     if (!read) {
         // The record read itself failed: `ci` is the error, and no sections read was made.
         detail.ci = std::unexpected(read.error());
-        detail.ci_sections = {};
+        detail.ci_sections.reset(); // NOT READ
         return;
     }
     detail.ci = std::move(read->record);
@@ -988,30 +1002,80 @@ void downgrade_with(SectionVerdict& v, std::string_view token) {
 
 SectionVerdict verify_section_row_count(const DeviceCiSection& section) {
     SectionVerdict v{section.level, section.reason};
-    if (row_count_disagrees(section))
+    if (row_count_disagrees(section)) {
         downgrade_with(v, kSectionRowCountMismatchReason);
+        v.fault = SectionFault::RowCount;
+    }
     return v;
 }
 
+std::string_view section_fault_token(SectionFault fault) noexcept {
+    switch (fault) {
+    case SectionFault::RowCount:
+        return kSectionRowCountMismatchReason;
+    case SectionFault::Content:
+        return kSectionContentDigestMismatchReason;
+    case SectionFault::Unverifiable:
+        return kSectionContentDigestUnverifiableReason;
+    case SectionFault::None:
+        break;
+    }
+    return {};
+}
+
+std::string_view section_fault_label(SectionFault fault) noexcept {
+    switch (fault) {
+    case SectionFault::RowCount:
+        return "row_count_mismatch";
+    case SectionFault::Content:
+        return "content_digest_mismatch";
+    case SectionFault::Unverifiable:
+        return "digest_unverifiable";
+    case SectionFault::None:
+        break;
+    }
+    return {};
+}
+
 SectionVerdict verify_section_content(const DeviceCiSection& section) {
+    return verify_section_content(section, &sha256_hex);
+}
+
+SectionVerdict verify_section_content(const DeviceCiSection& section, DigestFn digest) {
+    if (digest == nullptr)
+        digest = &sha256_hex;
     SectionVerdict v = verify_section_row_count(section);
     if (row_count_disagrees(section))
         return v; // the count already reports the loss; a lost row always changes the digest too
     if (!section.content_digest.has_value())
-        return v; // not verifiable: served as the count rule left it
+        return v; // not compared: served as the count rule left it
     if (classify_stored_digest(*section.content_digest) == StoredDigestForm::kOtherLayout)
-        return v; // a well-formed digest of another layout version: unverified. Anything else that
+        return v; // a well-formed digest of another layout version: unchecked. Anything else that
                   // is not the current form falls through to the comparison and mismatches.
     if (section.level != "ok" && section.level != "constrained")
         return v; // no rows by contract: nothing to hash
     const auto idx = device_ci_section_index(section.kind);
     if (!idx || kDeviceCiSections[*idx].table == nullptr)
         return v; // not a table-backed registered kind: no digest to compare
-    const auto computed = section_content_digest(kDeviceCiSections[*idx], section.rows);
+    const auto computed = section_content_digest(kDeviceCiSections[*idx], section.rows, digest);
     if (computed.has_value() && *computed == *section.content_digest)
         return v;
+    if (!computed.has_value()) {
+        // The provider failed: a fault of this server, not of the rows (owner ruling 2026-11-09).
+        downgrade_with(v, kSectionContentDigestUnverifiableReason);
+        v.fault = SectionFault::Unverifiable;
+        return v;
+    }
     downgrade_with(v, kSectionContentDigestMismatchReason);
+    v.fault = SectionFault::Content;
     return v;
+}
+
+SectionVerdict served_section_verdict(const DeviceCiSection& section, DigestFn digest) {
+    const auto idx = device_ci_section_index(section.kind);
+    if (!idx || kDeviceCiSections[*idx].table == nullptr)
+        return SectionVerdict{section.level, section.reason}; // never compared: served as stored
+    return verify_section_content(section, digest);
 }
 
 } // namespace yuzu::server

@@ -238,14 +238,15 @@ FRAGMENT_FILES = [
 # runtimes python: +1 (runtimes.python ReadOnly, Inventory, gate None) on top of H.2's 244 = 245, re-derived the same way.
 # middleware (ibm_mq, +1, ReadOnly, Inventory:Read, gate None) on top of runtimes python's 245 = 246, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
 # virtualization (host, +1, ReadOnly, Inventory:Read, gate None) on top of SAM-32's 247 = 248, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
+# virtualization (wsl, +1, ReadOnly, Inventory:Read, gate AdminOrApproval) on top of host's 248 = 249, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
 # H.2 hardware scaffold: +4 hardware (chassis/baseboard/swap/machine_id) +2 disk_actions
 # (partitions/topology), all ReadOnly, Inventory:Read, gate None, on top of 238 = 244, re-derived by
 # running this test (parse_fragment_gate_rows over FRAGMENT_FILES), not by adding to a baseline.
 # SAM-32 hardware.drivers_inventory (+1, ReadOnly, Inventory:Read, gate None) on top of middleware's 246 = 247, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
 # PRQ.1 firewall containment: +4 firewall (quarantine Destructive/Reversible, release Mutating, quarantine_status
-# ReadOnly, quarantine_allow Mutating) on top of SAM-32's 248 = 252, re-derived by running
+# ReadOnly, quarantine_allow Mutating) on top of dev's 249 = 253, re-derived by running
 # parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
-EXPECTED_TOTAL_ROWS = 252
+EXPECTED_TOTAL_ROWS = 253
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

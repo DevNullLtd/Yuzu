@@ -5,6 +5,12 @@
 # reads and the Windows RSMB firmware table are all in-process.
 virtualization_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 
+# win_profiles.hpp (the `wsl` action's with_user_hive ladder) calls Reg*W, RegLoadKeyW and
+# AdjustTokenPrivileges, which live in advapi32 (installed_apps/meson.build precedent).
+if host_machine.system() == 'windows'
+  virtualization_deps += meson.get_compiler('cpp').find_library('advapi32')
+endif
+
 # Assigned (not anonymous) so tests/meson.build's link_depends can name this build output,
 # matching mgmt_posture_plugin_lib.
 virtualization_plugin_lib = shared_library(
