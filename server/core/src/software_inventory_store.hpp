@@ -60,7 +60,17 @@ struct SoftwareFleetRow {
     std::string agent_id;
     SoftwareEntry entry;
     std::int64_t install_id{0}; ///< row id (BIGSERIAL); keyset tiebreak, churns on full replace
+    /// The row's facet state (`software_facet_state` for the row's own `source`), filled by
+    /// `query_software` only. facet_status is the raw status ('' = no state row); facet_enabled
+    /// is TRUE when there is no state row. The wire `status` is derived from the pair by ONE
+    /// rule, kRowStatusCaseSql (SQL) and its C++ twin software_list_model.hpp derive_status.
+    std::string facet_status;
+    bool facet_enabled{true};
+    std::int64_t last_confirmed_at{0}; ///< facet last_confirmed_at; 0 = never confirmed / no row
 };
+
+/// How `SoftwareFleetQuery::name` / `SoftwareComponentQuery::name` is matched.
+enum class NameMatch { kExact, kPrefix, kContains };
 
 /// Keyset position for `SoftwareFleetQuery::after`: the last row of the previous page.
 struct SoftwareCursor {
@@ -208,6 +218,18 @@ struct SoftwareFleetQuery {
     /// Exact version filter: nullopt = any version; present (including "") = that exact
     /// version, so "" selects only the empty-version rows.
     std::optional<std::string> version;
+    /// How `name` is matched (default exact). kPrefix is a LIKE-escaped `name LIKE term%`, which
+    /// installed_software_name_idx serves only under the C collation (under a locale collation it
+    /// is a sequential scan the row LIMIT does not bound); kContains is a literal ILIKE. Both run
+    /// under the 5 s bound, like `q`; only kExact is index-driven everywhere.
+    NameMatch match{NameMatch::kExact};
+    /// Exact version SET (`version = ANY(...)`), the resolved form of a version range. nullopt =
+    /// any; present-empty selects nothing (empty value, no SQL). ANDed with `version` if both set.
+    std::optional<std::vector<std::string>> versions;
+    /// Row status filter over the derived status ("current" | "unconfirmed" | "disabled");
+    /// "" = no filter. The same CASE the response `status` is derived from (kRowStatusCaseSql);
+    /// no index serves it, so a non-empty status runs the read under the 5 s bound, like `q`.
+    std::string status;
     /// Scope push-down (ADR-0033): nullopt = unfiltered; PRESENT-EMPTY = deny-all -> empty
     /// value with no SQL; non-empty -> `agent_id = ANY(...)` in SQL, so the last returned row
     /// is the cursor and a scoped caller never gets a short page.
@@ -224,6 +246,72 @@ struct SoftwareFleetQuery {
     /// make the next page skip or repeat a row (same class as the install_id churn above).
     std::int64_t skip{0};
 };
+
+/// One component row (`software_components`, SAM-14) with its facet state
+/// (`component_inventory`). No agent emits component rows until SAM-40; the server apply path is
+/// live, so the read surface is too.
+struct SoftwareComponentRow {
+    std::string agent_id;
+    std::string kind;
+    std::string path_hash; ///< keyset tiebreak (SHA-256 of the exact path bytes)
+    std::string name;
+    std::string version;
+    std::string version_source;
+    std::string path;
+    std::string anchor_app;
+    std::int64_t first_seen{0};
+    std::string facet_status; ///< as SoftwareFleetRow::facet_status, for `component_inventory`
+    bool facet_enabled{true};
+    std::int64_t last_confirmed_at{0};
+};
+
+/// Keyset position for `SoftwareComponentQuery::after`.
+struct SoftwareComponentCursor {
+    std::string name;
+    std::string agent_id;
+    std::string kind;
+    std::string path_hash;
+};
+
+/// Fleet component query. Empty filters match all. Ordered (name, agent_id, kind, path_hash).
+/// `q` is a literal case-insensitive substring over name | path | anchor_app (clamped to 128
+/// bytes, 5 s bound). `limit` is clamped to kFleetQueryRowCap's ceiling inside the store.
+struct SoftwareComponentQuery {
+    std::string kind;
+    std::string name;
+    NameMatch match{NameMatch::kExact};
+    std::optional<std::vector<std::string>> versions; ///< as SoftwareFleetQuery::versions
+    std::string agent_id;
+    std::string q;
+    std::string status; ///< as SoftwareFleetQuery::status
+    std::optional<std::vector<std::string>> agent_ids; ///< scope push-down, as SoftwareFleetQuery
+    int limit{1000};
+    std::optional<SoftwareComponentCursor> after;
+    std::int64_t skip{0};
+};
+
+/// Exact fleet totals for one title or component. `installs` counts INSTALL ROWS (a device with
+/// two architectures counts twice) and `devices` DISTINCT devices, the same two definitions for a
+/// rollup-served and a live-computed figure. `devices_unconfirmed` (components only, else 0) is
+/// the distinct devices whose row status is not `current`.
+struct SoftwareTotals {
+    /// Install rows; on the components route, component instances (serialised as `instances`).
+    std::int64_t installs{0};
+    std::int64_t devices{0};
+    std::int64_t devices_unconfirmed{0};
+};
+
+/// Freshness stamp of the components rollup (refreshed_at == 0: never computed, "building").
+struct ComponentRollupMeta {
+    std::int64_t refreshed_at{0};
+};
+
+/// The row-status rule, ONE SQL fragment shared by every read and the rollup. Needs the facet
+/// state joined as `fs` (LEFT JOIN: a missing row is unconfirmed). Its C++ twin is
+/// software_list_model.hpp derive_status; a [pg] case materialises every (status, enabled) pair.
+inline constexpr std::string_view kRowStatusCaseSql =
+    "CASE WHEN fs.enabled IS FALSE OR fs.status = 'disabled' THEN 'disabled' "
+    "WHEN fs.status IN ('full', 'delta') THEN 'current' ELSE 'unconfirmed' END";
 
 /// The cadence of the background catalogue refresh (server.cpp constructs SoftwareCatalogRollup
 /// with it).
@@ -619,6 +707,54 @@ public:
     [[nodiscard]] std::optional<std::vector<SoftwareFleetRow>>
     query_software(const SoftwareFleetQuery& q);
 
+    /// Fleet component query (see SoftwareComponentQuery). Same AUTHORITATIVE contract and scope
+    /// push-down as query_software: nullopt on any degrade, never a silent empty; a present-empty
+    /// `agent_ids` or `versions` is an empty value with no SQL.
+    [[nodiscard]] std::optional<std::vector<SoftwareComponentRow>>
+    query_components(const SoftwareComponentQuery& q);
+
+    /// Distinct non-empty versions of one installed title, LIVE from `installed_software` (served
+    /// by installed_software_name_idx), ordered, at most kCatalogRowCap rows: a read that returns
+    /// that many may have been cut (the caller must treat it as unresolvable). Live, not the hourly
+    /// version_rollup, so a version first reported since the last refresh is never missing from a
+    /// range resolved against it. `agent_ids` is the caller's scope pushed into the WHERE (the
+    /// SoftwareFleetQuery::agent_ids rule: nullopt = the whole fleet; present-empty = an empty
+    /// value with no SQL), so the cap and the set a confined caller's range resolves against are
+    /// about its own rows only. 5 s bound; nullopt on degrade. Empty name -> empty value.
+    [[nodiscard]] std::optional<std::vector<std::string>>
+    installed_software_distinct_versions(std::string_view name,
+                                         const std::optional<std::vector<std::string>>& agent_ids);
+
+    /// Distinct non-empty versions of one component (kind may be empty = any kind), LIVE from
+    /// `software_components` (served by software_components_name_idx), ordered, at most
+    /// kCatalogRowCap rows (the same cut-read and `agent_ids` scope rules as
+    /// installed_software_distinct_versions). 5 s bound; nullopt on degrade. Empty name -> empty
+    /// value.
+    [[nodiscard]] std::optional<std::vector<std::string>>
+    component_versions(std::string_view kind, std::string_view name,
+                       const std::optional<std::vector<std::string>>& agent_ids);
+
+    /// Exact application totals for one title (name-only grain of the catalogue rollup):
+    /// installs = install rows, devices = distinct devices. nullopt on degrade; a title absent
+    /// from the rollup is a genuine zero (pair with catalog_rollup_meta() for "building").
+    [[nodiscard]] std::optional<SoftwareTotals> catalog_title_totals(std::string_view name);
+
+    /// Live exact totals for one title restricted to a version set: COUNT(*) rows and COUNT(DISTINCT
+    /// agent_id) in ONE statement (never a sum of per-version distinct counts: a device on two
+    /// selected versions counts once). 5 s bound; nullopt on degrade; empty set -> zeros.
+    [[nodiscard]] std::optional<SoftwareTotals>
+    installed_software_version_set_totals(std::string_view name,
+                                          const std::vector<std::string>& versions);
+
+    /// Exact component totals. A non-empty `kind` with no `versions` is served by the (kind, name)
+    /// rollup row (a missing row is a genuine zero; pair with component_rollup_meta() for
+    /// "building"); every other shape (a version set, or no kind: distinct devices are not
+    /// additive across kinds) is ONE live aggregate over software_components (5 s bound,
+    /// name-index driven).
+    [[nodiscard]] std::optional<SoftwareTotals>
+    component_totals(std::string_view kind, std::string_view name,
+                     const std::optional<std::vector<std::string>>& versions);
+
     /// Name-pattern rollup over `installed_software` (see `NamePatternQuery`): per-(label,
     /// version, ecosystem) distinct-device counts, per-label and grand-total distinct-device
     /// counts (a device carrying two packages of one label counts ONCE for it). Scope is
@@ -721,6 +857,18 @@ public:
     /// degrade. The singleton meta row is seeded at migration with `refreshed_at = 0`
     /// (the "building" sentinel), so a successful read always returns a value.
     [[nodiscard]] std::optional<CatalogRollupMeta> catalog_rollup_meta();
+
+    /// Recompute the components rollup (`component_rollup`, `component_rollup_meta`) from
+    /// software_components with the same shape and guarantees as refresh_catalog_rollup: ONE
+    /// REPEATABLE READ transaction, a non-blocking cluster-wide advisory lock (a peer holding it
+    /// is a skip, success), KEEP-LAST-GOOD on failure/cancel/budget. One row per (kind, name);
+    /// instances = rows, devices = distinct devices, devices_unconfirmed = distinct devices whose
+    /// row status is not `current`.
+    bool refresh_component_rollup(const std::function<bool()>& cancelled = {});
+
+    /// The components rollup freshness stamp; refreshed_at == 0 = never computed. AUTHORITATIVE:
+    /// nullopt on degrade.
+    [[nodiscard]] std::optional<ComponentRollupMeta> component_rollup_meta();
 
     /// Drop an agent's software inventory (e.g. on agent removal). Returns true
     /// iff the transaction committed both deletes; false on a closed store, a

@@ -446,9 +446,14 @@ agent forwards on every heartbeat as `yuzu.plugin.echo.db_corruption_total` /
 deduplicated against the audit store and bounded to one row per agent per 10
 minutes per server process (intermediate quarantines inside that window collapse
 to the newest identity; another HA node can add a second row for the same
-identity) — see the audit-log reference. A plugin that failed to
-initialise (including Echo when the corrupt file cannot be moved aside) is reported
-in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
+identity) — see the audit-log reference. Devices are not queued behind one
+another, so a quarantine that hits many devices at once writes each device's
+audit row on the heartbeat that reports it while the audit store is healthy. A
+report is deferred to a later heartbeat if the same device's lookup is already
+in flight, if it arrives inside the server-wide 60 s back-off that follows any
+failed lookup or write, or if the in-flight set is at capacity. A plugin that
+failed to initialise (including Echo when the corrupt file cannot be moved
+aside) is reported in the `yuzu.plugins_failed` heartbeat tag and `yuzu_fleet_plugin_init_failed{plugin}`,
 which distinguishes "failed to load" from "not installed". The plugin keeps its
 count in a private storage record; if that record is present but unreadable the
 plugin logs `ECHO: db_health.ledger unreadable; not overwriting` and stops updating
@@ -466,10 +471,12 @@ gauge counts affected agents, not events, so this narrows to a small undercount
 rather than a lost signal; tracked as #5037.
 
 Two things worth knowing about the timing of this signal. **A mass event** (many
-devices quarantining near-simultaneously, e.g. a bad storage-driver rollout) still
-updates the fleet gauge in real time, but individual audit rows serialize behind
-one another server-wide, so the audit trail can lag well behind the gauge during a
-burst — don't read row latency as gauge inaccuracy. **A device already quarantined
+devices quarantining near-simultaneously, e.g. a bad storage-driver rollout) updates
+the fleet gauge in real time, and each device's audit row lands as its heartbeat
+is ingested while the audit store is healthy. The trail can still lag the gauge
+during the server-wide 60 s back-off that follows a failed lookup or write, and
+by up to the 10-minute per-device limit for a device whose quarantine identity
+keeps rotating — don't read row latency as gauge inaccuracy. **A device already quarantined
 before this fleet-visibility mechanism shipped** has no durable epoch/basename
 recorded yet, so it produces no fleet signal until its *next* corruption event —
 there is no backfill of pre-existing quarantines.
@@ -516,7 +523,7 @@ The first frame surfaces every device × source pair where the collector has bee
 
 **State persistence:** Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click **Scan fleet** again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.
 
-**Audit trail:** Every Scan emits an `echo.status.scan` audit event. Every Re-enable emits `echo.source.reenable` (with `result=success` and `detail` carrying `device_id` and `source` on success, or `result=failure` with `detail` carrying the real reason — `scope_violation` or `agent_not_connected` — on rejected attempts). Every **Purge data** emits `echo.source.purge` (same detail shape; `result=denied` if the `Infrastructure:Delete` permission is missing). Because purge dispatch is fire-and-forget, the number of rows deleted is recorded in the command's **response record**, not the dispatch audit row. See `docs/user-manual/audit-log.md` for the full schema.
+**Audit trail:** Every Scan emits an `echo.status.scan` audit event. Every Re-enable emits `echo.source.reenable` (with `result=success` and `detail` carrying `device_id` and `source` on success, or `result=failure` with `detail` carrying the real reason — `scope_violation`, `agent_not_connected`, `permission_revoked` (the grant lapsed after the `attempted` row: `Execution:Execute` for a re-enable, `Infrastructure:Delete` for a purge) or `dispatch_denied reason=<token>` (the dispatch chokepoint refused the command for the operator, answered `403`, or `500` for a server catalogue fault; #7114) — on rejected attempts). Every **Purge data** emits `echo.source.purge` (same detail shape; `result=denied` if the `Infrastructure:Delete` permission is missing). Because purge dispatch is fire-and-forget, the number of rows deleted is recorded in the command's **response record**, not the dispatch audit row. See `docs/user-manual/audit-log.md` for the full schema.
 
 ### Process tree viewer
 
@@ -1087,7 +1094,7 @@ To bring it down, raise the budget (`echo.configure db_budget_bytes=524288000`),
 
 The events folded into the tiers are bounded at the point of writing as well as by the budget:
 
-- **`tcp`**: a socket first seen already closing (`TIME_WAIT`, `CLOSE_WAIT`, `FIN_WAIT1`/`2`, `LAST_ACK`, `CLOSING`, `CLOSED`, plus Linux `CLOSE` and Windows `DELETE_TCB`) is one `connected` row, state as seen, per process, remote address and remote port per hour; repeats are dropped and no `disconnected` row follows. A tracked socket moving into a closing state writes one `disconnected` row. A closing socket that vanishes adds nothing. A closing socket that returns to a non-closing state (the 4-tuple was reused) writes `connected`. For outbound connections the hourly `connect_count` for these sockets is therefore **distinct remotes per process per hour**, not sockets; an inbound socket first seen already closing is one row per client socket per hour, because the remote port is the client's ephemeral port. `process_name` is filled from the process source's pid map when the collector could not name the socket (a paused process source leaves it empty; `TIME_WAIT` sockets have pid 0 and stay unnamed). On macOS the `nstat` event stream still writes one open and one close per flow; the closing rules apply to the poll path, and an `nstat` open event now carries the descriptor's TCP state. A connection attempt that vanishes (or turns to a closing state) while its last observed state is `SYN_SENT` counts as `failed_count`; a poll cannot tell a refused or timed-out attempt from one the remote accepted and closed between two polls, so `failed_count` can over-count a very short-lived connection. A listening socket counts as `listen_open_count` / `listen_close_count` under `remote_addr` `*` with `remote_port` set to its local port, and never as a connection. Both rules run on the poll path's state transitions, so they apply on every OS that polls; the macOS `nstat` stream reports flows, not `SYN_SENT` or `LISTEN` states, and feeds neither count.
+- **`tcp`**: a socket first seen already closing (`TIME_WAIT`, `CLOSE_WAIT`, `FIN_WAIT1`/`2`, `LAST_ACK`, `CLOSING`, `CLOSED`, plus Linux `CLOSE` and Windows `DELETE_TCB`) is one `connected` row, state as seen, per process, remote address and remote port per hour; repeats are dropped and no `disconnected` row follows. A tracked socket moving into a closing state writes one `disconnected` row. A closing socket that vanishes adds nothing. A closing socket that returns to a non-closing state (the 4-tuple was reused) writes `connected`. For outbound connections the hourly `connect_count` for these sockets is therefore **distinct remotes per process per hour**, not sockets; an inbound socket first seen already closing is one row per client socket per hour, because the remote port is the client's ephemeral port. `process_name` is filled from the process source's pid map when the collector could not name the socket (a paused process source leaves it empty; `TIME_WAIT` sockets have pid 0 and stay unnamed). On macOS the `nstat` event stream writes one open and one close per flow; an `nstat` open event carries the descriptor's TCP state, and an open first reported already closing is stored once per hour per process, remote address and remote port, sharing the poll path's per-hour set (the dump of existing flows at each subscription repeats on every agent restart). Only open events go through that rule: an `nstat` close event is never filtered, so a stored closing-state open can still be followed by its `disconnected` row, unlike the poll path. A connection attempt that vanishes (or turns to a closing state) while its last observed state is `SYN_SENT` counts as `failed_count`; a poll cannot tell a refused or timed-out attempt from one the remote accepted and closed between two polls, so `failed_count` can over-count a very short-lived connection. A listening socket counts as `listen_open_count` / `listen_close_count` under `remote_addr` `*` with `remote_port` set to its local port, and never as a connection. Both rules run on the poll path's state transitions, so they apply on every OS that polls; the macOS `nstat` stream reports flows, not `SYN_SENT` or `LISTEN` states, and feeds neither count.
 - **`module`** *(Windows)*: unload events are not stored. A load is always stored when it is risky (blocked, unsigned, invalid, revoked, or a kernel driver). Every other load, including one with an `unknown` signature, is stored once per hour per loader process name, module name and module folder. The hourly `load_count` for ordinary modules is therefore **distinct loader/module/folder combinations per hour**, not raw loads. The remembered set holds at most 20,000 keys and is cleared at each hour boundary and when it overflows (`module_dedup_overflow_total`, and `tcp_closing_dedup_overflow_total` for `tcp`, count the overflows; an overflow can repeat a row, never lose a first one). The set is in memory, so a restart records each ordinary load once more in the current hour.
 - **`registry`** *(Windows)*: the new value is capped at 512 bytes, the old value is not stored (neither its text nor its type or size; the new value's type and the attributed writer's image are), the `bam\State` subtree is not read, and a row's `ts` is the key's last-write time. A one-off rewrite of each root's baseline follows the upgrade, with no rows.
 - **`user`**: `logon_type` is `remote` when `ut_host` is set and is not an X display, on both Linux and macOS; the fixed-width `utmp` fields are read without running past their width.

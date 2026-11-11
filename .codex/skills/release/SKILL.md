@@ -42,6 +42,17 @@ Before invoking the skill, the operator should already have:
   ```
 
   It must print all six names, each `completed` with `success` or `skipped`. The ruleset that lists them is the repo's "Protect Main" setting, not this file.
+- The release/LTO legs green on `main`'s tip, and no open `release-legs-broken` issue. These legs are not required checks, but they are the only place the test suite runs in release/NDEBUG mode: `release.yml` builds with `-Dbuild_tests=false`. Since Tier 2b (`docs/ci-architecture.md`) they no longer run on dev pushes, only on `main` pushes and a daily dispatch on dev. An open issue means dev's release legs were red at the last dispatch, or the daily workflow itself failed (its reconcile or dispatch job; the issue says which). Find out whether that defect reached `main` before tagging:
+
+  ```bash
+  SHA=$(git rev-parse origin/main)
+  gh issue list --repo DevNullLtd/Yuzu --label release-legs-broken --state open
+  gh api "repos/DevNullLtd/Yuzu/commits/$SHA/check-runs?per_page=100" --jq '
+    [.check_runs[] | select(.name | test("^(Linux (gcc-15|clang-21)|Windows MSVC|macOS) release$"))]
+    | group_by(.name) | map(max_by(.id)) | .[] | "\(.name)\t\(.status)\t\(.conclusion)"'
+  ```
+
+  Expect four names, each `completed`/`success`. If the tip is a docs-only commit (the usual case for the final `promote --append --date` commit), it built nothing and the query prints nothing. In that case, set `SHA` to the most recent `main` commit whose push run built code (its run shows the build legs, not the `docs-required-checks` stubs) and re-run it there. No output on a code commit is a stop.
 - All tracked compose files updated to `${YUZU_VERSION:-<BASE_VERSION>}` defaults — the **base** version with any `-rcN`/`-betaN` suffix stripped (e.g., for tag `v0.12.0-rc0` the default is `0.12.0`, NOT `0.12.0-rc0`). The workflow's `Validate docker-compose image versions` gate inside the `Create Release` job invokes `bash scripts/check-compose-versions.sh "$BASE_VERSION"` and will hard-fail the release after the full build matrix has run if the defaults don't match. Local dry-run **must use the same base version**: `bash scripts/check-compose-versions.sh 0.12.0` (NOT `0.12.0-rc0`) — the script accepts whatever you pass and is happy with consistent garbage, so passing the rc-suffixed version locally green-lights a doomed release. Preflight (`scripts/release-preflight.sh`) does the right thing automatically because it strips the suffix internally; the lesson from v0.12.0-rc0's first cut was that local one-off `check-compose-versions.sh` invocations are misleading on RC tags.
 
 If any of these are missing, the skill prompts the operator to fix-and-commit-and-push before continuing. **It does NOT auto-bump versions** — bumping is a deliberate decision (which X, which Y, which Z) the operator owns.

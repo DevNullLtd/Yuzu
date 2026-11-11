@@ -117,6 +117,8 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("create_offload_target",                "POST",   R"(/api/v1/offload-targets)"),
     step_up_mcp_detail::exempt ("create_result_set",                    step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets)"),
     step_up_mcp_detail::exempt ("set_crypto_dashboard_layout",          step_up_detail::kOperationalData,   "PUT",    R"(/api/v1/crypto/dashboard/layout)"),
+    step_up_mcp_detail::exempt ("reset_dex_score_policy",               step_up_detail::kOperationalData,   "DELETE", R"(/api/v1/dex/score-policy)"),
+    step_up_mcp_detail::exempt ("set_dex_score_policy",                 step_up_detail::kOperationalData,   "PUT",    R"(/api/v1/dex/score-policy)"),
     // On kMcpPendingBecauseRestTwinRequired: the twin is kRequired (an administrator can write the plugin-signing and audit-retention keys through it).
     step_up_mcp_detail::pending("set_runtime_config",                   "PUT",    R"(/api/v1/config/([a-z_]+))"),
     step_up_mcp_detail::pending("delete_offload_target",                "DELETE", R"(/api/v1/offload-targets/(\d+))"),

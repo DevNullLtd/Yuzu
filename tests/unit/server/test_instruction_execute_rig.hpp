@@ -27,6 +27,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -147,6 +148,8 @@ struct Rig {
     bool create_fails{false};
     std::vector<ExecutionRow> rows;
     std::vector<std::string> cancelled;
+    bool cancel_fails{false};  ///< mark_cancelled answers false (the row stays running)
+    bool cancel_throws{false}; ///< ... or throws (a store fault inside the cancel)
     std::vector<std::pair<std::string, int>> targeted;
     std::vector<std::string> refreshed;
     bool set_targeted_ok{true};
@@ -164,8 +167,21 @@ struct Rig {
     std::int64_t seq{0};
 
     std::optional<DispatchDenial> force_denial;
+    /// #7110 post-write recheck. By default `readmit` answers the caller the last `request()` was
+    /// built with (the surface re-derives the SAME principal); a test narrows that with
+    /// `readmit_caller`, withdraws the permission with `readmit_withdrawn`, or leaves the port
+    /// unset with `readmit_unwired`. `on_create` runs inside the execution-row write (the core's
+    /// last own write before the recheck), the window in which production lets a grant move.
+    bool readmit_unwired{false};
+    bool readmit_withdrawn{false};
+    bool readmit_throws{false}; ///< the recheck throws (a store fault): must read as withdrawn
+    std::optional<DispatchCaller> readmit_caller;
+    DispatchCaller last_caller;
+    int readmits{0};
+    std::function<void()> on_create;
     std::set<std::string> denied_securables; // has_permission() answers false for these
     bool authorize_unwired{false};
+    bool authorize_throws{false}; ///< the chokepoint dry run throws (a store fault): a test sets it inside on_create
     bool classify_unwired{false};
 
     struct AuditRow {
@@ -211,13 +227,13 @@ struct Rig {
                 return has_permission(p, s, o);
             });
         if (!decision)
-            return ConfinedDispatchOutcome{.command_id = command_id};
+            return ConfinedDispatchOutcome{.command_id = command_id, .denied = decision.error()};
         const auto arm = classify_dispatch_arm(!ids.empty(), scope);
         auto classified = yuzu::server::detail::finalize_classified_command(
             *decision, yuzu::server::detail::KillSwitchFn{}, plugin, action, command_id, params, {}, 0, 0,
             std::string(dispatch_arm_label(arm)), execution_id);
         if (!classified)
-            return ConfinedDispatchOutcome{.command_id = command_id};
+            return ConfinedDispatchOutcome{.command_id = command_id, .denied = classified.error()};
         const auto gate = ContainmentGate::enforcing(/*fail_closed_in=*/false, {});
         auto noop = [](const std::string&, const std::string&, const std::string&,
                        const std::string&) {};
@@ -245,6 +261,16 @@ struct Rig {
             };
         }
         p.validators = &validators;
+        if (!readmit_unwired) {
+            p.readmit = [this]() -> std::optional<DispatchCaller> {
+                ++readmits;
+                if (readmit_throws)
+                    throw std::runtime_error("readmit: rbac store unavailable");
+                if (readmit_withdrawn)
+                    return std::nullopt;
+                return readmit_caller ? *readmit_caller : last_caller;
+            };
+        }
         if (!classify_unwired) {
             p.classify = [this](std::string_view pl, std::string_view ac) {
                 return caps.classify(pl, ac);
@@ -254,6 +280,8 @@ struct Rig {
             p.authorize = [this](const DispatchCaller& caller, std::string_view pl,
                                  std::string_view ac)
                 -> std::expected<CommandCapability, DispatchDenial> {
+                if (authorize_throws)
+                    throw std::runtime_error("authorize: rbac store unavailable");
                 if (force_denial)
                     return std::unexpected(*force_denial);
                 return yuzu::server::detail::classify_and_authorize_dispatch(
@@ -293,6 +321,8 @@ struct Rig {
         p.visible_agents = [this](const std::string&) { return visible_agents; };
         if (ledger_wired) {
             p.create_execution = [this](const ExecutionRow& r) -> std::optional<std::string> {
+                if (on_create)
+                    on_create();
                 if (create_throws)
                     throw std::runtime_error("create boom");
                 if (create_throws_nonstd)
@@ -304,7 +334,9 @@ struct Rig {
             };
             p.mark_cancelled = [this](const std::string& id, const std::string&) {
                 cancelled.push_back(id);
-                return true;
+                if (cancel_throws)
+                    throw std::runtime_error("cancel boom");
+                return !cancel_fails;
             };
             p.set_agents_targeted = [this](const std::string& id, int n) {
                 targeted.emplace_back(id, n);
@@ -361,6 +393,7 @@ struct Rig {
         r.surface = s;
         r.definition_id = def_id;
         r.body = std::move(body);
+        last_caller = caller;
         r.caller = std::move(caller);
         return r;
     }

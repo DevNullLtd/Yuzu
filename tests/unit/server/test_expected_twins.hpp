@@ -229,6 +229,11 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // /api/config routes do. The per-key administrator-only refusal is config::write_refusal's.
     {"get_runtime_config", "Infrastructure", "Read", true},
     {"set_runtime_config", "Infrastructure", "Write", false},
+    // DEX score policy (#6087): twins of GET/PUT/DELETE /api/v1/dex/score-policy. reset is the
+    // distinct operation Infrastructure:Delete so the supervised tier's approval rule applies.
+    {"get_dex_score_policy", "GuaranteedState", "Read", true},
+    {"set_dex_score_policy", "Infrastructure", "Write", false},
+    {"reset_dex_score_policy", "Infrastructure", "Delete", false},
     // get_me, the twin of GET /api/v1/me (ledger row get.api-me). The REST route has no
     // permission gate (auth_fn only), so this row pins the MCP side alone:
     // Infrastructure:Read drives MCP tier classification only, with no RBAC check behind it

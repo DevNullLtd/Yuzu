@@ -3,7 +3,8 @@
  * v1 routes and MCP tools share (dispatch_zero_reach.hpp).
  *
  * Binds the FIXED priority order copied from the MCP execute_instruction
- * cascade: invalid_scope > containment_unreadable > route_unreadable >
+ * cascade, with #7114's chokepoint denial ranked first: dispatch_denied >
+ * invalid_scope > containment_unreadable > route_unreadable >
  * os_gate_unreadable > quarantined > plugin_not_found > kill_switched_os >
  * no_agents_reached. Each adjacent pair is asserted with both flags set so a
  * swapped branch fails.
@@ -22,6 +23,8 @@ using yuzu::server::ConfinedDispatchOutcome;
 using yuzu::server::zero_reach_retryable;
 using yuzu::server::zero_reach_token;
 using yuzu::server::ZeroReachCause;
+using yuzu::server::detail::DispatchDenial;
+using yuzu::server::detail::DispatchDenialReason;
 
 namespace {
 
@@ -212,6 +215,7 @@ TEST_CASE("zero_reach: sent and command_id do not influence the classification",
 
 TEST_CASE("zero_reach: wire tokens are the existing status and reason strings",
           "[dispatch_zero_reach]") {
+    CHECK(zero_reach_token(ZeroReachCause::Denied) == "dispatch_denied");
     CHECK(zero_reach_token(ZeroReachCause::InvalidScope) == "invalid_scope");
     CHECK(zero_reach_token(ZeroReachCause::ContainmentUnreadable) == "containment_unreadable");
     CHECK(zero_reach_token(ZeroReachCause::RouteUnreadable) == "route_unreadable");
@@ -223,8 +227,8 @@ TEST_CASE("zero_reach: wire tokens are the existing status and reason strings",
 }
 
 TEST_CASE("zero_reach: tokens are distinct and non-empty", "[dispatch_zero_reach]") {
-    constexpr std::array<ZeroReachCause, 8> all{
-        ZeroReachCause::InvalidScope,     ZeroReachCause::ContainmentUnreadable,
+    constexpr std::array<ZeroReachCause, 9> all{
+        ZeroReachCause::Denied,           ZeroReachCause::InvalidScope,     ZeroReachCause::ContainmentUnreadable,
         ZeroReachCause::RouteUnreadable,  ZeroReachCause::OsGateUnreadable,
         ZeroReachCause::Quarantined,      ZeroReachCause::PluginNotFound,
         ZeroReachCause::KillSwitchedOs,   ZeroReachCause::Generic};
@@ -246,4 +250,22 @@ TEST_CASE("zero_reach: retryable flags match the existing semantics", "[dispatch
     CHECK_FALSE(zero_reach_retryable(ZeroReachCause::Quarantined));
     CHECK_FALSE(zero_reach_retryable(ZeroReachCause::PluginNotFound));
     CHECK_FALSE(zero_reach_retryable(ZeroReachCause::KillSwitchedOs));
+    CHECK_FALSE(zero_reach_retryable(ZeroReachCause::Denied));
+}
+
+TEST_CASE("zero_reach: denied wins over every other flag", "[dispatch_zero_reach][security]") {
+    auto o = with_everything();
+    o.denied = DispatchDenial{DispatchDenialReason::ApprovalRequired, "Execution",
+                              yuzu::server::authz::Operation::Execute};
+    CHECK(classify_zero_reach(o, false) == ZeroReachCause::Denied);
+    // A protective action is not exempt from the chokepoint's own refusal.
+    CHECK(classify_zero_reach(o, true) == ZeroReachCause::Denied);
+    // Alone, and with nothing else set.
+    ConfinedDispatchOutcome only;
+    only.denied = DispatchDenial{DispatchDenialReason::Forbidden, "Execution",
+                                 yuzu::server::authz::Operation::Execute};
+    CHECK(classify_zero_reach(only, false) == ZeroReachCause::Denied);
+    // Without it the same outcome falls back to the next cause (invalid_scope).
+    o.denied.reset();
+    CHECK(classify_zero_reach(o, false) == ZeroReachCause::InvalidScope);
 }

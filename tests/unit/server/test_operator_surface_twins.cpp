@@ -523,6 +523,7 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_crypto_widgets",
             "get_crypto_dashboard_layout",
             "get_crypto_ca_stats",
+            "get_dex_score_policy",
             "get_me",
             // Inert for this tool: the check below rejects only the exact literal
             // {"type":"object","properties":{}}, and get_rbac_enforcement's input schema also

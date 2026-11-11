@@ -157,6 +157,12 @@ public:
                                                              yuzu::server::detail::DispatchDenial>(
         const yuzu::server::DispatchCaller& caller, std::string_view plugin,
         std::string_view action)>;
+    /// agent_id -> hostname over the device table's roster (the 30-day roster, offline devices
+    /// included — the same read the dashboard's Software devices table uses), one call per page.
+    /// Consumers: the `hostname` field of GET /api/v1/inventory/software[/components] rows.
+    /// Set via `set_hostnames_fn` (below), BEFORE `register_routes()`; `{}` leaves those
+    /// hostnames `null` (unknown).
+    using HostnamesFn = std::function<std::unordered_map<std::string, std::string>()>;
     /// ADR-0017 admit-then-filter list-read gate for a list/fan-out route
     /// over per-agent data (`AuthRoutes::require_list_read`). Unlike PermFn/
     /// ScopedPermFn (bool: caller re-derives the session separately if
@@ -747,6 +753,13 @@ public:
     /// `device_ids` is unaffected either way.
     void set_all_agent_ids_fn(AllAgentIdsFn fn) { all_agent_ids_fn_ = std::move(fn); }
 
+    /// The device-table roster behind the `hostname` field of GET /api/v1/inventory/software and
+    /// .../components (see `HostnamesFn`). A setter, not a `register_routes()` parameter: the
+    /// tier-policy lexical gate pins `authorize_dispatch` as that call's trailing argument. MUST be
+    /// called BEFORE `register_routes()`, same timing contract as `set_engine_principal_store`.
+    /// Unset (`{}`, the default) leaves those hostnames `null`.
+    void set_hostnames_fn(HostnamesFn fn) { hostnames_fn_ = std::move(fn); }
+
     /// TEST SEAM for POST /api/v1/executions/{id}/cancel and .../rerun. Production leaves this
     /// unset and the routes bind `make_tracker_mutation_ports(execution_tracker)`; a test that
     /// has no Postgres sets fake ports instead. MUST be called BEFORE `register_routes()`. An
@@ -873,6 +886,7 @@ private:
     std::vector<std::string> csrf_trusted_origins_;
     ScopeEvaluateFn scope_evaluate_fn_;
     AllAgentIdsFn all_agent_ids_fn_;
+    HostnamesFn hostnames_fn_; // see set_hostnames_fn
     ExecutionMutationPorts execution_mutation_ports_; // see set_execution_mutation_ports_for_test
     EmitEventFn emit_event_fn_;                       // see set_emit_event_fn
 };

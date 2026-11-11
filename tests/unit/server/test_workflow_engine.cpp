@@ -3015,8 +3015,10 @@ ConfinedDispatchOutcome parity_reached() {
     return ConfinedDispatchOutcome{.sent = 1, .command_id = "cmd-parity"};
 }
 ConfinedDispatchOutcome parity_missed() {
+    // The transient miss (no_agents_reached): the retried scenarios need a cause the engine
+    // retries, and a quarantine is permanent (workflow_parity_scenarios.hpp).
     ConfinedDispatchOutcome o;
-    o.denied_quarantined_count = 1;
+    o.sent = 0;
     return o;
 }
 

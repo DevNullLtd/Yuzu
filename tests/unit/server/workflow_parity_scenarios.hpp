@@ -39,10 +39,13 @@ inline constexpr Scenario kScenarios[] = {
     {"succeeded", "succeeded", "none", Matrix::kBoth, ""},
     {"continue_later_step_missed", "partial", "none", Matrix::kBoth, ""},
     {"continue_first_step_missed", "partial", "none", Matrix::kBoth, ""},
-    {"nothing_reached", "failed", "quarantined", Matrix::kBoth, ""},
+    // A missed step is the TRANSIENT miss (sent 0, no_agents_reached): a permanent cause
+    // (quarantined, plugin_not_found, kill_switched_os, dispatch_denied) is never retried, so it
+    // cannot model a step that is retried (#7114).
+    {"nothing_reached", "failed", "no_agents_reached", Matrix::kBoth, ""},
     {"same_instruction_twice", "partial", "none", Matrix::kBoth, ""},
     {"retried_to_success", "succeeded", "none", Matrix::kBoth, ""},
-    {"retried_still_failing_only_step", "failed", "quarantined", Matrix::kBoth, ""},
+    {"retried_still_failing_only_step", "failed", "no_agents_reached", Matrix::kBoth, ""},
     {"late_denied", "aborted", "late_denied", Matrix::kBoth, ""},
     {"late_denied_first_step", "aborted", "late_denied", Matrix::kBoth, ""},
     {"definition_changed", "aborted", "definition_changed", Matrix::kBoth, ""},

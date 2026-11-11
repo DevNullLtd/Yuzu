@@ -320,15 +320,17 @@ inline constexpr std::string_view kReasonCredentialIndeterminate = "credential_i
 
 /// Every `error.reason` (REST 503) and every `status` (MCP success envelope) a run that started
 /// and reached no agent can carry, pinned against the MCP description, the output schema and the
-/// REST documents by test. The first four are the transient causes, the next three the permanent
-/// ones of `dispatch_zero_reach.hpp` (`invalid_scope` is not here: a workflow names its agents,
-/// so the dispatch never parses a scope); `late_denied` and `definition_changed` are a step
-/// refused at send time; `deadline_exceeded` is the run budget ending the run first; `run_failed`
-/// is the engine closing the run without a single dispatch attempt.
-inline constexpr std::array<std::string_view, 11> kWorkflowZeroReachStatuses{
-    "containment_unreadable", "route_unreadable", "os_gate_unreadable", "no_agents_reached",
-    "quarantined",            "plugin_not_found", "kill_switched_os",   "late_denied",
-    "definition_changed",     "deadline_exceeded", "run_failed"};
+/// REST documents by test. The first is the chokepoint denial of `dispatch_zero_reach.hpp` (a
+/// step refused before targeting: the pre-send dry run passed, so the caller's grant or the
+/// action's gate moved between the two), the next four its transient causes, the next three its
+/// permanent ones (`invalid_scope` is not here: a workflow names its agents, so the dispatch never
+/// parses a scope); `late_denied` and `definition_changed` are a step refused at send time;
+/// `deadline_exceeded` is the run budget ending the run first; `run_failed` is the engine closing
+/// the run without a single dispatch attempt.
+inline constexpr std::array<std::string_view, 12> kWorkflowZeroReachStatuses{
+    "dispatch_denied",        "containment_unreadable", "route_unreadable", "os_gate_unreadable",
+    "no_agents_reached",      "quarantined",            "plugin_not_found", "kill_switched_os",
+    "late_denied",            "definition_changed",     "deadline_exceeded", "run_failed"};
 
 /// What a step's absence of a `command_id` does NOT prove. The command id is stored only in the
 /// step result written after the dispatch returns, and that write can be dropped (a lease timeout,
@@ -713,7 +715,7 @@ struct WorkflowRunOutcomeSeries {
 ///   succeeded    none
 ///   partial      none
 ///   interrupted  server_shutdown
-///   failed       a zero-reach cause (7), run_failed, dispatch_exception (the run threw)
+///   failed       a zero-reach cause (8), run_failed, dispatch_exception (the run threw)
 ///   aborted      deadline_exceeded, server_shutdown, credential_revoked,
 ///                credential_indeterminate, late_denied, definition_changed, or a zero-reach
 ///                cause of an earlier step that reached nobody

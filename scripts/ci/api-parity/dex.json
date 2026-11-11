@@ -277,8 +277,8 @@
       "method": "GET",
       "path": "/api/v1/dex/score-policy"
     },
-    "mcp_twin": null,
-    "status": "planned:#6087"
+    "mcp_twin": "get_dex_score_policy",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -288,8 +288,8 @@
       "method": "PUT",
       "path": "/api/v1/dex/score-policy"
     },
-    "mcp_twin": null,
-    "status": "planned:#6087"
+    "mcp_twin": "set_dex_score_policy",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -299,8 +299,8 @@
       "method": "PUT",
       "path": "/api/v1/dex/score-policy"
     },
-    "mcp_twin": null,
-    "status": "planned:#6087"
+    "mcp_twin": "set_dex_score_policy",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -310,7 +310,7 @@
       "method": "DELETE",
       "path": "/api/v1/dex/score-policy"
     },
-    "mcp_twin": null,
-    "status": "planned:#6087"
+    "mcp_twin": "reset_dex_score_policy",
+    "status": "twinned"
   }
 ]

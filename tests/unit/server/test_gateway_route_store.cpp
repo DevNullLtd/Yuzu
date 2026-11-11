@@ -438,6 +438,59 @@ TEST_CASE("GatewayRouteStore[pg]: legacy_echo_wire_name is written by register_f
     CHECK_FALSE((*upgraded)->legacy_echo_wire_name);
 }
 
+TEST_CASE("GatewayRouteStore[pg]: set_legacy_echo_wire_name re-states the flag for the matching "
+          "session only and leaves the rest of the row alone",
+          "[gateway_route][pg][store][echo_rename]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-up", "session-u", true).value().won);
+    REQUIRE(fx.store().announce_connected("agent-up", "session-u", "c1", "n1", 30).value().matched);
+    const auto before = fx.store().lookup_route("agent-up");
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+    REQUIRE((*before)->legacy_echo_wire_name);
+
+    // A different session (a stale re-announce) changes nothing.
+    const auto other = fx.store().set_legacy_echo_wire_name("agent-up", "session-other", false);
+    REQUIRE(other.has_value());
+    CHECK_FALSE(*other);
+    CHECK(fx.store().lookup_route("agent-up").value()->legacy_echo_wire_name);
+
+    // `updated_at` is the tombstone purge clock: back-date it; a flag refresh must not reset it.
+    fx.raw_set_updated_at_ago("agent-up", 400);
+
+    // The matching session flips the flag; placement, epoch and session are untouched.
+    const auto flipped = fx.store().set_legacy_echo_wire_name("agent-up", "session-u", false);
+    REQUIRE(flipped.has_value());
+    CHECK(*flipped);
+    const auto after = fx.store().lookup_route("agent-up");
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK_FALSE((*after)->legacy_echo_wire_name);
+    CHECK((*after)->session_id == (*before)->session_id);
+    CHECK((*after)->connection_epoch == (*before)->connection_epoch);
+    CHECK((*after)->cluster_id == (*before)->cluster_id);
+    CHECK((*after)->gateway_node == (*before)->gateway_node);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(fx.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(), "SELECT extract(epoch FROM now() - updated_at) >= 399 FROM "
+                        "gateway_route_store.agent_routes WHERE agent_id = 'agent-up'")};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        CHECK(std::string_view(PQgetvalue(r.get(), 0, 0)) == "t");
+    }
+
+    // And it can set it back (the flag is restated, not only cleared).
+    REQUIRE(*fx.store().set_legacy_echo_wire_name("agent-up", "session-u", true));
+    CHECK(fx.store().lookup_route("agent-up").value()->legacy_echo_wire_name);
+
+    // An agent with no row is a clean no-match, not an error.
+    const auto none = fx.store().set_legacy_echo_wire_name("agent-none", "session-x", true);
+    REQUIRE(none.has_value());
+    CHECK_FALSE(*none);
+}
+
 TEST_CASE("GatewayRouteStore[pg]: announce_connected is a no-op against a different session",
           "[gateway_route][pg][store]") {
     GatewayRoutePg fx;

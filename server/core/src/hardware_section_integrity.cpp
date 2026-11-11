@@ -65,9 +65,9 @@ void register_section_integrity_metrics(yuzu::MetricsRegistry& metrics) {
                      "Hardware record sections composed downgraded to constrained because the "
                      "rows read back disagree with the row count or content digest the server "
                      "recorded when the section was written (row_count_mismatch, "
-                     "content_digest_mismatch), or the server could not compute the digest to "
-                     "compare (digest_unverifiable: a fault of this server, not of the "
-                     "device). Counts reads composed with a faulted section, once per section per "
+                     "content_digest_mismatch: the section is served with NO rows), or the "
+                     "server could not compute the digest to compare (digest_unverifiable: a "
+                     "fault of this server, not of the device; the rows are still served). Counts reads composed with a faulted section, once per section per "
                      "read (including a read whose body is then withheld by an audit-write "
                      "failure), so a polled device inflates it; it is not a count of distinct "
                      "defects",
@@ -108,8 +108,9 @@ void record_section_integrity(const std::vector<DeviceCiSection>& sections,
             // Device id and section kind only - never row contents (a section's rows are
             // agent-supplied bytes and may hold personal data).
             spdlog::warn("hardware record: section integrity fault agent={} kind={} reason={} "
-                         "(served constrained; occurrence {})",
-                         yuzu::log_token(agent_id), yuzu::log_token(section.kind), label, n);
+                         "(served constrained, rows {}; occurrence {})",
+                         yuzu::log_token(agent_id), yuzu::log_token(section.kind), label,
+                         section_rows_withheld(fault) ? "withheld" : "served", n);
         }
     }
 }

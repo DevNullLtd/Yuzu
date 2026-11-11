@@ -336,16 +336,16 @@ TEST_CASE("gather_echo_retention_paused: row count reads <src>_rows then <src>_l
         return nullptr;
     };
     REQUIRE(row_of("agent-new"));
-    CHECK(row_of("agent-new")->live_rows == 111);
+    CHECK(row_of("agent-new")->hourly_rows == 111);
     CHECK_FALSE(row_of("agent-new")->pre_rollup_agent);
     REQUIRE(row_of("agent-old"));
-    CHECK(row_of("agent-old")->live_rows == -1);
+    CHECK(row_of("agent-old")->hourly_rows == -1);
     CHECK(row_of("agent-old")->pre_rollup_agent);
     REQUIRE(row_of("agent-both"));
-    CHECK(row_of("agent-both")->live_rows == 333);
+    CHECK(row_of("agent-both")->hourly_rows == 333);
     CHECK_FALSE(row_of("agent-both")->pre_rollup_agent);
     REQUIRE(row_of("agent-none"));
-    CHECK(row_of("agent-none")->live_rows == -1);
+    CHECK(row_of("agent-none")->hourly_rows == -1);
     CHECK_FALSE(row_of("agent-none")->pre_rollup_agent);
 
     // The rendered table shows the flagged agent a dash with the reason, and never its figure.

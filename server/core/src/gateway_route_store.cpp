@@ -741,6 +741,36 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
 }
 
 std::expected<bool, GatewayRouteStoreError>
+GatewayRouteStore::set_legacy_echo_wire_name(std::string_view agent_id,
+                                             std::string_view session_id,
+                                             bool legacy_echo_wire_name) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("GatewayRouteStore::set_legacy_echo_wire_name: lease timeout — degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    // Session-guarded, nothing else touched: placement, lease and epoch belong to the
+    // announce/renew paths, and `updated_at` is deliberately NOT bumped: it is the tombstone
+    // purge clock (reap_stale_routes), and an adoption that never converges must still age out.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE gateway_route_store.agent_routes SET "
+        "  legacy_echo_wire_name = $3::boolean "
+        "WHERE agent_id = $1 AND session_id = $2 "
+        "RETURNING agent_id",
+        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
+                                                 std::string(legacy_echo_wire_name ? "t" : "f")});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("GatewayRouteStore::set_legacy_echo_wire_name: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    return PQntuples(res.get()) > 0;
+}
+
+std::expected<bool, GatewayRouteStoreError>
 GatewayRouteStore::clear_cluster_affinity(std::string_view agent_id) {
     if (!open_)
         return std::unexpected(GatewayRouteStoreError::store_unavailable);

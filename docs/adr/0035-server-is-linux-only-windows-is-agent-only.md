@@ -1,13 +1,17 @@
 ---
-status: proposed
+status: accepted
 date: 2026-07-21
+accepted: 2026-11-10
 owner: Fraser Jarvis (Darwin/macOS compatibility guardian)
 deciders: >-
-  pending — acceptance requires at least one recorded independent review and a linked tracking issue
-  (SOC 2 Workstream F change-management evidence; cf. ADR-0006/0007 decision records). This draft
-  was shaped by a grill-with-docs design session on 2026-07-21 and reviewed by Fable acting as
-  Enterprise Architect (verdict ACCEPT-WITH-CHANGES; the three blockers and should-fixes are
-  incorporated in this revision).
+  Decided 2026-11-10 by Fraser Jarvis (owner) after consulting Tr3kkR and Doomgoose; all three agreed.
+  Tracking issue of record: #2323 (SOC 2 Workstream F change-management evidence; cf. ADR-0006/0007
+  decision records). Independent reviews of record: (1) Fable acting as Enterprise Architect on the
+  2026-07-21 draft, verdict ACCEPT-WITH-CHANGES, whose three blockers and should-fixes were
+  incorporated before the ADR merged as `proposed`; (2) a second Fable Enterprise Architect re-read
+  against `origin/dev` cd163fe4d on 2026-11-10, verdict ACCEPT-WITH-CHANGES, whose required
+  corrections are incorporated in the acceptance change; (3) the review of the acceptance pull
+  request itself, whose number is recorded here on merge.
 scope: platform — supported operating systems per deployable, the CI/release matrix, and the platform-specific server code + build/CI plumbing that removal deletes
 amends: >-
   0031-presentation-core-engine-decomposition Gate G10 — the "MSVC static linkage included" clause of
@@ -19,6 +23,9 @@ related: >-
   constraint here binds all three server-role binaries it defines);
   1005-headless-platform-use-case-engines (a headless, containerised control plane is more coherent
   as Linux-only);
+  2003-linux-native-build-floor (the server's Linux build floor: an EL8 build image);
+  0069-gateway-transport-owned-grpc-cowboy-gun-overload-model (already cites this ADR for "server and
+  gateway are Linux-only");
   docs/windows-build.md, docs/darwin-compat.md, docs/os-capability-matrix.md, docs/ci-architecture.md,
   docs/uat-environment.md (the reference docs whose Windows/macOS-server content this ADR retires).
 ---
@@ -27,8 +34,7 @@ related: >-
 
 ## Binding status
 
-Nothing here binds reviews or blocks PRs until this ADR's status is **accepted**. On acceptance the
-Decisions bind **prospectively**, and the implementation ladder below is the order in which they
+Accepted 2026-11-10 (#2323). The Decisions bind **prospectively**, and the implementation ladder below is the order in which they
 become true. This ADR decides a direction and authorises the removal work; it does not itself remove
 code — that lands in the follow-up PRs the ladder names. The Decision-6 amendment to ADR-0031 takes
 effect on this ADR's acceptance, on the same change-management basis ADR-0031 used to amend
@@ -57,9 +63,14 @@ Today the build/release matrix treats the **server** as a first-class Windows *a
   (the release matrix's macOS-server column is `—`), a **scripted native-macOS server install path
   does ship today**. The claim to retire is "no `.pkg`", not "no macOS server".
 - CI builds the server on Windows and macOS across several workflows, with differing depth:
-  - **`ci.yml`** — the only workflow that **builds and runs the server test suite** on Windows
-    (Wee Tam) *and* on macOS (which runs `scripts/ci/ensure-postgres.sh` and the native
-    `--suite server` leg).
+  - **`ci.yml`** — the only workflow that **builds and runs the server test suite** off Linux. On
+    Windows (Wee Tam) it runs the full set: `server-nonpg`, `server-checks`, `server-pg` (14
+    shards) on the debug leg, or the `server pg smoke` entry on the release leg, plus the `yuzu_pg_canary.exe` libpq provenance step.
+    On macOS it builds the server and runs the non-`[pg]` server suite and the static-libpq
+    canary, but **not** the `[pg]` suite: that was dropped there under this ADR's name by #2394
+    while the ADR was still `proposed` (see the "Server Postgres suite skipped on macOS" step in
+    `ci.yml` and `docs/ci-architecture.md`, "macOS does NOT run the server `[pg]` suite"), a
+    partial, pre-acceptance step 1. No Postgres is provisioned on the macOS leg.
   - **`nightly.yml`** — its Windows ASan job is **already agent-only** (`-Dbuild_server=false`,
     `--suite agent`); it does not build the server. (An earlier draft of this ADR wrongly listed it
     as a Windows server-test leg.)
@@ -80,7 +91,18 @@ This carries a large, recurring cost for a server configuration **no one deploys
    (the published Docker image, Kubernetes) or a Linux host binary/`.deb`/`.rpm`. A native
    Windows-Server or macOS install of a Postgres-backed control plane is not how customers run this
    class of software, and there is **no known production or POC deployment** of the server on native
-   Windows or macOS. It is pre-1.0 (v0.12.0).
+   Windows or macOS. It is pre-1.0 (v0.12.0 when this ADR was drafted; v0.15.0 at acceptance).
+   **Post-draft fact (2026-11-10):** after this ADR was drafted, the Windows server installer
+   received real work — PR #5326 hardened the existing `YuzuServerSetup-*.exe` for 0.14.1
+   (closing #5196, #5210 and #5272; #5343 followed separately), with
+   `deploy/packaging/windows/yuzu-server.iss` + `generate-config.ps1`, a runbook in
+   `docs/user-manual/server-admin.md`, and release-notes copy in `release.yml` advertising
+   `YuzuServerSetup-*.exe /ADMIN_USER=…`. The "no deployments" premise is unaffected, because **the
+   installer has never produced a running service**: `yuzu-server.exe` has no service entry point,
+   so the installed `YuzuServer` service never starts (#5325, open). (`server-admin.md` also
+   documents wrapping the server with `sc.exe` or NSSM; there is no known deployment that way
+   either.) The same 0.14.1 changelog and `server-admin.md` already tell users the Windows
+   server is not a supported deployment, citing this ADR.
 3. **It privileges an unused path over the product's actual promise.** Engineering effort spent
    green-lighting the Windows/macOS *server* is effort not spent on the Windows/macOS *agent*, which
    is where cross-platform support genuinely matters.
@@ -113,7 +135,8 @@ including CI, sanitizers where applicable, and signed/notarized installers.
 
 ### 3. Full removal now — not deprecation, not dead-code retention
 
-Because there are no deployments to strand (Context §2), the Windows/macOS server is removed outright
+Because there are no deployments to strand (Context §2 — and the 0.14.x `YuzuServerSetup` installer
+created none, since its service cannot start, #5325), the Windows/macOS server is removed outright
 rather than deprecated over a sunset window or left in-tree as unbuilt "best-effort" source.
 Concretely, removal covers: the server from the Windows/macOS release staging (incl.
 `install-server-postgres.sh` from the macOS tarball); the `YuzuServerSetup-*.exe` InnoSetup path;
@@ -142,6 +165,13 @@ from any build machine stays legal** — matching "the server *runs* on Linux", 
 build it on Linux". The same PR updates `scripts/setup.sh`, the CLAUDE.md quickstarts, and the docs
 that pass `-Dbuild_server=false` (now `-Dbuild_server=disabled`).
 
+The Meson guard alone is not enough: since 5b903db26 (#4295) `vcpkg.json` lists `"default-features": ["server",
+"tests"]`, so a plain `vcpkg install` on Windows or macOS still builds the server-only dependencies
+(libpq, xmlsec, drogon) even when Meson then skips the server. The same PR therefore also makes the
+non-Linux paths install agent dependencies only — either `scripts/setup.sh` and the Windows/macOS CI
+legs pass `--x-no-default-features --x-feature=tests` off Linux, or the manifest default drops
+`server` and the Linux paths opt in. The choice is the implementing PR's, recorded there.
+
 ### 5. Windows/macOS release archives become agent-only and are renamed for honesty
 
 With the server gone, `yuzu-windows-x64.zip` and `yuzu-macos-arm64.tar.gz` contain only the agent +
@@ -162,6 +192,15 @@ Linux before the leg is committed) stands. This removes a contradiction that wou
 between two accepted ADRs — G10 would require a Windows-MSVC canary for a binary Decision 1 forbids
 from building on Windows.
 
+This change also carries a reciprocal `Update (2026-11-10)` note at ADR-0031's Gate G10, so a reader
+of ADR-0031 sees the amendment (the ADR-0006 "Update" precedent). Issue #2701 ("ADR-0031 G10: prove
+Drogon…") currently says to preserve the Windows MSVC and macOS Apple Clang server matrix and that
+#2323 "does not relax this requirement"; on acceptance its platform-matrix clause narrows to Linux
+and its dependency on #2185 (the Windows CI leg) drops for G10. A Drogon build canary already exists
+(`yuzu_drogon_canary`, `server/core/meson.build`, WS-B1) and today builds on every server leg, Wee
+Tam included; it is `build_server`-gated, so ladder step 1 makes it Linux-only with no further
+wiring.
+
 ## Considered and rejected
 
 - **A. Keep the Windows/macOS server (status quo).** Rejected: recurring CI cost and flake
@@ -170,7 +209,10 @@ from building on Windows.
   maintenance tax.
 - **B. Deprecate with a one-or-two-release sunset window.** Rejected: a sunset window protects
   existing users, and there are none (pre-1.0, no native server deployments). A sunset here is
-  ceremony that prolongs the cost it is meant to retire.
+  ceremony that prolongs the cost it is meant to retire. This held after 0.14.1 shipped a Windows
+  server installer, because that installer's service cannot start (#5325; Context §2). Evidence that
+  any `YuzuServerSetup` install ever ran as a service would reopen this option. Instead of a sunset,
+  ladder step 2 carries a release-notes removal notice.
 - **C. Untier (drop CI + artifacts) but keep the server platform code in-tree.** Rejected: unbuilt
   platform branches rot, and a green agent build emits a false "the non-Linux server still compiles"
   signal. If the OS is unsupported, the honest state is that the code is gone. (Reversal cost is
@@ -198,11 +240,11 @@ the only artifacts are `yuzu-gateway-linux-x64.tar.gz` + `.deb`/`.rpm`, built by
 job. This ADR **affirms** the gateway as a Linux-only deployable, co-located with the server.
 
 The gateway's meson `custom_target('gateway')` fires whenever `rebar3` is on `PATH`
-(`meson.build:440`), **independent of `build_server`**. It therefore continues to compile on the
+(the `custom_target('gateway', …)` in the root `meson.build`), **independent of `build_server`**. It therefore continues to compile on the
 Windows agent CI leg with no extra wiring, and we **keep** this Windows compile as a cheap
 portability canary for the Erlang code — it ships nothing and costs only the rebar3-on-Windows
 toolchain already provisioned on Wee Tam. It is a **known-fragile, non-blocking** canary (CodeQL
-notes the target "may fail on Windows", `codeql.yml:445`) — it must stay `continue-on-error` /
+notes the target "may fail on Windows" in `codeql.yml`'s Windows build step) — it must stay `continue-on-error` /
 informational, or it reintroduces the Windows flake this ADR exists to shed. **Standing
 prerequisite:** the canary exists only while `rebar3` stays on Wee Tam's `PATH` (the target is
 find-program-gated); a runner reprovision that drops rebar3 silently deletes it. Its toolchain owner
@@ -269,8 +311,14 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
 ## Implementation ladder (follow-up PRs — not this ADR)
 
 1. **CI** — make the Windows and macOS legs agent-only: in `ci.yml` set the server feature to
-   `disabled` and drop the `--suite server` runs on **both** Wee Tam and the macOS leg (incl. that
-   leg's `scripts/ci/ensure-postgres.sh` for server tests); drop the Windows server build row in
+   `disabled`. On Wee Tam drop `server-nonpg`, `server-checks`, `server-pg` and the
+   `server pg smoke` entry, the `yuzu_pg_canary.exe` provenance step and Postgres provisioning. On
+   the macOS leg drop the server build, the non-`[pg]` `--suite server` run, the
+   `yuzu_pg_canary` static-libpq check and the "skipped on macOS" placeholder step (there is no
+   macOS Postgres provisioning left to remove, #2394). In `docs/ci-architecture.md`, rewrite the
+   "#3508 … deliberately NOT adopted" paragraph and the "PG coverage by platform" table: their
+   stated reason ("ADR-0035 is `proposed`, not accepted") lapses on acceptance. Drop the Windows
+   server build row in
    `codeql.yml`; retire or re-scope `instructions-windows-validate.yml` (its live `yuzu-server.exe`
    smoke rig is server-only). `nightly.yml` Windows ASan is already agent-only — no change. Sweep
    `pre-release.yml` (its Windows/macOS install jobs are already agent-installer-only, but the
@@ -284,23 +332,32 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    names + provenance-attestation subjects in `release.yml`, `.claude/skills/release/SKILL.md`,
    `.codex/skills/release/SKILL.md`, `docs/user-manual/release-verification.md`, and
    `scripts/build-agent-bundle.sh`. Update the release-notes platform matrix (server row → Linux-only)
-   and the platform-archives table.
+   and the platform-archives table. Replace the `YuzuServerSetup-*.exe` release-notes copy with a
+   removal notice ("`YuzuServerSetup-*.exe` is discontinued; use the container image or the Linux
+   packages"), remove the Windows server runbook from `docs/user-manual/server-admin.md`, and close
+   #5325 and #1835 as resolved by removal.
 3. **Build guard** — implement Decision 4: convert `build_server` to a feature option, key the guard
-   on `host_machine.system()`, and update `scripts/setup.sh`, the CLAUDE.md quickstarts, and any docs
-   passing `-Dbuild_server=false` in the same PR.
+   on `host_machine.system()`, make the non-Linux `vcpkg install` paths skip the `server` feature,
+   and update `scripts/setup.sh`, the CLAUDE.md quickstarts, and any docs passing
+   `-Dbuild_server=false` in the same PR.
 4. **Code + build/CI plumbing** — remove server-side `_WIN32` / `__APPLE__`-specific branches under
    `server/core/` (retain POSIX/Linux; do not disturb `agents/shared/` or `sdk/`, which stay
    cross-platform); and remove the plumbing that exists only for the non-Linux server: the
    `meson.build` Windows libpq branch (incl. the `_vcpkg_lib_win` CRT-mismatch note), the libpq
    link-provenance canary steps in `ci.yml` (Windows DLL-import + macOS static variants), Postgres
    provisioning for server tests on the Wee Tam and macOS legs, the CLAUDE.md vcpkg libpq-DLL
-   paragraph, and the server-dep entries in `deploy/windows/README.md` / `toolchain-manifest.json`.
+   paragraph, and the server-dep entries in `deploy/windows/README.md` / `toolchain-contract.json`
+   (its Postgres pin). Remove only the libpq branch: CLAUDE.md's "Windows grpc/protobuf/abseil is
+   load-bearing — both halves" rule survives, because the agent still links that stack.
 5. **Docs + dev workflow** — retire the server sections of `docs/windows-build.md`; scope
    `docs/darwin-compat.md` to the agent and **document the replacement macOS server dev workflow**
    (Linux builder container / VM / Docker image) and the `/test` platform-asymmetry
    (`.claude/skills/test/SKILL.md`); make `docs/uat-environment.md`'s native rig Linux-only; update
    `docs/os-capability-matrix.md`, `docs/ci-architecture.md`, `docs/capability-map.md`, and the
-   CLAUDE.md build sections; add a `changelog.d/` fragment; add release-note guidance pointing any
+   CLAUDE.md build sections; fix the user manual's "Supported Platforms" table
+   (`docs/user-manual/README.md`, which still lists Server = Yes on Windows x64 and macOS ARM64), the
+   "Windows (server + agent)" and "macOS (server + agent)" release-notes lines in `release.yml`, and the Windows-server behaviour
+   notes in `docs/user-manual/authentication.md` and `tls.md`; add a `changelog.d/` fragment; add release-note guidance pointing any
    former Windows/macOS-server curiosity at the Docker image / Linux binary.
 
 ## Security note (for Gate 6)

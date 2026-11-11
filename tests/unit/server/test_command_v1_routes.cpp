@@ -106,6 +106,10 @@ struct Rig {
     // ---- the seam ----
     ContainmentGate gate = ContainmentGate::exempt_control_plugin();
     std::optional<ConfinedDispatchOutcome> canned; // overrides the real seam for one outcome
+    /// When set, the chokepoint dry run (`authorize_dispatch_fn`) refuses with this denial; a
+    /// test sets it inside `on_create` to move the gate between the two runs (#7110).
+    std::optional<detail::DispatchDenial> authorize_denial;
+    bool authorize_throws = false; ///< the dry run throws (a store fault); set inside `on_create`
     bool dispatch_throws = false;
     bool dispatch_throws_nonstd = false;
     /// >0: the dispatch runs the REAL arms and the REAL instrumented sink, and send number N
@@ -113,6 +117,8 @@ struct Rig {
     int throw_on_nth_send = 0;
     bool set_targeted_ok = true;
     bool set_targeted_throws = false; ///< the count write THROWS (the success path's bookkeeping)
+    bool cancel_fails = false;  ///< mark_cancelled answers false after a recheck refusal
+    bool cancel_throws = false; ///< ... or throws (a store fault inside the cancel)
     bool create_throws = false;
     bool create_throws_nonstd = false;
     bool create_fails = false; ///< the tracker answers an error: the dispatch runs with execution_id ""
@@ -139,6 +145,10 @@ struct Rig {
     /// Audit rows and emitted events in the order they happened (one vector, so order is real).
     std::vector<std::string> trace;
     bool emit_throws = false;
+    /// Runs inside the execution-row write, the route's last own write before the dispatch: the
+    /// window in which production lets a grant, an elevation or a visible set move (#7110).
+    std::function<void()> on_create;
+    bool session_gone = false; ///< the credentials no longer resolve (the recheck's auth_fn call)
 
     yuzu::server::test::TestRouteSink sink;
 
@@ -159,6 +169,8 @@ struct Rig {
         d.auth_fn = [this](const httplib::Request&,
                            httplib::Response&) -> std::optional<auth::Session> {
             ++auth_calls;
+            if (session_gone)
+                return std::nullopt;
             auto s = session;
             if (principal_flips && auth_calls >= 2)
                 s.username = "mallory";
@@ -205,7 +217,12 @@ struct Rig {
             return caps.classify(p, a);
         };
         d.authorize_dispatch_fn = [this](const DispatchCaller& caller, std::string_view plugin,
-                                         std::string_view action) {
+                                         std::string_view action)
+            -> std::expected<CommandCapability, detail::DispatchDenial> {
+            if (authorize_throws)
+                throw std::runtime_error("authorize boom");
+            if (authorize_denial)
+                return std::unexpected(*authorize_denial);
             return detail::classify_and_authorize_dispatch(
                 caps, caller, plugin, action,
                 [](std::string_view, std::string_view, authz::Operation) { return true; });
@@ -233,6 +250,8 @@ struct Rig {
                                     const std::string& params_json)
             -> std::expected<std::string, std::string> {
             exec_params.push_back(params_json);
+            if (on_create)
+                on_create();
             if (create_throws)
                 throw std::runtime_error("create boom");
             if (create_throws_nonstd)
@@ -243,7 +262,9 @@ struct Rig {
         };
         d.execution.mark_cancelled = [this](const std::string& id, const std::string&) {
             cancelled.push_back(id);
-            return true;
+            if (cancel_throws)
+                throw std::runtime_error("cancel boom");
+            return !cancel_fails;
         };
         d.execution.set_targeted = [this](const std::string& id, int n) {
             targeted.emplace_back(id, n);
@@ -289,13 +310,13 @@ struct Rig {
             caps, caller, plugin, action,
             [](std::string_view, std::string_view, authz::Operation) { return true; });
         if (!decision)
-            return ConfinedDispatchOutcome{.command_id = command_id};
+            return ConfinedDispatchOutcome{.command_id = command_id, .denied = decision.error()};
         const auto arm = classify_dispatch_arm(!ids.empty(), scope);
         auto classified = detail::finalize_classified_command(
             *decision, detail::KillSwitchFn{}, plugin, action, command_id, params, /*payload=*/{}, 0,
             0, std::string(dispatch_arm_label(arm)), exec_id);
         if (!classified)
-            return ConfinedDispatchOutcome{.command_id = command_id};
+            return ConfinedDispatchOutcome{.command_id = command_id, .denied = classified.error()};
         auto noop = [](const std::string&, const std::string&, const std::string&,
                        const std::string&) {};
         return wire_and_dispatch_confined(registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop,
@@ -1384,6 +1405,7 @@ TEST_CASE("command_v1: zero_reach_reply pins the whole status table",
         {ZeroReachCause::RouteUnreadable, 503},       {ZeroReachCause::OsGateUnreadable, 503},
         {ZeroReachCause::Quarantined, 409},           {ZeroReachCause::PluginNotFound, 422},
         {ZeroReachCause::KillSwitchedOs, 403},        {ZeroReachCause::Generic, 503},
+        {ZeroReachCause::Denied, 403},
     };
     for (const auto& e : table) {
         const auto r = cv1::zero_reach_reply(e.cause, "x");
@@ -1409,4 +1431,151 @@ TEST_CASE("command_v1: check_command_v1_request is total over non-objects",
           "[server][command_v1]") {
     for (const auto& v : {json(), json(1), json("x"), json::array(), json(nullptr)})
         CHECK(cv1::check_command_v1_request(v).has_value());
+}
+
+TEST_CASE("POST /api/v1/commands: the caller is re-derived after the writes (visible set shrunk "
+          "mid-write confines the dispatch)",
+          "[server][command_v1][dispatch][security][7110]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.on_create = [&] {
+        rig.facts = {};
+        rig.facts.scoped_visible = std::unordered_set<std::string>{kC};
+    };
+    const auto res = rig.post(kRead); // omitted target: the whole fleet, as far as the caller sees
+    REQUIRE(res->status == 202);
+    CHECK(rig.sent() == Ids{kC});
+}
+
+TEST_CASE("POST /api/v1/commands: a chokepoint denial on the outcome is zero-reach dispatch_denied "
+          "(403), never no_agents_reached (#7114)",
+          "[server][command_v1][dispatch][security][7114]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    rig.canned = ConfinedDispatchOutcome{
+        .denied = detail::DispatchDenial{detail::DispatchDenialReason::ApprovalRequired,
+                                         "Infrastructure", authz::Operation::Write}};
+    const auto res = rig.post(kRead);
+    CHECK(res->status == 403);
+    CHECK(body_of(res)["error"]["reason"] == "dispatch_denied");
+    CHECK(body_of(res)["error"]["retry_after_ms"].is_null());
+    CHECK(rig.has_audit("failure", "reason=dispatch_denied"));
+}
+
+TEST_CASE("POST /api/v1/commands: a permission withdrawn inside the execution-row write (the session, "
+          "Execution:Execute at the route gate, the pair's own securable, or a chokepoint dry run that "
+          "refuses) dispatches nothing, cancels the row; failure row reason=permission_revoked (#7110)",
+          "[server][command_v1][dispatch][security][7110]") {
+    struct Withdrawal {
+        const char* name;
+        std::function<void(Rig&)> mutate; // runs INSIDE the execution-row write
+        const char* detail;
+        bool counted; // a chokepoint refusal also counts yuzu_server_dispatch_denied_total
+        /// Exact perm_fn calls per "Securable:Operation": the admission gate, then the recheck (a
+        /// refusal at the session gate returns before the route gate, so it counts the admission one).
+        std::vector<std::pair<const char*, int>> perm_counts;
+        std::function<void(Rig&)> arrange{}; // runs before the post
+        json body = kRead;
+    };
+    const std::vector<Withdrawal> withdrawals = {
+        // Red-before-fix probe for the post-write Execution:Execute recheck: the dry run alone
+        // would not catch this (with RBAC off it admits every human principal).
+        {"gate=route: Execution:Execute withdrawn inside the execution-row write",
+         [](Rig& r) { r.perm_denied.insert("Execution:Execute"); },
+         "reason=permission_revoked gate=route", false, {{"Execution:Execute", 2}}},
+        {"gate=session: the credentials no longer resolve",
+         [](Rig& r) { r.session_gone = true; }, "reason=permission_revoked gate=session", false,
+         {{"Execution:Execute", 1}}},
+        {"gate=session: the credentials now resolve to another principal",
+         [](Rig& r) { r.principal_flips = true; }, "reason=permission_revoked gate=session", false,
+         {{"Execution:Execute", 1}}},
+        {"gate=dispatch: chokepoint dry run refuses after the writes",
+         [](Rig& r) {
+             r.authorize_denial = detail::DispatchDenial{detail::DispatchDenialReason::ApprovalRequired,
+                                                         "Infrastructure", authz::Operation::Write};
+         },
+         "gate=dispatch dispatch_reason=approval_required", true, {{"Execution:Execute", 2}}},
+        // A recheck that throws (a store fault) is a withdrawn permission, not an escape: the rows the
+        // route wrote are closed and the answer is the typed 403, never an unhandled 500.
+        {"gate=exception: the chokepoint dry run throws after the writes (fail closed)",
+         [](Rig& r) { r.authorize_throws = true; }, "reason=permission_revoked gate=exception", false,
+         {{"Execution:Execute", 2}}},
+        // The pair's own securable, decided before and after the writes (a Destructive pair).
+        {"gate=securable: the destructive pair's own securable withdrawn inside the write",
+         [](Rig& r) { r.perm_denied.insert("Infrastructure:Delete"); },
+         "reason=permission_revoked gate=securable", false,
+         {{"Execution:Execute", 2}, {"Infrastructure:Delete", 2}},
+         [](Rig& r) { r.visible_agents = Ids{kA}; },
+         json{{"plugin", "echo"}, {"action", "purge_source"}, {"agent_ids", Ids{kA}}}},
+        // The caller is derived from the session as it resolves AFTER the writes: an admin whose JIT
+        // elevation lapsed mid-write is a user by then and an AdminOrApproval pair refuses.
+        {"gate=dispatch: the caller is derived from the session as it resolves AFTER the writes (JIT "
+         "lapse)",
+         [](Rig& r) { r.session.role = auth::Role::user; },
+         // script_exec.exec's own securable IS Execution:Execute: the route gate and the pair's
+         // securable are one pair, each decided before and after the writes.
+         "gate=dispatch dispatch_reason=approval_required", true, {{"Execution:Execute", 4}},
+         [](Rig& r) {
+             r.session.role = auth::Role::admin; // admin at both pre-write resolutions
+             r.visible_agents = Ids{kA};
+         },
+         json{{"plugin", "script_exec"},
+              {"action", "exec"},
+              {"params", {{"command", "id"}}},
+              {"agent_ids", Ids{kA}}}},
+    };
+    for (const auto& w : withdrawals) {
+        DYNAMIC_SECTION(w.name) {
+            Rig rig;
+            rig.facts = {.legacy_open = true};
+            if (w.arrange)
+                w.arrange(rig);
+            rig.on_create = [&] { w.mutate(rig); };
+            const auto res = rig.post(w.body);
+            CHECK(res->status == 403);
+            CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
+            CHECK(rig.dispatch_calls == 0);
+            CHECK(rig.sent().empty());
+            CHECK(rig.exec_created == 1);
+            CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
+            CHECK(rig.has_audit("requested"));
+            CHECK(rig.has_audit("failure", w.detail));
+            CHECK_FALSE(rig.has_audit("success"));
+            // A chokepoint refusal is counted exactly as the admission dry run counts it (#7114).
+            CHECK(rig.metrics
+                      .counter("yuzu_server_dispatch_denied_total", {{"reason", "approval_required"}})
+                      .value() == (w.counted ? 1 : 0));
+            for (const auto& [pair, n] : w.perm_counts)
+                CHECK(std::count(rig.perm_calls.begin(), rig.perm_calls.end(), pair) == n);
+        }
+    }
+}
+
+// Kills: `cancel_execution` letting a throwing mark_cancelled escape (a generic 500 over a row
+// the refusal says is closed) or a failed one go uncounted.
+TEST_CASE("POST /api/v1/commands: a cancel that fails or throws after a recheck refusal still answers "
+          "403 permission_revoked, is counted, and the row is left for the reaper",
+          "[server][command_v1][dispatch][security][7110]") {
+    const std::vector<std::pair<const char*, bool Rig::*>> faults = {
+        {"mark_cancelled answers false", &Rig::cancel_fails},
+        {"mark_cancelled throws", &Rig::cancel_throws},
+    };
+    for (const auto& [name, flag] : faults) {
+        DYNAMIC_SECTION(name) {
+            Rig rig;
+            rig.facts = {.legacy_open = true};
+            rig.*flag = true;
+            rig.on_create = [&] { rig.perm_denied.insert("Execution:Execute"); };
+            const auto res = rig.post(kRead);
+            CHECK(res->status == 403);
+            CHECK(body_of(res)["error"]["reason"] == "permission_revoked");
+            CHECK(rig.dispatch_calls == 0);
+            CHECK(rig.cancelled == std::vector<std::string>{"exec-1"}); // attempted once
+            CHECK(rig.has_audit("failure", "reason=permission_revoked gate=route"));
+            CHECK(rig.metrics
+                      .counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                               {{"op", "mark_cancelled"}, {"surface", "rest"}})
+                      .value() == 1);
+        }
+    }
 }

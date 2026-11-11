@@ -330,6 +330,62 @@ class WorkflowWiringTests(unittest.TestCase):
     def meson_test_name(chunk: str) -> str:
         return re.match(r"\s*('[^']*')", chunk).group(1)
 
+    # ── Tier 2b release-legs dispatch (docs/ci-architecture.md) ──────────────
+    DIRECT_DISPATCH = "(github.event_name == 'workflow_dispatch' && !inputs.head_sha)"
+
+    def test_release_leg_matrix_predicates_stay_in_lockstep(self) -> None:
+        """The three build matrices carry the same two build_type excludes, and
+        the two conditional include: lists the same predicate. A drift silently
+        misconfigures one OS (e.g. a dev push building release on one pool)."""
+        rel = ("- build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' "
+               "&& github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}")
+        dbg = ("- build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha "
+               "&& inputs.legs != 'all') && 'debug' || 'NONE' }}")
+        inc = ("include: ${{ fromJSON((github.event_name == 'workflow_dispatch' && !inputs.head_sha "
+               "&& inputs.legs != 'all') && '[{\"pg_mode\":\"smoke\"}]' || ")
+        for job in ("linux", "windows", "macos"):
+            with self.subTest(job=job):
+                body = self.job("ci.yml", job)
+                self.assertIn(rel, body)
+                self.assertIn(dbg, body)
+                if job != "macos":  # macOS has no pg_mode include
+                    self.assertIn(inc, body)
+
+    def test_direct_dispatch_never_posts_a_required_context_name(self) -> None:
+        """Every job carrying a ruleset-required context name is suffixed on a
+        direct dispatch, so a dispatch cannot post, satisfy or shadow it —
+        except proto-compat (next test)."""
+        for job in ("preflight", "linux", "windows", "macos"):
+            with self.subTest(job=job):
+                name_line = next(l for l in self.job("ci.yml", job).splitlines()
+                                 if l.startswith("    name:"))
+                self.assertIn(self.DIRECT_DISPATCH, name_line)
+                self.assertIn("[dispatch]", name_line)
+
+    def test_proto_compat_keeps_its_literal_name_and_never_skips_on_dispatch(self) -> None:
+        """proto-compat is routinely skipped (docs-only PRs) and GitHub does not
+        evaluate a skipped job's name expression, so its name must stay the
+        literal required context. On a direct dispatch it must instead never be
+        skipped: it runs, or fails red when preflight-gate did not succeed."""
+        body = self.job("ci.yml", "proto-compat")
+        self.assertIn('    name: "Proto backward-compat"\n', body)
+        self.assertIn(f"if: ${{{{ ({self.DIRECT_DISPATCH} && always()) || (success() && ", body)
+        self.assertIn(f"if: always() && {self.DIRECT_DISPATCH} && (needs.preflight-gate.result != 'success' "
+                      "|| needs.preflight-gate.outputs.linux_pool_healthy != 'true')", body)
+        self.assertIn("runs-on: ${{ ((github.event_name == 'workflow_dispatch' && !inputs.head_sha) && (needs.preflight-gate.result != 'success' || needs.preflight-gate.outputs.linux_pool_healthy != 'true')) && 'ubuntu-24.04' || fromJSON(", body)
+        self.assertIn("if: always() && " + self.DIRECT_DISPATCH, body)
+        self.assertIn("if: always() && " + self.DIRECT_DISPATCH + " && cancelled()", body)
+        self.assertIn("exit 1", body)
+
+    def test_ci_yml_stays_within_the_trusted_fork_token_ceiling(self) -> None:
+        """trusted-fork-ci.yml calls ci.yml as a reusable workflow with a
+        read-only token; GitHub rejects the whole call at load time if any
+        nested job requests more (before any if:). So ci.yml requests no write
+        permission at all — the release-legs alert lives in its own workflow."""
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        writes = re.findall(r"(?m)^\s+[a-z-]+:\s*write\b", text)
+        self.assertEqual(writes, [], f"ci.yml requests write permission(s): {writes}")
+
     def test_weetam_gate_matches_every_windows_consumer(self) -> None:
         # ci.yml's pool probe lives in the fast `preflight-gate` job (the required
         # `preflight` check carries only the source gates); nightly.yml still has
@@ -370,7 +426,9 @@ class WorkflowWiringTests(unittest.TestCase):
 
     def test_preflight_context_names_are_unique(self) -> None:
         expected = {
-            "ci.yml": 'name: "Preflight (runner health)"',
+            # ci.yml's name is an expression (` [dispatch]` suffix on a direct
+            # dispatch); this is its non-dispatch arm, the required context.
+            "ci.yml": "|| 'Preflight (runner health)' }}",
             "nightly.yml": 'name: "Nightly preflight (runner health)"',
             "sanitizer-tests.yml": 'name: "Sanitizer preflight (runner health)"',
         }
@@ -415,7 +473,11 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn('name: "Preflight (gate)"', gate)
 
         preflight = self.job("ci.yml", "preflight")
-        self.assertIn('name: "Preflight (runner health)"', preflight)
+        # The required-check name, unchanged on every event except a direct
+        # dispatch, which suffixes it so a dispatch never posts a required
+        # context (docs/ci-architecture.md Tier 2b).
+        self.assertIn("|| 'Preflight (runner health)' }}", preflight)
+        self.assertIn("'Preflight (runner health) [dispatch]'", preflight)
         self.assertIn("needs: [trusted_inputs, preflight-gate]", preflight)
         self.assertIn("if: ${{ !cancelled() }}", preflight)
         self.assertIn("needs.preflight-gate.result", preflight)
@@ -528,10 +590,39 @@ class WorkflowWiringTests(unittest.TestCase):
                     self.assertTrue(runs)
                     self.assertEqual(runs[-1], m.group(1))
 
+    def test_linux_concurrent_halves_isolate_their_logs(self) -> None:
+        """The Linux test step runs its non-pg and pg halves concurrently in one
+        build dir. Every flake-retry invocation there must carry --no-rebuild
+        (one serial meson-test-prereq build precedes them) and its own
+        --logbase, each summary must read the logbase of the invocation it
+        follows, and the telemetry import must name exactly those logbases."""
+        job = self.job("ci.yml", "linux")
+        self.assertIn("meson-test-prereq", job)
+        runs = re.findall(r"flake-retry\.py --builddir \S+ -- (.*)", job)
+        self.assertEqual(4, len(runs))  # cheap, server shards, pg full, pg smoke
+        bases = []
+        for args in runs:
+            with self.subTest(args=args[:60]):
+                self.assertIn("--no-rebuild", args)
+                m = re.search(r"--logbase (\S+)", args)
+                self.assertIsNotNone(m)
+                bases.append(m.group(1))
+        # full and smoke are exclusive branches of the pg half, so they share one.
+        self.assertEqual(
+            ["testlog-nonpg-cheap", "testlog-nonpg-server", "testlog-pg", "testlog-pg"], bases
+        )
+        summary_bases = re.findall(
+            r'test-durations-summary\.py --builddir \S+ --label "[^"]+" --logbase (\S+)', job
+        )
+        self.assertEqual(bases[:3], summary_bases)
+        self.assertEqual(
+            sorted(set(bases)), sorted(re.findall(r"^\s*--logbase (\S+)\s*$", job, re.M))
+        )
+
     def test_every_catch2_entry_carries_durations(self) -> None:
         """The per-case summary reads Catch2's `--durations=yes` (the `=` form is
         required, see docs/ci-architecture.md). Every `*_exe` test() entry is a
-        Catch2 binary. The two exemptions are deliberate: a ~3 s push-only smoke
+        Catch2 binary. The two exemptions are deliberate: a ~3 s non-PR smoke
         entry and the [tsan-heavy] checkpoints entry."""
         exempt = {"'server pg smoke'", "'agent tsan-heavy checkpoints'"}
         seen = set()

@@ -15,11 +15,13 @@
 // Pure: no I/O, no logging, no store access. Reads only a
 // `ConfinedDispatchOutcome` and one bool.
 //
-// FIXED priority order (first match wins). Copied from the MCP
+// FIXED priority order (first match wins). Entries 1-8 are copied from the MCP
 // `execute_instruction` cascade (mcp_server.cpp, the zero-reach block that
 // tests `dispatch_outcome.scope_parse_error` first; find it by that symbol, not
-// by line number):
+// by line number); entry 0 (`dispatch_denied`, #7114) is this classifier's own
+// and that cascade does not have it:
 //
+//   0. dispatch_denied          outcome.denied set (#7114)        permanent
 //   1. invalid_scope            outcome.scope_parse_error set     permanent
 //   2. containment_unreadable   outcome.containment_unreadable    retryable
 //   3. route_unreadable         outcome.route_unreadable          retryable
@@ -28,6 +30,9 @@
 //   6. plugin_not_found         unknown_plugin_count > 0          permanent
 //   7. kill_switched_os         kill_switched_os_count > 0        permanent
 //   8. no_agents_reached        catch-all                         retryable
+//
+// `dispatch_denied` ranks first: the chokepoint refused before targeting, so no
+// other outcome signal is set alongside it.
 //
 // `> 0`, not "== every target": a mixed failure (some quarantined, some
 // offline) is still not "just offline", and understating a permanent cause as
@@ -65,6 +70,14 @@
 //     workflow_routes.cpp answer with no `reason`; command_routes.cpp and
 //     server.cpp also carry no `retry_after_ms`; dashboard_routes.cpp keeps a
 //     plain message. The retryable flag below follows the MCP site.
+//   - denied (#7114): the classifier reads it first. Of the five legacy cascades
+//     only dashboard_routes.cpp checks `outcome.denied` (the exec console, the
+//     Echo re-enable and purge arms, and the echo-execute and echo.status scan
+//     arms), because it runs no pre-send dry run; mcp_server.cpp,
+//     command_routes.cpp and server.cpp run the dry run, so a denial there is
+//     only a race; workflow_routes.cpp runs no dry run and reads no cause, so a
+//     denial there is the generic no-agents 503. See
+//     `ConfinedDispatchOutcome::denied`.
 
 #include "dispatch_confined_arms.hpp"
 
@@ -76,6 +89,7 @@ namespace yuzu::server {
 /// catch-all (unreachable targets, or a residual race); every other value is a
 /// specific, named cause.
 enum class ZeroReachCause {
+    Denied,
     InvalidScope,
     ContainmentUnreadable,
     RouteUnreadable,
@@ -92,6 +106,8 @@ enum class ZeroReachCause {
 /// for the dispatched pair (see the banner for what it suppresses).
 [[nodiscard]] inline ZeroReachCause classify_zero_reach(const ConfinedDispatchOutcome& outcome,
                                                         bool protective_action) noexcept {
+    if (outcome.denied)
+        return ZeroReachCause::Denied;
     if (outcome.scope_parse_error)
         return ZeroReachCause::InvalidScope;
     if (outcome.containment_unreadable)
@@ -113,6 +129,8 @@ enum class ZeroReachCause {
 /// `execute_instruction` and the `reason` string of the REST 503 bodies.
 [[nodiscard]] constexpr std::string_view zero_reach_token(ZeroReachCause cause) noexcept {
     switch (cause) {
+    case ZeroReachCause::Denied:
+        return "dispatch_denied";
     case ZeroReachCause::InvalidScope:
         return "invalid_scope";
     case ZeroReachCause::ContainmentUnreadable:
@@ -145,6 +163,7 @@ enum class ZeroReachCause {
     case ZeroReachCause::OsGateUnreadable:
     case ZeroReachCause::Generic:
         return true;
+    case ZeroReachCause::Denied:
     case ZeroReachCause::InvalidScope:
     case ZeroReachCause::Quarantined:
     case ZeroReachCause::PluginNotFound:

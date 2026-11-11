@@ -56,7 +56,22 @@ namespace detail {
 /// (unlike istream::read / operator<<) has no sentry to catch it, so the exception used to
 /// unwind through the snapshot pump and terminate the agent. On a throw the bytes read before
 /// it are returned. Exposed for the unit test.
+///
+/// Bounded: the read stops at `kProcReadCap` bytes and the prefix is kept. The kernel's argument
+/// limit bounds /proc/<pid>/cmdline only at megabytes, and this runs for every process on every
+/// snapshot. The Echo store keeps a command line longer than the cap as its first 256 KiB with
+/// no marker (the reader does not look one byte further to tell, so a result of exactly the cap
+/// means "possibly cut"); the fleet-snapshot push is clamped again to 4096 bytes on the server. The cut lands on a
+/// UTF-8 scalar boundary: a multi-byte character the cap would split is dropped whole, so the
+/// kept prefix is still well-formed UTF-8 (the snapshot's JSON serialiser rejects a split one).
+inline constexpr std::size_t kProcReadCap = 256 * 1024;
+
 YUZU_EXPORT std::string read_proc_bytes(std::istream& in) noexcept;
+
+/// Drop an unfinished trailing UTF-8 sequence (a lead byte whose continuations were cut off)
+/// from the end of `s`; at most 3 bytes go. Anything else at the end is untouched. Exposed for
+/// the unit test.
+YUZU_EXPORT void trim_incomplete_utf8_tail(std::string& s) noexcept;
 
 #if defined(__linux__) || defined(__APPLE__)
 /// Parse a /proc/<pid>/status stream into `pi`: Name, PPid, and the real Uid resolved to a user

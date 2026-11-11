@@ -195,6 +195,7 @@ struct ExecHarness {
     /// silently 503; tests that want to exercise the no-bus path build
     /// the deps inline.
     std::unique_ptr<ExecutionEventBus> event_bus;
+    std::unique_ptr<ApprovalManager> approvals; ///< #7110: wired only with `with_approval_manager`
 
     bool perm_grant{true};
     /// #4990: the executions drawer serves its responses section only to a caller who also holds
@@ -364,7 +365,11 @@ struct ExecHarness {
                          // ServerImpl owns. Empty = register_routes builds its own.
                          std::shared_ptr<instr::ParamValidatorCache> param_validators_override = {},
                          // The legacy execute route's run bound (unset = the production 60 s).
-                         std::optional<std::chrono::milliseconds> workflow_run_budget_arg = {})
+                         std::optional<std::chrono::milliseconds> workflow_run_budget_arg = {},
+                         // #7110: opt-in real ApprovalManager so a `role-gated` definition
+                         // reaches the legacy execute handler's post-row approval-mode recheck
+                         // (with none wired, any non-auto definition is 503 at entry).
+                         bool with_approval_manager = false)
         : stream_budget(budget),
           instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
@@ -395,6 +400,8 @@ struct ExecHarness {
         REQUIRE(instructions->is_open());
         responses = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(responses->is_open());
+        if (with_approval_manager)
+            approvals = std::make_unique<ApprovalManager>(pool);
 
         // ADR-0064: WorkflowEngine is now Postgres-backed — shares this harness's `pool`
         // (schema-per-store, ADR-0008), same as InstructionStore/ResponseStore above. wf_db (the
@@ -541,6 +548,7 @@ struct ExecHarness {
         wf_deps.scope_fn = scope_fn;
         wf_deps.execution_tracker = tracker.get();
         wf_deps.instruction_store = instructions.get();
+        wf_deps.approval_manager = approvals.get();
         wf_deps.command_dispatch_fn = cmd_dispatch;
         // K-R7-02 / PLAN-006: wire the DispatchCaller derivation (or leave it
         // EMPTY so the handler's own fail-closed path runs). The wired form
@@ -3983,6 +3991,142 @@ TEST_CASE("POST /api/instructions/:id/execute: a body nested past the depth limi
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.dispatch_calls == 0);
+}
+
+// -- #7110: post-row recheck on the legacy POST /api/instructions/{id}/execute --
+//
+// The execution row is the handler's last own write before the send. The route gate and the
+// definition's approval_mode were decided on the entry session; both are decided again on the
+// fresh caller right before the dispatch is built. `caller_fn` runs in exactly that window, so a
+// test moves the gate from inside it. Kills: deleting either recheck arm (the dispatch would run).
+
+namespace {
+
+/// A definition with the given approval mode (the harness's make_def has no mode parameter).
+void make_mode_def(ExecHarness& h, const std::string& id, const std::string& approval_mode) {
+    InstructionDefinition d;
+    d.id = id;
+    d.name = id;
+    d.type = "question";
+    d.plugin = "test";
+    d.action = "list";
+    d.approval_mode = approval_mode;
+    REQUIRE(h.instructions->create_definition(d).has_value());
+}
+
+std::string execution_id_of(const std::string& detail) {
+    const auto pos = detail.find("execution_id=");
+    REQUIRE(pos != std::string::npos);
+    return detail.substr(pos + std::string("execution_id=").size());
+}
+
+} // namespace
+
+TEST_CASE("legacy instruction execute: Execution:Execute withdrawn inside the execution-row write "
+          "dispatches nothing; 403, denied row reason=permission_revoked gate=route, row cancelled "
+          "(#7110)",
+          "[pg][workflow][executions][execute][security][7110]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-RECHECK-ROUTE", "rr");
+    h.dispatch_cmd_override = "cmd-never";
+    h.dispatch_sent_override = 1;
+    h.caller_fn = [&h](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        h.perm_grant = false; // withdrawn AFTER the execution row, BEFORE the send
+        return yuzu::server::DispatchCaller{.principal = "tester", .principal_is_admin = true};
+    };
+    auto res = h.sink.Post("/api/instructions/def-RECHECK-ROUTE/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // The body is the route's own refusal (rest-api.md documents the message), not the gate's.
+    CHECK(res->body.find("permission revoked after the request was recorded") != std::string::npos);
+    CHECK(h.dispatch_calls == 0);
+    REQUIRE_FALSE(h.audit_calls.empty());
+    const auto& row = h.audit_calls.back();
+    CHECK(row.action == "instruction.execute");
+    CHECK(row.result == "denied");
+    CHECK(row.detail.rfind("reason=permission_revoked gate=route execution_id=", 0) == 0);
+    auto exec = h.tracker->get_execution(execution_id_of(row.detail));
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled"); // the row the route created is closed, not left running
+}
+
+TEST_CASE("legacy instruction execute: the administrator standing a role-gated definition needs, "
+          "lapsed inside the execution-row write, dispatches nothing and queues no approval; 403, "
+          "denied row gate=approval_mode, row cancelled (#7110)",
+          "[pg][workflow][executions][execute][security][7110]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn=*/true,
+                  /*with_product_pack_store=*/false, /*auth_override=*/{},
+                  /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
+                  /*schedule_api_override=*/{}, /*workflow_api_override=*/{},
+                  /*param_validators_override=*/{}, /*workflow_run_budget=*/{},
+                  /*with_approval_manager=*/true);
+    make_mode_def(h, "def-RECHECK-MODE", "role-gated");
+    h.dispatch_cmd_override = "cmd-never";
+    h.dispatch_sent_override = 1;
+    // The entry session is an administrator (the harness auth_fn), so step one admits the
+    // definition without a ticket; the caller derived after the row is no longer one.
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.principal = "tester", .principal_is_admin = false};
+    };
+    const int pending_before = h.approvals->pending_count();
+    auto res = h.sink.Post("/api/instructions/def-RECHECK-MODE/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("permission revoked after the request was recorded") != std::string::npos);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.approvals->pending_count() == pending_before); // a refusal, never a pending approval
+    REQUIRE_FALSE(h.audit_calls.empty());
+    const auto& row = h.audit_calls.back();
+    CHECK(row.result == "denied");
+    CHECK(row.detail.rfind("reason=permission_revoked gate=approval_mode mode=role-gated execution_id=",
+                           0) == 0);
+    auto exec = h.tracker->get_execution(execution_id_of(row.detail));
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
+    // Control: an administrator still is one after the row, so the same definition dispatches.
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.principal = "tester", .principal_is_admin = true};
+    };
+    res = h.sink.Post("/api/instructions/def-RECHECK-MODE/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+}
+
+TEST_CASE("legacy instruction execute: a recheck that throws after the execution row is refused "
+          "like a withdrawn permission; 403, denied row gate=exception, row cancelled, nothing "
+          "dispatched (#7110)",
+          "[pg][workflow][executions][execute][security][7110]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-RECHECK-THROW", "rt");
+    h.dispatch_cmd_override = "cmd-never";
+    h.dispatch_sent_override = 1;
+    // The fresh-caller derivation is the first step of the recheck; a store fault there used to
+    // fall to the dispatch catch (500, row cancelled, NO audit row). Kills: dropping the recheck's
+    // own catch (the outer catch answers 500 and writes no row).
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        throw std::runtime_error("caller store unavailable");
+    };
+    auto res = h.sink.Post("/api/instructions/def-RECHECK-THROW/execute", R"({"agent_ids":["a1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("permission revoked after the request was recorded") != std::string::npos);
+    CHECK(h.dispatch_calls == 0);
+    REQUIRE_FALSE(h.audit_calls.empty());
+    const auto& row = h.audit_calls.back();
+    CHECK(row.action == "instruction.execute");
+    CHECK(row.result == "denied");
+    CHECK(row.detail.rfind("reason=permission_revoked gate=exception execution_id=", 0) == 0);
+    auto exec = h.tracker->get_execution(execution_id_of(row.detail));
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "cancelled");
 }
 
 // -- Stored parameter_schema enforcement on POST /api/instructions/{id}/execute --
