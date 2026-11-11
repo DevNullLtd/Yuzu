@@ -713,6 +713,8 @@ Create a new management group.
 }
 ```
 
+**Errors:** `400` if the name is empty or already used by another group (`a group with that name already exists`; the MCP tools answer the same conflict as invalid params with no retry hint), or if the parent is missing, would be too deep, or the body is not valid.
+
 ---
 
 #### `GET /api/v1/management-groups/{id}`
@@ -909,6 +911,8 @@ Add an agent to a static management group.
 }
 ```
 
+**Errors:** `400` if `agent_id` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.add_member`, `result=denied`, `detail=invalid_agent_id`). `404` if the group does not exist (no audit row, no retry hint). `503` if the store could not apply the add (audited `result=failure`, `detail=store_error`, with a retry hint). `added: true` and the success audit row are only produced after the store reports the add. The MCP twin `add_management_group_member` refuses and answers the same cases (see `mcp.md`).
+
 ---
 
 #### `DELETE /api/v1/management-groups/{id}/members/{agent_id}`
@@ -925,6 +929,8 @@ Remove an agent from a management group.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:** `400` if `agent_id` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.remove_member`, `result=denied`, `detail=invalid_agent_id`); a member whose stored id already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `removed: true` and the success audit row are only produced after the store reports the removal.
 
 ---
 
@@ -1007,6 +1013,8 @@ Assign a role to a principal within this management group. Only the `Operator` a
 }
 ```
 
+**Other errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte (audited `management_group.assign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`), or if any of the three is not valid UTF-8; `400` (no audit row) if `principal_type` is anything other than `user` or `group` (`engine` is refused by the store with its own `400`, since engine principals cannot hold scoped role assignments); once the body is a JSON object whose `principal_type`, `principal_id` and `role_name`, where present, are strings, with `principal_id` and `role_name` present (`400`, no row, otherwise), the permission check comes first, so a caller without rights on the group gets `403` and no `management_group.*` audit row whatever the field values hold (the permission check writes its own `auth.*` denied row); `404` if the group does not exist (no audit row, no retry hint); `503` if the store could not apply the assignment (audited `result=failure`, `detail=store_error`, with a retry hint). `assigned: true` and the success audit row are only produced after the store reports the assignment.
+
 ---
 
 #### `DELETE /api/v1/management-groups/{id}/roles`
@@ -1033,6 +1041,8 @@ Remove a role assignment from this management group.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.unassign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`); a grant whose stored `principal_id` or `role_name` already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `unassigned: true` and the success audit row are only produced after the store reports the removal.
 
 ---
 
@@ -2988,7 +2998,10 @@ a principal).
 }
 ```
 
-**Errors:** `400` — invalid JSON, missing `role`, unknown role name, or the
+**Errors:** `400` — invalid JSON, missing `role`, a `role` containing a NUL,
+other control byte (0x01-0x1F) or DEL (audited `result=denied`,
+`detail=invalid_role_name`, checked before the principal and role are looked
+up), unknown role name, or the
 role is admin/built-in/otherwise rejected by `validate_assignment` (design
 §4.2 — always a `4xx`, never a `500`); `401`/`403` — not authenticated, missing
 `Security:Write`, an engine session, or MFA step-up required/failed; `404` — no active (live,
@@ -3017,7 +3030,9 @@ Unassign a fleet-wide role from an engine principal.
 ```
 
 **Errors:** the call is idempotent: a role that was not held also answers `200`
-(`removed=false` appears only in the audit detail). `401` or `403`: not
+(`removed=false` appears only in the audit detail). `400`: the `{role}` contains a
+NUL, other control byte (0x01-0x1F) or DEL (audited `result=denied`,
+`detail=invalid_role_name`). `401` or `403`: not
 authenticated, missing `Security:Write`, an engine session, or MFA step-up
 required or failed. `503`: the RBAC store is unavailable or the query failed.
 Audited
@@ -6705,6 +6720,8 @@ Trigger a directory sync. Requires `Directory:Write`. Also available from **Sett
 
 **Response (200):** `{"status": "completed", "provider": "entra", "user_count": <n>, "group_count": <n>}`
 
+`user_count` and `group_count` are the users and groups this sync stored (the same numbers as `applied_users` and `applied_groups` in the audit detail), not a second read of the status row. A record with a NUL byte in a key field is skipped and a NUL in a display field is replaced, so the counts can be lower than the tenant's; the skipped count is in the audit detail and in the status row's `last_error` note (`<n> record(s) skipped, <m> field(s) sanitized (embedded NUL)`) on a `completed` status.
+
 **Response (409, ADR-1007):** `{"error": "sync already in progress"}` — `sync_entra` holds a single in-process re-entrancy guard for the duration of one sync call; a second `POST` that arrives while a sync is already running is rejected immediately rather than racing it. See "Diagnosing a stuck directory sync" in `docs/user-manual/server-admin.md` for how long a legitimate sync can hold the guard and what a stuck one looks like. Not queued or retried automatically — the caller decides when to retry.
 
 **Response (400):** malformed body, or a missing required Entra field.
@@ -6713,7 +6730,7 @@ Trigger a directory sync. Requires `Directory:Write`. Also available from **Sett
 
 **Response (503):** `directory_sync` is unavailable (store not open), or the `result=attempted` audit row written before the sync could not be persisted (`Sec-Audit-Failed: true`; no upstream call is made).
 
-**Response (500):** a genuine sync failure (e.g. Graph API error) — the error message is passed through from `sync_entra`'s result.
+**Response (500):** a genuine sync failure (e.g. Graph API error) — the error message is passed through from `sync_entra`'s result. A snapshot in which every user record, or every group record, would be skipped is refused the same way (`refusing to apply a snapshot in which every user record was skipped`, or `... every group record ...`); the stored roster is left unchanged and the status row reads `failed` with that text.
 
 #### `GET /api/directory/users`
 
@@ -6725,7 +6742,7 @@ List directory-synced users from the last successful sync. Requires `Directory:R
 
 #### `GET /api/directory/status`
 
-Sync status plus the last-synced group list (there is no separate `GET /api/directory/groups` route — groups are embedded here). Requires `Directory:Read`.
+Sync status plus the last-synced group list (there is no separate `GET /api/directory/groups` route — groups are embedded here). Requires `Directory:Read`. On a `completed` status a non-empty `last_error` is a count note (`<n> record(s) skipped, <m> field(s) sanitized (embedded NUL)`), not a failure.
 
 **Response (200):** `{"provider","status","last_sync_at","user_count","group_count","last_error","groups":[{"id","display_name","description","mapped_role","synced_at"}]}`
 
@@ -6779,7 +6796,7 @@ Every call is audited (`directory.users.view`) — this closes a real pre-existi
 
 #### `GET /api/v1/directory/status`
 
-REST v1 twin of `GET /api/directory/status` above (#4031), with a real MCP twin (`get_directory_status`). No per-person PII (counts + synced-group metadata only) — unaudited, matching the legacy route's own posture.
+REST v1 twin of `GET /api/directory/status` above (#4031), with a real MCP twin (`get_directory_status`). No per-person PII (counts + synced-group metadata only) — unaudited, matching the legacy route's own posture. As on the legacy route, a non-empty `last_error` on a `completed` status is a count note, not a failure.
 
 **Permission:** `Directory:Read`
 
@@ -8467,6 +8484,8 @@ surfaces, not reads. `from-echo-query` runs SQL on Echo agents; `from-instructio
 runs an `InstructionDefinition` and filters responders by `matcher`; `{id}/re-eval`
 re-runs a set's own source query and creates a **sibling** (same parent, new id).
 
+A NUL byte in the `name`, in the `sql` of `from-echo-query`, in an instruction parameter (name or value) of `from-instruction-result`, or in `parent_id` is refused with `400` (`RESULT_SET_BAD_REQUEST`) before an execution row is written or anything is dispatched, so a command is never run and then reported as failed because the result-set row could not be stored. The refusal is audited as `result_set.create` with `result=denied` and `reason=field_contains_nul`. The MCP twins refuse it as invalid params (-32602) with the same audit row.
+
 **Permission:** `Execution:Execute`, **confined per device**
 
 > **Per-device confinement (#1788).** These routes admit on a global
@@ -8523,6 +8542,7 @@ re-eval, unchanged.
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
+| 400 | `RESULT_SET_BAD_REQUEST`: a NUL byte in the `name`, in the `sql` of `from-echo-query`, in an instruction parameter (name or value), or in `parent_id`; nothing is dispatched and the refusal is audited `result_set.create\|denied`, `reason=field_contains_nul`. On `re-eval`, a NUL in the stored `sql` or parameters is refused the same way |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_REEVAL_STALE_SOURCE` — on `from-echo-query`, the `sql` reads a raw capture table (a `$<Source>_Live` name or a `<source>_live` table); on `from-instruction-result`, an `echo.sql` definition's SQL does (the `params.sql` value, else the definition's declared default: the text the dashboard submits for a canned query; a default is never injected at dispatch, so a dispatch without `sql` is answered with an error by the agent and counted in `agents_failed`); on `re-eval`, the stored SQL does (for an `instruction_result` set, the stored `sql` param, else that same declared default). Echo keeps roll-up tiers only, so such a query answers with no rows and the set would be silently empty. Nothing is dispatched; query the hourly roll-up instead (for example `$Process_Hourly`). A match inside a comment, or inside a longer string literal (`'see process_live'`), is not a reference; a single-quoted token that is exactly a raw table name (`'process_live'`, `'$Process_Live'`) is one wherever it stands, because SQLite reads such a token as the table after `FROM`, `JOIN`, `IN` and in other positions, so `FROM 'process_live'` and `x IN 'process_live'` are refused, and so is a string literal equal to a raw table name (`WHERE name = 'process_live'`), the price of a rule that does not depend on position. This is a behaviour change for a stale client that stored a set over a `$<Source>_Live` name |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
@@ -8740,7 +8760,7 @@ Every row carries `source` — the `<plugin>.<action>` that produced it (an **op
 | `last_seen` | Epoch seconds of the device's last accepted installed-software report (the last poll), or `null` if it never synced |
 | `status` | `current` when the row's collection facet last reported a `full` or `delta` section; `disabled` when that facet is switched off; `unconfirmed` for anything else, including a device with no facet record (for example one still reporting the older blob format). **An `unconfirmed` row may be stale or missing: it is never proof of absence** |
 | `last_confirmed_at` | Epoch seconds the facet last confirmed a `full` or `delta` section, or `null` if never |
-| `install_type`, `install_scope`, `install_location`, `instance_key` | The server-derived install classification, the scope (`machine`), the install path and the row's stable identity hash. `install_location` is stored as the agent sent it and served to every `Inventory:Read` holder admitted by the gate (a confined caller sees only its own rows' paths). The control is on the agent: its blob-v3 installed-software writer (delivered by the sibling agent-side change, which lands before any agent sends this field) keeps a location only under a machine-scope root and blanks every other path before it is sent (ADR-0016 §8, the 2026-11-09 update), so a per-user path can appear here only from an agent that does not apply that rule. A component's `path` and `anchor_app` on the components route carry no such allowlist yet (no agent reports components until the component producer ships, which must apply it) |
+| `install_type`, `install_scope`, `install_location`, `instance_key` | The server-derived install classification, the scope (`machine`), the install path and the row's stable identity hash. `install_location` is stored as the agent sent it and served to every `Inventory:Read` holder admitted by the gate (a confined caller sees only its own rows' paths). The control is on the agent: its blob-v3 installed-software writer keeps a location only under a machine-scope root and blanks every other path before it is sent (ADR-0016 §8, the 2026-11-09 update), so a per-user path can appear here only from an agent that does not apply that rule. A component's `path` and `anchor_app` on the components route carry no such allowlist yet (no agent reports components until the component producer ships, which must apply it) |
 
 Rows therefore have **22 fields**; the original 14 are unchanged. `format=csv` carries the same 22 columns (`hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,instance_key` after the original header), so an external consumer that pinned 14 columns must read by header name.
 
@@ -9013,7 +9033,7 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget` and `appx`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx` and `kernel_module`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
 
 A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
@@ -9127,7 +9147,7 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | Parameter | Meaning |
 |---|---|
 | `family` | One family id from the curated table; omitted or empty means every family. An unknown id is a `400`. |
-| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
+| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx`, `kernel_module`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
 
 ```json
 {
@@ -9495,6 +9515,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | 400 | `RESULT_SET_TOO_MANY_MEMBERS` (`device_ids` exceeds the per-set cap), or another `ResultSetError` (every non-quota `create_materialized` failure — including a store-level error — maps to `400`, not `503`) |
 | 400 | `name`/`source_kind` present but not a JSON string, or over the MCP-matching length cap (`name` 256 bytes, `source_kind` 64 bytes) - checked before `create_materialized` is ever called, not a `ResultSetError` (#4373) |
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but empty/non-string. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
+| 400 | `RESULT_SET_BAD_REQUEST`: a NUL byte in `name`, `source_kind` or `parent_id`; nothing is created and the refusal is audited `result_set.create\|denied`, `reason=field_contains_nul source_kind=<kind>` (the same row the producers write) |
 | 400 | `RESULT_SET_UNKNOWN_DEVICE_ID` (#4983) — a non-empty `device_ids` contains an id that does not exist, or exists but is outside the caller's own scope; the offending id(s) are named in the error message (the caller's own submitted list, so echoing them back is not a disclosure) — checked after the size cap and before `create_materialized`, so an oversized array is rejected for that reason first |
 | 400 | `RESULT_SET_DEVICE_ID_TOO_LONG` (#4983) — a `device_ids` entry exceeds 256 bytes; checked before both the per-set member-count cap and the existence/scope lookup above |
 | 403 | Service-scoped API token |
@@ -13477,10 +13498,26 @@ primitive (empty `scope_expression` targets every agent; `requires_approval` def
 string, `null`, boolean, array, out-of-range value or a number that does not fit (`4294967297`
 minutes used to become an every-minute schedule) is `400` and nothing is created (#4644).
 
+A NUL byte in `name`, `definition_id`, `frequency_type`, `time_of_day` or `scope_expression` is `400`
+and nothing is created (audited `schedule.create`, `result=denied`, `detail=field_contains_nul`). A
+value the store refuses as invalid text (for example a byte sequence that is not valid UTF-8) or as a
+constraint violation is also `400`, audited `result=denied`, `detail=invalid_field_value` (empty target,
+the value is never echoed). A body that is not valid JSON is `400` with the fixed message
+`invalid JSON in request body`, and no audit row. A store fault before any write (the database is not open, or the
+insert failed) answers `503` with `retry_after_ms` and is audited `result=failure`,
+`detail=store_error`; nothing was created and a retry is safe. A fault after the insert ran (the
+transaction did not report success) answers `503` with `error.outcome` set to `unknown` and **no**
+`retry_after_ms`, audited `result=failure`, `detail=outcome_unknown`: the schedule may or may not
+exist, so list schedules before creating it again.
+
 #### `DELETE /api/schedules/{id}`
 
 Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another
-principal is left untouched (reports `deleted: false`, same as a nonexistent id).
+principal is left untouched (reports `deleted: false`, same as a nonexistent id). A store
+fault answers `503` (audited `schedule.delete`, `result=failure`, `detail=store_error`, with
+`retry_after_ms`), not the `deleted: false` answer; the check that tells the two apart is a read of
+that one id for you as owner, so it does not depend on how many schedules exist. An id containing a
+NUL or other control byte is `400` (audited `result=denied`, `detail=invalid_schedule_id`).
 
 #### `POST /api/schedules/{id}/enable`
 
@@ -13489,10 +13526,17 @@ disabling) additionally requires `Execution:Execute`, since enabling arms the sc
 fire — an operator can always disable a schedule to stop it even without
 `Execution:Execute`.
 
-`enabled` is a JSON boolean, or the integer `0` (disable) or `1` (enable). An omitted key or a blank
-(empty or whitespace-only) body enables, as before. A string (including the old `"true"` / `"false"` encoding), any other number,
-`null`, an array or object, or a body that is truncated or not a JSON object is `400` and the schedule
-is neither armed nor changed: `{"enabled":0}` used to arm it (#4644).
+`enabled` is a JSON boolean, the integer `0` (disable) or `1` (enable), or the exact lowercase string
+`"true"` or `"false"` (accepted so that a client that sends text can still disable a schedule). An omitted
+key or a blank (empty or whitespace-only) body enables, as before. Any other string (`"True"`, `"0"`, an
+empty string), any other number, `null`, an array or object, or a body that is truncated or not a JSON
+object is `400` and the schedule is neither armed nor changed: `{"enabled":0}` used to arm it (#4644).
+
+A schedule id containing a NUL or other control byte is `400` (audited `result=denied`,
+`detail=invalid_schedule_id`). When the change is not applied, the route answers `404` for a
+schedule you cannot see, or `503` for a store fault (audited `result=failure`,
+`detail=store_error`, with `retry_after_ms`), instead of `200` with the requested state. `200` and
+the success audit row mean the change was applied.
 
 ---
 

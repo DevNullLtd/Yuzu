@@ -225,9 +225,8 @@ std::string wire_record_reserved(const SoftwareEntry& e, const std::string& inst
 
 // SERVER CONTRACT PIN (16 fields, slots 13-14 empty). sha256 of wire_record(full_extended_entry(), 16) bytes:
 //   printf 'bash\0375.2.21\037Fedora Project\037Mon 01 Jan 2026\037package\037rpm\0370\0373.fc40\037x86_64\037signed\037fedora\03740\037\037\037bash-5.2.21-3.fc40.x86_64\037installed_apps.list_inventory\036' | shasum -a 256
-// The agent builder (installed_software_canonical_blob) emits this tail; the identical
-// constant and fixture bytes live in tests/unit/test_inventory_sync.cpp, making it the
-// live cross-side pin exactly as kCrossPinHash is.
+// This pins the server's v2-shape parser. The agent now writes only blob v3 (installed_software_v3.cpp),
+// whose cross-side byte pins are the golden vectors in tests/unit/test_installed_software_v3.cpp.
 constexpr const char* kCrossPinHashExtended =
     "371b647c95b0f48a039ff98790c6085947ef71fcfd40a399c3cd70d70321291d";
 

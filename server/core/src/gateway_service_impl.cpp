@@ -2005,6 +2005,23 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
     // ADR-1005 enforceable seam — see grpc_on_behalf_enforce.hpp.
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
+    // The identifiers below are asserted by the gateway and are compared and stored as text.
+    // A value with an embedded NUL cannot be stored faithfully (the database sees only its
+    // prefix), so the whole notification is refused here, before any lookup, check, publish or
+    // write. Only the field name is logged: the value is externally supplied.
+    for (const auto& [field, value] :
+         {std::pair<std::string_view, const std::string*>{"agent_id", &request->agent_id()},
+          {"session_id", &request->session_id()},
+          {"cluster_id", &request->cluster_id()},
+          {"stream_home_id", &request->stream_home_id()}}) {
+        if (value->find('\0') != std::string::npos) {
+            spdlog::warn("[gateway] NotifyStreamStatus rejected: {} contains an embedded NUL",
+                         field);
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "identifier contains an embedded NUL");
+        }
+    }
+
     const auto& agent_id = request->agent_id();
     const auto& session_id = request->session_id();
 
