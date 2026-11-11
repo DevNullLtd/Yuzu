@@ -45,7 +45,8 @@
  * fallback, and logs that cause once per process. The open is exercised by the Windows-only cases
  * `runtimes win: read_file_bounded follows no reparse point below the drive root` and
  * `runtimes win: drive_relative_name*` (tests/unit/test_runtimes_win_walk.cpp) on the Windows test
- * leg, and no Windows floor is claimed. A JVM key whose home value is present but empty, mistyped
+ * leg: they passed, with the flag accepted, on Windows build 10.0.26200.9974 (native MSVC run, 2026-11-11),
+ * and no Windows floor is claimed. A JVM key whose home value is present but empty, mistyped
  * or oversized records
  * `windows:runtimes:jvm:home_unusable` (an absent value stays silent). The read has no deadline,
  * a disclosed residual on a dead FIXED volume.
