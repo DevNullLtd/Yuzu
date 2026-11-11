@@ -273,7 +273,7 @@ yuzu-server --rate-limit 100 --login-rate-limit 10
 ```
 
 - `--rate-limit`: Maximum API requests per second per IP (default: 100). It is also the per-source budget for `/health` and `/api/health` requests that carry a credential header; values below 1 are treated as 1
-- `--login-rate-limit`: Maximum login attempts per second per IP (default: 10). It covers local login, SAML start and ACS, and OIDC sign-in start (`GET /auth/oidc/start`) and callback (`GET /auth/callback`), because these are unauthenticated entry points that trigger outbound requests. An OIDC sign-in uses two requests from the browser's source address, one for start and one for the callback
+- `--login-rate-limit`: Maximum login attempts per second per IP (default: 10). It covers local login, SAML start and ACS, and OIDC sign-in start (`GET /auth/oidc/start`) and callback (`GET /auth/callback`), because these are unauthenticated entry points that trigger outbound requests. An OIDC sign-in uses two requests from the browser's source address, one for start and one for the callback.
 
 Clients exceeding the limit receive `429 Too Many Requests` with a `Retry-After: 1` header.
 
