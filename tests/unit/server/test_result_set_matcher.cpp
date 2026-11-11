@@ -956,6 +956,7 @@ TEST_CASE("UnverifiedFrameRegistry: an agent id past the bound is never stored a
     const std::string too_long(UnverifiedFrameRegistry::kMaxAgentIdBytes + 1, 'a');
     const auto r = reg.note("cmd", too_long, 100);
     CHECK(r.latched);
+    CHECK(r.evicted == 1); // counted, so the overflow counter moves
     CHECK(reg.size() == 0);
     CHECK(reg.contains("cmd", too_long, 101));
     CHECK(reg.contains("other-cmd", "other-agent", 101)); // the latch covers every pair

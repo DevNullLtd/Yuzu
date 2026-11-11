@@ -251,6 +251,9 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
     // constructs this service directly. set_ota_bound_config() replaces it.
     set_ota_bound_config(ota_cfg_);
     registry_audit_budget_ = make_registry_audit_budget();
+    if (unverified_frames_.salt_fell_back())
+        spdlog::warn("[ingest] no random salt could be drawn for the unverified-frame record: its "
+                     "command-id digest runs unsalted in this process");
 }
 
 // -- Register -----------------------------------------------------------------

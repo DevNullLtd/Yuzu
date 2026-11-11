@@ -17,13 +17,18 @@
 /// Keys (in process only, never persisted or compared across processes): the EXACT agent id, and a
 /// 64-bit digest of the command id salted with a random per-process value. Entries, the per-agent
 /// index and the agent markers all compare agent ids byte for byte, so nothing one agent sends can
-/// read, erase or mark another agent's entry. Agent ids are at most `kMaxAgentIdBytes` (Register
-/// refuses a longer one, `auth::kMaxAgentIdLength`), which bounds what an entry or marker holds; a
-/// longer id is never stored: noting one sets the global latch (fail closed). Two command ids with
-/// the same digest read as one command: within one agent's own pairs forgetting one also erases the
-/// other, and a remembered command also covers the other; neither reaches another agent's entry.
-/// The salt keeps such a collision from being computed ahead of time; the digest is not a
-/// cryptographic MAC.
+/// read, erase or mark another agent's entry. Agent ids are at most `kMaxAgentIdBytes`
+/// (`auth::kMaxAgentIdLength`), which bounds what an entry or marker holds. Register and
+/// ProxyRegister refuse a longer id. The ingest sites check no length themselves: Subscribe takes
+/// the id of its registered session, and the gateway-forward path applies a response only when its
+/// agent id equals the target it forwarded (`classify_gateway_forward_response`), a target taken
+/// from a registered session or from the gateway route directory that ProxyRegister writes. A
+/// longer id is never stored: noting one sets the global latch (fail closed) and counts as an
+/// eviction. Two command ids with the same digest read as one command: within one agent's own pairs
+/// forgetting one also erases the other, and a remembered command also covers the other; forget
+/// never reaches another agent's entry. The salt makes which command ids collide unpredictable
+/// from outside the process; it is not a MAC, and the exact agent key, not the salt, is what keeps
+/// agents apart.
 ///
 /// Bounded, and FAILS CLOSED whenever it cannot keep a record (it over-reports an answer as not
 /// fully stored rather than lose one):
@@ -34,19 +39,22 @@
 /// - at most `capacity` entries in all: past it the oldest entry is evicted and its COMMAND is
 ///   remembered (at most `command_capacity` of them, refreshed on each eviction), and `contains`
 ///   is true for every agent of a remembered command;
-/// - a full marker set or a full command set cannot take another: either one sets a global latch
-///   for `max_age_s` seconds during which `contains` is true for every pair. Only these two cases
-///   affect agents other than the one that sent the frames.
+/// - when a full marker set or a full command set takes another member, the oldest is dropped and
+///   a global latch is set for `max_age_s` seconds during which `contains` is true for every pair.
+///   Only the latch and a remembered command affect agents other than the one that sent the frames.
 /// A failed allocation loses no record (a marker or command is set before the entry it stands for
-/// is erased, and a refresh re-keys in place without allocating), but can leave more than
-/// `capacity` entries (one per failed `note`) until the next successful `note` evicts back to it.
+/// is erased, a refresh re-keys in place without allocating, and a scope guard undoes a half-done
+/// insert), but can leave more than `capacity` entries (one per failed `note`) until the next
+/// inserting `note` evicts back to it (a note for a pair already held returns without trimming).
 /// Memory is bounded, about 4 MiB worst case at the default caps with every agent id at the
 /// 256-byte bound (an estimate from allocation sizes measured on one platform, not a guarantee).
-/// Every entry, marker, remembered command and latch is dropped `max_age_s` seconds after it was set
-/// (the result-set fill runs within minutes of a dispatch, so an older one no longer changes any
-/// fill). Lives in process memory only: a restart, or a terminal frame served by another replica,
-/// loses the record (docs/executions-history-ladder.md, "Response frames the response store did not
-/// keep"). Mutex-guarded, no thread; the clock is the caller's.
+/// Every entry, marker, remembered command and latch is dropped `max_age_s` seconds after it was
+/// last set (a marker, remembered command and the latch are set again on each eviction they stand
+/// for, so they last for `max_age_s` after the last record they covered). The result-set fill runs
+/// within minutes of a dispatch, so an older one no longer changes any fill. Lives in process
+/// memory only: a restart, or a terminal frame served by another replica, loses the record
+/// (docs/executions-history-ladder.md, "Response frames the response store did not keep").
+/// Mutex-guarded, no thread; the clock is the caller's.
 
 #include <algorithm>
 #include <cstddef>
@@ -112,8 +120,10 @@ public:
         expire_locked(now_s);
         NoteResult out;
         if (agent_id.size() > kMaxAgentIdBytes) {
-            // Not reachable (Register refuses such an id); never stored, so fail closed for all.
+            // Never stored, so fail closed for all, and count it as an eviction so the overflow
+            // counter moves.
             out.latched = latch_locked(now_s);
+            out.evicted = 1;
             return out;
         }
         if (by_key_.contains(view))
@@ -124,7 +134,7 @@ public:
             // allocation loses nothing, stands for it.
             const auto oldest = by_age_.at(*own->second.begin());
             const bool was_marked = markers_.contains(agent_id);
-            if (markers_.remember(std::string(agent_id), now_s, next_seq_++, marker_capacity_))
+            if (markers_.remember(agent_id, now_s, next_seq_++, marker_capacity_))
                 out.latched |= latch_locked(now_s);
             out.marked = !was_marked;
             erase_locked(oldest);
@@ -134,10 +144,7 @@ public:
         const uint64_t seq = next_seq_++;
         const auto entry =
             by_key_.emplace(Key{view.first, std::string(agent_id)}, Entry{now_s, seq}).first;
-        try {
-            by_age_.emplace(seq, entry);
-            by_agent_[entry->first.second].insert(seq);
-        } catch (...) {
+        ScopeGuard undo([&]() noexcept {
             by_age_.erase(seq);
             if (auto own = by_agent_.find(agent_id); own != by_agent_.end()) {
                 own->second.erase(seq);
@@ -145,8 +152,10 @@ public:
                     by_agent_.erase(own);
             }
             by_key_.erase(entry);
-            throw;
-        }
+        });
+        by_age_.emplace(seq, entry);
+        by_agent_[entry->first.second].insert(seq);
+        undo.dismiss();
         while (by_key_.size() > capacity_) {
             const auto oldest = by_age_.begin()->second;
             if (commands_.remember(oldest->first.first, now_s, next_seq_++, command_capacity_))
@@ -178,6 +187,10 @@ public:
             erase_locked(it);
     }
 
+    /// True when no random salt could be drawn and the command digest runs unsalted (a drawn salt
+    /// of 0 reads the same; its chance is negligible). Nothing else changes: the caller logs it.
+    [[nodiscard]] bool salt_fell_back() const noexcept { return salt_ == 0; }
+
     /// Pairs held (markers, remembered commands and the latch are not counted).
     [[nodiscard]] std::size_t size() const {
         std::lock_guard lock(mu_);
@@ -201,12 +214,30 @@ private:
     };
     using Entries = std::map<Key, Entry, KeyLess>;
 
+    /// Runs `f` on scope exit unless dismissed: undoes a half-done insert when an allocation
+    /// throws.
+    template <class F> class ScopeGuard {
+    public:
+        explicit ScopeGuard(F f) : f_(std::move(f)) {}
+        ScopeGuard(const ScopeGuard&) = delete;
+        ScopeGuard& operator=(const ScopeGuard&) = delete;
+        ~ScopeGuard() {
+            if (armed_)
+                f_();
+        }
+        void dismiss() noexcept { armed_ = false; }
+
+    private:
+        F f_;
+        bool armed_{true};
+    };
+
     static uint64_t random_salt() noexcept {
         try {
             std::random_device rd;
             return (static_cast<uint64_t>(rd()) << 32) ^ rd();
         } catch (...) {
-            return 0; // the exact agent key, not the salt, keeps agents apart
+            return 0; // reported by salt_fell_back(); the exact agent key keeps agents apart
         }
     }
 
@@ -215,8 +246,10 @@ private:
     public:
         template <class K> bool contains(const K& id) const { return items_.contains(id); }
 
-        /// Sets (or refreshes) `id`. True when the set was full and dropped its oldest member.
-        bool remember(Id id, int64_t now_s, uint64_t seq, std::size_t capacity) {
+        /// Sets (or refreshes) `id`. True when the set was full and dropped its oldest member. The
+        /// `Id` is built only when `id` is new.
+        template <class K>
+        bool remember(const K& id, int64_t now_s, uint64_t seq, std::size_t capacity) {
             if (auto it = items_.find(id); it != items_.end()) {
                 // Refresh in place: re-keying the age node allocates nothing, so it cannot throw.
                 auto node = by_age_.extract(it->second.seq);
@@ -225,13 +258,10 @@ private:
                 it->second = Item{now_s, seq};
                 return false;
             }
-            const auto item = items_.emplace(std::move(id), Item{now_s, seq}).first;
-            try {
-                by_age_.emplace(seq, item);
-            } catch (...) {
-                items_.erase(item);
-                throw;
-            }
+            const auto item = items_.emplace(Id(id), Item{now_s, seq}).first;
+            ScopeGuard undo([&]() noexcept { items_.erase(item); });
+            by_age_.emplace(seq, item);
+            undo.dismiss();
             bool dropped = false;
             while (items_.size() > capacity) {
                 const auto oldest = by_age_.begin();

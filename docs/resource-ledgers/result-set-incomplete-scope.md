@@ -60,7 +60,7 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
 - **Bound:** 64 entries per agent, 4,096 entries in all, 1,024 agent markers and 1,024 remembered
   commands. An entry and a marker hold the agent id, which Register bounds to 256 bytes
   (`auth::kMaxAgentIdLength`, asserted equal to the registry's `kMaxAgentIdBytes`); a longer id is
-  never stored and sets the latch instead. Held memory is bounded, about 4 MiB worst case with every
+  never stored, sets the latch instead and is counted as an eviction. Held memory is bounded, about 4 MiB worst case with every
   structure full and every agent id at 256 bytes (an estimate from allocation sizes measured on one
   platform). A new entry past an
   agent's own cap evicts that agent's oldest entry and marks the agent (every pair of a marked agent
@@ -72,9 +72,10 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
   markers, remembered commands and the latch last one hour (expired on every `note` and `contains`,
   against `steady_clock` seconds). `note` inserts into its three indexes or none, sets a marker or
   remembers a command before it erases the entry that stands for it, and refreshes an existing
-  marker or remembered command in place without allocating, so an allocation failure leaves no
-  orphan and loses no record. After such a failure the registry can hold more than 4,096 entries
-  (one more per failed `note`) until the next successful `note` evicts back to the cap.
+  marker or remembered command in place (the re-key allocates nothing, and the id is copied only
+  when it is new), so an allocation failure leaves no orphan and loses no record. After such a
+  failure the registry can hold more than 4,096 entries (one more per failed `note`) until the
+  next inserting `note` evicts back to the cap (a note for a pair already held does not trim).
 - **Lock:** its own `mu_`, held only for the map operations; no other lock is taken under it and it
   is never held across I/O.
 - **Release point:** each entry on a recorded flag, expiry or eviction; the whole registry with the
@@ -82,7 +83,9 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
   bounded by the service's lifetime: they are the known #3279 residual (the gateway-forward note
   near the top of `agent_service_impl.cpp`, above `audit_registry_frame`), and this member shares
   that residual with `this`, `metrics_` and every other member those threads touch.
-- **Failure cleanup:** RAII only; nothing persists.
+- **Failure cleanup:** RAII only: two RAII scope guards (in `note` and in `AgedSet::remember`),
+  dismissed on success, undo a half-inserted index node when an allocation throws; nothing
+  persists.
 
 ### Borrowed `const ForensicsPluginSet*` on the result-set producers
 - **Site:** REST `run_async` (`rest_api_v1.cpp`) captures the route's `forensics_plugins` pointer by
