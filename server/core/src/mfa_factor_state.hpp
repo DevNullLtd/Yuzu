@@ -85,6 +85,12 @@ struct LocalMfaBindingJudgement {
     LocalMfaBinding kind{LocalMfaBinding::kUnavailable};
     /// The audit / remediation token for a refusal; empty for `kBound`.
     std::string_view reason{};
+    /// True only for a `kUnavailable` that no retry can clear: the enrolled account's generation is
+    /// not positive (a row the factor-generation trigger never stamped), which only
+    /// `yuzu-server --mfa-reset` repairs. False for every other kind and for the transient
+    /// `kUnavailable` causes. `kUnenforced` is not decided here: a trigger observed not in force
+    /// (persistent) and a validation that could not run (transient) look the same to this function.
+    bool persistent{false};
 };
 
 /// The ONE binding decision (a second copy in any gate is the drift this seam exists to
@@ -111,7 +117,7 @@ judge_local_mfa_binding(const auth::DurableMfaProof& durable, std::int64_t curre
     // so a non-positive one is a read that cannot be trusted, not a statement about the proof:
     // undecidable, answered as unavailable (503) rather than a 401 the caller can never clear.
     if (current_factor_gen <= 0)
-        return {LocalMfaBinding::kUnavailable, "mfa_proof_unavailable"};
+        return {LocalMfaBinding::kUnavailable, "mfa_proof_unavailable", /*persistent=*/true};
     if (durable.source != Source::kRow || durable.mfa_verified_ms <= 0)
         return {LocalMfaBinding::kNoProof, "mfa_proof_missing"};
     if (durable.mfa_factor_gen <= 0)

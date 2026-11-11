@@ -108,6 +108,13 @@ struct StepUpVerdict {
     /// another static string: the verdict only views it. `emit_step_up_refusal_effects` appends it
     /// as ` reason=<token>` to a kChallenge row and uses it for a kStoreUnavailable one.
     std::string_view reason;
+    /// Only for kStoreUnavailable: true when a retry can clear the refusal (a failed read of the
+    /// enrolment status or of the stored proof). False for every cause only an administrator
+    /// repairs (an enrolled account whose factor generation is not positive, a stored-proof
+    /// binding the session store reports untrusted) and for an unenforced trigger, which this gate
+    /// cannot tell from a validation that could not run. `render_step_up_refusal` turns it into
+    /// `retry_after_ms` (5000 or null); no other decision carries the field.
+    bool retryable{false};
 
     [[nodiscard]] bool passed() const noexcept { return decision == StepUpDecision::kPass; }
 };

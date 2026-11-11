@@ -107,6 +107,15 @@ RefusalText refusal_text(const StepUpVerdict& v) {
             v.is_oidc ? "/auth/oidc/start" : "/login/mfa/stepup", true};
 }
 
+// The A4 `retry_after_ms` of one refusal: a number only for a store refusal a retry can clear
+// (StepUpVerdict::retryable, the same 5 s the approver rule's transient 503 carries), null for
+// every other refusal, so a client can tell a sticky 503 from a transient one.
+nlohmann::json retry_after_json(const StepUpVerdict& v) {
+    if (v.decision == StepUpDecision::kStoreUnavailable && v.retryable)
+        return 5000;
+    return nullptr;
+}
+
 void count_gate(yuzu::MetricsRegistry* metrics, std::string_view outcome,
                 std::string_view auth_source, StepUpSurface surface) noexcept {
     if (!metrics)
@@ -382,6 +391,7 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
         if (!status) {
             v.decision = is_store_unavailable(status.error()) ? StepUpDecision::kStoreUnavailable
                                                               : StepUpDecision::kStatusFailed;
+            v.retryable = v.decision == StepUpDecision::kStoreUnavailable;
             return v;
         }
         admission = {true, status->factor_gen};
@@ -406,6 +416,9 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
         v.reason = judgement.reason;
         switch (judgement.kind) {
         case LocalMfaBinding::kUnavailable:
+            v.decision = StepUpDecision::kStoreUnavailable;
+            v.retryable = !judgement.persistent && !durable->binding_untrusted;
+            return v;
         case LocalMfaBinding::kUnenforced:
             v.decision = StepUpDecision::kStoreUnavailable;
             return v;
@@ -495,6 +508,7 @@ std::string step_up_refusal_json_rpc_error(const StepUpVerdict& verdict,
     const auto t = refusal_text(verdict);
     nlohmann::json data = {{"mfa_step_up_required", t.mfa_step_up_required},
                            {"http_status", t.http_status},
+                           {"retry_after_ms", retry_after_json(verdict)},
                            {"correlation_id", correlation_id.empty()
                                                   ? detail::make_correlation_id()
                                                   : std::string(correlation_id)},
@@ -527,6 +541,7 @@ void render_step_up_refusal(const httplib::Request& req, httplib::Response& res,
                                       {{"code", t.http_status},
                                        {"message", t.message},
                                        {"correlation_id", cid},
+                                       {"retry_after_ms", retry_after_json(verdict)},
                                        {"remediation", t.remediation}}},
                                      {"meta", std::move(meta)}};
     res.status = t.http_status;

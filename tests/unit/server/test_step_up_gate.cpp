@@ -464,6 +464,8 @@ TEST_CASE("decide_step_up (binding): a refused proof names its cause", "[stepup]
             const auto v = decide_with(s, status_enrolled(current), fresh, calls, 300);
             CHECK(v.decision == StepUpDecision::kStoreUnavailable);
             CHECK(v.reason == "mfa_proof_unavailable");
+            // Only `yuzu-server --mfa-reset` clears it, so no retry hint.
+            CHECK_FALSE(v.retryable);
         }
     }
     SECTION("no stored session, or a stored row with no proof: mfa_proof_missing, age -1") {
@@ -489,11 +491,21 @@ TEST_CASE("decide_step_up (binding): an undecidable binding is a 503, never a ch
         const auto v = decide_with(s, status_enrolled(4), auth::DurableMfaProof{}, calls, 300);
         CHECK(v.decision == StepUpDecision::kStoreUnavailable);
         CHECK(v.reason == "mfa_proof_unavailable");
+        CHECK(v.retryable);
+    }
+    SECTION("a degraded read the session store reports untrusted is not retryable") {
+        auth::DurableMfaProof untrusted;
+        untrusted.binding_untrusted = true;
+        const auto v = decide_with(s, status_enrolled(4), untrusted, calls, 300);
+        CHECK(v.decision == StepUpDecision::kStoreUnavailable);
+        CHECK(v.reason == "mfa_proof_unavailable");
+        CHECK_FALSE(v.retryable);
     }
     SECTION("a row whose database clock is not positive") {
         const auto v = decide_with(s, status_enrolled(4), proof_row(1'000, 0, 4), calls, 300);
         CHECK(v.decision == StepUpDecision::kStoreUnavailable);
         CHECK(v.reason == "mfa_proof_unavailable");
+        CHECK(v.retryable);
     }
     SECTION("an unenforced generation trigger, bound or not") {
         const MfaStatusFn unenforced =
@@ -508,6 +520,8 @@ TEST_CASE("decide_step_up (binding): an undecidable binding is a 503, never a ch
             const auto v = decide_with(s, unenforced, durable_matching(s, gen), calls, 300);
             CHECK(v.decision == StepUpDecision::kStoreUnavailable);
             CHECK(v.reason == "mfa_binding_unenforced");
+            // A trigger seen not in force and a validation that could not run read the same here.
+            CHECK_FALSE(v.retryable);
         }
     }
     SECTION("no provider wired is the unwired 503, same as a missing store") {
@@ -905,6 +919,55 @@ TEST_CASE("render_step_up_refusal: 503 for store outage, unwired store and unsup
         const auto j = body_of(res);
         CHECK(j["error"]["message"] == "authentication store is temporarily unavailable");
         CHECK_FALSE(j["meta"].contains("challenge_url"));
+    }
+}
+
+TEST_CASE("render_step_up_refusal: retry_after_ms is 5000 only for a retryable store refusal, "
+          "otherwise null, on REST and MCP",
+          "[stepup][gate][binding]") {
+    struct Row {
+        StepUpDecision decision;
+        std::string_view reason;
+        bool retryable;
+        bool expect_hint;
+    };
+    const Row rows[] = {
+        // a failed read the next request may not repeat
+        {StepUpDecision::kStoreUnavailable, "", true, true},
+        {StepUpDecision::kStoreUnavailable, "mfa_proof_unavailable", true, true},
+        // causes only an administrator repairs: the key is present and null
+        {StepUpDecision::kStoreUnavailable, "mfa_proof_unavailable", false, false},
+        {StepUpDecision::kStoreUnavailable, "mfa_binding_unenforced", false, false},
+        // `retryable` is read for no other decision
+        {StepUpDecision::kUnwired, "", true, false},
+        {StepUpDecision::kChallenge, "proof_factor_mismatch", true, false},
+    };
+    for (const auto& row : rows) {
+        StepUpVerdict v;
+        v.decision = row.decision;
+        v.reason = row.reason;
+        v.retryable = row.retryable;
+        httplib::Request req;
+        {
+            httplib::Response res;
+            render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+            const auto j = body_of(res);
+            REQUIRE(j["error"].contains("retry_after_ms"));
+            if (row.expect_hint)
+                CHECK(j["error"]["retry_after_ms"] == 5000);
+            else
+                CHECK(j["error"]["retry_after_ms"].is_null());
+        }
+        {
+            httplib::Response res;
+            render_step_up_refusal(req, res, v, StepUpSurface::kMcp);
+            const auto j = body_of(res);
+            REQUIRE(j["error"]["data"].contains("retry_after_ms"));
+            if (row.expect_hint)
+                CHECK(j["error"]["data"]["retry_after_ms"] == 5000);
+            else
+                CHECK(j["error"]["data"]["retry_after_ms"].is_null());
+        }
     }
 }
 

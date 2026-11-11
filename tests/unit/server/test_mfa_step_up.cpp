@@ -1236,6 +1236,7 @@ TEST_CASE("judge_local_mfa_binding: every arm, its reason token and its preceden
         const auto zero = judge_local_mfa_binding(auth::DurableMfaProof{}, 7, true);
         CHECK(zero.kind == LocalMfaBinding::kUnavailable);
         CHECK(zero.reason == "mfa_proof_unavailable");
+        CHECK_FALSE(zero.persistent); // a failed read is the transient cause
         CHECK(judge_local_mfa_binding(proof_row(1'000, 0, 7), 7, true).kind ==
               LocalMfaBinding::kUnavailable);
         CHECK(judge_local_mfa_binding(proof_row(1'000, -1, 7), 7, true).kind ==
@@ -1255,6 +1256,7 @@ TEST_CASE("judge_local_mfa_binding: every arm, its reason token and its preceden
             const auto j = judge_local_mfa_binding(row, current, true);
             CHECK(j.kind == LocalMfaBinding::kUnavailable);
             CHECK(j.reason == "mfa_proof_unavailable");
+            CHECK(j.persistent); // only `yuzu-server --mfa-reset` clears it
         }
         // ...but an unenforced trigger keeps its priority over it.
         CHECK(judge_local_mfa_binding(proof_row(1'000, 2'000, 7), current, false).kind ==
