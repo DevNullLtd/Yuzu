@@ -15932,13 +15932,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return; // rs_load_owned already wrote the error
                     if (!parent_may_seed(*parent)) {
-                    // retry-hint-exempt: a state conflict the caller resolves by waiting for
-                    // the parent to materialize; the message says so.
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   std::string(kParentNotReadyMessage)),
-                                    "application/json");
-                    return;
-                }
+                        // retry-hint-exempt: a state conflict the caller resolves by waiting for
+                        // the parent to materialize; the message says so.
+                        res.set_content(error_response(id, kInvalidParams,
+                                                       std::string(kParentNotReadyMessage)),
+                                        "application/json");
+                        return;
+                    }
                     cr.parent_id = *pid;
                     // #4306 follow-up: do NOT add the marker for a parent_id
                     // that failed ownership above -- that request is already
@@ -16268,13 +16268,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!parent)
                         return;
                     if (!parent_may_seed(*parent)) {
-                    // retry-hint-exempt: a state conflict the caller resolves by waiting for
-                    // the parent to materialize; the message says so.
-                    res.set_content(error_response(id, kInvalidParams,
-                                                   std::string(kParentNotReadyMessage)),
-                                    "application/json");
-                    return;
-                }
+                        // retry-hint-exempt: a state conflict the caller resolves by waiting for
+                        // the parent to materialize; the message says so.
+                        res.set_content(error_response(id, kInvalidParams,
+                                                       std::string(kParentNotReadyMessage)),
+                                        "application/json");
+                        return;
+                    }
                     // The child is narrowed from this parent, so it is no more complete than
                     // it (REST twin: from-inventory-query).
                     inherit_completeness(cr, *parent);
