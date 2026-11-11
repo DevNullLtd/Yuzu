@@ -16,7 +16,8 @@
  *   1. The key has any claim: this rule's own live arm with other content, spec or ownership
  *      reports content_changed (even if the key is also unhealthy); any other claim reports
  *      key_busy. (This rule's own live arm with identical content is a skip, not a rebuild.)
- *   2. No committed entry for the rule or the key: first_attach.
+ *   2. No committed entry for the rule or the key, or the rule's live arm is mapped to a different
+ *      key than the one it now targets (a retarget onto a key another rule holds): first_attach.
  *   3. Committed path, health before content: the key's recorded faulted bit (reports the cause
  *      recorded with it, else faulted_key); an absent health probe (health_unknown); a probe of a
  *      different subscription (subscription_replaced); a Dead probe (dead_key); any other

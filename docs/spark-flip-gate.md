@@ -1691,7 +1691,9 @@ flip, with a red-first test each:
     logged on every production full push that reaches the end of its rule loop (a rejected push,
     or one the retry gate suppresses as an identical retry, logs neither this line nor the
     preserved one, so a missing line for one push is not by itself evidence of a fault; the
-    first flipped-rig run saw one such silent push, cause not confirmed) but is inactive there:
+    first flipped-rig run saw one such silent push; the second run reproduced it as the retry
+    gate, since two identical pushes seconds after a deploy logged neither line and the same
+    push after the next heartbeat did) but is inactive there:
     the counts it reports come only
     from the Spark attach path, which is reached only while `prefer_spark_` is true: while it is false the line
     prints `path=legacy` and `rebuilt 0`, and `rebuilt 0` on `path=legacy` does not mean nothing

@@ -1489,6 +1489,44 @@ TEST_CASE("#5719 reason R2: a first attach reports first_attach on every success
 }
 
 // ---------------------------------------------------------------------------------------
+// R2b. A committed rule retargeted onto a key ANOTHER rule already holds is a first attach for
+// that key, never `other` (found on the flipped Linux rig: a service rule moved onto a unit a
+// second rule watched logged other=1 although the arm committed normally). keys_ holds the key,
+// so the "no key entry" test does not fire; the rule's live arm is mapped to its old key.
+// Mutation: delete the mapped_to_other_key() test in reuse_existing_locked and this reports
+// `other` (attach_nw's own CHECK also trips). Also pins the reverse (retarget onto a FREE key)
+// and that a plain identical push on the new key afterwards is a skip, so the label change
+// cannot hide a skip/rebuild change.
+// ---------------------------------------------------------------------------------------
+TEST_CASE("#5719 reason R2b: a retarget onto a key another rule holds reports first_attach, "
+          "not other",
+          "[spark][runtime][4415prA][5719]") {
+    Rig rig;
+    const auto spec_a = file_spec("/a");
+    const auto spec_b = file_spec("/b");
+    REQUIRE(rig.rt->attach_rule("r2", spec_b, file_exists_rule("r2"), true).has_value());
+    REQUIRE(rig.rt->attach_rule("r1", spec_a, file_exists_rule("r1"), true).has_value());
+
+    SECTION("onto an occupied key") {
+        const auto out = attach_nw(rig, "r1", spec_b, file_exists_rule("r1"));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "first_attach");
+        settle(rig, spec_b);
+        // The decision is unchanged: the rule is now live on /b, so an identical push skips.
+        const auto again = attach_nw(rig, "r1", spec_b, file_exists_rule("r1"));
+        CHECK(again.skipped);
+        CHECK(why_tok(again.rebuild_reason) == "none");
+    }
+    SECTION("onto a free key") {
+        const auto spec_c = file_spec("/c");
+        const auto out = attach_nw(rig, "r1", spec_c, file_exists_rule("r1"));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "first_attach");
+        settle(rig, spec_c);
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // R3. KeyBusy: the key is held by ANOTHER rule's in-flight claim.
 // Mutation: return FirstAttach (or None) from the claims branch of reuse_existing_locked when
 // the claim belongs to a different rule.

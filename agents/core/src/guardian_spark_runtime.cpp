@@ -2970,7 +2970,8 @@ GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::s
     // order of evaluation below IS the precedence (first match wins):
     //   1. a key with any claim: own identical live arm -> skip (Reobserved); own arm with other
     //      content, spec or ownership -> ContentChanged; any other claim -> KeyBusy;
-    //   2. no committed rules_/keys_ entry -> FirstAttach;
+    //   2. no committed rules_/keys_ entry -> FirstAttach; likewise a committed rule whose live
+    //      arm is mapped to another key (a retarget onto a key someone else holds);
     //   3. committed path, HEALTH before content: the recorded bit (its recorded cause, else
     //      KeyFaulted), an absent probe (HealthUnknown), a probe of another subscription
     //      (SubscriptionReplaced), a Dead probe (KeyDead), any other non-Healthy probe
@@ -2979,7 +2980,8 @@ GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::s
     //   4. content: a changed content id (ContentChanged), then for FileHashEquals an empty
     //      (BaselineEmpty) or differing (BaselineDiffers) pushed hash;
     //   5. defensive invariants no public path violates (inactive generation, spec mismatch, an
-    //      index that does not own the generation) -> Other.
+    //      index that does not own the generation although the rule is mapped to this key, or
+    //      has no mapping at all) -> Other.
     // On the committed path (steps 3 and 4) health outranks content, so a committed rule on a
     // broken key is reported as a broken key even when its content also changed; step 1 comes
     // first, so a changed rule that still has its own arm in flight is ContentChanged even when
@@ -3011,6 +3013,13 @@ GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::s
     const auto rit = rules_.find(rule_id);
     const auto kit = keys_.find(key);
     if (rit == rules_.end() || kit == keys_.end())
+        return std::unexpected(GuardianRebuildReason::FirstAttach);
+    // A retarget onto a key another rule already holds: keys_ has the key, but this rule's live
+    // arm is mapped to a different key. From this key's side it is a first attach, exactly as
+    // when the key is new (the check above). Without this the index-ownership invariant at
+    // step 5 reports it as `other`, a label documented as a defect (found on the flipped rig,
+    // #5719). Non-allocating, so the noexcept contract holds.
+    if (index_->mapped_to_other_key(key, rule_id))
         return std::unexpected(GuardianRebuildReason::FirstAttach);
     const RuleGeneration& live = *rit->second;
     // Health terms first (precedence step 3). The recorded bit depends on an event having been

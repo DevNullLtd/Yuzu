@@ -132,6 +132,16 @@ public:
                it->second.generation == generation;
     }
 
+    /// True IFF `rule_id` is mapped, and to a key other than `spark_key`. Does not mutate and
+    /// does not allocate (unlike key_for_rule). False for an unknown rule and for a rule
+    /// mapped to exactly `spark_key`, so a caller can tell "this rule lives on another key"
+    /// (#5719: a retarget) from "this rule has no mapping at all" (an invariant break).
+    [[nodiscard]] bool mapped_to_other_key(std::string_view spark_key,
+                                           std::string_view rule_id) const noexcept {
+        const auto it = by_rule_.find(rule_id);
+        return it != by_rule_.end() && it->second.key != spark_key;
+    }
+
     [[nodiscard]] bool empty() const noexcept { return by_rule_.empty(); }
     [[nodiscard]] std::size_t key_count() const noexcept { return by_key_.size(); }
     [[nodiscard]] std::size_t rule_count() const noexcept { return by_rule_.size(); }
