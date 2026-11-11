@@ -226,9 +226,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // sqlite_backfill_source's sole purpose was the backfill idempotency marker,
         // which no longer has a writer. Appended at the next free version (3) rather
         // than reusing v2 — v2 (the idempotency-key ALTER above) has actually run
-        // against real dev/UAT databases, and PgMigrationRunner tracks a bare version
-        // integer with no content check, so renumbering an already-shipped migration
-        // makes any database already at v2 re-apply it and fail closed on boot. See
+        // against real dev/UAT databases, and PgMigrationRunner tracks the version
+        // integer (plus, since #7158, a hash of each applied migration's text), so
+        // renumbering an already-shipped migration makes any database already at v2
+        // re-apply it and fail closed on boot. See
         // ADR-0054's Update.
         {3, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
     };

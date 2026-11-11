@@ -163,8 +163,11 @@ Therefore we **coexist, not replace**:
   sources that need fleet-wide queries. `installed_software` is the first;
   future high-query sources get their own typed table in this store. Built per
   the `OfflineEndpointStore` template + ADR-0012 + the postgres-store-playbook:
-  - **Current-state only** (replace on change). No history in central PG —
-    change-history stays an edge/Echo concern (ADR-0004 boundary).
+  - **Current-state only** (replace on change) for the inventory rows. One
+    exception, recorded in the 2026-11-04 Update (schema v11): a per-device
+    install history (`software_changes`, 400 days, clock-guarded prune) is kept
+    in central PG; any wider change-history is an edge/Echo concern (ADR-0004
+    boundary).
   - **Normalized relational rows**, **no JSONB/GIN** — honors the
     "migrate off Postgres easily" constraint. Generic parent
     `inventory_state(agent_id, source, content_hash, first_seen, last_seen)` +
@@ -829,10 +832,10 @@ kind:
 
 | Record | Fields after the kind | Meaning |
 |---|---|---|
-| `S` | `facet`, `status`, `base`, `token`, `duration_ms`, `bytes_read` | opens a section |
+| `S` | `facet`, `status`, `base`, `token`, `duration_ms`, `bytes_read`, `expect` | opens a section; `expect` is the section hash after the agent applies it (64 lowercase hex, mandatory on `delta`, see the SAM-14 entry below) |
 | `+` | `name`, `version`, `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`, `install_location`, *slot 14 (reserved, empty)*, `package_id`, `source` | an install row |
-| `-` | `row_hash` | a deletion by row hash (64 lowercase hex); parsed and validated, applied by a later change |
-| `comp` | `kind`, `name`, `version`, `version_source`, `path`, `size`, `mtime`, `anchor_app` | a component row; `version_source` is one of `filename`, `pom`, `manifest`, `metadata`, `package_json`, `pe`, `elf`, `macho`, `unreadable`; parsed and validated, stored by a later change |
+| `-` | `row_hash` | a deletion by row hash (64 lowercase hex); applied by the SAM-14 delta apply below |
+| `comp` | `kind`, `name`, `version`, `version_source`, `path`, `size`, `mtime`, `anchor_app` | a component row; `version_source` is one of `filename`, `pom`, `manifest`, `metadata`, `package_json`, `pe`, `elf`, `macho`, `unreadable`; stored by the SAM-14 component store below |
 
 `facet` is a `kSoftwareSources` value (the collector source) or `component_inventory`, 1 to 64
 characters of `[a-z0-9_.]`. `status` is `full`, `delta`, `constrained`, `timeout`, `oversize`,
@@ -911,28 +914,20 @@ advisory lock as the v2 replace):
   `last_confirmed_at`, duration, bytes). An honest-empty section deletes the facet's rows.
 - *Status-only.* Upserts status, token, duration, bytes and `enabled` (false only for
   `disabled`). Rows, the stored section hash and `last_confirmed_at` are left alone.
-- *`delta`.* Not applied. Answered with a per-section nack whatever its base: a base that is
-  not the stored section hash is a plain `need_full`, a matching base is counted as
-  `delta_unsupported` and logged (sampled), because delta apply is not built. The agent falls
-  back to a full section, so nothing is lost. The `-` records are parsed and validated here and
-  applied with the delta apply path.
-- *`component_inventory`.* Grammar-validated; its facet state is recorded with an empty section
-  hash (this store holds no component rows), so it never enters the report hash. The nack is keyed
-  on the section's STATUS, not on its record count: every `full` or `delta` component section is
-  answered `need_full`, including an honest-empty `full` one, and only a status-only one is a
-  complete report. An agent that reports the facet `full` therefore resends it on every cycle until
-  the component store lands. That is safe by the delivery order: the server's component apply ships
-  before any agent sends the section, so no fleet is left in the permanent resend.
+- *`delta`.* Applied by the SAM-14 rules in the entry below (row-hash `-` / `+` against the held
+  rows, verified against the agent's `expect`).
+- *`component_inventory`.* Applied by the SAM-14 rules in the entry below: the rows live in
+  `software_components`, the section hash is real and joins the report hash.
 - *Refused sections.* A refused section is skipped before any write, so its previously held
   rows, facet state and section hash stay as they were, and the report hash still includes that
   held section hash. A facet the agent refuses permanently therefore keeps its old rows and is
   nacked `need_full` on every cycle until the agent is fixed (`YuzuInventorySectionIngestRefused`
   alerts on it); this is by design, not a stuck state to repair on the server.
 - *Report state.* `inventory_state` (the report hash and `last_seen`) is written only by a call
-  that wrote at least one section's state: a `full`, a status-only or a `component_inventory`
-  section. A call made up only of `delta` and refused sections is a nack, not a received report:
-  it leaves the hash and `last_seen` alone, and the full section the agent sends on the resend
-  is what advances them.
+  that applied at least one section: a `full`, a status-only, a `component_inventory` or a `delta`
+  that verified. A call made up only of refused, need-full and mismatched sections is a nack, not
+  a received report: it leaves the hash and `last_seen` alone, and the section the agent sends on
+  the resend is what advances them.
 - *Failure.* A SQL failure rolls the whole call back and every section in it that was not
   refused is answered `error` and nacked. A v2 full report additionally deletes the agent's
   `software_facet_state` rows, and `delete_agent` deletes them too.
@@ -946,9 +941,17 @@ v2 canonical hash is unchanged. Slot 14 (`uninstall_string`) stays reserved on b
 operator-tier: machine-scope roots only (ADR-0028), but a root can still name an account's home
 directory, so it is classified like the `list` column above. It is erased on decommission
 (`delete_agent` deletes the rows), and nothing in this change reads it back (no route, tool, page
-or log line carries it). The server stores it as sent after the field step, without minimisation,
+or log line carries it; the first read-back is the 2026-11-09 lookup surface below, which
+re-opens §8 again). The server stores it as sent after the field step, without minimisation,
 so **the agent writer must not send per-user paths**: that precondition is owned by the change
 that starts sending slot 13, which must also test that no profile path is emitted.
+The change ledger (the 2026-11-04 Update, schema v11) keeps a copy for its retention window:
+`software_changes.identity_key` carries the lower-cased location as its last segment for 400
+days, past the hard delete of the `installed_software` row (`delete_agent` removes the ledger
+rows with the device). That is accepted on the writer's requirement not to send per-user paths
+(the precondition above), which the server does not enforce, so the copy is expected to name
+machine-scope roots only; the writer's no-profile-path test covers the ledger copy as well, and
+nothing reads the ledger back.
 
 **`install_type` and `install_scope`.** Both are derived by the server at insert time and are
 never on the wire or in either hash. `install_type` is one of `msi`, `installer`, `store`,
@@ -1006,7 +1009,8 @@ store's `derive_install_keys`) on both insert paths:
   serialisation of that one row). Rows are sorted and de-duplicated before insert, so it is
   unique per agent by construction. It is the value a `-` record names. A partial unique index on
   `(agent_id, instance_key) WHERE instance_key <> ''` enforces it.
-- `identity_key` is `norm_key(name, publisher)`, `0x1F`, `version`, `0x1F`, `arch`, `0x1F`, the
+- `identity_key` is `norm_key(name, publisher)` (an origin label `via:<ecosystem>` in `publisher` reads
+  as no vendor), `0x1F`, `version`, `0x1F`, `arch`, `0x1F`, the
   install location lower-cased with trailing path separators stripped (empty on v2 rows). It is
   stored and **not** unique and not indexed; it is the key a later consolidation step will use.
 
@@ -1038,7 +1042,7 @@ measured query, the `installed_software_name_idx` seek, into a scan of every par
 decision is reversible and is revisited when a measurement exists.
 
 **Observability.** Each section bumps `yuzu_inventory_section_ingest_total{facet,outcome}`
-(`outcome`: `stored`, `status_only`, `need_full`, `delta_unsupported`, `rejected`, `error`; `facet`
+(`outcome`: `stored`, `status_only`, `need_full`, `mismatch`, `rejected`, `error`; `facet`
 is a collector source, `component_inventory`, or `unknown`, never the agent's raw string). The
 apply is timed under `yuzu_inventory_ingest_duration_seconds{source="installed_software",phase="v3"}`,
 and the source-level
@@ -1048,9 +1052,8 @@ labels.
 
 **Hand-off to the delta apply and the agent writer.** Two facts the next changes must carry.
 `instance_key` hashes the row's whole 16-slot record, so adding a slot to that record re-keys
-every stored row once, so the agent writer and the server move together on it. Until the
-delta apply and the component store exist, every `delta` section and every `full` or `delta`
-`component_inventory` section (even one with no records) is answered `need_full`; the agent writer's golden-vector parity
+every stored row once, so the agent writer and the server move together on it. The
+delta apply and the component store are described in the SAM-14 entry below; the agent writer's golden-vector parity
 test must reproduce the section hash, the report hash and the hash membership rule above
 byte for byte, including that a facet whose status moves from `full` to a status-only status
 (for example `disabled`) leaves the report hash while its rows are kept.
@@ -1067,8 +1070,7 @@ read is a status-only section and the rows are kept, so the writer must send `fu
 empty) to retire a facet's rows and not a status. The first v3 call of a device that applies a section also deletes
 all its v2 rows first, so it should carry `full` for every facet it holds.
 
-**Not in this change.** Delta apply and the `-` deletions; storage of component rows; the agent
-writer; any read surface returning the new columns (the existing reads select the old columns
+**Not in this change.** The agent writer; any read surface returning the new columns (the existing reads select the old columns
 only; `find_by_purl` is a store method with no caller).
 
 ### 2026-11-04 — sync-now parameters, the installed-software window, and overdue catch-up
@@ -1140,13 +1142,141 @@ map, and the wire, the KV keys and the heartbeat tags are unchanged.
   daily cycles" staleness threshold of `docs/user-manual/inventory.md`, and the freshness gauge
   keys on server receipt time, so no freshness expectation is weakened.
 
+### 2026-11-04 — `installed_software` blob v3: delta apply, change ledger, component store, retention (schema v11)
+
+The server applies a verified delta section, records what every applied section changed, stores
+the component section, and prunes the ledger, so an agent can be delta-only. Schema v11 adds three
+empty tables; nothing existing is rewritten.
+
+**The `expect` field (a contract revision).** The `S` record has a seventh field after
+`bytes_read`: `expect`, the section hash the agent holds AFTER applying the section (64 lowercase
+hex). A `delta` section without a valid `expect` is refused `bad_record`; a `full` or status-only
+section ignores it (the server recomputes a full section's hash from its rows). The field is
+mandatory for `delta`, and the agent writer of the same build emits it. Like every other record
+field it follows the parse rules above: a record holding a NUL byte refuses its section (`nul_byte`,
+which covers the `S` record and so `expect`), and an `S` record cut off before its terminator fails
+the whole blob. It is the only per-section check the server has that its apply produced the
+agent's row set.
+
+**Delta apply.** Each full or delta section runs inside its own `SAVEPOINT`; a section that does
+not verify is rolled back alone and the others of the call still apply.
+
+- The facet must be held with status `full` or `delta` and a section hash equal to the delta's
+  `base`; anything else is `need_full` and writes nothing (a facet last reported status-only is
+  not a valid base).
+- The `-` set is ONE statement: `DELETE ... WHERE agent_id AND source AND instance_key =
+  ANY(...) RETURNING ...`. The rows returned must equal the UNIQUE `-` count (an agent may repeat a
+  hash); fewer means the agent's base is not what the server holds.
+- The `+` rows are inserted with the same batched statement as a full section. A collision on
+  `installed_software_instance_idx` is a producer defect, not a fault.
+- The facet's rows are re-read and their section hash must equal `expect`.
+- Any of these failing is `mismatch`: the savepoint is rolled back, the facet keeps its held rows and hash, and it is
+  nacked so the agent resends it in full. A genuine SQL fault still rolls the whole call back.
+- A facet that would hold more than the per-call cap (20,000 rows or components) after the apply is
+  `mismatch` too: the cap bounds the records one call carries, and this check bounds what deltas
+  can accumulate.
+- On success the facet state is `delta` with `expect` as its section hash and the report hash is
+  recomputed.
+
+**Change ledger (`software_changes`).** Every applied installed-software section (a component
+section writes none) writes one row per install, remove
+or upgrade, in the same transaction (one `unnest()` statement per section). `observed_at` is the
+replica's own server clock in whole seconds (not the database clock) and, with `agent_id`, groups
+the rows of one apply call: calls for an agent are serialised by its advisory lock, but two calls
+inside the same second share an `observed_at`, so rows are ordered by `change_id` within a group.
+A row's identity is its `instance_key`, stored on the ledger row. The rows come from a pure
+diff: removed = held-not-new, added = new-not-held, keyed by `instance_key`. A row's version is
+the (`epoch`, `version`, `release`) tuple, so a release-only or epoch-only change (a distribution
+backport, a Flatpak commit) is an update. Within one identity stem (`identity_key` with its
+version segment blanked) both sides are sorted by (tuple, `instance_key`): a removed and an added
+row with an EQUAL tuple pair first and write no row (install_date, signature, a location
+spelling that normalises equal, or a publisher that normalises equal, which includes one origin
+label for another); the rest pair k-th to k-th in tuple order as one
+`upgrade(from, to)` each; leftovers are `remove` and `install`. `from_version` and `to_version`
+hold `[epoch:]version[-release]`, non-empty parts only (the `:` follows a non-empty epoch, the
+`-` joins a release to a non-empty version, so a Flatpak row reads as its commit), in the
+existing text columns. A version is compared as written, so a row whose version could not be read
+(an empty version, which the collector reports when a Chocolatey package's nuspec cannot be read,
+for example when the `lib` directory is a junction) moves to or from a real version as an
+`upgrade` with an empty side, provided the row has no epoch or release either. The writer must
+also keep the spelling of `arch`, the install location and the vendor stable from one sync to the
+next: a row whose `arch`, or whose location beyond ASCII case and trailing separators, or whose
+vendor beyond what the vendor normaliser reads as equal, changes is a removal and an install, not
+an update. An origin label (`via:<ecosystem>`) reads as no vendor, so one label for another is no
+event, while a source that starts or stops declaring a vendor changes the vendor.
+**There are no tombstones on `installed_software`**: a removal is a hard
+delete plus a `remove` row carrying name, publisher and that version text, so no read needs a
+`removed_at` filter.
+
+**Baseline rule.** A `full` section is a BASELINE (rows written, no ledger rows) unless the
+server HOLDS the facet's rows. A facet is held when its state has a non-empty section hash, its
+status is not `disabled`, and the stored rows hash to that section hash. A baseline is therefore a
+device's first contact for the facet (including the first v3 call that applies a section, which
+deletes the device's v2 rows), a facet that has received only status-only sections (that creates a
+facet state with no hash), a facet switched off and then on (a status-only section over a
+`disabled` facet clears its stored hash, so a timeout following the switch-off does not turn the next
+full into a diff), and a facet whose stored rows do not hash to its section hash (an out-of-band
+delete or a partial-table restore; no product path produces one), which is baselined with a
+warning so a missing row is never recorded as a phantom `install`. The warning is the only signal
+of that last case: no counter or alert counts it, because no product path produces it. Changes made
+while a facet is disabled are never recorded, by design. A held facet's rows are in the table (a
+status-only section leaves them in place), so its full section is diffed against them: a timeout
+followed by a full carrying an upgrade writes one `upgrade`, and an honest-empty full followed by
+a populated one writes the installs.
+
+**Components (`software_components`).** The component table lives in this store's schema, owned
+by `SoftwareInventoryStore`, because a component section is applied in the same transaction as
+`software_facet_state` and the report hash and ADR-0012 §3 forbids a second store writing across
+the schema. Primary key `(agent_id, kind, path_hash)`, `path_hash` = SHA-256 of
+the exact path bytes. A component canonical record is `kind US name US version US version_source
+US path US size US mtime US anchor_app RS`; a row hash is the SHA-256 of one record (the value a
+`-` names); the section hash is the SHA-256 of the records sorted by those fields (size and mtime
+numerically) and de-duplicated. A full section deletes the agent's components then inserts
+(`first_seen` = the time the row was written); a delta deletes by
+`row_hash`, inserts, and verifies `expect`, and does not touch the rows it does not name; every `-`
+must name a held row, else the section is a mismatch and rolls back. Freshness
+of a delta-maintained facet is `software_facet_state.last_confirmed_at`, not a per-row column.
+An honest-empty full
+deletes the rows. A repeated `(kind, path)` inside one section is a producer defect: `mismatch`.
+That includes two components of one kind with an empty path, and it holds for a `full` section
+too: the resend repeats the pair, so the facet is answered `mismatch` on every cycle and none of
+it is stored until the writer sends each path once. It does not repair itself.
+
+The component writer is held to the same precondition as slot 13: `path` and `anchor_app` are
+stored as sent, the server does not enforce it, so the writer must not send per-user paths.
+
+The facet now carries a real section hash and enters the report hash. A row a delta removes is
+hard-deleted with no history row: component change history is out of scope. Components are
+current-state, bounded to the per-call cap per device by the post-apply check above, and die with
+the device, so they have no prune.
+
+**Retention.** `run_retention_prune_changes` prunes `software_changes` through the shared
+clock-guarded helper (all seven parts, `docs/clock-guarded-retention.md` register): 400-day window
+in epoch seconds, a missing anchor declines, 50,000 rows per pass, ticked hourly beside the
+deployment prune. The rows are stamped by the replica's clock while the cutoff reads Postgres
+`now()`: the two clock domains are split, which the 400-day window absorbs (the register records
+why). `decommission` (`delete_agent`) removes an agent's ledger and component rows.
+
+**Observability.** `yuzu_software_changes_total{kind}` counts ledger rows by kind (a baseline
+counts none); its closed `kind` set (`install`, `remove`, `upgrade`) is created at 0 at boot beside
+the section counter's series. `YuzuInventorySectionDeltaMismatch` (warning, `for: 1h`) watches
+`outcome="mismatch"`. A device reports about once a day, so a `rate()` over a short window
+never holds for an hour; the rule reads `increase(...[1d])` and needs both at least 5 `mismatch`
+sections for a facet and more than 5% of that facet's sections. An isolated mismatch (an agent
+restored from a snapshot, a report racing a decommission) is expected and does not fire it; the
+agent resends the facet in full, which repairs a delta that went out of step; a component section
+that repeats a `(kind, path)` does not repair itself (above).
+
+**Not in this change.** The agent writer (it must emit `expect` and mirror the component hashes);
+any read surface for the ledger or the components.
+
 ### 2026-11-04 — `device_ci` read surface on REST and MCP (H.7)
 
 `GET /api/v1/hardware/{id}` and the MCP tool
 `get_hardware_ci` serve the expanded record behind the fail-closed `inventory.device.ci` audit.
 The chassis, board and DIMM serials and the machine-id hash (with its algorithm and source) are
-served. Section rows are served only for the `ok` and `constrained` levels; a section at any other
-level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
+served. Section rows are served only for the `ok` and `constrained` levels, except a section withheld
+for an integrity mismatch (below); a section at any other level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
 snapshot (`get_device_ci_with_sections`), so the scalars and the rows are the same replace
 generation. A failed read of the sections is a `503` on REST and a retryable error on MCP
 (`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections
@@ -1157,8 +1287,8 @@ nullable): the number of child rows the full replace actually inserted for it, t
 the same transaction and never from the agent. The read side compares it with the rows it reads in the
 same snapshot; if they differ (child rows lost outside the product, for example a partial single-table
 restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason
-`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the
-rows that were read are still served.
+`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and its
+rows are withheld (`rows: []`; #7165, owner ruling 2026-11-09).
 
 The status row also records `content_digest` (the same migration v3, additive and nullable): the
 SHA-256 of a canonical, length-prefixed serialization of the section's rows (section kind, column
@@ -1177,7 +1307,7 @@ alarm on every stored row. (A column change also needs its own ALTER migration; 
 read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
 row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
 and `complete: false` with reason `server:content_digest_mismatch`, appended after any existing
-reason. The rows that were read are still served, but they are not the values the agent reported. A
+reason. Its rows are withheld (`rows: []`; #7165), because they are not the values the agent reported. A
 lost row is reported by the count token alone, since it changes the digest too. This is an integrity
 check against accident and non-malicious drift, not tamper resistance: anyone able to write the child
 tables can also rewrite the digest column, and the digest covers the rows only, not the section's
@@ -1314,3 +1444,101 @@ build sends no settings to agents.
   a window only at a whole-day interval of 24 hours or more in whole days, apply the IANA zone, honour
   the per-collector switch, and reject any setting it cannot honour, then report the effective version
   it applied. Until the push lands the settings have no effect on any agent.
+
+### 2026-11-09 — the lookup read surface: v3 columns, components, and totals (SAM-17, schema v12)
+
+**Decision.** The first read surface that returns the v3 columns. `GET /api/v1/inventory/software`
+rows gain `hostname`, `last_seen`, `status`, `last_confirmed_at`, `install_type`, `install_scope`,
+`install_location` and `instance_key`, and a new `GET /api/v1/inventory/software/components`
+reads the component store (`software_components`, schema v11) the same way. One call answers
+the lookup question for an application or a component: how many installs, on which devices,
+polled when, in what state.
+
+- **Row status.** `status` is derived from the row's own collection facet (`software_facet_state`
+  for the row's `source`; `component_inventory` for a component) by ONE rule: `disabled` when the
+  facet is switched off, `current` when it last reported a `full` or `delta` section, `unconfirmed`
+  otherwise, including a device with no facet record. The rule is one SQL fragment
+  (`kRowStatusCaseSql`) used by the reads, the status filter, the rollup and the live totals, and
+  its C++ twin is pinned equal to it by a test over every (status, enabled) pair. An unconfirmed
+  row may be stale or missing and is never proof of absence; it is returned by default.
+- **Totals.** `totals` is `{installs, devices, as_of}` (components: `{instances, devices,
+  devices_unconfirmed, as_of}`). `installs` and `instances` count install ROWS everywhere (a
+  device with two architectures counts twice), `devices` distinct devices, so a rollup-served and a
+  live figure agree on one definition. Application totals come from the hourly catalogue rollup
+  (the name-only grain, which gains a `row_count` column) unless a version filter is present, in
+  which case they are ONE live aggregate over the version set (never a sum of per-version distinct
+  counts). Component totals come from a new hourly `component_rollup` (one row per kind and name,
+  refreshed by the existing rollup thread with its own advisory lock and keep-last-good), or are
+  live for a version filter or no kind. Totals are served only to an unfiltered caller for an
+  exact name; ADR-0017 records why a confined caller gets rows and `totals_omitted: "scope"`.
+- **Version range.** `version_min` / `version_max` resolve against the title's distinct versions
+  within the caller's scope (the gate's `VisibleSet` pushed into the read; an unfiltered caller
+  reads the fleet) under the catalogue comparator into a version set, for every caller; a title
+  at the 2000-version read cap in that scope is refused. The set is a predicate only. The distinct
+  versions are read LIVE (`installed_software` for a title, `software_components` for a component,
+  5 s bounded, the name indexes), never from the hourly rollups: a rollup lacks a version first
+  reported since its last refresh, which would drop that version from the set and serve a live,
+  exact-looking zero for software that is installed. The scope is pushed into this read for the
+  same reason the totals are withheld (ADR-0017): a fleet-wide cut would make the refusal a fact
+  about devices the caller cannot see, so a confined caller is answered for a title with 2000
+  versions outside its scope exactly as for an unknown title.
+- **Schema v12.** `catalog_rollup.row_count` (constant default, metadata-only; the migration also
+  sets the catalogue stamp back to `building` so no reader sees a zero row count beside a non-zero
+  device count), the two component rollup tables, and `software_components_name_idx`. The index is a plain `CREATE INDEX` in the ladder transaction:
+  `software_components` is empty in every deployment until an agent emits component rows (the
+  server apply path is live, the producer ships later), so the build holds its lock for no
+  measurable time.
+- **Component rollup ceiling (recorded, not fixed here).** `refresh_component_rollup` is one
+  `GROUP BY kind, name` with a `count(DISTINCT agent_id)` over `software_components`: measured at
+  44-47 s for 8.8M component rows (en_US collation, 4 MB and 64 MB `work_mem` alike), so it meets
+  the flat 60 s statement limit near 11M rows (about 1M devices with 10 components each); past
+  that the first refresh never completes and the kind-and-name totals stay `building`
+  (keep-last-good; rows and live totals are unaffected). Latent today: the table is empty until
+  the component producer ships (SAM-40). A per-(kind, name, agent) pre-aggregate ran the same
+  refresh in 8.2 s and is the recorded upgrade path.
+- **Recorded limits of the lookup surface (recorded, not fixed here).** (1) The live
+  version-set totals and the version-range reads (`installed_software_version_set_totals`,
+  `installed_software_distinct_versions`, `component_versions`) run under the 5 s statement
+  bound with no in-flight bound of their own (`/crypto` has one): about 3 requests per second
+  of 5-second reads can pin a 16-connection pool, which audit and revocation share; the figure
+  is 5 s divided by 16 leases, not measured. On a title above about 5M rows the live read times
+  out every time, so that `503` is deterministic and retrying does not clear it (the rows are
+  still served by paging or export). (2) The range read pushes the caller's whole scope as one
+  array with no `kScopePushdownMaxIds` cut (a cut distinct set cannot be post-filtered without
+  re-leaking the fleet property), so a confined caller with 100k or more devices sends a
+  multi-MB parameter per range request and the same 5 s bound caps it; cost at 100k and 500k
+  ids is unmeasured. (3) Rollup alerting shares the catalogue rollup's pattern: a peer holding
+  the advisory lock makes a replica's refresh a skip that counts as success and stamps the
+  liveness gauge, so replicas whose tick offsets alternate the lock winner, each timing out,
+  keep both `YuzuInventoryComponentRollup*` rules quiet while the totals age; a worker that
+  never started exports no series at all, and a throw in the catalogue leg (none expected, the
+  store returns bool) skips the components leg with no `error` increment. (4) The wide-scope
+  cursor's `skip` reaches `OFFSET` on the unbounded installs page read and a forged value can
+  hold a pool lease to the 30 s statement timeout; this is the pre-existing `read_devices_page`
+  behaviour moved verbatim into `read_scoped_page` (base `software_catalogue_model.cpp:865` and
+  `software_inventory_store.cpp:2268`), not introduced here. (5) A maximum-width CSV export
+  (1024-byte fields in 22 columns, 10,000 rows) can reach about 200 MB per request by cap
+  arithmetic; the measured exports used typical rows. Each is a candidate issue; none changes a
+  served figure.
+- **§8 re-opened for the first read-back of slot 13 and the component path.** `install_location`
+  (and a component's `path` and `anchor_app`) is served by both routes and their CSV exports to
+  every caller the gate admits with `Inventory:Read`; a confined caller sees only the paths of its
+  own rows, and a service-scoped token only those of its service's devices. Classification is
+  unchanged (operator-tier, a machine-scope path that can still name an account's directory, the
+  `list` column's class); retention is unchanged (erased with the device by `delete_agent`, kept
+  lower-cased in `software_changes.identity_key` for 400 days). The server cannot minimise the
+  value at read or store time without breaking the v3 hash agreement, so the control for
+  `install_location` is the agent writer's allowlist: the agent-side blob-v3 writer
+  (`installed_software_v3.cpp`, delivered by the sibling SAM-15 change, which lands before this
+  surface is read) keeps a location only under a machine root (`kMachineRoots`) and blanks every
+  other path, fail closed, and tests that no profile path is emitted. A component's `path` and
+  `anchor_app` carry NO allowlist yet: the component writer only clamps them
+  (`component_normal_form`), and the SAM-40 producer must apply the same machine-root allowlist
+  with a no-profile-path test before it populates them. This read surface therefore depends on
+  the SAM-15 writer shipping alongside it; until it does, no agent sends slot 13 or component
+  rows and both fields are empty. An agent that does not apply the allowlist (older, forked or
+  hostile) can place a per-user path here; the row is still served as sent, which the manual
+  states beside the field.
+- **Not changed.** The MCP `query_installed_software` rows keep their 14 fields; the twin is a
+  later change (recorded in `docs/api-parity-ledger.md` and as the 2026-11-09 entry of the
+  ADR-1005 exception ledger, revisit by 2026-12-31).

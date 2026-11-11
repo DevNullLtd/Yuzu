@@ -873,13 +873,16 @@ groups:
       # READS: op="session_lookup" (HA WS-5 batched session_id resolution) and
       # op="cluster_affinity_check" (#4669). Same counter, same pool-health
       # root cause, so one rule covers reads and writes.
-      # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
-      # fresh-registration branch returns UNAVAILABLE on this); the other
-      # five writer SITES (announce_connected, both ProxyRegister renew
-      # branches, BatchHeartbeat's renew, deregister) — which collapse to
-      # three fail-OPEN `op` label values (announce_connected, renew_leases,
-      # deregister; see the label set in docs/user-manual/metrics.md) — are
-      # deliberately fail-OPEN, so a rate here can mean silent directory drift even with
+      # The fail-CLOSED sites (the RPC returns UNAVAILABLE) are ProxyRegister's
+      # fresh-registration branch (`op="register_fresh"`) and both of its
+      # replay-adopt branches (`op="renew_leases"` and
+      # `op="reclaim_tombstoned_session"`). The four writer SITES —
+      # announce_connected, BatchHeartbeat's renew_leases, deregister and the
+      # adopted-session set_legacy_echo_wire_name flag refresh — are
+      # deliberately fail-OPEN and use the `op` label values announce_connected,
+      # renew_leases, deregister and set_legacy_echo_wire_name (see the label
+      # set in docs/user-manual/metrics.md), so a rate here can mean silent
+      # directory drift even with
       # no visible RPC failure. INITIAL / conservative threshold — no fleet
       # background-rate data exists yet to tune against (same lesson as the
       # #913 OTA-bounds alert thresholds, the single largest source of
@@ -919,7 +922,12 @@ groups:
             announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
             NULL) — lease renewal does NOT repopulate placement, so it does NOT
             self-heal on the lease TTL and needs another CONNECTED / agent
-            re-registration to restore routing. op="session_lookup" is the
+            re-registration to restore routing. op="set_legacy_echo_wire_name"
+            (an upgrade-window shim) leaves the row's legacy plugin-name flag
+            stale: nothing repairs it until that agent registers fresh or is
+            adopted again, and until then a directory-routed Echo dispatch to
+            it is written under the wrong plugin name and the agent answers
+            plugin_not_found. op="session_lookup" is the
             batched READ that resolves gateway session ids (HA WS-5): while it
             fails, BatchHeartbeat is fail-SOFT (locally hinted pairs are still
             acked and renewed, unreadable ids with no local hint are neither
@@ -5831,11 +5839,13 @@ groups:
             self-healing; check release notes for a recent contract change before
             treating this as an incident. A sustained ratio with no such change
             suggests hash drift or agents stuck in a resend cycle. Blob-v3 agents
-            add one more source of need_full until the server can apply deltas and
-            store component rows: every delta section and every full or delta
-            component_inventory section (even one with no records) is answered
-            need_full, so a fleet of v3 agents reporting deltas or the component
-            facet raises this ratio without any hash drift.
+            add one more source of need_full: a delta section whose base the server
+            does not hold (for example after a restore from backup, or after the
+            facet was last reported as a status-only section) is answered need_full
+            and the agent resends that facet in full. A delta or component section that
+            did not verify is answered need_full too, so it raises this ratio; its own
+            per-section count and alert are outcome=mismatch and
+            YuzuInventorySectionDeltaMismatch.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventorySectionIngestRefused
         # Blob v3 (ADR-0016 Update 2026-11-04): a section the server refuses is nacked
@@ -5843,9 +5853,10 @@ groups:
         # still apply. outcome=rejected is a GRAMMAR refusal: the agent resends the same
         # bytes and never self-heals, so it is its own alert; a refused section also counts
         # toward YuzuInventoryHighNeedFullRatio (it is answered need_full), but that ratio
-        # alone cannot say that the cause is a grammar break. outcome=delta_unsupported is NOT here: it is the
-        # expected placeholder until the delta apply is built, so it has its own
-        # non-paging rule (YuzuInventorySectionDeltaUnsupported) below.
+        # alone cannot say that the cause is a grammar break. outcome=mismatch is NOT here: a
+        # delta or component section that did not verify is rolled back and the agent resends in
+        # full, which repairs a delta that went out of step; it has its own rule
+        # (YuzuInventorySectionDeltaMismatch) below.
         # increase over a day with NO hold (the YuzuCertInventoryReportsRejected shape): one
         # refused section per sync cycle is enough, and a rate()-with-for would never fire for a
         # low-cadence refusal. The series are pre-seeded at 0 (seed_section_ingest_series), so the
@@ -5869,24 +5880,49 @@ groups:
             is the exception: the server does not know the facet name, which is a
             version-skew incident to fix by reprovisioning matching builds.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
-      - alert: YuzuInventorySectionDeltaUnsupported
-        # The expected honest placeholder until the delta apply is built (the agent falls
-        # back to a full section, nothing is lost). Info severity, so it never pages: it keeps
-        # the rate visible and is the reminder to retire this rule when the delta apply lands.
+      - alert: YuzuInventorySectionDeltaMismatch
+        # A delta or component_inventory section that did not verify is rolled back alone
+        # (the facet keeps its previously held rows and hash) and nacked, so the agent
+        # resends that facet in full, which repairs a delta that went out of step. An isolated
+        # mismatch is expected (an agent restored from a snapshot, a report racing a
+        # decommission) and must not page; a SUSTAINED one means the agent's section writer and
+        # the server disagree about the row set (a contract defect) and the fleet is quietly
+        # paying for full resends. A component section that repeats a kind and path (two
+        # components of one kind with an empty path among them) fails on every resend and does
+        # not repair itself. A device reports about once a day, so a rate() over a short window
+        # never holds for 1h: this reads a day of increases, which stays over the threshold
+        # for hours once crossed. Both clauses must hold: at least 5 mismatches AND more than
+        # 5% of the facet's sections, so a large fleet's background noise does not fire it.
         expr: |
-          sum by (facet) (rate(yuzu_inventory_section_ingest_total{outcome="delta_unsupported"}[15m])) > 0
+          (
+            sum by (facet) (increase(yuzu_inventory_section_ingest_total{outcome="mismatch"}[1d])) >= 5
+          )
+          and
+          (
+            sum by (facet) (increase(yuzu_inventory_section_ingest_total{outcome="mismatch"}[1d]))
+            > 0.05 * sum by (facet) (increase(yuzu_inventory_section_ingest_total[1d]))
+          )
         for: 1h
         labels:
-          severity: info
+          severity: warning
         annotations:
-          summary: "Installed-software v3 deltas answered with a full-section request"
+          summary: "Installed-software v3 deltas failing verification"
           description: >-
-            yuzu_inventory_section_ingest_total{outcome="delta_unsupported"} has been
-            non-zero for 1h for the facet label. A delta section whose base matched was
-            answered need_full because this server cannot apply deltas yet; the agent
-            falls back to a full section. Expected while v3 agents ship ahead of the delta
-            apply, so no action is needed; it is a runbook item only if it persists once
-            the delta apply has shipped.
+            yuzu_inventory_section_ingest_total{outcome="mismatch"} increased by at least 5
+            in the last day for the facet label and is more than 5% of that facet's
+            sections, for 1h. A delta or component section named a row the server does not
+            hold, added a row whose key collides with a held one, would leave the facet over
+            the per-call record cap, repeated a component kind and path (two components of
+            one kind with an empty path among them), or left the facet with a section hash
+            other than the agent's own post-apply hash, so the server rolled that section
+            back and asked for a full one. The full section the agent sends in answer repairs
+            a delta that went out of step. A repeated component kind and path is the
+            exception: it fails on every cycle and does not repair itself, and the fix is in
+            the agent's component writer. A persistent share means the agent and server
+            disagree about the row set: grep the warn-level "did not verify" server line
+            for the agent_id (that line is sampled, about 1 in 100, so the search can
+            come back empty even while mismatches are happening) and compare the agent's
+            writer against the server's canonical section hash.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryDroppedBlobs
         # outcome=dropped = a blob over the 3 MiB cap, or a blob-v3 blob that cannot be
@@ -6017,8 +6053,10 @@ groups:
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
         # reason = store_not_open | pool_acquire_timeout | query_error, plus
-        # admission_full (source=installed_software or ca_issued): a /crypto read
-        # refused by its per-process in-flight bound BEFORE any store call. The
+        # sections_query_error (source=device_ci: the hardware record read answered but its
+        # sections did not) and admission_full (source=installed_software or ca_issued):
+        # a /crypto read refused by its per-process in-flight bound BEFORE any store call.
+        # The
         # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)
         # reads count here too; ca_issued has its own longer-held alert below. Sustained for 5m
         # that is saturation of the bound (a poll storm or slow summary reads), which
@@ -6045,7 +6083,11 @@ groups:
             fleet vulnerability query ("which devices run <CVE>") reads as degraded,
             NOT "installed nowhere" - do not trust a zero-result inventory answer while
             one of those fires. admission_full is a shed: a refused /crypto read is an
-            error response, never a zero-result answer. A source=installed_software
+            error response, never a zero-result answer. sections_query_error
+            (source=device_ci) means the hardware record read answered but its v2
+            sections did not, so the REST record route answered 503 (the MCP tool, a
+            retryable error): check yuzu_pg_* and the DeviceInventoryStore warning in
+            the server log. A source=installed_software
             query_error that fires together with YuzuInventoryCatalogRollupStale or
             YuzuInventoryCatalogRollupFailing is the /crypto live name scan exceeding
             its 5s bound (too many distinct package names): retrying will not help, fix
@@ -6567,6 +6609,56 @@ groups:
             (yuzu_inventory_catalog_rollup_duration_seconds vs the 60s budget).
             While it fires, /crypto reads its package names live (slower) if the shared
             catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryComponentRollupStale
+        # The software components rollup (component_rollup, the totals of
+        # GET /api/v1/inventory/software/components; SAM-17) rides the catalogue rollup thread
+        # on the same hourly, completion-spaced cadence, so this is the
+        # YuzuInventoryCatalogRollupStale shape: the gauge is seeded to 0 at thread start, the
+        # `> 0` guard skips that "building" window (a refresh that has never succeeded is the
+        # Failing rule's case below), and 7200 is twice the cadence.
+        expr: |
+          (time() - yuzu_inventory_component_rollup_last_success_timestamp) > 7200
+          and yuzu_inventory_component_rollup_last_success_timestamp > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software components rollup is stale"
+          description: >-
+            The components rollup has not refreshed in over 2h (cadence is 1h). Keep-last-good is
+            serving an aging rollup: the `as_of` of the components totals ages and recent
+            component changes are not counted. Check
+            yuzu_inventory_component_rollup_total{outcome="error"} and the SoftwareCatalogRollup
+            thread log (Postgres outage, or the single GROUP BY over software_components past its
+            60s statement limit at scale; the recorded upgrade path is a per-(kind, name, agent)
+            pre-aggregate). Rows and version-filtered totals are live and unaffected.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryComponentRollupFailing
+        # The never-succeeded / ongoing-failure case the Stale rule's `> 0` guard skips. The
+        # refresh is HOURLY and adds ONE error increment per failed tick, so this is the
+        # YuzuSoftwareNormalizationFailing shape below (increase()[3h] >= 2, for 10m: two failed
+        # ticks within 3h fire, one isolated failure stays quiet, and a sustained outage at a
+        # period a little over an hour stays firing), not the rate()[15m] of
+        # YuzuInventoryCatalogRollupFailing, whose window ages an hourly increment out before its
+        # hold elapses. Both outcome series are seeded at 0 when the thread starts, so the first
+        # failure is already an increase.
+        expr: |
+          sum by (instance) (increase(yuzu_inventory_component_rollup_total{outcome="error"}[3h])) >= 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software components rollup refreshes are failing"
+          description: >-
+            Two or more hourly components rollup refreshes failed within 3h. If
+            yuzu_inventory_component_rollup_last_success_timestamp is still 0 the rollup has never
+            populated and the components totals read "building"; otherwise they are frozen at the
+            last good rollup (its `as_of` ages). Investigate Postgres availability and
+            yuzu_inventory_component_rollup_duration_seconds against the 60s statement limit (the
+            single GROUP BY over software_components meets it near 11M rows; the recorded upgrade
+            path is a per-(kind, name, agent) pre-aggregate). Rows and version-filtered totals are
+            live and unaffected.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuSoftwareNormalizationStale
         # The title normalisation job (SoftwareNormalizationJob) ticks hourly (after a full
@@ -7868,6 +7960,90 @@ groups:
             boot log line says which. Make the data directory writable
             (one persistent data directory per replica; an ephemeral one makes
             the mechanism inert).
+
+  - name: yuzu-echo
+    # No alert on the echo.status registry_* keys yet (no fleet gauge); decision and follow-up in
+    # docs/observability-conventions.md (#6521).
+    rules:
+      # The gauge counts agents once per sweep, so a rise is a net rise in the agents reporting a
+      # quarantine history, not an event count (limits spelled out in the description). It is a gauge, so `delta`, not `increase`: an
+      # agent that leaves and returns takes the count down and back up, and `increase` would
+      # read the return as a rise. `for: 0m`: a rise is an event, a sustained condition would
+      # never clear. Warning, not critical: the value is agent-self-reported inside the
+      # heartbeat trust boundary, so one forged or buggy agent can raise it.
+      #
+      # THE RESTART GUARD. The server publishes the gauge every sweep, 0 included, over agents
+      # with a live heartbeat, so a restarted replica starts at 0 and ramps back to N as agents
+      # reconnect. About an hour later the 1h window start slides into that ramp and
+      # `delta(...[1h]) > 0` fires with no new corruption (the same happens on a series younger
+      # than 1h). `unless ... (yuzu_server_uptime_seconds < 3900)` suppresses the rule for the
+      # first 65 minutes of a replica's life: the 1h window plus a 5 minute reconnect ramp. A
+      # real rise stays visible to `delta[1h]` for an hour, so the guard loses a rise inside the
+      # first ~5 minutes of a boot and delays one later in the first 65. If agents take longer than 5 minutes to
+      # reconnect, the tail of the ramp can still leak. An absent uptime series suppresses
+      # nothing. The join is `on (job, instance)` because the guard is about one replica's own
+      # uptime (both series must come from the same scrape job and target, as the shipped scrape
+      # config does; otherwise the guard silently never matches): any label a scrape attaches to only one of the two series would otherwise
+      # defeat the join and silence the guard, and `on (job)` alone would let a young sibling
+      # replica silence an old one (pinned by the two-replica case). The 1h any-rise threshold
+      # is the #5065 starting default, not sized from fleet data.
+      - alert: YuzuEchoDbCorruptionDetected
+        expr: |
+          delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
+            unless on (job, instance) (yuzu_server_uptime_seconds < 3900)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The count of agents with a quarantined Echo database rose in the last hour"
+          description: >-
+            At least one more agent than an hour ago reports that its Echo database failed its
+            integrity check and was quarantined. This is a net rise in the agents reporting a
+            quarantine history, not an event count: the gauge counts agents once per sweep, so an
+            agent returning from offline with an old quarantine raises it, a repeat quarantine on
+            an agent already counted does not, and an agent leaving in the same window can mask
+            one arriving. A rise seen while the reporting replica has been up under 65 minutes is
+            held until the guard lifts. A failover, a rolling upgrade, agents returning after a
+            site or gateway outage, or ordinary endpoint churn can all raise it with no new
+            corruption, once per replica that gains agents; treat it as a ticket, not a page. The
+            signal is agent-self-reported, so one agent can raise or mask it; the
+            echo.db.corruption_quarantined audit rows name the affected agents but corroborate
+            rather than prove it.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
+
+      # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the
+      # description carries the Echo remedy. The plugin label is agent-supplied: agent-minted
+      # names can push a real plugin past the 64-name cut into plugin="other" (server fix tracked
+      # separately). The family is absent-not-zero, so a clean fleet
+      # returns no series and the rule stays quiet (max_over_time over an absent series is
+      # absent too).
+      #
+      # Same expression and effects as YuzuDedupStoreDegraded (#3663,
+      # docs/observability-conventions.md); do not widen the window.
+      - alert: YuzuPluginInitFailed
+        expr: |
+          sum by (job, plugin) (max_over_time(yuzu_fleet_plugin_init_failed[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "About {{ $value }} agent(s) report plugin {{ $labels.plugin }} failed to initialise"
+          description: >-
+            For more than 10 minutes, about {{ $value }} agent(s) (summed across core replicas,
+            so a failover can count one twice for a few minutes) have reported that plugin
+            {{ $labels.plugin }} failed init (heartbeat tag yuzu.plugins_failed); it is loaded
+            but not running, as distinct from not installed. plugin="other" is the sum over
+            plugins past the first 64 names the server labels per sweep; the agent log names
+            them. The runbook link is the Echo upgrade note; for any other plugin the agent log
+            is the source. For plugin="echo" the usual causes are a failed tar.db adoption after
+            the rename (including a sidecar present under both names) and a corrupt echo.db that
+            could not be moved aside; the upgrade notes cover adoption under 'Two cases the
+            agent refuses, and what to do', and the corrupt-database case is under
+            Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack
+            of free space is not counted here (#7290). The value and the plugin label are
+            agent-self-reported: agent-minted names can displace a real plugin into
+            plugin="other", so the label is not authoritative.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
 
   - name: yuzu-web-writes
     # Cookie-session requests refused by the pre-routing same-site gate

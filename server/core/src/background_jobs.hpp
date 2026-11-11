@@ -43,8 +43,8 @@
 /// `command_capability.hpp` ExecuteGate precedent): all FencedLeaderOnly and
 /// DisabledUntilFixed passes (schedule/policy/quarantine dispatch, ca.publish_crl,
 /// nvd_sync, the concurrency reconciler), plus the load-bearing ReplicaSafe ones —
-/// the event-outbox poll, the four retention prunes, the app_perf rollup upsert, the typed-source purge,
-/// and the MUST-run-per-replica / shared-PG-writing passes found by the sweep
+/// the event-outbox poll, the five retention prunes, the app_perf rollup upsert, the
+/// typed-source purge, and the MUST-run-per-replica / shared-PG-writing passes found by the sweep
 /// (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
 /// projector, MCP bridge sweep + session gc, store-worker delivery pools, the
 /// HA WS-8 Postgres reachability probe). This
@@ -94,16 +94,17 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (50 passes). Verified against the source sweep
+/// The exhaustive inventory (51 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
 /// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29, the #5678
 /// addition of `offline_endpoint_store.run_retention_prune`, 2026-10-12, and the #5513
 /// addition of `guardian_reconcile_gate.sweep`, the 2a-1b addition of
-/// `inventory_store.purge_typed_sources`, and the SAM.4 addition of
-/// `software_normalization_job.run_tick`, and the #2146 addition of
-/// `workflow_engine.refresh_table_size_metrics`); keep the count
+/// `inventory_store.purge_typed_sources`, the SAM.4 addition of
+/// `software_normalization_job.run_tick`, the #2146 addition of
+/// `workflow_engine.refresh_table_size_metrics`, and the SAM-14 addition of
+/// `software_inventory_store.run_retention_prune_changes`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -200,6 +201,10 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"offline_endpoint_store.run_retention_prune", "preflight_runner_thread_",
      BackgroundJobClass::ReplicaSafe,
      "clock-guarded + advisory lock (#5678 / #1545 UP-4); piggybacks the preflight thread"},
+    {"software_inventory_store.run_retention_prune_changes", "preflight_runner_thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "clock-guarded + pg_try_advisory_xact_lock, PG now() in-SQL (SAM-14); piggybacks the "
+     "preflight thread"},
 
     // ---- policy_eval_thread_ (10s tick) — tick() SPLITS into two passes (PR #4134) ----
     {"policy_evaluator.collect_ready", "policy_eval_thread_", BackgroundJobClass::ReplicaSafe,
@@ -309,6 +314,13 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "pg_try_advisory_xact_lock (skip-if-held) before its one-txn DELETE+INSERT atomic replace of "
      "the catalogue rollup tables, and is keep-last-good on failure — so concurrent replicas "
      "serialize on the lock (a loser skips), never racing the unique-key replace"},
+    {"software_catalog_rollup.refresh_component_rollup", "SoftwareCatalogRollup::thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "SHARED-PG, SINGLE-WRITER (SAM-17): the components rollup leg of the same tick, one "
+     "REPEATABLE READ txn that first takes its OWN transaction-scoped pg_try_advisory_xact_lock "
+     "(software_inventory_store:component_rollup, skip-if-held) then DELETE+INSERT replaces "
+     "component_rollup whole and stamps component_rollup_meta; keep-last-good on failure, cancel "
+     "or budget (rollback), so concurrent replicas serialize on the lock and a loser skips"},
     {"software_normalization_job.run_tick", "SoftwareNormalizationJob::thread_",
      BackgroundJobClass::ReplicaSafe,
      "SHARED-PG, SINGLE-WRITER: every pass runs in its own transaction and, after its SET LOCAL "

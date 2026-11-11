@@ -113,6 +113,9 @@ Rendered render_refusal(const Refusal& r, bool audit_dropped, const std::string&
     case RefusalKind::kApprovalCapReached:
         out.code = kTierDenied;
         break;
+    case RefusalKind::kPermissionRevoked: // no denial to describe: never dereference r.denial
+        out.code = kPermissionDenied;
+        break;
     case RefusalKind::kDispatchDenied: {
         const auto& d = *r.denial;
         const auto text = describe_dispatch_denial(d.reason, r.plugin, r.action, d, DenialSurface::kMcp);

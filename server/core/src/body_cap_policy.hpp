@@ -62,12 +62,13 @@
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
 /// DEFAULTS OFF and is opted into per class, not per table. It is ON for
-/// five classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// six classes: `/mcp/` (that surface's own protocol/client contract already requires
 /// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
 /// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
 /// costs a conforming client nothing), `upload_session`, `hardware` (the
 /// Hardware CI routes carry only a tiny JSON body from the dashboard and API
-/// callers), `dex_score_policy` (one JSON document, capped by its handler) and `commands`
+/// callers), `dex_score_policy` (one JSON document, capped by its handler),
+/// `dex_score_policy_form` (the DEX Scoring tab's three form POSTs, the same reason) and `commands`
 /// (`POST /api/v1/commands`, a new route whose MCP twin `execute_instruction` already requires a
 /// measurable body, so a REST caller is held to the same contract). Every other
 /// class below — public REST (bundles), SCIM, certificate import (REST + dashboard), the
@@ -564,6 +565,18 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body must be
     // refused here (the hardware row's reasoning).
     {kBodyCapAnyMethod, "/api/v1/dex/score-policy", 320u * 1024, true, "dex_score_policy"},
+    // /api/settings/dex-scoring: the DEX Scoring tab's three POSTs (settings_routes.cpp). The
+    // body is the whole policy as a urlencoded form, and Save, Preview and Reset each submit all
+    // of it. Worst case from the document's own limits: 200 override rows (kDexPolicyMaxOverrides)
+    // of 15 fields plus the Remove box, each with a 260-byte key (kDexPolicyMaxKeyBytes) of
+    // punctuation that percent-encodes to 3 bytes a character (780 B), four 24-byte names
+    // (288 B encoded), 17-digit numbers, and field names whose brackets are encoded too
+    // (`overrides%5B199%5D.`): about 1.8 KB a row, so about 360 KB with the globals. 512 KiB holds
+    // that with ~1.45x headroom and stays 8x under the 4 MiB catch-all; test_body_cap_policy.cpp
+    // rebuilds the worst case and pins it under this cap. The REST row above stays 320 KiB: its
+    // body is the 256 KiB JSON document. requires_measurable = true for the same reason as the
+    // REST row: the permission gate runs in the handler, after httplib buffers the body.
+    {kBodyCapAnyMethod, "/api/settings/dex-scoring", 512u * 1024, true, "dex_score_policy_form"},
     // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
     // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most
     // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
@@ -610,6 +623,16 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // cap on this route while the twin refuses it. ANY method: the segment-boundary match keeps a
     // future sibling under this prefix capped too (rule 4 in the routed-concern row).
     {kBodyCapAnyMethod, "/api/v1/commands", 4u * 1024 * 1024, true, "commands"},
+    // /api/v1/crypto/revocation-sources — registered CRL sources (ADR-0070 R1, revocation_source_
+    // routes.cpp): POST / PUT carry {name, ca_certificates (<= 8 PEM, 16 KiB each), crl_urls (<= 8
+    // x 2,048 bytes)}, so 192 KiB (the largest valid body, JSON-escaped, is about 151 KiB) mirrors revocation_source::kBodyMaxBytes exactly (a
+    // static_assert in the routes TU pins the pair). The gates (administrator predicate,
+    // securable) run in the handler after httplib buffered the body, so without its own entry the
+    // path would take the 16 KiB `/api/v1/crypto` row and refuse a legitimate 8-certificate body.
+    // Longest match: it outranks the `/api/v1/crypto` row above for this subtree only. ANY method:
+    // a verb-scoped row would drop the whole prefix to the shorter row (rule 4).
+    {kBodyCapAnyMethod, "/api/v1/crypto/revocation-sources", 192u * 1024, false,
+     "crypto_revocation_sources"},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.

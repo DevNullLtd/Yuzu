@@ -21,6 +21,7 @@
 #include "authz_model.hpp"                // authz::VisibleSet
 #include "device_containment_render.hpp" // kContainmentUi
 #include "device_inventory_types.hpp"    // DeviceCiRecord, CiReadError
+#include "digest_fn.hpp"                 // DigestFn (the verify seam; no OpenSSL here)
 #include "inventory_types.hpp"           // InventoryDeviceRow
 #include "offline_endpoint_types.hpp"    // OfflineEndpoint, PresenceReadError, OfflineRosterRead
 #include "software_inventory_types.hpp"  // SoftwareEntry
@@ -184,6 +185,13 @@ struct HardwareListPage {
 [[nodiscard]] nlohmann::json hardware_list_json(const HardwareListPage& page, bool ci_degraded,
                                                 std::size_t devices_omitted, bool tags_degraded = false);
 
+/// What a `CiDetailFn` caller asks the record composition to read (#7162; it replaced a
+/// `bool with_sections`). `WithSections` reads the v2 per-section statuses and rows in the SAME
+/// snapshot as the record; ONLY the REST record route and the MCP tool `get_hardware_ci` ask for
+/// it. `RecordOnly` (the dashboard fragment, its sync-now poll, the actions lens) leaves
+/// `HardwareCiDetail::ci_sections` NOT READ.
+enum class CiRead : std::uint8_t { RecordOnly, WithSections };
+
 /// The full CI record composition — identity + CI blob + installed software + tags.
 /// Each optional/expected member independently distinguishes "degraded" from
 /// "absent" (ADR-0016 §7): a store failure must never render as "this device has no
@@ -196,17 +204,19 @@ struct HardwareCiDetail {
     std::expected<std::optional<DeviceCiRecord>, CiReadError> ci{std::unexpected(CiReadError::kDegraded)};
     /// The v2 per-section statuses and list rows, in registry order, read in the SAME
     /// REPEATABLE READ snapshot as `ci` (`DeviceInventoryStore::get_device_ci_with_sections`; see
-    /// `apply_ci_with_sections_read`). An EMPTY value means "no section stored" (a v1 agent, a
-    /// record that carries none, `ci` not found/degraded, or the caller did not ask for sections:
-    /// only the REST record route and the MCP tool do) - never "the device has none". An ERROR
-    /// means the sections read itself failed: both the REST route (503) and the MCP tool (a
-    /// retryable error) answer it via `hardware_ci_sections_unreadable` and withhold the record,
-    /// never an empty list. Default-constructed = empty = NOT READ: `hardware_ci_json` renders an
-    /// empty `ci_sections` as `sections_state` "absent", which is a CLAIM that the sections were
-    /// read and none were stored. A caller that did not read the sections (`with_sections` false,
-    /// as the dashboard fragment does) must NOT feed this detail to `hardware_ci_json` for a
-    /// record-serving surface (REST record route, MCP get_hardware_ci).
-    std::expected<std::vector<DeviceCiSection>, CiReadError> ci_sections{};
+    /// `apply_ci_with_sections_read`). THREE states, which the type keeps apart (#7162):
+    ///  - `std::nullopt` = NOT READ: the caller asked for `CiRead::RecordOnly` (the dashboard
+    ///    fragment and the actions lens do), or the record read itself failed so none was made.
+    ///    This is the default-constructed state.
+    ///  - a value holding a vector = READ. An EMPTY vector means "no section stored" (a v1 agent,
+    ///    a record that carries none, or no record), never "the device has none".
+    ///  - a value holding an error = the sections read itself FAILED. Both the REST route (503) and
+    ///    the MCP tool (a retryable error) answer it via `classify_hardware_ci_read`
+    ///    (`HardwareCiRead::SectionsUnreadable`) and withhold the record, never an empty list.
+    /// `hardware_ci_json` renders NOT READ as `sections_state` "degraded" with `ci.sections` null,
+    /// never as "absent" (a claim that the sections were read and none stored): no served path
+    /// reaches that rendering, because the two record-serving surfaces always ask for sections.
+    std::optional<std::expected<std::vector<DeviceCiSection>, CiReadError>> ci_sections{};
     std::optional<std::vector<SoftwareEntry>> software; // nullopt = store degraded/unwired
     bool software_truncated{false};                     // capped at kHwSoftwareCap
     std::optional<std::vector<DeviceTag>> tags;          // nullopt = tag store degraded/unwired
@@ -235,12 +245,21 @@ inline constexpr std::string_view kSectionRowCountMismatchReason = "server:row_c
 ///    appended to the reason (`;`-joined, the same convention as `server_cap:<n>`). An already
 ///    `constrained` section keeps its level and its existing reason tokens (the agent's or
 ///    `server_cap:<n>`); the mismatch token is appended after them so the loss is not hidden.
-///    The rows that WERE read are still served (a constrained section serves its rows).
+///    The rows that WERE read are WITHHELD (`rows: []`, #7165): they are a partial or extended
+///    set, not what the device reported (see `section_rows_withheld`).
 ///  - `unavailable`, `permission_denied`, an unknown level and a blank level are never touched:
 ///    by contract they serve no rows, so there is nothing to reconcile.
+///
+/// `fault` is the PURE cause of the downgrade this server applied (None when it applied none: an
+/// agent-reported `constrained` stays None). It is the one source for both the served token and
+/// the `yuzu_hardware_section_integrity_total` counter label (`record_section_integrity`); both
+/// read it from `served_section_verdict`, so they name the same cause for the same rows (see the
+/// intermittent-provider caveat there).
+enum class SectionFault : std::uint8_t { None, RowCount, Content, Unverifiable };
 struct SectionVerdict {
     std::string level;
     std::string reason;
+    SectionFault fault{SectionFault::None};
 };
 [[nodiscard]] SectionVerdict verify_section_row_count(const DeviceCiSection& section);
 
@@ -250,34 +269,103 @@ struct SectionVerdict {
 /// change the row count alone cannot see when the number of rows is unchanged.
 inline constexpr std::string_view kSectionContentDigestMismatchReason = "server:content_digest_mismatch";
 
+/// The reason token a section carries when the server could NOT compute the digest to compare
+/// (the digest provider failed - `EVP_Digest` returned an error - which is a fault of THIS SERVER,
+/// not of the device or its stored rows). Served with level `constrained` and its rows STILL SERVED
+/// (unlike the two mismatch tokens, which withhold them: nothing shows the rows are wrong); it is a
+/// distinct token so an operator does not chase the device.
+inline constexpr std::string_view kSectionContentDigestUnverifiableReason =
+    "server:content_digest_unverifiable";
+
+/// Whether a section with this fault is served with `rows: []` (#7165, option (c)): the two
+/// MISMATCH faults withhold, because the rows read are known not to be what the agent reported.
+/// `Unverifiable` does not (the server could not compare, which says nothing about the rows) and
+/// `None` does not. A `switch` with no `default`, so -Wswitch flags a new enumerator here. Status,
+/// reason and `complete: false` are served unchanged either way.
+[[nodiscard]] constexpr bool section_rows_withheld(SectionFault fault) noexcept {
+    switch (fault) {
+    case SectionFault::RowCount:
+    case SectionFault::Content:
+        return true;
+    case SectionFault::Unverifiable:
+    case SectionFault::None:
+        return false;
+    }
+    return false;
+}
+
+/// THE row-serving decision `ci_sections_json` makes for one section, as a pure function so every
+/// input is testable without a digest provider: rows are served only for a table-backed kind whose
+/// STORED level is `ok` or `constrained` and whose fault is not a withholding one. A section at any
+/// other level (`unavailable`, `permission_denied`, an unknown or blank level) serves no rows even
+/// if some were stored; `Unverifiable` and `None` serve them.
+[[nodiscard]] constexpr bool section_serves_rows(bool table_backed, std::string_view stored_level,
+                                                 SectionFault fault) noexcept {
+    return table_backed && (stored_level == "ok" || stored_level == "constrained") &&
+           !section_rows_withheld(fault);
+}
+
+/// The reason token a downgrade of kind `fault` is served with; empty for `SectionFault::None`.
+[[nodiscard]] std::string_view section_fault_token(SectionFault fault) noexcept;
+
+/// The `reason` label `yuzu_hardware_section_integrity_total` counts `fault` under
+/// (`row_count_mismatch` / `content_digest_mismatch` / `digest_unverifiable`); empty for None.
+[[nodiscard]] std::string_view section_fault_label(SectionFault fault) noexcept;
+
 /// The level and reason a table-backed section is SERVED with: `verify_section_row_count` first,
-/// then the content digest. This is the function every serving path uses (`ci_sections_json`);
-/// anything that serves raw `get_device_ci_sections` levels must call it.
+/// then the content digest. Serving paths MUST go through `served_section_verdict`, which adds the
+/// registered/table-backed guard: called directly on a status-only or unregistered kind that
+/// carries a stored count, this function can report a fault the served body never carries.
 ///
 /// Pure. Rules, on top of the row-count rules above:
 ///  - `content_digest == nullopt` (a status-only kind, or a row written before migration v3):
-///    not verifiable, served as the row-count rule left it. So is a WELL-FORMED digest of a
+///    not compared, served as the row-count rule left it. So is a WELL-FORMED digest of a
 ///    different layout version (`classify_stored_digest` == `kOtherLayout`, e.g. `v2:...`; the
 ///    version is one to six digits): this
 ///    build cannot recompute it. Any other non-NULL value that is not the current `v1:` form (an
 ///    empty or whitespace value, `V1:`, bare hex, garbage, a malformed version, `v2:` with nothing
-///    after it) is a MISMATCH, never unverified: a damaged column must not let an edit through.
+///    after it) is a MISMATCH, never left unchecked: a damaged column must not let an edit through.
 ///  - `unavailable`, `permission_denied`, an unknown or blank level: never touched (no rows by
 ///    contract).
 ///  - If the row count already disagrees, that verdict is returned alone: the count token is the
 ///    more specific report of the same loss, and a lost row always changes the digest too, so a
 ///    second token would only repeat it.
 ///  - Otherwise the digest of the rows read (`section_content_digest`, the writer's own function)
-///    is compared with the stored one; any difference - or a digest the server cannot compute -
-///    DOWNGRADES `ok` to `constrained` and appends `server:content_digest_mismatch` to the reason
-///    (`;`-joined, idempotent). An already `constrained` section keeps its level and tokens.
-///  - The rows that were read are STILL SERVED (as for the count mismatch). On a digest mismatch
-///    they are NOT the generation the agent reported: they may be edited or swapped values, so a
-///    consumer must not treat them as the device's reported hardware.
+///    is compared with the stored one; any difference DOWNGRADES `ok` to `constrained` and appends
+///    `server:content_digest_mismatch` to the reason (`;`-joined, idempotent). A digest the server
+///    cannot compute (the provider failed) downgrades the same way but appends
+///    `server:content_digest_unverifiable` instead: that is a fault of this server, not of the
+///    stored rows (owner ruling 2026-11-09). An already `constrained` section keeps its level
+///    and tokens.
+///  - The rows that were read are WITHHELD on a digest mismatch, as on a count mismatch (#7165,
+///    owner ruling 2026-11-09): they are NOT the generation the agent reported (edited or swapped
+///    values), and a consumer that reads `constrained` as "partial but true" would consume them
+///    as the device's hardware. See `section_rows_withheld`. `unverifiable` keeps its rows.
 /// Scope: an integrity check against accident and non-malicious drift. Anyone who can write the
 /// child tables can also rewrite the digest, so this is not tamper resistance. The digest covers
 /// the rows only, not the level or reason columns.
 [[nodiscard]] SectionVerdict verify_section_content(const DeviceCiSection& section);
+
+/// The same function with an injectable digest provider (#7163). The one-argument form above
+/// passes `sha256_hex`; only a test passes anything else, to drive the "provider failed" branch.
+[[nodiscard]] SectionVerdict verify_section_content(const DeviceCiSection& section,
+                                                    DigestFn digest);
+
+/// THE serving predicate: the level and reason `section` is served with, as one function both
+/// the response body (`ci_sections_json`) and the integrity counter
+/// (`record_section_integrity`, hardware_section_integrity.hpp) call. A kind that is not in the
+/// section registry, or is registered but not table-backed (status-only), is served exactly as
+/// stored with `fault == None` - even if it carries a stored `row_count` or digest, which are
+/// never compared for such a kind. A table-backed kind goes through `verify_section_content`
+/// (which itself leaves a level other than `ok`/`constrained` untouched). `digest` nullptr means
+/// `sha256_hex`.
+///
+/// One function and the same rows, but two CALLS per read (once for the body, once for the
+/// counter): an INTERMITTENT digest-provider failure between them could make the counted label
+/// differ from the served token. That is documented and accepted; carrying a precomputed verdict
+/// from the first call to the second would create a second serving path.
+[[nodiscard]] SectionVerdict served_section_verdict(const DeviceCiSection& section,
+                                                    DigestFn digest = nullptr);
 
 inline constexpr std::size_t kHwSoftwareCap = 2000;
 
@@ -327,11 +415,12 @@ void apply_identity_read(HardwareCiDetail& detail,
                          std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> ident);
 
 /// Record+sections read (`DeviceInventoryStore::get_device_ci_with_sections`, ONE snapshot) ->
-/// `ci` and `ci_sections`. A failed read: `ci` is the error and `ci_sections` stays empty (none
-/// was made). Success: `ci` is the record (nullopt when absent) and, for a v2 record only, its
-/// sections are MOVED into `ci_sections` (`ci->sections` is left empty - one home for the rows);
-/// a v1 record or no record leaves `ci_sections` empty. `sections_failed` keeps the error in
-/// `ci_sections` (never an empty list) while `ci` stays the record.
+/// `ci` and `ci_sections`. A failed read: `ci` is the error and `ci_sections` is reset to NOT READ
+/// (`std::nullopt`; no sections read was made). Success: `ci` is the record (nullopt when absent)
+/// and, for a v2 record only, its sections are MOVED into `ci_sections` (`ci->sections` is left
+/// empty - one home for the rows); a v1 record or no record leaves `ci_sections` READ and empty.
+/// `sections_failed` keeps the error in `ci_sections` (never an empty list) while `ci` stays the
+/// record.
 void apply_ci_with_sections_read(HardwareCiDetail& detail,
                                  std::expected<DeviceCiWithSections, CiReadError> read);
 
@@ -341,9 +430,10 @@ void apply_ci_with_sections_read(HardwareCiDetail& detail,
 /// detail and answers the same "not found" as `NotFound`, so a hidden device and a nonexistent
 /// one stay indistinguishable (the existence-oracle closure).
 enum class HardwareCiRead {
-    Found,            ///< something is known about the device (identity, CI, software or tags)
-    NotFound,         ///< nothing is known and no read failed: a genuinely absent id
-    RosterUnreadable, ///< nothing is known AND the identity fallback failed (#5531): never a 404
+    Found,              ///< something is known about the device (identity, CI, software or tags)
+    NotFound,           ///< nothing is known and no read failed: a genuinely absent id
+    RosterUnreadable,   ///< nothing is known AND the identity fallback failed (#5531): never a 404
+    SectionsUnreadable, ///< the record was read but its v2 sections read FAILED: never a 200 (H.7)
 };
 
 /// "Nothing known" is: no identity, a CI read that ANSWERED (not degraded) with no record, and
@@ -352,24 +442,31 @@ enum class HardwareCiRead {
 /// degraded software or tag read counts as empty, exactly as the REST handler has always
 /// treated them. Only a failed identity fallback (`identity_degraded`) turns an otherwise empty
 /// record into `RosterUnreadable`.
+///
+/// PRECEDENCE, stated once for every transport: RosterUnreadable > NotFound >
+/// SectionsUnreadable > Found. #6228's future arm for a failed software or tag read slots BEFORE
+/// NotFound, which keeps that a one-arm addition. SectionsUnreadable after NotFound is byte-safe:
+/// a failed sections read only arises when the record read returned a record, so such a detail is
+/// never "nothing known". A sections state of NOT READ (`std::nullopt`) is never unreadable.
 [[nodiscard]] HardwareCiRead classify_hardware_ci_read(const HardwareCiDetail& detail);
 
-/// True iff the v2 sections read FAILED (not merely "nothing stored"). The REST record route maps
-/// it to a 503 with no record data (a store error is never an empty 200, H.7); see `ci_sections`.
+/// True iff the v2 sections read FAILED (not merely "nothing stored" or "not read"). Prefer
+/// `classify_hardware_ci_read`, which carries this as `SectionsUnreadable` in its fixed order;
+/// this predicate is what that arm is built from.
 [[nodiscard]] inline bool hardware_ci_sections_unreadable(const HardwareCiDetail& detail) noexcept {
-    return !detail.ci_sections.has_value();
+    return detail.ci_sections.has_value() && !detail.ci_sections->has_value();
 }
 
 /// `ci_state`, `sections_state` and `identity_state` in the output are each one of "found" |
 /// "absent" | "degraded" — never inferred by the reader from a blank field. `sections_state` is
-/// "degraded" when the sections read failed OR `ci` could not be read (so none was attempted),
-/// "absent" when nothing is stored (a v1 agent: NOT "the device has none"), else "found".
+/// "degraded" when the sections read failed OR `ci` could not be read (so none was attempted)
+/// OR the sections were not read (below),
+/// "absent" when sections were READ and nothing is stored (a v1 agent: NOT "the device has
+/// none"), else "found". A detail whose sections were NOT READ (`ci_sections` is `std::nullopt`)
+/// also renders "degraded" with `ci.sections` null; it is never "absent".
 /// Inside `ci`, `sections` is an array in registry order of `{kind, status, reason, source,
 /// complete, rows}`; `complete` is true only for status `ok`, and a section whose status is
 /// anything but `ok`/`constrained` carries its reason and NO rows.
-/// A default (empty) `ci_sections` means NOT READ and renders as `sections_state` "absent":
-/// callers that did not read the sections (`with_sections` false) must NOT feed their detail
-/// here for a record-serving surface (see `HardwareCiDetail::ci_sections`).
 [[nodiscard]] nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t now_secs);
 
 } // namespace yuzu::server

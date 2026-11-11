@@ -112,7 +112,8 @@ constexpr std::string_view kDexSignals[] = {
     "get_dex_device_score",   "get_dex_app",              "list_dex_apps",
     "get_dex_catalogue",      // ADR-0031 WS-A4 PR-1
     "get_dex_catalogue_group", "get_dex_device_history",  "get_dex_observation",
-    "get_dex_health",         "get_dex_trends",           "get_dex_overview"};
+    "get_dex_health",         "get_dex_trends",           "get_dex_overview",
+    "get_dex_score_policy",   "set_dex_score_policy",     "reset_dex_score_policy"};
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
                                          "get_dex_perf_cohort_diff", "list_dex_perf_devices",
                                          "list_dex_perf_apps",   "get_dex_app_perf",
@@ -333,7 +334,13 @@ constexpr std::string_view kCryptoDashboard[] = {
     "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
     "get_crypto_ca_stats"};
 
-constexpr std::array<ToolFamily, 42> kFamilies{{
+// ADR-0070 R1 (slice 2b-1a): registered CRL sources - a CA plus the CRL URLs the server may fetch.
+// Admin-only in both RBAC states (not grantable). Registration only: nothing is fetched yet.
+constexpr std::string_view kRevocationSources[] = {
+    "list_revocation_sources", "get_revocation_source", "register_revocation_source",
+    "update_revocation_source", "remove_revocation_source", "reset_revocation_source_high_water"};
+
+constexpr std::array<ToolFamily, 43> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions (read, create, edit, delete, import, "
@@ -363,7 +370,10 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
     {"Approvals", "list pending approvals; approve_request/reject_request always refuse "
                   "(approver_assurance_required:*) -- deciding a ticket is a dashboard/REST act",
      kApprovals},
-    {"DEX signals", "digital-employee-experience reliability signals and their scope/detail",
+    {"DEX signals",
+     "digital-employee-experience reliability signals and their scope/detail, plus the customer "
+     "score policy (get_dex_score_policy; set_dex_score_policy and reset_dex_score_policy are "
+     "supervised-tier writes, reset also approval-gated)",
      kDexSignals},
     {"DEX performance", "fleet, cohort, device, and per-app performance over time", kDexPerf},
     {"Network quality", "fleet and per-device network-quality posture, and hosts found by "
@@ -448,6 +458,10 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
     {"Crypto dashboard", "the /crypto widget catalogue, your own widget layout, and counts of "
                          "certificates issued by Yuzu's own CA (fixed windows, with as_of)",
      kCryptoDashboard},
+    {"Revocation sources", "administrator-only registry of CRL sources: the CAs and the CRL URLs "
+                           "the server may fetch for them (registration only; nothing is fetched "
+                           "or judged yet)",
+     kRevocationSources},
 }};
 
 }  // namespace

@@ -391,7 +391,7 @@ forwards to the `CryptoApi` instance `CryptoRoutes` serves, `crypto_access_fn`, 
 re-resolves the caller's username from the request because the registry path carries no session), so a
 twin reuses the route's composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
 may be empty: a handler checks both and answers an internal error, never an empty result. A tool that
-needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writer `audit_fn` and a closure meeting the criterion in `mcp_tool_deps.hpp`: a pure forward of the REST twin's own `*Api` method, the gate stays central, the handler audits "attempted" first and refuses to run without a sink) still belongs on the legacy path, and a lexical
+needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writers `audit_fn` / `audit_as_session_fn` and a closure meeting the criterion in `mcp_tool_deps.hpp`, which admits two shapes and keeps the gate central in both: (i) a pure forward of the REST twin's own `*Api` method, with the handler writing "attempted" before the call and refusing to run without a sink; (ii) a pure forward of the REST twin's shared audit-first apply function, with the audit sink injected per request and the handler refusing to call the closure without one; a write tool that wants REST-parity attribution binds its DOMAIN audit rows through `ToolDeps::session_fn` plus `audit_as_session_fn` (see `writer_identity` in `mcp_tools_dex.cpp`), while the older registry write tools still use the per-row `audit_fn` pattern) still belongs on the legacy path, and a lexical
 test fails an `mcp_tools_*.cpp` that includes a `*_store.hpp`, `agent_registry.hpp`, `mcp_server.hpp`,
 `auth_db*` or `pg/` header. Tools are compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
 `registered_tool_records()` itself. **Served order:** `tools/list` lists the merged legacy and registry
@@ -439,7 +439,7 @@ function, `requires_approval(mcp_tier, securable_type, operation)` (in `mcp_poli
 own doc comment, "AFTER `tier_allows()` returns true." **It is not derived from anything else — it
 is its own hard-coded, exact-match `(securable_type, operation)` list** (supervised tier:
 `Execution:Execute`, any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`,
-`UserManagement:Write`, `ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; operator
+`UserManagement:Write`, `ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`, `RevocationSource:Write`; operator
 tier: `Tag:Delete` only; read the supervised branch of `requires_approval()` in `mcp_policy.hpp`
 for the current list, which this paragraph can fall behind). A pair that is destructive in the
 everyday sense but **absent** from this list runs un-approved at supervised tier, full stop: there
@@ -955,7 +955,7 @@ Next, the decision §3's "fifth registration point"
 calls out explicitly: `SoftwareDeployment:Execute` is **not** in `requires_approval()`'s hard-coded
 supervised-tier list today (verified; the list at the time of writing is `Execution:Execute`,
 any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`, `UserManagement:Write`,
-`ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; read the supervised branch of
+`ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`, `RevocationSource:Write`; read the supervised branch of
 `requires_approval()` in `mcp_policy.hpp` for the current one). Starting a deployment pushes a package to live
 endpoints — REST gates the equivalent action behind an MFA step-up (`step_up_fn`,
 `rest_api_v1.cpp:9053`) precisely because it is consequential. The twin PR's job is to make that

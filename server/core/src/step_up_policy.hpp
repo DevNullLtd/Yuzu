@@ -174,6 +174,13 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     {"DELETE", R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",          StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/guaranteed-state/rules/{id}"},
     {"POST",   R"(/api/v1/guaranteed-state/push)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/push"},
     {"POST",   R"(/api/v1/guaranteed-state/policy-generation/raise)",           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/policy-generation/raise"},
+    // ADR-0070 R1 (slice 2b-1a): registered CRL sources. Registering adds an egress target the server
+    // will fetch from, a replace/remove changes what is fetched, and a reset reopens the CRL replay
+    // window - all admin-only and none of them reversible by the caller alone, so each is kRequired.
+    {"POST",   R"(/api/v1/crypto/revocation-sources)",                          StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/crypto/revocation-sources"},
+    {"PUT",    R"(/api/v1/crypto/revocation-sources/([0-9]+))",                 StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/crypto/revocation-sources/{id}"},
+    {"DELETE", R"(/api/v1/crypto/revocation-sources/([0-9]+))",                 StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/crypto/revocation-sources/{id}"},
+    {"POST",   R"(/api/v1/crypto/revocation-sources/([0-9]+)/reset-high-water)", StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/crypto/revocation-sources/{id}/reset-high-water"},
     // Approvals (approval_routes.cpp; the label is the handler's verb-based one)
     {"POST",   R"(/api/approvals/([^/]+)/approve)",                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/approvals/{id}/approve"},
     {"POST",   R"(/api/approvals/([^/]+)/reject)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/approvals/{id}/reject"},
@@ -391,6 +398,12 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/settings/dex-alerts/routing)",                                        step_up_detail::kAlertingConfig),
     step_up_detail::exempt("POST",  R"(/api/settings/dex-alerts/blast)",                                          step_up_detail::kAlertingConfig),
     step_up_detail::exempt("POST",  R"(/api/settings/dex-alerts/cohort-export)",                                  step_up_detail::kAlertingConfig),
+    // The DEX Scoring tab: the dashboard form over the same apply function (and the same
+    // exempt classification, kOperationalData) as PUT/DELETE /api/v1/dex/score-policy above;
+    // preview is a dry run that stores nothing.
+    step_up_detail::exempt("POST",  R"(/api/settings/dex-scoring/save)",                                          step_up_detail::kOperationalData),
+    step_up_detail::exempt("POST",  R"(/api/settings/dex-scoring/preview)",                                       step_up_detail::kOperationalData),
+    step_up_detail::exempt("POST",  R"(/api/settings/dex-scoring/reset)",                                         step_up_detail::kOperationalData),
     step_up_detail::pending("POST",  R"(/api/settings/plugin-signing/upload)"),
     step_up_detail::pending("POST",  R"(/api/settings/plugin-signing/clear)"),
     step_up_detail::pending("POST",  R"(/api/settings/plugin-signing/require)"),

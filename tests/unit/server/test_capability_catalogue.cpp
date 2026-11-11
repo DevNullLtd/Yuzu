@@ -434,7 +434,7 @@ TEST_CASE("capability catalogue: shares.list pins its exact classification",
 TEST_CASE("capability catalogue: virtualization.host pins its exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_virtualization();
-    REQUIRE(rows.size() == 1);
+    REQUIRE(rows.size() == 2);
     const auto& row = rows.front();
     CHECK(row.plugin == "virtualization");
     CHECK(row.action == "host");
@@ -451,6 +451,32 @@ TEST_CASE("capability catalogue: virtualization.host pins its exact classificati
     REQUIRE(classified.has_value());
     CHECK(classified->securable == "Inventory");
     CHECK(classified->execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `virtualization.wsl`. A per-user, read-only list of WSL distributions (the
+/// offline arm mounts a logged-off profile's hive through the shared helper), classified exactly
+/// like `installed_apps.list_per_user`: `Inventory`:Read behind `AdminOrApproval`, checked on the
+/// fragment AND as the composed registry classifies it.
+TEST_CASE("capability catalogue: virtualization.wsl pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 2);
+    const auto& row = rows.back();
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "wsl");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::AdminOrApproval);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "wsl");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::AdminOrApproval);
 }
 
 /// Exact-row pin for `remote_access_audit.list` (Wave 11, Forensics-class): per-account SSH key

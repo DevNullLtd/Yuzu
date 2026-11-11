@@ -432,13 +432,41 @@ dashboard or the API shows that record yet.
 A section the server cannot accept is asked for again by name (`installed_software:<source>` in
 the acknowledgement's `need_full`), while the other sections of the same report are stored. The
 first v3 call from a device that applies a section removes the rows its earlier v2 reports left, so a device never
-shows the same software from two report formats. A `delta` section, and the
-`component_inventory` section, are checked but not applied by this server version: each is
-answered with a request for a full section, so nothing is lost. No shipped agent sends v3 yet;
-the agent side arrives in a later release. Operators can see the outcome of each section in
+shows the same software from two report formats.
+
+A `delta` section lists only what changed (rows removed by hash, rows added) and carries the hash
+the device holds once it has applied it. The server applies it to the rows it holds and checks
+its own result against that hash. If the device's starting point is not the one the server holds,
+the section is asked for again in full and nothing is written. If a removal names a row the
+server does not hold, an added row has the key of a held row, the result
+does not match, or the facet would hold more than the per-call record cap (20,000), the section is
+undone on its own (the other sections of the report apply) and asked for again in full, which
+repairs a delta that went out of step. The
+`component_inventory` section is stored the same way, per device, as the current list of
+components found (`full` replaces the list, `delta` changes it, an empty `full` clears it). A
+component section that names one kind and path twice (two components of one kind with an empty
+path, for example) is answered the same way, but the full section the agent sends in answer
+repeats the pair, so it does not repair itself and none of that section is stored. The fix is in
+the agent's component writer, which must send each path once; the server's "did not verify"
+warning names the agent (that line is sampled, about 1 in 100).
+
+The server also keeps a change history for installed software: one entry for every install,
+removal or upgrade a stored installed-software section produced, with the from and to versions
+written as `[epoch:]version[-release]` (non-empty parts only), so a release-only or epoch-only
+update (a distribution backport, a Flatpak commit) is an upgrade too. The first full
+section the server receives for a collector, the first one following a switch-off and switch-on
+of that collector, and a full section for a collector whose stored rows do not match its stored
+section hash (an out-of-band change to the table) set the starting point and produce no history;
+the last case is logged as a warning and, by decision, no counter or alert counts it. Removed
+software is simply deleted from the device's list; the history entry is the record that it was
+there. History older than 400 days is pruned, and decommissioning a device deletes its history
+and its components with it. Nothing in
+the dashboard or the API shows the change history or the components yet. No shipped agent sends v3
+yet. Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
-`need_full`, `delta_unsupported`, `rejected` or `error`, and `facet` is the collector source
-(`unknown` for a name the server does not recognise). The existing
+`need_full`, `mismatch`, `rejected` or `error`, and `facet` is the collector source
+(`unknown` for a name the server does not recognise), and the number of history entries in
+`yuzu_software_changes_total{kind}`. The existing
 `yuzu_inventory_ingest_total` keeps one outcome per report; a v3 report with any section asked for
 again counts as `need_full`. A blob the server cannot split into sections at all (see below) counts
 as `dropped` there, and a call whose transaction failed counts as `error` for every section of the
@@ -713,22 +741,57 @@ curl -H "Authorization: Bearer $TOKEN" \
 # Everything on one device
 curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
+
+# The zero-day question, in one call each. Which devices run an affected version range of a
+# title, still confirmed by their last poll (status=current), with the fleet totals for an
+# unfiltered caller (a version filter reads the totals live, so it is not affected by the
+# catalogue ceiling):
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&status=current"
+# The same for a component bundled inside applications (empty until agents report components):
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software/components?name=log4j-core&version_min=2.0&version_max=2.14.1"
+# Hand the device list over as a file (up to 10,000 rows per call; follow X-Next-Cursor for more):
+curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
+  "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&format=csv"
 ```
 
 - Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
   selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
-  `ecosystem`, `source` (exact), `limit` (max 1000; 10000 with `format`), `cursor` and `format` (`json` or
-  `csv`: an export). Omit `name` and `agent_id` for a fleet-wide scan. The full parameter
-  and error tables are in [rest-api.md](rest-api.md); `q`, `kind`, `ecosystem` and
-  `source` are REST-only (the MCP tool takes `name`, `agent_id`, `version`, `limit` and
-  `cursor`).
-- Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
-  "meta": {"api_version": "v1"}}`. Each row has 14 fields: `{agent_id, name, version,
-  publisher, install_date, kind, ecosystem, epoch, release, arch, signature_status,
-  distro_id, distro_version, source}` — the v2 fields are `""` where the ecosystem does not
-  store them (see the availability matrix above), and `source` is the
-  `<plugin>.<action>` that produced the row. The MCP tool's rows carry the identical
-  field set.
+  `ecosystem`, `source` (exact), `match` (`exact`, `prefix` or `contains` for `name`),
+  `version_min` / `version_max` (inclusive version range), `status`, `limit` (max 1000; 10000
+  with `format`), `cursor` and `format` (`json` or `csv`: an export). Omit `name` and
+  `agent_id` for a fleet-wide scan. The full parameter and error tables are in
+  [rest-api.md](rest-api.md); everything except `name`, `agent_id`, `version`, `limit` and
+  `cursor` is REST-only (the MCP tool takes only those).
+- Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
+  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 22 fields: the 14
+  package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
+  release, arch, signature_status, distro_id, distro_version, source}` — `""` where the
+  ecosystem does not store them (see the availability matrix above); `source` is the
+  `<plugin>.<action>` that produced the row — plus the lookup fields `hostname`, `last_seen`
+  (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
+  `last_confirmed_at`, `install_type`, `install_scope`, `install_location` and
+  `instance_key`. The MCP tool's rows keep the 14 package fields until its twin catches up.
+- **Lookup totals.** For an exact `name`, an unfiltered (global) caller also gets `totals`
+  (install rows and distinct devices); a management-group-confined caller gets its rows and
+  `totals: null` with `totals_omitted: "scope"`: **null means not shown, never zero**. The
+  totals rule, the `totals_omitted` reasons and the version-range limit are in
+  [rest-api.md](rest-api.md#get-apiv1inventorysoftware).
+- **Components.** [`GET /api/v1/inventory/software/components`](rest-api.md#get-apiv1inventorysoftwarecomponents)
+  answers the same question for components found inside applications, under the same gate,
+  scope confinement, status and `totals` rule; its totals come from an hourly rollup on the
+  catalogue rollup's thread (`yuzu_inventory_component_rollup_total{outcome}`, both outcomes
+  seeded at 0 so the first failure is an increase; `yuzu_inventory_component_rollup_duration_seconds`;
+  `yuzu_inventory_component_rollup_last_success_timestamp`, seeded 0 until the first success;
+  watched by the shipped rules `YuzuInventoryComponentRollupStale` and
+  `YuzuInventoryComponentRollupFailing`).
+  The refresh runs at server start and then hourly, with no manual trigger (a restart runs
+  one at once; a restart disconnects that replica's agents, so restart one replica at a
+  time); a failed, cancelled or over-budget refresh keeps the last-good rollup and its
+  stamp, and the figures read `building` until the first refresh completes. The freshness
+  stamp is the single row `component_rollup_meta` (`id = 1`), seeded by the schema: if that
+  row is deleted every refresh fails (keep-last-good) until it is restored, so never delete it.
 - **Carries the same scope push-down as the MCP tool** — the SAME
   `require_fleet_read` gate, so REST and MCP cannot observe a different
   admit/filter decision for the same caller (see the MCP note above). A positive
@@ -1211,7 +1274,7 @@ ingest is failing. Four further series sharpen the picture:
   hash_only majority doesn't bury the `full` and `v3` tail, the pool-pressure
   signal under a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
+  `pool_acquire_timeout` / `query_error`, plus `sections_query_error` for `source="device_ci"` only: the hardware record read answered but its v2 sections did not, the case the REST record route answers `503` and the MCP tool with a retryable error, where `query_error` is the record read itself failing; plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`, and the `/crypto` sources `ca_issued` (Yuzu-issued certificate reads) and `crypto_layout` (dashboard layouts), see [metrics.md](metrics.md#crypto-dashboard-metrics)) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
@@ -1278,12 +1341,16 @@ hourly by the background `SoftwareCatalogRollup` thread) emits three further ser
 
 - `yuzu_inventory_catalog_rollup_total{outcome}` (counter, outcome ∈ `success` / `error`)
   — one per recompute attempt that completes or fails (a shutdown-cancelled attempt is
-  not counted as an error). A rising `error` count with a frozen
+  not counted as an error); both outcome series are seeded at 0 when the rollup thread
+  starts, so the first failure is an increase a rate rule can see. A rising `error` count with a frozen
   `…_last_success_timestamp` means recomputes are failing (PG outage, a statement over
   its 60 s limit, or the 10-minute whole-refresh limit exceeded at scale) and the
   catalogue is going stale; keep-last-good serves the prior rollup meanwhile, except for
-  the first refresh after the v8 upgrade, which has no last-good and leaves the catalogue
-  "building". The failing statement and its cause are in the server log (warning).
+  a first refresh that has no last-good (a fresh deployment whose refresh fails or never
+  fits its limit), which leaves the catalogue "building" for as long as the refreshes keep
+  failing; on a fleet above the ceiling below that is permanent until the rollup is made
+  incremental. The first-boot `building` window and what reads it are described in
+  [upgrading.md](upgrading.md). The failing statement and its cause are in the server log (warning).
 - `yuzu_inventory_catalog_rollup_duration_seconds` (gauge) — the last recompute's
   whole-refresh wall-clock. Compare it with the two compile-time limits (not flags): 60 s
   per statement and 600 s for the whole refresh. A value rising towards either is the
@@ -1355,8 +1422,11 @@ holding a connection >10s — a leading pool-saturation indicator),
 `YuzuInventorySectionIngestRefused` (warning: a v3 section was refused, `outcome="rejected"`,
 at least once in the last day, so a single refusal is enough; the refusal is a grammar failure
 that never self-heals, so fix the agent, except `facet="unknown"`, a version-skew incident fixed by reprovisioning matching builds),
-`YuzuInventorySectionDeltaUnsupported` (info, held 1h: a v3 delta was answered with a request
-for a full section because this server cannot apply deltas yet; expected, no action), and
+`YuzuInventorySectionDeltaMismatch` (warning, held 1h: at least 5 `outcome="mismatch"` sections in
+the last day for one facet and more than 5% of that facet's sections; a delta or component section
+did not verify and is rolled back, the agent resends it in full, and a few a day are expected; a
+sustained share means the agent's section writer and the server disagree about the row set, and a
+component section that names one kind and path twice fails on every resend), and
 `YuzuInventoryStaleCountUnavailable` (the freshness gauge may be frozen).
 
 A **recording rule**, `yuzu:inventory_ingest_duration_seconds:p99{source,phase}`,
@@ -1468,16 +1538,29 @@ sync, defeating the hash-skip protocol.
   `machine_id` section means the reported machine ID was not a hash and was discarded;
   `server:row_count_mismatch` means the rows stored for the section no longer match the count
   recorded when the device last synced in full (rows were lost outside the product, for example
-  a partial database restore), so the section is served `constrained` and incomplete with the
-  rows that remain. `server:content_digest_mismatch` means the number of rows still matches but
+  a partial database restore), so the section is served `constrained` and incomplete with its
+  `rows` empty: the rows that remain are withheld, not listed (#7165). `server:content_digest_mismatch` means the number of rows still matches but
   the rows no longer hash to the digest the server recorded beside the section's status when the
   device last synced in full (a row was edited, or the rows were swapped for another sync's out
-  of band): the section is served `constrained` and incomplete, with the rows that were read, but
-  those rows are **not** the values the agent reported, so do not rely on them. A lost row
-  reports `server:row_count_mismatch` alone. Neither token is stored: both are worked out each
-  time the record is read, so they never appear in the `device_ci_section` query further down.
-  Reading the record again does not clear either token. **Only a full device-record sync
-  repairs either** (a device whose hardware has not changed sends only a hash on its daily sync,
+  of band): the section is served `constrained` and incomplete with its `rows` empty, because the
+  rows read are **not** the values the agent reported. This holds even when the agent's own level
+  was already `constrained` (for example `server_cap:<n>`). Only a full device-record sync
+  repairs either. A damaged stored digest alone, with intact rows, is withheld the same way. The
+  stored rows stay in the database (read them with SQL if you need to inspect them; neither REST
+  nor MCP shows them). A lost row
+  reports `server:row_count_mismatch` alone. A third token, `server:content_digest_unverifiable`,
+  means this **server** could not compute the digest to compare (its digest provider failed, an
+  OpenSSL fault): the section is served `constrained` and incomplete with the rows that were read,
+  which are not known to be wrong. It is a fault of the server, not of the device or the stored
+  rows, so no device sync clears it. The verdict is recomputed on every read, so a transient
+  provider fault may clear on a later read; a persistent one needs an operator to fix the server's
+  OpenSSL provider or FIPS configuration (for example `openssl list -providers` in the server's
+  environment). None of the tokens is stored: all are worked out each time the record is read,
+  so they never appear in the `device_ci_section` query further down. Each faulted section of a
+  read composed is also counted in `yuzu_hardware_section_integrity_total` ([Metrics](metrics.md#hardware-record-section-integrity-metric-7159)).
+  Reading the record again does not clear either mismatch token (it may clear
+  `server:content_digest_unverifiable`, see above). **Only a full device-record sync
+  repairs either mismatch** (a device whose hardware has not changed sends only a hash on its daily sync,
   which leaves the rows alone): use **Sync now** on the device's Hardware page, or
   `POST /api/v1/hardware/{id}/sync` with `source` omitted (`all`) or `device_ci`. The fleet-wide
   `POST /api/v1/hardware/sync` and the MCP tool `sync_hardware_software` re-send installed
@@ -1492,13 +1575,14 @@ sync, defeating the hash-skip protocol.
   non-malicious drift, not tamper resistance: someone who can write the table can rewrite the
   digest. It covers the rows only, not the section's `status` or `reason`. Stored, it carries a
   layout version prefix (`v1:` then the SHA-256). A well-formed digest of a different layout
-  version (for example `v2:` followed by a digest) is treated as unverified, because this server
-  cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
+  version (for example `v2:` followed by a digest) is not compared (left unchecked, no token),
+  because this server cannot recompute it (the version is one to six digits, not starting with 0 and not 1, followed
   by a colon and a non-empty remainder). Any other stored value that is not the current form (an
   empty or damaged value, `V1:`, a bare hex string, a malformed version) is compared as a
   mismatch and reported as `server:content_digest_mismatch`, so a damaged column cannot let an
   edited section read as complete. Only an absent value (a section stored before migration 3, or
-  a status-only kind) or a well-formed digest of another layout version is unverified. A section
+  a status-only kind) or a well-formed digest of another layout version is left unchecked (no
+  token). A section
   whose row count already disagrees reports the count token alone, and an `unavailable` or
   `permission_denied` section is never compared.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
