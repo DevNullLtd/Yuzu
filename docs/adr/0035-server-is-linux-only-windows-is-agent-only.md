@@ -339,9 +339,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    artifact-name change reaches it). Keep the (non-blocking) gateway canary. Prune now-unused Windows
    server cache scopes (`cache-prune.yml`).
 
-   *Status: in progress — the step-1 CI change, #PENDING (the number is filled in when the pull
-   request exists, as its `changelog.d/PENDING-windows-macos-agent-only-ci.changed.md` fragment is
-   renamed).* As
+   *Status: in progress — the step-1 CI change, #7499.* As
    implemented: the Windows and macOS legs of `ci.yml` pass `-Dbuild_server=false` (the boolean;
    the feature option is step 3) and drop every item listed above for them, and the Windows leg
    moves to `build-windows-agent-{debug,release}` and deletes the old dirs, so a branch cut
