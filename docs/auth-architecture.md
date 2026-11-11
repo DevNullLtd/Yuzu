@@ -498,9 +498,9 @@ user retries; no re-verify. Counted by
 seed-only by construction: an operator can no longer reset a password by
 editing it, and a password rotated that way before this change reverts on
 upgrade to the stored one (behaviour change — see
-`docs/user-manual/upgrading.md`). The Windows server installer refuses a
-password on an upgrade for the same reason (exit code 11,
-`docs/user-manual/server-admin.md`). cfg-only non-admin accounts are a
+`docs/user-manual/upgrading.md`). The Windows server installer, while it
+shipped (it was discontinued by ADR-0035), refused a password on an upgrade
+for the same reason (exit code 11). cfg-only non-admin accounts are a
 separate gap, mitigated by #5343: only the cfg admin is provisioned on a fresh
 database, so the second first-run account and the installer's `/OPERATOR_USER`
 could never sign in on Postgres, and both generators were removed (a hand-written
@@ -526,9 +526,8 @@ count. It writes no audit row (#5361).
 `kMinPasswordBytes = 12`, `kMaxPasswordBytes = 1024` (bytes). It replaces the
 three hand-copied `< 12` checks; `/login` answers an over-max password like a
 wrong one without running PBKDF2. Body cap: `kBodyCapTable` row `/api/v1/users`
-(any method, 16 KiB, `path_class="users"`). The Windows server installer and
-`generate-config.ps1` enforce the same 1024-byte maximum (UTF-8) on a fresh
-install; the Compose Wizard does not yet (#5363).
+(any method, 16 KiB, `path_class="users"`). The Compose Wizard does not yet
+enforce it (#5363). (The discontinued Windows server installer enforced it.)
 
 **No MCP twin** (ADR-1005 parity-ledger `exception:` rows,
 `docs/api-parity-ledger.md`). Self-service change is permanently excluded: an

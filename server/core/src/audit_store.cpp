@@ -538,8 +538,8 @@ std::optional<std::vector<AuditEvent>> AuditStore::query(const AuditQuery& q,
         binds.push_back(q.principal);
     }
     if (!q.action.empty()) {
-        // Upgrade-window shim (Echo rename; removed with the other legacy-name shims once old
-        // rows age out): audit rows written before the rename keep their `tar.` action spelling
+        // Upgrade-window shim (Echo rename; removed once pre-rename rows have aged out of
+        // audit retention): audit rows written before the rename keep their `tar.` action spelling
         // and are never rewritten. An `echo.`-prefixed exact action therefore also matches its
         // `tar.` twin.
         if (std::string_view{q.action}.starts_with(kEchoPrefix)) {

@@ -59,13 +59,9 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   mode between promotions (`release.yml` builds with `-Dbuild_tests=false`), so
   a release-only defect now surfaces within about a day instead of on the push
   that caused it; `main` pushes still build release, so nothing tags untested
-  in release mode — except the Windows and macOS **server**: since ADR-0035
-  ladder step 1 no CI leg builds or tests it, yet `release.yml` still builds it
-  at tag time until ladder step 2 removes it (step 2 must merge before the next
-  release tag, or, before tagging, a caveat `changelog.d` fragment merged
-  through a reviewed PR (naming who accepted it, and when) must be promoted
-  into that release's changelog section, so the caveat is in its notes when
-  `release.yml` publishes them: ADR-0035 and the `/release` skill's preflight).
+  in release mode. (Since ADR-0035 ladder step 2, `release.yml` builds no
+  Windows or macOS server either, so nothing it ships goes untested by CI for
+  that reason; `tests/test_release_agent_only.py` keeps it that way.)
   - **Failure signal.** A dispatched run is started by `github-actions[bot]`,
     which emails nobody. Whether to open, comment on or close a
     `release-legs-broken` issue is decided in one place,
@@ -3181,8 +3177,8 @@ subset, both with the migration-DDL tests skipped (next paragraph).
 deliberately not adopted while the Windows server still shipped and ADR-0035
 was `proposed`. ADR-0035 was accepted on 2026-11-10 (#7465) and step 1 goes
 further than #3508 asked: the Windows leg runs no server suite at all, on any
-event, so the `server-pg` shard set is Linux-only. (`release.yml` still builds
-and signs `yuzu-server.exe` and `YuzuServerSetup` until ladder step 2.)
+event, so the `server-pg` shard set is Linux-only. (Since ladder step 2,
+`release.yml` builds neither `yuzu-server.exe` nor `YuzuServerSetup`.)
 
 **Historical (Windows, before ADR-0035 step 1):** 44 migration-in-substance fresh-DB Postgres test sites (a real from-scratch
 migration, `!is_open`-on-failure, backfill/upgrade, drift detection) SKIP
