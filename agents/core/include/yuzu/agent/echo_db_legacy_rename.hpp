@@ -30,8 +30,9 @@
 //     size and mtime: nothing has touched tar.db since the sidecars moved; resume as normal.
 //   - the same with the marker ABSENT or recording a different tar.db: the echo.db sidecar is not
 //     provably this adoption's own (the marker is written before every move it guards), so adoption
-//     fails closed, naming both files, and moves nothing; EchoDatabase::open() then refuses until
-//     the operator resolves the two files.
+//     fails closed, naming both files, and moves no legacy file (a foreign echo.db or sidecar that
+//     the planted-file heal below already set aside is logged before the refusal);
+//     EchoDatabase::open() then refuses until the operator resolves the two files.
 // The marker is a plain file written with write_file_atomic (fsync'd on POSIX; on Windows the
 // shared writer documents no flush-by-handle, so a power loss right after the write can lose the
 // marker there, which fails closed rather than open). A marker left behind once tar.db is gone (the
@@ -322,8 +323,8 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db,
             if (to_present && !from_present)
                 return std::unexpected(std::format(
                     "cannot adopt {}: {} exists but {}, so it cannot be shown to belong to this "
-                    "adoption (it could be an older database's log); nothing was moved, resolve "
-                    "{} by hand",
+                    "adoption (it could be an older database's log); no legacy files were moved "
+                    "(a foreign file moved aside is logged above), resolve {} by hand",
                     legacy.string(), to.string(),
                     recorded ? std::format("{} records a different {}", marker.string(),
                                            legacy.string())
