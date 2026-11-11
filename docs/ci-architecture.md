@@ -33,10 +33,11 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   push; the other three legs run a small `[pg-smoke]`-tagged subset instead —
   see "PG push-leg policy" below. PR coverage is unaffected (the PR `exclude:`
   already trims the matrix to gcc-15/debug alone, which always resolves to
-  `pg_mode: full`). **Since the Windows CI test-phase-split PR (#3443,
-  2026-08-28)**, the Windows matrix carries the identical `pg_mode` key via
-  the same `include:` mechanism (debug=full, release=smoke) — Windows and
-  Linux now share one `pg_mode` concept, not two independently-invented ones.
+  `pg_mode: full`). **Since ADR-0035 ladder step 1**, the Windows and macOS legs
+  are agent-only (`-Dbuild_server=false`): they build and test no server code and
+  run no Postgres suite, so `pg_mode` exists on the Linux matrix only. (From the
+  Windows test-phase split, #3443 on 2026-08-28, until then the Windows matrix
+  carried the same `pg_mode` key: debug=full, release=smoke.)
   **Since #5320** the push trigger has no `paths` filter: a docs-only push
   (for example a changelog-only release commit) runs the preflight jobs and the
   `docs-required-checks` stubs instead of the matrix, so the required contexts
@@ -58,7 +59,13 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   mode between promotions (`release.yml` builds with `-Dbuild_tests=false`), so
   a release-only defect now surfaces within about a day instead of on the push
   that caused it; `main` pushes still build release, so nothing tags untested
-  in release mode.
+  in release mode — except the Windows and macOS **server**: since ADR-0035
+  ladder step 1 no CI leg builds or tests it, yet `release.yml` still builds it
+  at tag time until ladder step 2 removes it (step 2 must merge before the next
+  release tag, or, before tagging, a caveat `changelog.d` fragment merged
+  through a reviewed PR (naming who accepted it, and when) must be promoted
+  into that release's changelog section, so the caveat is in its notes when
+  `release.yml` publishes them: ADR-0035 and the `/release` skill's preflight).
   - **Failure signal.** A dispatched run is started by `github-actions[bot]`,
     which emails nobody. Whether to open, comment on or close a
     `release-legs-broken` issue is decided in one place,
@@ -1131,7 +1138,7 @@ and hardening them for the shared-identity runner pools, is #6116.
 | Runner | Host | Jobs |
 |---|---|---|
 | `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) — 4 L3/CCD-pinned runners (`0-7,32-39`; `8-15,40-47`; `16-23,48-55`; `24-31,56-63`), Ninja capped at `-j16` | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. Provisioned from [`deploy/linux/`](../deploy/linux/README.md). |
-| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
+| `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg (since ADR-0035 step 1 the Windows CodeQL row analyses the agent only; server code is CodeQL-scanned on Linux only), release `build-windows`, cache-prune-windows (the dispatch-only `instructions-windows-validate.yml` server smoke rig was deleted by ADR-0035 step 1). Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
 | `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix + `release.yml` build-macos. Only pre-release `install-macos` stays GitHub-hosted (`macos-14`, an install-to-root smoke test). Release **signing/notarization is deferred** — macOS releases currently ship UNSIGNED (Phase B = on-token `rcodesign`). Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
 **Retired 2026-06-21** (removed from the inventory afterwards): `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
@@ -1213,6 +1220,33 @@ telemetry start step exports the same values for already-running listeners.
 
 ### Windows test-phase concurrency gate
 
+**Update (ADR-0035 ladder step 1).** The Windows leg is now agent-only: it
+configures with `-Dbuild_server=false` into `build-windows-agent-{debug,release}`
+and has one test step, `Test (non-pg suites)`, selecting `--suite agent --suite
+platform --suite proto --suite echo --suite gateway`. The `Ensure Postgres`,
+`Resolve pg_mode + assert Postgres DSN`, `Test (pg shards, full)` and `Test (pg
+smoke)` steps and the `yuzu_pg_canary.exe` libpq import check are gone, and so
+is the `pg_mode` key on the Windows matrix. The `with-test-slot.sh 2` gate, the
+30-minute slot timeout and the `assert-suite-cover.py` guard stay. The server
+`[pg]` measurements in this section (the c0/c2/c4 figures and Pushes 1–4) are
+kept as historical evidence for the Wee Tam box; they describe steps that no
+longer run. The build dirs were renamed so that a branch cut before this change
+(which still configures the server) and one cut after it never share a stored
+`build_server` value; the job deletes the old `build-windows-{debug,release}`
+dirs on every run, so an unrebased branch rebuilds cold (ccache-warm) until it
+is rebased onto `dev` (see `docs/ci-troubleshooting.md`).
+
+**Measuring the saving.** Baseline: the Windows MSVC debug job on `dev`
+pushes took 25.4–28.6 min wall time over 5 runs on 2026-11-10 (runs
+42908124262, 42902526001, 42895515198, 42879744786, 42865414562), of
+which `Test (pg shards, full)` was 14.3–17.0 min. Compare against the
+median wall time of 5 post-cutover warm runs of the same job, excluding
+each runner's first (cold) run after the cutover and any docs-only stub
+run. Record the cold-run wall time and the ccache hit rate separately
+(the MSVC `/Zi` hit rate is unverified). Leave the Windows job's
+`timeout-minutes: 120` unchanged until at least 10 post-cutover samples
+exist.
+
 Wee Tam's 4 runners are CCD-pinned, but affinity partitions only **cores** — not
 DRAM bandwidth, the disk, or the Defender minifilter. So when several Windows jobs
 run their **test** phase at the same time, the heavy unit-test suites
@@ -1236,16 +1270,17 @@ through two real widening rounds (k=4, then k=6 — see the Push 2 and
 Push 3 paragraphs below for the actual numbers); the slot count (2) has
 not moved.
 
-`ci.yml`'s Windows job now splits what used to be one combined `Test` step
-into `Test (non-pg suites)`, `Test (pg shards, full)`, and (release/push
-only) `Test (pg smoke)` — see "PG coverage by platform" below for the full
-shape. Each gated step still wraps the run in
+From #3443 (2026-08-28) until ADR-0035 ladder step 1, `ci.yml`'s Windows job
+split what used to be one combined `Test` step into `Test (non-pg suites)`,
+`Test (pg shards, full)`, and (release/push only) `Test (pg smoke)`; only the
+first remains. It wraps the run in
 [`scripts/ci/with-test-slot.sh`](../scripts/ci/with-test-slot.sh) — a crash-safe
 `flock` gate (a killed job releases its slot via OS fd-close, so a timeout never
 leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 **build** phase stays 4-wide). `Test (non-pg suites)` passes `--num-processes 4`
-(one consolidated invocation now covers what used to be five separate
-suites plus the four non-pg server shards). Since 2026-10-21 that
+(one consolidated invocation covered what used to be five separate
+suites plus the four non-pg server shards; since ADR-0035 step 1 it covers
+the five agent-side suites only). Since 2026-10-21 that
 invocation selects `--suite platform` instead of `--suite docs` (the
 `docs` suite is Linux-only, "Test suites by leg" below) and its
 `assert-suite-cover.py` guard names `--exclude-suite docs`, so a missed
@@ -1401,7 +1436,8 @@ stopped rather than continuing to k=8; going wider buys no
 round-reduction here and only adds CCD-thread-contention risk on Wee
 Tam's fixed 16-thread envelope.
 
-**Push 4 (staged 2026-10-21, not yet applied).** The CI test-phase tuning PR
+**Push 4 (staged 2026-10-21, never applied; its pg-shards half is moot since
+ADR-0035 step 1 removed that step).** The CI test-phase tuning PR
 (#4884) lands as a push ladder (the table in "Staged widening — Linux" below)
 and its second push takes the Windows widths: `Test (pg shards, full)` 6 → 8
 and `Test (non-pg suites)` 4 → 6, each judged by the decision rule above.
@@ -1472,13 +1508,16 @@ attributable error — the 90-minute budget also covers checkout/build time
 before Test starts, so a slow build can still leave less than 30 minutes of
 headroom when the wait begins. **Since the Windows CI test-phase-split PR
 (#3443, 2026-08-28), Windows pins this same `YUZU_TEST_SLOT_TIMEOUT_MIN: "30"`
-explicitly too** (on both of its two gated steps, "Test (non-pg suites)" and
-"Test (pg shards, full)") — not for the Linux `SLOT_DIR`/`SLOT_NAME` reason
+explicitly too** (then on both of its two gated steps, "Test (non-pg suites)"
+and "Test (pg shards, full)"; since ADR-0035 step 1 on the one remaining step,
+"Test (non-pg suites)") — not for the Linux `SLOT_DIR`/`SLOT_NAME` reason
 above (`RUNNER_TOOL_CACHE` IS box-wide on Wee Tam already), but because two
 slot acquisitions per Windows job at the script's 115-minute default could
 together exceed the job's own 120-minute budget — the identical
 "ambiguous kill vs. attributable error" reasoning, applied to a different
-constraint. This fix gates contention only *inside* a
+constraint. With one acquisition left, a 115-minute wait would still leave
+almost nothing of the 120-minute budget for checkout, build and the run, so
+the explicit 30 minutes stays. This fix gates contention only *inside* a
 job that already holds a runner — it does not address a job that cannot
 start at all because no runner is free; see "Cross-job — runner
 acquisition, a fourth layer" later in this section for that gap.
@@ -1681,9 +1720,11 @@ own cap, not an expected case: the degenerate figure applies only when every
 shard runs to 700s, and the makespan is lower whenever any shard finishes
 under its cap (the earlier "BEST and WORST makespan are the same number" holds
 only in that all-at-cap case). The expected case moves the other way, see the
-measured Windows run of the 16-shard layout below. On Windows the pg step runs
+measured Windows run of the 16-shard layout below. On Windows the pg step ran
 `--num-processes 6` (`ci.yml`, "Test (pg shards, full)" in the `windows`
-job), so 14 shards are ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
+job, until ADR-0035 step 1 removed it; the Windows arithmetic in the rest of
+this paragraph is historical, and the Windows job now pays at most one
+30-minute slot wait, for its single test step), so 14 shards were ceil(14/6) = 3 rounds, 3 * 700 = 2100s = 35 minutes,
 65 minutes with a 30-minute slot wait for the pg step alone. The job also
 acquires a slot for its non-pg step, so the worst case with both 30-minute
 waits is 95 minutes plus that step's own run time, still under that job's
@@ -1814,8 +1855,9 @@ now carries `suite: ['server', 'server-pg']`, so `ci.yml` selects the whole
 group with `--suite server-pg` instead of enumerating names, and a new
 `scripts/ci/check-pg-shard-partition.py` runs as its own meson test
 (`'server pg shard partition invariant'`, `suite: ['server', 'server-checks']`
-— the second label is what lets the Windows non-pg step's
-`assert-suite-cover.py` select it) that discovers
+— the second label let the Windows non-pg step's
+`assert-suite-cover.py` select it until ADR-0035 step 1 made that leg
+agent-only; Linux selects it by name) that discovers
 every `server-pg`-suite entry via `meson introspect --tests` and proves, via
 `--list-tests --reporter xml` against the real compiled binary, that every
 `[pg]`-tagged Catch2 case lands in exactly one shard — none lost, none
@@ -1835,7 +1877,8 @@ exactly, reusing one chokepoint instead of a second hand-rolled copy. See
 "Sharded 2026-07-13") for the full incident history this replaces.
 
 **PG push-leg policy — full on one leg, smoke elsewhere (#3443 Phase 2,
-2026-08-26; extended to Windows 2026-08-28):** Phase 1's load asymmetry
+2026-08-26; extended to Windows 2026-08-28; Linux-only again since ADR-0035
+ladder step 1, which removed the server suites from the Windows leg):** Phase 1's load asymmetry
 diagnosis (a `dev`/`main` push originally ran the full pg-shard suite on
 all 4 Linux legs, ~85% of each job's time, vs 2 Windows legs both running
 the same full set on their own 4-runner box) is cut by narrowing what the
@@ -2174,13 +2217,12 @@ first, the runner's end-of-job orphan sweep is what reaps the halves, and until
 then a pg half can still hold its `with-test-slot.sh` slot. All of this is
 exercised by `tests/shell/test_linux_concurrent_step.sh` against stubs.
 
-**Windows stays sequential, deliberately.** The Windows job keeps its separate
-`Test (non-pg suites)`, `Test (pg shards, full)` and `Test (pg smoke)` steps.
-Its test-phase widths are set by the measurements under "Windows test-phase
-concurrency gate", each taken with the non-pg and pg phases running one after
-the other; running them side by side would change the load those numbers were
-measured under, on a box (Wee Tam) this change has not measured at all. A
-Windows version would be its own change with its own same-SHA samples.
+**Windows has nothing to run side by side.** When this change landed, the
+Windows job kept its separate `Test (non-pg suites)`, `Test (pg shards, full)`
+and `Test (pg smoke)` steps, sequential, because its widths were measured that
+way on a box (Wee Tam) this change had not measured. Since ADR-0035 ladder step
+1 the Windows leg is agent-only and has a single `Test (non-pg suites)` step, so
+there is no second half to overlap.
 
 **Kill switch.** Setting the repository variable `YUZU_CI_SEQUENTIAL_HALVES`
 to `1` makes the step run the non-pg half, then the pg half, and skip the pg
@@ -2257,7 +2299,7 @@ delta is attributable to one axis ("never bundled with a topology change"):
 | 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
 | 2b | `gateway eunit` meson `priority: 120`, so it starts first in the cheap-suites invocation (see Push 2b below) | ordering | | | | | | |
 | 2c | Linux np 2 → 4 on the pg-shards step only (see Push 2c below) | width | | | | | | |
-| 2 | Linux np 2 → 4 on the server-shard invocation (not planned: that invocation is about 66 s of wall time, Push 2a, so there is little to gain); Windows pg 6 → 8, non-pg 4 → 6 (held) | width | | | | | | |
+| 2 | Linux np 2 → 4 on the server-shard invocation (not planned: that invocation is about 66 s of wall time, Push 2a, so there is little to gain); Windows pg 6 → 8 (moot: the step was removed by ADR-0035 step 1), non-pg 4 → 6 (held) | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
 
@@ -2358,8 +2400,8 @@ non-timing red.
 the BEAM are multi-threaded, so load follows threads, not entries. With four
 runner agents, Linux can now have 16 concurrent entries box-wide (up from 8). The
 Linux non-pg step has no `with-test-slot.sh` gate, whereas the Windows non-pg
-step runs a similar set (it adds the server non-pg entries and drops docs) at 4
-behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported; the probe
+step runs the agent, platform, proto, echo and gateway suites (no server
+entries since ADR-0035 ladder step 1; no docs) at 4 behind a slot of 2. Both boxes have 256 GB of RAM (owner-reported; the probe
 measurement above is still pending) and no per-runner memory limit is documented.
 This was measured on one leg (`gcc-15`/`debug`) but ships on all four: the
 clang-21 and release legs never run on a PR (clang-21 debug on any push; release
@@ -2757,24 +2799,26 @@ by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
 that prevents post-steps intentionally leaves an `in_progress` row, which is
 itself evidence of runner/job termination rather than a fabricated result.
 
-**Windows gap (Linux closed 2026-11-10), since the "Suite isolation" split
-above:** on Linux each invocation now has its own meson `--logbase` and the
-finalizer imports all three (`ci-telemetry.py finish --logbase ...`), so the
-rest of this paragraph is history for Linux and current for Windows. Before
+**Multi-invocation telemetry gap (Linux closed 2026-11-10; Windows closed by
+ADR-0035 ladder step 1), since the "Suite isolation" split above:** on Linux
+each invocation now has its own meson `--logbase` and the finalizer imports all
+three (`ci-telemetry.py finish --logbase ...`); the Windows leg is now
+agent-only with ONE test invocation, so its single `testlog.junit.xml` is the
+whole record. The rest of this paragraph is history for both. Before
 that, the finalizer imported one `meson-logs/testlog.junit.xml`, and both platforms'
-Test steps now run multiple separate `meson test` invocations against the
-same builddir (Linux: 3; Windows: always 2 — the non-pg step plus
+Test steps ran multiple separate `meson test` invocations against the
+same builddir (Linux: 3; Windows: then 2 — the non-pg step plus
 exactly one of pg-full/pg-smoke, `matrix.pg_mode` resolves to exactly
-one or the job fails loud earlier), each overwriting that file. Only
+one or the job failed loud earlier), each overwriting that file. Only
 the LAST invocation's per-suite `ci_test_suites` rows and any `flake-retry`
-recovery it reports survive — the earlier, cheaper invocation(s) still gate
-the job (their own exit code), but produce no queryable history via
+recovery it reported survived — the earlier, cheaper invocation(s) still gated
+the job (their own exit code), but produced no queryable history via
 `test-db-query.sh ci-suite-stats`/`ci-flakes` for this job. This was true
 for Linux from the original #3443 restructuring and became true for
 Windows too once this PR mirrored that shape — see the "Telemetry note"
-above for the Windows-specific ordering detail (pg runs last on both
-platforms, for the same reason). macOS remains genuinely unaffected — it
-never runs a `[pg]`-tagged suite (ADR-0035) and still has one invocation.
+above for the Windows-specific ordering detail (pg then ran last on both
+platforms, for the same reason). macOS was never affected — it never ran a
+`[pg]`-tagged suite (ADR-0035) and has one invocation.
 
 Provisioning is versioned in
 [`deploy/linux/Provision-BigTam-Runner-Telemetry.sh`](../deploy/linux/Provision-BigTam-Runner-Telemetry.sh)
@@ -2901,7 +2945,9 @@ The meson `docs` suite is OS-independent (lexical gates, selftests, lint
 tests) and runs on the **Linux leg only**. Its "runs on every leg" premise was
 false at the test-file level: nine entries pin OS-specific behaviour inside the
 test file or script itself, not behind a meson guard. Those nine carry the
-`platform` suite instead, which every leg runs:
+`platform` suite instead, which every leg runs (except where an entry is not
+registered: since ADR-0035 ladder step 1 the Windows and macOS legs configure
+with `-Dbuild_server=false`, so a `build_server`-gated entry runs on Linux only):
 
 | Entry | Why it is OS-contract |
 |---|---|
@@ -2913,10 +2959,10 @@ test file or script itself, not behind a meson guard. Those nine carry the
 | `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |
 | `start-UAT.sh kill_stale scoping (#5333)` | sources `scripts/start-UAT.sh`, the macOS/Linux rig with Darwin branches; registered off Windows, so it runs on Linux and macOS |
 | `capability matrix gate shell tests (#2204 F10)` | picks `.so`/`.dylib`/`.dll` and loads the real fixture plugins through `capmatrix-gen` on each leg |
-| `healthcheck CLI contract (#5906)` | a bash test that drives the real native `yuzu-server` binary (`.exe` probe, `MSYS2_ARG_CONV_EXCL`, `cygpath`); labelled `['server', 'platform']` |
+| `healthcheck CLI contract (#5906)` | a bash test that drives the real native `yuzu-server` binary (`.exe` probe, `MSYS2_ARG_CONV_EXCL`, `cygpath`); labelled `['server', 'platform']` (Linux only since ADR-0035 step 1; not registered when `build_server=false`) |
 
-Linux selects `--suite docs … --suite platform`; Windows selects `--suite platform`
-(not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
+Linux selects `--suite docs … --suite platform`; Windows selects `--suite agent
+--suite platform --suite proto --suite echo --suite gateway` (not `docs`) with `--exclude-suite docs` on its coverage guard; macOS runs
 everything but `--no-suite docs`. The five dual-labelled node tests
 (`shell bell script behaviour`, `tokens page rotate behaviour`,
 `echo timeline script behaviour`, `mcp http adapter behaviour` and
@@ -2938,14 +2984,27 @@ excluded.
 
 ADR-0006 decision 8: every tier that runs the server **`[pg]`** suite gets a
 real PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
-**PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker +
-Windows legs test against it; the server SQL is version-agnostic (13+), so a
+**PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker
+legs test against it; the server SQL is version-agnostic (13+), so a
 runner-native cluster on an older major still exercises the suites correctly.
 One script implements it everywhere — `scripts/ci/ensure-postgres.sh`, inserted
 as an `Ensure Postgres (server tests)` step between Build and Test in ci.yml
-(linux / windows) and nightly.yml (asan / tsan / coverage).
+(linux) and nightly.yml (asan / tsan / coverage).
 
-**macOS does NOT run the server `[pg]` suite (ADR-0035; #2394).** The Yuzu
+**Only Linux runs the server suites (ADR-0035 ladder step 1).** The Windows and
+macOS legs of `ci.yml` configure with `-Dbuild_server=false`, so they build no
+server code, register no server suite and need no Postgres; the Windows job no
+longer runs `Ensure Postgres`. Wee Tam's per-agent PostgreSQL services stay
+provisioned until ladder step 4 deprovisions them, and
+`deploy/windows/Assert-Toolchain.ps1` still health-checks them in the Windows
+job's `Assert toolchain manifest (self-hosted)` step, so a Wee Tam Postgres
+outage still fails the Windows leg although no step uses the database. The
+Windows-specific paragraphs below (path 1, the per-agent ports) describe that
+still-provisioned setup and the pre-step-1 CI use of it.
+
+**macOS does NOT run the server `[pg]` suite (ADR-0035; #2394).** Since ADR-0035
+step 1 it builds no server at all; the history below explains why the `[pg]`
+suite was dropped there first. The Yuzu
 server is a Linux-only component (macOS/Windows are agent-only platforms), and
 GHA-hosted macos-15 runs a *single* brew Postgres cluster. After the
 auth→Postgres migration (ADR-0006) roughly doubled the `[pg]` population to
@@ -2956,13 +3015,9 @@ hit their timeout). So the macOS leg deliberately **does not provision Postgres
 / export the DSN**: every `[pg]` server test then SKIPS (env-unset → skip, the
 same contract the Catch2 PG fixtures use), completing in milliseconds, while
 the non-PG server suite (`~[pg]`), the agent suite, and the Apple-Clang compile
-still run. Linux + Windows both run the full `[pg]` shard set (macOS runs
-none) — Windows additionally skips 44 migration-in-substance fresh-DB
-cases within that set (#2354, "PG coverage by platform" below); that is a
-narrower, Windows-specific exclusion, not a return to macOS's all-or-nothing
-skip. Re-enabling full macOS `[pg]` coverage requires first solving the
-single-cluster capacity problem (per-shard clusters or a cheaper per-test
-isolation model than database-per-test).
+still ran. At the time Linux + Windows both ran the full `[pg]` shard set
+(Windows additionally skipping 44 migration-in-substance fresh-DB cases,
+#2354, "PG coverage by platform" below); since ADR-0035 step 1 only Linux does.
 Resolution order inside the script:
 
 1. **Pre-set `YUZU_TEST_POSTGRES_DSN`** (runner-level env) — the escape
@@ -3040,7 +3095,8 @@ Resolution order inside the script:
    Prefer the runner-level env override (path 1) if the box already runs
    Postgres with different credentials.
 
-   **Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4:** each runner
+   **Wee Tam (`yuzu-weetam-windows`) uses path 1, not path 4 (unused by CI
+   since ADR-0035 step 1):** each runner
    provides native PostgreSQL **18** services — agent 0's winget-installed
    `postgresql-x64-18-yuzu-ci` on `:5433` plus one initdb'd cluster per
    further agent (`postgresql-x64-18-yuzu-ci-<n>` on `:5433+<n>`, #2094) —
@@ -3052,12 +3108,12 @@ Resolution order inside the script:
    `yuzu-local-windows` box ran a PG 16 binaries-zip service on 5433 — see
    git history if that bootstrap pattern is ever needed again.)
 
-   Windows CI test-phase restructuring (#3443, 2026-08-28): `ci.yml`'s
-   Windows job runs the `Test (pg shards, full)` / `Test (pg smoke)`
-   split described in "PG coverage by platform" below, mirroring the
-   Linux job's `pg_mode` shape. Neither the ensure-postgres.sh mechanism
-   above nor the per-agent cluster topology changed — only which meson
-   suites a given job invocation selects.
+   From the Windows CI test-phase restructuring (#3443, 2026-08-28)
+   until ADR-0035 ladder step 1, `ci.yml`'s Windows job ran the
+   `Test (pg shards, full)` / `Test (pg smoke)` split, mirroring the
+   Linux job's `pg_mode` shape. Since step 1 no `ci.yml` job on Wee Tam
+   uses these clusters; they stay provisioned (and health-checked by
+   `Assert-Toolchain.ps1`) until ladder step 4.
 5. Nothing found → `::error`, exit 1.
 
 **Fatal on every non-success path since #1320 PR 1 (`SOFT_EXIT=1`):**
@@ -3076,8 +3132,9 @@ get the authenticated gate instead). Locally the tests still skip when
 `YUZU_TEST_POSTGRES_DSN` is unset; when it is set but unreachable they
 fail rather than skip.
 
-On the Windows pool (path 1, #3443 restructuring): `ci.yml`'s `Resolve
-pg_mode + assert Postgres DSN` step loud-fails (`::error`+`exit 1`,
+On the Windows pool, until ADR-0035 step 1 removed it (path 1, #3443
+restructuring), `ci.yml`'s `Resolve pg_mode + assert Postgres DSN` step
+loud-failed (the Linux job's step of the same name still does) (`::error`+`exit 1`,
 checked before any test invocation runs, not just the PG-tagged ones) on
 three separate conditions — `pg_mode` resolving to neither `full` nor
 `smoke`, `YUZU_TEST_POSTGRES_DSN` being unset/empty after Ensure Postgres,
@@ -3086,9 +3143,10 @@ does NOT check DSN *parseability* — a syntactically malformed but
 non-empty DSN clears this step and only fails later, at the first actual
 libpq connection attempt inside a PG-tagged test.
 
-**Connect cap on the Linux and Windows test legs.** The
-`Resolve pg_mode + assert Postgres DSN` step in each of those two jobs appends
-`PGCONNECT_TIMEOUT=30` to `$GITHUB_ENV`, so every connect libpq makes in the
+**Connect cap on the Linux test legs.** The
+`Resolve pg_mode + assert Postgres DSN` step in the Linux job appends
+`PGCONNECT_TIMEOUT=30` to `$GITHUB_ENV` (the Windows job did the same until
+ADR-0035 step 1 removed its Postgres steps), so every connect libpq makes in the
 later steps has a bound, including a connect to a backend that accepts the TCP
 connection and then never answers (libpq has no connect timeout by default).
 30 s is deliberately looser than `PgPool`'s own 10 s default: the pool lets the
@@ -3098,8 +3156,8 @@ in these steps the pool's connect bound is 30 s unless the DSN itself carries a
 must therefore put it in the DSN.
 A 10 s cap failed a fixture connect on a heavily loaded dev box, which is why
 the value is not 10. `scripts/ci/sweep-test-databases.sh` exports its own 10 s
-for itself. macOS is not given the variable: that leg exports no DSN, so no
-`[pg]` test connects. On POSIX the `[pg_reachability]` unit tests unset the
+for itself. Windows and macOS are not given the variable: those legs build no
+server and export no DSN, so no `[pg]` test connects. On POSIX the `[pg_reachability]` unit tests unset the
 variable for the duration of each case (`test_pg_reachability_probe.cpp`),
 because the probe lets it override the 3 s deadline those tests bound; the
 timing-sensitive cases are compiled out on Windows. A case that needs another
@@ -3111,21 +3169,21 @@ value sets it itself.
 |---|---|---|---|
 | Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
 | Linux (other legs: clang-21 debug on a push; release legs on a `main` push or Tier 2b dispatch) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
-| Windows (debug, every PR + push) | full (14 shards) | **skipped** (`YUZU_REQUIRE_PG_MIGRATION_DB`) | #2354; behaviour covered on Linux |
-| Windows (release, `main` push or Tier 2b dispatch) | smoke | **skipped** (2 of the 11 smoke cases) | never runs on a PR or `dev` push |
-| macOS | none (ADR-0035) | n/a | server is Linux-only |
+| Windows | none (ADR-0035 step 1: agent-only, `-Dbuild_server=false`) | n/a | server is Linux-only |
+| macOS | none (ADR-0035 step 1: agent-only, `-Dbuild_server=false`) | n/a | server is Linux-only |
 
-**#3508 (moving pg shards off Windows PRs entirely) is deliberately NOT
-adopted here** — Windows PR legs keep full `server-pg` coverage rather than
-dropping to `[pg-smoke]`. The Windows server still ships (ADR-0035 is
-`proposed`, not accepted, and `release.yml` signs `yuzu-server.exe` +
-builds `YuzuServerSetup`), and there is no agent<->server integration step
-in the Windows job that would make full pg coverage there redundant — the
-#3508 premise for narrowing Windows PR coverage does not hold today. This
-PR's non-pg/pg-shard split closes the time gap #3508 was trying to close
-by a different, more targeted route instead.
+Until ADR-0035 ladder step 1, Windows debug (every PR and push) ran the full
+14 shards and Windows release (a `main` push or a Tier 2b dispatch) the smoke
+subset, both with the migration-DDL tests skipped (next paragraph).
 
-44 migration-in-substance fresh-DB Postgres test sites (a real from-scratch
+**#3508 (moving pg shards off Windows PRs) is superseded.** It was
+deliberately not adopted while the Windows server still shipped and ADR-0035
+was `proposed`. ADR-0035 was accepted on 2026-11-10 (#7465) and step 1 goes
+further than #3508 asked: the Windows leg runs no server suite at all, on any
+event, so the `server-pg` shard set is Linux-only. (`release.yml` still builds
+and signs `yuzu-server.exe` and `YuzuServerSetup` until ladder step 2.)
+
+**Historical (Windows, before ADR-0035 step 1):** 44 migration-in-substance fresh-DB Postgres test sites (a real from-scratch
 migration, `!is_open`-on-failure, backfill/upgrade, drift detection) SKIP
 on Windows via `YUZU_REQUIRE_PG_MIGRATION_DB` in `tests/unit/test_helpers.hpp`
 — each pays EXEC_BACKEND CreateProcess-per-connection plus the migration
@@ -3243,7 +3301,10 @@ sanctioned in-repo nuke path**; never `rm -rf` runner caches (memory
 
 ## Per-OS build directory names
 
-Matrix: `build-{linux,windows,macos}`. Nightly variants:
+Matrix: `build-{linux,windows,macos}`. `ci.yml`'s Windows job uses
+`build-windows-agent-{debug,release}` (agent-only since ADR-0035 step 1; the
+earlier `build-windows-{debug,release}` dirs are deleted on every run so a
+server-configured tree is never reused). Nightly variants:
 `build-linux-{asan,tsan,coverage}`. `sanitizer-tests.yml` + `release.yml` +
 `pre-release.yml` follow the same convention so the warm asan binary cache
 is shared. Closes #406.
@@ -3294,11 +3355,11 @@ reversible test tooling — no ADR (rationale in the wrapper header).
 **Per-case duration summary (#4884).** The suite-budget table above is
 per meson entry. Next to it, `scripts/ci/test-durations-summary.py` appends a
 "Test durations — <label>" block to the job summary after each
-`flake-retry.py` invocation in the Linux (three), Windows (two) and macOS (one)
-Test steps: every entry's wall seconds, meson timeout and share of it, then the
-25 slowest Catch2 cases (entry, case, seconds, runs). The non-PR pg smoke
-runs (the Windows `Test (pg smoke)` step, the Linux step's smoke branch) are
-deliberately not summarised: each runs one ~3 s entry. The case data is Catch2's
+`flake-retry.py` invocation in the Linux (three), Windows (one, since ADR-0035
+step 1) and macOS (one) Test steps: every entry's wall seconds, meson timeout and
+share of it, then the 25 slowest Catch2 cases (entry, case, seconds, runs). The
+non-PR pg smoke run (the Linux step's smoke branch; the Windows `Test (pg smoke)`
+step went with ADR-0035 step 1) is deliberately not summarised: it runs one ~3 s entry. The case data is Catch2's
 own `--durations=yes`, now on every Catch2 entry except the two pinned exemptions
 (the non-PR pg smoke entry and the `[tsan-heavy]` checkpoints entry; the `=`
 form is required: a space would add a positional

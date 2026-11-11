@@ -1162,6 +1162,20 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
      old and new names. The ledger records the retirement because the policy
      requires it.
+   - **2026-11-10 - the Echo retention-paused row count is renamed from
+     `live_rows` to `hourly_rows` with no deprecation window.**
+     `docs/api-versioning-policy.md` treats a response-field rename as a Breaking
+     change that keeps the old name for a window; this rename retires `live_rows`
+     outside that cycle, by the owner's ruling of 2026-11-10: a hard cut, no
+     alias, the same ruling as the 2026-10-28 Echo rename above. Scope: the
+     `rows[].live_rows` field of `GET /api/v1/echo/retention-paused` and of the MCP
+     tool `list_echo_retention_paused` (one shared builder), their OpenAPI and MCP
+     output schemas. The replacement is `hourly_rows`, the count of rows in the
+     source's hourly roll-up tier. Rationale: Echo keeps roll-up tiers only, so
+     the old name now describes a table that does not exist, and a retained
+     alias would keep it alive; this ships as a fresh deployment, so no existing
+     client is carried across. The migration guide
+     (`docs/user-manual/upgrading.md`) names the change. No calendar revisit.
    - **2026-10-31 - gate parity (check 6) pins one more known mismatch for
      `POST /api/v1/commands` and `execute_instruction`.** Owner ruling: the
      gate-parity table `GATE_PARITY_KNOWN_MISMATCHES` gains the entry

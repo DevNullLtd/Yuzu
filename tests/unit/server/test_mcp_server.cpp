@@ -6764,6 +6764,32 @@ TEST_CASE("MCP Integration: tools/call list_echo_retention_paused answers a clea
          "Echo retention-paused surface unavailable");
 }
 
+TEST_CASE("MCP list_echo_retention_paused: tools/list names the hourly roll-up row count",
+          "[mcp][integration][echo]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":4043})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "list_echo_retention_paused")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+
+    const auto description = (*tool)["description"].get<std::string>();
+    CHECK(description.find("hourly_rows") != std::string::npos);
+    CHECK(description.find("live_rows") == std::string::npos);
+
+    const auto& row = (*tool)["outputSchema"]["properties"]["rows"]["items"];
+    CHECK(row["properties"].contains("hourly_rows"));
+    CHECK_FALSE(row["properties"].contains("live_rows"));
+    const auto required = row["required"].dump();
+    CHECK(required.find("\"hourly_rows\"") != std::string::npos);
+    CHECK(required.find("live_rows") == std::string::npos);
+}
+
 // ── Guardian schema discovery on the MCP plane (contract §4 dec.3 / §9 G9) ───
 // The schema catalog must be discoverable on BOTH the REST plane and the MCP
 // plane, byte-for-byte identical (single source: guardian_schema_catalog), so an

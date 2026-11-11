@@ -3228,7 +3228,8 @@ if build_server
   # GCC/Clang only: the script reads `*.cpp.o` objects with `nm`; MSVC emits
   # `.obj` files and its runners ship no `nm`, so this test() entry does not
   # exist at all on that toolchain — the Windows leg adds nothing here. The
-  # macOS leg runs it (no by-name filter, full `meson test`); the Linux
+  # macOS leg ran it (no by-name filter, full `meson test`) until ADR-0035
+  # made that leg agent-only (it no longer builds the server); the Linux
   # leg's own non-pg Test step selects `server-checks`-suite tests by an
   # explicit NAME list, which had never named this one (CI-2, 2026-09-28,
   # WS-A4 PR-1 Gate 7 fix round build-ci review) — this test silently never
@@ -4605,10 +4606,12 @@ endif
 # #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
 # Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
 # runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
-# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
-# it drives the native binary (`.exe` probe, MSYS2_ARG_CONV_EXCL, cygpath). Suite 'platform', not a bare
-# 'server': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate
-# labelled only 'server' fails that check on the Windows legs.
+# platform: OS-contract test (docs is OS-independent and Linux-only since 2026-10-21). It is registered
+# only when build_server is on, so since ADR-0035 ladder step 1 (Windows and macOS CI configure with
+# -Dbuild_server=false) it runs on the Linux legs only; its `.exe` probe, MSYS2_ARG_CONV_EXCL and cygpath
+# handling now serve local Windows builds alone. Suite 'platform', not a bare 'server':
+# scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate labelled
+# only 'server' would fail that check on any leg that registers it.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server
   test('healthcheck CLI contract (#5906)',
     _bash_test,

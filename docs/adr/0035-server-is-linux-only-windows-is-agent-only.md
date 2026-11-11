@@ -11,7 +11,7 @@ deciders: >-
   incorporated before the ADR merged as `proposed`; (2) a second Fable Enterprise Architect re-read
   against `origin/dev` cd163fe4d on 2026-11-10, verdict ACCEPT-WITH-CHANGES, whose required
   corrections are incorporated in the acceptance change; (3) the review of the acceptance pull
-  request itself, whose number is recorded here on merge.
+  request itself, #7465.
 scope: platform — supported operating systems per deployable, the CI/release matrix, and the platform-specific server code + build/CI plumbing that removal deletes
 amends: >-
   0031-presentation-core-engine-decomposition Gate G10 — the "MSVC static linkage included" clause of
@@ -151,7 +151,8 @@ ladder step 4). Leaving the code but disabling CI is explicitly rejected (Consid
 
 `build_server` is converted from a plain boolean (which defaults **true**, so a naive "error on
 non-Linux" would break every fresh `meson setup build-macos` / `scripts/setup.sh` on Windows and
-macOS — including agent-only developers) into a **Meson feature option** with the semantics:
+macOS — including agent-only developers) into a **Meson feature option** (under a new option name;
+see the Update at the end of this decision) with the semantics:
 
 - `auto` (default) on a **Linux target** → build the server; on a **non-Linux target** → silently
   **disabled** with an informational message. A plain checkout configures agent-only off-Linux with
@@ -163,7 +164,8 @@ macOS — including agent-only developers) into a **Meson feature option** with 
 The check keys on `host_machine.system() == 'linux'` (the *target*), so a **Linux-target cross build
 from any build machine stays legal** — matching "the server *runs* on Linux", not "you may only
 build it on Linux". The same PR updates `scripts/setup.sh`, the CLAUDE.md quickstarts, and the docs
-that pass `-Dbuild_server=false` (now `-Dbuild_server=disabled`).
+that pass `-Dbuild_server=false` (to the feature option's `disabled` value, under the option name the
+Update below requires).
 
 The Meson guard alone is not enough: since 5b903db26 (#4295) `vcpkg.json` lists `"default-features": ["server",
 "tests"]`, so a plain `vcpkg install` on Windows or macOS still builds the server-only dependencies
@@ -171,6 +173,17 @@ The Meson guard alone is not enough: since 5b903db26 (#4295) `vcpkg.json` lists 
 non-Linux paths install agent dependencies only — either `scripts/setup.sh` and the Windows/macOS CI
 legs pass `--x-no-default-features --x-feature=tests` off Linux, or the manifest default drops
 `server` and the Linux paths opt in. The choice is the implementing PR's, recorded there.
+
+**Update (2026-11-10, ladder step 1):** the feature option takes a NEW name (for example `server`,
+so `-Dserver=disabled`); it does not retype `build_server`. Retyping the existing boolean
+`build_server` as a feature breaks existing build dirs, measured with Meson 1.11.1:
+`meson setup --reconfigure` fails on any build dir that stored the boolean, whether or not
+`-Dbuild_server=disabled` is passed, and `meson setup --wipe` fails on a build dir that was
+configured with an explicit `-Dbuild_server=<bool>`. Renaming the persistent CI build dirs would
+cover CI only: it does not reach developer trees, because `scripts/setup.sh` reuses an existing
+build dir via `--reconfigure`. A new option name avoids the retype everywhere, so it is the
+recommendation outright. `build_server` then stays a boolean (deprecated, then removed) or is
+deleted in the same change; the implementing PR records which.
 
 ### 5. Windows/macOS release archives become agent-only and are renamed for honesty
 
@@ -304,9 +317,10 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
 - **ADR-1005 (headless platform / use-case engines).** Reinforcing, not conflicting: a headless,
   containerised, Postgres-backed control plane with separately-deployed use-case engines is *more*
   coherent as Linux-only.
-- **`build_agent` stays a boolean; `build_server` becomes a feature** (Decision 4). `-Dbuild_server=false`
-  becomes `-Dbuild_server=disabled` across CI and docs — the CI change is mostly flipping/renaming an
-  option plus the configure guard, not new build plumbing.
+- **`build_agent` stays a boolean; the server switch becomes a feature** (Decision 4). `-Dbuild_server=false`
+  becomes the feature option's `disabled` value across CI and docs, under a NEW option name such as
+  `-Dserver=disabled` (Decision 4's Update, 2026-11-10) — the CI change is mostly flipping/renaming
+  an option plus the configure guard, not new build plumbing.
 
 ## Implementation ladder (follow-up PRs — not this ADR)
 
@@ -324,8 +338,37 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    `pre-release.yml` (its Windows/macOS install jobs are already agent-installer-only, but the
    artifact-name change reaches it). Keep the (non-blocking) gateway canary. Prune now-unused Windows
    server cache scopes (`cache-prune.yml`).
-2. **Release + rename blast radius** — remove the server from the Windows/macOS staging in
-   `release.yml` (incl. `install-server-postgres.sh` from the macOS tarball); delete the
+
+   *Status: in progress — the step-1 CI change, #7499.* As
+   implemented: the Windows and macOS legs of `ci.yml` pass `-Dbuild_server=false` (the boolean;
+   the feature option is step 3) and drop every item listed above for them, and the Windows leg
+   moves to `build-windows-agent-{debug,release}` and deletes the old dirs, so a branch cut
+   before this change never shares a stored `build_server` value with one cut after it.
+   `codeql.yml`'s Windows row is kept, agent-only (`-Dbuild_server=false`) rather than dropped,
+   because it is the only CodeQL coverage of the agent's Windows code.
+   `instructions-windows-validate.yml` is deleted. `vcpkg install` is unchanged (the full
+   manifest, server ports included) until step 3, which changes it on every Windows and macOS
+   workflow at once. `cache-prune.yml` has no Windows-server-only scope to prune: its Windows
+   `sweep-test-databases.sh` step goes with Wee Tam's Postgres in step 4, and until then
+   `Assert-Toolchain.ps1` still health-checks those clusters in the Windows job.
+   `pre-release.yml`: no change until step 2's artefact rename.
+
+   **Release ordering (owner decision, 2026-11-10):** step 2 MUST merge before the next release
+   tag, or that release MUST explicitly accept shipping a Windows/macOS server that CI never
+   built or tested before tagging, recorded as a `changelog.d` caveat fragment merged through a
+   reviewed PR (whose description names the approver and the date) and promoted before tagging,
+   so `release.yml` carries the caveat into that release's notes (the exact form
+   and the `release.yml` check are in
+   `.claude/skills/release/SKILL.md`, Phase 0 preflight). From step 1 on, CI no longer compiles
+   or tests the Windows or macOS server, but `release.yml` still builds and ships it until step 2.
+   If a Windows or macOS server compile break surfaces at release time before step 2, the remedy
+   is to land step 2 (drop the server from those release jobs), not to patch server code for an
+   unsupported platform.
+2. **Release + rename blast radius** — stop building the server in `release.yml`'s Windows and
+   macOS jobs (`-Dbuild_server=false` on their configure; remove their server `--help` smoke tests,
+   `yuzu-server.exe` from the Windows signing set, and `build-macos/yuzu-server` from the macOS
+   codesign loop and notarization zip) and remove it from their staging (incl. `install-server-postgres.sh` from the macOS
+   tarball), so the `/release` preflight grep goes empty; delete the
    `YuzuServerSetup` / `deploy/packaging/windows/yuzu-server.iss` path; rename the Windows/macOS
    archives to their agent-only names and update **every** consumer: `scripts/check-release-artifacts.sh`
    (the `FILES` array **and** the `.cdx.json`/`.spdx.json` SBOM name expectations), the SBOM artifact
@@ -339,7 +382,12 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
 3. **Build guard** — implement Decision 4: convert `build_server` to a feature option, key the guard
    on `host_machine.system()`, make the non-Linux `vcpkg install` paths skip the `server` feature,
    and update `scripts/setup.sh`, the CLAUDE.md quickstarts, and any docs passing
-   `-Dbuild_server=false` in the same PR.
+   `-Dbuild_server=false` in the same PR. The feature option takes a NEW option name (for example
+   `server`), not a retype of `build_server`: see Decision 4's **Update (2026-11-10, ladder step
+   1)** for why. Also update `tests/shell/test_build_examples_gating.sh` (suite `platform`, runs on
+   the Windows and macOS legs): it configures against the vcpkg tree with the default server
+   switch, so once the server ports leave the Windows/macOS install it must pass
+   `-Dbuild_server=false` (or the new option's `disabled`) off Linux.
 4. **Code + build/CI plumbing** — remove server-side `_WIN32` / `__APPLE__`-specific branches under
    `server/core/` (retain POSIX/Linux; do not disturb `agents/shared/` or `sdk/`, which stay
    cross-platform); and remove the plumbing that exists only for the non-Linux server: the
