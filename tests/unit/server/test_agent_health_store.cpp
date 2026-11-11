@@ -1999,6 +1999,16 @@ std::size_t count_init_failed_series(const std::string& out) {
 }
 } // namespace
 
+TEST_CASE("catalogue_plugin_names skips the __-prefixed protocol names",
+          "[health_store][echo][real]") {
+    const auto& names = catalogue_names();
+    CHECK(std::ranges::find(names, "__guard__") == names.end());
+    CHECK(std::ranges::find(names, "__sync__") == names.end());
+    CHECK(std::ranges::find(names, "echo") != names.end());
+    for (const auto& n : names)
+        CHECK_FALSE(n.starts_with("__"));
+}
+
 TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, bounded by the catalogue, absent-not-zero",
           "[health_store][echo][corruption][real]") {
     REQUIRE(catalogue_names().size() > 70); // the fleet-wide case below uses 70 distinct names

@@ -36,11 +36,16 @@ inline constexpr const char* kRejectOverCap = "over_cap";
 
 /// Every distinct plugin named by a row of the composed catalogue, lowercased and sorted. The same
 /// `for_each_row` walk `derive_forensics_plugin_set` is built on, without its securable filter, so
-/// a new catalogue fragment is reflected here with no second list to keep.
+/// a new catalogue fragment is reflected here with no second list to keep. Names starting with
+/// "__" (`__guard__`, `__sync__`) are protocol names, not plugins, and are skipped so an agent
+/// cannot claim them as a label.
 [[nodiscard]] inline std::vector<std::string>
 catalogue_plugin_names(const CommandCapabilityRegistry& registry) {
     std::set<std::string> names;
-    registry.for_each_row([&](const CommandCapability& cap) { names.insert(ascii_lower(cap.plugin)); });
+    registry.for_each_row([&](const CommandCapability& cap) {
+        if (!cap.plugin.starts_with("__"))
+            names.insert(ascii_lower(cap.plugin));
+    });
     return {names.begin(), names.end()};
 }
 
