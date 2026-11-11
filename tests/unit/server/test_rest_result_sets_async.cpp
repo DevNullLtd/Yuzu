@@ -5080,13 +5080,14 @@ TEST_CASE("ingest: a failed provenance lookup is carried to the terminal answer 
         ++sites;
     }
     CHECK(sites == 2);
-    // A lost answer whose tracker row could not be written is noted instead (only when the record
-    // does not already hold it), so a later terminal or replayed frame still reports it.
+    // A lost answer whose tracker row could not be written is noted instead, unconditionally (a
+    // marker, remembered command or latch covering the pair may expire before a fresh entry), so a
+    // later terminal or replayed frame still reports it.
     CHECK(count_in(src, "const bool recorded = tracker->update_agent_status(execution_id, s); "
                         "if (response_dropped) { if (recorded) "
                         "unverified_frames_.forget(command_id, agent_id); "
-                        "else if (!unverified_frame_seen(command_id, agent_id)) "
-                        "note_unverified_frame(command_id, agent_id); }") == 1);
+                        "else note_unverified_frame(command_id, agent_id); }") == 1);
+    CHECK(count_in(src, "unverified_frame_seen(command_id, agent_id)") == 0);
     CHECK(count_in(src, "unverified_frames_.forget(") == 1);
     CHECK(count_in(src, "update_agent_status(") == 1);
     // Three note sites (two failed lookups, one failed tracker write) plus the definition.

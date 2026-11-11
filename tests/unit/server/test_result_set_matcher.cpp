@@ -1011,12 +1011,33 @@ TEST_CASE("UnverifiedFrameRegistry: a lost answer noted after a failed tracker w
     // row could not be written either; the replayed terminal frame then reads it, and it is
     // erased only after a tracker write that carried the flag.
     UnverifiedFrameRegistry reg;
-    CHECK_FALSE(reg.contains("cmd", "agent-a", 100)); // the caller notes only when not held
+    CHECK_FALSE(reg.contains("cmd", "agent-a", 100));
     (void)reg.note("cmd", "agent-a", 100);
     CHECK(reg.contains("cmd", "agent-a", 101)); // replayed terminal frame: still dropped
-    CHECK(reg.contains("cmd", "agent-a", 102)); // its write failed too: still held
-    reg.forget("cmd", "agent-a");               // a write that carried the flag
-    CHECK_FALSE(reg.contains("cmd", "agent-a", 103));
+    (void)reg.note("cmd", "agent-a", 102);      // its write failed too: noted again, one entry
+    CHECK(reg.size() == 1);
+    CHECK(reg.contains("cmd", "agent-a", 103));
+    reg.forget("cmd", "agent-a"); // a write that carried the flag
+    CHECK_FALSE(reg.contains("cmd", "agent-a", 104));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a pair noted while its agent marker covers it outlives the "
+          "marker",
+          "[result_set][unverified_frames]") {
+    // notify_exec_tracker notes a lost answer even when the pair already reads as not fully
+    // stored: the marker that covers it may expire before a fresh entry would.
+    UnverifiedFrameRegistry reg(100, 60, 1, 50, 50);
+    (void)reg.note("c0", "agent-a", 1);
+    CHECK(reg.note("c1", "agent-a", 2).marked); // marker set at t=2
+    CHECK(reg.contains("lost", "agent-a", 50)); // covered by the marker
+    (void)reg.note("lost", "agent-a", 50);      // a fresh entry (evicts c1, refreshes the marker)
+    CHECK(reg.contains("lost", "agent-a", 50 + 59));
+    CHECK_FALSE(reg.contains("lost", "agent-a", 50 + 60));
+    // Without the fresh note the marker alone would have ended at t=62.
+    UnverifiedFrameRegistry only_marker(100, 60, 1, 50, 50);
+    (void)only_marker.note("c0", "agent-a", 1);
+    (void)only_marker.note("c1", "agent-a", 2);
+    CHECK_FALSE(only_marker.contains("lost", "agent-a", 62 + 1));
 }
 
 TEST_CASE("UnverifiedFrameRegistry: concurrent note contains and forget stay consistent",

@@ -37,6 +37,9 @@
 /// - a full marker set or a full command set cannot take another: either one sets a global latch
 ///   for `max_age_s` seconds during which `contains` is true for every pair. Only these two cases
 ///   affect agents other than the one that sent the frames.
+/// A failed allocation loses no record (a marker or command is set before the entry it stands for
+/// is erased, and a refresh re-keys in place without allocating), but can leave more than
+/// `capacity` entries (one per failed `note`) until the next successful `note` evicts back to it.
 /// Memory is bounded, about 4 MiB worst case at the default caps with every agent id at the
 /// 256-byte bound (an estimate from allocation sizes measured on one platform, not a guarantee).
 /// Every entry, marker, remembered command and latch is dropped `max_age_s` seconds after it was set

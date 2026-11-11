@@ -2503,12 +2503,13 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // The row now carries the dropped-answer flag (sticky), so the record of an earlier unverified
     // frame of this pair has done its job; a failed upsert keeps it for a replayed terminal frame.
     // A lost answer whose row could not be written is recorded instead, so a later terminal or
-    // replayed frame of the pair still reports it.
+    // replayed frame of the pair still reports it. Noted even when a marker, a remembered command
+    // or the latch already reports the pair: those may expire first (note keeps an existing entry).
     const bool recorded = tracker->update_agent_status(execution_id, s);
     if (response_dropped) {
         if (recorded)
             unverified_frames_.forget(command_id, agent_id);
-        else if (!unverified_frame_seen(command_id, agent_id))
+        else
             note_unverified_frame(command_id, agent_id);
     }
 }

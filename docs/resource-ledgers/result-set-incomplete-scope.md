@@ -49,10 +49,11 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
   (`unverified_frame_registry.hpp`). Written by `note_unverified_frame` at the two RUNNING ingest
   sites (Subscribe and gateway) only when the frame's provenance lookup failed
   (`ProvenanceOutcome::kLookupDegraded`), and by `notify_exec_tracker` when a frame the store did
-  not keep could not be recorded on a tracker row either (`update_agent_status` returned false) and
-  the registry does not already report the pair; read without erasing by `unverified_frame_seen` at
-  the two terminal ingest sites; an entry is erased by `notify_exec_tracker` only after
-  `ExecutionTracker::update_agent_status` wrote a row carrying a true `response_dropped`.
+  not keep could not be recorded on a tracker row either (`update_agent_status` returned false),
+  even when a marker, remembered command or the latch already reports the pair; read without
+  erasing by `unverified_frame_seen` at the two terminal ingest sites; an entry is erased by
+  `notify_exec_tracker` only after `ExecutionTracker::update_agent_status` wrote a row carrying a
+  true `response_dropped`.
 - **Owner type:** owned by value by the service; `std::map`/`std::set` entries keyed by the exact
   agent id and a 64-bit digest of the command id salted with a random per-process value (in
   process only), plus a `std::mutex`, no thread, no callback, no handle.
@@ -69,9 +70,11 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
   only these reach other agents. Each eviction is counted as
   `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Entries,
   markers, remembered commands and the latch last one hour (expired on every `note` and `contains`,
-  against `steady_clock` seconds). `note` inserts into its three indexes or none, and sets a marker
-  or remembers a command before it erases the entry that stands for it, so an allocation failure
-  leaves no orphan and loses no record.
+  against `steady_clock` seconds). `note` inserts into its three indexes or none, sets a marker or
+  remembers a command before it erases the entry that stands for it, and refreshes an existing
+  marker or remembered command in place without allocating, so an allocation failure leaves no
+  orphan and loses no record. After such a failure the registry can hold more than 4,096 entries
+  (one more per failed `note`) until the next successful `note` evicts back to the cap.
 - **Lock:** its own `mu_`, held only for the map operations; no other lock is taken under it and it
   is never held across I/O.
 - **Release point:** each entry on a recorded flag, expiry or eviction; the whole registry with the
