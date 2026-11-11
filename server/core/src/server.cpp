@@ -2730,9 +2730,9 @@ public:
                           "Agents reporting a plugin that failed init, by plugin name (absent "
                           "when none). The label is bounded to the server's plugin catalogue: a "
                           "well-formed name the catalogue does not know is summed under "
-                          "plugin=unknown, which sums reported names (tokens), so one agent can add "
-                          "several (see yuzu_fleet_plugin_init_failed_rejected, which counts "
-                          "agents)",
+                          "plugin=unknown, which sums each agent's distinct reported names (tokens), so "
+                          "one agent can add several; matching is exact and case sensitive (see "
+                          "yuzu_fleet_plugin_init_failed_rejected, which counts agents)",
                           "gauge");
         metrics_.describe(yuzu::server::kPluginInitFailedRejectedGauge,
                           yuzu::server::kPluginInitFailedRejectedHelp, "gauge");

@@ -3348,8 +3348,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         .set(static_cast<double>(ota_signature_refusing));
     // #1567: agents reporting a quarantined echo.db (cumulative per agent since
     // install; a RISING value is the signal), and per-plugin init failures
-    // (absent-not-zero). Fleet-wide label cap: the first 64 plugin names in
-    // lexicographic order, the remainder summed under plugin="other".
+    // (absent-not-zero). The plugin label is bounded by the server's catalogue; every
+    // other well-formed name is summed under plugin="unknown" (see the block below).
     metrics.gauge("yuzu_fleet_echo_db_corruption_agents")
         .set(static_cast<double>(echo_db_corruption_agents));
     // #5332: published every sweep, 0 included (a server-owned count over the reporting
@@ -3369,7 +3369,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     if (dedup_rows_reported)
         metrics.gauge(kDedupRowsMaxGauge).set(static_cast<double>(dedup_rows_max));
     {
-        // Every label is a name the SERVER knows (the catalogue, about 75 names), so the label
+        // Every label is a name the SERVER knows (the catalogue, about 73 names), so the label
         // set is bounded without a cap an agent could fill to displace a real plugin. Names the
         // catalogue does not know are summed under "unknown", never "other", so a real plugin
         // named "other" is never overwritten.
