@@ -12,7 +12,7 @@ metadata:
   description: >
     Returns the current status of the Echo database including record count,
     oldest and newest event timestamps, the database size (used pages plus the
-    write-ahead log), and the configured retention period. Use this to verify
+    write-ahead log), and the configured byte budget. Use this to verify
     Echo is collecting data and to monitor disk usage. Also reports both the configured
     network_capture_method and the network_capture_method_effective (the
     mechanism actually collecting — always polling today), so status never
@@ -51,15 +51,12 @@ metadata:
     eviction pass that failed or was skipped, while a catch-up is still
     draining, or when only exempt rows remain),
     budget_evicted_hourly_rows_total (cumulative hourly rows the budget
-    removed; budget_evicted_raw_rows_total is retired, no longer written, and
-    prints its last value for one release), and db_auto_vacuum (incremental;
+    removed), and db_auto_vacuum (incremental;
     none; or deferred once a one-off conversion was wanted and could not run,
     for too little free disk space or a failed VACUUM, which stays until a
     conversion succeeds).
     Per capture source it reports config|<src>_rows|<n>, the rows held for that
-    source (an agent from before the roll-up-only release reports
-    config|<src>_live_rows|<n> instead; the server shows a dash for it rather
-    than reading that figure as the hourly count).
+    source.
     module_dedup_overflow_total and tcp_closing_dedup_overflow_total count how
     often the hourly de-duplication sets filled and were cleared.
     An exception inside any action ends the reply with a fixed error|internal
@@ -101,11 +98,6 @@ spec:
       - name: db_size_bytes
         type: int64
         description: 'Bytes the Echo database holds: used pages (free pages are reusable and not counted) plus the write-ahead log file. This is the figure the byte budget (configure.db_budget_bytes) is enforced against; it is not the size of the file on disk, which can be larger until freed pages are returned. Values: non-negative integer.'
-        example: "-"
-        platforms: [windows, linux, darwin]
-      - name: retention_days
-        type: int32
-        description: 'Currently configured retention window in days (see configure.retention_days). Values: 1-365.'
         example: "-"
         platforms: [windows, linux, darwin]
 
@@ -387,8 +379,8 @@ metadata:
   version: 1.0.0
   description: >
     Updates Echo plugin configuration. Changes take effect on the next
-    collection cycle. Configurable settings include data retention period,
-    the database byte budget, collection intervals, and command-line
+    collection cycle. Configurable settings include the database byte budget,
+    collection intervals, and command-line
     redaction patterns for sensitive data protection. Lowering
     db_budget_bytes deletes history on the next maintenance pass (within 15
     minutes) and cannot be undone.
@@ -406,14 +398,6 @@ spec:
   parameters:
     type: object
     properties:
-      retention_days:
-        type: string
-        displayName: Retention Days
-        description: >
-          Number of days to retain Echo events before automatic purging.
-          Valid range: 1-365. Default: 7.
-        validation:
-          pattern: "^[0-9]+$"
       db_budget_bytes:
         type: string
         displayName: Database Byte Budget
@@ -871,7 +855,7 @@ spec:
       - name: key
         type: string
         description: >-
-          Name of one configuration setting that was changed by this call (e.g. retention_days, arp_enabled); one row is emitted per persisted key — unchanged keys emit nothing. Values: one of the parameter names listed under Inputs.
+          Name of one configuration setting that was changed by this call (e.g. db_budget_bytes, arp_enabled); one row is emitted per persisted key — unchanged keys emit nothing. Values: one of the parameter names listed under Inputs.
         example: "-"
         platforms: [windows, linux, darwin]
       - name: value

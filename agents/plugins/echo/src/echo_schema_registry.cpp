@@ -707,7 +707,7 @@ const std::unordered_map<std::string, std::string>& dollar_name_map() {
         std::unordered_map<std::string, std::string> m;
         for (const auto& src : build_sources()) {
             for (const auto& g : src.granularities) {
-                // $Process_Live -> process_live
+                // $Usage_Live -> usage_live, $TCP_Hourly -> tcp_hourly
                 std::string dollar = std::format("${}_{}",
                     src.dollar_name,
                     std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(g.suffix[0])))) +
@@ -715,9 +715,6 @@ const std::unordered_map<std::string, std::string>& dollar_name_map() {
                 std::string real = std::format("{}_{}", src.name, g.suffix);
                 m[dollar] = real;
             }
-            // $Process_Live and friends: the retired raw tables answer with an empty view.
-            if (is_legacy_live_shim(std::format("{}_live", src.name)))
-                m[std::format("${}_Live", src.dollar_name)] = std::format("{}_live", src.name);
         }
         return m;
     }();
@@ -974,10 +971,6 @@ bool is_queryable_table(std::string_view real_table_name) {
         // no-oracle reasoning this function already documents.
         for (const char* usage_table : {"usage_live", "usage_daily", "usage_daily_user"})
             s.erase(usage_table);
-        // The retired raw tables' shim views: a stored `$X_Live` query still reads an (empty)
-        // relation instead of failing at the authorizer.
-        for (const auto& shim : legacy_live_shim_names())
-            s.insert(shim);
         return s;
     }();
     return allowed.contains(std::string(real_table_name));
@@ -993,14 +986,6 @@ std::vector<std::string> all_dollar_names() {
 }
 
 std::vector<std::string> columns_for_table(const std::string& real_table_name) {
-    if (is_legacy_live_shim(real_table_name)) {
-        // `process_live` -> the source `process`: the legacy column list, `id` first.
-        std::vector<std::string> cols{"id"};
-        for (const auto& c : legacy_live_columns(
-                 std::string_view{real_table_name}.substr(0, real_table_name.size() - 5)))
-            cols.emplace_back(c.name);
-        return cols;
-    }
     auto& refs = table_ref_map();
     auto it = refs.find(real_table_name);
     if (it == refs.end())

@@ -117,9 +117,6 @@ struct EchoPausedSourceRow {
     std::int64_t paused_at = 0;
     /// Hourly roll-up row count; -1 = unknown (no `<source>_rows` key).
     std::int64_t hourly_rows = -1;
-    /// The agent reported `<source>_live_rows` only: it has not moved to the roll-up store, so
-    /// its count is raw capture rows and is rendered as a dash, not as the hourly count.
-    bool pre_rollup_agent = false;
     std::int64_t oldest_ts = 0;
     bool value_error = false;    ///< #560: `<source>_enabled` held a non-canonical value
     std::string enabled_raw;     ///< the offending value, when value_error

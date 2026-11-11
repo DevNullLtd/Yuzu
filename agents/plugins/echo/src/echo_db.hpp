@@ -10,7 +10,7 @@
  *
  * Schema:
  *   echo_state  — last-known state per collector for diff computation
- *   echo_config — key/value config (retention_days, redaction patterns, etc.)
+ *   echo_config — key/value config (the per-source switches, intervals, redaction patterns, etc.)
  *   echo_cursor — last-persisted cursor JSON per cursor-model source
  *                (echo_cursor.hpp: power, removable, registry)
  *   <src>_<tier>_r, echo_dict, echo_fold_seen — the roll-up tables, and the
@@ -477,7 +477,6 @@ struct EchoStats {
     /// the WAL file. Free pages are excluded because they are reusable, so this is the figure
     /// the byte budget is enforced against; it is NOT the on-disk file size.
     int64_t db_size_bytes{0};
-    int retention_days{7};
 };
 
 /// Room the WAL file is allowed beyond the data pages: `PRAGMA journal_size_limit` at open, and
