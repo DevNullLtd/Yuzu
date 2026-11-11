@@ -329,10 +329,8 @@ std::string render_echo_arp_panel(const std::vector<EchoArpHourRow>& rows, std::
                                   const EchoReadNotes& notes = {});
 
 /// Render the Capture-sources cards (ADR-0015) from a device's `echo status` output
-/// (per-source `<src>_enabled` / `<src>_rows` / `<src>_oldest_ts`). A status that carries a
-/// source's `<src>_live_rows` but not its `<src>_rows` comes from an agent without the
-/// roll-up tables: that count is NOT shown (a dash), and one note above the cards says to
-/// upgrade the agent. Produces the filter chips + one card per
+/// (per-source `<src>_enabled` / `<src>_rows` / `<src>_oldest_ts`; a source with no `<src>_rows`
+/// shows a dash). Produces the filter chips + one card per
 /// reported source with staged (not-yet-pushed) toggles + the push/discard bar — the
 /// page JS handles staging and the Push dispatch. Category, always-on classification,
 /// the hourly `$`-name and the kept tiers are presentation metadata held here (the

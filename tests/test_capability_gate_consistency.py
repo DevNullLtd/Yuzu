@@ -243,10 +243,11 @@ FRAGMENT_FILES = [
 # (partitions/topology), all ReadOnly, Inventory:Read, gate None, on top of 238 = 244, re-derived by
 # running this test (parse_fragment_gate_rows over FRAGMENT_FILES), not by adding to a baseline.
 # SAM-32 hardware.drivers_inventory (+1, ReadOnly, Inventory:Read, gate None) on top of middleware's 246 = 247, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
+# virtualization (runtime_posture, +1, ReadOnly, Security:Read, gate None) on top of wsl's 249 = 250, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
 # PRQ.1 firewall containment: +4 firewall (quarantine Destructive/Reversible, release Mutating, quarantine_status
-# ReadOnly, quarantine_allow Mutating) on top of dev's 249 = 253, re-derived by running
+# ReadOnly, quarantine_allow Mutating) on top of runtime_posture's 250 = 254, re-derived by running
 # parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
-EXPECTED_TOTAL_ROWS = 253
+EXPECTED_TOTAL_ROWS = 254
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

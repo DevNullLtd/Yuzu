@@ -624,6 +624,8 @@ agent_test_exe = executable(
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_virtualization_parsers.cpp',         # virtualization: pure classifier/vendor tables/CPUID fact builder/row formatters over labelled fixtures; portable
     'unit/test_virtualization_local_dispatcher.cpp',  # virtualization: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_virtualization_runtime_parsers.cpp',  # virtualization runtime_posture: pure verb table/endpoint decision/JSON readers/field allow-lists/row formatters over labelled fixtures; portable
+    'unit/test_virtualization_runtime_legs.cpp',    # virtualization runtime_posture: OS-free runtime_posture_linux seam over injected fakes (recording transport, fake clock); portable
     'unit/test_virtualization_wsl_parsers.cpp',     # virtualization wsl: Ops-faked Lxss walk + fake hive-access seam (live and offline outcomes) + budget + decide_wsl + row formatters, portable
     'unit/test_remote_access_audit_config_parsers.cpp',  # remote_access_audit: pure sshd_config/Include/service parsers over REAL CAPTURE + labelled fixtures; portable
     'unit/test_remote_access_audit_keys_parsers.cpp',    # remote_access_audit: pure authorized_keys/options/blob decoder/fingerprint over REAL ssh-keygen captures; portable
@@ -1400,7 +1402,7 @@ echo_test_exe = executable(
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
     'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
-    'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, shim views
+    'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, retired names
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -3462,6 +3464,17 @@ test('release artifact gate',
   args: [files('test_check_release_artifacts.py')],
   suite: 'docs',
   timeout: 60,
+)
+
+# Agent-only Windows and macOS releases (ADR-0035 ladder step 2): release.yml's
+# Windows/macOS jobs build no server and no server installer, the old archive
+# names are gone, and every place that names a platform archive agrees on one
+# set. Lints source text with a mutation self-test.
+test('agent-only release lint',
+  _python3_test,
+  args: [files('test_release_agent_only.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled

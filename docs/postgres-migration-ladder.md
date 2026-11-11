@@ -63,7 +63,8 @@ for a non-`*Store`-suffixed class (the Wave-4 ladder-blind-spot components below
 > that scan all-time history (`response_store` v3 and `execution_tracker` v8)
 > lift the pool's statement timeout for their own transaction. They run against a carried-forward
 > database only: the deployment contract is a fresh database (`docs/user-manual/upgrading.md`).
-> The removal tracker for the upgrade-window shims is #6694.
+> The agent registry's plugin-name mapping and the HA directory flag are gone: `gateway_route_store`
+> v6 stays in the ladder, but nothing writes or reads its column.
 
 ## Done
 

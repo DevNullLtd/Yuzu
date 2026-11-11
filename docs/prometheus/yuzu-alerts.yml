@@ -876,11 +876,10 @@ groups:
       # The fail-CLOSED sites (the RPC returns UNAVAILABLE) are ProxyRegister's
       # fresh-registration branch (`op="register_fresh"`) and both of its
       # replay-adopt branches (`op="renew_leases"` and
-      # `op="reclaim_tombstoned_session"`). The four writer SITES —
-      # announce_connected, BatchHeartbeat's renew_leases, deregister and the
-      # adopted-session set_legacy_echo_wire_name flag refresh — are
+      # `op="reclaim_tombstoned_session"`). The three writer SITES —
+      # announce_connected, BatchHeartbeat's renew_leases and deregister — are
       # deliberately fail-OPEN and use the `op` label values announce_connected,
-      # renew_leases, deregister and set_legacy_echo_wire_name (see the label
+      # renew_leases and deregister (see the label
       # set in docs/user-manual/metrics.md), so a rate here can mean silent
       # directory drift even with
       # no visible RPC failure. INITIAL / conservative threshold — no fleet
@@ -922,12 +921,7 @@ groups:
             announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
             NULL) — lease renewal does NOT repopulate placement, so it does NOT
             self-heal on the lease TTL and needs another CONNECTED / agent
-            re-registration to restore routing. op="set_legacy_echo_wire_name"
-            (an upgrade-window shim) leaves the row's legacy plugin-name flag
-            stale: nothing repairs it until that agent registers fresh or is
-            adopted again, and until then a directory-routed Echo dispatch to
-            it is written under the wrong plugin name and the agent answers
-            plugin_not_found. op="session_lookup" is the
+            re-registration to restore routing. op="session_lookup" is the
             batched READ that resolves gateway session ids (HA WS-5): while it
             fails, BatchHeartbeat is fail-SOFT (locally hinted pairs are still
             acked and renewed, unreadable ids with no local hint are neither
