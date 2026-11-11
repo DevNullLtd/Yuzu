@@ -2536,7 +2536,7 @@ jobs:
           existing Windows or macOS server to Linux, follow "Moving a Windows
           or macOS server to Linux" in \`docs/user-manual/server-admin.md\`:
           its data cannot be carried over, so you deploy a new Linux server,
-          reinstall the agents against it, and delete the old server's
+          enroll agents with it as new installations, and delete the old server's
           leftover files, which hold secrets.
 
           ### Windows silent install (GPO / SCCM / Intune)
