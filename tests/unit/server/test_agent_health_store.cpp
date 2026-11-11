@@ -1903,10 +1903,9 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_echo_db_corruption_agents counts va
     CHECK(series_val(metrics.serialize(), "yuzu_fleet_echo_db_corruption_agents ") == 1.0);
 }
 
-// Echo rename, upgrade window: an agent that has not upgraded still publishes the pre-rename
-// `yuzu.plugin.tar.` tag keys. The store normalises them at ingest, so the fleet gauge and the
-// corruption sink see one spelling. The legacy keys below are the point of the cases.
-TEST_CASE("REAL AgentHealthStore: legacy yuzu.plugin.tar.* tags are read as yuzu.plugin.echo.*",
+// The corruption gate and the fleet gauge read the `yuzu.plugin.echo.` tag keys only: the retired
+// `yuzu.plugin.tar.` spelling is an unrelated key. The retired keys below are the point of the case.
+TEST_CASE("REAL AgentHealthStore: retired yuzu.plugin.tar.* tags are not read as yuzu.plugin.echo.*",
           "[health_store][echo][corruption][real][echo_rename]") {
     AgentHealthStore store;
     yuzu::MetricsRegistry metrics;
@@ -1920,24 +1919,24 @@ TEST_CASE("REAL AgentHealthStore: legacy yuzu.plugin.tar.* tags are read as yuzu
         calls.push_back({a, t, q});
     });
 
-    beat_tags(store, "old", {{"yuzu.plugin.tar.db_corruption_total", "2"},
-                             {"yuzu.plugin.tar.db_quarantine_last", "100:f1"}});
-    beat_tags(store, "new", {{"yuzu.plugin.echo.db_corruption_total", "1"},
-                             {"yuzu.plugin.echo.db_quarantine_last", "200:f2"}});
-    REQUIRE(calls.size() == 2);
-    CHECK(calls[0].agent == "old");
-    CHECK(calls[0].total == 2);
-    CHECK(calls[0].q == "100:f1");
+    beat_tags(store, "retired", {{"yuzu.plugin.tar.db_corruption_total", "2"},
+                                 {"yuzu.plugin.tar.db_quarantine_last", "100:f1"}});
+    beat_tags(store, "current", {{"yuzu.plugin.echo.db_corruption_total", "1"},
+                                 {"yuzu.plugin.echo.db_quarantine_last", "200:f2"}});
+    REQUIRE(calls.size() == 1);
+    CHECK(calls[0].agent == "current");
+    CHECK(calls[0].total == 1);
+    CHECK(calls[0].q == "200:f2");
 
     store.recompute_metrics(metrics, std::chrono::seconds{300});
-    CHECK(series_val(metrics.serialize(), "yuzu_fleet_echo_db_corruption_agents ") == 2.0);
+    CHECK(series_val(metrics.serialize(), "yuzu_fleet_echo_db_corruption_agents ") == 1.0);
 }
 
-TEST_CASE("REAL AgentHealthStore: unrelated tag keys are not normalised",
+TEST_CASE("REAL AgentHealthStore: unrelated tag keys are not read as Echo tags",
           "[health_store][echo][real][echo_rename]") {
     AgentHealthStore store;
     yuzu::MetricsRegistry metrics;
-    // A key merely containing the legacy prefix text, and another plugin's corruption tag, must
+    // A key merely containing the retired prefix text, and another plugin's corruption tag, must
     // not be mistaken for an Echo tag.
     beat_tags(store, "a", {{"yuzu.plugin.other.db_corruption_total", "5"},
                            {"x.yuzu.plugin.tar.db_corruption_total", "5"}});

@@ -837,6 +837,7 @@ public:
             std::to_string(cfg_.heartbeat_interval.count());
         plugin_ctx_.config["agent.plugin_dir"] = cfg_.plugin_dir.string();
         plugin_ctx_.config["agent.data_dir"] = cfg_.data_dir.string();
+        plugin_ctx_.config["agent.container_runtime_endpoint"] = cfg_.container_runtime_endpoint;
         plugin_ctx_.config["agent.log_level"] = cfg_.log_level;
         plugin_ctx_.config["agent.debug_mode"] = cfg_.debug_mode ? "true" : "false";
         plugin_ctx_.config["agent.verbose_logging"] = cfg_.verbose_logging ? "true" : "false";
@@ -864,7 +865,7 @@ public:
             }
         }
 
-        // 1b''. Upgrade-window step (removed with the other legacy-name shims): the activity-record
+        // 1b''. Pre-rename install step (kept while a pre-rename tar.db can still exist): the activity-record
         // feature was renamed from TAR to Echo. Adopt a pre-rename tar.db as echo.db and re-key its
         // KV namespace, BEFORE any plugin init or dispatch (the plugin scan above only registers
         // descriptors and opens no database). This is the ONLY adopter - the plugins never
