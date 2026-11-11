@@ -18,7 +18,6 @@ ACTION = "ilammy/msvc-dev-cmd"
 EXPECTED_WORKFLOWS = {
     "ci.yml",
     "codeql.yml",
-    "instructions-windows-validate.yml",
     "nightly.yml",
     "release.yml",
 }

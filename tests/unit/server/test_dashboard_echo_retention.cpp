@@ -335,13 +335,13 @@ TEST_CASE("gather_echo_retention_paused: row count reads <src>_rows only",
         return nullptr;
     };
     REQUIRE(row_of("agent-new"));
-    CHECK(row_of("agent-new")->live_rows == 111);
+    CHECK(row_of("agent-new")->hourly_rows == 111);
     REQUIRE(row_of("agent-old"));
-    CHECK(row_of("agent-old")->live_rows == -1);
+    CHECK(row_of("agent-old")->hourly_rows == -1);
     REQUIRE(row_of("agent-both"));
-    CHECK(row_of("agent-both")->live_rows == 333);
+    CHECK(row_of("agent-both")->hourly_rows == 333);
     REQUIRE(row_of("agent-none"));
-    CHECK(row_of("agent-none")->live_rows == -1);
+    CHECK(row_of("agent-none")->hourly_rows == -1);
 
     // The rendered table never shows the retired key's figure.
     const auto html = acc.render(kUser);

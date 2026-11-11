@@ -2321,8 +2321,9 @@ void AgentHealthStore::upsert(const std::string& agent_id,
 
         // #1567 candidate: surfaced on EVERY heartbeat whose tag pair parses (not
         // deduped here); EchoCorruptionAuditGate dedups; a candidate skipped
-        // because the gate's slot was busy retries on the next heartbeat, a
-        // failed write after the 60 s degraded window.
+        // because that agent's lookup was already in flight (or the in-flight
+        // set is at its bound) retries on the next heartbeat, a failed write
+        // after the 60 s degraded window.
         if (corruption_sink_) {
             const auto tot = snap.status_tags.find(kEchoTagCorruptionTotal);
             const auto ql = snap.status_tags.find(kEchoTagQuarantineLast);

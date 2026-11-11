@@ -783,10 +783,10 @@ static const ToolDef kTools[] = {
      "10,000-row / 50 MiB cap, so rows and the counters are PARTIAL (a dropped "
      "response reads as an agent that never answered); store_degraded is then "
      "also true, and result_truncated_by_cap tells a cut apart from a failed read. "
-     "Each row's live_rows is the count of rows in the source's finest tier (daily for usage; the "
-     "name is kept for compatibility; -1 when unknown).",
+     "Each row's hourly_rows is the count of rows in the source's hourly roll-up tier "
+     "(-1 when unknown); it is not a count of raw capture rows.",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"result_truncated_by_cap":{"type":"boolean","description":"true when the scan's response read hit the 10,000-row or 50 MiB payload cap: rows and counts are partial"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"live_rows":{"type":"integer"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows"]})j"},
+     R"j({"type":"object","properties":{"scan_id":{"type":"string"},"scan_count":{"type":"integer"},"scan_at":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_with_no_paused_sources":{"type":"integer"},"agents_filtered_out_of_scope":{"type":"integer"},"store_degraded":{"type":"boolean"},"result_truncated_by_cap":{"type":"boolean","description":"true when the scan's response read hit the 10,000-row or 50 MiB payload cap: rows and counts are partial"},"rows":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"agent_display":{"type":"string"},"source":{"type":"string"},"paused_at":{"type":"integer"},"hourly_rows":{"type":"integer","description":"rows in the source's hourly roll-up tier; not a count of raw capture rows; -1 when unknown"},"oldest_ts":{"type":"integer"},"value_error":{"type":"boolean"},"enabled_raw":{"type":"string"}},"required":["agent_id","agent_display","source","paused_at","hourly_rows","oldest_ts","value_error","enabled_raw"]}}},"required":["scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows"]})j"},
 
     {"get_agent_details",
      "Get one connected agent's identity (hostname, OS, architecture, agent version), its "
@@ -958,7 +958,7 @@ static const ToolDef kTools[] = {
      "version (upstream, release stripped), publisher (the declared vendor: rpm VENDOR else PACKAGER, "
      "deb Maintainer, Windows Publisher, macOS signer; or, when the source declares none, the "
      "origin label via:<ecosystem> such as via:brew, which names where the row came from, not a "
-     "vendor), install_date, kind (package|app|pkg|feat), "
+     "vendor), install_date, kind (package|app|pkg|feat|driver), "
      "ecosystem (@@ECOSYSTEM_LIST@@), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "
@@ -1493,7 +1493,8 @@ static const ToolDef kTools[] = {
      "only draining lets a run finish its steps (it gives up retries it had not made). The closing "
      "audit row is result failure with run_outcome=failed|partial|interrupted|aborted. If "
      "NO step reached any agent the envelope instead carries status set to the cause with "
-     "agents_reached 0 on every step, one of: \"containment_unreadable\", \"route_unreadable\", "
+     "agents_reached 0 on every step, one of: \"dispatch_denied\" (the dispatch chokepoint "
+     "refused a step for the caller at send time), \"containment_unreadable\", \"route_unreadable\", "
      "\"os_gate_unreadable\", \"no_agents_reached\" (offline devices, or a concurrency claim), "
      "\"quarantined\", \"plugin_not_found\", \"kill_switched_os\", \"late_denied\", "
      "\"definition_changed\", \"deadline_exceeded\" (the 60 second budget ended the run before "
@@ -1517,7 +1518,7 @@ static const ToolDef kTools[] = {
      R"j("idempotent_replay":{"type":"boolean","description":"Present (true) only when the idempotency_key was already bound to a run and this call sent nothing: the other fields then describe that run, thinly (status, started_at, message), and steps and late_denied are absent"},)j"
      R"j("started_at":{"type":"integer","description":"Present only on an idempotent replay: when the run started, epoch seconds"},)j"
      R"j("workflow_id":{"type":"string"},)j"
-     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), partial, aborted or interrupted for a run that sent something and did not succeed, or the zero-reach cause token when no step reached any agent (one of containment_unreadable, route_unreadable, os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, kill_switched_os, late_denied, definition_changed, deadline_exceeded, run_failed). On an idempotent replay: the first answer's class judged from the stored steps, never from the engine's status alone: completed (only for a run that succeeded), partial, failed, aborted or interrupted (each retryable false), running (retry_after_ms 2000: poll, never re-send) or indeterminate (a run still running long after it started, or a completed run whose stored steps cannot prove its outcome; retryable false)"},)j"
+     R"j("status":{"type":"string","description":"The engine's recorded status (completed, failed, ...), partial, aborted or interrupted for a run that sent something and did not succeed, or the zero-reach cause token when no step reached any agent (one of dispatch_denied, containment_unreadable, route_unreadable, os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, kill_switched_os, late_denied, definition_changed, deadline_exceeded, run_failed). On an idempotent replay: the first answer's class judged from the stored steps, never from the engine's status alone: completed (only for a run that succeeded), partial, failed, aborted or interrupted (each retryable false), running (retry_after_ms 2000: poll, never re-send) or indeterminate (a run still running long after it started, or a completed run whose stored steps cannot prove its outcome; retryable false)"},)j"
      R"j("late_denied":{"type":"boolean","description":"True when a step was refused at send time because its definition changed after the precheck"},)j"
      R"j("steps":{"type":"array","items":{"type":"object","properties":{"instruction_id":{"type":"string"},"attempt":{"type":"integer","minimum":1,"description":"The 1-based send attempt of this step this entry records: a retry has the next number and the next step starts again at 1. A step is judged by its last attempt"},"command_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":0},"reason":{"type":"string","description":"Present when agents_reached is 0"},"retryable":{"type":"boolean"},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0}},"required":["instruction_id","command_id","agents_reached"]}},)j"
      R"j("remediation":{"type":"string","description":"Present on an idempotent replay of every status but completed and running, and when no step reached any agent (use a new idempotency key (MCP: a new approval) for another run). A replay's text says a step recorded pending or skipped may still have been sent"},)j"
@@ -2918,17 +2919,21 @@ static const ToolDef kTools[] = {
      "explicit non-empty agent_ids (broadcast and scope are refused) and a Forensics-classified "
      "one exactly one, both confined to the agents you may see. "
      "ZERO AGENTS: a SUCCESS result with agents_reached 0 carries a status to branch on, not "
-     "message text: invalid_scope, quarantined, plugin_not_found and kill_switched_os are "
+     "message text: dispatch_denied (the dispatch chokepoint refused the command for you at send "
+     "time), invalid_scope, quarantined, plugin_not_found and kill_switched_os are "
      "PERMANENT (retry_after_ms is null; retrying the same request cannot help); "
      "containment_unreadable, route_unreadable, os_gate_unreadable and no_agents_reached are "
      "transient (retry_after_ms 5000). A dispatch-authorization denial is a JSON-RPC error whose "
      "error.data.reason is one of unclassified, ambiguous, anonymous_operator, forbidden, "
-     "approval_required, kill_switched. A per-device definition takes the ADR-1007 concurrency "
+     "approval_required, kill_switched, or permission_revoked (-32003, permanent): the "
+     "permission, the credential or the administrator standing a role-gated definition requires "
+     "was withdrawn after the 'requested' row; nothing was dispatched and the execution row is "
+     "cancelled. A per-device definition takes the ADR-1007 concurrency "
      "claim, so a device already running it may be skipped (no_agents_reached). "
      "A 'requested' audit row (mcp.execute_instruction_definition) is written BEFORE dispatch; "
      "if it cannot be stored nothing is dispatched (-32603, retryable). A refusal earlier than "
      "that row does not always write an audit row: a definition-store fault and an unwired "
-     "definition lookup, authorizer, validator cache, classifier or dispatch write none, while an unknown "
+     "definition lookup, authorizer, validator cache, classifier, post-row recheck or dispatch write none, while an unknown "
      "definition, an out-of-bounds argument and the later validation refusals write a 'denied' "
      "row (a 'failure' row for an unusable stored schema, an approval that could not be queued, "
      "an unwired approval manager or an unreadable pending-approval count). Every row the "
@@ -2955,7 +2960,7 @@ static const ToolDef kTools[] = {
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"audit_persisted":{"const":false}},"required":["command_id","execution_id","agents_reached","definition_id","plugin","action"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"pending_approval"},"approval_id":{"type":"string"},"approval_mode":{"type":"string"},"definition_id":{"type":"string"},"audit_persisted":{"const":false}},"required":["status","approval_id","approval_mode","definition_id"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"enum":["invalid_scope","containment_unreadable","route_unreadable","os_gate_unreadable","quarantined","plugin_not_found","kill_switched_os","no_agents_reached"]},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"type":["integer","null"]},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0},"audit_persisted":{"const":false}},"required":["status","command_id","execution_id","agents_reached","definition_id","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
+     R"j({"type":"object","properties":{"status":{"enum":["dispatch_denied","invalid_scope","containment_unreadable","route_unreadable","os_gate_unreadable","quarantined","plugin_not_found","kill_switched_os","no_agents_reached"]},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"definition_id":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"type":["integer","null"]},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0},"agents_kill_switched_os":{"type":"integer","minimum":0},"audit_persisted":{"const":false}},"required":["status","command_id","execution_id","agents_reached","definition_id","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin","agents_kill_switched_os"],"additionalProperties":false})j"
      R"j(]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -4680,7 +4685,7 @@ static const ToolDef kTools[] = {
      "get_software_versions, or to query_installed_software for the devices carrying it. A "
      "degraded store read is a retryable error, never an empty result. Every call that reaches "
      "the store is audited (mcp.query_software_catalogue).",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat","driver"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
      R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
 
     {"get_software_versions",
@@ -4697,7 +4702,7 @@ static const ToolDef kTools[] = {
      "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
      "query_installed_software lists the devices carrying a version. Audited as "
      "mcp.get_software_versions.",
-     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat","driver"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 
     // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
@@ -21202,13 +21207,31 @@ McpServer::HandlerFn McpServer::build_handler(
                 // L1: on the supervised tier, the effect the consumed ticket was bound to. The
                 // core re-reads the definition, and holds that read to it (definition_changed).
                 rq.expected_effect = ticket_bound_effect;
+                // #7110: the post-write recheck re-authenticates: the admin bit is a session
+                // snapshot (the REST twins do the same). The re-derived caller gets
+                // approval_provenance None again, as above. `auth_fn` / `perm_fn` write a 401 /
+                // 403 into `res` on refusal; the rendered JSON-RPC answer below replaces the
+                // body AND the status (a handler-rendered envelope rides HTTP 200, so the
+                // status never reveals which internal branch refused).
+                auto exec_ports = instr_exec_ports_;
+                exec_ports.readmit = [&]() -> std::optional<DispatchCaller> {
+                    const auto fresh = auth_fn(req, res);
+                    if (!fresh || fresh->username != session->username)
+                        return std::nullopt;
+                    if (!perm_fn(req, res, "Execution", "Execute") || !caller_fn)
+                        return std::nullopt;
+                    auto again = caller_fn(*fresh);
+                    again.approval_provenance = yuzu::server::ApprovalProvenance::None;
+                    return again;
+                };
                 const auto out = yuzu::server::instruction_execute::run(
-                    rq, instr_exec_ports_,
+                    rq, exec_ports,
                     [&](std::string_view result_status, const std::string& detail_text) {
                         return mcp_audit(std::string(result_status), detail_text);
                     },
                     bind_event_emit(emit_event_fn_, req, metrics));
                 const auto rendered = idef::render_outcome(out, out.correlation_id);
+                res.status = 200;
                 res.set_content(
                     rendered.is_error
                         ? error_response(id, rendered.code, rendered.message, rendered.data_json)

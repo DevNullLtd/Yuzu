@@ -42,6 +42,17 @@ Before invoking the skill, the operator should already have:
   ```
 
   It must print all six names, each `completed` with `success` or `skipped`. The ruleset that lists them is the repo's "Protect Main" setting, not this file.
+- The release/LTO legs green on `main`'s tip, and no open `release-legs-broken` issue. These legs are not required checks, but they are the only place the test suite runs in release/NDEBUG mode: `release.yml` builds with `-Dbuild_tests=false`. Since Tier 2b (`docs/ci-architecture.md`) they no longer run on dev pushes, only on `main` pushes and a daily dispatch on dev. An open issue means dev's release legs were red at the last dispatch, or the daily workflow itself failed (its reconcile or dispatch job; the issue says which). Find out whether that defect reached `main` before tagging:
+
+  ```bash
+  SHA=$(git rev-parse origin/main)
+  gh issue list --repo DevNullLtd/Yuzu --label release-legs-broken --state open
+  gh api "repos/DevNullLtd/Yuzu/commits/$SHA/check-runs?per_page=100" --jq '
+    [.check_runs[] | select(.name | test("^(Linux (gcc-15|clang-21)|Windows MSVC|macOS) release$"))]
+    | group_by(.name) | map(max_by(.id)) | .[] | "\(.name)\t\(.status)\t\(.conclusion)"'
+  ```
+
+  Expect four names, each `completed`/`success`. If the tip is a docs-only commit (the usual case for the final `promote --append --date` commit), it built nothing and the query prints nothing. In that case, set `SHA` to the most recent `main` commit whose push run built code (its run shows the build legs, not the `docs-required-checks` stubs) and re-run it there. No output on a code commit is a stop.
 - All tracked compose files updated to `${YUZU_VERSION:-<BASE_VERSION>}` defaults — the **base** version with any `-rcN`/`-betaN` suffix stripped (e.g., for tag `v0.12.0-rc0` the default is `0.12.0`, NOT `0.12.0-rc0`). The workflow's `Validate docker-compose image versions` gate inside the `Create Release` job invokes `bash scripts/check-compose-versions.sh "$BASE_VERSION"` and will hard-fail the release after the full build matrix has run if the defaults don't match. Local dry-run **must use the same base version**: `bash scripts/check-compose-versions.sh 0.12.0` (NOT `0.12.0-rc0`) — the script accepts whatever you pass and is happy with consistent garbage, so passing the rc-suffixed version locally green-lights a doomed release. Preflight (`scripts/release-preflight.sh`) does the right thing automatically because it strips the suffix internally; the lesson from v0.12.0-rc0's first cut was that local one-off `check-compose-versions.sh` invocations are misleading on RC tags.
 
 If any of these are missing, the skill prompts the operator to fix-and-commit-and-push before continuing. **It does NOT auto-bump versions** — bumping is a deliberate decision (which X, which Y, which Z) the operator owns.
@@ -66,6 +77,8 @@ Preflight checks:
 6. All `actions/cache@v*` steps in release.yml have `save-always: true`
 7. `docker-compose.full-uat.yml` includes `--data-dir`
 8. `origin/dev` and `origin/main` are reconciled (no divergence either direction)
+
+Also check by hand (the script does not): **ADR-0035 ladder step 2 merges first, OR the release explicitly accepts shipping an untested Windows/macOS server** (owner decision 2026-11-10). Since ladder step 1, no CI leg compiles or tests the Windows or macOS server. Run `grep -nE 'build-(windows|macos)/server/core/yuzu-server|yuzu-server\.iss' .github/workflows/release.yml` — it matches only the Windows server build smoke test, staging and installer script, and the macOS server smoke test and staging, never the Linux job or the release-notes text. Empty output means the Windows/macOS server build has been removed (it does not by itself prove every step-2 item landed); proceed. Any hit means **stop**: either land step 2 first, or, BEFORE tagging, merge to `main` through a reviewed PR a `changelog.d/<PR-or-issue-number>-win-mac-server-untested.changed.md` fragment whose body is `- **The Windows and macOS server artefacts in this release were not built or tested in CI before tagging and are not supported.** Run the Yuzu server on Linux (packages or container image); the platform tables below still list the Windows and macOS server artefacts.` The PR description names the approver and the date: that reviewed PR is the acceptance record. Then run `python3 scripts/assemble-changelog.py promote X.Y.Z --append` (or plain `promote X.Y.Z` if the version is not promoted yet), commit it to `main`, and re-run this preflight. `release.yml` publishes the GitHub Release in the same job that builds its notes from `CHANGELOG.md`, with no draft stage, so the caveat must be in the promoted changelog section before the tag is pushed. A Windows or macOS server compile break at release time is fixed by landing step 2, never by patching server code for an unsupported platform.
 
 Optional `--full` adds a local C++ + Erlang compile (~2 min).
 
