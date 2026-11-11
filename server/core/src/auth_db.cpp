@@ -1790,7 +1790,8 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
 
     MfaStatus status;
     status.disabled_at = col_str(res.get(), 0, 4);
-    // #6079: read for an un-enrolled account too (0 never enrolled, g cleared g times).
+    // #6079: read for an un-enrolled account too (0 never enrolled; otherwise the random value the
+    // trigger last assigned, which is never ordered or counted).
     status.factor_gen = to_i64(col(res.get(), 0, 5));
     status.db_now_ms = to_i64(col(res.get(), 0, 6));
 

@@ -13,6 +13,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <format>
 #include <fstream>
@@ -2034,8 +2035,12 @@ bool AuthManager::stored_binding_trustworthy() const {
     // is the one place that logs and counts that degrade.
     if (session_store_ && session_store_->rebind_guard_ok())
         return true;
-    spdlog::warn("stored_binding_trustworthy: the session store's rebind guard is not in force - "
-                 "failing closed");
+    // Once the guard is latched this runs on every gated request: sample the line (the first
+    // always), the degrade counter below records all of them.
+    static std::atomic<std::uint64_t> untrusted_hits{0};
+    if (untrusted_hits.fetch_add(1, std::memory_order_relaxed) % 100 == 0)
+        spdlog::warn("stored_binding_trustworthy: the session store's rebind guard is not in force "
+                     "- failing closed (1 log per 100 refusals; the counter records all)");
     note_session_store_degrade("rebind_guard");
     return false;
 }

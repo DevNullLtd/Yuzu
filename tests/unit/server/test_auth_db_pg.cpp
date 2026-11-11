@@ -2979,7 +2979,7 @@ Enrolled enroll_full(AuthDB& db, const std::string& user) {
 // A store built over a FRESH, un-initialised codec on the same database: exactly the boot path
 // (migrations + the trigger validation) with no secret to decrypt.
 bool second_store_opens(const std::string& dsn) {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgPool pool{{.conninfo = dsn, .size = 1}};
@@ -3014,7 +3014,7 @@ TEST_CASE(
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
     {
-        yuzu::test::TempDir keys;
+        yuzu::test::TempDir keys{"yuzu_test_keys_"};
         FileKeyProvider provider(keys.path);
         SecretCodec codec(provider);
         PgConn conn = connect(db.dsn());
@@ -3827,7 +3827,7 @@ TEST_CASE("AuthDB recovery bypass opens past a tampered trigger and never report
                                bool& enforced_flag, bool& enforced_status,
                                const std::function<void(AuthDB&)>& after = {},
                                bool read_status = true) {
-        yuzu::test::TempDir keys;
+        yuzu::test::TempDir keys{"yuzu_test_keys_"};
         FileKeyProvider provider(keys.path);
         SecretCodec codec(provider);
         PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -3909,7 +3909,7 @@ TEST_CASE("AuthDB trigger validation is sticky once it observes tampering",
 
     // A new instance runs the boot check afresh and is the gate back in.
     PgPool pool2{{.conninfo = db.dsn(), .size = 2}};
-    yuzu::test::TempDir keys2;
+    yuzu::test::TempDir keys2{"yuzu_test_keys_"};
     FileKeyProvider provider2(keys2.path);
     SecretCodec codec2(provider2);
     AuthDB fresh{pool2, codec2, 0};
@@ -4048,7 +4048,7 @@ TEST_CASE("AuthDB trigger validation under 8 concurrent readers latches when the
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("cc", "h", "s", yuzu::server::auth::Role::user).has_value());
     // A reader store with a pool wide enough for all threads at once (the harness pool is 4).
-    yuzu::test::TempDir keys2;
+    yuzu::test::TempDir keys2{"yuzu_test_keys_"};
     FileKeyProvider provider2(keys2.path);
     SecretCodec codec2(provider2);
     PgPool wide{{.conninfo = db.dsn(), .size = kThreads + 1}};
