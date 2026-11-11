@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-10 · euid 501 · leg-hash 1f699dc06d7d
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-10 · euid 501 · leg-hash aec6e0e7930c
 == action=host
 status|host|supported|-
 host|no|bare_metal|Apple Inc.|Mac16,10|sysctl|high
