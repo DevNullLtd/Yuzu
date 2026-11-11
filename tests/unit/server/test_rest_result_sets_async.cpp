@@ -4989,6 +4989,112 @@ TEST_CASE("result-set producers refuse a pending parent and inherit an incomplet
     }
 }
 
+// The remaining parent-accepting routes obey the same rule as the inventory and echo producers
+// above: a pending parent is refused (409) before anything is dispatched or created, and a
+// materialized parent is the control that proves the refusal is the parent state, not a body
+// the route would reject anyway.
+TEST_CASE("result-set routes: instruction-result and generic create and re-eval refuse a pending "
+          "parent",
+          "[pg][result_set][async][parent_seed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    CreateRequest pending_req;
+    pending_req.owner_principal = "operator-1";
+    pending_req.name = "pending-parent";
+    pending_req.source_kind = std::string(source_kind::kEchoQuery);
+    pending_req.source_payload = R"({"sql":"SELECT 1"})";
+    auto pending = h.store->create_pending(pending_req, "exec-pending-parent");
+    REQUIRE(pending.has_value());
+    const auto only_pending_parent_exists = [&h] {
+        std::string next;
+        return h.store->list_by_owner("operator-1", "", 50, next).size() == 1;
+    };
+
+    SECTION("from-instruction-result refuses a pending parent and dispatches nothing") {
+        nlohmann::json body;
+        body["instruction_id"] = make_instruction(*h.instr);
+        body["parent_id"] = pending->id;
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        CHECK(status == 409);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        CHECK(h.calls.empty());
+        CHECK(only_pending_parent_exists());
+    }
+    SECTION("control: from-instruction-result with a materialized parent dispatches") {
+        nlohmann::json body;
+        body["instruction_id"] = make_instruction(*h.instr);
+        body["parent_id"] = h.seed_materialized("ready-parent", {"dev-1"});
+        int status = 0;
+        h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        CHECK(status == 202);
+        CHECK(h.calls.size() == 1);
+    }
+    SECTION("generic create refuses a pending parent and creates nothing") {
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets",
+                        R"({"name":"child","parent_id":")" + pending->id + R"("})", status);
+        CHECK(status == 409);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        CHECK(only_pending_parent_exists());
+    }
+    SECTION("generic create refuses a failed parent") {
+        h.store->mark_failed(pending->id, "bound exceeded");
+        int status = 0;
+        h.post("/api/v1/result-sets", R"({"name":"child","parent_id":")" + pending->id + R"("})",
+               status);
+        CHECK(status == 409);
+        CHECK(only_pending_parent_exists());
+    }
+    SECTION("control: generic create with a materialized parent is lineage only") {
+        // Direct creation does not inherit completeness: its members are the supplied device_ids.
+        CreateRequest cr;
+        cr.owner_principal = "operator-1";
+        cr.name = "partial-parent";
+        cr.source_kind = std::string(source_kind::kManualCurate);
+        cr.source_payload = "{}";
+        cr.agents_failed = 2;
+        cr.agents_unanswered = 3;
+        auto parent = h.store->create_materialized(cr, {"dev-1"});
+        REQUIRE(parent.has_value());
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets",
+                        R"({"name":"child","device_ids":["dev-1"],"parent_id":")" + parent->id +
+                            R"("})",
+                        status);
+        REQUIRE(status == 201);
+        auto child = get_ok(*h.store, j["data"]["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        CHECK(child->parent_id == parent->id);
+        CHECK(child->agents_failed == 0);
+        CHECK(child->agents_unanswered == 0);
+    }
+    SECTION("re-eval refuses an original whose parent is still pending") {
+        CreateRequest original_req;
+        original_req.owner_principal = "operator-1";
+        original_req.name = "original";
+        original_req.source_kind = std::string(source_kind::kEchoQuery);
+        original_req.source_payload =
+            R"({"sql":"SELECT 1","scope_input_id":")" + pending->id + R"("})";
+        original_req.parent_id = pending->id;
+        auto original = h.store->create_pending(original_req, "exec-original");
+        REQUIRE(original.has_value());
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/" + original->id + "/re-eval", "", status);
+        CHECK(status == 409);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        CHECK(h.calls.empty());
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 2); // parent + original
+    }
+}
+
 // A name carrying an embedded NUL cannot be stored faithfully, so it is refused BEFORE dispatch:
 // nothing is sent to an agent and then reported as failed because the row could not be written.
 TEST_CASE("result-set producers: a name with an embedded NUL is refused with 400 before any "

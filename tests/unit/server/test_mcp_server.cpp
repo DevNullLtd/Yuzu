@@ -52811,3 +52811,141 @@ TEST_CASE("MCP create_result_set: a pending parent is refused with RESULT_SET_NO
     CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
           std::string::npos);
 }
+
+// The async producers and re-eval refuse a pending parent before dispatching anything.
+TEST_CASE("MCP result-set producers: echo-query and instruction-result and re-eval refuse a "
+          "pending parent before any dispatch",
+          "[pg][mcp][integration][result-sets][parent_seed]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    yuzu::server::InstructionDefinition def;
+    def.name = "Get OS Version";
+    def.version = "1.0";
+    def.plugin = "os_info";
+    def.action = "version";
+    def.type = "question";
+    def.description = "test";
+    def.enabled = true;
+    auto instruction_id = instr.create_definition(def);
+    REQUIRE(instruction_id.has_value());
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "pending-parent";
+    parent_cr.source_kind = std::string(source_kind::kEchoQuery);
+    parent_cr.source_payload = R"({"sql":"SELECT 1"})";
+    auto parent = rs_bundle.get()->create_pending(parent_cr, "exec-pending-parent");
+    REQUIRE(parent.has_value());
+
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-parent-seed"};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const auto expect_not_ready = [&](const std::string& request) {
+        auto res = ts.call(request);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        CHECK(sends == 0);
+    };
+
+    SECTION("create_result_set_from_echo_query") {
+        expect_not_ready(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT 1","parent_id":")" +
+            parent->id + R"("}}})");
+    }
+    SECTION("control: a materialized parent reaches the dispatch mock") {
+        CreateRequest ready_cr = parent_cr;
+        ready_cr.name = "ready-parent";
+        auto ready = rs_bundle.get()->create_materialized(ready_cr, {"dev-1"});
+        REQUIRE(ready.has_value());
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT 1","parent_id":")" +
+            ready->id + R"("}}})");
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(sends == 1);
+    }
+    SECTION("create_result_set_from_instruction_result") {
+        expect_not_ready(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":")" +
+            *instruction_id + R"(","parent_id":")" + parent->id + R"("}}})");
+    }
+    SECTION("reevaluate_result_set on an original whose parent is still pending") {
+        CreateRequest original_cr = parent_cr;
+        original_cr.name = "original";
+        original_cr.parent_id = parent->id;
+        original_cr.source_payload =
+            R"({"sql":"SELECT 1","scope_input_id":")" + parent->id + R"("})";
+        auto original = rs_bundle.get()->create_pending(original_cr, "exec-original");
+        REQUIRE(original.has_value());
+        expect_not_ready(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+            original->id + R"("}}})");
+    }
+}
+
+TEST_CASE("MCP create_result_set_from_inventory_query: a pending parent is refused and an "
+          "incomplete parent is inherited",
+          "[pg][mcp][integration][result-sets][inventory][parent_seed]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    yuzu::server::InventoryStore inventory{rs_bundle.pool()};
+    REQUIRE(inventory.is_open());
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "pending-parent";
+    parent_cr.source_kind = std::string(source_kind::kEchoQuery);
+    parent_cr.source_payload = R"({"sql":"SELECT 1"})";
+    auto parent = rs_bundle.get()->create_pending(parent_cr, "exec-pending-parent");
+    REQUIRE(parent.has_value());
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+    const std::string request =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query","arguments":{"name":"child","parent_id":")" +
+        parent->id + R"("}}})";
+
+    SECTION("a pending parent is refused and nothing is created") {
+        auto res = ts.call(request);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        std::string next;
+        CHECK(rs_bundle.get()->list_by_owner("test-user", "", 50, next).size() == 1);
+    }
+    SECTION("an incomplete materialized parent passes its counters to the child") {
+        REQUIRE(rs_bundle.get()->materialize(parent->id, {"a1"}, 2, 3).has_value());
+        auto res = ts.call(request);
+        REQUIRE(res);
+        auto payload = operator_surface_payload(res);
+        auto child = rs_bundle.get()->get(payload["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        REQUIRE(child->has_value());
+        CHECK((*child)->agents_failed == 2);
+        CHECK((*child)->agents_unanswered == 3);
+    }
+}
