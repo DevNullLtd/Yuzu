@@ -4883,8 +4883,12 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     CHECK(src.find("targeted, responded, execution_tracker_ != nullptr, dropped);") !=
           std::string::npos);
     CHECK(src.find("dropped = sum.agents_response_dropped;") != std::string::npos);
-    CHECK(src.find("agents_failed += (*parent)->agents_failed;") != std::string::npos);
-    CHECK(src.find("agents_unanswered += (*parent)->agents_unanswered;") != std::string::npos);
+    // The parent decision lives in rs_matcher::fold_parent_completeness (unit-tested there); the
+    // tick passes it the marker so a parent deleted before the fill still counts, and skips the
+    // set when the fold returns nothing (a degraded parent read).
+    CHECK(src.find("rs_matcher::fold_parent_completeness(") != std::string::npos);
+    CHECK(src.find("p.had_parent_input, parent_counters);") != std::string::npos);
+    CHECK(src.find("agents_unanswered = folded->agents_unanswered;") != std::string::npos);
     CHECK(src.find("agents_failed = found->agents_failed;") != std::string::npos);
     // The truncated branch: between its `if` and the line that adopts the membership, the set
     // is marked failed and the branch ends in `continue;` with nothing but the closing brace

@@ -804,3 +804,46 @@ TEST_CASE("unanswered_agent_count: a counted answer whose response was not store
     // A negative count never lowers the result.
     CHECK(unanswered_agent_count(3, 1, true, -4) == 2);
 }
+
+TEST_CASE("fold_parent_completeness: a live parent adds both counters monotonically",
+          "[result_set][rs_matcher][agents_unanswered]") {
+    const auto r = fold_parent_completeness({1, 2}, ParentRead::Live, true, {3, 4});
+    REQUIRE(r.has_value());
+    CHECK(r->agents_failed == 4);
+    CHECK(r->agents_unanswered == 6);
+    // A complete parent leaves the child's own counters alone, marker or not.
+    const auto same = fold_parent_completeness({1, 2}, ParentRead::Live, false, {0, 0});
+    REQUIRE(same.has_value());
+    CHECK(same->agents_failed == 1);
+    CHECK(same->agents_unanswered == 2);
+    // Never more complete than either side.
+    const auto both = fold_parent_completeness({0, 0}, ParentRead::Live, false, {0, 5});
+    REQUIRE(both.has_value());
+    CHECK(both->agents_unanswered == 5);
+}
+
+TEST_CASE("fold_parent_completeness: a parent that is gone counts as at least one unanswered",
+          "[result_set][rs_matcher][agents_unanswered]") {
+    const auto gone = fold_parent_completeness({0, 0}, ParentRead::Gone, true);
+    REQUIRE(gone.has_value());
+    CHECK(gone->agents_unanswered >= 1);
+    // The parent_id was cleared when the parent was deleted: the marker alone shows the dependence.
+    const auto cleared = fold_parent_completeness({0, 0}, ParentRead::NoParentId, true);
+    REQUIRE(cleared.has_value());
+    CHECK(cleared->agents_unanswered >= 1);
+    // The child's own unanswered count is preserved, not reset to one.
+    const auto own = fold_parent_completeness({2, 7}, ParentRead::NoParentId, true);
+    REQUIRE(own.has_value());
+    CHECK(own->agents_failed == 2);
+    CHECK(own->agents_unanswered == 7);
+}
+
+TEST_CASE("fold_parent_completeness: no parent and no marker is unchanged and a degraded read skips",
+          "[result_set][rs_matcher][agents_unanswered]") {
+    const auto none = fold_parent_completeness({2, 0}, ParentRead::NoParentId, false);
+    REQUIRE(none.has_value());
+    CHECK(none->agents_failed == 2);
+    CHECK(none->agents_unanswered == 0);
+    CHECK_FALSE(fold_parent_completeness({0, 0}, ParentRead::Unreadable, true).has_value());
+    CHECK_FALSE(fold_parent_completeness({0, 0}, ParentRead::Unreadable, false).has_value());
+}

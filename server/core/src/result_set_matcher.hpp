@@ -153,4 +153,49 @@ inline int64_t unanswered_agent_count(int64_t targeted, int64_t responded, bool 
     return total > 1 ? total : 1;
 }
 
+/// What the fill pass learned about a pending set's parent.
+enum class ParentRead {
+    Live,       ///< the parent row was read
+    Gone,       ///< the row has a `parent_id` but that row no longer exists
+    Unreadable, ///< the read degraded: no information
+    NoParentId  ///< the row has no `parent_id` (never had one, or it was cleared by a delete)
+};
+
+/// A set's completeness counters as the fill pass will persist them.
+struct FillCounters {
+    int64_t agents_failed{0};
+    int64_t agents_unanswered{0};
+};
+
+/// The ONE decision on how a pending set's parent affects its counters when it is filled. The
+/// dispatch behind a child set was narrowed to its parent's members, so the child is no more
+/// complete than the parent. `own` holds the child's counters from its own execution.
+///   * Live: add the parent's counters to `own` (monotone: never more complete than either).
+///   * Gone, or NoParentId with `had_parent_input` (the `parent_id` FK is cleared when the parent
+///     is deleted, so the persisted `scope_input_id` marker is the only trace of the dependence):
+///     the parent cannot vouch for completeness, so at least 1 unanswered.
+///   * NoParentId without the marker: a genuinely parentless set; `own` unchanged.
+///   * Unreadable: nullopt, skip this set for this tick and retry on the next.
+inline std::optional<FillCounters> fold_parent_completeness(FillCounters own, ParentRead parent,
+                                                            bool had_parent_input,
+                                                            FillCounters parent_counters = {}) {
+    switch (parent) {
+    case ParentRead::Unreadable:
+        return std::nullopt;
+    case ParentRead::Live:
+        own.agents_failed += parent_counters.agents_failed;
+        own.agents_unanswered += parent_counters.agents_unanswered;
+        return own;
+    case ParentRead::NoParentId:
+        if (!had_parent_input)
+            return own;
+        [[fallthrough]];
+    case ParentRead::Gone:
+        if (own.agents_unanswered == 0)
+            own.agents_unanswered = 1;
+        return own;
+    }
+    return std::nullopt; // unreachable: every enumerator is handled above
+}
+
 } // namespace yuzu::server::rs_matcher

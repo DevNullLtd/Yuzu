@@ -1071,6 +1071,31 @@ TEST_CASE("ResultSetStore: member_set_owned refuses a set that is not materializ
             }
         CHECK(seen);
     }
+    SECTION("list_pending keeps the parent marker after the parent is deleted") {
+        auto parent = store.create_materialized(req("alice", "doomed-parent"), {"dev-1"});
+        REQUIRE(parent.has_value());
+        CreateRequest child_req = pending_req("orphaned-child");
+        child_req.parent_id = parent->id;
+        child_req.source_payload = R"({"sql":"SELECT 1","scope_input_id":")" + parent->id + R"("})";
+        auto child = store.create_pending(child_req, "exec-orphan");
+        REQUIRE(child.has_value());
+        auto plain = store.create_pending(pending_req("parentless-child"), "exec-plain");
+        REQUIRE(plain.has_value());
+        REQUIRE(store.delete_set(parent->id).has_value());
+        bool seen_child = false, seen_plain = false;
+        for (const auto& p : store.list_pending()) {
+            if (p.id == child->id) {
+                seen_child = true;
+                CHECK_FALSE(p.parent_id.has_value());
+                CHECK(p.had_parent_input);
+            } else if (p.id == plain->id) {
+                seen_plain = true;
+                CHECK_FALSE(p.had_parent_input);
+            }
+        }
+        CHECK(seen_child);
+        CHECK(seen_plain);
+    }
 }
 
 TEST_CASE("parent_may_seed admits only a materialized parent", "[result_set][parent_seed]") {

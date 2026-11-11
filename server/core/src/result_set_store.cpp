@@ -1014,7 +1014,8 @@ std::vector<PendingSet> ResultSetStore::list_pending() {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT id, owner_principal, source_kind, source_execution_id, matcher, created_at, "
-        "parent_id FROM result_set_store.result_sets WHERE status = 'pending' "
+        "parent_id, position('\"scope_input_id\"' in source_payload) > 0 "
+        "FROM result_set_store.result_sets WHERE status = 'pending' "
         "ORDER BY created_at ASC",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
@@ -1033,6 +1034,7 @@ std::vector<PendingSet> ResultSetStore::list_pending() {
         p.created_at = to_i64(PQgetvalue(res.get(), i, 5));
         if (!PQgetisnull(res.get(), i, 6))
             p.parent_id = PQgetvalue(res.get(), i, 6);
+        p.had_parent_input = PQgetvalue(res.get(), i, 7)[0] == 't';
         result.push_back(std::move(p));
     }
     return result;

@@ -204,6 +204,10 @@ struct PendingSet {
     std::string matcher;
     int64_t created_at{0};
     std::optional<std::string> parent_id; // lineage edge; the fill pass inherits its completeness
+    /// True when the pending row's source_payload records a parent reference (`scope_input_id`).
+    /// `parent_id` is cleared (ON DELETE SET NULL) when the parent is deleted before the fill, so
+    /// this marker is what tells the fill pass the dispatch was once narrowed to a parent.
+    bool had_parent_input{false};
 };
 
 /// Typed failure surface; the REST layer maps these to the error taxonomy
