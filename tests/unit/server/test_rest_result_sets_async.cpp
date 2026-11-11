@@ -5059,10 +5059,16 @@ TEST_CASE("ingest: a failed provenance lookup is carried to the terminal answer 
         "notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);";
     CHECK(count_in(src, peek) == 2);
     std::size_t sites = 0;
+    const std::string store = "response_dropped = !store_outcome_durable(";
     for (auto at = src.find(peek); at != std::string::npos; at = src.find(peek, at + 1)) {
+        // The peek runs AFTER the store outcome is assigned (it would otherwise be overwritten):
+        // the nearest preceding assignment is this site's own, a few statements earlier.
+        const auto store_at = src.rfind(store, at);
+        REQUIRE(store_at != std::string::npos);
+        CHECK(at - store_at < 300);
         const auto notify_at = src.find(notify, at);
         REQUIRE(notify_at != std::string::npos);
-        CHECK(notify_at - at < 600); // the registry audit hook, nothing else, in between
+        CHECK(notify_at - at < 300); // the registry audit hook, nothing else, in between
         ++sites;
     }
     CHECK(sites == 2);

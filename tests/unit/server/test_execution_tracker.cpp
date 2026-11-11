@@ -1334,7 +1334,9 @@ TEST_CASE("ExecutionTracker: response_dropped is counted and is sticky",
     AgentExecStatus kept;
     kept.agent_id = "agent-kept";
     kept.status = "success";
-    tracker.update_agent_status(*id_result, kept);
+    // True once the row is written: notify_exec_tracker forgets an unverified-frame record only
+    // then, and records a lost answer itself when it is false.
+    CHECK(tracker.update_agent_status(*id_result, kept));
 
     // A terminal write that reports a lost answer still counts as responded; the dropped count says
     // its answer is missing.
@@ -1342,7 +1344,7 @@ TEST_CASE("ExecutionTracker: response_dropped is counted and is sticky",
     lost.agent_id = "agent-lost";
     lost.status = "success";
     lost.response_dropped = true;
-    tracker.update_agent_status(*id_result, lost);
+    CHECK(tracker.update_agent_status(*id_result, lost));
 
     auto summary = tracker.get_summary(*id_result);
     CHECK(summary.agents_responded == 2);
@@ -1572,7 +1574,7 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
     AgentExecStatus status;
     status.agent_id = "agent-1";
     status.status = "running";
-    closed.update_agent_status("exec-1", status);
+    CHECK_FALSE(closed.update_agent_status("exec-1", status)); // nothing written
     closed.refresh_counts("exec-1");
     CHECK_FALSE(closed.mark_cancelled("exec-1", "tester"));
     CHECK_FALSE(closed.set_agents_targeted("exec-1", 1));
