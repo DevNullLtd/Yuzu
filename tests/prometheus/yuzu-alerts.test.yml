@@ -8423,3 +8423,70 @@ tests:
       - expr: 'ALERTS{alertname="YuzuOutboxDeadLettered", alertstate="firing"}'
         eval_time: 125m
         exp_samples: []
+
+  # -- Approval submit refusals (group yuzu-dispatch, #2146) ----------------------------------
+  #
+  # YuzuApprovalSubmitRefused: `increase(...{reason=~"approval_queue_full|approval_cap_reached"}[15m]) > 0`,
+  # `for: 2m`. The counter is pre-seeded to 0 at boot, so a first refusal is a 0 -> 1 step.
+  # Under the pinned 3.x left-open ranges the step at minute 10 is inside the window for evals
+  # 10m..23m, so the alert is pending at 10m and 11m, firing from 12m through 23m, and gone at 24m.
+  #
+  # APPROVAL CASE A -- a single approval_queue_full refusal fires (pending, then firing) and
+  # resolves once the step leaves the 15 minute window. RED if the regex drops a reason, `> 0` is
+  # raised, `for:` is lost or lengthened past 3m (firing at 13m), or the window is shortened.
+  - interval: 1m
+    name: approval submit refused - one queue_full refusal fires and then resolves
+    input_series:
+      - series: 'yuzu_server_approval_submit_refused_total{job="yuzu",instance="s1",reason="approval_queue_full"}'
+        values: "0x9 1x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuApprovalSubmitRefused", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuApprovalSubmitRefused", alertstate="pending"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuApprovalSubmitRefused", alertstate="pending", job="yuzu", instance="s1", reason="approval_queue_full", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuApprovalSubmitRefused", alertstate="firing"}'
+        eval_time: 13m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuApprovalSubmitRefused", alertstate="firing", job="yuzu", instance="s1", reason="approval_queue_full", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuApprovalSubmitRefused", alertstate=~"firing|pending"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # APPROVAL CASE B -- approval_cap_reached fires too, and the two storage/wiring reasons do NOT:
+  # approval_unavailable and approval_submit_failed move in the same run and stay quiet. RED if the
+  # regex is widened to every reason or the cap reason is dropped.
+  - interval: 1m
+    name: approval submit refused - cap_reached fires; unavailable and submit_failed stay quiet
+    input_series:
+      - series: 'yuzu_server_approval_submit_refused_total{job="yuzu",instance="s1",reason="approval_cap_reached"}'
+        values: "0x9 1x80"
+      - series: 'yuzu_server_approval_submit_refused_total{job="yuzu",instance="s1",reason="approval_unavailable"}'
+        values: "0x9 4x80"
+      - series: 'yuzu_server_approval_submit_refused_total{job="yuzu",instance="s1",reason="approval_submit_failed"}'
+        values: "0x9 4x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuApprovalSubmitRefused", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuApprovalSubmitRefused", alertstate="firing", job="yuzu", instance="s1", reason="approval_cap_reached", severity="warning"}'
+            value: 1
+
+  # APPROVAL CASE C -- a counter that is high but flat (no refusal in the window) is quiet, and a
+  # zero-seeded series that never moves is quiet. RED if the rule reads the raw counter instead of
+  # its increase.
+  - interval: 1m
+    name: approval submit refused - a flat counter and a zero-seeded one are quiet
+    input_series:
+      - series: 'yuzu_server_approval_submit_refused_total{job="yuzu",instance="s1",reason="approval_queue_full"}'
+        values: "7x80"
+      - series: 'yuzu_server_approval_submit_refused_total{job="yuzu",instance="s2",reason="approval_cap_reached"}'
+        values: "0x80"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuApprovalSubmitRefused", alertstate=~"firing|pending"}'
+        eval_time: 60m
+        exp_samples: []

@@ -52,7 +52,7 @@ for a non-`*Store`-suffixed class (the Wave-4 ladder-blind-spot components below
 
 > **Cross-store data migrations (Echo rename, 2026-10-28).** One idempotent upgrade-window step per
 > store rewrites the pre-rename plugin name `tar` to `echo` in stored references:
-> `instruction_store` v3, `schedule_engine` v2, `execution_tracker` v8, `approval_manager` v4,
+> `instruction_store` v3 (the store is now at v4, which is additive: it adds the tombstone `last_version` column and rewrites no data), `schedule_engine` v2, `execution_tracker` v8, `approval_manager` v4,
 > `device_token_store` v2, `plugin_config_store` v4, `result_set_store` v3, `policy_store` v5,
 > `workflow_engine` v2, `response_store` v3 and `command_outbox_store` v3 (`gateway_route_store` v6
 > is a schema change only: one additive column). Each is data-only and matches nothing on a fresh
