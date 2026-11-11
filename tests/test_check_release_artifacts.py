@@ -27,9 +27,9 @@ SCRIPT = ROOT / "scripts" / "check-release-artifacts.sh"
 VERSION = "0.14.0-rc9"
 
 ARCHIVES = ["yuzu-linux-x64.tar.gz", "yuzu-gateway-linux-x64.tar.gz",
-            "yuzu-windows-x64.zip", "yuzu-macos-arm64.tar.gz"]
+            "yuzu-agent-windows-x64.zip", "yuzu-agent-macos-arm64.tar.gz"]
 PACKAGES = ["yuzu-server_0.14.0-rc9_amd64.deb", "yuzu-server-0.14.0-0.1.rc9.x86_64.rpm",
-            "YuzuAgentSetup-0.14.0_rc9.exe", "YuzuServerSetup-0.14.0_rc9.exe",
+            "YuzuAgentSetup-0.14.0_rc9.exe",
             "YuzuAgent-0.14.0_rc9-arm64.pkg"]
 CHISEL = ["yuzu-server-chisel-image", "yuzu-gateway-chisel-image", "yuzu-agent-chisel-image"]
 
@@ -79,6 +79,20 @@ class CheckReleaseArtifacts(unittest.TestCase):
                     r = self.run_script(d)
                     self.assertNotEqual(r.returncode, 0, f"{base}.{fmt} missing but the gate passed")
                     self.assertIn(f"missing SBOM: {base}.{fmt}", r.stderr)
+
+    def test_retired_assets_are_refused(self):
+        # ADR-0035 step 2: a server installer or an old-name Windows/macOS
+        # archive or SBOM must fail the gate, not be hashed into SHA256SUMS.
+        for stray in ("YuzuServerSetup-0.14.0_rc9.exe", "yuzu-windows-x64.zip",
+                      "yuzu-macos-arm64.tar.gz", "yuzu-windows-x64.cdx.json"):
+            with self.subTest(stray=stray), \
+                    tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                (d / stray).write_bytes(b"x")
+                r = self.run_script(d)
+                self.assertNotEqual(r.returncode, 0, f"{stray} present but the gate passed")
+                self.assertIn(f"release must not carry {stray}", r.stderr)
 
 
 if __name__ == "__main__":

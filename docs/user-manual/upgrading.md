@@ -2,6 +2,28 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: the Windows and macOS releases ship the agent only; their archives are renamed and `YuzuServerSetup` is discontinued
+
+**What changed.** The server runs on Linux only (ADR-0035). The Windows and macOS release jobs no longer build the server, and the release assets change:
+
+| Before | Now |
+|---|---|
+| `yuzu-windows-x64.zip` (server + agent) | `yuzu-agent-windows-x64.zip` (agent and plugins) |
+| `yuzu-macos-arm64.tar.gz` (server + agent, plus `scripts/install-server-postgres.sh`) | `yuzu-agent-macos-arm64.tar.gz` (agent and plugins) |
+| `yuzu-windows-x64.{cdx,spdx}.json`, `yuzu-macos-arm64.{cdx,spdx}.json` | `yuzu-agent-windows-x64.{cdx,spdx}.json`, `yuzu-agent-macos-arm64.{cdx,spdx}.json` |
+| `YuzuServerSetup-<version>.exe` | not published |
+
+The top-level directory inside each archive is renamed the same way (`yuzu-agent-<version>-windows-x64`, `yuzu-agent-<version>-macos-arm64`). The Linux archives, the `.deb`/`.rpm` packages, `YuzuAgentSetup-<version>.exe`, the macOS `.pkg` and the container images are unchanged.
+
+**Who is affected.** Anyone who downloads the Windows or macOS archive or its SBOM by name (scripts, SCCM, Intune or Jamf packages, mirrors), anyone who unpacks it by its top-level directory name, and anyone running the server on Windows or macOS. A download by the old name fails with "not found". `scripts/build-agent-bundle.sh` accepts both names, so it still builds a bundle from an older release.
+
+**What to do.**
+- Update download and unpack paths to the new names.
+- If you run the server on Windows or macOS, follow "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md): the old server's data cannot be carried over, so you deploy a new Linux server (the container image or the Linux packages), enroll agents with it as new installations, and delete the old server's leftover files, which hold secrets.
+- Do not unpack the new agent archive over a directory a server still runs from.
+
+**Known limitations.** Until a later release removes the server's dependencies from the Windows build (ADR-0035 step 3), the Windows archive still contains `libpq.dll`, `drogon.dll`, `trantor.dll` and the `libxmlsec1` DLLs, which the agent never loads. Separately, the Windows and macOS SBOMs are generated from the whole build workspace, so they list thousands of components the archive does not ship or load, the server's dependencies among them; a dependency scan of an SBOM therefore reports components the agent does not use.
+
 ## ⚠️ Breaking: role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte
 
 **What changed.** `unassign_rbac_role` (MCP), the engine-role unassign (`DELETE /api/v1/engine-principals/{id}/roles/{role}` and MCP `unassign_engine_role`) and the engine-role assign (`POST /api/v1/engine-principals/{id}/roles` and MCP `assign_engine_role`) refuse a role name containing a NUL byte, any other control byte (0x01-0x1F) or DEL (0x7F). REST answers `400`, MCP answers invalid params (-32602), and the audit row is `result=denied` with the fixed detail `invalid_role_name` (the value is never echoed). The check runs before the principal or role is looked up. Every other role name is accepted unchanged, including one granted out of band, spaces and UTF-8 included.
@@ -3585,7 +3607,7 @@ and the free-space guidance are in [Installed-Software Inventory](inventory.md) 
 
 **The config file is still a bootstrap credential.** It seeds the first administrator whenever the auth schema is empty, so rebuilding onto an empty database (a lost or recreated Postgres, a restore onto a fresh database) brings back whatever password the file holds. Keep it protected, and change the administrator password in the product after any such rebuild. The reverse also holds: a **fresh install pointed at an already-populated database** (for example a reinstall, or a new server joining an existing cluster) seeds nothing — the installer's `/ADMIN_PASS` (or the first-run prompt) is written to the new config file but **ignored** by the server, and the accounts already in the database keep their passwords.
 
-**Windows server installer.** On an upgrade (a `yuzu-server.cfg` already exists in `%ProgramData%\Yuzu Server`), the installer now **refuses** a non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` with **exit code 11** before it stops the service or changes anything, instead of writing a config file the server would ignore. The interactive wizard skips its account pages on an upgrade. Remove those parameters from your upgrade command lines (SCCM/Intune packages included); see the Windows server installer section of [Server Administration](server-admin.md) (#5196 note).
+**Windows server installer.** On an upgrade (a `yuzu-server.cfg` already exists in `%ProgramData%\Yuzu Server`), the installer now **refuses** a non-empty `/ADMIN_PASS=` or `/OPERATOR_PASS=` with **exit code 11** before it stops the service or changes anything, instead of writing a config file the server would ignore. The interactive wizard skips its account pages on an upgrade. Remove those parameters from your upgrade command lines (SCCM/Intune packages included). (The Windows server installer was later discontinued, ADR-0035: the server runs on Linux only; see [Server Administration](server-admin.md).)
 
 **Breaking — the second first-run account and the Windows installer's `/OPERATOR_USER`/`/OPERATOR_PASS` are removed (#5343).** They were written to `yuzu-server.cfg` only and were never provisioned into the PostgreSQL auth store, so the account they created could never sign in. First-run setup now prompts for the administrator only, and a fresh Windows install that passes a non-empty `/OPERATOR_USER=` or `/OPERATOR_PASS=` is refused with **exit code 7** (nothing changed; an upgrade given `/OPERATOR_PASS=` still gets exit code 11, and an upgrade given `/OPERATOR_USER=` alone gets exit code 7). Remove both parameters from fresh-install command lines and create further accounts in Settings → User Management (`POST /api/settings/users`). Upgrades are unaffected: an existing installation keeps its accounts, and a leftover `yuzu-server.cfg` entry that has no stored account is reported by name in a warning at boot — delete that line.
 
@@ -7771,22 +7793,9 @@ docker compose -f docker-compose.reference.yml up -d server
 
 **Never** run `docker compose down -v` unless you intend to delete `server-data`, the keys volume (`certs` in the reference composes, `server-certs` in the others: the CA and the secrets KEK), `postgres-data` (the PostgreSQL substrate — the server's primary data store), and every bit of server state. `down` alone is safe; the `-v` flag removes named volumes.
 
-### Windows
+### Windows and macOS
 
-```powershell
-# 1. Stop the service (if running as service) or kill the process
-Stop-Service yuzu-server  # or: taskkill /IM yuzu-server.exe /F
-
-# 2. Back up data
-Copy-Item C:\ProgramData\Yuzu\*.db C:\ProgramData\Yuzu\backup\
-Copy-Item C:\ProgramData\Yuzu\*.cfg C:\ProgramData\Yuzu\backup\
-
-# 3. Replace the binary
-Copy-Item yuzu-server.exe "C:\Program Files\Yuzu\yuzu-server.exe"
-
-# 4. Start
-Start-Service yuzu-server  # or start manually
-```
+There is no Windows or macOS server to upgrade to: the server runs on Linux only (ADR-0035), and no release after 0.15.0 ships `yuzu-server.exe`, a macOS `yuzu-server` or `YuzuServerSetup`. To move an existing Windows or macOS server to Linux, follow "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md) (under "the Windows server installer is discontinued"): deploy a new Linux server, enroll agents with it as new installations, and retire the old one. Its data cannot be carried over (copying `*.db` and `*.cfg` files never was a backup: the server's data is in PostgreSQL).
 
 ## Upgrading the Gateway
 
