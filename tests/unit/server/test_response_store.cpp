@@ -133,8 +133,8 @@ TEST_CASE("ResponseStore: bad-path constructor (unroutable DSN) is closed",
     // Reads degrade to nullopt; ingest/reap are silent no-ops.
     CHECK_FALSE(store.query("cmd-x", kAllRows).has_value());
     CHECK(store.total_count(kAllRows) == 0);
-    store.store(StoredResponse{}); // must not throw/crash
-    store.reap_expired();          // must not throw/crash
+    CHECK_FALSE(store.store(StoredResponse{})); // not persisted: no throw, and the caller is told
+    store.reap_expired();                       // must not throw/crash
 }
 
 TEST_CASE("ResponseStore: store and retrieve", "[pg][response_store]") {
@@ -4074,6 +4074,36 @@ TEST_CASE("ResponseStore: a capped stream finalizes in place and replay cannot g
     f.store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
     CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
     CHECK(cap_dropped(f.metrics) == 3.0);
+}
+
+// store() reports whether the frame is durable: the terminal ingest sites record a lost answer
+// from it. False when the store is closed (see the bad-path test), a NUL is in an identity field
+// or the transaction fails; true for a persisted frame and for a terminal frame the cap refused
+// because the pair already holds its terminal row.
+TEST_CASE("ResponseStore: store reports whether the frame is durable",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    CHECK(f.store.store(cap_frame("cmd-ret", "agent-1", 1, "exec-1")));
+    CHECK(cap_rows(f.store, "cmd-ret", "agent-1") == 1);
+
+    auto nul = cap_frame("cmd-ret", "agent-2", 1);
+    nul.agent_id = std::string("agent") + '\0' + "2";
+    CHECK_FALSE(f.store.store(nul));
+    auto nul_instruction = cap_frame("cmd-ret", "agent-3", 1);
+    nul_instruction.instruction_id = std::string("cmd-ret") + '\0' + "x";
+    CHECK_FALSE(f.store.store(nul_instruction));
+
+    // Fill the pair with RUNNING rows, finalize them in place, then replay a terminal frame: the
+    // cap refuses it, but the pair already holds a terminal row, so the answer is durable.
+    for (int i = 0; i < 4; ++i)
+        REQUIRE(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 0, "exec-2")));
+    REQUIRE(f.store.finalize_terminal_status("cmd-ret-cap", "agent-1", 1, "", "exec-2", 0) ==
+            ResponseStore::FinalizeResult::Updated);
+    CHECK(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 1, "exec-2")));
+    CHECK(cap_rows(f.store, "cmd-ret-cap", "agent-1") == 4); // refused, not grown
+    CHECK(cap_dropped(f.metrics) == 1.0);
 }
 
 TEST_CASE("ResponseStore: the row cap is per (instruction, agent) pair",
