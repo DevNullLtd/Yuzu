@@ -1022,6 +1022,73 @@ TEST_CASE("ResultSetStore: member_set_owned refuses a set that is not materializ
         REQUIRE(got.has_value());
         CHECK(got->agents_unanswered == 4);
     }
+    SECTION("a child created from an incomplete parent reads incomplete") {
+        auto parent = store.create_pending(pending_req("incomplete-parent"), "exec-ip");
+        REQUIRE(parent.has_value());
+        REQUIRE(store.materialize(parent->id, {"dev-1", "dev-2"}, 1, 2).has_value());
+        auto parent_row = get_ok(store, parent->id);
+        REQUIRE(parent_row.has_value());
+        REQUIRE(parent_may_seed(*parent_row));
+
+        CreateRequest child_req = req("alice", "inherited-child");
+        child_req.parent_id = parent->id;
+        inherit_completeness(child_req, *parent_row);
+        auto child = store.create_materialized(child_req, {"dev-1"});
+        REQUIRE(child.has_value());
+
+        auto got = get_ok(store, child->id);
+        REQUIRE(got.has_value());
+        CHECK(got->agents_failed == 1);
+        CHECK(got->agents_unanswered == 2);
+        auto r = store.member_set_owned(child->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->complete);
+    }
+    SECTION("a child created from a complete parent reads complete") {
+        auto parent = store.create_materialized(req("alice", "complete-parent"), {"dev-1"});
+        REQUIRE(parent.has_value());
+        CreateRequest child_req = req("alice", "complete-child");
+        child_req.parent_id = parent->id;
+        inherit_completeness(child_req, *parent);
+        auto child = store.create_materialized(child_req, {"dev-1"});
+        REQUIRE(child.has_value());
+        auto r = store.member_set_owned(child->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->complete);
+    }
+    SECTION("list_pending carries the parent id") {
+        auto parent = store.create_materialized(req("alice", "lineage-parent"), {"dev-1"});
+        REQUIRE(parent.has_value());
+        CreateRequest child_req = pending_req("pending-child");
+        child_req.parent_id = parent->id;
+        auto child = store.create_pending(child_req, "exec-pc");
+        REQUIRE(child.has_value());
+        bool seen = false;
+        for (const auto& p : store.list_pending())
+            if (p.id == child->id) {
+                seen = true;
+                CHECK(p.parent_id == parent->id);
+            }
+        CHECK(seen);
+    }
+}
+
+TEST_CASE("parent_may_seed admits only a materialized parent", "[result_set][parent_seed]") {
+    ResultSet row;
+    row.status = ResultSetStatus::Materialized;
+    CHECK(parent_may_seed(row));
+    row.status = ResultSetStatus::Pending;
+    CHECK_FALSE(parent_may_seed(row));
+    row.status = ResultSetStatus::Failed;
+    CHECK_FALSE(parent_may_seed(row));
+
+    ResultSet parent;
+    parent.agents_failed = 3;
+    parent.agents_unanswered = 5;
+    CreateRequest child;
+    inherit_completeness(child, parent);
+    CHECK(child.agents_failed == 3);
+    CHECK(child.agents_unanswered == 5);
 }
 
 TEST_CASE("ResultSetStore: member_set_owned reports DbError on a genuine store failure, "

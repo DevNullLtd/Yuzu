@@ -4922,3 +4922,61 @@ TEST_CASE("materialise: a success-status error| answer under the default matcher
           std::vector<std::string>{"agent-a"});
     CHECK(found->agents_failed == 1);
 }
+
+// A parent that is not materialized has no membership to seed a child from: every producer that
+// accepts a parent_id refuses it (409) before any dispatch or read, and a materialized parent that
+// is incomplete passes its completeness on to the child.
+TEST_CASE("result-set producers refuse a pending parent and inherit an incomplete parent",
+          "[pg][result_set][async][parent_seed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    CreateRequest pending_req;
+    pending_req.owner_principal = "operator-1";
+    pending_req.name = "pending-parent";
+    pending_req.source_kind = std::string(source_kind::kEchoQuery);
+    pending_req.source_payload = R"({"sql":"SELECT 1"})";
+    auto pending = h.store->create_pending(pending_req, "exec-pending-parent");
+    REQUIRE(pending.has_value());
+
+    const std::string inv_body =
+        R"({"name":"child","conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}],"parent_id":")" +
+        pending->id + R"("})";
+
+    SECTION("from-inventory-query refuses a pending parent and creates nothing") {
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", inv_body, status);
+        CHECK(status == 409);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 1); // the parent only
+    }
+    SECTION("from-echo-query refuses a pending parent and dispatches nothing") {
+        int status = 0;
+        h.post("/api/v1/result-sets/from-echo-query",
+               R"({"sql":"SELECT 1","parent_id":")" + pending->id + R"("})", status);
+        CHECK(status == 409);
+        CHECK(h.calls.empty());
+    }
+    SECTION("from-inventory-query refuses a failed parent") {
+        h.store->mark_failed(pending->id, "bound exceeded");
+        int status = 0;
+        h.post("/api/v1/result-sets/from-inventory-query", inv_body, status);
+        CHECK(status == 409);
+    }
+    SECTION("from-inventory-query inherits a partial parent's counters") {
+        REQUIRE(h.store->materialize(pending->id, {}, 2, 3).has_value());
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", inv_body, status);
+        REQUIRE(status == 201);
+        auto child = get_ok(*h.store, j["data"]["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        CHECK(child->agents_failed == 2);
+        CHECK(child->agents_unanswered == 3);
+    }
+}

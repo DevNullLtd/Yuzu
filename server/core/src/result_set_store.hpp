@@ -203,6 +203,7 @@ struct PendingSet {
     std::string source_execution_id;
     std::string matcher;
     int64_t created_at{0};
+    std::optional<std::string> parent_id; // lineage edge; the fill pass inherits its completeness
 };
 
 /// Typed failure surface; the REST layer maps these to the error taxonomy
@@ -232,7 +233,31 @@ struct CreateRequest {
     std::string source_kind;
     std::string source_payload; // JSON
     std::string matcher;        // JSON; only meaningful for async instruction-result
+    /// Completeness a child inherits from its parent (see `parent_may_seed`). Only
+    /// `create_materialized` persists them; an async child's counters are set by `materialize`.
+    int64_t agents_failed{0};
+    int64_t agents_unanswered{0};
 };
+
+/// A parent set may seed a child only once its membership means something: status
+/// `materialized`. A `pending` set has no members yet and a `failed` one never will, so
+/// seeding from either would read as an empty (complete) membership. Every producer that
+/// accepts a `parent_id` applies this right after its owner check and before it reads the
+/// parent's members; a refusal is the shared `kParentNotReadyMessage` (REST 409, MCP -32602).
+inline bool parent_may_seed(const ResultSet& parent) noexcept {
+    return parent.status == ResultSetStatus::Materialized;
+}
+
+inline constexpr std::string_view kParentNotReadyMessage =
+    "RESULT_SET_NOT_READY: the parent result set is not materialized (still pending or "
+    "failed); wait until its status is materialized";
+
+/// Carry a parent's completeness onto a child created from its members: a child is never
+/// more complete than the parent it was narrowed from.
+inline void inherit_completeness(CreateRequest& child, const ResultSet& parent) noexcept {
+    child.agents_failed = parent.agents_failed;
+    child.agents_unanswered = parent.agents_unanswered;
+}
 
 class ResultSetStore {
 public:

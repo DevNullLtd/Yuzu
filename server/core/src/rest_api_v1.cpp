@@ -14297,6 +14297,12 @@ void RestApiV1::register_routes(
             auto row = load_owned(req, id, owner, res);
             if (!row)
                 return std::nullopt;
+            // A parent that is not materialized has no membership to seed a child from: refuse
+            // before the child's scope names it.
+            if (!parent_may_seed(*row)) {
+                rs_err(res, 409, kParentNotReadyMessage);
+                return std::nullopt;
+            }
             return id;
         };
 
@@ -14882,8 +14888,13 @@ void RestApiV1::register_routes(
                 // Owner-check the parent before persisting the lineage edge,
                 // else an operator can parent onto a victim's id and read its
                 // name/source_kind/device_count back via /lineage (review B2).
-                if (!load_owned(req, pid, session->username, res))
+                auto lineage_parent = load_owned(req, pid, session->username, res);
+                if (!lineage_parent)
                     return; // load_owned wrote 404
+                if (!parent_may_seed(*lineage_parent)) {
+                    rs_err(res, 409, kParentNotReadyMessage);
+                    return;
+                }
                 cr.parent_id = pid;
                 if (payload.is_object())
                     payload["scope_input_id"] = pid;
@@ -15274,6 +15285,14 @@ void RestApiV1::register_routes(
                           auto parent = load_owned(req, pid, session->username, res);
                           if (!parent)
                               return; // load_owned already wrote 404
+                          if (!parent_may_seed(*parent)) {
+                              rs_err(res, 409, kParentNotReadyMessage);
+                              return;
+                          }
+                          // The child is narrowed from this parent, so it is no more complete
+                          // than it. A materialized parent's counters never change afterwards, so
+                          // reading them here matches the members read below.
+                          inherit_completeness(cr, *parent);
                           cr.parent_id = pid;
                           body["scope_input_id"] = pid;
                           std::unordered_set<std::string> ms;

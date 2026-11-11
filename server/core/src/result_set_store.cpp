@@ -343,6 +343,8 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
     row.source_execution_id = execution_id;
     row.matcher = req.matcher;
     row.device_count = static_cast<int64_t>(uniq.size());
+    row.agents_failed = req.agents_failed;
+    row.agents_unanswered = req.agents_unanswered;
 
     const std::vector<std::string_view> member_views = as_views(uniq);
     bool quota_exceeded = false;
@@ -374,15 +376,17 @@ std::expected<ResultSet, ResultSetError> ResultSetStore::insert_row_impl(
             conn,
             "INSERT INTO result_set_store.result_sets "
             "(id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, "
-            " source_kind, source_payload, status, source_execution_id, matcher, device_count) "
+            " source_kind, source_payload, status, source_execution_id, matcher, device_count, "
+            " agents_failed, agents_unanswered) "
             "VALUES ($1,$2,$3,$4::bigint,$5::bigint,$6::bigint,false,$7,$8,$9,$10,$11,$12,"
-            "$13::bigint) RETURNING id",
+            "$13::bigint,$14::bigint,$15::bigint) RETURNING id",
             std::vector<std::optional<std::string>>{
                 row.id, row.name.empty() ? std::nullopt : std::optional<std::string>(row.name),
                 row.owner_principal, std::to_string(row.created_at), std::to_string(row.ttl_at),
                 std::to_string(row.last_used_at), row.parent_id, row.source_kind,
                 row.source_payload, std::string(to_string(row.status)), row.source_execution_id,
-                row.matcher, std::to_string(row.device_count)});
+                row.matcher, std::to_string(row.device_count), std::to_string(row.agents_failed),
+                std::to_string(row.agents_unanswered)});
         if (r1.status() != PGRES_TUPLES_OK || PQntuples(r1.get()) == 0) {
             spdlog::error("ResultSetStore::insert_row_impl: row insert failed: {}",
                           PQerrorMessage(conn));
@@ -1009,8 +1013,9 @@ std::vector<PendingSet> ResultSetStore::list_pending() {
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT id, owner_principal, source_kind, source_execution_id, matcher, created_at "
-        "FROM result_set_store.result_sets WHERE status = 'pending' ORDER BY created_at ASC",
+        "SELECT id, owner_principal, source_kind, source_execution_id, matcher, created_at, "
+        "parent_id FROM result_set_store.result_sets WHERE status = 'pending' "
+        "ORDER BY created_at ASC",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::list_pending: query failed: {}", PQerrorMessage(lease.get()));
@@ -1026,6 +1031,8 @@ std::vector<PendingSet> ResultSetStore::list_pending() {
         p.source_execution_id = PQgetvalue(res.get(), i, 3);
         p.matcher = PQgetvalue(res.get(), i, 4);
         p.created_at = to_i64(PQgetvalue(res.get(), i, 5));
+        if (!PQgetisnull(res.get(), i, 6))
+            p.parent_id = PQgetvalue(res.get(), i, 6);
         result.push_back(std::move(p));
     }
     return result;

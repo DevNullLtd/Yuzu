@@ -51770,3 +51770,28 @@ TEST_CASE("MCP Guardian: tool descriptions carry the never-render-clean rule and
     }
     CHECK(seen == 3);
 }
+
+TEST_CASE("MCP create_result_set: a pending parent is refused with RESULT_SET_NOT_READY",
+          "[pg][mcp][integration][result-sets][parent_seed]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user";
+    parent_cr.name = "pending-parent";
+    parent_cr.source_kind = std::string(source_kind::kEchoQuery);
+    parent_cr.source_payload = R"({"sql":"SELECT 1"})";
+    auto parent = rs_bundle.get()->create_pending(parent_cr, "exec-pending-parent");
+    REQUIRE(parent.has_value());
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"name":"child","device_ids":[],"parent_id":")" +
+        parent->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+          std::string::npos);
+}

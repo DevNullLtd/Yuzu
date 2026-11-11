@@ -19047,7 +19047,7 @@ private:
                                 responded = sum.agents_responded;
                                 terminal = targeted > 0 && responded >= targeted;
                             }
-                            const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
+                            int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
                                 targeted, responded, execution_tracker_ != nullptr);
                             const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
                             if (!terminal && !timed_out)
@@ -19090,6 +19090,22 @@ private:
                                 }
                                 agents_failed = found->agents_failed;
                                 members = std::move(*found);
+                            }
+                            // The dispatch behind this set was narrowed to its parent's members,
+                            // so the set is no more complete than the parent: add the parent's
+                            // counters to its own (monotone, never more complete). A parent that
+                            // is gone cannot vouch for completeness, so count it as unanswered; a
+                            // degraded read retries on the next tick.
+                            if (p.parent_id) {
+                                auto parent = result_set_store_->get(*p.parent_id);
+                                if (!parent)
+                                    continue;
+                                if (*parent) {
+                                    agents_failed += (*parent)->agents_failed;
+                                    agents_unanswered += (*parent)->agents_unanswered;
+                                } else if (agents_unanswered == 0) {
+                                    agents_unanswered = 1;
+                                }
                             }
                             if (agents_failed > 0)
                                 spdlog::warn("result set {} materialized partial: {} agent(s) "

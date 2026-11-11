@@ -286,6 +286,13 @@ TEST_CASE("evaluate_scope: a result set that is not ready or is incomplete is no
         auto r = eval("hostname != \"x\" AND from_result_set:" + partial->id);
         REQUIRE(r.has_value());
     }
+    SECTION("an OR branch does not hide a NOT over an incomplete set") {
+        aborts_unusable("ostype != \"x\" OR NOT from_result_set:" + partial->id, partial->id);
+    }
+    SECTION("the same incomplete set used in both polarities aborts") {
+        aborts_unusable("from_result_set:" + partial->id + " AND NOT from_result_set:" + partial->id,
+                        partial->id);
+    }
     SECTION("an inverted comparison or a wrapped atom needs a complete set") {
         aborts_unusable("STARTSWITH(from_result_set:" + partial->id + ", \"r\")", partial->id);
         aborts_unusable("LEN(from_result_set:" + partial->id + ") == 0", partial->id);

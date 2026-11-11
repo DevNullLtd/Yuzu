@@ -8407,6 +8407,9 @@ List all inventory tables (one per plugin that reports inventory data).
 
 Creates an owner-scoped result set from an inventory query (scope-walking
 producer; see `docs/scope-walking-design.md` for the full result-set surface).
+A `parent_id` must name a `materialized` set the caller owns: a `pending` or `failed`
+parent is refused with **409** `RESULT_SET_NOT_READY`, and the new set inherits an
+incomplete parent's `agents_failed` and `agents_unanswered`.
 One behavior worth calling out here: when the underlying inventory read hits
 the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 ("inventory query truncated ... refusing to materialise a partial result set") rather than
@@ -8518,6 +8521,7 @@ re-eval, unchanged.
 
 | Status | Reason |
 |---|---|
+| 409 | `RESULT_SET_NOT_READY` — `parent_id` names a set that is still `pending` or has `failed`; wait until it is `materialized`. A materialized parent that is incomplete is accepted and the new set inherits its `agents_failed` and `agents_unanswered` |
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_REEVAL_STALE_SOURCE` — on `from-echo-query`, the `sql` reads a raw capture table (a `$<Source>_Live` name or a `<source>_live` table); on `from-instruction-result`, an `echo.sql` definition's SQL does (the `params.sql` value, else the definition's declared default: the text the dashboard submits for a canned query; a default is never injected at dispatch, so a dispatch without `sql` is answered with an error by the agent and counted in `agents_failed`); on `re-eval`, the stored SQL does (for an `instruction_result` set, the stored `sql` param, else that same declared default). Echo keeps roll-up tiers only, so such a query answers with no rows and the set would be silently empty. Nothing is dispatched; query the hourly roll-up instead (for example `$Process_Hourly`). A match inside a comment, or inside a longer string literal (`'see process_live'`), is not a reference; a single-quoted token that is exactly a raw table name (`'process_live'`, `'$Process_Live'`) is one wherever it stands, because SQLite reads such a token as the table after `FROM`, `JOIN`, `IN` and in other positions, so `FROM 'process_live'` and `x IN 'process_live'` are refused, and so is a string literal equal to a raw table name (`WHERE name = 'process_live'`), the price of a rule that does not depend on position. This is a behaviour change for a stale client that stored a set over a `$<Source>_Live` name |
@@ -9360,7 +9364,7 @@ The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-wal
 }
 ```
 
-`agents_failed` counts the agents that answered an asynchronous producer's dispatch with a failure (a non-success status, output starting `error|`, or a success answer whose `__schema__` header lacks the column a column matcher names) and never produced a matching row. They are absent from the set because their query failed, not because they do not match, so `partial` is `true` whenever `agents_failed` is above zero and the set may be missing devices. An agent that failed once and later matched is a member and is not counted. `partial` means at least one *answering* agent failed: an agent that never answered is neither a member nor counted, so a set filled at the five-minute fill timeout reflects the answers stored by then and says nothing about the agents still missing. The execution's `agents_targeted` (`GET /api/v1/executions/{id}`) shows how many were sent the query, but under confinement it counts only agents with a response row, so a confined caller cannot see the non-responders that way. The fill reads every stored answer of the execution, 500 rows at a time, up to 100,000 rows; past that bound the set is marked `failed` rather than filled as partial: it reads `device_count` `0`, `agents_failed` `0` and `partial` `false`, and the reason (`response rows exceed the members read bound`) is in the server log only, not in the set. Both are `0` / `false` for a set that is not filled from agent answers, and while a set is still `pending`. On a database carried forward from an earlier build (not a supported deployment; see Upgrading), a set filled before this release, or by a server replica from before it, also reads `0` / `false` without information. `parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `echo_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
+`agents_failed` counts the agents that answered an asynchronous producer's dispatch with a failure (a non-success status, output starting `error|`, or a success answer whose `__schema__` header lacks the column a column matcher names) and never produced a matching row. They are absent from the set because their query failed, not because they do not match, so `partial` is `true` whenever `agents_failed` is above zero and the set may be missing devices. An agent that failed once and later matched is a member and is not counted. `partial` means at least one *answering* agent failed: an agent that never answered is neither a member nor counted, so a set filled at the five-minute fill timeout reflects the answers stored by then and says nothing about the agents still missing. The execution's `agents_targeted` (`GET /api/v1/executions/{id}`) shows how many were sent the query, but under confinement it counts only agents with a response row, so a confined caller cannot see the non-responders that way. The fill reads every stored answer of the execution, 500 rows at a time, up to 100,000 rows; past that bound the set is marked `failed` rather than filled as partial: it reads `device_count` `0`, `agents_failed` `0` and `partial` `false`, and the reason (`response rows exceed the members read bound`) is in the server log only, not in the set. Both are `0` / `false` for a set that is not filled from agent answers, and while a set is still `pending`. On a database carried forward from an earlier build (not a supported deployment; see Upgrading), a set filled before this release, or by a server replica from before it, also reads `0` / `false` without information. A set created from a parent (any producer) is never more complete than that parent: it inherits the parent's `agents_failed` and `agents_unanswered` (an asynchronous producer adds them to its own when it is filled), and a `pending` or `failed` parent is refused with `409` `RESULT_SET_NOT_READY`. `parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `echo_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized` (or `failed` if the dispatch could not be materialized).
 
 #### `GET /api/v1/result-sets`
 
@@ -13673,10 +13677,11 @@ row for that agent — a presence-only cross-replica agent has no live
 session to fall back to, so it still resolves store-only for such agents,
 same as real dispatch. See
 [Tag source precedence](../asset-tagging-guide.md). `POST /api/scope/estimate`
-below also resolves `from_result_set:` against the owner, but a failed
-owner-check there degrades to "zero members" rather than aborting the whole
-evaluation like this route's ladder does — a separate, still-open fail-open
-gap, tracked `#5003`, not fixed by `#4981`.
+below also resolves `from_result_set:` against the owner, but when its
+evaluation aborts (a failed owner check, a set that is not ready, an incomplete
+set under `NOT`) it returns an honest zero match count, which under-reports
+rather than over-matches, instead of surfacing the abort like this route's
+ladder does.
 
 **Permission:** `Infrastructure:Read`, via the admit-then-filter fleet-read
 chokepoint (ADR-0017) — this route discloses agent identities, unlike the
