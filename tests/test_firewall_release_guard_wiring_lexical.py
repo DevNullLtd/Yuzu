@@ -17,6 +17,12 @@ stayed green with it reverted. This gate pins what they cannot, inside WinLeg::r
      the anchor: its first call is step 1's `ours_at_start`, which step 3's fallback decision
      needs and which therefore legitimately precedes the guard.
 
+  3. The unreadable-image branch (`PriorImageStep::unreadable_image`) increments
+     `tally.policy_restore_failed` before any default setter can run, so a present-but-unparsable
+     captured image refuses instead of falling back to the OS default.
+  4. Inside `restore_default`, the delete_local branch calls `put_Default*Action` BEFORE
+     `RegDeleteKeyValueW(`, and returns false when the put fails.
+
 The live half (a failing default-action restore mid-release on a real Windows host: the rules
 survive and the record stays `releasing`) is exercised at gate 4 on Windows, not here.
 
@@ -57,6 +63,11 @@ def normalise(src):
     return re.sub(r"[ \t\n\r\f\v]+", " ", re.sub(r"//.*", "", src))
 
 
+def _restore_default_body(cpp):
+    m = re.search(r"static bool restore_default\(.*?\) \{(.*?)struct PolicyDword", cpp)
+    return m.group(1) if m else None
+
+
 def problems(plugin_src):
     """One message per violated invariant, in invariant order; [] when clean."""
     out = []
@@ -87,6 +98,27 @@ def problems(plugin_src):
         out.append("WinLeg::remove() no longer returns release_incomplete( for a failed "
                    "default-action restore BEFORE the step-4 rule removal (the allowances would be "
                    "deleted while a profile still blocks)")
+
+    unreadable = re.search(
+        r"fq::PriorImageStep::unreadable_image\) \{ ?\+\+tally\.policy_restore_failed;", text)
+    if not unreadable:
+        out.append("WinLeg::remove() no longer counts a present-but-unreadable prior-policy image "
+                   "(PriorImageStep::unreadable_image) as tally.policy_restore_failed (the release "
+                   "would fall back to the OS default over a captured hardened policy)")
+
+    rd = _restore_default_body(cpp)
+    if rd is None:
+        out.append("firewall_plugin.cpp no longer defines restore_default( ahead of the policy-store reader")
+    else:
+        put = re.search(r"put_Default(?:Inbound|Outbound)Action\(", rd)
+        delete = re.search(r"RegDeleteKeyValueW\(", rd)
+        if not put or not delete or put.start() > delete.start():
+            out.append("restore_default() no longer puts the OS default through put_Default*Action( "
+                       "BEFORE RegDeleteKeyValueW( (the running firewall service would keep the "
+                       "quarantine block after the local value is deleted)")
+        if not re.search(r"!= S_OK\) return false;\s*const LONG rc = RegDeleteKeyValueW\(", rd):
+            out.append("restore_default() no longer returns false when the put_Default*Action( before "
+                       "RegDeleteKeyValueW( fails (a failed put would count as restored)")
     return out
 
 
@@ -119,6 +151,27 @@ MUTATIONS = [
     (lambda raw: re.subn(r"(if \(tally\.policy_restore_failed > 0\)\s*)return release_incomplete\([^;]*;",
                          r"\1return result;", raw, count=1),
      "no longer returns release_incomplete( when"),
+]
+
+
+def _swap_put_and_delete(raw):
+    m = re.search(
+        r"(            const NET_FW_ACTION os_default = .*?\n)(            if \(\(inbound \? policy\.put_DefaultInboundAction.*?return false;\n)"
+        r"(            const LONG rc = RegDeleteKeyValueW\([^\n]*\n)", raw, re.S)
+    if not m:
+        return raw, 0
+    return raw[:m.start()] + m.group(1) + m.group(3) + m.group(2) + raw[m.end():], 1
+
+
+MUTATIONS += [
+    (_swap_put_and_delete, "BEFORE RegDeleteKeyValueW("),
+    (lambda raw: re.subn(r"\n            if \(\(inbound \? policy\.put_DefaultInboundAction.*?return false;\n",
+                         "\n", raw, count=1, flags=re.S),
+     "BEFORE RegDeleteKeyValueW("),
+    (lambda raw: re.subn(r"(!= S_OK\)\s*)return false;(\s*const LONG rc = RegDeleteKeyValueW)", r"\1return true;\2", raw, count=1),
+     "no longer returns false when the put_Default"),
+    (lambda raw: re.subn(r"(PriorImageStep::unreadable_image\) \{(?:\s*//[^\n]*)*\s*)\+\+tally\.policy_restore_failed;", r"\1", raw, count=1),
+     "unreadable_image"),
 ]
 
 

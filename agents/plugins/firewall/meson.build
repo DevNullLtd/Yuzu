@@ -11,6 +11,8 @@ if host_machine.system() == 'windows'
   # ws2_32 + iphlpapi: the containment verify probe (icmp_probe.hpp's TCP connect
   # sample over Winsock) and the host resolver read (GetAdaptersAddresses).
   firewall_deps += [cxx.find_library('ws2_32'), cxx.find_library('iphlpapi')]
+  # advapi32: RegGetValueW/RegDeleteKeyValueW (profile default-action local store).
+  firewall_deps += cxx.find_library('advapi32')
 elif host_machine.system() == 'linux'
   # Linux firewalld leg (rung 1, bounded sd-bus) -- reuses agent-core's
   # existing systemd_guard feature option rather than minting a new one; same

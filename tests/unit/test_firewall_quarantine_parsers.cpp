@@ -4309,6 +4309,24 @@ TEST_CASE("kv presence: only 0 and 1 are answers; a fault is never 'absent'",
         CHECK(kv_presence(rc) == KvPresence::unknown);
 }
 
+TEST_CASE("prior image step: only a confirmed absence may fall back to the OS default",
+          "[agent][firewall_quarantine]") {
+    WinPriorPolicy p{};
+    for (auto& x : p)
+        x = {WinAction::block, WinAction::block};
+    const std::string v2 = serialize_prior_policy(p);
+    const auto step = [](KvPresence p, std::string_view text) {
+        return prior_image_step(p, parse_prior_policy(text).has_value());
+    };
+    // A present image the parser rejects (old v=1, malformed v=2) refuses; no default setter runs.
+    CHECK(step(KvPresence::present, std::string(v2).replace(0, 3, "v=1")) == PriorImageStep::unreadable_image);
+    CHECK(step(KvPresence::present, "v=2\ndomain.in=allow\n") == PriorImageStep::unreadable_image);
+    CHECK(step(KvPresence::present, "") == PriorImageStep::unreadable_image); // get failed after presence
+    CHECK(step(KvPresence::present, v2) == PriorImageStep::restore_image);
+    CHECK(step(KvPresence::absent, "") == PriorImageStep::fallback_no_image);
+    CHECK(step(KvPresence::unknown, v2) == PriorImageStep::unknown_presence);
+}
+
 TEST_CASE("staged path: a space in the data directory is safe; anything outside the directory is not",
           "[agent][firewall_quarantine]") {
     const std::string dir = "/Library/Application Support/Yuzu/firewall-staging";

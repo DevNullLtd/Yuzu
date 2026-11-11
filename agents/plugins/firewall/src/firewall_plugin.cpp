@@ -2279,11 +2279,17 @@ public:
         std::optional<fq::WinPriorPolicy> prior;
         if (image_exists)
             prior = fq::parse_prior_policy(pc.storage_get(prior_key));
-        if (image_presence == fq::KvPresence::unknown) {
+        const auto image_step = fq::prior_image_step(image_presence, prior.has_value());
+        if (image_step == fq::PriorImageStep::unknown_presence) {
             // Neither the image nor its absence is known: restoring Windows' default
             // over a hardened policy would be a guess, and so would skipping the restore.
             ++tally.policy_restore_failed;
             result.notes.emplace_back("storage_unreadable=1");
+        } else if (image_step == fq::PriorImageStep::unreadable_image) {
+            // The image exists but cannot be trusted (old format, malformed, failed read):
+            // the same guess, so refuse before any default setter and keep the allowances.
+            ++tally.policy_restore_failed;
+            result.notes.emplace_back("prior_policy_unreadable=1");
         } else if (prior || !ours_at_start->empty()) {
             for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
                 if (!restore_default(*policy.get(), i, L"DefaultInboundAction", prior, true) ||

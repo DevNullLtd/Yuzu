@@ -2922,6 +2922,23 @@ enum class KvPresence : std::uint8_t { present, absent, unknown };
     return KvPresence::unknown;
 }
 
+/// What a release does about the captured profile-policy image. Only a CONFIRMED absence may
+/// fall back to the OS default; an image that is present but cannot be parsed (an old v=1, a
+/// malformed v=2, a get that failed after the presence read) is as unknown as a failed presence
+/// read: restoring the OS default over it would silently weaken a hardened policy.
+enum class PriorImageStep : std::uint8_t { restore_image, fallback_no_image, unreadable_image, unknown_presence };
+
+[[nodiscard]] constexpr PriorImageStep prior_image_step(KvPresence presence, bool parsed) noexcept {
+    switch (presence) {
+    case KvPresence::present:
+        return parsed ? PriorImageStep::restore_image : PriorImageStep::unreadable_image;
+    case KvPresence::absent:
+        return PriorImageStep::fallback_no_image;
+    default:
+        return PriorImageStep::unknown_presence;
+    }
+}
+
 struct StateLoad {
     enum class Kind : std::uint8_t { absent, ok, unreadable } kind = Kind::absent;
     QuarantineState state;
