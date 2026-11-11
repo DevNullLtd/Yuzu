@@ -87,7 +87,9 @@
 ///     `"denied"`; it is not reachable from a single-threaded test without
 ///     simulating the race. A genuine DB error (either read or write leg)
 ///     audits `"error"`. A plain validation 400 is NOT audited. Success
-///     audits `"success"`.
+///     audits `"success"`, its detail naming any change to plugin, action,
+///     approval_mode or enabled as `field: old -> new` (#2146 batch C; empty
+///     when none of the four changed).
 ///   - `DELETE /:id`: a DB error audits `"error"`; a not-found audits
 ///     `"denied"`; success audits `"success"`.
 ///   - `POST /api/instructions/import`: a DB error audits `"error"`; EVERY
@@ -152,6 +154,8 @@
 ///   POST   /api/instructions/yaml                 (perm_fn InstructionDefinition:Write, then auth_fn)
 ///   POST   /api/instructions/validate-yaml        (perm_fn InstructionDefinition:Read)
 
+#include "instruction_referrers.hpp" // DefinitionReferrersFn / DefinitionPackAdvisoryFn
+
 #include <yuzu/server/auth.hpp>
 
 #include <httplib.h>
@@ -200,6 +204,15 @@ struct Deps {
     /// they degrade to a 200 HTML error instead, matching the original
     /// inline code's fragment-response convention).
     InstructionStore* store{nullptr};
+    /// The shared "what still points at this definition?" lookup (instruction_referrers.hpp), the
+    /// SAME closure the v1 DELETE and MCP `delete_definition` take. `DELETE /api/instructions/{id}`
+    /// refuses with a 409 listing the referrers when any exist, and with a 503 (fail closed, nothing
+    /// deleted) when it is unwired or cannot answer. An id that does not exist skips the check and
+    /// keeps the 404.
+    DefinitionReferrersFn referrers_fn;
+    /// Advisory only: the packs that contain the definition, noted as `packs=` in the delete's
+    /// success audit detail. Unwired or failing = no note, the delete unaffected.
+    DefinitionPackAdvisoryFn pack_advisory_fn;
     /// `--csrf-trusted-origin` allowlist (#2537), for the same-site gate on cookie-authorised
     /// writes. Empty = same-host only (fails closed behind a Host-rewriting proxy).
     std::vector<std::string> csrf_trusted_origins;

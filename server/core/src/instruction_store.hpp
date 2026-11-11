@@ -277,7 +277,7 @@ public:
     /// `expected_updated_at`, when set, makes the delete conditional on the stored version token
     /// (the same token `update_definition` checks): a row that moved on is NOT deleted and the
     /// error is `kConflictPrefix`-tagged; an absent row stays `not_found` either way. Unset =
-    /// unconditional (the legacy DELETE and pack uninstall pass none and keep their id-only semantics).
+    /// unconditional (the legacy DELETE and pack uninstall keep their id-only semantics).
     std::expected<void, std::string>
     delete_definition(const std::string& id,
                       std::optional<std::int64_t> expected_updated_at = std::nullopt);

@@ -31,12 +31,17 @@
 /// over source text would be.
 
 #include "instruction_param_schema.hpp"
+#include "instruction_referrers.hpp"
 #include "instruction_routes.hpp"
 #include "instruction_schema_test_util.hpp"
+#include "test_instruction_store_faults.hpp" // SqlFault (N1-6b)
 #include "test_route_sink.hpp"
 
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "policy_store.hpp"
+#include "schedule_engine.hpp"
+#include "workflow_engine.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -121,11 +126,28 @@ struct Harness {
 
     std::vector<EmitRow> emits;
 
+    /// The legacy DELETE's referrer guard. Wired by default to "nothing references it" so every
+    /// other case is unaffected; `referrers` overrides, `referrers_wired = false` leaves it unset
+    /// (a fail-closed 503 for an existing id). `pack_advisory` is the optional `packs=` note.
+    bool referrers_wired{true};
+    yuzu::server::DefinitionReferrersFn referrers;
+    yuzu::server::DefinitionPackAdvisoryFn pack_advisory;
+
     yuzu::server::test::TestRouteSink sink;
 
     void wire() {
         instruction::Deps deps;
         deps.store = store;
+        if (referrers_wired)
+            deps.referrers_fn =
+                referrers ? referrers
+                          : yuzu::server::DefinitionReferrersFn(
+                                [](const std::string&)
+                                    -> std::expected<std::vector<yuzu::server::DefinitionReferrer>,
+                                                     std::string> {
+                                    return std::vector<yuzu::server::DefinitionReferrer>{};
+                                });
+        deps.pack_advisory_fn = pack_advisory;
         deps.auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
             if (!auth_allow) {
@@ -534,6 +556,144 @@ TEST_CASE("instruction_routes: POST/GET/PUT/DELETE definition round-trip over HT
     CHECK(h.audits[3].result == "denied"); // not_found -> "denied", not "error"
 }
 
+TEST_CASE("instruction_routes: PUT success audit detail records a plugin/action/approval_mode/"
+          "enabled change old -> new (#2146 batch C); and stays empty when none changed",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    auto create = h.sink.Post("/api/instructions",
+                              json{{"name", "Audited"},
+                                   {"plugin", "os_info"},
+                                   {"action", "os_name"},
+                                   {"type", "question"},
+                                   {"approval_mode", "always"}}
+                                  .dump());
+    REQUIRE(create);
+    REQUIRE(create->status == 200);
+    const auto id = body(create->body)["id"].get<std::string>();
+    h.audits.clear();
+
+    auto put = h.sink.Put("/api/instructions/" + id,
+                          json{{"approval_mode", "auto"}, {"plugin", "remediation"}, {"enabled", false}}
+                              .dump());
+    REQUIRE(put);
+    CHECK(put->status == 200);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail ==
+          "plugin: os_info -> remediation; approval_mode: always -> auto; enabled: true -> false");
+
+    h.audits.clear();
+    auto noop = h.sink.Put("/api/instructions/" + id, json{{"description", "only text"}}.dump());
+    REQUIRE(noop);
+    CHECK(noop->status == 200);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].detail.empty());
+}
+
+// UP-5 on the legacy route (Gate 8 F2). Turns red if the legacy PUT handler stops calling
+// clear_stale_yaml_source (the YAML stays stale and a later dashboard YAML round trip reverts the
+// edit), or if the predicate grows `enabled` back (the first section).
+TEST_CASE("instruction_routes: legacy PUT clears a stored yaml_source on an edit to a column the YAML "
+          "merge takes; audits the cleared text's digest; and leaves it for an enabled edit",
+          "[pg][server][routes][instruction_routes][yaml-merge]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: test.route.put.stale\n  displayName: Put Stale\nspec:\n  plugin: "
+        "os_info\n  action: os_name\n  type: question\n";
+    // The stored text STATES approval: auto, so a stale copy of it would revert a PUT to `always`.
+    auto create = h.sink.Post("/api/instructions/yaml",
+                              "yaml_source=" + url_encode_form(yaml + "  approval: auto\n"),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    const std::string id = "test.route.put.stale";
+    const auto stored = [&] { return *w.store.get_definition(id); };
+    REQUIRE(stored().has_value());
+    const std::string yaml_stored = (*stored()).yaml_source;
+    REQUIRE_FALSE(yaml_stored.empty());
+
+    SECTION("a pure enabled toggle leaves the YAML intact") {
+        h.audits.clear();
+        auto en = h.sink.Put("/api/instructions/" + id, json{{"enabled", false}}.dump());
+        REQUIRE(en);
+        CHECK(en->status == 200);
+        CHECK((*stored()).yaml_source == yaml_stored);
+        CHECK_FALSE((*stored()).enabled);
+        for (const auto& a : h.audits)
+            CHECK(a.detail.find("yaml_source cleared") == std::string::npos);
+    }
+    SECTION("a name, description, version or type edit clears it too and the row names which") {
+        // M1-5: the YAML merge takes `name` always and the others whenever the YAML states them,
+        // so an edit to one left a stale YAML that a dashboard round trip reverted. Turns red if
+        // clear_stale_yaml_source drops any of the four.
+        struct Edit {
+            const char* field;
+            json value;
+            const char* named;
+        };
+        const std::vector<Edit> edits = {{"name", "Renamed", "name: Put_Stale -> Renamed"},
+                                         {"description", "new words",
+                                          "description: changed 0 -> 9 bytes"},
+                                         {"version", "9.9", "version: 1.0.0 -> 9.9"},
+                                         {"type", "action", "type: question -> action"}};
+        for (const auto& e : edits) {
+            INFO(e.field);
+            // Restore a YAML-authored row each round (the dashboard YAML save is the authority).
+            auto back = h.sink.Post("/api/instructions/yaml",
+                                    "id=" + id + "&yaml_source=" + url_encode_form(yaml_stored),
+                                    "application/x-www-form-urlencoded");
+            REQUIRE(back);
+            REQUIRE((*stored()).yaml_source == yaml_stored);
+            h.audits.clear();
+            auto put = h.sink.Put("/api/instructions/" + id, json{{e.field, e.value}}.dump());
+            REQUIRE(put);
+            CHECK(put->status == 200);
+            CHECK((*stored()).yaml_source.empty());
+            REQUIRE(h.audits.size() == 1);
+            CHECK(h.audits[0].detail.find(e.named) != std::string::npos);
+            CHECK(h.audits[0].detail.find("yaml_source cleared") != std::string::npos);
+        }
+    }
+    SECTION("an approval_mode edit clears it and a later YAML save cannot revert the edit") {
+        h.audits.clear();
+        auto put = h.sink.Put("/api/instructions/" + id, json{{"approval_mode", "always"}}.dump());
+        REQUIRE(put);
+        CHECK(put->status == 200);
+        CHECK((*stored()).yaml_source.empty());
+        CHECK((*stored()).approval_mode == "always");
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].detail.find("approval_mode: auto -> always; yaml_source cleared") !=
+              std::string::npos);
+        CHECK(h.audits[0].detail.find("yaml_source_bytes=" + std::to_string(yaml_stored.size())) !=
+              std::string::npos);
+        CHECK(h.audits[0].detail.find("yaml_source_sha256=") != std::string::npos);
+
+        // The dashboard YAML save of what the editor pre-fills NOW (the stored text). A missing
+        // clear leaves the stale text, which states `approval: auto`, and saving it reverts the
+        // PUT (an explicit approval in a YAML IS an edit); a cleared text pre-fills nothing, so
+        // the operator's own YAML, stating no approval, keeps the stored 'always'.
+        const std::string editor_copy =
+            (*stored()).yaml_source.empty() ? yaml : (*stored()).yaml_source;
+        auto edit = h.sink.Post("/api/instructions/yaml",
+                                "id=" + id + "&yaml_source=" + url_encode_form(editor_copy),
+                                "application/x-www-form-urlencoded");
+        REQUIRE(edit);
+        CHECK(edit->status == 200);
+        CHECK(edit->body.find("Definition updated") != std::string::npos);
+        CHECK((*stored()).approval_mode == "always");
+    }
+}
+
 TEST_CASE("instruction_routes: GET /api/instructions lists real rows and honors the "
           "name/plugin/type/limit query filters, unaudited",
           "[pg][server][routes][instruction_routes]") {
@@ -614,6 +774,113 @@ TEST_CASE("instruction_routes: POST /api/instructions with a bad approval_mode 4
     REQUIRE(r);
     CHECK(r->status == 400);
     CHECK(h.audits.empty());
+}
+
+// M1-7 (a4). The legacy create / PUT / validate-yaml apply the v1 twins' plugin / action identifier
+// rule through the shared check_dispatch_identifier. Turns red if the create check, the PUT check
+// or the validate-yaml check is removed; the PUT section also pins that an UNCHANGED odd stored
+// value stays editable through other fields.
+TEST_CASE("instruction_routes: legacy create and PUT and validate-yaml apply the plugin/action "
+          "identifier rule; PUT only to a value it changes",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const auto error_of = [](const httplib::Response& r) {
+        return body(r.body)["error"].get<std::string>();
+    };
+
+    SECTION("create refuses a bad plugin or action, 400, no row, no audit") {
+        for (const auto& [field, value] : std::vector<std::pair<std::string, std::string>>{
+                 {"plugin", "bad plugin"}, {"plugin", "a/b"}, {"action", "bad action"},
+                 {"plugin", std::string(129, 'p')}, {"action", std::string(129, 'a')}}) {
+            INFO(field << " size " << value.size());
+            json b{{"name", "x"}, {"type", "question"}, {"plugin", "os_info"}, {"action", "os_name"}};
+            b[field] = value;
+            auto r = h.sink.Post("/api/instructions", b.dump());
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(error_of(*r).rfind(field, 0) == 0);
+        }
+        CHECK(h.audits.empty());
+        auto all = w.store.query_definitions();
+        REQUIRE(all.has_value());
+        CHECK(all->empty());
+        // The boundary and the legacy leniencies stay: 128 characters, a dot, an empty action.
+        auto ok = h.sink.Post("/api/instructions",
+                              json{{"name", "x"}, {"type", "question"},
+                                   {"plugin", std::string(128, 'p')}, {"action", ""}}
+                                  .dump());
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
+    SECTION("PUT refuses a CHANGED bad plugin or action; an unchanged odd stored value is editable") {
+        auto made = h.sink.Post("/api/instructions",
+                                json{{"name", "x"}, {"type", "question"}, {"plugin", "os_info"},
+                                     {"action", "os_name"}}
+                                    .dump());
+        REQUIRE(made);
+        REQUIRE(made->status == 200);
+        const std::string id = body(made->body)["id"].get<std::string>();
+        for (const auto& [field, value] : std::vector<std::pair<std::string, std::string>>{
+                 {"plugin", "bad plugin"}, {"action", "a/b"}}) {
+            INFO(field);
+            auto r = h.sink.Put("/api/instructions/" + id, json{{field, value}}.dump());
+            REQUIRE(r);
+            CHECK(r->status == 400);
+            CHECK(error_of(*r).rfind(field, 0) == 0);
+        }
+        auto row = w.store.get_definition(id);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        CHECK((*row)->plugin == "os_info");
+        CHECK((*row)->action == "os_name");
+
+        // A row stored before the rule (written through the store, which does not apply it) with
+        // an odd plugin: re-sending that SAME value, or editing another field, still works.
+        InstructionDefinition odd;
+        odd.id = "legacy.odd";
+        odd.name = "odd";
+        odd.type = "question";
+        odd.plugin = "odd plugin";
+        odd.action = "odd action";
+        REQUIRE(w.store.create_definition(odd).has_value());
+        auto other = h.sink.Put("/api/instructions/legacy.odd", json{{"description", "d"}}.dump());
+        REQUIRE(other);
+        CHECK(other->status == 200);
+        auto same = h.sink.Put("/api/instructions/legacy.odd",
+                               json{{"plugin", "odd plugin"}, {"action", "odd action"}}.dump());
+        REQUIRE(same);
+        CHECK(same->status == 200);
+        auto changed = h.sink.Put("/api/instructions/legacy.odd", json{{"plugin", "still odd"}}.dump());
+        REQUIRE(changed);
+        CHECK(changed->status == 400);
+    }
+    SECTION("validate-yaml reports a bad plugin or action") {
+        const auto yaml = [](const std::string& plugin, const std::string& action) {
+            return "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+                   "id: test.route.ident\n  displayName: Ident\nspec:\n  plugin: \"" + plugin +
+                   "\"\n  action: \"" + action + "\"\n  type: question\n";
+        };
+        const auto validate = [&](const std::string& y) {
+            auto r = h.sink.Post("/api/instructions/validate-yaml",
+                                 "yaml_source=" + url_encode_form(y),
+                                 "application/x-www-form-urlencoded");
+            REQUIRE(r);
+            CHECK(r->status == 200);
+            return r->body;
+        };
+        CHECK(validate(yaml("os_info", "os_name")).find("validation passed") != std::string::npos);
+        const auto bad_plugin = validate(yaml("bad plugin", "os_name"));
+        CHECK(bad_plugin.find("Validation errors") != std::string::npos);
+        CHECK(bad_plugin.find("plugin may only contain") != std::string::npos);
+        const auto bad_action = validate(yaml("os_info", "a/b"));
+        CHECK(bad_action.find("action may only contain") != std::string::npos);
+        CHECK(h.audits.empty());
+    }
 }
 
 TEST_CASE("instruction_routes: POST /api/instructions/yaml validation failure renders "
@@ -735,6 +1002,73 @@ TEST_CASE("instruction_routes: POST import success/duplicate both audit, unlike 
     CHECK(h.audits[1].result == "denied"); // EVERY rejection is audited on /import
     CHECK(h.audits[1].detail == "duplicate_id");
     CHECK(body(second->body)["audit_emitted"] == true);
+}
+
+TEST_CASE("instruction_routes: POST import stores the AUTHENTICATED caller as created_by; never the "
+          "document's claim",
+          "[pg][server][routes][instruction_routes]") {
+    // Turns red if `stamp_import_creator` is removed from the import handler (the store would then
+    // bind the document's own created_by).
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const auto doc = [](const std::string& id) {
+        return json{{"id", id}, {"name", "Creator Stamp"}, {"version", "1.0"},
+                    {"type", "question"}, {"plugin", "os_info"}, {"action", "os_name"}};
+    };
+    const auto created_by = [&](const std::string& id) {
+        const auto got = w.store.get_definition(id);
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        return (*got)->created_by;
+    };
+
+    json claims = doc("test.route.import.creator.claim");
+    claims["created_by"] = "someone-else";
+    auto r1 = h.sink.Post("/api/instructions/import", claims.dump());
+    REQUIRE(r1);
+    CHECK(r1->status == 200);
+    CHECK(created_by("test.route.import.creator.claim") == "alice");
+
+    auto r2 = h.sink.Post("/api/instructions/import", doc("test.route.import.creator.none").dump());
+    REQUIRE(r2);
+    CHECK(r2->status == 200);
+    CHECK(created_by("test.route.import.creator.none") == "alice");
+
+    // A non-string claim no longer reaches the store's type gate: the field is ignored.
+    json odd = doc("test.route.import.creator.odd");
+    odd["created_by"] = 5;
+    auto r3 = h.sink.Post("/api/instructions/import", odd.dump());
+    REQUIRE(r3);
+    CHECK(r3->status == 200);
+    CHECK(created_by("test.route.import.creator.odd") == "alice");
+
+    // No resolvable session: the claim is still not trusted (stored empty, as the POST create
+    // route does).
+    h.resolve_session_username.clear();
+    json anon = doc("test.route.import.creator.anon");
+    anon["created_by"] = "someone-else";
+    auto r4 = h.sink.Post("/api/instructions/import", anon.dump());
+    REQUIRE(r4);
+    CHECK(r4->status == 200);
+    CHECK(created_by("test.route.import.creator.anon").empty());
+    h.resolve_session_username = "alice";
+
+    // A malformed body is refused exactly as before: 400, one denied row, nothing stored.
+    h.audits.clear();
+    for (const char* bad : {"not json", "[1,2]"}) {
+        INFO(bad);
+        auto r = h.sink.Post("/api/instructions/import", bad);
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "instruction.import");
+        CHECK(h.audits[0].result == "denied");
+        h.audits.clear();
+    }
 }
 
 TEST_CASE("instruction_routes: POST import refuses an invalid or over-cap parameter_schema with a "
@@ -1325,4 +1659,311 @@ TEST_CASE("instruction_routes: a cookie-session write that is cross-site or carr
     auto token_write = h.sink.Post("/api/instruction-sets", json{{"name", "Via Token"}}.dump());
     REQUIRE(token_write);
     CHECK(token_write->status == 200);
+}
+
+TEST_CASE("instruction_routes: a YAML editor save audits a plugin / action / approval_mode / "
+          "concurrency_mode change old -> new; not approval_mode alone (#2146 batch C gov)",
+          "[pg][server][routes][instruction_routes][yaml-merge]") {
+    // Turns red if the dashboard YAML save goes back to recording only approval_mode: a repoint
+    // or a concurrency change would leave an empty detail.
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    InstructionDefinition d;
+    d.id = "test.route.yaml.audit";
+    d.name = "Audit Me";
+    d.type = "question";
+    d.plugin = "os_info";
+    d.action = "os_name";
+    d.approval_mode = "always";
+    d.concurrency_mode = "per-device";
+    d.yaml_source = "---\nmetadata:\n  id: test.route.yaml.audit\n  displayName: Audit Me\nspec:\n"
+                    "  plugin: os_info\n  action: os_name\n";
+    REQUIRE(w.store.create_definition(d).has_value());
+    h.audits.clear();
+
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: test.route.yaml.audit\n  displayName: Audit Me\nspec:\n  plugin: remediation\n"
+        "  action: other_action\n  concurrency: per-fleet\n";
+    auto edit = h.sink.Post("/api/instructions/yaml",
+                            "id=test.route.yaml.audit&yaml_source=" + url_encode_form(yaml),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(edit);
+    CHECK(edit->body.find("Definition updated") != std::string::npos);
+    REQUIRE(h.audits.size() == 1); // the legacy route writes its single success row, as before
+    CHECK(h.audits[0].action == "instruction.update");
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail ==
+          "plugin: os_info -> remediation; action: os_name -> other_action; "
+          "concurrency_mode: per-device -> per-fleet");
+}
+
+TEST_CASE("instruction_routes: DELETE success audit detail carries the deleted definition's "
+          "dispatch tuple; an absent id keeps its not_found row and 404",
+          "[pg][server][routes][instruction_routes]") {
+    // Turns red if the pre-read in the legacy DELETE handler is removed: the success row's
+    // detail goes back to empty and nothing records what the deleted definition ran.
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    auto create = h.sink.Post("/api/instructions",
+                              json{{"name", "Doomed"},
+                                   {"plugin", "os_info"},
+                                   {"action", "os_name"},
+                                   {"type", "question"},
+                                   {"approval_mode", "always"}}
+                                  .dump());
+    REQUIRE(create);
+    REQUIRE(create->status == 200);
+    const auto id = body(create->body)["id"].get<std::string>();
+    h.audits.clear();
+
+    auto del = h.sink.Delete("/api/instructions/" + id);
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail == "name=Doomed plugin=os_info action=os_name approval_mode=always "
+                                "concurrency_mode=per-device enabled=true");
+
+    h.audits.clear();
+    auto again = h.sink.Delete("/api/instructions/" + id);
+    REQUIRE(again);
+    CHECK(again->status == 404);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "denied");
+    CHECK(h.audits[0].detail == "not_found");
+}
+
+// M2-1. The released legacy DELETE gets the same referrer guard as the v1 twin. Real stores: a
+// schedule that names the definition makes the delete a 409 that lists it, writes one `denied` row
+// with detail `referenced`, emits nothing and leaves the definition in place. Turns red if the
+// `referrers_fn` block in the legacy DELETE handler (instruction_routes.cpp) is removed.
+TEST_CASE("instruction_routes: DELETE a definition that a schedule names is refused 409 with the "
+          "referrer listed and nothing deleted; removing the schedule lets it through",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    yuzu::server::ScheduleEngine schedules{w.pool};
+    yuzu::server::WorkflowEngine workflows{w.pool};
+    yuzu::server::PolicyStore policies{w.pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(workflows.is_open());
+    REQUIRE(policies.is_open());
+    Harness h;
+    h.store = &w.store;
+    h.referrers = yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies);
+    h.wire();
+
+    auto create = h.sink.Post("/api/instructions",
+                              json{{"name", "Pinned"},
+                                   {"plugin", "os_info"},
+                                   {"action", "os_name"},
+                                   {"type", "question"}}
+                                  .dump());
+    REQUIRE(create);
+    REQUIRE(create->status == 200);
+    const auto id = body(create->body)["id"].get<std::string>();
+
+    yuzu::server::InstructionSchedule sched;
+    sched.name = "nightly";
+    sched.definition_id = id;
+    sched.frequency_type = "interval";
+    sched.interval_minutes = 60;
+    sched.scope_expression = "ostype = 'linux'";
+    sched.created_by = "alice";
+    auto sid = schedules.create_schedule(sched);
+    REQUIRE(sid.has_value());
+    h.audits.clear();
+    h.emits.clear();
+
+    auto del = h.sink.Delete("/api/instructions/" + id);
+    REQUIRE(del);
+    CHECK(del->status == 409);
+    const auto msg = body(del->body)["error"]["message"].get<std::string>();
+    CHECK(msg.find("schedule " + *sid) != std::string::npos);
+    CHECK(msg.find("NOT deleted") != std::string::npos);
+    auto still = w.store.get_definition(id);
+    REQUIRE(still.has_value());
+    CHECK(still->has_value());
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "instruction.delete");
+    CHECK(h.audits[0].result == "denied");
+    CHECK(h.audits[0].detail == "referenced");
+    CHECK(h.emits.empty());
+
+    REQUIRE(schedules.delete_schedule(*sid, "alice"));
+    h.audits.clear();
+    auto ok = h.sink.Delete("/api/instructions/" + id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+}
+
+// M2-1 fail closed. A failing or unwired lookup is never "no referrers": 503, nothing deleted, an
+// `error` row. An id that does not exist keeps its 404 whatever the wiring. Turns red if the handler
+// treats an error or an unset function as an empty list.
+TEST_CASE("instruction_routes: DELETE with a failing or unwired referrer lookup is a 503 and "
+          "deletes nothing; a missing id is still 404",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness maker;
+    maker.store = &w.store;
+    maker.wire();
+    auto create = maker.sink.Post("/api/instructions",
+                                  json{{"name", "Keep"},
+                                       {"plugin", "os_info"},
+                                       {"action", "os_name"},
+                                       {"type", "question"}}
+                                      .dump());
+    REQUIRE(create);
+    const auto id = body(create->body)["id"].get<std::string>();
+
+    Harness h;
+    h.store = &w.store;
+    SECTION("failing") {
+        h.referrers = [](const std::string&)
+            -> std::expected<std::vector<yuzu::server::DefinitionReferrer>, std::string> {
+            return std::unexpected(std::string("schedule read failed"));
+        };
+    }
+    SECTION("unwired") {
+        h.referrers_wired = false;
+    }
+    h.wire();
+    auto del = h.sink.Delete("/api/instructions/" + id);
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(del->body.find("nothing was deleted") != std::string::npos);
+    auto still = w.store.get_definition(id);
+    REQUIRE(still.has_value());
+    CHECK(still->has_value());
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "instruction.delete");
+    CHECK(h.audits[0].result == "error");
+    CHECK(h.emits.empty());
+
+    h.audits.clear();
+    auto missing = h.sink.Delete("/api/instructions/no.such.definition");
+    REQUIRE(missing);
+    CHECK(missing->status == 404);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].detail == "not_found");
+}
+
+// N1-6b. The legacy DELETE's pre-image read failing is a 503 with ONE `error` row (detail
+// `db_error`), nothing deleted and no event; with the sink down the answer carries
+// Sec-Audit-Failed. Turns red if the `if (!stored) return refuse(503, "error", "db_error", ...)`
+// branch is removed (the delete would then run against an unreadable store and answer from the
+// delete's own failure, with a different row and message).
+TEST_CASE("instruction_routes: DELETE with an unreadable definition store is a 503 db_error row and "
+          "deletes nothing",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    auto create = h.sink.Post("/api/instructions",
+                              json{{"name", "Unreadable"},
+                                   {"plugin", "os_info"},
+                                   {"action", "os_name"},
+                                   {"type", "question"}}
+                                  .dump());
+    REQUIRE(create);
+    const auto id = body(create->body)["id"].get<std::string>();
+    h.audits.clear();
+    h.emits.clear();
+
+    yuzu::test::SqlFault broken(
+        w.pool,
+        "ALTER TABLE instruction_store.instruction_definitions RENAME TO "
+        "instruction_definitions_gone",
+        "ALTER TABLE instruction_store.instruction_definitions_gone RENAME TO "
+        "instruction_definitions");
+    broken.arm();
+    auto del = h.sink.Delete("/api/instructions/" + id);
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(del->body.find("nothing was deleted") != std::string::npos);
+    CHECK(del->get_header_value("Sec-Audit-Failed").empty());
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "instruction.delete");
+    CHECK(h.audits[0].result == "error");
+    CHECK(h.audits[0].detail == "db_error");
+    CHECK(h.emits.empty());
+    // The sink down: the same 503 now carries the lost-row signal the v1 twin asserts.
+    h.audit_succeeds = false;
+    auto lost = h.sink.Delete("/api/instructions/" + id);
+    broken.repair();
+    REQUIRE(lost);
+    CHECK(lost->status == 503);
+    CHECK(lost->get_header_value("Sec-Audit-Failed") == "true");
+    auto still = w.store.get_definition(id);
+    REQUIRE(still.has_value());
+    CHECK(still->has_value());
+}
+
+// M2-3. The packs that contain the deleted definition are noted on the success row, bounded at
+// five ids plus `+N`; a failing pack read changes nothing. Turns red if the legacy handler stops
+// appending the note, or lets a failing lookup block or alter the delete.
+TEST_CASE("instruction_routes: DELETE notes the containing packs on the success row (bounded); a "
+          "failing pack lookup neither blocks nor changes the delete",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    std::string seen_id;
+    bool expect_note = false;
+    bool existed_at_lookup = false; // N1-5: the pack read happens BEFORE the delete
+    SECTION("seven packs") {
+        expect_note = true;
+        h.pack_advisory = [&](const std::string& id)
+            -> std::expected<std::vector<std::string>, std::string> {
+            seen_id = id;
+            const auto row = w.store.get_definition(id);
+            existed_at_lookup = row.has_value() && row->has_value();
+            return std::vector<std::string>{"p1", "p2", "p3", "p4", "p5", "p6", "p7"};
+        };
+    }
+    SECTION("failing") {
+        h.pack_advisory = [](const std::string&)
+            -> std::expected<std::vector<std::string>, std::string> {
+            return std::unexpected(std::string("pack read failed"));
+        };
+    }
+    h.wire();
+    auto create = h.sink.Post("/api/instructions",
+                              json{{"name", "Packed"},
+                                   {"plugin", "os_info"},
+                                   {"action", "os_name"},
+                                   {"type", "question"}}
+                                  .dump());
+    REQUIRE(create);
+    const auto id = body(create->body)["id"].get<std::string>();
+    h.audits.clear();
+    auto del = h.sink.Delete("/api/instructions/" + id);
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    if (!expect_note) {
+        CHECK(h.audits[0].detail.find("packs=") == std::string::npos);
+    } else {
+        CHECK(seen_id == id);
+        CHECK(existed_at_lookup);
+        CHECK(h.audits[0].detail.starts_with("name=Packed plugin=os_info "));
+        CHECK(h.audits[0].detail.ends_with(" enabled=true packs=p1,p2,p3,p4,p5,+2"));
+        CHECK(h.audits[0].detail.find("p6") == std::string::npos);
+    }
 }

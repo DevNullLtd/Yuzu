@@ -275,7 +275,7 @@ bool clear_stale_yaml_source(const InstructionDefinition& before, InstructionDef
 std::string describe_dispatch_binding_change(const InstructionDefinition& before,
                                              const InstructionDefinition& after) {
     std::string out;
-    // Free-text values (the legacy PUT, which does not bound them, can store plugin / action / concurrency_mode of any length) are
+    // Free-text values (the legacy PUT stores plugin / action / concurrency_mode unbounded) are
     // bounded for the detail, but COMPARED whole: two values equal in their first 128 bytes are
     // still a change.
     const auto shown = [](const std::string& v) {

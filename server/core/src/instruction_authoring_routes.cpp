@@ -511,7 +511,7 @@ void register_instruction_authoring_routes(HttpRouteSink& sink, RouteDeps deps) 
         auto stored = deps.store->get_definition(id);
         if (!stored) {
             // The read failed before anything was decided: one `error` row (the same vocabulary
-            // the other v1 refusals write), no attempted/outcome pair, nothing mutated.
+            // the legacy DELETE writes), no attempted/outcome pair, nothing mutated.
             audit.outcome("error", target, "db_error");
             return fail(res, 503, "instruction store unavailable", /*retry=*/true);
         }

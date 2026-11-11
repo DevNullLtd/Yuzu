@@ -1,11 +1,14 @@
 #include "instruction_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "instruction_definition_model.hpp"
 #include "instruction_extras_render.hpp"
+#include "instruction_referrers.hpp"
 #include "instruction_store.hpp"
 #include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "instruction_yaml.hpp"
 #include "json_extract.hpp"
+#include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth: the shared #2437 guard
 #include "rest_a4_envelope_http.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp"
@@ -18,6 +21,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 // Editor fragment HTML templates — defined in instruction_ui.cpp (a
 // separate, build-time-embedded TU) and forward-declared here at global
@@ -46,6 +50,38 @@ bool refuse_cross_site_write(const Deps& deps, const httplib::Request& req, http
                         "cross-site or header-less browser write refused");
     res.status = 403;
     res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+    return true;
+}
+
+/// The legacy import body with `created_by` set to the authenticated caller. The document's own
+/// `created_by` is unsigned (the signature covers `yaml_source` only), so a caller could name any
+/// creator in the audit-relevant column; the v1 and MCP twins overwrite it the same way. A body
+/// that is not a depth-safe JSON object is returned unchanged: the store then refuses it exactly
+/// as before (same status, same audit row). `username` is empty when no session resolves, as for
+/// the POST create route.
+std::string stamp_import_creator(const std::string& body, const std::string& username) {
+    if (mcp::json_exceeds_depth(body, mcp::kMcpMaxJsonDepth))
+        return body;
+    auto doc = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (doc.is_discarded() || !doc.is_object())
+        return body;
+    doc["created_by"] = username;
+    return doc.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+/// The v1 routes' plugin / action identifier rule (`check_dispatch_identifier`, the one shared
+/// helper) on a legacy JSON route: a non-empty `value` that fails it is answered `400
+/// {"error": "<field> ..."}` and true is returned. An empty value passes here: the store owns
+/// "plugin is required", and an empty action is legal.
+bool refuse_bad_dispatch_identifier(httplib::Response& res, std::string_view field,
+                                    const std::string& value) {
+    if (value.empty())
+        return false;
+    const auto err = check_dispatch_identifier(field, value);
+    if (!err)
+        return false;
+    res.status = 400;
+    res.set_content(nlohmann::json({{"error", *err}}).dump(), "application/json");
     return true;
 }
 } // namespace
@@ -163,6 +199,11 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+
+            // The v1 twins' plugin / action identifier rule (<= 128 of A-Za-z0-9._-).
+            if (refuse_bad_dispatch_identifier(res, "plugin", def.plugin) ||
+                refuse_bad_dispatch_identifier(res, "action", def.action))
+                return;
 
             if (auto session = deps.resolve_session_fn(req))
                 def.created_by = session->username;
@@ -350,12 +391,23 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 }
             }
 
+            // The identifier rule applies only to a plugin / action this request CHANGES, so a
+            // stored row with an odd value stays editable through its other fields.
+            if ((def.plugin != (*existing_result)->plugin &&
+                 refuse_bad_dispatch_identifier(res, "plugin", def.plugin)) ||
+                (def.action != (*existing_result)->action &&
+                 refuse_bad_dispatch_identifier(res, "action", def.action)))
+                return;
+
             // This route edits other fields on a copy it loaded moments ago. An empty
             // parameter_schema means "keep the stored column" (update_definition), so blank
             // the copy rather than write it back: that would revert a schema replaced
             // between the load and this write, and would re-run the write-time schema check
             // on a legacy row.
             def.parameter_schema.clear();
+            // UP-5: a changed column the YAML merge takes (clear_stale_yaml_source) makes a stored
+            // YAML stale; clear it (the success row below describes the clear).
+            (void)clear_stale_yaml_source(**existing_result, def);
             // Optimistic concurrency: only apply if the row is still the one loaded above, so
             // a concurrent edit is a 409 rather than silently overwritten by this stale copy.
             auto result = deps.store->update_definition(def, def.updated_at);
@@ -365,7 +417,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 // error. Previously not_found fell through to the 400 branch, indistinguishable
                 // from a validation failure (consistency-auditor Gate 8 finding).
                 bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
-                bool not_found = !db_error && result.error().rfind("not_found: ", 0) == 0;
+                bool not_found = !db_error && result.error().rfind(kNotFoundPrefix, 0) == 0;
                 // Audited on db_error (existing convention) and not_found (matches the
                 // DELETE route's audited not_found branch just below); a plain validation
                 // 400 stays unaudited, matching create_definition's equivalent branch.
@@ -393,8 +445,11 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                 "application/json");
                 return;
             }
+            // The detail records a change to plugin/action/approval_mode/concurrency_mode/enabled
+            // (old -> new), so an approval downgrade or a repoint is visible here as it is on the
+            // YAML save and the v1 twin; empty when none of the five changed.
             (void)deps.audit_fn(req, "instruction.update", "success", "InstructionDefinition", id,
-                                "");
+                                describe_dispatch_binding_change(**existing_result, def));
             deps.emit_event_fn("instruction.updated", req, {}, {{"instruction_id", id}});
             res.set_header(
                 "HX-Trigger",
@@ -422,6 +477,48 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
+        // The pre-image, for the success row's detail (once the row is gone nothing else records
+        // what it ran), and whether the id exists at all (the referrer check below runs only for
+        // one that does). An ABSENT definition leaves the detail empty and keeps the 404; an
+        // UNREADABLE one cannot be checked for referrers, so it is a 503 (see below).
+        std::string preimage;
+        bool exists = false;
+        auto stored = deps.store->get_definition(id);
+        if (stored && *stored) {
+            preimage = describe_deleted_definition(**stored);
+            exists = true;
+        }
+        // UP-6 (the v1 DELETE's guard, applied to this released route): a definition other things
+        // name by id is not deleted out from under them. Only an id that exists is checked (a
+        // missing one keeps the 404 below). An unwired or failing lookup is a 503 and nothing is
+        // deleted, never read as "no referrers". The check is advisory-not-transactional: a
+        // schedule created between it and the delete is not seen.
+        if (exists || !stored) {
+            const auto refuse = [&](int status, const char* audit_result, const char* audit_detail,
+                                    std::string_view message) {
+                if (!deps.audit_fn(req, "instruction.delete", audit_result, "InstructionDefinition",
+                                   id, audit_detail))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = status;
+                res.set_content(detail::a4_error(res, message), "application/json");
+            };
+            if (!stored)
+                return refuse(503, "error", "db_error",
+                              "instruction store unavailable; nothing was deleted");
+            if (!deps.referrers_fn)
+                return refuse(503, "error", "referrer_check_unwired",
+                              "definition reference check not configured; nothing was deleted");
+            auto referrers = deps.referrers_fn(id);
+            if (!referrers)
+                return refuse(503, "error", "referrer_check_unavailable",
+                              "definition reference check unavailable; nothing was deleted");
+            if (!referrers->empty())
+                return refuse(409, "denied", "referenced",
+                              describe_definition_referrers(*referrers));
+        }
+        // The packs that contain the definition are noted on the success row, never a reason to
+        // block; read BEFORE the delete so no lookup sits between the delete and its row.
+        const std::string packs = exists ? pack_advisory_note(deps.pack_advisory_fn, id) : "";
         // ADR-0058: delete_definition now returns std::expected<void, std::string> —
         // a genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
         // ProductPackStore::uninstall's identical REST contract change,
@@ -451,7 +548,10 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
-        (void)deps.audit_fn(req, "instruction.delete", "success", "InstructionDefinition", id, "");
+        if (!packs.empty())
+            preimage += (preimage.empty() ? "" : " ") + packs;
+        (void)deps.audit_fn(req, "instruction.delete", "success", "InstructionDefinition", id,
+                            preimage);
         deps.emit_event_fn("instruction.deleted", req, {}, {{"instruction_id", id}});
         res.set_header(
             "HX-Trigger",
@@ -501,7 +601,11 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto result = deps.store->import_definition_json(req.body);
+        std::string creator;
+        if (deps.resolve_session_fn)
+            if (auto session = deps.resolve_session_fn(req))
+                creator = session->username;
+        auto result = deps.store->import_definition_json(stamp_import_creator(req.body, creator));
         if (!result) {
             // ADR-0058: a genuine DB/lease failure 503s — never falls through to the
             // conflict/validation split below. R4: audited the same as every other
@@ -890,7 +994,9 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         // Save shares one contract with /api/instructions/validate-yaml
         // (#1993): YAML that passes validation always carries what Save
         // needs, and a failing Save names the actual missing field
-        // instead of a blanket "Missing required fields" for all three.
+        // instead of a blanket "Missing required fields" for all three. (The plugin / action
+        // identifier rule is validate-yaml's only: a save re-states a stored row's plugin and
+        // action from its YAML, so refusing an odd stored value would make the row uneditable.)
         auto errors = validate_yaml_source(yaml_source);
         if (!errors.empty()) {
             std::string html =
@@ -963,7 +1069,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             // concurrency, approval). A degraded read refuses the save: writing
             // a fresh definition over an unread row is exactly the data loss
             // this merge exists to prevent.
-            std::string approval_detail;
+            std::string change_detail;
             // The editor sends the updated_at it LOADED; a save is applied only if the row is
             // still at that version (409 otherwise), so two operators cannot silently overwrite
             // each other's approval/enabled/set changes. A caller that sends none (API use) is
@@ -993,9 +1099,10 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                     expected_updated_at = stored.updated_at;
                 def = instruction_extras::merge_yaml_into_stored(stored, fields, yaml_source,
                                                                  session->username);
-                if (def.approval_mode != stored.approval_mode)
-                    approval_detail = "approval_mode: " + stored.approval_mode + " -> " +
-                                      def.approval_mode;
+                // plugin / action / approval_mode / concurrency_mode (old -> new): the YAML can
+                // repoint a definition or downgrade its approval, so the row records it as the
+                // PUT route and the v1 twins do. (enabled is carried forward, never changed here.)
+                change_detail = describe_dispatch_binding_change(stored, def);
             }
             def.id = def_id;
             auto result = deps.store->update_definition(def, expected_updated_at);
@@ -1020,7 +1127,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             (void)deps.audit_fn(req, "instruction.update", "success", "InstructionDefinition",
-                                def_id, approval_detail);
+                                def_id, change_detail);
             deps.emit_event_fn("instruction.updated", req, {}, {{"instruction_id", def_id}});
             respond("Definition updated", true);
         } else {
@@ -1073,6 +1180,12 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
 
         auto yaml_source = req.get_param_value("yaml_source");
         auto errors = validate_yaml_source(yaml_source);
+        // The plugin / action identifier rule the v1 validate-yaml applies. A source refused on
+        // its bytes (NUL, over the size cap) is never parsed.
+        if (!yaml_source_byte_refusal(yaml_source))
+            if (auto err = check_yaml_dispatch_fields(
+                    instruction_yaml::parse_definition_yaml(yaml_source)))
+                errors.push_back(std::move(*err));
 
         if (errors.empty()) {
             res.set_content("<div class=\"alert alert-success\">YAML validation passed</div>",

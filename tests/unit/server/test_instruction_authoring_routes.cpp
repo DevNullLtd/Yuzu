@@ -1688,13 +1688,17 @@ TEST_CASE("instruction authoring: wiring -- server.cpp builds the referrer looku
     std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(in.is_open());
     const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    const std::array<std::string_view, 5> kNeedles = {
+    const std::array<std::string_view, 8> kNeedles = {
         "make_definition_referrers_fn(\n            schedule_engine_.get(), "
         "workflow_engine_.get(), policy_store_.get())",
         "authoring_deps.referrers_fn = definition_referrers_fn;",
         "mcp_server_->set_definition_referrers_fn(definition_referrers_fn);",
-        // The advisory pack lookup reaches both delete paths.
+        // M2: the SAME closure also guards the released legacy DELETE and the pack uninstall.
+        ".referrers_fn = definition_referrers_fn,\n",
+        "wf_deps.referrers_fn = definition_referrers_fn;",
+        // M2-3: and the advisory pack lookup reaches all three delete paths.
         "authoring_deps.pack_advisory_fn = definition_pack_advisory_fn;",
+        ".pack_advisory_fn = definition_pack_advisory_fn,\n",
         "mcp_server_->set_definition_pack_advisory_fn(definition_pack_advisory_fn);"};
     const auto wired = [&](const std::string& text) {
         return std::all_of(kNeedles.begin(), kNeedles.end(), [&](std::string_view n) {
@@ -1703,7 +1707,7 @@ TEST_CASE("instruction authoring: wiring -- server.cpp builds the referrer looku
     };
     CHECK(wired(src));
 
-    // Mutation: dropping any one of the wiring lines from the source turns the tripwire red
+    // Mutation: dropping any one of the three wiring lines from the source turns the tripwire red
     // (each needle is load-bearing, so a pattern that stopped matching cannot pass vacuously).
     for (const std::string_view needle : kNeedles) {
         SECTION(std::string("mutation: ") + std::string(needle.substr(0, 40))) {
