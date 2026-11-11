@@ -136,7 +136,7 @@ details[open]>summary.dx-sc::after{margin-top:3px;transform:rotate(-135deg)}
 .dx-ded .r .p{font-variant-numeric:tabular-nums;color:var(--ink)}
 .dx-ded .r.na,.dx-ded .r.na .p{color:var(--mut)}
 .dx-ded .t{display:flex;flex-wrap:wrap;justify-content:space-between;gap:0 10px;margin-top:4px;padding-top:4px;border-top:1px solid var(--line);font-weight:600;color:var(--ink)}
-@media (max-width:1000px){.gp-table.dx-apps{table-layout:auto;min-width:0}.gp-table.dx-apps th,.gp-table.dx-apps td{padding-left:9px;padding-right:9px}.gp-table.dx-apps th:first-child,.gp-table.dx-apps td:first-child{padding-left:12px;padding-right:6px}.gp-table.dx-apps th:last-child,.gp-table.dx-apps td:last-child{padding-right:12px}.gp-table.dx-apps td.dx-indent{padding-left:14px}.dx-ver .dx-vn{font-size:12px;white-space:nowrap}.dx-sc{padding:0 6px}.dx-ded{padding:6px 8px}.dx-apps th{width:auto}}
+@media (max-width:1000px){.gp-table.dx-apps{table-layout:auto;min-width:0}.gp-table.dx-apps th,.gp-table.dx-apps td{padding-left:9px;padding-right:9px}.gp-table.dx-apps th:first-child,.gp-table.dx-apps td:first-child{padding-left:12px;padding-right:6px;overflow-wrap:normal}.gp-table.dx-apps th:last-child,.gp-table.dx-apps td:last-child{padding-right:12px}.gp-table.dx-apps td.dx-indent{padding-left:14px}.dx-ver .dx-vn{font-size:12px;white-space:nowrap}.dx-sc{padding:0 6px}.dx-ded{padding:6px 8px}.dx-apps th{width:auto}}
 </style>)CSS";
 
 // ── page head ──
@@ -246,17 +246,19 @@ std::string placeholder(const std::string& title_html, const std::string& body_h
     return "<div class=\"gp-placeholder\"><b>" + title_html + "</b>" + body_html + "</div>";
 }
 
-std::string error_panel(const std::string& reason) {
+std::string error_panel(const std::string& reason, const std::string& window) {
     if (reason == "invalid_scope")
         return placeholder("Unknown platform",
                            "The platform filter must be one of all, windows, macos or linux, so no "
                            "figures are shown. Choose a platform above.");
-    // A busy or unavailable store arrives with no reason token; the window is then the one lever.
     std::string body = "The read could not be completed, so no figures are shown. Try again in a moment";
-    if (reason.empty())
-        body += "; a shorter window reads faster (30d and All are the slowest). If it keeps failing, check "
-                "PostgreSQL health.";
-    else
+    if (reason.empty()) {
+        // A busy or unavailable store arrives with no reason token; a shorter window is then the one
+        // lever, except at 24h, the shortest.
+        if (window != "24h")
+            body += "; a shorter window reads faster (30d and All are the slowest)";
+        body += ". If it keeps failing, check PostgreSQL health.";
+    } else
         body += ". If it keeps failing, check PostgreSQL health <span class=\"gp-mute\">(reason: <code "
                 "class=\"dx-code\">" +
                 esc(reason) + "</code>)</span>.";
@@ -350,7 +352,8 @@ std::string withheld_words(const DexStabilityFigures& f, const RowCtx& c) {
     if (w == "offline_affected") {
         const int64_t online = f.distinct_devices_online.value_or(0);
         return n(f.distinct_devices - online) + " of " + n(f.distinct_devices) + " affected device" +
-               (f.distinct_devices == 1 ? " is" : "s are") + " offline, so no score is given.";
+               (f.distinct_devices == 1 ? "" : "s") + (f.distinct_devices - online == 1 ? " is" : " are") +
+               " offline, so no score is given.";
     }
     if (w == "below_floor")
         return "Below the reporting floor: count only.";
@@ -509,7 +512,7 @@ std::string render_dex_apps_fragment(const DexAppsModel& model, int window_days,
     h += filters(window, scope);
 
     if (failed)
-        return h + error_panel(reason) + "</div>";
+        return h + error_panel(reason, window) + "</div>";
 
     if (!model.policy.fault.empty())
         h += "<div class=\"note warn dx-fault\"><b>The stored policy was refused.</b> The shipped defaults "

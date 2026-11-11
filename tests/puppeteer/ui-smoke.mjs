@@ -3,10 +3,10 @@
 //   1. NAV CRAWL  every shell nav route answers 200 with the CSP header and no page errors,
 //                 and the discovered set matches EXPECTED (nav drift fails both ways).
 //   2. OVERFLOW   submit controls stay inside their form/dialog and the viewport (#5576).
-//   3. SCENARIOS  four stubbed write paths (#6076, add user, #5840, #6074), each forcing its own
-//                 precondition with a request stub so nothing is written to the server; and the DEX
-//                 Apps tab (AP-3.2): a live keyboard half, then a committed golden page served
-//                 through a GET stub.
+//   3. SCENARIOS  four scenarios (#6076, add user, #5840, #6074), each forcing its own
+//                 precondition, with writes answered by a request stub so nothing is written to the
+//                 server; and the DEX Apps tab (AP-3.2): a live keyboard half, then a committed
+//                 golden page served through a GET stub.
 // One line per check; exit 1 when any check fails.
 //
 // `--selftest` needs no stack and no login: it proves the checks can fail, against a local

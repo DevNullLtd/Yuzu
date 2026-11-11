@@ -71,7 +71,7 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   selected platform; share, rate and score use the devices online now, while crashes, hangs,
   devices affected and last seen cover the selected window. An unknown platform value is an error
   panel, not a default. An unrecognised window falls back to 7d, with the 7d chip lit (the REST
-  API and the MCP tool answer 400 for it). The Windows, macOS and Linux views do not add up to
+  API answers `400` for it and the MCP tool an invalid-params error). The Windows, macOS and Linux views do not add up to
   All: a device with no recognised operating system appears only under All.
 - **Population and sources.** Under the title the page states the population (the devices of the
   scope online now, or that it is unknown or zero), which crash and hang sources are complete or
@@ -94,9 +94,9 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   events an `under 20 online events` tag; each tag names its own numerator, and the figure is
   still shown. The rate's numerator is the crash and hang events on the devices online now, so it
   can be below the window-wide Crashes and Hangs columns. A share or rate that cannot be
-  calculated says why in place of a figure (`not calculated: population unknown`, `not
-  calculated: no device online` or `not calculated: the counts disagree`); a missing estimate
-  reads `no estimate` and an unbounded interval end `no upper bound`.
+  calculated says why in place of a figure (`not calculated: population unknown`,
+  `not calculated: no device online` or `not calculated: the counts disagree`); a missing
+  estimate reads `no estimate` and an unbounded interval end `no upper bound`.
 - **Window-wide and online-only figures.** Crashes, hangs, devices affected and last seen cover
   every device in the window, online or not; share, rate and score use only the devices online
   now, so a note under the table says they can differ. Devices affected also shows how many of
@@ -121,8 +121,9 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   score policy unreadable for longer than the 60-second last-good window) is an error panel that
   shows no population, coverage, policy or interval line and no table; it is never an empty
   list. The panel prints the reason when the read names one; with none (a busy or unavailable
-  store) it suggests a shorter window, since 30d and All are the slowest reads. In both cases it
-  points to PostgreSQL health if the failure persists. A stored policy that is present but
+  store) it suggests a shorter window, since 30d and All are the slowest reads, except at 24h,
+  the shortest window, where it makes no such suggestion. In both cases it points to PostgreSQL
+  health if the failure persists. A stored policy that is present but
   refused is not a failure: the page scores under the shipped defaults and a warning names why. A
   healthy read with nothing recorded says `Nothing recorded`, and on a platform whose crash
   sources are partial that an empty list is not proof of stability.

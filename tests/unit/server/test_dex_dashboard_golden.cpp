@@ -1153,13 +1153,14 @@ std::size_t count_of(const std::string& hay, const std::string& needle) {
 
 } // namespace
 
-TEST_CASE("DEX apps UI: degraded model, window matrix (goldens)", "[dex][golden][apps_ui]") {
+TEST_CASE("DEX apps UI: degraded model across the window matrix (goldens)", "[dex][golden][apps_ui]") {
     const auto h24 = render_dex_apps_fragment(degraded_model(""), 1, "all");
     CHECK(contains(h24, "<h1>Applications</h1>"));
     CHECK(contains(h24, "<div class=\"gp-placeholder\"><b>Application stability is unavailable</b>"));
-    // No reason token (a busy or unavailable store): the one lever is the window; the remedy is PostgreSQL.
-    CHECK(contains(h24, "a shorter window reads faster (30d and All are the slowest). If it keeps failing, "
-                        "check PostgreSQL health."));
+    // No reason token (a busy or unavailable store): the remedy is PostgreSQL. 24h is the shortest
+    // window, so it is never told to try a shorter one.
+    CHECK_FALSE(contains(h24, "a shorter window"));
+    CHECK(contains(h24, "Try again in a moment. If it keeps failing, check PostgreSQL health."));
     CHECK_FALSE(contains(h24, "signal store"));
     CHECK(contains(h24, "class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/apps?window=24h&amp;platform=all\""));
     CHECK_FALSE(contains(h24, "No data"));
@@ -1167,10 +1168,12 @@ TEST_CASE("DEX apps UI: degraded model, window matrix (goldens)", "[dex][golden]
 
     const auto hall = render_dex_apps_fragment(degraded_model(""), 0, "all");
     CHECK(contains(hall, "class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/apps?window=all&amp;platform=all\""));
+    CHECK(contains(hall, "Try again in a moment; a shorter window reads faster (30d and All are the slowest). "
+                         "If it keeps failing, check PostgreSQL health."));
     check_golden("apps__null_win-all", hall);
 }
 
-TEST_CASE("DEX apps UI: populated page, window matrix (goldens)", "[dex][golden][apps_ui]") {
+TEST_CASE("DEX apps UI: populated page across the window matrix (goldens)", "[dex][golden][apps_ui]") {
     const auto model = populated_model();
     // The hand-computed anchor row.
     const auto page_all = render_dex_apps_fragment(model, 0, "all");
@@ -1237,7 +1240,7 @@ TEST_CASE("DEX apps UI: below-floor row reads count only", "[dex][golden][apps_u
     check_golden("apps__below-floor", page);
 }
 
-TEST_CASE("DEX apps UI: versions, incl. the unknown-version bucket", "[dex][golden][apps_ui]") {
+TEST_CASE("DEX apps UI: versions including the unknown-version bucket", "[dex][golden][apps_ui]") {
     const std::vector<DexAppStabilityRow> rows = {
         apps_total_row("chrome.exe", 30, 6, 12, 26, 6, 3, 1, "2026-10-14T01:00:00Z"),
         apps_version_row("chrome.exe", "131.0.1", 18, 3, 7, 16, 3, "2026-10-14T02:00:00Z"),
@@ -1277,7 +1280,7 @@ TEST_CASE("DEX apps UI: applications and versions capped", "[dex][golden][apps_u
     check_golden("apps__capped", page);
 }
 
-TEST_CASE("DEX apps UI: custom policy, renamed tiers, override row",
+TEST_CASE("DEX apps UI: custom policy with renamed tiers and an override row",
           "[dex][golden][apps_ui]") {
     DexPolicyInForce policy;
     policy.source = "custom";
@@ -1417,7 +1420,7 @@ TEST_CASE("DEX apps UI: each small-count tag names its own numerator", "[dex][ap
     CHECK(contains(cell(page, "wide.exe", "", kColShare), "under 20 affected online devices"));
 }
 
-TEST_CASE("DEX apps UI: the rate tag is judged on online events, not the window's", "[dex][apps_ui]") {
+TEST_CASE("DEX apps UI: the rate tag is judged on online events and not the whole window", "[dex][apps_ui]") {
     // 30 crashes over the window but only 9 on the 3 devices online now (population 50). The Crashes
     // column is window-wide; the rate and its tag are over the 9 online events, which the tag says.
     auto row = apps_total_row("lag.exe", 30, 0, 12, 20, 0, 1, 1, "2026-10-14T01:00:00Z");
@@ -1470,6 +1473,18 @@ TEST_CASE("DEX apps UI: a count of one reads in the singular", "[dex][apps_ui]")
         CHECK_FALSE(contains(page, never));
 }
 
+TEST_CASE("DEX apps UI: the version summary follows version_count and not the rows shipped",
+          "[dex][apps_ui]") {
+    // A model whose per-version rows were not shipped (a lazy versions list) but whose count says
+    // three exist: the cell offers the three, and never claims the version was not collected.
+    auto model = populated_model();
+    model.apps[0].versions.clear();
+    model.apps[0].version_count = 3;
+    const auto app = cell(render_dex_apps_fragment(model, 7, "all"), model.apps[0].subject, "", kColApp);
+    CHECK(contains(app, "<summary>3 versions</summary>"));
+    CHECK_FALSE(contains(app, "version not collected"));
+}
+
 TEST_CASE("DEX apps UI: the population sits beside every share and rate", "[dex][apps_ui]") {
     const auto model = populated_model();
     const auto page = render_dex_apps_fragment(model, 7, "all");
@@ -1515,7 +1530,7 @@ TEST_CASE("DEX apps UI: Devices affected and the share keep the total and online
     check_row("2.0", j["apps"][0]["versions"][0], 6, 3);
 }
 
-TEST_CASE("DEX apps UI: a non-finite interval value reads in words, never inf or nan", "[dex][apps_ui]") {
+TEST_CASE("DEX apps UI: a non-finite interval value reads in words and never inf or nan", "[dex][apps_ui]") {
     // Defensive twin of the REST serializer, which sends a non-finite estimate or upper as null.
     auto model = populated_model();
     const std::string subject = model.apps[0].subject;
@@ -1570,6 +1585,10 @@ TEST_CASE("DEX apps UI: every withheld score reads in words and the token is esc
     model.apps[0].figures.score = stability_detail::withheld_result("offline_affected");
     CHECK(contains(cell(render_dex_apps_fragment(model, 7, "all"), model.apps[0].subject, "", kColScore),
                    "2 of 9 affected devices are offline, so no score is given."));
+    // the noun agrees with the total, the verb with the offline count
+    model.apps[0].figures.distinct_devices_online = 8;
+    CHECK(contains(cell(render_dex_apps_fragment(model, 7, "all"), model.apps[0].subject, "", kColScore),
+                   "1 of 9 affected devices is offline, so no score is given."));
 }
 
 TEST_CASE("DEX apps UI: share and rate read \"the counts disagree\" when the model withholds them",
@@ -1600,7 +1619,7 @@ TEST_CASE("DEX apps UI: a deduction name and a degraded reason with markup are e
     CHECK_FALSE(contains(page, "<u>why</u>"));
 }
 
-TEST_CASE("DEX apps UI: the tone follows the closed band token, not the tier name", "[dex][apps_ui]") {
+TEST_CASE("DEX apps UI: the tone follows the closed band token and not the tier name", "[dex][apps_ui]") {
     DexPolicyInForce policy;
     policy.policy.tiers.names = {"One", "Two", "Three", "Four"};
     const struct {
@@ -1619,7 +1638,7 @@ TEST_CASE("DEX apps UI: the tone follows the closed band token, not the tier nam
     }
 }
 
-TEST_CASE("DEX apps UI: the page equals GET /api/v1/dex/apps, per row and per column", "[dex][apps_ui]") {
+TEST_CASE("DEX apps UI: the page equals GET /api/v1/dex/apps per row and per column", "[dex][apps_ui]") {
     const auto model = populated_model();
     const auto page = render_dex_apps_fragment(model, 7, "all");
     const auto j = json::parse(dex_apps_json(model));
@@ -1681,7 +1700,7 @@ TEST_CASE("DEX apps UI: the page equals GET /api/v1/dex/apps, per row and per co
     CHECK(contains(page, "revision <code class=\"dx-code\">" + j["policy"]["revision"].get<std::string>() + "</code>"));
 }
 
-TEST_CASE("DEX apps UI: payload key-set parity, both directions", "[dex][apps_ui]") {
+TEST_CASE("DEX apps UI: payload key-set parity in both directions", "[dex][apps_ui]") {
     // Every key path the Apps payload publishes (arrays collapsed to `[]`). A field added to the payload
     // fails here until the page shows it, or this test declares it omitted below.
     std::set<std::string> published;
@@ -1760,7 +1779,7 @@ TEST_CASE("DEX apps UI: payload key-set parity, both directions", "[dex][apps_ui
     CHECK(contains(render_dex_apps_fragment(populated_model(), 7, "all"), "Intervals at 95% confidence"));
 }
 
-TEST_CASE("DEX apps UI: population_basis is shown in words in the Population caption, per scope",
+TEST_CASE("DEX apps UI: population_basis is shown in words in the Population caption for each scope",
           "[dex][apps_ui]") {
     // Test-local table of basis token to caption words; a token with no entry fails.
     const std::map<std::string, std::string> words = {{"all_online", "all platforms"},
@@ -1778,7 +1797,7 @@ TEST_CASE("DEX apps UI: population_basis is shown in words in the Population cap
     }
 }
 
-TEST_CASE("DEX apps UI: the coverage caption is the shipped design, not a live check", "[dex][apps_ui]") {
+TEST_CASE("DEX apps UI: the coverage caption is the shipped design and not a live check", "[dex][apps_ui]") {
     // The table behind the caption does not change when a collector is disabled or disarmed on a
     // host, so the caption says what it is on every healthy page, whatever the scope.
     const std::string note = "This is what the agent collects on each platform, not a live check of each device.";
@@ -1993,7 +2012,7 @@ TEST_CASE("DEX apps UI: an unknown platform never reaches the API", "[dex][apps_
     CHECK(contains(empty->body, "<b>Unknown platform</b>"));
 }
 
-TEST_CASE("DEX apps UI: no DexApi wired, or a degraded model, is an error panel (200)", "[dex][apps_ui]") {
+TEST_CASE("DEX apps UI: no DexApi wired or a degraded model is an error panel (200)", "[dex][apps_ui]") {
     AppsRouteFixture unwired(/*wire_api=*/false);
     auto r = unwired.sink.Get("/fragments/dex/apps");
     REQUIRE(r);
