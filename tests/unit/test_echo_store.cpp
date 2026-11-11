@@ -4202,6 +4202,10 @@ TEST_CASE("EchoDatabase: a link swapped in at echo.db-wal before the claim trave
         // skip_unless_symlink_capable rightly treats as a set-up defect.
         if (!fired) {
             fired = true;
+            // Windows can leave a real -wal behind from the failed open; the planted link must
+            // take that name, so clear it first (an absent file is fine).
+            std::error_code rm;
+            fs::remove(wal, rm);
             fs::create_symlink(victim, wal, planted);
         }
         fs::create_hard_link(from, to, ec);
