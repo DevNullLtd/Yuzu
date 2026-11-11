@@ -1535,7 +1535,9 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") 
 
         // Row-scoped, not a whole-page search: inside the chrome.exe row, the Crashes cell (the
         // third <td>) equals chrome.exe's crashes figure in the REST payload for the same store.
-        const auto payload = nlohmann::json::parse(dex_apps_json(api->apps("7d", "all")));
+        const auto model = api->apps("7d", "all");
+        REQUIRE(!model.degraded); // dex_apps_json asserts on a degraded model and would abort the shard
+        const auto payload = nlohmann::json::parse(dex_apps_json(model));
         int64_t expected_crashes = -1;
         for (const auto& a : payload["apps"])
             if (a["subject"] == "chrome.exe")

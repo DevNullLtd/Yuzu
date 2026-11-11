@@ -3,8 +3,10 @@
 //   1. NAV CRAWL  every shell nav route answers 200 with the CSP header and no page errors,
 //                 and the discovered set matches EXPECTED (nav drift fails both ways).
 //   2. OVERFLOW   submit controls stay inside their form/dialog and the viewport (#5576).
-//   3. SCENARIOS  stubbed write paths (#6076, add user, #5840, #6074) and the DEX Apps tab; each
-//                 forces its own precondition with a request stub, nothing is written to the server.
+//   3. SCENARIOS  four stubbed write paths (#6076, add user, #5840, #6074), each forcing its own
+//                 precondition with a request stub so nothing is written to the server; and the DEX
+//                 Apps tab (AP-3.2): a live keyboard half, then a committed golden page served
+//                 through a GET stub.
 // One line per check; exit 1 when any check fails.
 //
 // `--selftest` needs no stack and no login: it proves the checks can fail, against a local
@@ -307,6 +309,11 @@ async function scenarioDexApps(page) {
 
   // live: Tab-order equivalent: focus the chip and press Enter, never a mouse click.
   await openAppsTab(page);
+  // The route answers 200 with an error panel when set_dex_api was never wired or the read failed, and
+  // nothing else here would notice: the chips and the shell are present either way.
+  const liveText = await page.$eval('#dex-apps', (e) => e.textContent);
+  check('dex-apps live: the Apps tab shows the model, not the "Application stability is unavailable" panel',
+    !liveText.includes('Application stability is unavailable'), liveText.slice(0, 200));
   await page.evaluate(() => {
     [...document.querySelectorAll('#dex-apps button.gp-chip')].find((c) => c.textContent.trim() === 'Windows').focus();
   });
@@ -320,8 +327,10 @@ async function scenarioDexApps(page) {
   // golden: the production markup under the real shell and CSP.
   w.reset();
   const body = readFileSync(APPS_GOLDEN, 'utf8');
-  await stub(page, { path: '/fragments/dex/apps', status: 200, contentType: 'text/html', body });
+  const rule = await stub(page, { path: '/fragments/dex/apps', status: 200, contentType: 'text/html', body });
   await openAppsTab(page);
+  check('dex-apps golden: the stub answered the Apps request, so the page under test is the golden',
+    rule.calls.length > 0, 'stub calls: ' + rule.calls.length);
   const have = await page.evaluate(() => ({
     tog: !!document.querySelector('details.dx-vx'), sc: !!document.querySelector('details.dx-score'),
   }));
@@ -347,10 +356,21 @@ async function scenarioDexApps(page) {
     await page.waitForFunction(() => !document.querySelector('details.dx-score .dx-ded').checkVisibility(),
       { timeout: WAIT_MS });
     check('dex-apps golden: the score decomposition opens and closes', before === false);
+
+    // A 256-byte image name with no break opportunity must wrap inside the first column rather than
+    // run under the Score cell (the column is fixed-width: table-layout:fixed).
+    const fit = await page.evaluate(() => {
+      const a = document.querySelector('tbody.dx-app .dx-apphead td:first-child > a');
+      a.textContent = 'W'.repeat(256);
+      const td = a.parentElement;
+      return { scroll: td.scrollWidth, client: td.clientWidth };
+    });
+    check('dex-apps golden: a 256-character unbroken application name stays inside its cell',
+      fit.scroll <= fit.client, JSON.stringify(fit));
   }
   await quiesce(page);
-  check('dex-apps: no page error and no CSP violation across the scenario', w.errors().length === 0,
-    JSON.stringify(w.errors()));
+  check('dex-apps golden: no page error and no CSP violation while the stubbed page is exercised',
+    w.errors().length === 0, JSON.stringify(w.errors()));
   clearStubs(page);
 }
 

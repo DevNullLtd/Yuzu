@@ -18,6 +18,7 @@
 #include "web_utils.hpp"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -101,6 +102,7 @@ button.gp-chip{line-height:inherit;font-variant-numeric:inherit}
 .gp-table.dx-apps th:first-child,.gp-table.dx-apps td:first-child{padding-left:16px}
 .gp-table.dx-apps th:last-child,.gp-table.dx-apps td:last-child{padding-right:16px}
 .gp-table.dx-apps td.dx-indent{padding-left:36px}
+.gp-table.dx-apps td:first-child{overflow-wrap:anywhere}
 .gp-table.dx-apps td:first-child>a{display:inline-block;margin-right:6px}
 .gp-table.dx-apps tbody tr:last-child td{border-bottom:1px solid var(--line)}
 .gp-table.dx-apps tbody:last-child tr:last-child td,.gp-table.dx-apps tbody:last-child:not(:has(.dx-vx[open])) .dx-apphead td{border-bottom:0}
@@ -191,7 +193,8 @@ Coverage coverage(const std::string& scope) {
     }
     if (scope == kDexAppsScopeLinux && !c.partial.empty())
         c.line = "Linux partial: it needs systemd-coredump as the active handler";
-    c.line += ".";
+    // The table is the shipped design of the crash and hang sources, not live collector health.
+    c.line += ". This is what the agent collects on each platform, not a live check of each device.";
     if (!c.partial.empty())
         c.line += scope == kDexAppsScopeAll
                       ? " An empty list on a partial platform is not proof of stability."
@@ -213,8 +216,9 @@ std::string captions(const DexAppsModel& m, const std::string& scope, const std:
         h += "<div class=\"gp-sub dx-cl\"><b>Population</b> 0 devices online now (" + basis +
              "). Shares, rates and scores need at least one online device.</div>";
     else
-        h += "<div class=\"gp-sub dx-cl\"><b>Population</b> " + n(*m.population) +
-             " devices online now (" + basis + "). Share and rate count online devices only.</div>";
+        h += "<div class=\"gp-sub dx-cl\"><b>Population</b> " + n(*m.population) + " device" +
+             (*m.population == 1 ? "" : "s") + " online now (" + basis +
+             "). Share and rate count online devices only.</div>";
 
     h += "<div class=\"gp-sub dx-cl\"><b>Crash and hang sources</b> " + coverage(scope).line + "</div>";
 
@@ -247,11 +251,16 @@ std::string error_panel(const std::string& reason) {
         return placeholder("Unknown platform",
                            "The platform filter must be one of all, windows, macos or linux, so no "
                            "figures are shown. Choose a platform above.");
-    std::string body = "The read could not be completed, so no figures are shown. Try again in a moment. "
-                       "If it keeps failing, check that the signal store is open";
-    if (!reason.empty())
-        body += " <span class=\"gp-mute\">(reason: <code class=\"dx-code\">" + esc(reason) + "</code>)</span>";
-    return placeholder("Application stability is unavailable", body + ".");
+    // A busy or unavailable store arrives with no reason token; the window is then the one lever.
+    std::string body = "The read could not be completed, so no figures are shown. Try again in a moment";
+    if (reason.empty())
+        body += "; a shorter window reads faster (30d and All are the slowest). If it keeps failing, check "
+                "PostgreSQL health.";
+    else
+        body += ". If it keeps failing, check PostgreSQL health <span class=\"gp-mute\">(reason: <code "
+                "class=\"dx-code\">" +
+                esc(reason) + "</code>)</span>.";
+    return placeholder("Application stability is unavailable", body);
 }
 
 // ── figure cells (one function per figure, shared by application and version rows) ──
@@ -293,6 +302,11 @@ std::string devices_cell(const DexStabilityFigures& f) {
            "</span><span class=\"s nw\">" + sub + "</span></td>";
 }
 
+// The small-count tags and the "Small counts" note below say "under 20"; dex.md repeats it.
+static_assert(kDexStatsReliableMinEvents == 20,
+              "the Apps page prose (share tag, rate tag, Small counts note) and dex.md say 'under 20'; "
+              "update them with this constant");
+
 std::string share_cell(const DexStabilityFigures& f, const RowCtx& c) {
     if (!f.share_affected || !c.population)
         return word_cell(not_calculated(f, c));
@@ -310,10 +324,10 @@ std::string rate_cell(const DexStabilityFigures& f, const RowCtx& c) {
         return word_cell(not_calculated(f, c));
     const auto& i = *f.rate_per_1000;
     // The rate's flag is judged on online EVENTS, not devices.
-    std::string tag = i.reliable ? "" : "<span class=\"gp-derived\">under 20 events</span>";
+    std::string tag = i.reliable ? "" : "<span class=\"gp-derived\">under 20 online events</span>";
     return "<td class=\"gp-num dx-fig\"><span class=\"v\">" + estimate_text(i, 1.0, "") +
            " <span class=\"gp-mute nw\">" + interval_text(i, 1.0, "") + "</span></span><span class=\"s\">per 1,000 of " +
-           n(*c.population) + " online devices</span>" + tag + "</td>";
+           n(*c.population) + " online device" + (*c.population == 1 ? "" : "s") + "</span>" + tag + "</td>";
 }
 
 const char* deduction_label(const std::string& name) {
@@ -335,8 +349,8 @@ std::string withheld_words(const DexStabilityFigures& f, const RowCtx& c) {
                             : "Population unknown, so there is nothing to measure against.";
     if (w == "offline_affected") {
         const int64_t online = f.distinct_devices_online.value_or(0);
-        return n(f.distinct_devices - online) + " of " + n(f.distinct_devices) +
-               " affected devices are offline, so no score is given.";
+        return n(f.distinct_devices - online) + " of " + n(f.distinct_devices) + " affected device" +
+               (f.distinct_devices == 1 ? " is" : "s are") + " offline, so no score is given.";
     }
     if (w == "below_floor")
         return "Below the reporting floor: count only.";
@@ -404,7 +418,7 @@ std::string app_body(const DexAppStability& a, const DexAppsModel& m, const std:
     std::string first = label;
     if (a.profile == DexPolicyProfile::Override)
         first += " <span class=\"dx-tag\">override</span>";
-    if (a.versions.empty())
+    if (a.version_count == 0)
         first += "<span class=\"gp-mute\">version not collected</span>";
     else
         first += "<details class=\"dx-vx\"><summary>" + n(a.version_count) + " version" +
@@ -420,9 +434,11 @@ std::string app_body(const DexAppStability& a, const DexAppsModel& m, const std:
     }
     if (a.versions_truncated) {
         const int64_t shown = static_cast<int64_t>(a.versions.size());
-        out += "<tr class=\"dx-ver dx-vcap\"><td colspan=\"8\">Showing the " + n(shown) +
-               " versions with the most devices affected; " + n(a.version_count - shown) +
-               " more versions have crashes or hangs in this window and are not listed.</td></tr>";
+        const int64_t cut = a.version_count - shown;
+        out += "<tr class=\"dx-ver dx-vcap\"><td colspan=\"8\">Showing the " + n(shown) + " version" +
+               (shown == 1 ? "" : "s") + " with the most devices affected; " + n(cut) + " more version" +
+               (cut == 1 ? " has" : "s have") + " crashes or hangs in this window and " +
+               (cut == 1 ? "is" : "are") + " not listed.</td></tr>";
     }
     return out + "</tbody>";
 }
@@ -437,10 +453,11 @@ std::string notes(const DexAppsModel& m, const std::string& scope) {
     std::string h;
     if (m.apps_truncated) {
         const int64_t shown = static_cast<int64_t>(m.apps.size());
+        const int64_t cut = m.apps_total - shown;
         h += "<div class=\"gp-note\">Showing " + n(shown) + " of " + n(m.apps_total) +
              " applications: the " + n(shown) +
-             " with the most devices affected, listed by crashes plus hangs. " + n(m.apps_total - shown) +
-             " are not listed.</div>";
+             " with the most devices affected, listed by crashes plus hangs. " + n(cut) +
+             (cut == 1 ? " is" : " are") + " not listed.</div>";
     }
     h += "<div class=\"gp-note\"><b>Window-wide figures:</b> crashes, hangs, devices affected and last seen "
          "cover every device in the window, online or not. Share, rate and score count online devices only, "
@@ -450,7 +467,7 @@ std::string notes(const DexAppsModel& m, const std::string& scope) {
     // With no usable population no share or rate is drawn, so there is nothing to tag.
     if (m.population && *m.population > 0)
         h += "<div class=\"gp-note\"><b>Small counts:</b> a figure on fewer than 20 affected online devices, "
-             "or fewer than 20 events, carries a tag. It is still shown; the interval says how uncertain it "
+             "or fewer than 20 online events, carries a tag. It is still shown; the interval says how uncertain it "
              "is.</div>";
     if (scope != kDexAppsScopeAll)
         h += "<div class=\"gp-note\">The application drill-down covers every platform.</div>";

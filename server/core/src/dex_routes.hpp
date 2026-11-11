@@ -363,8 +363,9 @@ public:
 
     /// The DexApi the Apps tab reads (`apps()`), the same model GET /api/v1/dex/apps serves.
     /// A setter, not a `register_routes` parameter: server.cpp registers this object before
-    /// it builds the DexApi. Set once before the listener starts and read unsynchronised per
-    /// request, like the sibling setters. Unset: the Apps tab answers an error panel.
+    /// it builds the DexApi. It follows the convention of `McpServer::set_dex_api` and
+    /// `SettingsRoutes::set_dex_apps_fn`: set once before the listener starts, read
+    /// unsynchronised per request. Unset: the Apps tab answers an error panel.
     void set_dex_api(std::shared_ptr<const DexApi> api) { dex_api_ = std::move(api); }
 
     /// Register the DEX routes. The page shell is auth-only static chrome; the

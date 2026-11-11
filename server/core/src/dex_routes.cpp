@@ -2507,7 +2507,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         // Canonical window and platform only: the raw params never reach the API or the markup.
-        // Always 200 (htmx drops a non-2xx body), so a failure is an error panel, never a bare status.
+        // A model-level failure is a 200 with an error panel (htmx drops a non-2xx body); a denied
+        // permission keeps perm_fn_'s status.
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
         const std::string scope = dex_normalize_apps_scope(
