@@ -1132,13 +1132,11 @@ gate applied.
 
 #### Rollout and cutover
 
-This build is a hard cutover. It has no upgrade path, no rolling or mixed-version window and no
-rollback. The supported procedure for an existing deployment (stop every replica, back up the `auth` and
-`session_store` schemas, run `yuzu-server --mfa-reset <user>` for each enrolled operator, which can be done before
-the new build starts or afterwards for each account still at generation `0`) is in `docs/user-manual/upgrading.md`,
-with the restore sequence that is the only way back (a restore of the previous build's data, not a rollback). Starting
-with empty `auth` and `session_store` schemas is an operator choice for a deployment with no enrolled
-operators; it discards local accounts, passwords, MFA enrolments and sessions.
+This build is a hard cutover. It supports a fresh database only: it has no upgrade path, no rolling or
+mixed-version window, no rollback, and no supported carry-over of an earlier build's database (the deployment
+contract in `docs/user-manual/upgrading.md`). An enrolled account that reads generation `0` can exist only in a
+database an earlier build wrote; the server refuses it (`503`) until `yuzu-server --mfa-reset <user>` clears its
+factor, which is the repair for that account and not a documented upgrade step.
 
 | State | Behaviour |
 |---|---|

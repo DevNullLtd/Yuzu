@@ -1096,9 +1096,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      decision.
 
     - **2026-10-28 - mixed-version admission during a rolling upgrade (scope
-      exception recorded by the maintainer, #6079; superseded by the
-      2026-10-28 hard-cutover entry below, a DRAFT pending the maintainer's approval, which
-      ships the change as a hard cutover with no rolling window).** The approver gate
+      exception recorded by the maintainer, #6079; the change now ships as the
+      hard cutover of the 2026-10-28 entry below, which has no rolling window).** The approver gate
       (`require_enrolled_fresh_mfa`) runs on each server replica and no
       minimum-version check exists. While a rolling upgrade is in progress, or
       after a replica is rolled back, a replica that predates the gate can admit
@@ -1110,10 +1109,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
       `docs/ha-delivery-matrix.md`), so the entry covers the rolling-upgrade
       case and is not a statement that multi-replica operation is supported.
       Operator wording: `docs/user-manual/upgrading.md` "Mixed-version
-      admission" (that section no longer exists: the cutover ruling of the
-      2026-10-28 hard-cutover entry below (a DRAFT pending the maintainer's approval) supersedes
-      this wording, and the marker query it
-      cites was removed with it).
+      admission" (that section no longer exists: the hard cutover below has
+      no rolling window, and the marker query it cites was removed with it).
      - **Conditions of this exception.** The upgrade is controlled: the
        operator records each replica's upgrade timestamp (UTC) in the change
        ticket (SOC 2 CC8.1) as the roll happens, because the audit row does not
@@ -1274,9 +1271,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
     cutover (#6079 PR 2).**
     **STATUS: DRAFT, not accepted until the maintainer approves it.**
     The factor-generation binding (`auth` schema v3, `session_store` schema v3)
-    is introduced with no upgrade path: an account that was already enrolled
-    reads factor generation `0`, and every gate that compares a proof with the
-    factor refuses it. This entry supersedes the operator wording of the
+    is introduced with no upgrade path and no supported carry-over of an earlier
+    build's database: an enrolled account that reads factor generation `0` (only
+    a database an earlier build wrote can hold one) is refused by every gate that
+    compares a proof with the factor. This entry supersedes the operator wording of the
     2026-10-28 mixed-version entry above, which described a rolling-upgrade
     window; this build has no such window, and mixed-version operation is
     unsupported. Operator wording: `docs/user-manual/upgrading.md`, the MFA
@@ -1284,25 +1282,24 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
     thing only: shipping #6079 as a hard cutover with no upgrade path. It does
     NOT cover the residual exposures listed below (enrolled operators refused
     until a host-shell reset, the password-only dip, the sso-only break-glass
-    trap, no minimum-version check), and it does not cover the carry-over
-    procedure or the restore sequence in `upgrading.md`; those are PROPOSED
-    extensions, put forward with this draft for the maintainer to accept,
-    amend or strike.
+    trap, no minimum-version check). The deployment contract of the Forensics
+    tier (fresh database only, no upgrade path, recovery by rolling forward or by
+    restoring this build's own backups into a fresh deployment) applies to this
+    change unchanged, and `upgrading.md` documents no carry-over procedure.
     - **Conditions of this exception (proposed).** There is no upgrade path and
-      no rollback of the migrations; the only way back is restoring the backup
-      taken before the cutover (a restore of the previous build's data, not an
-      undo of the migrations). Enrolled operators are refused `503`
+      no rollback of the migrations; recovery is rolling forward on this build or
+      restoring this build's own backups into a fresh deployment. An enrolled
+      operator who reads generation `0` is refused `503`
       (`mfa_proof_unavailable`) until `yuzu-server --mfa-reset <user>` has been
       run for them from a host shell, which needs the Postgres DSN and the keys
       directory, so an affected operator cannot recover alone. The refusal
-      applies to the step-up routes as follows: the 35 ordinary rows (approve
+      applies to the step-up routes as follows: the 39 ordinary rows (approve
       and reject among them) refuse only while `--mfa-step-up-window-secs` is
       above 0, whereas approve and reject, the 2 factor-credential routes and
-      the 3 JIT-elevation routes refuse regardless of the window. After the
-      cutover the operator reconciles the `mfa.reset.breakglass` rows against
-      the `mfa.enroll.verified` rows per operator (the query is in
-      `upgrading.md`). These controls are customer-operated: Yuzu neither
-      enforces nor evidences them. No MCP tool may twin
+      the 3 JIT-elevation routes refuse regardless of the window. An operator
+      can reconcile the `mfa.reset.breakglass` rows against the
+      `mfa.enroll.verified` rows per operator. These controls are
+      customer-operated: Yuzu neither enforces nor evidences them. No MCP tool may twin
       `/api/settings/mfa/recovery-codes` or `/api/settings/mfa/disable` until
       the MCP step-up table gains a local-session-only class; the build refuses
       such a twin (`step_up_mcp_policy.hpp`: a twin of those rows cannot be

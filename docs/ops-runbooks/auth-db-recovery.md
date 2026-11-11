@@ -415,8 +415,6 @@ administrator password in the product right after such a rebuild.
 
 After any restore, before declaring the incident closed:
 
-**Skip this checklist for the previous build.** After the documented restore of a pre-cutover backup (the sequence in the cutover section of `docs/user-manual/upgrading.md`), expect `public.schema_meta` `auth` 2 and `session_store` 2, no `users_mfa_factor_gen` or `sessions_mfa_rebind_guard` trigger and no `yuzu_auth_mfa_binding_enforcement_ok` series, so skip steps 2, 4 and 5 below (they expect `auth` 3, `session_store` 3, both triggers and both gauges); steps 1, 3 and 6 still apply.
-
 ```bash
 # 1. The server started and is serving. (/health and /readyz are on the web
 #    port — --web-port, default 8080; https:// if TLS is enabled.)
@@ -2132,9 +2130,9 @@ alert on the unit being `failed` or on `up == 0` as well.
    boot check still refuses: the `auth` body begins with a newline directly after `$$` and ends with a
    newline before the closing `$$`; the `session` body begins the same way and ends `END $$`, with a
    space after `END`. Do not run the migrations' `ALTER TABLE ... ADD COLUMN`: in a database the new build has migrated
-   the columns exist. If the tables came back from a dump taken before the cutover they do not, and this section
-   is the wrong tool: use the restore sequence in the cutover section of `docs/user-manual/upgrading.md`, which also
-   resets `public.schema_meta`. The full statements for each store are under [Repair statements](#repair-statements) below.
+   the columns exist. If the tables came back from a database an earlier build wrote they do not, and this section
+   is the wrong tool: a database in that state was written by an earlier build, which this build does not support
+   (`docs/user-manual/upgrading.md`, "Deployment contract"); recreate it. The full statements for each store are under [Repair statements](#repair-statements) below.
 3. **End the sessions that cannot be trusted.** Factor changes made while the trigger was not
    firing did not change the generation, so a proof bound before such a change still equals the unchanged
    generation. End the sessions of **every account whose factor changed in the window**
