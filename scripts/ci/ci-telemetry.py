@@ -202,17 +202,39 @@ def finish(args: argparse.Namespace, env: dict[str, str]) -> int:
         warning("job-finalization record failed; telemetry was skipped")
         return 0
     if args.builddir:
-        rc = run_db(
-            env,
-            "ci-import-junit",
-            "--workflow", meta["workflow"],
-            "--run-id", meta["run_id"],
-            "--run-attempt", meta["run_attempt"],
-            "--job-name", meta["job_name"],
-            "--builddir", args.builddir,
-        )
-        if rc != 0:
-            warning("suite/flake import failed; the CI job result is unaffected")
+        # One import per meson --logbase. No --logbase keeps the historical
+        # single import of testlog.junit.xml + flake-retry.json, byte-for-byte.
+        # With --logbase (ci.yml's Linux leg, whose invocations run concurrently
+        # under distinct logbases) each base's junit and its flake-retry.py
+        # report (`<base>-flake-retry.json`, flake-retry.py's artifact_prefix)
+        # is imported; a base whose files are absent or predate the job is a
+        # no-op inside ci-import-junit.
+        imports = [[]]
+        logbases = getattr(args, "logbase", None)
+        if logbases:
+            logs = Path(args.builddir) / "meson-logs"
+            imports = [
+                [
+                    "--junit", str(logs / f"{base}.junit.xml"),
+                    "--flake-report", str(
+                        logs / ("flake-retry.json" if base == "testlog" else f"{base}-flake-retry.json")
+                    ),
+                ]
+                for base in logbases
+            ]
+        for extra in imports:
+            rc = run_db(
+                env,
+                "ci-import-junit",
+                "--workflow", meta["workflow"],
+                "--run-id", meta["run_id"],
+                "--run-attempt", meta["run_attempt"],
+                "--job-name", meta["job_name"],
+                "--builddir", args.builddir,
+                *extra,
+            )
+            if rc != 0:
+                warning("suite/flake import failed; the CI job result is unaffected")
     print(f"ci-telemetry: finalized {meta['job_name']} as {args.conclusion}")
     return 0
 
@@ -227,6 +249,10 @@ def main(argv: list[str] | None = None) -> int:
     p_finish.add_argument("--job-name", required=True)
     p_finish.add_argument("--triplet", default=None)
     p_finish.add_argument("--builddir", default=None)
+    p_finish.add_argument(
+        "--logbase", action="append", default=None,
+        help="meson test --logbase to import (repeatable); omit for meson's default 'testlog'",
+    )
     p_finish.add_argument(
         "--conclusion", required=True,
         choices=["success", "failure", "cancelled", "skipped", "timed_out", "neutral"],
