@@ -437,3 +437,21 @@ Operator consequence: an in-place edit of an already-applied migration now refus
 (`docs/user-manual/upgrading.md`). The golden-hash CI test (#3895) is the matching author-side
 guard and should ship in the same release, so that an edit to shipped text is stopped at the
 source and not discovered at the first customer boot.
+
+## Update (2026-11-09) -- `pg::exec_params` refuses a NUL byte in a bound text parameter
+
+`pg::exec_params` (`pg/pg_exec.hpp`) binds text-format parameters, and libpq reads such a value as a
+C string, so an embedded NUL byte ended the value early instead of reaching the server. The helper
+now refuses a bound text parameter that contains a NUL byte: the call returns a failed result
+(SQLSTATE 22021, "parameter $N contains a NUL byte") and the caller's statement is not executed.
+The value is never echoed. An open transaction aborts exactly as it does for any other failed
+statement, so a caller that runs inside `with_txn_for` rolls back as it already does for a failed
+query. A caller that manages its own `BEGIN` with `pg::PgTxn` gets `false` from `commit()` when a statement aborted the transaction (the guard rolls it back at once); `PgPool::with_txn*` already refused to commit an aborted transaction. A failed statement recovered with `ROLLBACK TO SAVEPOINT` still commits. Only NUL is refused; tab, newline and the rest of the control range are valid text and are
+bound unchanged. The refusal is produced by a server-side `DO` block, so it needs `USAGE` on
+`plpgsql`, which every database has by default.
+
+A trust boundary (a route or tool that takes the value from a client) should validate first, so the
+client receives a client error (400 or -32602) rather than a store failure. `sanitize_pg_text`
+remains the rule for free text that should be kept: it replaces the byte and stores the rest. The
+only direct-bind exceptions, which call `PQexecParams` themselves and are not covered by the
+helper, are `pg/secret_codec.cpp` and `pg/pg_migration_runner.cpp`.

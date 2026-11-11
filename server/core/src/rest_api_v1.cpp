@@ -18,6 +18,8 @@
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
 #include "rbac_admin_predicate.hpp" // A2: is_rbac_administrator / is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 7-role set
+#include "mgmt_group_error.hpp" // mgmt_group_error_is_store_fault: one classifier for REST and MCP
+#include "rbac_text.hpp" // rbac_text_is_clean - the one clean-text predicate for RBAC identifiers
 #include "rbac_enforcement_read.hpp" // GET /api/v1/rbac/enforcement: the builder shared with MCP get_rbac_enforcement
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
 #include "app_perf_daily_store.hpp" // AppPerfDailyStore::kRetentionDays -- the VERIFY compare window clamp
@@ -1765,8 +1767,8 @@ const std::string& openapi_spec() {
       "overview": ["A management group is a named set of devices. Groups form a tree under one built-in root group called All Devices. Operators use them to organise the fleet, and to give a person or team a role over the devices in one branch only.", "Group membership and group roles feed the device confinement that other API groups apply. A role held on a group reaches the agents in that group and in the groups below it. This group of calls manages the groups, their members and the roles delegated on them.", "The group routes check global grants on the ManagementGroup securable. The roles routes add one group-scoped path, ITServiceOwner of that group, described under access."],
       "how_it_works": [{"title": "Root group", "text": "At start the server creates the root group All Devices (id 000000000000) if it is missing. Every agent is added to it when it registers, directly or through a gateway."}, {"title": "Build the tree", "text": "Create groups with an optional parent id. Add agents to a group one at a time. Group names must be unique across the whole tree."}, {"title": "Delegate roles", "text": "Assign Operator or Viewer to a user or a group principal on a management group. No other role can be delegated here."}, {"title": "Scope applies", "text": "When RBAC enforcement is on, a role held on a group is resolved to the agents in that group and the groups below it. Other API groups then confine their device reads and actions to that set."}],
       "tables": [{"title": "Kinds of group", "caption": "How members arrive and what the calls in this group can change.", "columns": ["Kind", "How members arrive", "What these calls can do"], "rows": [["Root (All Devices)", "Every agent is added on registration.", "Rename or describe it. Delete is refused with 403 and a new parent is refused with 400."], ["Static group", "You add agents one at a time.", "Add and remove members."], ["Dynamic group", "Entries marked source dynamic, written only by the server.", "Remove member never deletes a dynamic entry."], ["Service group", "Created by the server when a service tag is written, named Service: followed by the tag value.", "Same as a dynamic group. Members are filled from agents holding the tag when it is created."]]}],
-      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written after a group is created.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written after an add member call.", "management_group.remove_member, written after a remove member call.", "management_group.assign_role, written after a role is assigned.", "management_group.unassign_role, written after a role is unassigned. All seven are written on success and the write result is not checked, so a failed audit write does not fail the request. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
-      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Writes that report success", "text": "Add member returns 201 and remove member returns 200 without checking the outcome, so an unknown group id, a store failure or an agent that was not a member still gets a success body. Unassign role also always returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
+      "access": {"permissions": ["ManagementGroup:Read, gates list groups and get one group with its members. A global grant check.", "ManagementGroup:Write, gates create, update, add member, remove member and the agent count preview.", "ManagementGroup:Delete, gates delete group.", "ManagementGroup:Read plus either UserManagement:Read or ITServiceOwner of that group, gates list roles. The role list shows who holds which role, so it is treated as authorization topology.", "ManagementGroup:Write or ITServiceOwner of that group, gates assign role and unassign role."], "audit": ["management_group.create, written after a group is created.", "management_group.update, written after a group is updated.", "management_group.delete, written after a group is deleted.", "management_group.add_member, written after an add member call. A control byte or invalid UTF-8 in agent_id is written as denied (detail invalid_agent_id) and a store fault as failure (detail store_error).", "management_group.remove_member, written after a remove member call, with the same denied and failure rows.", "management_group.assign_role, written after a role is assigned. A control byte or invalid UTF-8 in the role name, principal_id or principal_type is written as denied (detail invalid_role_name, invalid_principal_id or invalid_principal_type) and a store fault as failure (detail store_error).", "management_group.unassign_role, written after a role is unassigned, with the same denied and failure rows. The success rows are written only after the store reports success, and the audit write result is not checked, so a failed audit write does not fail the request. A group id that names no group answers 404 on add member and assign role and writes no row. Reads are not audited."], "notes": ["The ITServiceOwner path on the roles routes is not offered to a service-scoped API token. Such a token is judged by the global permission check only.", "Only Operator and Viewer can be delegated. Any other role name returns 403.", "MCP tools exist for list, get, create, update, add member, list roles, assign role and the agent count preview. Delete, remove member and unassign role are REST only."]},
+      "good_to_know": [{"label": "Paging", "text": "The list returns every group in one response. The pagination block reports start 0, page size 50 and a total equal to the rows returned, whatever the size of the tree."}, {"label": "Dynamic groups", "text": "A dynamic group stores its scope expression, but the only server code that fills dynamic members is the service tag helper. A dynamic group you create through the API gets no members from its expression, so add static members or expect it to stay empty."}, {"label": "Write outcomes", "text": "Add member, remove member, assign role and unassign role answer success only after the store accepted the write. A control byte or invalid UTF-8 in an id is a 400, a group id naming no group on add member or assign role is a 404, and a store fault is a 503 with a retry hint. Removing an agent that was not a member, or unassigning a role that was not held, is not an error and still returns 200."}, {"label": "Delete cascades", "text": "Deleting a group also deletes the groups below it, their memberships and their role assignments. The agents themselves are not deleted."}, {"label": "Depth and cycles", "text": "A group may sit at most five levels below the root. Create is refused beyond that, and re-parenting is refused one level earlier. Moving a group under one of its own descendants is refused. Update changes only the fields you send."}, {"label": "Fail-closed read", "text": "Get one group reads the group row and its member list separately. If either read fails the call returns 503 with a retry hint, never a 404 or an empty member list."}, {"label": "RBAC off", "text": "While RBAC enforcement is off, device visibility falls back to every enrolled agent and group roles do not narrow it. Assign group roles before you turn enforcement on."}, {"label": "Ids and bodies", "text": "The server generates group ids as 12 lowercase hex characters, and the routes match only lowercase hex ids. Unassign role names the grant in its JSON body, not in the URL."}, {"label": "Count preview", "text": "The agent count preview needs ManagementGroup:Write, as creating a group does. Filters are repeated query parameters, and an empty filter set returns a count of 0 without reading the store. The response also lists unindexed_filter_keys, the filters whose value is longer than 2048 bytes as stored. Such a value is not indexed, so for those filters agent_count can be 0 or an undercount. If the response store is degraded it returns 503 with a retry hint."}],
       "docs": ["docs/user-manual/management-groups.md"]
     }},
 )json"
@@ -1846,7 +1848,7 @@ const std::string& openapi_spec() {
       "overview": ["A result set is a saved list of device ids with a name, an owner, a source and an expiry. Operators build one from an inventory query, an Echo SQL query, an instruction run, or a list of ids they already hold. A later query or dispatch can then use the set as its scope with from_result_set:<id>, so each step narrows the one before it.", "Sets are private to the operator who created them. There is no RBAC securable for them and no administrator override. Another operator's set answers exactly like one that does not exist, so ids cannot be probed. Only the routes that reach into fleet data to build a set carry real permission checks.", "A set expires an hour after it is created unless it is pinned. Using a set as the scope of a dispatch pushes the expiry out again, but a scope preview does not. The record shows metadata only. The query that built the set stays on the server for re-evaluation and is not returned."],
       "how_it_works": [{"title": "Produce a set", "text": "An inventory query or a direct create fills the set at once. An Echo SQL query or an instruction run dispatches a command to agents and returns a pending set with no members yet."}, {"title": "Wait for answers", "text": "A background pass runs about every two seconds. It fills a pending set when every targeted agent has answered, or after five minutes with whatever has answered by then. Only successful replies that match the set's matcher become members."}, {"title": "Narrow further", "text": "Pass a set as parent_id when producing the next set, or use from_result_set:<id> in a scope expression. The producers that run a query limit it to the devices the earlier set holds."}, {"title": "Keep or expire", "text": "Pin a set to keep it. Unpinned sets are removed by a sweep that runs about every five minutes once their expiry has passed."}],
       "tables": [{"title": "Ways to make a set", "columns": ["Route", "What runs", "Result", "Permission"], "rows": [["POST /result-sets", "Nothing. You supply device_ids", "materialized at once", "Ownership only. Infrastructure:Read scope applies when device_ids is not empty"], ["POST /result-sets/from-inventory-query", "An inventory query on the server", "materialized at once", "Inventory:Read, management group scoped"], ["POST /result-sets/from-echo-query", "SQL sent to agents (echo sql)", "pending, filled later", "Execution:Execute"], ["POST /result-sets/from-instruction-result", "A stored instruction definition sent to agents", "pending, filled later", "Execution:Execute"], ["POST /result-sets/{id}/re-eval", "The set's own source query, run again", "new pending set", "Execution:Execute"]]}, {"title": "Limits", "columns": ["Limit", "Value", "When it is reached"], "rows": [["Default lifetime", "1 hour", "The sweep removes the set unless it is pinned"], ["Sets per owner", "10000", "Creating another set is refused"], ["Members per set", "100000", "A direct create is refused"], ["Response rows read to fill a pending set", "100000", "The set is marked failed, not filled: it reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log"],["Pinned sets per owner", "50", "Pinning another set is refused"], ["Wait for a pending set", "5 minutes", "The set is filled with the replies received so far"], ["Inventory rows read", "5000", "The inventory query is refused, never cut short"], ["SQL text length", "100000 bytes", "The request is refused"], ["List page size", "50 by default, up to 500", "A whole number outside 1 to 500 falls back to 50. Anything that is not a whole number is a 400"], ["Member page size", "1000 by default, up to 10000", "A whole number outside 1 to 10000 falls back to 1000. Anything that is not a whole number is a 400"]]}],
-      "access": {"permissions": ["Execution:Execute gates from-echo-query, from-instruction-result and re-eval. The dispatch is limited to devices the caller may reach, so hidden devices are never sent the command.", "Inventory:Read, management group scoped, gates from-inventory-query. Devices outside the caller's scope are left out of the match.", "Infrastructure:Read, management group scoped, gates the members list and is applied before paging. It also gates a direct create whose device_ids list is not empty.", "Infrastructure:Write (create, pin, unpin) and Infrastructure:Delete (delete) are borrowed labels for the MCP tier check. They are not grantable RBAC permissions."], "audit": ["result_set.create, written for each create or re-eval attempt that passes validation. The outcome is success, denied or failure, and the detail carries a reason token. The success row is written after the set exists and a failed write does not undo it. A request refused at validation with a 400 (bad JSON, an oversized sql, or RESULT_SET_REEVAL_STALE_SOURCE) writes no row.", "result_set.pin, result_set.unpin and result_set.delete, written on success.", "result_set.access, outcome denied, written when an id is not found or not owned by the caller.", "result_set.list, result_set.members and result_set.lineage, outcome failure only, written when the store read fails. Successful reads are not audited.", "result_set.heal, written when re-eval discards a stored query that nests too deeply.", "result_set.create.access_denied, result_set.list.access_denied and the matching verbs for detail, members, lineage, pin, unpin and delete, outcome denied, written when a service-scoped token is refused."], "notes": ["Service-scoped API tokens get a 403 on the nine routes that do not dispatch, and the error names no permission to ask for. The three routes that dispatch (from-echo-query, from-instruction-result, re-eval) rely on the Execution:Execute check instead.", "A token that carries an MCP tier is also held to that tier's policy on create, pin, unpin and delete. Plain sessions and tokens without a tier are not affected by that check.", "Every route here has an MCP twin, for example list_result_sets, create_result_set_from_echo_query and reevaluate_result_set."]},
+      "access": {"permissions": ["Execution:Execute gates from-echo-query, from-instruction-result and re-eval. The dispatch is limited to devices the caller may reach, so hidden devices are never sent the command.", "Inventory:Read, management group scoped, gates from-inventory-query. Devices outside the caller's scope are left out of the match.", "Infrastructure:Read, management group scoped, gates the members list and is applied before paging. It also gates a direct create whose device_ids list is not empty.", "Infrastructure:Write (create, pin, unpin) and Infrastructure:Delete (delete) are borrowed labels for the MCP tier check. They are not grantable RBAC permissions."], "audit": ["result_set.create, written for each create or re-eval attempt that passes validation. The outcome is success, denied or failure, and the detail carries a reason token. The success row is written after the set exists and a failed write does not undo it. A request refused at validation with a 400 (bad JSON, an oversized sql, or RESULT_SET_REEVAL_STALE_SOURCE) writes no row, except that a refusal for a NUL byte in the name, the sql, an instruction parameter or parent_id writes a result_set.create row with outcome denied and reason=field_contains_nul.", "result_set.pin, result_set.unpin and result_set.delete, written on success.", "result_set.access, outcome denied, written when an id is not found or not owned by the caller.", "result_set.list, result_set.members and result_set.lineage, outcome failure only, written when the store read fails. Successful reads are not audited.", "result_set.heal, written when re-eval discards a stored query that nests too deeply.", "result_set.create.access_denied, result_set.list.access_denied and the matching verbs for detail, members, lineage, pin, unpin and delete, outcome denied, written when a service-scoped token is refused."], "notes": ["Service-scoped API tokens get a 403 on the nine routes that do not dispatch, and the error names no permission to ask for. The three routes that dispatch (from-echo-query, from-instruction-result, re-eval) rely on the Execution:Execute check instead.", "A token that carries an MCP tier is also held to that tier's policy on create, pin, unpin and delete. Plain sessions and tokens without a tier are not affected by that check.", "Every route here has an MCP twin, for example list_result_sets, create_result_set_from_echo_query and reevaluate_result_set."]},
       "good_to_know": [{"label": "Pending sets", "text": "The two dispatching producers and re-eval answer 202 with status pending and device_count 0. Poll GET /result-sets/{id} until status is materialized, or watch source_execution_id on the events stream. A direct create and an inventory query answer 201 with the finished set."}, {"label": "After a dispatch", "text": "If the store fails or the quota is hit after the command was already sent, the error message says so and carries the execution id. Do not send the request again. Look up that execution to see what happened."}, {"label": "Nobody reached", "text": "A 503 with RESULT_SET_NO_AGENTS means the command reached no agent. Targets may be unreachable, hidden from the caller, quarantined, or withheld because containment state could not be read. The response does not say which, because hidden devices must stay hidden."}, {"label": "Parent ids", "text": "On the two dispatching producers parent_id may be an rs_ id or the name of one of the caller's own sets. A direct create and the inventory query take the rs_ id only, and the id in a route path is always an rs_ id. A parent_id that is empty or not a string is rejected with 400 and never ignored."}, {"label": "Inventory query", "text": "The query reads at most 5000 inventory rows. If the read is cut short, or a record cannot be parsed, the route answers 503 and creates nothing, so a set is never narrower than the true match. With parent_id, only members of that parent are kept."}, {"label": "Re-eval", "text": "Only sets made by an Echo query or an instruction run can be re-evaluated. The result is a new set, and a named original gives it the same name with the suffix (re-eval). The original is left alone. The caller's current permission and visibility apply, so the new members can differ. It is refused with 400 if the original was built from a parent set that has since been deleted."}, {"label": "Members and counts", "text": "The members list shows only devices the caller can see, and that narrowing happens before the page limit. The device_count on the set record is not narrowed, so it can be larger than what the list returns."}, {"label": "Unknown ids on create", "text": "If any id in device_ids is unknown or hidden from the caller the whole request is refused with 400. The message names up to 20 of them. An unknown id and a hidden one look the same."}, {"label": "Fail-closed reads", "text": "List, members and lineage answer 503 with retry_after_ms 5000 when the store cannot be read. They never return an empty list for a failed read."}, {"label": "Pin and delete", "text": "A pinned set cannot be deleted until it is unpinned, and the 51st pin is refused. A delete answers 200 with deleted true, not 204."}, {"label": "Input checks", "text": "Each inventory condition is checked before the query runs: plugin, field and op must be strings, and the value must be a string, a number (with a comparison operator) or a boolean (with == or !=). A bad condition is a 400. On from-instruction-result a matcher that is present but not a JSON object, or has a malformed threshold, is a 400 and nothing is dispatched."}, {"label": "Who becomes a member", "text": "An Echo query keeps agents that returned at least one row, or every successful responder when include_empty is true. An instruction run with no matcher keeps every successful responder, and its matcher can ask for any response, a minimum number of Echo rows, or a test on one output column. A responder that failed never qualifies."}],
       "docs": ["docs/user-manual/rbac.md"]
     }},
@@ -2009,25 +2011,25 @@ const std::string& openapi_spec() {
 )json"
         R"json(
     "/management-groups/{id}/members": {
-      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Member added", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}}}
+      "post": {"operationId": "postManagementGroupsByIdMembers", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}}}}}, "summary": "Add member to management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Member added", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberAddedResponse"}}}}, "400": {"description": "agent_id missing, or it holds a control byte or invalid UTF-8"}, "404": {"description": "No management group has that id; nothing is written and no audit row is added"}, "503": {"description": "Store fault: nothing was added (retryable; envelope includes retry_after_ms)"}}}
     },
     "/management-groups/{id}/members/{agent_id}": {
-      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Member removed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}}}
+      "delete": {"operationId": "deleteManagementGroupsByIdMembersByAgentId", "summary": "Remove member from management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Member removed", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupMemberRemovedResponse"}}}}, "400": {"description": "agent_id holds a control byte or invalid UTF-8"}, "503": {"description": "Store fault: nothing was removed (retryable; envelope includes retry_after_ms)"}}}
     },
     "/management-groups/{id}/roles": {
       "get": {"operationId": "getManagementGroupsByIdRoles", "summary": "List roles assigned to a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "List of role assignments", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleListResponse"}}}}}},
-      "post": {"operationId": "postManagementGroupsByIdRoles", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_id", "role_name"], "properties": {"principal_type": {"type": "string", "default": "user"}, "principal_id": {"type": "string"}, "role_name": {"type": "string", "enum": ["Operator", "Viewer"], "description": "Only these two roles can be delegated; any other value is a 403."}}}}}}, "summary": "Assign a role on a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Role assigned", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleAssignedResponse"}}}}}},
-      "delete": {"operationId": "deleteManagementGroupsByIdRoles", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "description": "The body, not the URL, names the grant to remove.", "properties": {"principal_type": {"type": "string", "default": "user"}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}}}}}}, "summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleUnassignedResponse"}}}}}}
+      "post": {"operationId": "postManagementGroupsByIdRoles", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_id", "role_name"], "properties": {"principal_type": {"type": "string", "default": "user"}, "principal_id": {"type": "string"}, "role_name": {"type": "string", "enum": ["Operator", "Viewer"], "description": "Only these two roles can be delegated; any other value is a 403."}}}}}}, "summary": "Assign a role on a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Role assigned", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleAssignedResponse"}}}}, "400": {"description": "Invalid JSON, a body that is not an object, a field of the wrong type, a missing field, a control byte or invalid UTF-8 in a field, or the store refuses the assignment as invalid"}, "404": {"description": "No management group has that id; nothing is written and no audit row is added"}, "503": {"description": "Store fault: nothing was assigned (retryable; envelope includes retry_after_ms)"}}},
+      "delete": {"operationId": "deleteManagementGroupsByIdRoles", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "description": "The body, not the URL, names the grant to remove.", "properties": {"principal_type": {"type": "string", "default": "user"}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}}}}}}, "summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupRoleUnassignedResponse"}}}}, "400": {"description": "Invalid JSON, or a control byte or invalid UTF-8 in a field"}, "503": {"description": "Store fault: nothing was unassigned (retryable; envelope includes retry_after_ms)"}}}
     },
     "/management-groups/agent-count-preview": {
       "get": {"operationId": "getManagementGroupsAgentCountPreview", "summary": "Preview the agent count a would-be management group would match", "tags": ["Management Groups"], "description": "MCP twin: preview_management_group_agent_count. REST/MCP twin of the dashboard's /fragments/create-group-form live scoped count; this route and the MCP twin return the same result; the dashboard fragment computes its own equivalent count, except that for an over-bound filter it hides the count and shows a static sentence. Used before POST /api/v1/management-groups to preview how many currently-visible agents would match. Requires ManagementGroup:Write, matching the fragment's permission check exactly (only an operator who could create the group may preview it), not ManagementGroup:Read, even though this route performs no mutation. filters are supplied as repeated query params using the SAME mangling the fragment applies to a column name (lowercase, spaces/dashes -> underscore, e.g. Local Addr -> local_addr) but WITHOUT the fragment's f_ key prefix (supply local_addr, not f_local_addr); an empty filter set returns a genuine 0 (no scoped count to report), never a store read. Scope is the set of agents visible to the caller under Response:Read, with an elevated session getting the JIT full-fleet view. The response also carries unindexed_filter_keys (always present; empty when none): the mangled keys of any filter whose value is longer than 2048 bytes as ingest stores it (a NUL or invalid UTF-8 byte counts as 3), in a stable order (sorted by key) without duplicates. Such a value is not indexed in newly stored responses, so when this list is non-empty agent_count can be 0 or an undercount. Forensics-tier rows (those written by a plugin with an action on the Forensics securable) are counted only for a caller who also holds Forensics:Read: a global grant (there is no management-group-scoped read tier for these rows, so a grant scoped to a management group does not admit them), and with RBAC off Forensics:Read is administrator-only. For any other caller those rows are absent from the count, with no marker, so a low or zero count does NOT prove that no matching data exists. If the caller's Forensics authority cannot be determined the route answers a retryable 503 (retry_after_ms) instead of a partial count.", "parameters": [{"name": "command_id", "in": "query", "schema": {"type": "string"}, "description": "The response set's instruction/command id to count against"}, {"name": "plugin", "in": "query", "schema": {"type": "string"}, "description": "Plugin name whose response columns the filter keys are matched against"}], "responses": {"200": {"description": "{data: {agent_count, unindexed_filter_keys}, meta}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MgmtGroupAgentCountPreviewResponse"}}}}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks ManagementGroup:Write"}, "503": {"description": "Response store degraded (preview unavailable), or the caller's Forensics authority could not be determined (retryable); envelope includes retry_after_ms."}}}
     },
     "/engine-principals/{id}/roles": {
       "get": {"operationId": "getEnginePrincipalsByIdRoles", "summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/SecurityEngineRoleAssignment"}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "RBAC store unavailable"}}},
-      "post": {"operationId": "postEnginePrincipalsByIdRoles", "summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"assigned": {"type": "boolean"}, "principal_id": {"type": "string"}, "role": {"type": "string"}}, "required": ["assigned", "principal_id", "role"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller lacks Security:Write, or is an engine session (always refused)"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
+      "post": {"operationId": "postEnginePrincipalsByIdRoles", "summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"assigned": {"type": "boolean"}, "principal_id": {"type": "string"}, "role": {"type": "string"}}, "required": ["assigned", "principal_id", "role"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected / role name holds a control byte"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller lacks Security:Write, or is an engine session (always refused)"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
     },
     "/engine-principals/{id}/roles/{role}": {
-      "delete": {"operationId": "deleteEnginePrincipalsByIdRolesByRole", "summary": "Unassign a fleet-wide RBAC role from an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}, {"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned (idempotent — success even if not held)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"unassigned": {"type": "boolean", "description": "True even when the role was not held (idempotent)."}}, "required": ["unassigned"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller lacks Security:Write, or is an engine session (always refused)"}, "503": {"description": "RBAC store unavailable"}}}
+      "delete": {"operationId": "deleteEnginePrincipalsByIdRolesByRole", "summary": "Unassign a fleet-wide RBAC role from an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}, {"name": "role", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned (idempotent — success even if not held)", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"unassigned": {"type": "boolean", "description": "True even when the role was not held (idempotent)."}}, "required": ["unassigned"]}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}, "required": ["data", "meta"]}}}}, "400": {"description": "Role name holds a control byte"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Caller lacks Security:Write, or is an engine session (always refused)"}, "503": {"description": "RBAC store unavailable"}}}
     })json"
         // Split here so each raw-string literal stays under MSVC's 16,380-byte
         // C2026 cap. Adjacent string literals are concatenated at compile time,
@@ -2840,7 +2842,7 @@ const std::string& openapi_spec() {
     },
     "/result-sets": {
       "get": {"operationId": "getResultSets", "summary": "List the caller's own result sets", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Owner-scoped: every result set is visible only to its owner_principal (session->username). Service-scoped API tokens are denied outright (403): owner-scoping keys on the minting principal's username, which a sibling service token of the same minter would otherwise share.", "parameters": [{"name": "cursor", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Opaque pagination cursor from a prior response's next_cursor"}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer"}, "description": "Max rows, 1-500 (default 50); an integer outside the range uses the default"}], "responses": {"200": {"description": "{result_sets: [<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}>], next_cursor}", "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"type": "object", "required": ["result_sets", "next_cursor"], "properties": {"result_sets": {"type": "array", "items": {"$ref": "#/components/schemas/ResultSet"}}, "next_cursor": {"type": "string", "description": "Empty string on the last page."}}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "400": {"description": "limit is not one base-10 integer"}, "403": {"description": "Fleet-wide result-set list denied to a service-scoped token"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — a genuine database read failure (Retry-After present)"}}},
-      "post": {"operationId": "postResultSets", "summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reason as the GET list). Synchronous: lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (the parent is owner-checked before the lineage edge is persisted). When device_ids is non-empty, the route additionally checks that field against the caller's Infrastructure:Read scope (each id must exist and be visible to the caller); a request that omits device_ids (or supplies an empty array) is unaffected and pays no extra cost.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "maxLength": 64, "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string", "maxLength": 256}, "description": "The initial member set. Each entry is capped at 256 bytes (400 \"a device_ids entry exceeds 256 bytes\", checked before the existence/scope lookup below). Every entry must name a device that exists and is visible to the caller's own Infrastructure:Read scope -- a nonexistent or out-of-scope id rejects the WHOLE request (400 RESULT_SET_UNKNOWN_DEVICE_ID), never a silent drop or a partial create"}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}>", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, a device_ids entry exceeding 256 bytes, device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS), device_ids contains an id that does not exist or is not visible to the caller (RESULT_SET_UNKNOWN_DEVICE_ID -- rejects the whole request, checked only when device_ids is non-empty), parent_id supplied but empty/non-string (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE -- the device_ids existence/scope check itself is unwired or its backing agent registry is unavailable; only reachable when device_ids is non-empty, a request without it is unaffected"}}}
+      "post": {"operationId": "postResultSets", "summary": "Create a result set directly from pre-computed device ids", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires an authenticated session; service-scoped API tokens are denied outright (403, same cross-service-reach reason as the GET list). Synchronous: lands materialized immediately (e.g. dashboard \"I have a CSV\" import), unlike the from-* async producers below. An optional parent_id parents the new set onto an owned existing set (the parent is owner-checked before the lineage edge is persisted). When device_ids is non-empty, the route additionally checks that field against the caller's Infrastructure:Read scope (each id must exist and be visible to the caller); a request that omits device_ids (or supplies an empty array) is unaffected and pays no extra cost.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "source_kind": {"type": "string", "default": "manual_curate"}, "source_payload": {"description": "Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"}, "parent_id": {"type": "string", "maxLength": 64, "description": "An existing set owned by the caller to parent this one onto"}, "device_ids": {"type": "array", "items": {"type": "string", "maxLength": 256}, "description": "The initial member set. Each entry is capped at 256 bytes (400 \"a device_ids entry exceeds 256 bytes\", checked before the existence/scope lookup below). Every entry must name a device that exists and is visible to the caller's own Infrastructure:Read scope -- a nonexistent or out-of-scope id rejects the WHOLE request (400 RESULT_SET_UNKNOWN_DEVICE_ID), never a silent drop or a partial create"}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}>", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, a device_ids entry exceeding 256 bytes, device_ids exceeds the per-set member cap (100000, RESULT_SET_TOO_MANY_MEMBERS), device_ids contains an id that does not exist or is not visible to the caller (RESULT_SET_UNKNOWN_DEVICE_ID -- rejects the whole request, checked only when device_ids is non-empty), parent_id supplied but empty/non-string (RESULT_SET_BAD_PARENT), parent_id exceeds 64 bytes, or name, source_kind or parent_id contains a NUL byte (RESULT_SET_BAD_REQUEST: name, source_kind and parent_id must not contain a NUL byte)"}, "403": {"description": "Result-set create denied to a service-scoped token"}, "404": {"description": "parent_id supplied but not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (10000, RESULT_SET_QUOTA)"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE -- the device_ids existence/scope check itself is unwired or its backing agent registry is unavailable; only reachable when device_ids is non-empty, a request without it is unaffected"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #4980 fix: the
         // #4980 service-scope 403 description addition below pushed this
@@ -2851,10 +2853,10 @@ const std::string& openapi_spec() {
       "post": {"operationId": "postResultSetsFromInventoryQuery", "summary": "Create an owner-scoped result set from a synchronous inventory query", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires Inventory:Read (a synchronous read of the inventory store, not a dispatch; same securable as GET /api/v1/inventory/software). Service-scoped API tokens are denied outright (403), for the same cross-service-reach reason as the other result-set routes that do not dispatch: management-group confinement, which this route also applies, does not by itself close that gap, since the created set is owned by the minting principal's identity, not the token's own service tag. Membership is every agent matching the supplied conditions, optionally narrowed to an owned parent set's current members. When the underlying inventory read hits the server row (5000) or 8 MiB aggregate payload cap, the route returns 503 rather than persisting a silently-incomplete set (a fleet-targeting set is never silently narrowed).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["conditions"], "properties": {"name": {"type": "string"}, "combine": {"type": "string", "enum": ["all", "any"], "default": "all"}, "conditions": {"type": "array", "items": {"type": "object", "properties": {"plugin": {"type": "string"}, "field": {"type": "string"}, "op": {"type": "string"}, "value": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}], "description": "A string, or a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically and exactly, and a stored numeric string counts as a number; JSON integers are exact and every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is refused, so send an integer, or the decimal as a string under >, >=, <, <= (at most 15 significant digits, below 2^53, not subnormal); write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as \"1e16\" (read exactly)), or a boolean for == and != only. Null, an array, an object, or a number/boolean under any other op is refused (400)."}}}}, "parent_id": {"type": "string", "maxLength": 64}}}}}}, "responses": {"201": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}>", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), parent_id exceeds 64 bytes, or a condition that is not an object, has a non-string plugin/field/op, or has a value of a refused type"}, "403": {"description": "Result-set create denied to a service-scoped token (checked before any other gate); unlike the other result-set routes that do not dispatch, this route also has a real Inventory:Read RBAC gate underneath that check, so a caller past the service-scope check can still be denied here by that gate: no management-group grant for Inventory:Read, an MCP-tier restriction, or, for an engine principal, RBAC disabled or no grant for Inventory:Read"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap (RESULT_SET_QUOTA)"}, "503": {"description": "Inventory store unavailable/degraded, or the query was truncated at the row/byte cap (refuses to materialise a partial set); or, when parent_id is supplied, RESULT_SET_STORE_UNAVAILABLE reading the parent set's own members page mid-pagination (a distinct cause from the inventory store read degrading)"}}}
     },
     "/result-sets/from-echo-query": {
-      "post": {"operationId": "postResultSetsFromEchoQuery", "summary": "Create a result set from an async dispatched Echo SQL query", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the echo plugin in parent_id's scope (or __all__ when parent_id is omitted); the SQL runs agent-side in a read-only sandbox, and the server only length-checks it (max 100 KiB). Membership is every agent that returned >= 1 row, or every responder when include_empty=true. Async: lands a pending row that the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution. An agent whose query failed is not a member: the filled set reports how many in agents_failed and sets partial.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}> with status=pending", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, sql reads a raw capture table - a $<Source>_Live name or a <source>_live table, which Echo no longer keeps (RESULT_SET_REEVAL_STALE_SOURCE; query the hourly roll-up instead, for example $Process_Hourly), parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED: the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH: a command was already dispatched but the store fault occurred persisting the pending row afterward; do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch): the per-owner quota could not be verified before dispatch; nothing sent, safe to retry"}}}
+      "post": {"operationId": "postResultSetsFromEchoQuery", "summary": "Create a result set from an async dispatched Echo SQL query", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the echo plugin in parent_id's scope (or __all__ when parent_id is omitted); the SQL runs agent-side in a read-only sandbox, and the server only length-checks it (max 100 KiB). Membership is every agent that returned >= 1 row, or every responder when include_empty=true. Async: lands a pending row that the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution. An agent whose query failed is not a member: the filled set reports how many in agents_failed and sets partial.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}> with status=pending", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, sql reads a raw capture table - a $<Source>_Live name or a <source>_live table, which Echo no longer keeps (RESULT_SET_REEVAL_STALE_SOURCE; query the hourly roll-up instead, for example $Process_Hourly), parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), parent_id exceeds 64 bytes, or name, sql or parent_id contains a NUL byte (RESULT_SET_BAD_REQUEST; nothing is dispatched and a result_set.create denied row is written)"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED: the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH: a command was already dispatched but the store fault occurred persisting the pending row afterward; do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch): the per-owner quota could not be verified before dispatch; nothing sent, safe to retry"}}}
     },
     "/result-sets/from-instruction-result": {
-      "post": {"operationId": "postResultSetsFromInstructionResult", "summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-echo-query. An echo.sql definition whose SQL (the params.sql value, else the definition's own default) reads a raw capture table is refused with RESULT_SET_REEVAL_STALE_SOURCE, the same as from-echo-query. If the definition runs a Forensics-tier plugin (an action on the Forensics securable) the set materializes with no members for every creator, because the materializer never reads Forensics-tier output; an empty set from such a definition says nothing about the fleet.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} - selects which responders join the set. {kind: echo_rows_ge, n} needs n to be a JSON integer from 1 to 2147483647"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}> with status=pending", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, missing instruction_id, instruction_id/params exceeds its bound, a matcher that is not an object or whose n or kind is malformed, an echo.sql definition whose SQL reads a raw capture table - a $<Source>_Live name or a <source>_live table, which Echo no longer keeps (RESULT_SET_REEVAL_STALE_SOURCE; nothing is dispatched), parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), or parent_id exceeds 64 bytes"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED: the dispatch-visibility gate is not wired. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH: a command was already dispatched but the store fault occurred persisting the pending row afterward; do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch): the per-owner quota could not be verified before dispatch; nothing sent, safe to retry"}}}
+      "post": {"operationId": "postResultSetsFromInstructionResult", "summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-echo-query. An echo.sql definition whose SQL (the params.sql value, else the definition's own default) reads a raw capture table is refused with RESULT_SET_REEVAL_STALE_SOURCE, the same as from-echo-query. If the definition runs a Forensics-tier plugin (an action on the Forensics securable) the set materializes with no members for every creator, because the materializer never reads Forensics-tier output; an empty set from such a definition says nothing about the fleet.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} - selects which responders join the set. {kind: echo_rows_ge, n} needs n to be a JSON integer from 1 to 2147483647"}, "parent_id": {"type": "string", "maxLength": 64}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}> with status=pending", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "400": {"description": "Invalid JSON, missing instruction_id, instruction_id/params exceeds its bound, a matcher that is not an object or whose n or kind is malformed, an echo.sql definition whose SQL reads a raw capture table - a $<Source>_Live name or a <source>_live table, which Echo no longer keeps (RESULT_SET_REEVAL_STALE_SOURCE; nothing is dispatched), parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT), parent_id exceeds 64 bytes, or name, a params key or value, or parent_id contains a NUL byte (RESULT_SET_BAD_REQUEST; nothing is dispatched and a result_set.create denied row is written)"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED: the dispatch-visibility gate is not wired. Or RESULT_SET_STORE_FAULT_AFTER_DISPATCH: a command was already dispatched but the store fault occurred persisting the pending row afterward; do not re-send, poll GET /api/v1/executions/{id} instead"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or RESULT_SET_STORE_UNAVAILABLE (pre-dispatch): the per-owner quota could not be verified before dispatch; nothing sent, safe to retry"}}}
     },
     "/result-sets/{id}": {
       "get": {"operationId": "getResultSetsById", "summary": "Get one result set's metadata", "tags": ["Result Sets"], "description": "Always available in a running server. If the result-set store cannot be constructed (for example Postgres is unreachable at boot) the server refuses to start; it never runs in a degraded mode without it. Owner-scoped (non-owner is indistinguishable from missing: 404). Service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, partial}>", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResultSetEnvelope"}}}}, "403": {"description": "Result-set detail denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}},
@@ -4913,9 +4915,64 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(JObj().add("deleted", true).str()), "application/json");
         });
 
+    // A management-group write whose store call reported an error answers a
+    // retryable 503 with a fixed message (the store's libpq text is never
+    // echoed), never a 2xx. The caller writes the matching `failure` audit row.
+    const auto mgmt_write_failed = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(
+            detail::a4_error(res, "management group store unavailable",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                 .remediation = "retry shortly"}),
+            "application/json");
+    };
+
+    // The member and role id fields reach a text bind: a control byte or an
+    // invalid UTF-8 sequence is refused up front (400) instead of becoming a
+    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (same rule).
+    const auto mgmt_text_ok = [](std::string_view s) {
+        if (!rbac_text_is_clean(s))
+            return false;
+        for (std::size_t i = 0; i < s.size();) {
+            if (static_cast<unsigned char>(s[i]) < 0x80) {
+                ++i;
+                continue;
+            }
+            const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
+            if (len == 0)
+                return false;
+            i += len;
+        }
+        return true;
+    };
+
+    // True only when the store answered authoritatively that the group does not
+    // exist (a failed read is not "absent"). Used after a write failed to tell a
+    // missing group (the caller's mistake, 404) from a store fault (503). Twin:
+    // the same check in mcp_server.cpp.
+    const auto mgmt_group_confirmed_absent = [](auto& store, const std::string& group_id) {
+        auto g = store->get_group_checked(group_id);
+        return g.has_value() && !g->has_value();
+    };
+
+    // The store reports a fault with one of the fixed messages in mgmt_group_error.hpp (matched
+    // on the prefix, never on a word anywhere in the message, because a validation message can
+    // echo caller text); every other message is a validation answer.
+    // Twin: classify_mgmt_group_error in mcp_server.cpp, the same function.
+    const auto mgmt_error_is_store_fault = [](const std::string& msg) {
+        return mgmt_group_error_is_store_fault(msg);
+    };
+
+    const auto mgmt_group_not_found = [](httplib::Response& res) {
+        res.status = 404;
+        res.set_content(detail::a4_error(res, "group not found"), "application/json");
+    };
+
     // Members
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
-              [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+              [perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
+               mgmt_group_confirmed_absent, mgmt_group_not_found](const httplib::Request& req,
+                                                                  httplib::Response& res) {
                   if (!perm_fn(req, res, "ManagementGroup", "Write"))
                       return;
                   if (!mgmt_store) {
@@ -4926,13 +4983,39 @@ void RestApiV1::register_routes(
 
                   auto group_id = req.matches[1].str();
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  if (body.is_discarded() || !body.is_object()) {
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "invalid JSON: body must be a JSON object"),
+                                      "application/json");
+                      return;
+                  }
                   auto agent_id = body.value("agent_id", "");
                   if (agent_id.empty()) {
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "agent_id required"), "application/json");
                       return;
                   }
-                  mgmt_store->add_member(group_id, agent_id);
+                  if (!mgmt_text_ok(agent_id)) {
+                      audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
+                               group_id, "invalid_agent_id");
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "agent_id contains invalid characters"),
+                                      "application/json");
+                      return;
+                  }
+                  if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
+                      // A well-formed id naming no group fails the membership foreign
+                      // key: answer 404 (no failure row, no retry hint), not a retryable 503.
+                      if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
+                          mgmt_group_not_found(res);
+                          return;
+                      }
+                      spdlog::warn("management_group.add_member store failure: {}", added.error());
+                      audit_fn(req, "management_group.add_member", "failure", "ManagementGroup",
+                               group_id, "store_error");
+                      mgmt_write_failed(res);
+                      return;
+                  }
                   audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
                            group_id, agent_id);
                   res.status = 201;
@@ -4941,7 +5024,8 @@ void RestApiV1::register_routes(
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
-        [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, audit_fn, mgmt_store, mgmt_write_failed,
+         mgmt_text_ok](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Write"))
                 return;
             if (!mgmt_store) {
@@ -4952,7 +5036,21 @@ void RestApiV1::register_routes(
 
             auto group_id = req.matches[1].str();
             auto agent_id = req.matches[2].str();
-            mgmt_store->remove_member(group_id, agent_id);
+            if (!mgmt_text_ok(agent_id)) {
+                audit_fn(req, "management_group.remove_member", "denied", "ManagementGroup",
+                         group_id, "invalid_agent_id");
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "agent_id contains invalid characters"),
+                                "application/json");
+                return;
+            }
+            if (auto removed = mgmt_store->remove_member(group_id, agent_id); !removed) {
+                spdlog::warn("management_group.remove_member store failure: {}", removed.error());
+                audit_fn(req, "management_group.remove_member", "failure", "ManagementGroup",
+                         group_id, "store_error");
+                mgmt_write_failed(res);
+                return;
+            }
             audit_fn(req, "management_group.remove_member", "success", "ManagementGroup", group_id,
                      agent_id);
             res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
@@ -5036,8 +5134,9 @@ void RestApiV1::register_routes(
              });
 
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
-              [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
-                                                                   httplib::Response& res) {
+              [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store, mgmt_write_failed, mgmt_text_ok,
+               mgmt_group_confirmed_absent, mgmt_group_not_found,
+               mgmt_error_is_store_fault](const httplib::Request& req, httplib::Response& res) {
                   auto session = auth_fn(req, res);
                   if (!session)
                       return;
@@ -5055,6 +5154,23 @@ void RestApiV1::register_routes(
                       return;
                   }
 
+                  // A body that is not an object, or a field of the wrong JSON type, is a 400
+                  // here, before the accessor below can throw (a bare 500). It is not defaulted
+                  // either: a numeric principal_type must not read as "user".
+                  const auto is_string_or_absent = [&body](const char* key) {
+                      return !body.contains(key) || body[key].is_string();
+                  };
+                  if (!body.is_object() || !is_string_or_absent("principal_type") ||
+                      !is_string_or_absent("principal_id") || !is_string_or_absent("role_name")) {
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, "the body must be a JSON object whose "
+                                                "principal_type, principal_id and role_name are "
+                                                "strings"),
+                          "application/json");
+                      return;
+                  }
+
                   auto principal_type = body.value("principal_type", "user");
                   auto principal_id = body.value("principal_id", "");
                   auto role_name = body.value("role_name", "");
@@ -5066,13 +5182,11 @@ void RestApiV1::register_routes(
                       return;
                   }
 
-                  if (role_name != "Operator" && role_name != "Viewer") {
-                      res.status = 403;
-                      res.set_content(detail::a4_error(res, "only Operator and Viewer roles can be delegated"),
-                                      "application/json");
-                      return;
-                  }
-
+                  // The permission gate comes first (after the body-shape answers above): a
+                  // caller with no rights on the group gets 403 whatever the field values hold
+                  // and adds no management_group.* audit row for it (the gate writes its own
+                  // denied row). The rows for a refused value below are written only for a
+                  // caller who passed it.
                   // guardian-confinement-2298 PR3 §3e: was a direct
                   // rbac_store->check_permission call, bypassing
                   // require_permission (and therefore the §3a flip) entirely —
@@ -5100,6 +5214,51 @@ void RestApiV1::register_routes(
                       return;
                   }
 
+                  // Checked before the closed role list so a role name holding a control byte
+                  // or invalid UTF-8 is a 400 with its own denied row, not a generic 403.
+                  if (!mgmt_text_ok(role_name)) {
+                      audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
+                               group_id, "invalid_role_name");
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res,
+                                           "role name must be valid text without control "
+                                           "characters"),
+                          "application/json");
+                      return;
+                  }
+
+                  if (role_name != "Operator" && role_name != "Viewer") {
+                      res.status = 403;
+                      res.set_content(detail::a4_error(res, "only Operator and Viewer roles can be delegated"),
+                                      "application/json");
+                      return;
+                  }
+
+                  if (!mgmt_text_ok(principal_type) || !mgmt_text_ok(principal_id)) {
+                      const char* detail_token = !mgmt_text_ok(principal_id)
+                                                     ? "invalid_principal_id"
+                                                     : "invalid_principal_type";
+                      audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
+                               group_id, detail_token);
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "principal_id and principal_type must "
+                                                            "not contain control characters"),
+                                      "application/json");
+                      return;
+                  }
+
+                  // The store's own check echoes the value in its message, so the closed set is
+                  // checked here and the caller gets a plain 400. "engine" is let through so the
+                  // store gives its own refusal (scoped engine grants are not offered here).
+                  if (principal_type != "user" && principal_type != "group" &&
+                      principal_type != "engine") {
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "principal_type must be user or group"),
+                                      "application/json");
+                      return;
+                  }
+
                   GroupRoleAssignment assignment;
                   assignment.group_id = group_id;
                   assignment.principal_type = principal_type;
@@ -5108,6 +5267,20 @@ void RestApiV1::register_routes(
 
                   auto result = mgmt_store->assign_role(assignment);
                   if (!result) {
+                      if (mgmt_error_is_store_fault(result.error())) {
+                          // A well-formed id naming no group fails the role foreign key:
+                          // 404 with no failure row; any other store fault is a 503.
+                          if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
+                              mgmt_group_not_found(res);
+                              return;
+                          }
+                          spdlog::warn("management_group.assign_role store failure: {}",
+                                       result.error());
+                          audit_fn(req, "management_group.assign_role", "failure",
+                                   "ManagementGroup", group_id, "store_error");
+                          mgmt_write_failed(res);
+                          return;
+                      }
                       res.status = 400;
                       res.set_content(detail::a4_error(res, result.error()), "application/json");
                       return;
@@ -5120,8 +5293,8 @@ void RestApiV1::register_routes(
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
-        [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
-                                                             httplib::Response& res) {
+        [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store, mgmt_write_failed,
+         mgmt_text_ok](const httplib::Request& req, httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -5165,7 +5338,35 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            mgmt_store->unassign_role(group_id, principal_type, principal_id, role_name);
+            if (!mgmt_text_ok(principal_type) || !mgmt_text_ok(principal_id) ||
+                !mgmt_text_ok(role_name)) {
+                const bool role_bad = !mgmt_text_ok(role_name);
+                const char* detail_token = role_bad ? "invalid_role_name"
+                                           : !mgmt_text_ok(principal_id)
+                                               ? "invalid_principal_id"
+                                               : "invalid_principal_type";
+                audit_fn(req, "management_group.unassign_role", "denied", "ManagementGroup",
+                         group_id, detail_token);
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res, role_bad ? "role name must be valid text "
+                                                     "without control characters"
+                                                   : "principal_id and principal_type must not "
+                                                     "contain control characters"),
+                    "application/json");
+                return;
+            }
+
+            if (auto unassigned =
+                    mgmt_store->unassign_role(group_id, principal_type, principal_id, role_name);
+                !unassigned) {
+                spdlog::warn("management_group.unassign_role store failure: {}",
+                             unassigned.error());
+                audit_fn(req, "management_group.unassign_role", "failure", "ManagementGroup",
+                         group_id, "store_error");
+                mgmt_write_failed(res);
+                return;
+            }
             audit_fn(req, "management_group.unassign_role", "success", "ManagementGroup", group_id,
                      principal_id + ":" + role_name);
             res.set_content(ok_json(JObj().add("unassigned", true).str()), "application/json");
@@ -5343,6 +5544,20 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "role is required"), "application/json");
                 return;
             }
+            // The same clean-text rule the unassign route applies, checked before any
+            // lookup so a role name the unassign route refuses cannot be assigned.
+            if (!rbac_text_is_clean(role_name)) {
+                (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                    "engine_principal.role.assigned", "denied",
+                                                    "EnginePrincipal", principal_id,
+                                                    "invalid_role_name");
+                res.status = 400;
+                res.set_content(detail::a4_error(res,
+                                                 "role name must be valid text without control "
+                                                 "characters"),
+                                "application/json");
+                return;
+            }
 
             // Target must name a live (non-revoked) engine principal.
             // MissingOrRevoked is a terminal answer (404); StoreUnreachable
@@ -5449,6 +5664,21 @@ void RestApiV1::register_routes(
 
             const std::string principal_id = "engine:" + req.matches[1].str();
             const std::string role_name = req.matches[2].str();
+
+            // A role name holding a NUL or other control byte is refused as a client error
+            // before the store is asked, so it is never reported as a store fault.
+            if (!rbac_text_is_clean(role_name)) {
+                (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                    "engine_principal.role.unassigned", "denied",
+                                                    "EnginePrincipal", principal_id,
+                                                    "invalid_role_name");
+                res.status = 400;
+                res.set_content(detail::a4_error(res,
+                                                 "role name must be valid text without control "
+                                                 "characters"),
+                                "application/json");
+                return;
+            }
 
             // unassign_role is an idempotent DELETE — success even when the
             // role was not held (matches the management-group sibling). With
@@ -8683,16 +8913,25 @@ void RestApiV1::register_routes(
                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "rbac.role.unassigned",
                                                     "denied", "User", principal_id,
                                                     result.error());
-                res.status = last_admin ? 409 : 503;
+                // RbacAdminAuthorityOwner::unassign_role refuses a role name or principal id
+                // that is not clean text with "invalid role name" / "invalid principal". This
+                // route cannot produce one today: both values come from the path regex above
+                // (`[A-Za-z0-9._-]+`), which admits no control byte. The refusal is still a
+                // caller mistake, not a store fault, so if the regex is ever widened it answers
+                // 400 and not a retryable 503.
+                const bool bad_input =
+                    result.error() == "invalid role name" || result.error() == "invalid principal";
+                res.status = last_admin ? 409 : bad_input ? 400 : 503;
                 // The 409 carries the store's business-rule message; a store fault
                 // returns a constant client message (the raw text, which can name
                 // relations or carry a CONTEXT line, goes only to the audit row).
                 res.set_content(
-                    detail::a4_error(res, last_admin
-                                              ? result.error()
-                                              : std::string("role unassignment store fault; retry, "
-                                                            "and if this persists escalate to an "
-                                                            "operator")),
+                    detail::a4_error(
+                        res, last_admin || bad_input
+                                 ? result.error()
+                                 : std::string("role unassignment store fault; retry, "
+                                               "and if this persists escalate to an "
+                                               "operator")),
                     "application/json");
                 return;
             }
@@ -14601,6 +14840,39 @@ void RestApiV1::register_routes(
                 rs_err(res, 503, "RESULT_SET_DISPATCH_UNAVAILABLE: command dispatch not wired");
                 return;
             }
+            // A value with an embedded NUL cannot be stored in the result-set row, and the row is
+            // written AFTER the command has been dispatched. Refuse it here, before anything is
+            // sent, so a command is never run and then reported as failed. The checked values are
+            // the name, every dispatched parameter key and value, and a string parent_id. The
+            // matcher and source payload checks are defence in depth only: the request body
+            // builder escapes a NUL when it serialises, so neither can carry one from a request.
+            const auto has_nul = [](std::string_view v) {
+                return v.find('\0') != std::string_view::npos;
+            };
+            bool nul_found = has_nul(name) || has_nul(matcher) || has_nul(source_payload);
+            if (!nul_found) {
+                for (const auto& [key, value] : params) {
+                    if (has_nul(key) || has_nul(value)) {
+                        nul_found = true;
+                        break;
+                    }
+                }
+            }
+            if (!nul_found && body.contains("parent_id") && body["parent_id"].is_string())
+                nul_found = has_nul(body["parent_id"].get_ref<const std::string&>());
+            if (nul_found) {
+                bool audit_ok = true;
+                if (audit_fn)
+                    audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                        std::string("reason=field_contains_nul source_kind=") +
+                                            std::string(src_kind));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                rs_err(res, 400,
+                       "RESULT_SET_BAD_REQUEST: name, parameters and parent_id must not "
+                       "contain a NUL byte");
+                return;
+            }
             // #1788: these three producers are OPERATOR dispatch surfaces that
             // admit on a bare GLOBAL Execution:Execute gate and then reach the
             // fleet by scope or `__all__` broadcast. The derived VisibleSet is
@@ -15095,6 +15367,30 @@ void RestApiV1::register_routes(
                     rs_err(res, 400,
                            std::format("source_kind must be at most {} bytes",
                                        yuzu::server::mcp::kResultSetSourceKindMaxLen));
+                    return;
+                }
+            }
+            // A NUL byte in a stored text value cannot be kept in the row: refuse it before
+            // any store call, with the same denied row and wording as the three producers.
+            {
+                const auto has_nul = [](std::string_view v) {
+                    return v.find('\0') != std::string_view::npos;
+                };
+                const std::string nul_kind =
+                    body.contains("source_kind")
+                        ? body["source_kind"].get<std::string>()
+                        : std::string(source_kind::kManualCurate);
+                if (has_nul(body.value("name", "")) || has_nul(nul_kind) ||
+                    (body.contains("parent_id") && body["parent_id"].is_string() &&
+                     has_nul(body["parent_id"].get_ref<const std::string&>()))) {
+                    const bool nul_audit_ok = audit_fn(
+                        req, "result_set.create", "denied", "ResultSet", "",
+                        "reason=field_contains_nul source_kind=" + audit_token(nul_kind));
+                    if (!nul_audit_ok)
+                        res.set_header("Sec-Audit-Failed", "true");
+                    rs_err(res, 400,
+                           "RESULT_SET_BAD_REQUEST: name, source_kind and parent_id must not "
+                           "contain a NUL byte");
                     return;
                 }
             }
