@@ -4661,6 +4661,7 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption plus a planted echo.db 
     ScratchDir d;
     make_legacy_tar_db_with_wal(d.path());
     fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal"); // the interrupted step
+    write_adoption_marker(d.path()); // what the interrupted run wrote before its first move
     const auto echo_db = d.path() / "echo.db";
     spit_file(echo_db, "planted by another account");
 
@@ -4727,6 +4728,7 @@ TEST_CASE("adopt_legacy_echo_db: a lone echo.db-wal is the resume state and is n
     ScratchDir d;
     make_legacy_tar_db_with_wal(d.path());
     fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal"); // the interrupted step
+    write_adoption_marker(d.path()); // what the interrupted run wrote before its first move
     bool probed = false;
     auto probe = [&](const fs::path&) {
         probed = true;
