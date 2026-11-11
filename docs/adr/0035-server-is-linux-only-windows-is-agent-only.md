@@ -420,7 +420,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      deployment plus re-enrollment, not a data migration: the CA store records the CA key's
      absolute path (`ca_store.ca_root.key_ref`), and a Linux server refuses a key outside its own
      CA directory, so a Windows server's restored database could not sign agent certificates or
-     publish CRLs. Carrying data over would need a server change, tracked as a follow-up.
+     publish CRLs. Carrying data over would need a server change; none is planned.
    - **#5325 and #1835** are closed as resolved by removal when this change merges.
    - Proof without an RC (owner decision, 2026-11-11): the static pins, plus a Windows rehearsal of
      the agent-only build, packaging and installer on a build box. The first stable tag after this

@@ -2533,11 +2533,11 @@ jobs:
           The server runs on Linux only (ADR-0035): use the container image or
           the Linux packages. \`YuzuServerSetup-*.exe\` is discontinued, and
           the Windows and macOS archives contain the agent only. To move an
-          existing Windows or macOS server to Linux, deploy a new Linux server,
-          enroll the agents with it, then retire the old one as "Moving a
-          Windows or macOS server to Linux" in
-          \`docs/user-manual/server-admin.md\` describes (its data cannot be
-          carried over; the section lists which leftover files hold secrets).
+          existing Windows or macOS server to Linux, follow "Moving a Windows
+          or macOS server to Linux" in \`docs/user-manual/server-admin.md\`:
+          its data cannot be carried over, so you deploy a new Linux server,
+          reinstall the agents against it, and delete the old server's
+          leftover files, which hold secrets.
 
           ### Windows silent install (GPO / SCCM / Intune)
           \`\`\`powershell
