@@ -271,7 +271,7 @@ TEST_CASE("evaluate_scope: a result set that is not ready or is incomplete is no
         REQUIRE(r.has_value());
         REQUIRE(r->size() == 1);
         CHECK(has(*r, "agent-win"));
-        auto t = eval("from_result_set:" + timed_out->id + " == \"true\"");
+        auto t = eval("from_result_set:" + timed_out->id);
         REQUIRE(t.has_value());
         CHECK(has(*t, "agent-win"));
     }
@@ -287,7 +287,7 @@ TEST_CASE("evaluate_scope: a result set that is not ready or is incomplete is no
         REQUIRE(r.has_value());
     }
     SECTION("an inverted comparison or a wrapped atom needs a complete set") {
-        aborts_unusable("from_result_set:" + partial->id + " != \"true\"", partial->id);
+        aborts_unusable("STARTSWITH(from_result_set:" + partial->id + ", \"r\")", partial->id);
         aborts_unusable("LEN(from_result_set:" + partial->id + ") == 0", partial->id);
     }
     SECTION("a non-owner never learns the state of another operator's pending set") {

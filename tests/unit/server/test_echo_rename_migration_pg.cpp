@@ -873,7 +873,7 @@ TEST_CASE("Echo rename: result_set_store v3 rewrites the source kind and matcher
         yuzu::server::ResultSetStore store{pool};
         REQUIRE(store.is_open());
     }
-    CHECK(version_of(dsn, "result_set_store") == "4"); // v3 rewrote the rows, v4 adds agents_failed
+    CHECK(version_of(dsn, "result_set_store") == "5"); // v3 rewrote the rows, v4 adds agents_failed, v5 agents_unanswered
     CHECK(one(dsn, "SELECT source_kind || '|' || matcher FROM result_set_store.result_sets WHERE "
                    "id = 'rs_legacy1'") == "echo_query|{\"kind\":\"echo_rows_ge\",\"n\":1}");
     CHECK(one(dsn, "SELECT source_kind || '|' || matcher FROM result_set_store.result_sets WHERE "

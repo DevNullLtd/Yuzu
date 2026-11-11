@@ -1807,10 +1807,10 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
 }
 
 // The from_result_set:<id> references whose result depends on the set being COMPLETE: every
-// use other than a plain membership test (`== "true"` or EXISTS) outside any NOT. An incomplete
-// set (an agent failed or never answered) is missing members, so a plain positive reference can
-// only under-match, but under a NOT (or `!=`, `== ""`, LEN, STARTSWITH ...) a missing member
-// evaluates as "matches". Such references must abort on an incomplete set.
+// use other than a plain membership test (the bare atom, which the parser lowers to EXISTS)
+// outside any NOT. An incomplete set (an agent failed or never answered) is missing members, so a
+// plain positive reference can only under-match, but under a NOT (or LEN, STARTSWITH ...) a
+// missing member evaluates as "matches". Such references must abort on an incomplete set.
 static void collect_completeness_dependent_result_set_ids(const yuzu::scope::Expression& expr,
                                                           bool negated,
                                                           std::vector<std::string>& out) {
@@ -1823,8 +1823,7 @@ static void collect_completeness_dependent_result_set_ids(const yuzu::scope::Exp
                 out.push_back(std::string(real.substr(kPrefix.size())));
             return;
         }
-        const bool plain = !negated && ((cond->op == yuzu::scope::CompOp::Eq && cond->value == "true") ||
-                                        cond->op == yuzu::scope::CompOp::Exists);
+        const bool plain = !negated && cond->op == yuzu::scope::CompOp::Exists;
         if (!plain)
             out.push_back(cond->attribute.substr(kPrefix.size()));
     } else if (const auto* comb = std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
