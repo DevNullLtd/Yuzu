@@ -50,9 +50,9 @@
  * SECTION 9 (the Apps tab) is the one deliberate exception to the characterization
  * rule above: AP-3.2 rewired /fragments/dex/apps onto DexApi::apps and replaced the
  * store-fed renderer with the pure `render_dex_apps_fragment(DexAppsModel, ...)`, so
- * its five goldens were REGENERATED on purpose and six states were added
+ * its five goldens were REGENERATED on purpose and seven states were added
  * (apps__error, __below-floor, __versions, __capped, __policy-custom,
- * __no-population). Its cases are pure (no store, no Postgres): shard C.
+ * __policy-refused, __no-population). Its cases are pure (no store, no Postgres): shard C.
  */
 #include "dex_apps_ui.hpp"
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
@@ -1261,12 +1261,11 @@ TEST_CASE("DEX apps UI: applications and versions capped", "[dex][golden][apps_u
     check_golden("apps__capped", page);
 }
 
-TEST_CASE("DEX apps UI: custom policy, renamed tiers, override row, refused-policy note",
+TEST_CASE("DEX apps UI: custom policy, renamed tiers, override row",
           "[dex][golden][apps_ui]") {
     DexPolicyInForce policy;
     policy.source = "custom";
     policy.revision = "7c41e9b2a05d3f68";
-    policy.fault = "edge_gap_below_minimum";
     policy.policy.tiers.names = {"Healthy", "Watch", "Degraded", "Critical"};
     policy.policy.tiers.edges = {92.0, 80.0, 55.0};
     policy.policy.interval_confidence = 0.90;
@@ -1290,20 +1289,25 @@ TEST_CASE("DEX apps UI: custom policy, renamed tiers, override row, refused-poli
     CHECK(contains(cell(page, "legacy.exe", "", kColScore), "Stable"));
     CHECK_FALSE(contains(cell(page, "legacy.exe", "", kColScore), "Healthy"));
     CHECK(contains(cell(page, "Teams", "", kColScore), "Healthy"));
-    CHECK(contains(page, "<b>The stored policy was refused.</b>"));
-    CHECK(contains(page, "<code class=\"dx-code\">edge_gap_below_minimum</code>"));
+    // a custom policy is a valid document, so the page never also claims it was refused
+    CHECK_FALSE(contains(page, "The stored policy was refused"));
     CHECK(contains(page, "Linux partial: it needs systemd-coredump as the active handler."));
     CHECK(contains(page, "The application drill-down covers every platform."));
     check_golden("apps__policy-custom", page);
 }
 
-TEST_CASE("DEX apps UI: a refused stored policy with the shipped defaults in force", "[dex][apps_ui]") {
+TEST_CASE("DEX apps UI: a refused stored policy with the shipped defaults in force",
+          "[dex][golden][apps_ui]") {
     DexPolicyInForce policy;
     policy.revision = "5b0e3c91d7a24f60";
     policy.fault = "edge_gap_below_minimum";
     const auto page = render_dex_apps_fragment(model_of(populated_rows(), 50, "windows", policy), 7, "windows");
     CHECK(contains(page, "default (a stored policy was refused), revision <code class=\"dx-code\">5b0e3c91d7a24f60</code>"));
     CHECK(contains(page, "The shipped defaults are in force until a valid policy is saved."));
+    CHECK(contains(page, "<b>The stored policy was refused.</b>"));
+    CHECK(contains(page, "<code class=\"dx-code\">edge_gap_below_minimum</code>"));
+    CHECK_FALSE(contains(page, "custom, revision"));
+    check_golden("apps__policy-refused", page);
 }
 
 TEST_CASE("DEX apps UI: unknown and zero population read in words", "[dex][golden][apps_ui]") {

@@ -65,8 +65,10 @@ figure for figure. The page needs `GuaranteedState:Read`.
   The application name links to the per-application blast-radius drill-down, which counts every
   platform; with a platform selected the page says so under the table.
 - **Platform and window.** Native buttons (keyboard-reachable) choose All platforms, Windows,
-  macOS or Linux (default All platforms) and 24h, 7d, 30d or All. Every figure is over the devices
-  of that platform that are online now. An unknown platform value is an error panel, not a default.
+  macOS or Linux (default All platforms) and 24h, 7d, 30d or All. Every figure is restricted to the
+  selected platform; share, rate and score use the devices online now, while crashes, hangs,
+  devices affected and last seen cover the selected window. An unknown platform value is an error
+  panel, not a default.
 - **Population and sources.** Under the title the page states the population (the devices of the
   scope online now, or that it is unknown or zero), which crash and hang sources are complete or
   partial for the scope, and the score policy in force (shipped defaults or custom, its revision,
