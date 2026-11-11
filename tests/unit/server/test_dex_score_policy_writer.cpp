@@ -35,14 +35,13 @@ std::string doc_with_excellent(double e) {
 
 const std::string kPrefixedError = std::string(kDbErrorPrefix) + "database write failed";
 
-// The recovery hint of every unknown-outcome 503, pinned whole as the live response body. The
-// served OpenAPI text and the rest-api.md runbook word its first branch as state ("the policy is
-// as it was before your request") and no longer repeat "the write did not apply"; that wording
-// difference is left to a later change to the writer's own string.
+// The recovery hint of every unknown-outcome 503, pinned whole as the live response body. Its
+// first branch is worded as state, like the served OpenAPI text and the rest-api.md runbook: a
+// write that applied and was then restored to the revision you sent also reads as that revision.
 const std::string kUnknownRemediation =
     "GET /api/v1/dex/score-policy and compare its revision: if it is the If-Match revision you "
-    "sent, the write did not apply; if it is any other revision, review the policy before "
-    "changing it again";
+    "sent, the policy is as it was before your request; if it is any other revision, review the "
+    "policy before changing it again";
 
 // The lost-race 409: it names no revision (the store was not re-read).
 const std::string kLostRaceMessage = "the stored policy changed while this write was being made";

@@ -547,8 +547,8 @@ TEST_CASE("score-policy routes: an ambiguous outcome is a 503 that names the sto
     CHECK(j["error"]["retry_after_ms"] == 2000);
     CHECK(j["error"]["remediation"] ==
           "GET /api/v1/dex/score-policy and compare its revision: if it is the If-Match "
-          "revision you sent, the write did not apply; if it is any other revision, review the "
-          "policy before changing it again");
+          "revision you sent, the policy is as it was before your request; if it is any other "
+          "revision, review the policy before changing it again");
     const std::string msg = j["error"]["message"];
     CHECK(msg.find(dex_score_policy_revision(doc_with_excellent(70.0))) != std::string::npos);
     CHECK(msg.find("not changed") == std::string::npos);

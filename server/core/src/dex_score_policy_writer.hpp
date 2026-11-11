@@ -510,8 +510,8 @@ apply_dex_score_policy(const DexScorePolicyWriteRequest& rq, const DexScorePolic
     out.status = Status::OutcomeUnknown;
     out.retry_after_ms = kDexScorePolicyRetryMs;
     out.remediation = "GET /api/v1/dex/score-policy and compare its revision: if it is the "
-                      "If-Match revision you sent, the write did not apply; if it is any other "
-                      "revision, review the policy before changing it again";
+                      "If-Match revision you sent, the policy is as it was before your request; "
+                      "if it is any other revision, review the policy before changing it again";
     if (re) {
         const bool intended = put ? (re->has_value() && **re == canonical) : !re->has_value();
         if (intended) {
