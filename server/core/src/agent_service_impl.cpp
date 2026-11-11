@@ -2310,14 +2310,14 @@ void AgentServiceImpl::note_unverified_frame(const std::string& command_id,
     if (noted.marked) {
         static RefusalLogThrottle marker_log(std::chrono::seconds(600));
         if (marker_log.should_warn(agent_id))
-            spdlog::warn("[ingest] the unverified-frame record is full for agent={}: every answer "
-                         "of that agent recorded in the next {} s is reported as not fully stored",
+            spdlog::warn("[ingest] the unverified-frame record is full for agent={}: for the "
+                         "next {} s every answer of that agent is reported as not fully stored",
                          yuzu::log_id_token(agent_id),
                          UnverifiedFrameRegistry::kDefaultMaxAgeSeconds);
     }
     if (noted.latched)
-        spdlog::warn("[ingest] the unverified-frame record cannot keep an entry: every agent "
-                     "answer recorded in the next {} s is reported as not fully stored (agent={})",
+        spdlog::warn("[ingest] the unverified-frame record cannot keep an entry: for the next "
+                     "{} s every agent answer is reported as not fully stored (agent={})",
                      UnverifiedFrameRegistry::kDefaultMaxAgeSeconds, yuzu::log_id_token(agent_id));
 }
 

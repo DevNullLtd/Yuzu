@@ -380,7 +380,7 @@ Prometheus metrics:
 
 Enforcement of the per-operator 10,000 cap and the per-operator pin cap fires `result_set_quota_rejected` so SREs can see runaway scripts before they wedge the table.
 
-`yuzu_result_sets_total{result="count_unreadable"}` counts a pending set the fill pass filled as incomplete because the tracker's dropped-answer count stayed unreadable for three pending timeouts (15 minutes) after the set was created. It is counted once, when that fill succeeds, beside `materialized`; a fill that fails counts only `materialize_failed` and the set is tried again. Until then the pass retries the set on each tick, logging at most one warning per set every 30 seconds (the log can be throttled away; the counter is the record).
+`yuzu_result_sets_total{result="count_unreadable"}` counts a pending set the fill pass filled as incomplete because the tracker's dropped-answer count stayed unreadable for three pending timeouts (15 minutes) after the set was created. It is counted once, when that fill succeeds, beside `materialized`; a fill that fails counts only `materialize_failed`. Until then the pass retries the set on each tick, logging at most one warning per set every 30 seconds (the log can be throttled away; the counter is the record).
 
 ## 10. Reference walkthrough — Chrome IR
 

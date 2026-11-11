@@ -3931,10 +3931,15 @@ groups:
           description: >-
             The server could not keep every record of an answer that may be
             missing from the response store, so it reported more answers as
-            not fully stored. The cause is a degraded provenance read: check
-            yuzu_exec_correlation_read_degrade_total{reason} first, then
-            yuzu_server_response_provenance_total{outcome="lookup_degraded"}
-            and PostgreSQL pool health. One agent sending many streaming
+            not fully stored. The record holds two kinds of answer: a
+            streaming frame whose provenance lookup failed (evidence:
+            yuzu_server_response_provenance_total{outcome="lookup_degraded"}),
+            and an answer the store did not keep whose tracker write failed
+            twice (evidence: yuzu_server_response_ingest_dropped_total with
+            reason store_not_open, pool_acquire_timeout or query_error, and
+            the server log line "upsert failed twice"). Check PostgreSQL
+            health and yuzu_exec_correlation_read_degrade_total{reason}
+            first. One agent sending many streaming
             frames while the read is degraded only amplifies it. Effect: an
             agent past its own share is marked, and for up to an hour that
             agent's answers read as not fully stored, so result sets it
@@ -3942,7 +3947,9 @@ groups:
             the evicted entry's command is remembered and every agent's
             answer to it reads as not fully stored. When too many agents are
             marked or too many commands remembered, a global latch is set:
-            for up to an hour every result set filled reads partial, and NOT,
+            for up to an hour every terminal answer ingested reads as not
+            fully stored, so result sets filled from those answers read
+            partial (sets already filled are not changed), and NOT,
             LEN and STARTSWITH scopes over those sets are refused with no
             retry hint. Re-run the affected
             commands once the cause is resolved. The server log names the

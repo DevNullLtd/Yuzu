@@ -789,6 +789,11 @@ cap has its command id remembered (at most 1,024 commands), and every agent of t
 reports `response_dropped`. When a marker or a command cannot be kept, a one-hour latch makes every
 terminal answer report `response_dropped`; only this and a remembered command reach other agents.
 Over-reporting a set as partial is the safe direction. Evictions count as
-`yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Residual: the
+`yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Evidence for a
+failed provenance lookup is `yuzu_server_response_provenance_total{outcome="lookup_degraded"}`; for
+an answer the store did not keep whose tracker write failed twice it is
+`yuzu_server_response_ingest_dropped_total{reason=~"store_not_open|pool_acquire_timeout|query_error"}`
+and the "upsert failed twice" log line. Check PostgreSQL health and
+`yuzu_exec_correlation_read_degrade_total{reason}` first. Residual: the
 record is held in the server process, so a restart, or a terminal frame served by a different
 replica than the non-terminal one, loses it and the set can read as complete without that frame's output.
