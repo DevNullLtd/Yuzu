@@ -2576,8 +2576,12 @@ public:
                           "not store unhealth. unverified_registry_overflow is not a row either: "
                           "it counts entries evicted from the in-memory record of answers that may "
                           "be missing (a streaming frame whose provenance lookup failed, or an "
-                          "answer the store did not keep whose tracker write failed twice); "
-                          "the affected answers are reported as not fully stored instead",
+                          "answer the store did not keep, for example per_agent_cap, "
+                          "malformed_identity_field or a failed terminal finalize, whose tracker "
+                          "write failed: closed, or failed twice; a failed terminal finalize is "
+                          "counted in no reason here, its evidence is the "
+                          "finalize_terminal_status log line); the affected answers are reported "
+                          "as not fully stored instead",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "

@@ -3934,24 +3934,29 @@ groups:
             not fully stored. The record holds two kinds of answer: a
             streaming frame whose provenance lookup failed (evidence:
             yuzu_server_response_provenance_total{outcome="lookup_degraded"}),
-            and an answer the store did not keep whose tracker write failed
-            twice (evidence: yuzu_server_response_ingest_dropped_total with
-            reason store_not_open, pool_acquire_timeout or query_error, and
-            the server log line "upsert failed twice"). Check PostgreSQL
+            and an answer the store did not keep (for example per_agent_cap,
+            malformed_identity_field, a failed terminal finalize) whose
+            tracker write failed (closed, or failed twice). Evidence for the
+            second: yuzu_server_response_ingest_dropped_total by reason and
+            the server log line "upsert failed twice"; a failed terminal
+            finalize is counted in no ingest_dropped reason, and its evidence
+            is the finalize_terminal_status log line. Check PostgreSQL
             health and yuzu_exec_correlation_read_degrade_total{reason}
             first. One agent sending many streaming
             frames while the read is degraded only amplifies it. Effect: an
-            agent past its own share is marked, and for up to an hour that
-            agent's answers read as not fully stored, so result sets it
-            contributes to read partial. When the record as a whole is full,
-            the evicted entry's command is remembered and every agent's
-            answer to it reads as not fully stored. When too many agents are
-            marked or too many commands remembered, a global latch is set:
-            for up to an hour every terminal answer ingested reads as not
-            fully stored, so result sets filled from those answers read
-            partial (sets already filled are not changed), and NOT,
-            LEN and STARTSWITH scopes over those sets are refused with no
-            retry hint. Re-run the affected
+            agent past its own share is marked, and that agent's answers read
+            as not fully stored for an hour after the last record the marker
+            covered, so result sets it contributes to read partial. When the
+            record as a whole is full, the evicted entry's command is
+            remembered and every agent's answer to it reads as not fully
+            stored. When the marker set or the command set is full, the
+            oldest member is dropped and a global latch is set; an agent id
+            longer than 256 bytes (Register and ProxyRegister refuse one) also
+            sets it. For an hour after the last record the latch covered every
+            terminal answer ingested reads as not fully stored, so result sets
+            filled from those answers read partial (sets already filled are
+            not changed), and NOT, LEN and STARTSWITH scopes over those sets
+            are refused with no retry hint. Re-run the affected
             commands once the cause is resolved. The server log names the
             agent when its marker is first set (at most once per 10 minutes
             per agent) and when the latch first sets ("unverified-frame

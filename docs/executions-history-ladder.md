@@ -782,18 +782,24 @@ written (`update_agent_status` returned false) is recorded in the same registry,
 or replayed frame of the pair still reports it. The registry keys on the exact agent id and a
 salted digest of the command id, so one agent's frames never read or erase another agent's record.
 It is bounded (about 4 MiB worst case, an estimate) and fails closed: 64 entries per agent, 4,096
-in all, one hour per entry. An agent
+in all, one hour per entry. Markers, remembered commands and the latch are set again on each
+eviction they stand for, so each lasts for an hour after the last record it covered. An agent
 past its own 64 is marked (at most 1,024 markers), and every answer of that agent then reports
 `response_dropped`: a flooding agent affects only its own answers. An entry evicted by the 4,096
 cap has its command id remembered (at most 1,024 commands), and every agent of that command then
-reports `response_dropped`. When a marker or a command cannot be kept, a one-hour latch makes every
-terminal answer report `response_dropped`; only this and a remembered command reach other agents.
-Over-reporting a set as partial is the safe direction. Evictions count as
-`yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Evidence for a
-failed provenance lookup is `yuzu_server_response_provenance_total{outcome="lookup_degraded"}`; for
-an answer the store did not keep whose tracker write failed twice it is
-`yuzu_server_response_ingest_dropped_total{reason=~"store_not_open|pool_acquire_timeout|query_error"}`
-and the "upsert failed twice" log line. Check PostgreSQL health and
+reports `response_dropped`. When the marker set or the command set is full, the oldest member is
+dropped and a latch is set that makes every terminal answer report `response_dropped`; an agent id
+longer than 256 bytes is never stored and sets the latch too (Register and ProxyRegister refuse
+such an id; the ingest paths check no length themselves). Only the latch and a remembered command
+reach other agents.
+Over-reporting a set as partial is the safe direction. Evictions, and an over-long agent id, count
+as `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Evidence for
+a failed provenance lookup is `yuzu_server_response_provenance_total{outcome="lookup_degraded"}`;
+for an answer the store did not keep (for example `per_agent_cap`, `malformed_identity_field`, a
+failed terminal finalize) whose tracker write failed (closed, or failed twice) it is
+`yuzu_server_response_ingest_dropped_total` by reason and the "upsert failed twice" log line; a
+failed terminal finalize is counted in no `ingest_dropped` reason, and its evidence is the
+`finalize_terminal_status` log line. Check PostgreSQL health and
 `yuzu_exec_correlation_read_degrade_total{reason}` first. Residual: the
 record is held in the server process, so a restart, or a terminal frame served by a different
 replica than the non-terminal one, loses it and the set can read as complete without that frame's output.

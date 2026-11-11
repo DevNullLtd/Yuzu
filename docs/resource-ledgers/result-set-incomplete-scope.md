@@ -66,11 +66,13 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
   agent's own cap evicts that agent's oldest entry and marks the agent (every pair of a marked agent
   reads as not fully stored; a flooding agent affects only its own pairs); past the global cap the
   oldest entry is evicted and its command remembered (every agent of it reads as not fully stored).
-  A full marker set or command set sets one latch under which every pair reads as not fully stored:
-  only these reach other agents. Each eviction is counted as
-  `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Entries,
-  markers, remembered commands and the latch last one hour (expired on every `note` and `contains`,
-  against `steady_clock` seconds). `note` inserts into its three indexes or none, sets a marker or
+  When the marker set or the command set is full, the oldest member is dropped and one latch is set
+  under which every pair reads as not fully stored: only the latch and a remembered command reach
+  other agents. Each eviction is counted as
+  `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Entries last
+  one hour; markers, remembered commands and the latch last for an hour after the last record they
+  covered (set again on each eviction; expired on every `note` and `contains`, against
+  `steady_clock` seconds). `note` inserts into its three indexes or none, sets a marker or
   remembers a command before it erases the entry that stands for it, and refreshes an existing
   marker or remembered command in place (the re-key allocates nothing, and the id is copied only
   when it is new), so an allocation failure leaves no orphan and loses no record. After such a
