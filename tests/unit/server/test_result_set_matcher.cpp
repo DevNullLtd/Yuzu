@@ -780,3 +780,13 @@ TEST_CASE("instruction raw capture predicate: stored param first then schema def
     CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), "not json"));
     CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), R"({"properties":{}})"));
 }
+
+TEST_CASE("unanswered_agent_count: terminal is zero and unproven completion is at least one",
+          "[result_set][rs_matcher][agents_unanswered]") {
+    CHECK(unanswered_agent_count(3, 1, true) == 2);
+    CHECK(unanswered_agent_count(1, 1, true) == 0);
+    CHECK(unanswered_agent_count(3, 5, true) == 0);
+    CHECK(unanswered_agent_count(0, 0, true) >= 1);
+    CHECK(unanswered_agent_count(3, 3, false) >= 1);
+    CHECK(unanswered_agent_count(0, 0, false) >= 1);
+}

@@ -602,6 +602,48 @@ TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op 
     }
 }
 
+// Migration v5 adds agents_unanswered. Roll the recorded version back to 4 and drop the column,
+// as a database last opened by the previous build would be, then open the store twice: the first
+// open applies v5 and reads the old row as complete, the second applies nothing and keeps data.
+TEST_CASE("ResultSetStore: migration v5 applies on a v4 database and old rows read complete",
+          "[pg][result_set][migration][agents_unanswered]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    std::string old_id;
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ResultSetStore store(pool);
+        REQUIRE(store.is_open());
+        auto rs = store.create_materialized(req("alice", "old-row"), {"dev-1", "dev-2"});
+        REQUIRE(rs.has_value());
+        old_id = rs->id;
+    }
+    exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_sets DROP COLUMN agents_unanswered");
+    exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 4 WHERE store = 'result_set_store'");
+    const std::string column_count_sql =
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+        "'result_set_store' AND table_name = 'result_sets' AND column_name = "
+        "'agents_unanswered'";
+    REQUIRE(query_scalar(db.dsn(), column_count_sql) == "0");
+
+    for (int open = 0; open < 2; ++open) {
+        INFO("open " << open);
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ResultSetStore store(pool);
+        REQUIRE(store.is_open());
+        CHECK(query_scalar(db.dsn(), column_count_sql) == "1");
+        auto got = get_ok(store, old_id);
+        REQUIRE(got.has_value());
+        CHECK(got->agents_unanswered == 0);
+        CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta WHERE store = "
+                                     "'result_set_store'") == "5");
+        auto owned = store.member_set_owned(old_id, "alice");
+        REQUIRE(owned.has_value());
+        CHECK(owned->complete);
+    }
+}
+
 TEST_CASE("ResultSetStore: touch extends TTL", "[pg][result_set][ttl]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

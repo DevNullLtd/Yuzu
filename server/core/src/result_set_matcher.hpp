@@ -2,6 +2,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -135,5 +136,16 @@ inline constexpr std::string_view kStaleSourceMessage =
 /// trailer when present; otherwise counts data lines. An `error|...` output
 /// (the echo failure shape) returns 0. Exposed for direct testing.
 int echo_row_count(std::string_view output);
+
+/// Targeted agents recorded as unanswered when a pending set is filled. Terminal (every targeted
+/// agent responded) is 0. Otherwise the count is `targeted - responded`, floored at 1: with no
+/// tracker data, or none targeted, completeness cannot be proven, so the set reads "not known
+/// complete" rather than complete.
+inline int64_t unanswered_agent_count(int64_t targeted, int64_t responded, bool tracker_present) {
+    if (tracker_present && targeted > 0 && responded >= targeted)
+        return 0;
+    const int64_t gap = tracker_present && targeted > responded ? targeted - responded : 0;
+    return gap > 1 ? gap : 1;
+}
 
 } // namespace yuzu::server::rs_matcher

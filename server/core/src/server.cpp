@@ -19038,19 +19038,17 @@ private:
                                 continue;
                             bool terminal = false;
                             // Targeted agents that never answered: absent from a set filled at
-                            // the timeout, and not counted in agents_failed.
-                            int64_t agents_unanswered = 0;
+                            // the timeout, and not counted in agents_failed. Never 0 without
+                            // proof that every agent answered.
+                            int64_t targeted = 0, responded = 0;
                             if (execution_tracker_) {
                                 auto sum = execution_tracker_->get_summary(p.source_execution_id);
-                                terminal = sum.agents_targeted > 0 &&
-                                           sum.agents_responded >= sum.agents_targeted;
-                                agents_unanswered = std::max<int64_t>(
-                                    0, int64_t{sum.agents_targeted} - sum.agents_responded);
+                                targeted = sum.agents_targeted;
+                                responded = sum.agents_responded;
+                                terminal = targeted > 0 && responded >= targeted;
                             }
-                            // Filled at the timeout without proof that every agent answered
-                            // (no tracker data, or none targeted): not known complete.
-                            if (!terminal)
-                                agents_unanswered = std::max<int64_t>(agents_unanswered, 1);
+                            const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
+                                targeted, responded, execution_tracker_ != nullptr);
                             const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
                             if (!terminal && !timed_out)
                                 continue;

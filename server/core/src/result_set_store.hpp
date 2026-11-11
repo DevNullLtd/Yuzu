@@ -173,7 +173,9 @@ struct ResultSet {
     /// Async producers: how many targeted agents never answered before the set was filled at the
     /// pending timeout. Those agents are absent from the membership because they did not answer,
     /// not because they do not match. 0 for sync producers and for a set filled before this
-    /// column existed (no data to say otherwise).
+    /// column existed (no data to say otherwise). The fill pass also stores 1 when it cannot prove
+    /// every agent answered (no tracker data, or none targeted), so a value of 1 can mean "not
+    /// known complete" rather than an exact count.
     int64_t agents_unanswered{0};
 };
 
