@@ -274,8 +274,8 @@ its single retention mechanism; the retired pending rows expire on that clock li
 (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire, so
 those rows are kept for good). The DEX observations are behavioural data, so retention expiry, not the decommission, is the
 erasure position for them. Widening the decommission to erase the events or the DEX observations is a
-follow-up that needs its own Update to this ADR and the store header; it is not made here and the
-follow-up issue is not yet filed.
+follow-up that needs its own Update to this ADR and the store header; it is not made here and is
+tracked in #7531.
 
 Known gap (tracker #7147, which also covers the sweep of stranded pending evidence; `delete_rule` has the same list-read gap): a pending event committed after `delete_agent` read the
 agent's pending list but before it deleted the census rows is not retired by that transaction. A later
@@ -283,7 +283,8 @@ pending event for a decommissioned agent likewise stays pending and is exempt fr
 until something retires it (a rule delete, a later decommission, a redelivery repair, or a later
 verdict that out-ranks it). A still-running agent re-creates its census row on its next
 census-bearing event (after a state change, an agent restart or a rule push; not on a schedule), and a journal replay cannot rebuild the census from retired
-evidence (the retained events are redelivered with no repair), so the agent is stopped first.
+evidence (the retained events are redelivered with no repair), so the agent is stopped first. The owner
+will revisit that later; it is tracked in #7532.
 
 ## Follow-ups
 
