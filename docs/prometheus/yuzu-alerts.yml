@@ -3850,7 +3850,7 @@ groups:
       # drop rather than being summed together.
       - alert: YuzuResponseIngestDrops
         expr: |
-          sum(rate(yuzu_server_response_ingest_dropped_total{reason!~"malformed_identity_field|per_agent_cap"}[5m])) by (reason) > 0
+          sum(rate(yuzu_server_response_ingest_dropped_total{reason!~"malformed_identity_field|per_agent_cap|unverified_registry_overflow|unverified_registry_skipped"}[5m])) by (reason) > 0
         for: 10m
         labels:
           severity: warning
@@ -3862,7 +3862,9 @@ groups:
             — malformed_identity_field and per_agent_cap excluded, those are
             agent behaviour, not store unhealth; see
             YuzuResponseMalformedIdentityDrops and
-            YuzuResponsePerAgentCapDrops for those cases).
+            YuzuResponsePerAgentCapDrops for those cases; the two
+            unverified_registry reasons are reported by
+            YuzuUnverifiedFrameRecordOverflow).
             The executions ladder still tracks the commands, but drawer/Echo
             result history is lossy — check PostgreSQL pool saturation / health.
 
@@ -3912,6 +3914,31 @@ groups:
             device. A redelivered terminal frame on a command and device
             already at the cap also counts here. Attribute with a server log
             grep for "per-agent row cap (" (one line carries the cap, the instruction and the agent).
+
+      # Companion: the in-memory record of streaming frames whose provenance
+      # lookup failed (unverified_frame_registry.hpp) evicted or could not keep
+      # an entry. It fails closed, so no answer is lost from a result set's
+      # completeness, but the affected sets read partial. Excluded from
+      # YuzuResponseIngestDrops above: no store remediation applies. No long
+      # `for`: one increase already means sets were reported partial.
+      - alert: YuzuUnverifiedFrameRecordOverflow
+        expr: |
+          sum(increase(yuzu_server_response_ingest_dropped_total{reason=~"unverified_registry_overflow|unverified_registry_skipped"}[1h])) by (reason) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "The record of streaming frames with a failed provenance lookup overflowed"
+          description: >-
+            The server could not keep every record of a streaming response
+            frame whose provenance lookup failed, so it reported the affected
+            agents' answers as not fully stored. Either an agent is sending
+            many frames with command ids the server cannot look up, or the
+            provenance lookup was degraded (database pool or query failures)
+            while streaming commands ran. Result sets filled in the next hour
+            from the affected commands read partial; re-run those commands
+            once the cause is resolved. Check the server log for
+            "unverified-frame record" and the provenance outcome counter
+            yuzu_server_response_provenance_total{outcome="lookup_degraded"}.
 
       - alert: YuzuResponseReadDegrade
         expr: |
