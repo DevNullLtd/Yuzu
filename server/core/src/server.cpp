@@ -16379,6 +16379,12 @@ private:
             is_login = is_login ||
                        (req.path == "/auth/saml/start" && req.method == "GET") ||
                        (req.path == "/saml/acs"        && req.method == "POST");
+            // OIDC sign-in start and callback are unauthenticated entry points that trigger
+            // outbound requests, so they share the per-source login bucket like local login
+            // and SAML.
+            is_login = is_login ||
+                       (req.path == "/auth/oidc/start" && req.method == "GET") ||
+                       (req.path == "/auth/callback"   && req.method == "GET");
             // #5342: POST /api/v1/users/me/password verifies the current
             // password, so it is the same online-guessing surface as /login
             // (lockout bounds it only while --auth-lockout-threshold > 0).

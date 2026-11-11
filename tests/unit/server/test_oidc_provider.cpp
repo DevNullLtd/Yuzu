@@ -4518,6 +4518,24 @@ TEST_CASE(
     CHECK(count(cpp, "kHttpTotalBoundMultiplier * t") == 2); // the watchdog and set_max_timeout
 }
 
+TEST_CASE("OIDC sign-in start and callback share the per-source login rate-limit bucket "
+          "(source pin)",
+          "[oidc][source_pin]") {
+    // The pre-routing is_login predicate is an inline expression in server.cpp, so pin by scan.
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp", std::ios::binary);
+    REQUIRE(in.good());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const auto text = ss.str();
+    const auto at = text.find("auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;");
+    REQUIRE(at != std::string::npos);
+    const auto window = text.substr(at > 3000 ? at - 3000 : 0, at > 3000 ? 3000 : at);
+    CHECK(window.find("(req.path == \"/auth/oidc/start\" && req.method == \"GET\")") !=
+          std::string::npos);
+    CHECK(window.find("(req.path == \"/auth/callback\"   && req.method == \"GET\")") !=
+          std::string::npos);
+}
+
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN
 
 // ── IdP-controlled JSON of the wrong type never throws out of handle_callback (#5692) ────────
