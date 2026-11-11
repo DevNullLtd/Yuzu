@@ -122,35 +122,25 @@ guard that exits 1 with an actionable message. CI workflow steps use
 retired `yuzu-local-windows` runner had `pwsh` 7.6.1 pre-installed; the Wee Tam runners are provisioned per `deploy/windows/README.md`. See
 issue #517 for the migration history.
 
-**Exception: installer helpers run on end-user hosts.** Scripts the
-installers run on the customer's machine, today
-`deploy/packaging/windows/generate-config.ps1` and the inline commands in
-`yuzu-agent.iss` / `yuzu-server.iss`, target the Windows PowerShell 5.1
-(`powershell.exe`) that every Windows host has, and carry no PowerShell 7
-guard. They must stay ASCII-only outside comments (5.1 reads BOM-less files
-in the ANSI codepage), and each must first reset `PSModulePath` (#5176):
-the permission checks to `$PSHOME\Modules` alone, `generate-config.ps1` to
-that plus the machine value.
+**Exception: installer helpers run on end-user hosts.** The inline
+PowerShell commands in `deploy/packaging/windows/yuzu-agent.iss`, which the
+agent installer runs on the customer's machine, target the Windows
+PowerShell 5.1 (`powershell.exe`) that every Windows host has, and carry no
+PowerShell 7 guard. They must stay ASCII-only outside comments (5.1 reads
+BOM-less files in the ANSI codepage), and must first reset `PSModulePath` to
+`$PSHOME\Modules` alone (#5176). (The server installer, `yuzu-server.iss`,
+and its `generate-config.ps1` helper were removed with ADR-0035 ladder
+step 2: the server is not supported on Windows.)
 
-**The permission checks (`RunAclCheck` in both installers) must run under
-Constrained Language Mode**, which WDAC script enforcement, or AppLocker
-script rules for an install run by an administrator, imposes on them. So
-they use no .NET method or static call: only property reads, `-match`,
-`-band` and cmdlets, comparing SDDL text by SID alias (#5196). Only
-`generate-config.ps1` needs .NET (password hashing). The server installer
-checks the language mode first and refuses with its own message; an upgrade
-that keeps the existing accounts never runs it.
+**The permission check (`RunAclCheck`) must run under Constrained Language
+Mode**, which WDAC script enforcement, or AppLocker script rules for an
+install run by an administrator, imposes on it. So it uses no .NET method or
+static call: only property reads, `-match`, `-band` and cmdlets, comparing
+SDDL text by SID alias (#5196).
 
-The installers run these helpers with `-Command`, never `-File`: a
+The installer runs these commands with `-Command`, never `-File`: a
 Group-Policy `AllSigned` execution policy blocks unsigned script *files* even
-with `-ExecutionPolicy Bypass`, but not command text. `generate-config.ps1`
-is therefore read as text and run as a script block. A helper that handles a
-secret takes it from the environment, never from its command line, and fails
-the install on any error rather than warning (#5196). The server installer's
-data-directory handling (`PrepareToInstall`, `RunAclCheck`) follows the
-agent's `SecureTrustAnchorDir` design: refuse links, never adopt what it did
-not create, build a new directory privately and move it into place, verify
-exact permissions. Change them together.
+with `-ExecutionPolicy Bypass`, but not command text.
 
 ## Running server tests locally (libpq.dll on PATH)
 
@@ -167,5 +157,8 @@ export PATH="$PWD/vcpkg_installed/x64-windows/debug/bin:$PATH"   # MSYS2 bash
 meson test -C build-windows --suite server --print-errorlogs
 ```
 
-The release zip is unaffected — its vcpkg-DLL sweep bundles `libpq.dll`
-next to the binaries, same as `sqlite3.dll` and the OpenSSL DLLs.
+The release zip (`yuzu-agent-windows-x64.zip`, agent only since ADR-0035
+ladder step 2) still bundles every vcpkg DLL, `libpq.dll` included, next to
+the agent: the sweep copies the whole `vcpkg_installed/x64-windows/bin`, and
+the server ports leave the Windows vcpkg install only in ladder step 3. The
+agent does not load them.

@@ -339,7 +339,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    artifact-name change reaches it). Keep the (non-blocking) gateway canary. Prune now-unused Windows
    server cache scopes (`cache-prune.yml`).
 
-   *Status: in progress — the step-1 CI change, #7499.* As
+   *Status: done — #7499 (merged 2026-11-11).* As
    implemented: the Windows and macOS legs of `ci.yml` pass `-Dbuild_server=false` (the boolean;
    the feature option is step 3) and drop every item listed above for them, and the Windows leg
    moves to `build-windows-agent-{debug,release}` and deletes the old dirs, so a branch cut
@@ -351,9 +351,10 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    workflow at once. `cache-prune.yml` has no Windows-server-only scope to prune: its Windows
    `sweep-test-databases.sh` step goes with Wee Tam's Postgres in step 4, and until then
    `Assert-Toolchain.ps1` still health-checks those clusters in the Windows job.
-   `pre-release.yml`: no change until step 2's artefact rename.
+   `pre-release.yml` needs no change at all: it never referenced the Windows or macOS
+   archives (it checks only the Linux and gateway tarballs).
 
-   **Release ordering (owner decision, 2026-11-10):** step 2 MUST merge before the next release
+   **Release ordering (owner decision, 2026-11-10; satisfied by step 2):** step 2 MUST merge before the next release
    tag, or that release MUST explicitly accept shipping a Windows/macOS server that CI never
    built or tested before tagging, recorded as a `changelog.d` caveat fragment merged through a
    reviewed PR (whose description names the approver and the date) and promoted before tagging,
@@ -379,6 +380,31 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    removal notice ("`YuzuServerSetup-*.exe` is discontinued; use the container image or the Linux
    packages"), remove the Windows server runbook from `docs/user-manual/server-admin.md`, and close
    #5325 and #1835 as resolved by removal.
+
+   *Status: done in this change (PR `#PENDING`).* As implemented, with these deviations and
+   additions:
+   - **The Windows DLL sweep is unchanged.** `release.yml` copies every DLL in
+     `vcpkg_installed/x64-windows/bin`, and that tree keeps the server ports until step 3, so the
+     agent archive still carries `libpq.dll` and the other server-port DLLs, and its SBOM still
+     lists them, until step 3. Pruning by a hand-written list, proven on no runner, was judged
+     riskier than one more release with unused DLLs (plan review, 2026-11-11). Instead a new,
+     gating step extracts the archive and runs `yuzu-agent.exe --help` with `PATH` cut to
+     System32, so a DLL the agent needs but the archive lacks fails the job before publishing.
+   - **The macOS codesign and notarization steps** pointed at `build-macos/yuzu-server` and
+     `build-macos/yuzu-agent`, paths that never existed (they never ran: no signing secret is
+     set). The server line is gone and the agent path is now `build-macos/agents/core/yuzu-agent`.
+   - **The in-archive top-level directory** is renamed with the archive
+     (`yuzu-agent-<version>-{windows-x64,macos-arm64}`).
+   - **`scripts/build-agent-bundle.sh`** accepts either archive name, so a hand-run against a tag
+     cut before this change still works.
+   - **`build-installer.sh`** builds the agent installer only; `--target server|all` is refused.
+   - **The `/release` preflight's hand check** is replaced by `tests/test_release_agent_only.py`
+     (Docs Lint and `meson test`), which fails if a Windows or macOS server build, `YuzuServerSetup`
+     or an old archive name comes back, and if the archive names in `release.yml`,
+     `scripts/check-release-artifacts.sh` and `scripts/build-agent-bundle.sh` disagree.
+   - Proof without an RC (owner decision, 2026-11-11): the static pins, plus a Windows rehearsal of
+     the agent-only build, packaging and installer on a build box. The first stable tag after this
+     change is the first real run of the changed jobs.
 3. **Build guard** — implement Decision 4: convert `build_server` to a feature option, key the guard
    on `host_machine.system()`, make the non-Linux `vcpkg install` paths skip the `server` feature,
    and update `scripts/setup.sh`, the CLAUDE.md quickstarts, and any docs passing

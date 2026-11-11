@@ -253,10 +253,9 @@ Required assets (the `--verify` mode of this skill checks each):
 ```
 yuzu-linux-x64.tar.gz
 yuzu-gateway-linux-x64.tar.gz
-yuzu-windows-x64.zip
+yuzu-agent-windows-x64.zip
 YuzuAgentSetup-X.Y.Z.exe
-YuzuServerSetup-X.Y.Z.exe
-yuzu-macos-arm64.tar.gz
+yuzu-agent-macos-arm64.tar.gz
 YuzuAgent-X.Y.Z-macos-arm64.pkg
 yuzu-server_X.Y.Z_amd64.deb
 yuzu-server-X.Y.Z-1.x86_64.rpm

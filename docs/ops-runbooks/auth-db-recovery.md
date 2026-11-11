@@ -561,9 +561,9 @@ also clears the account's lockout, recording `auth.lockout.cleared`
 (`detail=password_reset`) only when there was a lockout to clear. There
 is no MCP tool for either (#5357 tracks a temporary-password reset tool).
 
-**Re-running the Windows server installer is not a reset.** On an upgrade it
-refuses `/ADMIN_PASS=` (and the removed `/OPERATOR_PASS=`) with exit code 11
-(the config file it would write only seeds an empty database).
+**Re-running an installer is not a reset.** The config file seeds an empty
+database only. (The Windows server installer, discontinued by ADR-0035,
+refused `/ADMIN_PASS=` on an upgrade with exit code 11 for that reason.)
 
 **Fallback — direct SQL**, when no administrator can sign in at all (the only
 admin forgot their password). This writes no audit row and revokes no

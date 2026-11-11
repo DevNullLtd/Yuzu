@@ -78,7 +78,7 @@ Preflight checks:
 7. `docker-compose.full-uat.yml` includes `--data-dir`
 8. `origin/dev` and `origin/main` are reconciled (no divergence either direction)
 
-Also check by hand (the script does not): **ADR-0035 ladder step 2 merges first, OR the release explicitly accepts shipping an untested Windows/macOS server** (owner decision 2026-11-10). Since ladder step 1, no CI leg compiles or tests the Windows or macOS server. Run `grep -nE 'build-(windows|macos)/server/core/yuzu-server|yuzu-server\.iss' .github/workflows/release.yml` — it matches only the Windows server build smoke test, staging and installer script, and the macOS server smoke test and staging, never the Linux job or the release-notes text. Empty output means the Windows/macOS server build has been removed (it does not by itself prove every step-2 item landed); proceed. Any hit means **stop**: either land step 2 first, or, BEFORE tagging, merge to `main` through a reviewed PR a `changelog.d/<PR-or-issue-number>-win-mac-server-untested.changed.md` fragment whose body is `- **The Windows and macOS server artefacts in this release were not built or tested in CI before tagging and are not supported.** Run the Yuzu server on Linux (packages or container image); the platform tables below still list the Windows and macOS server artefacts.` The PR description names the approver and the date: that reviewed PR is the acceptance record. Then run `python3 scripts/assemble-changelog.py promote X.Y.Z --append` (or plain `promote X.Y.Z` if the version is not promoted yet), commit it to `main`, and re-run this preflight. `release.yml` publishes the GitHub Release in the same job that builds its notes from `CHANGELOG.md`, with no draft stage, so the caveat must be in the promoted changelog section before the tag is pushed. A Windows or macOS server compile break at release time is fixed by landing step 2, never by patching server code for an unsupported platform.
+Windows and macOS releases are agent-only (ADR-0035 ladder step 2): `release.yml` builds no Windows or macOS server and no `YuzuServerSetup`, and the Windows and macOS archives are `yuzu-agent-windows-x64.zip` and `yuzu-agent-macos-arm64.tar.gz`. `tests/test_release_agent_only.py` (Docs Lint and `meson test`) fails if a server build or an old archive name comes back, or if the archive names in `release.yml`, `scripts/check-release-artifacts.sh` and `scripts/build-agent-bundle.sh` disagree, so there is no hand check left for this. The first release after step 2 is also the first real run of the changed Windows and macOS jobs: watch them, especially the Windows "Verify the agent runs from the packaged archive" step.
 
 Optional `--full` adds a local C++ + Erlang compile (~2 min).
 
@@ -255,10 +255,9 @@ Required assets (the `--verify` mode of this skill checks each):
 ```
 yuzu-linux-x64.tar.gz
 yuzu-gateway-linux-x64.tar.gz
-yuzu-windows-x64.zip
+yuzu-agent-windows-x64.zip
 YuzuAgentSetup-X.Y.Z.exe
-YuzuServerSetup-X.Y.Z.exe
-yuzu-macos-arm64.tar.gz
+yuzu-agent-macos-arm64.tar.gz
 YuzuAgent-X.Y.Z-macos-arm64.pkg
 yuzu-server_X.Y.Z_amd64.deb
 yuzu-server-X.Y.Z-1.x86_64.rpm

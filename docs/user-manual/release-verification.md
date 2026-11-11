@@ -43,8 +43,8 @@ certificate at build time and cannot be restamped.
 
 | Asset type | Files | Verified with |
 |------------|-------|---------------|
-| Platform archives | `yuzu-{linux-x64,gateway-linux-x64,windows-x64,macos-arm64}.{tar.gz,zip}` | `sha256sum -c SHA256SUMS` |
-| Native installers | `*.deb`, `*.rpm`, `YuzuAgentSetup-*.exe`, `YuzuServerSetup-*.exe`, `YuzuAgent-*.pkg` | `sha256sum -c SHA256SUMS` |
+| Platform archives | `yuzu-linux-x64.tar.gz`, `yuzu-gateway-linux-x64.tar.gz`, `yuzu-agent-windows-x64.zip`, `yuzu-agent-macos-arm64.tar.gz` (the Windows and macOS archives hold the agent only, and were named `yuzu-windows-x64.zip` / `yuzu-macos-arm64.tar.gz` in earlier releases) | `sha256sum -c SHA256SUMS` |
+| Native installers | `*.deb`, `*.rpm`, `YuzuAgentSetup-*.exe`, `YuzuAgent-*.pkg` (`YuzuServerSetup-*.exe` was discontinued: the server runs on Linux only, ADR-0035) | `sha256sum -c SHA256SUMS` |
 | Checksum manifest | `SHA256SUMS` | `cosign verify-blob` against `SHA256SUMS.sigstore` |
 | Cosign bundle | `SHA256SUMS.sigstore` (legacy: `SHA256SUMS.bundle` for releases ≤ v0.11.0) | Sigstore OIDC identity |
 | CycloneDX SBOMs | `yuzu-*.cdx.json`, including the images: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
@@ -144,7 +144,7 @@ inputs used to produce the artifact.
 # Binary archives / installers
 gh attestation verify yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}"
 gh attestation verify YuzuAgentSetup-0.11.0.exe --repo "${SIGNER_REPO}"
-gh attestation verify yuzu-macos-arm64.tar.gz --repo "${SIGNER_REPO}"
+gh attestation verify yuzu-agent-macos-arm64.tar.gz --repo "${SIGNER_REPO}"
 
 # Docker images (by digest)
 gh attestation verify \
