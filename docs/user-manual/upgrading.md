@@ -2,6 +2,28 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: the Windows and macOS releases ship the agent only; their archives are renamed and `YuzuServerSetup` is discontinued
+
+**What changed.** The server runs on Linux only (ADR-0035). The Windows and macOS release jobs no longer build the server, and the release assets change:
+
+| Before | Now |
+|---|---|
+| `yuzu-windows-x64.zip` (server + agent) | `yuzu-agent-windows-x64.zip` (agent and plugins) |
+| `yuzu-macos-arm64.tar.gz` (server + agent, plus `scripts/install-server-postgres.sh`) | `yuzu-agent-macos-arm64.tar.gz` (agent and plugins) |
+| `yuzu-windows-x64.{cdx,spdx}.json`, `yuzu-macos-arm64.{cdx,spdx}.json` | `yuzu-agent-windows-x64.{cdx,spdx}.json`, `yuzu-agent-macos-arm64.{cdx,spdx}.json` |
+| `YuzuServerSetup-<version>.exe` | not published |
+
+The top-level directory inside each archive is renamed the same way (`yuzu-agent-<version>-windows-x64`, `yuzu-agent-<version>-macos-arm64`). The Linux archives, the `.deb`/`.rpm` packages, `YuzuAgentSetup-<version>.exe`, the macOS `.pkg` and the container images are unchanged.
+
+**Who is affected.** Anyone who downloads the Windows or macOS archive or its SBOM by name (scripts, SCCM, Intune or Jamf packages, mirrors), anyone who unpacks it by its top-level directory name, and anyone running the server on Windows or macOS. A download by the old name fails with "not found". `scripts/build-agent-bundle.sh` accepts both names, so it still builds a bundle from an older release.
+
+**What to do.**
+- Update download and unpack paths to the new names.
+- If you run the server on Windows or macOS, move it to Linux (the container image or the Linux packages) using "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md). Back up the database and the CA directory together first; deleting the old install before that loses the CA key every agent trusts and the keys that decrypt stored secrets.
+- Do not unpack the new agent archive over a directory a server still runs from.
+
+**Known limitation until ADR-0035 step 3.** The Windows archive still contains vcpkg's server-side DLLs (`libpq.dll` and the other PostgreSQL client libraries, among others), which the agent does not load, and the Windows and macOS SBOMs still list those components. A dependency scan of either archive therefore reports PostgreSQL client components the agent does not use.
+
 ## ⚠️ Breaking: role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte
 
 **What changed.** `unassign_rbac_role` (MCP), the engine-role unassign (`DELETE /api/v1/engine-principals/{id}/roles/{role}` and MCP `unassign_engine_role`) and the engine-role assign (`POST /api/v1/engine-principals/{id}/roles` and MCP `assign_engine_role`) refuse a role name containing a NUL byte, any other control byte (0x01-0x1F) or DEL (0x7F). REST answers `400`, MCP answers invalid params (-32602), and the audit row is `result=denied` with the fixed detail `invalid_role_name` (the value is never echoed). The check runs before the principal or role is looked up. Every other role name is accepted unchanged, including one granted out of band, spaces and UTF-8 included.
@@ -7777,22 +7799,9 @@ docker compose -f docker-compose.reference.yml up -d server
 
 **Never** run `docker compose down -v` unless you intend to delete `server-data`, the keys volume (`certs` in the reference composes, `server-certs` in the others: the CA and the secrets KEK), `postgres-data` (the PostgreSQL substrate — the server's primary data store), and every bit of server state. `down` alone is safe; the `-v` flag removes named volumes.
 
-### Windows
+### Windows and macOS
 
-```powershell
-# 1. Stop the service (if running as service) or kill the process
-Stop-Service yuzu-server  # or: taskkill /IM yuzu-server.exe /F
-
-# 2. Back up data
-Copy-Item C:\ProgramData\Yuzu\*.db C:\ProgramData\Yuzu\backup\
-Copy-Item C:\ProgramData\Yuzu\*.cfg C:\ProgramData\Yuzu\backup\
-
-# 3. Replace the binary
-Copy-Item yuzu-server.exe "C:\Program Files\Yuzu\yuzu-server.exe"
-
-# 4. Start
-Start-Service yuzu-server  # or start manually
-```
+There is no Windows or macOS server to upgrade to: the server runs on Linux only (ADR-0035), and no release after 0.15.0 ships `yuzu-server.exe`, a macOS `yuzu-server` or `YuzuServerSetup`. To move an existing Windows or macOS server to Linux, follow "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md) (under "the Windows server installer is discontinued"). Back up the database and the CA directory as described there before you stop or remove anything: copying `*.db` and `*.cfg` files is not a backup, because the server's data is in PostgreSQL.
 
 ## Upgrading the Gateway
 

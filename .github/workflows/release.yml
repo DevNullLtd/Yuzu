@@ -874,23 +874,40 @@ jobs:
 
           Compress-Archive -Path "${staging}" -DestinationPath "yuzu-agent-windows-x64.zip"
 
-      # Unlike "Test (smoke)" above, this one gates: it runs the agent from
-      # the extracted archive with PATH cut down to System32, so a DLL the
-      # agent needs but the archive lacks fails the job before anything is
-      # signed, attested or published.
+      # Unlike "Test (smoke)" above, this one gates, before the installers
+      # are built and signed and before anything is attested or uploaded
+      # (the binaries were Authenticode-signed above). It checks the archive
+      # holds yuzu-agent.exe and no yuzu-server.exe, holds every plugin DLL
+      # the build produced, and that yuzu-agent.exe --help runs from the
+      # extracted archive with PATH cut down to the Windows directories. That
+      # catches a DLL that yuzu-agent.exe or yuzu_agent_core.dll imports at
+      # load time and the archive lacks. It does NOT cover DLLs only a plugin
+      # imports (--help loads no plugin), or the MSVC runtime, which resolves
+      # from System32 here because the runner has the VC++ runtime installed
+      # (the archive does not ship it). The agent is killed if it has not
+      # exited within 60 s. Pinned by tests/test_release_agent_only.py.
       - name: Verify the agent runs from the packaged archive
         shell: pwsh
+        timeout-minutes: 5
         run: |
-          $out = Join-Path "${{ runner.temp }}" "yuzu-agent-archive-check"
+          $out = Join-Path $env:RUNNER_TEMP "yuzu-agent-archive-check"
           if (Test-Path $out) { Remove-Item -Recurse -Force $out }
           Expand-Archive -Path "yuzu-agent-windows-x64.zip" -DestinationPath $out
-          $bin = Get-ChildItem -Path $out -Directory | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName "bin" }
-          if (-not (Test-Path (Join-Path $bin "yuzu-agent.exe"))) { Write-Error "yuzu-agent.exe missing from the archive"; exit 1 }
+          $top = Get-ChildItem -Path $out -Directory | Select-Object -First 1
+          $bin = Join-Path $top.FullName "bin"
+          $agent = Join-Path $bin "yuzu-agent.exe"
+          if (-not (Test-Path $agent)) { Write-Error "yuzu-agent.exe missing from the archive"; exit 1 }
           if (Test-Path (Join-Path $bin "yuzu-server.exe")) { Write-Error "yuzu-server.exe found in the agent archive"; exit 1 }
+          $built = @(Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse).Count
+          $packed = @(Get-ChildItem -Path (Join-Path $top.FullName "plugins") -Filter "*.dll").Count
+          if ($built -lt 1 -or $packed -ne $built) { Write-Error "plugin DLLs: built $built, in the archive $packed"; exit 1 }
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-          & (Join-Path $bin "yuzu-agent.exe") --help | Out-Null
-          if ($LASTEXITCODE -ne 0) { Write-Error "yuzu-agent.exe --help exited $LASTEXITCODE from the packaged archive"; exit 1 }
-          Write-Host "yuzu-agent.exe --help ran from the packaged archive"
+          $p = Start-Process -FilePath $agent -ArgumentList "--help" -NoNewWindow -PassThru `
+                 -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP "yuzu-agent-help.txt")
+          $null = $p.Handle  # keeps the exit code readable after the process ends
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); Write-Error "yuzu-agent.exe --help did not exit within 60 s"; exit 1 }
+          if ($p.ExitCode -ne 0) { Write-Error "yuzu-agent.exe --help exited $($p.ExitCode) from the packaged archive"; exit 1 }
+          Write-Host "yuzu-agent.exe --help ran from the packaged archive ($packed plugin DLLs)"
 
       - name: Build Windows installers (InnoSetup)
         shell: pwsh
@@ -977,9 +994,12 @@ jobs:
 
       # ── Windows SBOM (CycloneDX + SPDX) ─────────────────────────────
       # Scans vcpkg_installed/x64-windows (C++ deps) + build-windows (PE
-      # binaries). Until ADR-0035 ladder step 3 drops the server ports from
-      # the Windows vcpkg install, this SBOM still lists them. Syft supports PowerShell/Windows runners via the
+      # binaries). Syft supports PowerShell/Windows runners via the
       # composite action, which downloads a Windows syft binary.
+      # Known limitation: `path: .` scans the whole workspace (the vcpkg
+      # ports tree and build trees too), so this SBOM lists components the
+      # agent archive does not ship or load, PostgreSQL client libraries
+      # among them. The release notes and release-verification.md say so.
       - name: Generate Windows SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -1271,12 +1291,23 @@ jobs:
 
           # Submit for notarization and wait for result
           echo "Submitting for Apple notarization..."
+          # --wait returns when Apple has decided, and an Invalid verdict is
+          # not guaranteed to be a non-zero exit, so read the status. (The
+          # .pkg below needs no such check: stapling fails without a ticket.)
+          RESULT="${RUNNER_TEMP}/yuzu-notarize-result.plist"
           xcrun notarytool submit "${NOTARIZE_ZIP}" \
             --apple-id "${MACOS_NOTARIZATION_APPLE_ID}" \
             --password "${MACOS_NOTARIZATION_PASSWORD}" \
             --team-id "${MACOS_NOTARIZATION_TEAM_ID}" \
             --wait \
-            --timeout 15m
+            --timeout 15m \
+            --output-format plist > "${RESULT}"
+          STATUS=$(/usr/libexec/PlistBuddy -c 'Print :status' "${RESULT}" 2>/dev/null || echo unknown)
+          if [ "${STATUS}" != "Accepted" ]; then
+            echo "::error::Apple notarization status is '${STATUS}', not Accepted. Read the reason with: xcrun notarytool log <id> (the id is below)."
+            cat "${RESULT}"
+            exit 1
+          fi
 
           echo "Notarization complete"
           rm -f "${NOTARIZE_ZIP}"
@@ -1355,6 +1386,9 @@ jobs:
 
       # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
       # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
+      # Same known limitation as the Windows SBOM: `path: .` covers the
+      # whole workspace, so it lists components the agent archive does not
+      # ship, PostgreSQL client libraries among them.
       - name: Generate macOS SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -2497,14 +2531,19 @@ jobs:
 
           The server runs on Linux only (ADR-0035): use the container image or
           the Linux packages. \`YuzuServerSetup-*.exe\` is discontinued, and
-          the Windows and macOS archives contain the agent only.
+          the Windows and macOS archives contain the agent only. To move an
+          existing Windows or macOS server to Linux, back up its database and
+          its CA directory together BEFORE removing anything, then follow
+          "Moving a Windows or macOS server to Linux" in
+          \`docs/user-manual/server-admin.md\` (it lists what to back up, how
+          to remove the old service, and which leftover files hold secrets).
 
           ### Windows silent install (GPO / SCCM / Intune)
           \`\`\`powershell
           YuzuAgentSetup-*.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
           \`\`\`
 
-          Silent uninstall: \`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\` (or the path in the product's \`UninstallString\` registry value, if it was installed to another directory). It removes the program but keeps its data directory, \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key). A server installed by an earlier release's \`YuzuServerSetup\` is removed with \`"C:\\Program Files\\Yuzu Server\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\`, which keeps \`%ProgramData%\\Yuzu Server\`. To decommission a device, revoke its certificate on the server and delete that directory (see \`docs/agent-bundle.md\`). Uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
+          Silent uninstall: \`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\` (or the path in the product's \`UninstallString\` registry value, if it was installed to another directory). It removes the program but keeps its data directory, \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key). To decommission a device, revoke its certificate on the server and delete \`%ProgramData%\\Yuzu\` (see \`docs/agent-bundle.md\`). Agent uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
 
           ### macOS silent install (Jamf / MDM)
           \`\`\`bash
@@ -2534,6 +2573,13 @@ jobs:
           In earlier releases the Windows and macOS archives were named
           \`yuzu-windows-x64.zip\` and \`yuzu-macos-arm64.tar.gz\` and also
           held the server; update any script that downloads them by name.
+
+          Known limitation: the Windows archive still carries vcpkg's
+          server-side DLLs (\`libpq.dll\` and other PostgreSQL client
+          libraries), which the agent does not load, and the Windows and
+          macOS SBOMs are generated from the whole build workspace, so a
+          dependency scan of them reports components the agent does not ship
+          or use, PostgreSQL client libraries among them.
 
           ## Compose Wizard
 

@@ -10,12 +10,22 @@ instead. Stdlib only; no network, no Windows, no macOS.
 What they pin:
 
 - The `build-windows` and `build-macos` jobs of release.yml each configure
-  with exactly one `-Dbuild_server=false` (ladder step 3 renames the switch to
-  the `server` feature option; change this test with it), and their
-  non-comment lines name no `yuzu-server`, `YuzuServerSetup`,
-  `yuzu-server.iss` or `install-server-postgres.sh`.
-- The release job's `gh release create` list attaches no `YuzuServerSetup`,
-  and scripts/check-release-artifacts.sh does not require one.
+  with exactly one literal `-Dbuild_server=false`, name `build_server`
+  nowhere else, never set it `=true` and never run `meson configure` (the
+  conventions of step 1's ci.yml pin, scripts/ci/test_runner_health_check.py;
+  ladder step 3 renames the switch to the `server` feature option: change
+  both pins with it). Their non-comment lines name no `yuzu-server`,
+  `YuzuServerSetup`, `yuzu-server.iss` or `install-server-postgres.sh`,
+  except the one exact line of the Windows archive check that FAILS on
+  `yuzu-server.exe`.
+- build-windows has exactly one gating "Verify the agent runs from the
+  packaged archive" step (no continue-on-error, a step timeout), after
+  Package archive and before the installers, attestation and upload, and it
+  keeps each of its checks (VERIFY_MUST). build-macos signs and notarizes
+  `build-macos/agents/core/yuzu-agent` and checks the notarization verdict.
+- The release job's `gh release create` list attaches no `YuzuServerSetup`;
+  scripts/check-release-artifacts.sh requires none and its FORBIDDEN_GLOBS
+  refuses it and both old archive names.
 - The old Windows and macOS archive names (`yuzu-windows-x64`,
   `yuzu-macos-arm64`, which held the server) appear nowhere in release.yml's
   code (the release-notes text may name them, to tell users about the rename)
@@ -27,7 +37,8 @@ What they pin:
   platform SBOM, whose stem must match an archive (release.yml `output-file`
   against SBOM_BASES). scripts/build-agent-bundle.sh must request, and prefer,
   the current Windows and macOS names (it also accepts the old ones, for a
-  hand-run against an older tag).
+  hand-run against an older tag), and must use the resolved names for
+  verification and extraction.
 
 Each check is also run against a mutated copy of the sources and must fail
 there, so a check that stops matching anything cannot pass silently.
@@ -47,8 +58,22 @@ OLD_ARCHIVES = ("yuzu-windows-x64", "yuzu-macos-arm64")
 SERVER_TOKENS = ("yuzu-server", "YuzuServerSetup", "yuzu-server.iss", "install-server-postgres.sh")
 ARCHIVE_RE = r"yuzu-[a-z0-9-]+\.(?:zip|tar\.gz)"
 # The one line allowed to name the server in build-windows: the packaged-archive
-# check that FAILS the job if yuzu-server.exe is in the agent archive.
-ABSENCE_CHECK = "yuzu-server.exe found in the agent archive"
+# check that FAILS the job if yuzu-server.exe is in the agent archive. Matched
+# whole, so an inverted or weakened copy of it is not exempt.
+ABSENCE_CHECK = re.compile(
+    r'^\s*if \(Test-Path \(Join-Path \$bin "yuzu-server\.exe"\)\) '
+    r'\{ Write-Error "yuzu-server\.exe found in the agent archive"; exit 1 \}\s*$')
+VERIFY_STEP = "Verify the agent runs from the packaged archive"
+# What the Verify step must keep doing (a weakened copy must fail this test).
+VERIFY_MUST = (
+    'Expand-Archive -Path "yuzu-agent-windows-x64.zip"',
+    'if (-not (Test-Path $agent)) { Write-Error',
+    'if ($built -lt 1 -or $packed -ne $built) { Write-Error',
+    '$env:PATH = "$env:SystemRoot\\System32;$env:SystemRoot"',
+    '-ArgumentList "--help"',
+    'if (-not $p.WaitForExit(60000)) { $p.Kill(); Write-Error',
+    'if ($p.ExitCode -ne 0) { Write-Error',
+)
 OLD_NAME_RE = re.compile(r"(?<![a-z0-9-])(?:" + "|".join(map(re.escape, OLD_ARCHIVES)) + r")\b")
 
 
@@ -63,6 +88,19 @@ def job_block(text: str, job: str) -> str:
 def code_lines(text: str) -> str:
     """Drop whole-line comments (YAML, shell and PowerShell all use #)."""
     return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+
+
+def without_forbidden_list(text: str) -> str:
+    """check-release-artifacts.sh with its FORBIDDEN_GLOBS array and refusal
+    message removed: that list names the retired assets on purpose."""
+    text = re.sub(r"^FORBIDDEN_GLOBS=\(.*?^\)", "", text, flags=re.S | re.M)
+    return "\n".join(l for l in text.splitlines() if "release must not carry" not in l)
+
+
+def step_block(job: str, name: str) -> str:
+    """One step of a job, from its `- name:` line to the next step."""
+    m = re.search(rf"^(\s*)- name: {re.escape(name)}\n.*?(?=^\1- |\Z)", job, re.S | re.M)
+    return m.group(0) if m else ""
 
 
 def without_release_notes(text: str) -> str:
@@ -96,13 +134,64 @@ def problems(release: str, check: str, bundle: str) -> list:
         if len(setups) != 1:
             found.append(f"{job}: expected one `meson setup`, found {len(setups)}")
         for s in setups:
-            n = len(re.findall(r"-Dbuild_server=false\b", s))
+            n = len(re.findall(r"-Dbuild_server=false(?![\w=-])", s))
             if n != 1:
                 found.append(f"{job}: its meson setup carries {n} `-Dbuild_server=false`, expected exactly 1")
-        scan = "\n".join(l for l in body.splitlines() if ABSENCE_CHECK not in l)
+            if "${{" in s and re.search(r"\$\{\{[^}]*build_server", s):
+                found.append(f"{job}: build_server is set from an expression; it must be the literal false")
+        # The same conventions as step 1's ci.yml pin: the switch appears once
+        # in the job, never `=true`, and nothing reconfigures it later.
+        if body.count("build_server") != 1:
+            found.append(f"{job}: `build_server` must appear exactly once (in its meson setup)")
+        if re.search(r"build_server\s*=\s*true", body):
+            found.append(f"{job}: sets build_server=true")
+        if re.search(r"\bmeson\s+configure\b", body):
+            found.append(f"{job}: runs `meson configure`, which could re-enable the server")
+        scan = "\n".join(l for l in body.splitlines() if not ABSENCE_CHECK.match(l))
         for tok in SERVER_TOKENS:
             if tok in scan:
                 found.append(f"{job}: a non-comment line names {tok} (the Windows/macOS release is agent-only, ADR-0035)")
+
+    # 1b. The Windows packaged-archive check gates, in the right place.
+    try:
+        win = job_block(release, "build-windows")
+    except AssertionError:
+        win = ""
+    verify = step_block(win, VERIFY_STEP)
+    if win.count(f"- name: {VERIFY_STEP}") > 1:
+        found.append(f"build-windows: more than one `{VERIFY_STEP}` step")
+    if not verify:
+        found.append(f"build-windows: the `{VERIFY_STEP}` step is missing")
+    else:
+        if "continue-on-error" in verify:
+            found.append(f"build-windows: `{VERIFY_STEP}` must gate (no continue-on-error)")
+        if not re.search(r"^\s*timeout-minutes:\s*\d+\s*$", verify, re.M):
+            found.append(f"build-windows: `{VERIFY_STEP}` has no step timeout")
+        if not any(ABSENCE_CHECK.match(l) for l in verify.splitlines()):
+            found.append(f"build-windows: `{VERIFY_STEP}` no longer fails on yuzu-server.exe in the archive")
+        for must in VERIFY_MUST:
+            if must not in verify:
+                found.append(f"build-windows: `{VERIFY_STEP}` lost: {must}")
+        pos = win.find(f"- name: {VERIFY_STEP}")
+        for later in ("- name: Package archive",):
+            if win.find(later) > pos:
+                found.append(f"build-windows: `{VERIFY_STEP}` runs before `{later[8:]}`")
+        for later in ("- name: Build Windows installers", "- name: Sign installers", "- name: Attest Windows provenance",
+                      "- name: Upload archive artifact"):
+            if not (0 <= pos < win.find(later)):
+                found.append(f"build-windows: `{VERIFY_STEP}` must run before `{later[8:]}`")
+
+    # 1c. macOS signs and notarizes the agent's real path and checks the verdict.
+    try:
+        mac = code_lines(job_block(release, "build-macos"))
+    except AssertionError:
+        mac = ""
+    if "for binary in build-macos/agents/core/yuzu-agent; do" not in mac:
+        found.append("build-macos: the codesign loop does not sign build-macos/agents/core/yuzu-agent")
+    if not re.search(r'zip -j "\$\{NOTARIZE_ZIP\}" \\\n\s*build-macos/agents/core/yuzu-agent\n', mac):
+        found.append("build-macos: the notarization zip does not hold build-macos/agents/core/yuzu-agent")
+    if 'if [ "${STATUS}" != "Accepted" ]; then' not in mac:
+        found.append("build-macos: the notarization verdict is not checked")
 
     # 2. The release job attaches no server installer.
     m = re.search(r'gh release create "\$\{GITHUB_REF_NAME\}".*?(?=\n\s*fi\b)', release, re.S)
@@ -112,13 +201,22 @@ def problems(release: str, check: str, bundle: str) -> list:
     if "YuzuServerSetup" in attach:
         found.append("release.yml: the release job still attaches YuzuServerSetup")
 
-    # A required asset the release no longer builds would fail every release.
-    if "YuzuServerSetup" in code_lines(check):
-        found.append("check-release-artifacts.sh still requires or names YuzuServerSetup, which no release builds")
+    # A required asset the release no longer builds would fail every release;
+    # the retired assets must be refused instead.
+    check_code = code_lines(without_forbidden_list(check))
+    if "YuzuServerSetup" in check_code:
+        found.append("check-release-artifacts.sh still requires or names YuzuServerSetup outside FORBIDDEN_GLOBS")
+    try:
+        forbidden = set(bash_array(check, "FORBIDDEN_GLOBS"))
+    except AssertionError:
+        forbidden = set()
+    for pat in ("YuzuServerSetup-*",) + tuple(f"{o}.*" for o in OLD_ARCHIVES):
+        if pat not in forbidden:
+            found.append(f"check-release-artifacts.sh FORBIDDEN_GLOBS does not refuse {pat}")
 
     # 3. The old archive names are gone from the code.
     for where, text in (("release.yml", code_lines(without_release_notes(release))),
-                        ("check-release-artifacts.sh", code_lines(check))):
+                        ("check-release-artifacts.sh", check_code)):
         for line in text.splitlines():
             if OLD_NAME_RE.search(line):
                 found.append(f"{where}: still names an old archive: {line.strip()}")
@@ -167,6 +265,15 @@ def problems(release: str, check: str, bundle: str) -> list:
         pick = re.search(rf"\"\$\(pick '{re.escape(new)}'\)\"; \[ -n \"\$(\w+)\" \] \|\| \1=", bundle)
         if not pick:
             found.append(f"build-agent-bundle.sh does not try {new} before the old name")
+    # ...and actually USES the resolved names (not a hard-coded old one).
+    bundle_code = code_lines(bundle)
+    for must in ('ARCHIVES="yuzu-linux-x64.tar.gz $WIN_ZIP $MAC_TGZ"',
+                 'extract_payload windows-x64 "$WIN_ZIP" zip',
+                 'extract_payload macos-arm64 "$MAC_TGZ" tar',
+                 '[ -n "$WIN_ZIP" ] || die "no Windows archive on $TAG"',
+                 '[ -n "$MAC_TGZ" ] || die "no macOS archive on $TAG"'):
+        if must not in bundle_code:
+            found.append(f"build-agent-bundle.sh lost: {must}")
     return found
 
 
@@ -199,6 +306,29 @@ class ReleaseAgentOnly(unittest.TestCase):
             "SBOM base typo": ("check", '  "yuzu-agent-macos-arm64"\n', '  "yuzu-agent-macos-arm"\n'),
             "server installer required again": ("check", '  "YuzuAgentSetup-*.exe"\n', '  "YuzuAgentSetup-*.exe"\n  "YuzuServerSetup-*.exe"\n'),
             "bundle new name typo": ("bundle", "-p 'yuzu-agent-windows-x64.zip'", "-p 'yuzu-agent-windows-x86.zip'"),
+            # Step-1 conventions (C-1): an override or a reconfigure is caught.
+            "windows =true appended": ("release", "-Dbuild_tests=false `\n            -Dbuild_server=false", "-Dbuild_tests=false `\n            -Dbuild_server=false `\n            -Dbuild_server=true"),
+            "macos =true appended": ("release", "            -Dbuild_server=false \\\n            -Db_lto=true", "            -Dbuild_server=false \\\n            -Dbuild_server=true \\\n            -Db_lto=true"),
+            "windows meson configure": ("release", "      - name: Build\n        run: meson compile -C build-windows", "      - name: Reconfigure\n        run: meson configure build-windows -Dbuild_server=true\n\n      - name: Build\n        run: meson compile -C build-windows"),
+            # The packaged-archive check (qe-1).
+            "verify step removed": ("release", "      - name: Verify the agent runs from the packaged archive", "      - name: Something else"),
+            "verify exit check dropped": ("release", "          if ($p.ExitCode -ne 0) { Write-Error", "          if ($false) { Write-Error"),
+            "verify PATH restriction dropped": ("release", '          $env:PATH = "$env:SystemRoot\\System32;$env:SystemRoot"\n', ""),
+            "verify agent-present check dropped": ("release", '          if (-not (Test-Path $agent)) { Write-Error "yuzu-agent.exe missing from the archive"; exit 1 }\n', ""),
+            "verify server check inverted": ("release", 'if (Test-Path (Join-Path $bin "yuzu-server.exe")) { Write-Error', 'if (-not (Test-Path (Join-Path $bin "yuzu-server.exe"))) { Write-Error'),
+            "verify plugin count dropped": ("release", "          if ($built -lt 1 -or $packed -ne $built) { Write-Error", "          if ($false) { Write-Error"),
+            "verify made non-gating": ("release", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n        continue-on-error: true\n"),
+            "verify timeout dropped": ("release", "        shell: pwsh\n        timeout-minutes: 5\n", "        shell: pwsh\n"),
+            "verify moved after installers": ("release", "      - name: Sign installers (Authenticode)", "      - name: Sign installers (Authenticode)\n        run: echo\n\n      - name: Verify the agent runs from the packaged archive"),
+            "macos codesign path reverted": ("release", "for binary in build-macos/agents/core/yuzu-agent; do", "for binary in build-macos/yuzu-agent; do"),
+            "macos notarize verdict unchecked": ("release", 'if [ "${STATUS}" != "Accepted" ]; then', 'if false; then'),
+            # The bundle actually uses the resolved names (qe-2).
+            "bundle ARCHIVES hard-coded old": ("bundle", 'ARCHIVES="yuzu-linux-x64.tar.gz $WIN_ZIP $MAC_TGZ"', 'ARCHIVES="yuzu-linux-x64.tar.gz yuzu-windows-x64.zip $MAC_TGZ"'),
+            "bundle extract hard-coded old": ("bundle", 'extract_payload windows-x64 "$WIN_ZIP" zip', "extract_payload windows-x64 yuzu-windows-x64.zip zip"),
+            "bundle die guard dropped": ("bundle", '[ -n "$MAC_TGZ" ] || die "no macOS archive on $TAG"\n', ""),
+            # The artifact gate refuses retired assets (UP-6).
+            "forbidden list loses server installer": ("check", '  "YuzuServerSetup-*"\n', ""),
+            "forbidden list loses old macOS name": ("check", '  "yuzu-macos-arm64.*"\n', ""),
             "bundle prefers old name": ("bundle", "WIN_ZIP=\"$(pick 'yuzu-agent-windows-x64.zip')\"; [ -n \"$WIN_ZIP\" ] || WIN_ZIP=\"$(pick 'yuzu-windows-x64.zip')\"",
                                         "WIN_ZIP=\"$(pick 'yuzu-windows-x64.zip')\"; [ -n \"$WIN_ZIP\" ] || WIN_ZIP=\"$(pick 'yuzu-agent-windows-x64.zip')\""),
         }

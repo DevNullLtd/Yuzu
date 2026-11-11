@@ -24,6 +24,8 @@
 #     yuzu-agent-windows-x64.zip
 #     yuzu-agent-macos-arm64.tar.gz
 #
+#   Retired assets (refused if present): YuzuServerSetup-*, yuzu-windows-x64.*, yuzu-macos-arm64.*
+#
 #   Glob archives (at least one match each):
 #     *.deb                     (linux server+agent+gateway)
 #     *.rpm                     (linux server+agent+gateway)
@@ -98,6 +100,26 @@ for pat in "${REQUIRED_GLOBS[@]}"; do
   matches=( "$ART_DIR"/$pat )
   if [[ ! -e "${matches[0]}" ]]; then
     echo "::error::no files match required pattern: $pat" >&2
+    fail=1
+  fi
+done
+
+# ── Assets no release may carry any more (ADR-0035 step 2) ──────────
+# The Windows/macOS server and its installer are no longer built, and the
+# Windows/macOS archives were renamed. A stray file of one of these names
+# (a leftover artifact, a re-run mixing runs) would otherwise be hashed into
+# SHA256SUMS while never being attached, so it is refused here.
+FORBIDDEN_GLOBS=(
+  "YuzuServerSetup-*"
+  "yuzu-windows-x64.*"
+  "yuzu-macos-arm64.*"
+)
+
+for pat in "${FORBIDDEN_GLOBS[@]}"; do
+  # shellcheck disable=SC2206 # intentional globbing
+  matches=( "$ART_DIR"/$pat )
+  if [[ -e "${matches[0]}" ]]; then
+    echo "::error::release must not carry ${matches[0]##*/} (no Windows/macOS server since ADR-0035; the archives are yuzu-agent-*)" >&2
     fail=1
   fi
 done
