@@ -2020,6 +2020,10 @@ TEST_CASE("every catalogue row's plugin name is already lowercase",
         ++rows;
         INFO("plugin: " << std::string{cap.plugin});
         CHECK(yuzu::server::ascii_lower(cap.plugin) == std::string{cap.plugin});
+        // The two words the family reserves: "unknown" is the sum label (a catalogue plugin of
+        // that name would be silently overwritten by it) and "other" was the retired overflow.
+        CHECK(cap.plugin != yuzu::server::kUnknownPluginLabel);
+        CHECK(cap.plugin != "other");
     });
     CHECK(rows > 0);
 }
@@ -2210,6 +2214,46 @@ TEST_CASE("REAL AgentHealthStore: one agent with two rejection reasons is counte
     CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 0.0);
     CHECK(series_val(out, init_failed_series("unknown")) == 2.0);
     CHECK(series_val(out, init_failed_series("echo")) == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: the 32-slot boundary, a repeated unknown token, and the literal reason series",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    const auto others = other_catalogue_names();
+    REQUIRE(others.size() >= 33);
+
+    // Exactly 32 real tokens: all read, none over the cap.
+    beat_tags(store, "exact", {{"yuzu.plugins_failed", join_names(others, 32)}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    CHECK(count_init_failed_series(out) == 32);
+    CHECK(has_series(out, init_failed_series(others[31])));
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 0.0);
+
+    // 33 tokens: the 33rd is not read, and the agent is over the cap once.
+    beat_tags(store, "exact", {{"yuzu.plugins_failed", join_names(others, 33)}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(count_init_failed_series(out) == 32);
+    CHECK_FALSE(has_series(out, init_failed_series(others[32])));
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 1.0);
+
+    // The same unknown token twice from ONE agent is deduped before the catalogue test: it adds
+    // one to plugin="unknown" and the agent is counted once.
+    store.remove("exact");
+    beat_tags(store, "dup", {{"yuzu.plugins_failed", "nosuchplugin,nosuchplugin"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(series_val(out, init_failed_series("unknown")) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
+
+    // The reason label values are the documented words, spelt out here so renaming or swapping
+    // a kReject* constant cannot stay green.
+    CHECK(has_series(out, "yuzu_fleet_plugin_init_failed_rejected{reason=\"unknown_plugin\"} 1"));
+    CHECK(has_series(out, "yuzu_fleet_plugin_init_failed_rejected{reason=\"malformed\"} 0"));
+    CHECK(has_series(out, "yuzu_fleet_plugin_init_failed_rejected{reason=\"over_cap\"} 0"));
 }
 
 TEST_CASE("REAL AgentHealthStore: an empty token carries no name and is not malformed",
