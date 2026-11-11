@@ -3,13 +3,13 @@
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
 | | |
 |---|---|
-| **What it does** | Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions |
-| **Version** | 1.1.0 |
-| **Kind** | Collector · read-only · gathered (crossplatform.virtualization.host, windows.virtualization.wsl) |
+| **What it does** | Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions, container-runtime posture |
+| **Version** | 1.2.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.virtualization.host, windows.virtualization.wsl, linux.virtualization.runtime_posture) |
 | **Platforms** | Windows 🟡 constrained · macOS ✅ · Linux ✅ |
-| **Actions** | `host` (definition `crossplatform.virtualization.host`) · `wsl` (definition `windows.virtualization.wsl`) |
-| **Security** | `host`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `wsl`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval |
-| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
+| **Actions** | `host` (definition `crossplatform.virtualization.host`) · `runtime_posture` (definition `linux.virtualization.runtime_posture`) · `wsl` (definition `windows.virtualization.wsl`) |
+| **Security** | `host`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None; `wsl`: securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate AdminOrApproval; `runtime_posture`: securable `Security` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: `host`: endpoint-admin, endpoint-operator; `wsl`: endpoint-admin, endpoint-operator; `runtime_posture`: endpoint-admin, endpoint-operator, security-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -92,6 +92,7 @@ The order matters: a positive identification is never outranked by a negative or
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `host` | 🟡 constrained · rung 1 · CPUID leaves 1 and 0x40000000-0x40000003 (__cpuid, x86) and the SMBIOS System Information table via GetSystemFirmwareTable('RSMB') | ✅ supported · rung 1 · sysctlbyname kern.hv_vmm_present and hw.model | ✅ supported · rung 1 · CPUID leaves 1 and 0x40000000-0x40000003 (x86), /sys/class/dmi/id/{sys_vendor,product_name}, /sys/hypervisor/type, /.dockerenv, /run/.containerenv, /run/systemd/container and /proc/self/cgroup (bounded reads, no subprocess) |
+| `runtime_posture` | ⛔ unsupported | ⛔ unsupported | 🟡 constrained · rung 1 · stat of the docker, podman and containerd default sockets, config files and data roots (no subprocess, no PATH walk), /etc/docker/daemon.json read through a key allow-list (nlohmann::json), /etc/containers and /etc/containerd presence only, and, only when agent.container_runtime_endpoint names an operator-provided read-only unix socket, four fixed GET requests over it (/version, /info, /containers/json?all=1, /containers/{id}/json) under a 20 s action deadline |
 | `wsl` | 🟡 constrained · rung 1 · Reg*W reads of HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Lxss\\MSI, the HKLM ProfileList (profile SIDs and folder paths; no privilege) and each local profile's Software\\Microsoft\\Windows\\CurrentVersion\\Lxss key through the shared with_user_hive ladder (loaded HKU hive first, else a guarded offline NTUSER.DAT mount under SeBackup/SeRestore and the process-wide offline-hive lock); no subprocess | ⛔ unsupported | ⛔ unsupported |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
@@ -99,6 +100,9 @@ The order matters: a positive identification is never outranked by a negative or
 - **`host` / Windows** — container not read: always unknown, windows:virtualization:container:not_read; an ARM64 build has no CPUID and reads unknown (windows:virtualization:cpuid:unavailable) unless SMBIOS names a VM vendor, and does not detect a Hyper-V or VBS host; no ARM64 build ships, and the x64 agent on a Windows-on-ARM device reads whatever CPUID the emulation presents (not measured)
 - **`host` / macOS** — no CPUID on arm64: the sysctl is the readable negative; container is always no
 - **`host` / Linux** — ARM has no CPUID: SMBIOS and OS hints alone decide, and a host with neither reads unknown, never bare_metal; a KVM host reads bare_metal (its own CPUID is not virtualised) but a Xen dom0 reads guest/xen; a cgroup-v2 namespace-obscured root reads container unknown; a container without a marker file or systemd record can read container no when its readable, non-root cgroup path has no recognised runtime signature
+- **`runtime_posture` / Windows** — Linux-only: container-runtime posture is read from Linux paths and a unix socket
+- **`runtime_posture` / macOS** — Linux-only: container-runtime posture is read from Linux paths and a unix socket
+- **`runtime_posture` / Linux** — no endpoint set (the default) means no socket is ever opened and no container is listed; the runtimes' own default sockets are refused as the endpoint (by path and by inode), and the permission bits plus the operator's proxy are the enforcement, not that check; not_detected means none of a runtime's standard-path artefacts exists, which a stopped, rootless or custom-root runtime also reads; containerd is presence only (its control plane is gRPC, not read); a read failure, a cap, the deadline or an overprivileged default socket reads constrained with a typed token
 - **`wsl` / Windows** — a profile whose hive was reached by neither arm is counted and reported on its own profile row, never read as having no distributions; a registry link planted at the Lxss key or at a distribution key is detected and reported (windows:virtualization:wsl:lxss_link), never followed; wsl2 counts version-2 distributions and is not a VM count (the utility VM's running state is not read); base, VHD and shortcut paths, SIDs, uids and hive mount names are never emitted; package version - means unavailable; the offline mount calls have no deadline (the walk is bounded in work, not in time: at most 512 profiles are mounted per dispatch)
 - **`wsl` / macOS** — Windows-only: WSL distributions are a Windows feature
 - **`wsl` / Linux** — Windows-only: WSL distributions are a Windows feature
@@ -120,7 +124,7 @@ No subprocess, no shell and no TCP: every leg is an in-process read (CPUID, sysc
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-Neither action takes parameters.
+No action takes parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -143,6 +147,20 @@ Every row is pipe-delimited and field 0 is the row kind; `-` is an absent value.
 | `field_4` | string | - | Windows, Linux, macOS | `Mac16,10` | host: the SMBIOS product name or macOS hw.model, "-" when not read. Not used by the other kinds. |
 | `field_5` | string | - | Windows, Linux, macOS | `sysctl` | host: the evidence source that decided the kind (cpuid, smbios, sysctl or sys_hypervisor); when the kind is unknown, the joined reason tokens instead. Not used by the other kinds. |
 | `field_6` | string | `high` `medium` `low` | Windows, Linux, macOS | `high` | host: confidence, high, medium or low (an unknown is low). Not used by the other kinds. |
+
+**`linux.virtualization.runtime_posture` — `row_kind|field_1|field_2|field_3|field_4|field_5|field_6|field_7|field_8`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `endpoint` `runtime` `config` `container` | Linux | `container` | Row shape discriminator (field 0). Values: status, endpoint, runtime, config, container. |
+| `field_1` | string | - | Linux | `docker` | status: the literal "runtime_posture". endpoint: the endpoint outcome, unset, endpoint_refused, permission_denied, unreachable, not_http or ok. runtime: the runtime, docker, podman or containerd. config: docker for a daemon.json setting, otherwise the runtime that /version identified. container: the runtime that /version identified. For config and container the runtime is docker or podman, or "-" when /version did not identify one. |
+| `field_2` | string | - | Linux | `detected` | status: supported, constrained or unsupported (a leg that threw). endpoint: the refusal reason for endpoint_refused (relative, dotdot, too_long, default_socket, same_inode, not_socket, symlink, owner, group, mode, insecure_ancestor, stat_error), otherwise "-". runtime: not_detected, detected or served. config: the setting name, or daemon_json on the one pseudo-row config\|docker\|daemon_json\|malformed that says daemon.json was not usable JSON or held an allow-listed key of the wrong type. container: the first 12 characters of the container id. |
+| `field_3` | string | - | Linux | `present:0660:0:998` | status: reason token(s) for a non-supported read, "-" when complete; every token is linux:virtualization:runtime_posture:<source>:<cause>, where <source> is endpoint, version, info, list, inspect, mountinfo, daemon_json or a runtime name; the source segment is omitted for the action-wide tokens busy, rows_capped, inspect_capped and deadline_exhausted, and inspect:failed:<n> carries a count in place of a cause; tokens look like linux:virtualization:runtime_posture:endpoint:default_socket, linux:virtualization:runtime_posture:version:timeout, linux:virtualization:runtime_posture:info:malformed, linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, "-" when it did not answer or its /version named no runtime. runtime: the default socket, present:<mode>:<uid>:<gid>, absent or unreadable (its stat failed). config: the setting value (malformed on the daemon_json pseudo-row). container: the container name. |
+| `field_4` | string | - | Linux | `present` | runtime: whether a config file was found, present, absent or unreadable (its read failed). container: the image reference. Not used by the other kinds. |
+| `field_5` | string | - | Linux | `running` | runtime: the runtime version, filled only on the served row, otherwise "-". container: the state, created, running, paused, restarting, removing, exited, dead or invalid. Not used by the other kinds. |
+| `field_6` | string | - | Linux | `no` | runtime: the API version, filled only on the served row, otherwise "-". container: privileged, yes, no or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds. |
+| `field_7` | string | - | Linux | `bridge` | container: the network mode, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds. |
+| `field_8` | string | - | Linux | `no` | container: host_runtime_socket_mounted, yes (a mount source is a default runtime socket path or a parent directory of one), no, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). The check covers the default socket paths only. Not used by the other kinds. |
 
 **`windows.virtualization.wsl` — `row_kind|field_1|field_2|field_3|field_4|field_5|field_6`**
 
@@ -205,7 +223,7 @@ For `host` and `wsl`, a refusal is reported as `CONSTRAINED` with a `permission_
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-08 · LocalSystem (elevated; account names replaced with jsmith) · leg-hash 2a955b994291
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-11 · interactive user (elevated; account names replaced with jsmith) · leg-hash aec6e0e7930c
 
 ```
 == action=host
@@ -216,12 +234,16 @@ container|unknown|windows:virtualization:container:not_read
 
 == action=wsl
 status|wsl|supported|-
-summary|1|1|6|0|3.0.3.0
+summary|1|1|6|0|3.0.5.0
 distribution|jsmith|Ubuntu-26.04|2|installed|yes|ubuntu
 [result_status] OK / FULL
+
+== action=runtime_posture
+status|runtime_posture|unsupported|windows:virtualization:runtime_posture:unsupported
+[result_status] UNAVAILABLE / UNKNOWN / windows:virtualization:runtime_posture:unsupported
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-08 · euid 501 · leg-hash 2a955b994291
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-10 · euid 501 · leg-hash aec6e0e7930c
 
 ```
 == action=host
@@ -233,9 +255,13 @@ container|no|macos:no_container_runtime
 == action=wsl
 status|wsl|unsupported|macos:virtualization:wsl:unsupported
 [result_status] UNAVAILABLE / UNKNOWN / macos:virtualization:wsl:unsupported
+
+== action=runtime_posture
+status|runtime_posture|unsupported|macos:virtualization:runtime_posture:unsupported
+[result_status] UNAVAILABLE / UNKNOWN / macos:virtualization:runtime_posture:unsupported
 ```
 
-**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-08 · euid 0 · leg-hash 2a955b994291
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-11 · euid 104 · leg-hash aec6e0e7930c
 
 ```
 == action=host
@@ -247,6 +273,14 @@ container|no|linux:no_container_marker
 == action=wsl
 status|wsl|unsupported|linux:virtualization:wsl:unsupported
 [result_status] UNAVAILABLE / UNKNOWN / linux:virtualization:wsl:unsupported
+
+== action=runtime_posture
+status|runtime_posture|supported|-
+endpoint|unset|-|-
+runtime|docker|detected|present:0660:0:108|absent|-|-
+runtime|podman|not_detected|absent|absent|-|-
+runtime|containerd|detected|present:0660:0:0|absent|-|-
+[result_status] OK / FULL
 ```
 <!-- END GENERATED -->
 
@@ -261,10 +295,10 @@ status|wsl|unsupported|linux:virtualization:wsl:unsupported
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/virtualization/src/virtualization_legs.hpp` · `agents/plugins/virtualization/src/virtualization_linux.cpp` · `agents/plugins/virtualization/src/virtualization_macos.cpp` · `agents/plugins/virtualization/src/virtualization_parsers.hpp` · `agents/plugins/virtualization/src/virtualization_plugin.cpp` · `agents/plugins/virtualization/src/virtualization_win.cpp` · `agents/plugins/virtualization/src/virtualization_wsl_parsers.hpp`
+- Plugin: `agents/plugins/virtualization/src/virtualization_legs.hpp` · `agents/plugins/virtualization/src/virtualization_linux.cpp` · `agents/plugins/virtualization/src/virtualization_macos.cpp` · `agents/plugins/virtualization/src/virtualization_parsers.hpp` · `agents/plugins/virtualization/src/virtualization_plugin.cpp` · `agents/plugins/virtualization/src/virtualization_runtime_parsers.hpp` · `agents/plugins/virtualization/src/virtualization_win.cpp` · `agents/plugins/virtualization/src/virtualization_wsl_parsers.hpp`
 - Definitions: `content/definitions/virtualization.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_virtualization.hpp`
-- Tests: `tests/test_virtualization_definition.py` · `tests/test_virtualization_wsl_pin_lexical.py` · `tests/unit/test_virtualization_local_dispatcher.cpp` · `tests/unit/test_virtualization_parsers.cpp` · `tests/unit/test_virtualization_wsl_parsers.cpp`
+- Tests: `tests/test_virtualization_definition.py` · `tests/test_virtualization_wsl_pin_lexical.py` · `tests/unit/test_virtualization_local_dispatcher.cpp` · `tests/unit/test_virtualization_parsers.cpp` · `tests/unit/test_virtualization_runtime_legs.cpp` · `tests/unit/test_virtualization_runtime_parsers.cpp` · `tests/unit/test_virtualization_wsl_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-11-08-virtualization-wsl.added.md` · `changelog.d/pr12-1a-virtualization-host.added.md`
+- Changelog: `changelog.d/2026-11-08-virtualization-wsl.added.md` · `changelog.d/pr12-1a-virtualization-host.added.md` · `changelog.d/pr12-1b-virtualization-runtime-posture.added.md`
 <!-- END GENERATED -->
