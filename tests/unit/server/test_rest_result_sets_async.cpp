@@ -4935,12 +4935,9 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     CHECK(src.find("targeted, responded, execution_tracker_ != nullptr, dropped);") !=
           std::string::npos);
     CHECK(src.find("dropped = sum.agents_response_dropped;") != std::string::npos);
-    // The parent decision lives in rs_matcher::fold_parent_completeness (unit-tested there); the
-    // tick passes it the marker so a parent deleted before the fill still counts, and skips the
-    // set when the fold returns nothing (a degraded parent read).
-    CHECK(src.find("rs_matcher::fold_parent_completeness(") != std::string::npos);
-    CHECK(src.find("p.had_parent_input, parent_counters);") != std::string::npos);
-    CHECK(src.find("agents_unanswered = folded->agents_unanswered;") != std::string::npos);
+    // The parent's completeness is snapshotted onto the pending row at create time
+    // (inherit_completeness); the tick never reads the parent.
+    CHECK(src.find("fold_parent_completeness") == std::string::npos);
     CHECK(src.find("agents_failed = found->agents_failed;") != std::string::npos);
     // The truncated branch: between its `if` and the line that adopts the membership, the set
     // is marked failed and the branch ends in `continue;` with nothing but the closing brace
@@ -5056,6 +5053,18 @@ TEST_CASE("result-set producers refuse a pending parent and inherit an incomplet
         REQUIRE(status == 201);
         auto child = get_ok(*h.store, j["data"]["id"].get<std::string>());
         REQUIRE(child.has_value());
+        CHECK(child->agents_failed == 2);
+        CHECK(child->agents_unanswered == 3);
+    }
+    SECTION("from-echo-query snapshots a partial parent's counters onto the pending row") {
+        REQUIRE(h.store->materialize(pending->id, {"dev-1"}, 2, 3).has_value());
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-echo-query",
+                        R"({"sql":"SELECT 1","parent_id":")" + pending->id + R"("})", status);
+        REQUIRE(status == 202);
+        auto child = get_ok(*h.store, j["data"]["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        CHECK(child->status == ResultSetStatus::Pending);
         CHECK(child->agents_failed == 2);
         CHECK(child->agents_unanswered == 3);
     }

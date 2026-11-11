@@ -15387,8 +15387,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // producers (matching REST exactly: the synchronous creators
             // below use `rs_load_owned` directly on a canonical id, no alias
             // resolution). Resolves a per-operator alias OR a canonical
-            // "rs_"-prefixed id to a canonical id this session owns.
-            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<std::string> {
+            // "rs_"-prefixed id to the materialized row this session owns.
+            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<ResultSet> {
                 std::string rs_id = raw;
                 if (!raw.starts_with("rs_")) {
                     auto canon = result_set_store_->resolve_alias(session->username, raw);
@@ -15416,7 +15416,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return std::nullopt;
                 }
-                return rs_id;
+                return row; // the caller snapshots its completeness (inherit_completeness)
             };
 
             // A NUL byte in a result-set producer input (name, parameters, parent_id) is
@@ -15638,14 +15638,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 std::optional<std::string> parent_id;
+                std::optional<ResultSet> parent_row;
                 std::string scope_expr;
                 if (args_for_parent.contains("parent_id") && args_for_parent["parent_id"].is_string() &&
                     !args_for_parent["parent_id"].get<std::string>().empty()) {
-                    auto canon = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
-                    if (!canon)
+                    parent_row = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
+                    if (!parent_row)
                         return; // rs_resolve_owned_parent already wrote the error
-                    parent_id = *canon;
-                    scope_expr = "from_result_set:" + *canon;
+                    parent_id = parent_row->id;
+                    scope_expr = "from_result_set:" + parent_row->id;
                 }
 
                 // Create-before-dispatch (UP2-4): the execution_id must be
@@ -15807,6 +15808,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = name;
                 cr.parent_id = parent_id;
+                // Narrowed to the parent's members: the pending row carries the parent's
+                // completeness from birth (REST twin: run_async).
+                if (parent_row)
+                    inherit_completeness(cr, *parent_row);
                 cr.source_kind = std::string(src_kind);
                 cr.source_payload = source_payload;
                 cr.matcher = matcher;

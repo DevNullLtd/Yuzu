@@ -1013,10 +1013,8 @@ std::vector<PendingSet> ResultSetStore::list_pending() {
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT id, owner_principal, source_kind, source_execution_id, matcher, created_at, "
-        "parent_id, position('\"scope_input_id\"' in source_payload) > 0 "
-        "FROM result_set_store.result_sets WHERE status = 'pending' "
-        "ORDER BY created_at ASC",
+        "SELECT id, owner_principal, source_kind, source_execution_id, matcher, created_at "
+        "FROM result_set_store.result_sets WHERE status = 'pending' ORDER BY created_at ASC",
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::list_pending: query failed: {}", PQerrorMessage(lease.get()));
@@ -1032,9 +1030,6 @@ std::vector<PendingSet> ResultSetStore::list_pending() {
         p.source_execution_id = PQgetvalue(res.get(), i, 3);
         p.matcher = PQgetvalue(res.get(), i, 4);
         p.created_at = to_i64(PQgetvalue(res.get(), i, 5));
-        if (!PQgetisnull(res.get(), i, 6))
-            p.parent_id = PQgetvalue(res.get(), i, 6);
-        p.had_parent_input = PQgetvalue(res.get(), i, 7)[0] == 't';
         result.push_back(std::move(p));
     }
     return result;
@@ -1078,9 +1073,11 @@ std::expected<void, ResultSetError> ResultSetStore::materialize(
         }
         pg::PgResult upd = pg::exec_params(
             conn,
+            // The counters ADD to what the pending row carries: a child inherits its parent's
+            // at create time (inherit_completeness), so the fill never reads the parent.
             "UPDATE result_set_store.result_sets SET status = 'materialized', "
-            "device_count = $1::bigint, agents_failed = $2::bigint, "
-            "agents_unanswered = $3::bigint "
+            "device_count = $1::bigint, agents_failed = agents_failed + $2::bigint, "
+            "agents_unanswered = agents_unanswered + $3::bigint "
             "WHERE id = $4 AND status = 'pending' RETURNING id",
             std::vector<std::string>{std::to_string(static_cast<int64_t>(uniq.size())),
                                      std::to_string(agents_failed),
@@ -1158,7 +1155,10 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
 
     pg::PgResult upd = pg::exec_params(
         lease.get(),
-        "UPDATE result_set_store.result_sets SET status = 'failed', source_payload = $1 "
+        // A failed set reads agents_failed 0 / agents_unanswered 0 (it is refused everywhere as
+        // not ready), so the counters a child inherited at create time are cleared here.
+        "UPDATE result_set_store.result_sets SET status = 'failed', source_payload = $1, "
+        "agents_failed = 0, agents_unanswered = 0 "
         "WHERE id = $2 AND status = 'pending'",
         std::vector<std::string>{payload.dump(), id});
     if (upd.status() != PGRES_COMMAND_OK)

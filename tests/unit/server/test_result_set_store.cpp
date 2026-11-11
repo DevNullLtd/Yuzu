@@ -1058,45 +1058,76 @@ TEST_CASE("ResultSetStore: member_set_owned refuses a set that is not materializ
         REQUIRE(r.has_value());
         CHECK(r->complete);
     }
-    SECTION("list_pending carries the parent id") {
-        auto parent = store.create_materialized(req("alice", "lineage-parent"), {"dev-1"});
+    SECTION("an async child of an incomplete parent is incomplete from birth and stays so") {
+        auto parent = store.create_pending(pending_req("async-parent"), "exec-ap");
         REQUIRE(parent.has_value());
-        CreateRequest child_req = pending_req("pending-child");
+        REQUIRE(store.materialize(parent->id, {"dev-1", "dev-2"}, 1, 2).has_value());
+        auto parent_row = get_ok(store, parent->id);
+        REQUIRE(parent_row.has_value());
+
+        // The async producers snapshot the parent's counters onto the pending row.
+        CreateRequest child_req = pending_req("async-child");
         child_req.parent_id = parent->id;
-        auto child = store.create_pending(child_req, "exec-pc");
+        inherit_completeness(child_req, *parent_row);
+        auto child = store.create_pending(child_req, "exec-ac");
         REQUIRE(child.has_value());
-        bool seen = false;
-        for (const auto& p : store.list_pending())
-            if (p.id == child->id) {
-                seen = true;
-                CHECK(p.parent_id == parent->id);
-            }
-        CHECK(seen);
-    }
-    SECTION("list_pending keeps the parent marker after the parent is deleted") {
-        auto parent = store.create_materialized(req("alice", "doomed-parent"), {"dev-1"});
-        REQUIRE(parent.has_value());
-        CreateRequest child_req = pending_req("orphaned-child");
-        child_req.parent_id = parent->id;
-        child_req.source_payload = R"({"sql":"SELECT 1","scope_input_id":")" + parent->id + R"("})";
-        auto child = store.create_pending(child_req, "exec-orphan");
-        REQUIRE(child.has_value());
-        auto plain = store.create_pending(pending_req("parentless-child"), "exec-plain");
-        REQUIRE(plain.has_value());
+
+        // Before the fill: the pending row already carries the parent's counters.
+        auto before = get_ok(store, child->id);
+        REQUIRE(before.has_value());
+        CHECK(before->status == ResultSetStatus::Pending);
+        CHECK(before->agents_failed == 1);
+        CHECK(before->agents_unanswered == 2);
+
+        // The fill adds its own counts to the inherited ones.
+        REQUIRE(store.materialize(child->id, {"dev-1"}, 3, 4).has_value());
+        auto after = get_ok(store, child->id);
+        REQUIRE(after.has_value());
+        CHECK(after->agents_failed == 4);
+        CHECK(after->agents_unanswered == 6);
+        auto r = store.member_set_owned(child->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->complete);
+
+        // Deleting the parent afterwards changes nothing on the child.
         REQUIRE(store.delete_set(parent->id).has_value());
-        bool seen_child = false, seen_plain = false;
-        for (const auto& p : store.list_pending()) {
-            if (p.id == child->id) {
-                seen_child = true;
-                CHECK_FALSE(p.parent_id.has_value());
-                CHECK(p.had_parent_input);
-            } else if (p.id == plain->id) {
-                seen_plain = true;
-                CHECK_FALSE(p.had_parent_input);
-            }
-        }
-        CHECK(seen_child);
-        CHECK(seen_plain);
+        auto orphan = get_ok(store, child->id);
+        REQUIRE(orphan.has_value());
+        CHECK(orphan->agents_failed == 4);
+        CHECK(orphan->agents_unanswered == 6);
+        auto r2 = store.member_set_owned(child->id, "alice");
+        REQUIRE(r2.has_value());
+        CHECK_FALSE(r2->complete);
+    }
+    SECTION("a parentless async set's counters are exactly the fill's own") {
+        auto rs = store.create_pending(pending_req("parentless-async"), "exec-pl");
+        REQUIRE(rs.has_value());
+        REQUIRE(store.materialize(rs->id, {"dev-1"}, 0, 0).has_value());
+        auto got = get_ok(store, rs->id);
+        REQUIRE(got.has_value());
+        CHECK(got->agents_failed == 0);
+        CHECK(got->agents_unanswered == 0);
+        auto r = store.member_set_owned(rs->id, "alice");
+        REQUIRE(r.has_value());
+        CHECK(r->complete);
+    }
+    SECTION("a failed set reads zero counters even when it inherited some") {
+        auto parent = store.create_pending(pending_req("fail-parent"), "exec-fp");
+        REQUIRE(parent.has_value());
+        REQUIRE(store.materialize(parent->id, {"dev-1"}, 2, 1).has_value());
+        auto parent_row = get_ok(store, parent->id);
+        REQUIRE(parent_row.has_value());
+        CreateRequest child_req = pending_req("fail-child");
+        child_req.parent_id = parent->id;
+        inherit_completeness(child_req, *parent_row);
+        auto child = store.create_pending(child_req, "exec-fc");
+        REQUIRE(child.has_value());
+        store.mark_failed(child->id, "test");
+        auto got = get_ok(store, child->id);
+        REQUIRE(got.has_value());
+        CHECK(got->status == ResultSetStatus::Failed);
+        CHECK(got->agents_failed == 0);
+        CHECK(got->agents_unanswered == 0);
     }
 }
 

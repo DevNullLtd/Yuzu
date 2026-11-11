@@ -35,9 +35,10 @@ New or modified owned resources in `server/core/src/` (`result_set_store.cpp`,
 
 ### Completeness inherited from a parent set
 - **Site:** `CreateRequest::agents_failed` / `agents_unanswered`, set by `inherit_completeness` at
-  the inventory producers and persisted by `insert_row_impl` in the same insert as the row; the
-  asynchronous fill pass in `server.cpp` adds the parent's counters (read through `get`) to its own
-  before `materialize`.
+  every producer whose members come from the parent's (the inventory producers and the three
+  asynchronous ones, REST `run_async` and MCP `rs_run_async`) and persisted by `insert_row_impl` in
+  the same insert as the row; `materialize` adds the fill's own counts to them in its
+  status-guarded update. The fill pass never reads the parent.
 - **Owner type:** plain integers on a request or local value; no handle.
 - **Release point:** scope exit.
-- **Failure cleanup:** a degraded parent read skips the set for that tick; it retries on the next.
+- **Failure cleanup:** none needed: the counters ride the existing insert and update statements.

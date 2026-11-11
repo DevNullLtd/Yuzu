@@ -19067,7 +19067,7 @@ private:
                             }
                             // An agent counted as responded whose answer was not persisted is
                             // absent from the stored rows the membership is built from: unanswered.
-                            int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
+                            const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
                                 targeted, responded, execution_tracker_ != nullptr, dropped);
                             const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
                             if (!terminal && !timed_out)
@@ -19111,33 +19111,6 @@ private:
                                 agents_failed = found->agents_failed;
                                 members = std::move(*found);
                             }
-                            // The dispatch behind this set was narrowed to its parent's members,
-                            // so the set is no more complete than the parent (rs_matcher decides:
-                            // a live parent adds its counters, a gone one counts as unanswered, a
-                            // degraded read retries on the next tick). A parent deleted before
-                            // this pass has had its parent_id cleared; had_parent_input still
-                            // shows the dependence.
-                            rs_matcher::ParentRead parent_read = rs_matcher::ParentRead::NoParentId;
-                            rs_matcher::FillCounters parent_counters;
-                            if (p.parent_id) {
-                                auto parent = result_set_store_->get(*p.parent_id);
-                                if (!parent) {
-                                    parent_read = rs_matcher::ParentRead::Unreadable;
-                                } else if (*parent) {
-                                    parent_read = rs_matcher::ParentRead::Live;
-                                    parent_counters = {(*parent)->agents_failed,
-                                                       (*parent)->agents_unanswered};
-                                } else {
-                                    parent_read = rs_matcher::ParentRead::Gone;
-                                }
-                            }
-                            const auto folded = rs_matcher::fold_parent_completeness(
-                                {agents_failed, agents_unanswered}, parent_read,
-                                p.had_parent_input, parent_counters);
-                            if (!folded)
-                                continue;
-                            agents_failed = folded->agents_failed;
-                            agents_unanswered = folded->agents_unanswered;
                             if (agents_failed > 0)
                                 spdlog::warn("result set {} materialized partial: {} agent(s) "
                                              "answered execution {} with a failure and never "

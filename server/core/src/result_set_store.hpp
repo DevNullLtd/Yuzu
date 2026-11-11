@@ -165,17 +165,19 @@ struct ResultSet {
     std::string source_execution_id;      // set for async producers; else empty
     std::string matcher;                  // JSON matcher for instruction-result; else empty
     int64_t device_count{0};
-    /// Async producers: how many agents never satisfied the matcher AND answered at least once
-    /// with a failure (status not success, or output starting `error|`). The set is partial when
-    /// this is non-zero: those agents are absent from the membership because their query failed,
-    /// not because they do not match. 0 for sync producers.
+    /// Agents absent from the membership because their query failed (they answered at least once
+    /// with a failure: status not success, or output starting `error|`), not because they do not
+    /// match. Async producers add the count from their own execution at fill time. A child created
+    /// from a parent's members also carries the parent's count from creation (`inherit_completeness`),
+    /// so along a lineage the value is a SUM over the chain, not "failed in this execution": only
+    /// the zero/non-zero distinction (`partial`) is reliable. 0 for a set created from explicit
+    /// device ids and for a failed set.
     int64_t agents_failed{0};
-    /// Async producers: how many targeted agents never answered before the set was filled at the
-    /// pending timeout. Those agents are absent from the membership because they did not answer,
-    /// not because they do not match. 0 for sync producers and for a set filled before this
-    /// column existed (no data to say otherwise). The fill pass also stores 1 when it cannot prove
-    /// every agent answered (no tracker data, or none targeted), so a value of 1 can mean "not
-    /// known complete" rather than an exact count.
+    /// Targeted agents absent from the membership because they never answered before the set was
+    /// filled (at the pending timeout at the latest), or because their answer was not fully
+    /// stored. The fill pass stores at least 1 when it cannot prove every agent answered (no
+    /// tracker data, or none targeted), so 1 can mean "not known complete" rather than an exact
+    /// count. Inherited and summed along a lineage exactly like `agents_failed`.
     int64_t agents_unanswered{0};
 };
 
@@ -203,11 +205,6 @@ struct PendingSet {
     std::string source_execution_id;
     std::string matcher;
     int64_t created_at{0};
-    std::optional<std::string> parent_id; // lineage edge; the fill pass inherits its completeness
-    /// True when the pending row's source_payload records a parent reference (`scope_input_id`).
-    /// `parent_id` is cleared (ON DELETE SET NULL) when the parent is deleted before the fill, so
-    /// this marker is what tells the fill pass the dispatch was once narrowed to a parent.
-    bool had_parent_input{false};
 };
 
 /// Typed failure surface; the REST layer maps these to the error taxonomy
@@ -237,8 +234,8 @@ struct CreateRequest {
     std::string source_kind;
     std::string source_payload; // JSON
     std::string matcher;        // JSON; only meaningful for async instruction-result
-    /// Completeness a child inherits from its parent (see `parent_may_seed`). Only
-    /// `create_materialized` persists them; an async child's counters are set by `materialize`.
+    /// Completeness a child inherits from its parent (`inherit_completeness`). Both create
+    /// methods persist them; for a pending row `materialize` later ADDS the fill's own counts.
     int64_t agents_failed{0};
     int64_t agents_unanswered{0};
 };
@@ -257,7 +254,11 @@ inline constexpr std::string_view kParentNotReadyMessage =
     "failed); wait until its status is materialized";
 
 /// Carry a parent's completeness onto a child created from its members: a child is never
-/// more complete than the parent it was narrowed from.
+/// more complete than the parent it was narrowed from. Every producer whose members come from
+/// the parent's calls this at create time: the inventory producers and the three async ones
+/// (whose pending row then carries the parent's counters from birth). A materialized parent's
+/// counters never change afterwards, so the snapshot is exact and a later delete of the parent
+/// changes nothing.
 inline void inherit_completeness(CreateRequest& child, const ResultSet& parent) noexcept {
     child.agents_failed = parent.agents_failed;
     child.agents_unanswered = parent.agents_unanswered;
@@ -454,8 +455,9 @@ public:
 
     // ── Async materialisation (server maintenance thread) ────────────────────
     std::vector<PendingSet> list_pending();
-    /// Populate members, flip status → materialized, set device_count, agents_failed and
-    /// agents_unanswered.
+    /// Populate members, flip status → materialized, set device_count, and ADD `agents_failed` /
+    /// `agents_unanswered` to the counters the pending row already carries (inherited from its
+    /// parent at create time), in the same status-guarded statement.
     std::expected<void, ResultSetError> materialize(const std::string& id,
                                                     const std::vector<std::string>& members,
                                                     int64_t agents_failed = 0,

@@ -14789,7 +14789,7 @@ void RestApiV1::register_routes(
         };
 
         // Resolve a parent reference (canonical `rs_` id OR a per-operator
-        // alias — design §2 "Source query" / §4.1) to a canonical owned id.
+        // alias — design §2 "Source query" / §4.1) to the owned, materialized row.
         // Alias pre-resolution at the dispatch layer is the right place: the
         // owner is known here, whereas `evaluate_scope` (which resolves
         // `from_result_set:` deep in the dispatch lambda) has no principal to
@@ -14801,7 +14801,7 @@ void RestApiV1::register_routes(
         auto resolve_owned_parent =
             [result_set_store, load_owned,
              rs_err](const httplib::Request& req, const std::string& raw, const std::string& owner,
-                     httplib::Response& res) -> std::optional<std::string> {
+                     httplib::Response& res) -> std::optional<ResultSet> {
             std::string id = raw;
             if (!raw.starts_with("rs_")) {
                 auto canon = result_set_store->resolve_alias(owner, raw);
@@ -14822,7 +14822,7 @@ void RestApiV1::register_routes(
                 rs_err(res, 409, kParentNotReadyMessage);
                 return std::nullopt;
             }
-            return id;
+            return row; // the caller snapshots its completeness (inherit_completeness)
         };
 
         // Shared async-producer engine for `from-echo-query` /
@@ -15013,15 +15013,16 @@ void RestApiV1::register_routes(
                 return;
             }
             std::optional<std::string> parent_id;
+            std::optional<ResultSet> parent_row;
             std::string scope_expr;
             if (body.contains("parent_id") && body["parent_id"].is_string() &&
                 !body["parent_id"].get<std::string>().empty()) {
-                auto canon =
+                parent_row =
                     resolve_owned_parent(req, body["parent_id"].get<std::string>(), owner, res);
-                if (!canon)
+                if (!parent_row)
                     return; // resolve_owned_parent wrote 404
-                parent_id = *canon;
-                scope_expr = "from_result_set:" + *canon;
+                parent_id = parent_row->id;
+                scope_expr = "from_result_set:" + parent_row->id;
             }
 
             // Create-before-dispatch: the execution_id must be registered
@@ -15194,6 +15195,10 @@ void RestApiV1::register_routes(
             cr.owner_principal = owner;
             cr.name = name;
             cr.parent_id = parent_id;
+            // The dispatch was narrowed to the parent's members, so the pending row carries the
+            // parent's completeness from birth; the fill adds its own counts (materialize).
+            if (parent_row)
+                inherit_completeness(cr, *parent_row);
             cr.source_kind = std::string(src_kind);
             cr.source_payload = source_payload;
             cr.matcher = matcher;
