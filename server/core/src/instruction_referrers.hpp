@@ -158,7 +158,7 @@ inline constexpr std::size_t kMaxPacksNoted = 5;
 /// The audit-detail fragment `packs=<id>,<id>,...[,+N]` for `definition_id` (at most
 /// `kMaxPacksNoted` ids, each folded through `log_token`, CWE-117), or an empty string when `fn` is
 /// unwired, the read failed, or no pack contains the definition. NEVER throws and never changes a
-/// delete's outcome. The three call sites read it BEFORE the delete (so a failed read cannot lose
+/// delete's outcome. The two call sites (v1 and MCP) read it BEFORE the delete (so a failed read cannot lose
 /// the outcome row) and append it to the success detail only if the delete then succeeds. `N` is a
 /// lower bound (the lookup itself is capped).
 [[nodiscard]] std::string pack_advisory_note(const DefinitionPackAdvisoryFn& fn,

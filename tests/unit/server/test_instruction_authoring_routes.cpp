@@ -1595,7 +1595,7 @@ TEST_CASE("DELETE /api/v1/instructions/{id}: the success row notes the containin
 // The referrer lookup's two call forms and its policy naming. The v1 and MCP deletes call the
 // one-argument form; the exclusion form and `held_by` are the library half a caller that removes
 // related rows together with the definition uses, so they are pinned here on their own.
-TEST_CASE("DefinitionReferrersFn: the two call forms, and an empty callable stays unwired",
+TEST_CASE("DefinitionReferrersFn: the two call forms and an empty callable stays unwired",
           "[instruction_authoring][referrers]") {
     SECTION("a one-argument callable ignores the exclusions") {
         int calls = 0;
@@ -1646,7 +1646,7 @@ TEST_CASE("DefinitionReferrersFn: the two call forms, and an empty callable stay
     }
 }
 
-TEST_CASE("describe_definition_referrers: a held_by list names policies, bounded and folded",
+TEST_CASE("describe_definition_referrers: a held_by list names policies bounded and folded",
           "[instruction_authoring][referrers]") {
     SECTION("no held_by: the plain kind and id list") {
         const auto text = describe_definition_referrers({{"schedule", "s1", {}}});
@@ -1703,7 +1703,7 @@ TEST_CASE("instruction authoring: wiring -- server.cpp builds the referrer looku
     };
     CHECK(wired(src));
 
-    // Mutation: dropping any one of the three wiring lines from the source turns the tripwire red
+    // Mutation: dropping any one of the wiring lines from the source turns the tripwire red
     // (each needle is load-bearing, so a pattern that stopped matching cannot pass vacuously).
     for (const std::string_view needle : kNeedles) {
         SECTION(std::string("mutation: ") + std::string(needle.substr(0, 40))) {
