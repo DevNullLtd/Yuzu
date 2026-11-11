@@ -8,7 +8,9 @@ plugin="unknown" and YuzuPluginInitFailed would fire only on that one series. Th
 their own store, so nothing but this gate notices the one production line being dropped, moved
 after the first sweep, or duplicated.
 
-Required (comments stripped, whitespace/line-wrap tolerant):
+Required (comments stripped, whitespace/line-wrap tolerant; the wiring, thread-start and
+recompute tokens are matched with string, raw-string and character literal contents blanked, so a
+statement spelt inside a literal cannot stand in for the call):
   * `health_store_.set_known_plugins(catalogue_plugin_names(capability_registry_))` exists EXACTLY
     once, and the registry it reads is composed (declared) in the same file;
   * that statement precedes the start of health_recompute_thread_ (which itself starts at exactly
@@ -43,10 +45,50 @@ _forensics = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _forensics
 _spec.loader.exec_module(_forensics)
 canonical = _forensics.canonical
+_RAW_OPEN = re.compile(r'R"([^()\\\s]{0,16})\(')
+
+
+def blank_literals(text: str) -> str:
+    """Empty the CONTENTS of string, raw-string and character literals in comment-free text.
+
+    A statement spelt inside a literal is inert text, so the code-token patterns must never match
+    it. The quotes stay, so `f("x")` keeps its shape.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "R" and text[i + 1:i + 2] == '"' and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+            m = _RAW_OPEN.match(text, i)
+            if m:
+                end = text.find(")" + m.group(1) + '"', m.end())
+                j = n if end < 0 else end + len(m.group(1)) + 2
+                out.append('R""')
+                i = j
+                continue
+        if c == '"' or (c == "'" and not (i and text[i - 1].isalnum())):  # 1'000 is a digit separator
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            out.append(c + c)
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def code_canonical(src: str) -> str:
+    """canonical() with literal contents blanked: only real code tokens remain."""
+    t = re.sub(r"\s+", " ", blank_literals(_forensics.strip_comments(src)))
+    return _forensics._PUNCT.sub(r"\1", t)
 
 _WIRE = (r"health_store_\.set_known_plugins\((?:yuzu::server::)?catalogue_plugin_names\(capability_registry_\)\);")
 _THREAD = r"health_recompute_thread_=std::thread\("
 _RECOMPUTE = r"health_store_\.recompute_metrics\("
+
+# Rows matched against the literal-preserving text: the two describe() name checks need the
+# metric-name string. Every other row matches code only (literal contents blanked).
+LITERAL_ROWS = frozenset({"describe-init-failed", "describe-rejected"})
 
 # (id, pattern with a named group `k` = the statement the selftest deletes, why)
 REQUIRED: list[tuple[str, str, str]] = [
@@ -73,11 +115,18 @@ COUNTED: list[tuple[str, str, int, str]] = [
 ]
 
 
-def problems_canonical(t: str) -> list[tuple[str, str]]:
+def text_for(rid: str, code: str, lit: str) -> str:
+    return lit if rid in LITERAL_ROWS else code
+
+
+def problems_canonical(code: str, lit: str | None = None) -> list[tuple[str, str]]:
+    """`code` is code_canonical(src); `lit` is canonical(src) (defaults to `code`)."""
+    lit = code if lit is None else lit
     out: list[tuple[str, str]] = []
     for rid, pat, why in REQUIRED:
-        if not re.search(pat, t, re.S):
+        if not re.search(pat, text_for(rid, code, lit), re.S):
             out.append((rid, f"{rid}: {why}"))
+    t = code
     for rid, pat, want, why in COUNTED:
         got = len(re.findall(pat, t, re.S))
         if got != want:
@@ -91,7 +140,7 @@ def problems_canonical(t: str) -> list[tuple[str, str]]:
 
 
 def problems(src: str) -> list[tuple[str, str]]:
-    return problems_canonical(canonical(src))
+    return problems_canonical(code_canonical(src), canonical(src))
 
 
 def main() -> int:

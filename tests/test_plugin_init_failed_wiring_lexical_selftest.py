@@ -36,42 +36,67 @@ def ids(found: list[tuple[str, str]]) -> set[str]:
 def main() -> int:
     with open(os.path.join(g.REPO_ROOT, g.SERVER_CPP), encoding="utf-8") as fh:
         raw = fh.read()
-    t = g.canonical(raw)
-    expect(g.problems_canonical(t) == [], "the real server.cpp must pass the gate")
+    code = g.code_canonical(raw)
+    lit = g.canonical(raw)
+    expect(g.problems_canonical(code, lit) == [], "the real server.cpp must pass the gate")
 
+    # Delete each required statement from the text its row matches against.
     for rid, pat, _why in g.REQUIRED:
-        m = re.search(pat, t, re.S)
+        base = g.text_for(rid, code, lit)
+        m = re.search(pat, base, re.S)
         if not m:
             expect(False, f"{rid}: pattern no longer matches the real source (stale pattern)")
             continue
         a, b = m.span("k")
-        expect(rid in ids(g.problems_canonical(t[:a] + t[b:])), f"{rid}: deleting its statement was NOT detected")
+        mutated = base[:a] + base[b:]
+        found = ids(g.problems_canonical(mutated if base is code else code,
+                                         lit if base is code else mutated))
+        expect(rid in found, f"{rid}: deleting its statement was NOT detected")
 
-    wire = re.search(g._WIRE, t)
-    thread = re.search(g._THREAD, t)
+    wire = re.search(g._WIRE, code)
+    thread = re.search(g._THREAD, code)
     expect(bool(wire and thread), "wiring and thread anchors must exist in the real source")
     if wire and thread:
         stmt = wire.group(0)
-        expect("wire-once" in ids(g.problems_canonical(t + stmt)), "a duplicated wiring call was NOT detected")
-        expect("anchor-thread" in ids(g.problems_canonical(t + "health_recompute_thread_=std::thread(")),
+        expect("wire-once" in ids(g.problems_canonical(code + stmt, lit)), "a duplicated wiring call was NOT detected")
+        expect("anchor-thread" in ids(g.problems_canonical(code + "health_recompute_thread_=std::thread(", lit)),
                "a second thread start was NOT detected")
-        moved = t[:wire.start()] + t[wire.end():thread.end()] + stmt + t[thread.end():]
-        expect("wire-before-thread" in ids(g.problems_canonical(moved)),
+        moved = code[:wire.start()] + code[wire.end():thread.end()] + stmt + code[thread.end():]
+        expect("wire-before-thread" in ids(g.problems_canonical(moved, lit)),
                "a wiring moved after the thread start was NOT detected")
-        early = t[:wire.start()] + "health_store_.recompute_metrics(metrics_,w);" + t[wire.start():]
-        expect("wire-before-sweep" in ids(g.problems_canonical(early)),
+        early = code[:wire.start()] + "health_store_.recompute_metrics(metrics_,w);" + code[wire.start():]
+        expect("wire-before-sweep" in ids(g.problems_canonical(early, lit)),
                "a recompute call ahead of the wiring was NOT detected")
 
-    # A comment mentioning the wiring must not satisfy the gate; a string literal must not hide it.
-    commented = re.sub(r"(?s)health_store_\s*\.\s*set_known_plugins\s*\(.*?\)\s*\)\s*;", lambda m: "// " + m.group(0).replace("\n", "\n// "), raw, count=1)
-    expect("wire-known-plugins" in ids(g.problems(commented)), "a commented-out wiring satisfied the gate")
+    # Inert text must not stand in for the call: a comment, an ordinary string literal and a raw
+    # string literal each replace the real statement and must turn the gate red. Likewise a
+    # thread start or recompute call spelt in a literal is not code.
+    stmt_re = r"health_store_\s*\.\s*set_known_plugins\s*\(.*?\)\s*\)\s*;"
+    m = re.search(stmt_re, raw, re.S)
+    expect(bool(m), "the real wiring statement must be found in the raw source")
+    if m:
+        orig = m.group(0)
+        for name, repl in (
+            ("comment", "// " + orig.replace("\n", "\n// ")),
+            ("ordinary string", 'const char* x = "' + re.sub(r"\s+", " ", orig) + '";'),
+            ("raw string", 'const char* x = R"pin(' + orig + ')pin";'),
+            ("char-literal-prefixed string", "const char c = 'x'; const char* y = \"" + re.sub(r"\s+", " ", orig) + '";'),
+        ):
+            mutated = raw[:m.start()] + repl + raw[m.end():]
+            expect("wire-known-plugins" in ids(g.problems(mutated)),
+                   f"the wiring replaced by a {name} satisfied the gate")
     hidden = raw.replace("health_store_.set_known_plugins(", 'const char* s = "/*"; health_store_.set_known_plugins(', 1)
     expect("wire-known-plugins" not in ids(g.problems(hidden)), "a string literal hid the real wiring statement")
+    fake_thread = raw.replace("health_recompute_thread_ = std::thread(", 'const char* q = "health_recompute_thread_ = std::thread("; auto z = std::thread(', 1)
+    expect("wire-before-thread" in ids(g.problems(fake_thread)) or "anchor-thread" in ids(g.problems(fake_thread)),
+           "a thread start spelt in a literal satisfied the gate")
+    # The literal blanker leaves a C++14 digit separator alone.
+    expect(g.blank_literals("int n = 1'000; f(\"a\");") == 'int n = 1\'000; f("");', "digit separator mishandled")
 
     if FAILURES:
         print(f"{len(FAILURES)} selftest failure(s)", file=sys.stderr)
         return 1
-    print(f"OK: selftest ({len(g.REQUIRED)} deletions, {len(g.COUNTED)} counts, 3 orderings, 2 comment/literal cases)")
+    print(f"OK: selftest ({len(g.REQUIRED)} deletions, {len(g.COUNTED)} counts, 3 orderings, 4 inert-text replacements, literal cases)")
     return 0
 
 
