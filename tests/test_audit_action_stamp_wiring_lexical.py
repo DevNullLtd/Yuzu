@@ -129,6 +129,9 @@ HOOK_HEAD = "audit_registry_frame(agent_id, resp, "
 HOOK_ARGS = ("plugin", "prov.plugin")
 HOOK_CALL_RE = re.compile(r"audit_registry_frame\(agent_id, resp, (.*?)\)(?=&&|;)")
 NOTIFY = "notify_exec_tracker(resp.command_id(), agent_id, resp, prov);"
+# The two terminal-frame sites also tell the tracker whether the response row was stored, so a
+# hook may be followed by either spelling of the call (the notification still follows the hook).
+NOTIFY_FORMS = (NOTIFY, "notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);")
 PLUGIN_ALIAS = "const std::string& plugin = prov.plugin;"
 PROV_DECL = "const ResponseProvenance prov = resolve_response_provenance(resp.command_id()"
 FLAG_DECL = "bool audit_failed_signalled = false;"
@@ -157,19 +160,21 @@ READ_LOOP = "while (stream->Read(&resp))"
 BOUNDARY = r"(?:^|[;{}] ?)"  # normalise() drops a space that sits before a `(`
 
 
-def subscribe_form(arg):
+def subscribe_form(arg, notify=NOTIFY):
     return normalise(
         f"if (!{HOOK_HEAD}{arg}) && !audit_failed_signalled) {{ signal_grpc_audit_failed(context);"
-        f" audit_failed_signalled = true; }} {NOTIFY}"
+        f" audit_failed_signalled = true; }} {notify}"
     )
 
 
-def gateway_form(arg):
-    return normalise(f"(void){HOOK_HEAD}{arg}); {NOTIFY}")
+def gateway_form(arg, notify=NOTIFY):
+    return normalise(f"(void){HOOK_HEAD}{arg}); {notify}")
 
 
 def count_forms(t, make):
-    return sum(len(re.findall(BOUNDARY + re.escape(make(a)), t)) for a in HOOK_ARGS)
+    return sum(
+        len(re.findall(BOUNDARY + re.escape(make(a, n)), t)) for a in HOOK_ARGS for n in NOTIFY_FORMS
+    )
 
 
 def last_decl(before, type_re, name):
@@ -499,7 +504,7 @@ SERVER_MUTATIONS = [
     ),
     # the notification loses the provenance (the old three-argument form)
     (
-        r"notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov\);\s*\n\s*std::string status_str",
+        r"notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov(?:, response_dropped)?\);\s*\n\s*std::string status_str",
         "notify_exec_tracker(resp.command_id(), agent_id, resp);\n\n        std::string status_str",
     ),
     # a fifth output-storing site appears

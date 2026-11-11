@@ -52800,7 +52800,7 @@ TEST_CASE("MCP create_result_set: a pending parent is refused with RESULT_SET_NO
 
     McpTestServer ts;
     ts.result_set_store_for_test = rs_bundle.get();
-    ts.start("operator");
+    ts.start("supervised"); // create_result_set is Infrastructure:Write, above the operator tier
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"name":"child","device_ids":[],"parent_id":")" +
         parent->id + R"("}}})");

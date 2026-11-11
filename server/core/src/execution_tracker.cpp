@@ -618,7 +618,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // upsert as the status, so a result-set fill can tell a counted answer that has no
         // stored row. Constant default: metadata-only ADD COLUMN, no rewrite.
         {10,
-         "ALTER TABLE agent_exec_status ADD COLUMN response_dropped BOOLEAN NOT NULL "
+         "ALTER TABLE agent_exec_status ADD COLUMN IF NOT EXISTS response_dropped BOOLEAN NOT NULL "
          "DEFAULT false;"},
     };
     return kMigrations;
