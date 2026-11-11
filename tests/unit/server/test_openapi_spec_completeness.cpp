@@ -2741,19 +2741,29 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
         REQUIRE(desc != nullptr);
         CHECK(desc->get<std::string>().find("refused with a 403 on every key") != std::string::npos);
 
-        // The score-policy PUT and DELETE word the audit refusal (5000), the busy writer (2000)
-        // and the one retry rule in prose; the behaviour is pinned at the writer and route level,
-        // and these phrases pin that the served text keeps saying it.
-        for (const char* method : {"put", "delete"}) {
-            INFO("score-policy " << method << " retry wording");
-            const json* d = find_at(spec, {"paths", "/dex/score-policy", method});
+        // The score-policy PUT and DELETE word the retry rule, the audit refusal (5000), the busy
+        // writer (2000) and the replay of an applied write in their own responses; the behaviour
+        // is pinned at the writer and route level, and these phrases pin that the served text
+        // keeps saying it, each in the response that carries it.
+        const auto response_text = [&](const char* method, const char* code) {
+            const json* d = find_at(spec, {"paths", "/dex/score-policy", method, "responses", code,
+                                           "description"});
             REQUIRE(d != nullptr);
-            const std::string text = d->dump(); // the sentences sit in the operation and its 200/503
-            CHECK(text.find("Sec-Audit-Failed") != std::string::npos);
-            CHECK(text.find("retry_after_ms 5000") != std::string::npos);
-            CHECK(text.find("2000") != std::string::npos);
-            CHECK(text.find("retry with the old If-Match answers 409") != std::string::npos);
+            return d->get<std::string>();
+        };
+        for (const char* method : {"put", "delete"}) {
+            INFO("score-policy " << method << " response wording");
+            CHECK(response_text(method, "409").find("is answered here too") != std::string::npos);
+            const std::string r503 = response_text(method, "503");
+            CHECK(r503.find("retry_after_ms 5000") != std::string::npos);
+            CHECK(r503.find("retry_after_ms 2000") != std::string::npos);
+            CHECK(r503.find("retry with the old If-Match answers 409") != std::string::npos);
         }
+        // The denied row is best effort: said once, in the PUT description.
+        const json* put_desc = find_at(spec, {"paths", "/dex/score-policy", "put", "description"});
+        REQUIRE(put_desc != nullptr);
+        CHECK(put_desc->get<std::string>().find("so a denied row is best effort") !=
+              std::string::npos);
     }
 }
 

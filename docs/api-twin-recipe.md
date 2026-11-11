@@ -268,9 +268,9 @@ first build. The document is the template literal, not generated, so nothing bel
    compiles it. `tests/test_openapi_literal_segments.py` (meson `docs` suite, no build, run it with
    `python3 tests/test_openapi_literal_segments.py`) fails any raw-string piece of 15,000 bytes or
    more. When a piece nears that, split it at the end of a line after a comma or closing brace:
-   close it with `)json"` and open the next piece with `R"json(` on the following line. The
-   script prints the largest piece, and pieces near the ceiling are common, so a clean merge of
-   `dev` into your branch can push one over: run it again after every merge.
+   close it with `)json"` and open the next piece with `R"json(` on the following line. A
+   clean merge of `dev` into your branch can push a piece over the ceiling without a conflict, so
+   run the script again after every merge.
 
 One command checks steps 2, 3, 5 and 6 without a build (step 4, the wording rules, still needs the
 C++ tests after a build): `python3 -I tests/test_openapi_operation_authoring.py` (meson `docs`

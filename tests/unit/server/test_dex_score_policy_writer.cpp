@@ -708,6 +708,20 @@ TEST_CASE("writer: the attempted row is refused with 503 and no store call",
     CHECK_FALSE(w.stored);
 }
 
+TEST_CASE("writer: a refused denied row keeps the refusal's own status",
+          "[dex][score_policy_writer]") {
+    // The denied row is best effort: the refusal does not depend on it, so a row the audit store
+    // refuses leaves the 428 and the store untouched.
+    World w;
+    w.refuse_results = {"denied"};
+    const auto r = w.put(std::nullopt, doc_with_excellent(95.0));
+    CHECK(r.status == St::IfMatchMissing);
+    CHECK(w.refused == 1);
+    CHECK(w.rows.empty());
+    CHECK(w.cas_calls == 0);
+    CHECK_FALSE(w.stored);
+}
+
 TEST_CASE("writer: a throwing audit hook is a refused row", "[dex][score_policy_writer]") {
     World w;
     w.audit_throws = 1;
