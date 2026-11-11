@@ -25,11 +25,13 @@
 #include "execution_tracker.hpp"
 #include "instruction_param_schema.hpp" // ParamValidatorCache (Deps injection)
 #include "instruction_schema_test_util.hpp"
+#include "instruction_referrers.hpp"
 #include "instruction_store.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "policy_store.hpp"
 #include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
 #include "schedule_engine.hpp" // full ScheduleEngine definition -- this harness constructs a real one (with_schedule_engine)
 #include "test_schedule_api_double.hpp" // ADR-0031 WS-A4 (seventh family): FnScheduleApi
@@ -38,6 +40,7 @@
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
 #include "test_forensics_tier_fixture.hpp"
+#include "test_principal_lock_gate.hpp" // SqlFault: a REAL table moved aside in the throwaway DB
 #include "test_route_sink.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
@@ -366,6 +369,13 @@ struct ExecHarness {
                          std::shared_ptr<instr::ParamValidatorCache> param_validators_override = {},
                          // The legacy execute route's run bound (unset = the production 60 s).
                          std::optional<std::chrono::milliseconds> workflow_run_budget_arg = {},
+                         // M2: the definition-referrer lookup the pack uninstall consults for
+                         // every InstructionDefinition item (unset = unwired, a fail-closed 503
+                         // for such a pack).
+                         yuzu::server::DefinitionReferrersFn referrers_arg = {},
+                         // The PolicyStore a pack's PolicyFragment items are installed into and
+                         // uninstalled from (unset = none, as every other test in this file).
+                         yuzu::server::PolicyStore* policy_store_arg = nullptr,
                          // #7110: opt-in real ApprovalManager so a `role-gated` definition
                          // reaches the legacy execute handler's post-row approval-mode recheck
                          // (with none wired, any non-auto definition is 503 at entry).
@@ -594,6 +604,8 @@ struct ExecHarness {
         // pre-existing test that leaves with_workflow_engine=false.
         wf_deps.workflow_api = workflow_api;
         wf_deps.product_pack_store = product_pack_store.get();
+        wf_deps.referrers_fn = std::move(referrers_arg);
+        wf_deps.policy_store = policy_store_arg;
         wf_deps.schedule_api = schedule_api; // ADR-0031 WS-A4 (seventh family), was #2146 A2-R1's raw engine
         // PR 3 — wire the per-execution event bus. The SSE handler at
         // /sse/executions/{id} returns 503 at request time when this is
@@ -4064,6 +4076,7 @@ TEST_CASE("legacy instruction execute: the administrator standing a role-gated d
                   /*fleet_read_override=*/{}, /*with_schedule_engine=*/false,
                   /*schedule_api_override=*/{}, /*workflow_api_override=*/{},
                   /*param_validators_override=*/{}, /*workflow_run_budget=*/{},
+                  /*referrers=*/{}, /*policy_store=*/nullptr,
                   /*with_approval_manager=*/true);
     make_mode_def(h, "def-RECHECK-MODE", "role-gated");
     h.dispatch_cmd_override = "cmd-never";
@@ -6564,4 +6577,840 @@ TEST_CASE("instruction execute: a cookie-session dispatch that is cross-site or 
     auto ok = h.sink.Post("/api/instructions/def-CSRF/execute", R"({"agent_ids":["agent-1"]})");
     REQUIRE(ok);
     CHECK(ok->status != 403);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// M2-2: DELETE /api/product-packs/{id} asks the shared definition-referrer lookup about every
+// InstructionDefinition item BEFORE it deletes anything. Real stores behind the lookup; the route
+// is reached through the real install/uninstall callbacks.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+constexpr const char* kPackWithDefinition = "apiVersion: yuzu.io/v1alpha1\n"
+                                            "kind: ProductPack\n"
+                                            "name: pack-with-definition\n"
+                                            "version: 1.0.0\n"
+                                            "description: pack containing one definition\n"
+                                            "---\n"
+                                            "apiVersion: yuzu.io/v1alpha1\n"
+                                            "kind: InstructionDefinition\n"
+                                            "name: pack-definition\n"
+                                            "plugin: os_info\n"
+                                            "action: os_name\n";
+
+/// The one InstructionDefinition item id of an installed pack.
+std::string pack_definition_id(ProductPackStore& packs, const std::string& pack_id) {
+    auto pack = packs.get(pack_id);
+    REQUIRE(pack.has_value());
+    REQUIRE(pack->has_value());
+    for (const auto& item : (*pack)->items)
+        if (item.kind == "InstructionDefinition")
+            return item.item_id;
+    FAIL("pack has no InstructionDefinition item");
+    return {};
+}
+
+InstructionSchedule schedule_naming(const std::string& definition_id) {
+    InstructionSchedule sched;
+    sched.name = "nightly";
+    sched.definition_id = definition_id;
+    sched.frequency_type = "interval";
+    sched.interval_minutes = 60;
+    sched.scope_expression = "ostype = 'linux'";
+    sched.created_by = "alice";
+    return sched;
+}
+
+} // namespace
+
+// Turns red if the referrer block in the DELETE /api/product-packs/{id} handler is removed: the
+// uninstall would then delete the definition under the schedule and answer 200.
+TEST_CASE("M2-2: uninstalling a pack whose definition a schedule names is refused 409 and deletes "
+          "nothing and audits it; removing the schedule lets it through",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    WorkflowEngine other_workflows{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {},
+                  yuzu::server::make_definition_referrers_fn(&schedules, &other_workflows,
+                                                             &policies));
+
+    auto install = h.sink.Post("/api/product-packs", kPackWithDefinition, "text/x-yaml");
+    REQUIRE(install);
+    REQUIRE(install->status == 201);
+    const auto pack_id = nlohmann::json::parse(install->body).at("id").get<std::string>();
+    const auto def_id = pack_definition_id(*h.product_pack_store, pack_id);
+    auto sid = schedules.create_schedule(schedule_naming(def_id));
+    REQUIRE(sid.has_value());
+    h.audit_calls.clear();
+
+    auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(del);
+    CHECK(del->status == 409);
+    const auto msg = nlohmann::json::parse(del->body).at("error").at("message").get<std::string>();
+    CHECK(msg.find("schedule " + *sid) != std::string::npos);
+    CHECK(msg.find("pack was NOT uninstalled") != std::string::npos);
+    // Nothing was deleted: the pack row and the definition are both still there.
+    auto still_pack = h.product_pack_store->get(pack_id);
+    REQUIRE(still_pack.has_value());
+    CHECK(still_pack->has_value());
+    auto still_def = h.instructions->get_definition(def_id);
+    REQUIRE(still_def.has_value());
+    CHECK(still_def->has_value());
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].action == "product_pack.uninstall");
+    CHECK(h.audit_calls[0].result == "denied");
+    CHECK(h.audit_calls[0].detail == "referenced");
+
+    REQUIRE(schedules.delete_schedule(*sid, "alice"));
+    auto ok = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    auto gone = h.instructions->get_definition(def_id);
+    REQUIRE(gone.has_value());
+    CHECK_FALSE(gone->has_value());
+}
+
+// The pack's OWN workflow that names the pack's own definition does not block: both go in the
+// same uninstall (otherwise such a pack could never be removed). A workflow outside the pack that
+// names the same definition does block. Turns red if the own-item exclusion is dropped (the first
+// half) or widened to every workflow (the second).
+TEST_CASE("M2-2: a pack's own workflow referencing its own definition does not block the "
+          "uninstall; a foreign workflow referencing it does",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    // The harness's own WorkflowEngine is the one the pack installs into and the referrer lookup reads.
+    WorkflowEngine* wf_for_lookup = nullptr;
+    auto lookup = [&](const std::string& id,
+                      const yuzu::server::DefinitionReferrerExclusions& exclusions) {
+        return yuzu::server::make_definition_referrers_fn(&schedules, wf_for_lookup,
+                                                          &policies)(id, exclusions);
+    };
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, lookup);
+    wf_for_lookup = h.workflows.get();
+
+    // Install through the store with callbacks that wire the workflow to the freshly created
+    // definition id (a bundle cannot know it in advance).
+    std::string def_id;
+    auto install_fn = [&](const std::string& kind,
+                          const std::string& yaml) -> std::expected<std::string, std::string> {
+        if (kind == "InstructionDefinition") {
+            InstructionDefinition d;
+            d.name = "own-def";
+            d.type = "question";
+            d.plugin = "os_info";
+            d.action = "os_name";
+            auto id = h.instructions->create_definition(d);
+            if (id)
+                def_id = *id;
+            return id;
+        }
+        (void)yaml;
+        return h.workflows->create_workflow("apiVersion: yuzu.io/v1alpha1\nkind: Workflow\n"
+                                            "metadata:\n  displayName: own-wf\nspec:\n  steps:\n"
+                                            "    - instruction: " + def_id + "\n");
+    };
+    const std::string bundle = "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\n"
+                               "name: self-contained\nversion: 1.0.0\ndescription: d\n---\n"
+                               "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
+                               "name: own-def\n---\n"
+                               "apiVersion: yuzu.io/v1alpha1\nkind: Workflow\nname: own-wf\n";
+    auto installed = h.product_pack_store->install(bundle, install_fn);
+    REQUIRE(installed.has_value());
+    const auto pack_id = *installed;
+    REQUIRE_FALSE(def_id.empty());
+
+    // A workflow that is NOT a pack item names the same definition.
+    auto foreign = h.workflows->create_workflow(
+        "apiVersion: yuzu.io/v1alpha1\nkind: Workflow\nmetadata:\n  displayName: foreign-wf\n"
+        "spec:\n  steps:\n    - instruction: " + def_id + "\n");
+    REQUIRE(foreign.has_value());
+    h.audit_calls.clear();
+
+    auto blocked = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(blocked);
+    CHECK(blocked->status == 409);
+    const auto msg = nlohmann::json::parse(blocked->body).at("error").at("message").get<std::string>();
+    CHECK(msg.find("workflow " + *foreign) != std::string::npos);
+    CHECK(msg.find("1 item still uses one of its definitions") != std::string::npos); // the pack's own workflow is excluded
+    CHECK(msg.find("then retry the uninstall") != std::string::npos);
+    auto still = h.product_pack_store->get(pack_id);
+    REQUIRE(still.has_value());
+    CHECK(still->has_value());
+
+    REQUIRE(h.workflows->delete_workflow(*foreign).has_value());
+    auto ok = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+namespace {
+
+/// A bundle of one InstructionDefinition, `workflows` Workflow documents and `fragments`
+/// PolicyFragment documents, plus the install callback that creates the definition first and then
+/// wires every workflow and fragment to its (server-assigned) id, so each of the pack's own items
+/// names the pack's own definition.
+struct OwnItemsBundle {
+    std::string yaml;
+    std::string def_id;
+    std::vector<std::string> fragment_ids;
+};
+
+OwnItemsBundle own_items_bundle(int workflows, int fragments) {
+    OwnItemsBundle b;
+    b.yaml = "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: own-items\nversion: 1.0.0\n"
+             "description: d\n---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
+             "name: own-def\n";
+    for (int i = 0; i < workflows; ++i)
+        b.yaml += "---\napiVersion: yuzu.io/v1alpha1\nkind: Workflow\nname: own-wf-" +
+                  std::to_string(i) + "\n";
+    for (int i = 0; i < fragments; ++i)
+        b.yaml += "---\napiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nname: own-frag-" +
+                  std::to_string(i) + "\n";
+    return b;
+}
+
+std::string workflow_naming(const std::string& definition_id, const std::string& name) {
+    return "apiVersion: yuzu.io/v1alpha1\nkind: Workflow\nmetadata:\n  displayName: " + name +
+           "\nspec:\n  steps:\n    - instruction: " + definition_id + "\n";
+}
+
+std::string fragment_naming(const std::string& definition_id, const std::string& id) {
+    return "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nid: " + id + "\ndisplayName: " + id +
+           "\nspec:\n  check:\n    instruction: " + definition_id + "\n    compliance: \"true\"\n";
+}
+
+std::string policy_using(const std::string& fragment_id) {
+    return "apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: uses-" + fragment_id +
+           "\ndescription: d\nfragment: " + fragment_id + "\nscope: \"tags.env == 'production'\"\n"
+           "triggers:\n  - type: interval\n    interval_seconds: 300\n";
+}
+
+} // namespace
+
+// N1-1: the pack's own workflows are left out INSIDE the capped query. A filter applied to the
+// capped answer lets a pack with more own workflows than the per-source window (21 rows) fill the
+// window with its own rows and hide a foreign referrer that sorts after them. Turns red if the
+// route stops passing the exclusions to the lookup (or the lookup stops applying them in SQL): the
+// uninstall would then answer 200 and delete the definition under the foreign workflow.
+TEST_CASE("M2-2: a pack with more own workflows than the referrer window cannot hide a foreign "
+          "workflow that names its definition",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    WorkflowEngine* wf_for_lookup = nullptr;
+    auto lookup = [&](const std::string& id,
+                      const yuzu::server::DefinitionReferrerExclusions& exclusions) {
+        return yuzu::server::make_definition_referrers_fn(&schedules, wf_for_lookup,
+                                                          &policies)(id, exclusions);
+    };
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, lookup);
+    wf_for_lookup = h.workflows.get();
+
+    // One more than the kMaxReferrersListed + 1 rows the lookup asks each source for.
+    constexpr int kOwn = static_cast<int>(yuzu::server::kMaxReferrersListed) + 2;
+    auto bundle = own_items_bundle(kOwn, 0);
+    std::string def_id;
+    int made = 0;
+    auto install_fn = [&](const std::string& kind,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        if (kind == "InstructionDefinition") {
+            InstructionDefinition d;
+            d.name = "own-def";
+            d.type = "question";
+            d.plugin = "os_info";
+            d.action = "os_name";
+            auto id = h.instructions->create_definition(d);
+            if (id)
+                def_id = *id;
+            return id;
+        }
+        return h.workflows->create_workflow(workflow_naming(def_id, "own-" + std::to_string(made++)));
+    };
+    auto installed = h.product_pack_store->install(bundle.yaml, install_fn);
+    REQUIRE(installed.has_value());
+    REQUIRE(made == kOwn);
+
+    // The foreign workflow is created AFTER the pack's, and pushed later still, so it sorts behind
+    // every own row in the lookup's `created_at ASC` order and a post-cap filter would lose it.
+    auto foreign = h.workflows->create_workflow(workflow_naming(def_id, "foreign-wf"));
+    REQUIRE(foreign.has_value());
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(pg::exec_params(conn.get(),
+                                "UPDATE workflow_engine.workflows SET created_at = created_at + "
+                                "100000 WHERE id = $1",
+                                std::vector<std::string>{*foreign})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    h.audit_calls.clear();
+
+    auto blocked = h.sink.Delete("/api/product-packs/" + *installed);
+    REQUIRE(blocked);
+    CHECK(blocked->status == 409);
+    const auto msg = nlohmann::json::parse(blocked->body).at("error").at("message").get<std::string>();
+    CHECK(msg.find("workflow " + *foreign) != std::string::npos);
+    CHECK(msg.find("1 item still uses one of its definitions") != std::string::npos);
+    auto still_pack = h.product_pack_store->get(*installed);
+    REQUIRE(still_pack.has_value());
+    CHECK(still_pack->has_value());
+    auto still_def = h.instructions->get_definition(def_id);
+    REQUIRE(still_def.has_value());
+    CHECK(still_def->has_value());
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].result == "denied");
+    CHECK(h.audit_calls[0].detail == "referenced");
+
+    REQUIRE(h.workflows->delete_workflow(*foreign).has_value());
+    auto ok = h.sink.Delete("/api/product-packs/" + *installed);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+// N1-2: PolicyStore::delete_fragment refuses a fragment a policy still uses and the uninstall
+// tolerates that, so such an own fragment SURVIVES the uninstall; excluding it from the referrer
+// check would delete the definition it names and leave it dangling. An own fragment no policy uses
+// goes in the same uninstall and is excluded. Turns red if the own-fragment exclusion is dropped
+// (the second half: 409 on a fragment that would be removed) or widened to every own fragment (the
+// first half: 200 and a dangling fragment).
+TEST_CASE("M2-2: a pack's own policy fragment still used by a policy blocks the uninstall; an "
+          "unused one is removed with it",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    WorkflowEngine* wf_for_lookup = nullptr;
+    auto lookup = [&](const std::string& id,
+                      const yuzu::server::DefinitionReferrerExclusions& exclusions) {
+        return yuzu::server::make_definition_referrers_fn(&schedules, wf_for_lookup,
+                                                          &policies)(id, exclusions);
+    };
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, lookup, &policies);
+    wf_for_lookup = h.workflows.get();
+
+    auto bundle = own_items_bundle(0, 1);
+    std::string def_id;
+    auto install_fn = [&](const std::string& kind,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        if (kind == "InstructionDefinition") {
+            InstructionDefinition d;
+            d.name = "own-def";
+            d.type = "question";
+            d.plugin = "os_info";
+            d.action = "os_name";
+            auto id = h.instructions->create_definition(d);
+            if (id)
+                def_id = *id;
+            return id;
+        }
+        return policies.create_fragment(fragment_naming(def_id, "own-frag-used"));
+    };
+    auto installed = h.product_pack_store->install(bundle.yaml, install_fn);
+    REQUIRE(installed.has_value());
+    const std::string frag_id = "own-frag-used";
+    auto policy_id = policies.create_policy(policy_using(frag_id));
+    REQUIRE(policy_id.has_value());
+    h.audit_calls.clear();
+
+    auto blocked = h.sink.Delete("/api/product-packs/" + *installed);
+    REQUIRE(blocked);
+    CHECK(blocked->status == 409);
+    const auto msg = nlohmann::json::parse(blocked->body).at("error").at("message").get<std::string>();
+    CHECK(msg.find("policy fragment " + frag_id + " (used by policy " + *policy_id + " (uses-" +
+                   frag_id + "))") != std::string::npos);
+    CHECK(msg.find("delete that policy, then retry") != std::string::npos);
+    CHECK(msg.find("then retry the uninstall") != std::string::npos);
+    // Nothing was deleted: the pack, the definition and the fragment are all still there.
+    auto still_pack = h.product_pack_store->get(*installed);
+    REQUIRE(still_pack.has_value());
+    CHECK(still_pack->has_value());
+    auto still_def = h.instructions->get_definition(def_id);
+    REQUIRE(still_def.has_value());
+    CHECK(still_def->has_value());
+    auto still_frag = policies.get_fragment(frag_id);
+    REQUIRE(still_frag.has_value());
+    CHECK(still_frag->has_value());
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].result == "denied");
+    CHECK(h.audit_calls[0].detail == "referenced");
+
+    // The policy goes: the fragment is now unused, so it is the pack's own item and is removed by
+    // the same uninstall together with the definition it names.
+    REQUIRE(policies.delete_policy(*policy_id));
+    auto ok = h.sink.Delete("/api/product-packs/" + *installed);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    auto gone_frag = policies.get_fragment(frag_id);
+    REQUIRE(gone_frag.has_value());
+    CHECK_FALSE(gone_frag->has_value());
+    auto gone_def = h.instructions->get_definition(def_id);
+    REQUIRE(gone_def.has_value());
+    CHECK_FALSE(gone_def->has_value());
+}
+
+namespace {
+
+/// A pack of one InstructionDefinition and one PolicyFragment (named `fragment_id`) that names it,
+/// plus, when `with_policy_item`, a Policy item that uses the fragment. Installed through the
+/// store so every item is the pack's own. Fills `def_id` and `policy_id`.
+std::string install_def_fragment_pack(ExecHarness& h, PolicyStore& policies,
+                                      const std::string& fragment_id, bool with_policy_item,
+                                      std::string& def_id, std::string& policy_id) {
+    std::string yaml = own_items_bundle(0, 1).yaml;
+    if (with_policy_item)
+        yaml += "---\napiVersion: yuzu.io/v1alpha1\nkind: Policy\nname: own-policy\n";
+    auto install_fn = [&](const std::string& kind,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        if (kind == "InstructionDefinition") {
+            InstructionDefinition d;
+            d.name = "own-def";
+            d.type = "question";
+            d.plugin = "os_info";
+            d.action = "os_name";
+            auto id = h.instructions->create_definition(d);
+            if (id)
+                def_id = *id;
+            return id;
+        }
+        if (kind == "PolicyFragment")
+            return policies.create_fragment(fragment_naming(def_id, fragment_id));
+        auto pid = policies.create_policy(policy_using(fragment_id));
+        if (pid)
+            policy_id = *pid;
+        return pid;
+    };
+    auto installed = h.product_pack_store->install(yaml, install_fn);
+    REQUIRE(installed.has_value());
+    return *installed;
+}
+
+} // namespace
+
+// N2-3(a): the owner design call, pinned in both directions. A pack whose OWN Policy item uses its
+// OWN fragment, which names its OWN definition, stays refused (409, the policy is named) until the
+// operator deletes that policy; then the same uninstall goes through. Turns red if the fragment is
+// excluded whenever it belongs to the pack (the first half would answer 200 and leave a dangling
+// fragment) or if the policy is never named (the message check).
+TEST_CASE("N2-3: a pack's own policy using its own fragment keeps the uninstall refused and names "
+          "the policy until the policy is deleted",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    WorkflowEngine* wf_for_lookup = nullptr;
+    auto lookup = [&](const std::string& id,
+                      const yuzu::server::DefinitionReferrerExclusions& exclusions) {
+        return yuzu::server::make_definition_referrers_fn(&schedules, wf_for_lookup,
+                                                          &policies)(id, exclusions);
+    };
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, lookup, &policies);
+    wf_for_lookup = h.workflows.get();
+    std::string def_id, policy_id;
+    const std::string pack_id =
+        install_def_fragment_pack(h, policies, "own-frag-pol", /*with_policy_item=*/true, def_id,
+                                  policy_id);
+    REQUIRE_FALSE(policy_id.empty());
+    h.audit_calls.clear();
+
+    auto blocked = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(blocked);
+    CHECK(blocked->status == 409);
+    const auto msg = nlohmann::json::parse(blocked->body).at("error").at("message").get<std::string>();
+    CHECK(msg.find("policy fragment own-frag-pol (used by policy " + policy_id +
+                   " (uses-own-frag-pol))") != std::string::npos);
+    CHECK(msg.find("1 item still uses one of its definitions") != std::string::npos);
+    CHECK(msg.find("delete that policy, then retry") != std::string::npos);
+    CHECK(msg.find("outside the uninstall") == std::string::npos);
+    auto still_pack = h.product_pack_store->get(pack_id);
+    REQUIRE(still_pack.has_value());
+    CHECK(still_pack->has_value());
+    auto still_def = h.instructions->get_definition(def_id);
+    REQUIRE(still_def.has_value());
+    CHECK(still_def->has_value());
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].result == "denied");
+    CHECK(h.audit_calls[0].detail == "referenced");
+
+    REQUIRE(policies.delete_policy(policy_id));
+    auto ok = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    auto gone_def = h.instructions->get_definition(def_id);
+    REQUIRE(gone_def.has_value());
+    CHECK_FALSE(gone_def->has_value());
+}
+
+// N2-3(b): a pack that carries a definition AND an own fragment needs the policy store to tell
+// whether a policy holds the fragment. With none wired the answer is a 503 (referrer_check_unwired)
+// and nothing is deleted. Turns red if `!policy_store` is read as "no policy uses it".
+TEST_CASE("N2-3: an unwired policy store 503s the uninstall of a pack with a definition and an own "
+          "fragment and deletes nothing",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    WorkflowEngine* wf_for_lookup = nullptr;
+    auto lookup = [&](const std::string& id,
+                      const yuzu::server::DefinitionReferrerExclusions& exclusions) {
+        return yuzu::server::make_definition_referrers_fn(&schedules, wf_for_lookup,
+                                                          &policies)(id, exclusions);
+    };
+    // The harness gets NO policy store (the last argument), the pack's items are still created in
+    // `policies` by the install callback.
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, lookup);
+    wf_for_lookup = h.workflows.get();
+    std::string def_id, policy_id;
+    const std::string pack_id = install_def_fragment_pack(h, policies, "own-frag-unwired",
+                                                          /*with_policy_item=*/false, def_id,
+                                                          policy_id);
+    h.audit_calls.clear();
+
+    auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(del->body.find("nothing was uninstalled") != std::string::npos);
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].result == "error");
+    CHECK(h.audit_calls[0].detail == "referrer_check_unwired");
+    auto still_pack = h.product_pack_store->get(pack_id);
+    REQUIRE(still_pack.has_value());
+    CHECK(still_pack->has_value());
+    auto still_def = h.instructions->get_definition(def_id);
+    REQUIRE(still_def.has_value());
+    CHECK(still_def->has_value());
+    auto still_frag = policies.get_fragment("own-frag-unwired");
+    REQUIRE(still_frag.has_value());
+    CHECK(still_frag->has_value());
+}
+
+// N2-3(c): a policy read that FAILS is a 503 (referrer_check_unavailable), never "no policy uses
+// it". `policy_store.policies` is moved aside, so query_policies fails while the fragment reads the
+// referrer lookup makes keep working. Turns red if a failed query_policies is read as empty.
+TEST_CASE("N2-3: a failing policy read 503s the uninstall of a pack with a definition and an own "
+          "fragment and deletes nothing",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    WorkflowEngine* wf_for_lookup = nullptr;
+    auto lookup = [&](const std::string& id,
+                      const yuzu::server::DefinitionReferrerExclusions& exclusions) {
+        return yuzu::server::make_definition_referrers_fn(&schedules, wf_for_lookup,
+                                                          &policies)(id, exclusions);
+    };
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, lookup, &policies);
+    wf_for_lookup = h.workflows.get();
+    std::string def_id, policy_id;
+    const std::string pack_id = install_def_fragment_pack(h, policies, "own-frag-broken",
+                                                          /*with_policy_item=*/false, def_id,
+                                                          policy_id);
+    h.audit_calls.clear();
+
+    yuzu::test::SqlFault broken(
+        pool, "ALTER TABLE policy_store.policies RENAME TO policies_gone",
+        "ALTER TABLE policy_store.policies_gone RENAME TO policies");
+    broken.arm();
+    auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+    broken.repair();
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(del->body.find("nothing was uninstalled") != std::string::npos);
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].result == "error");
+    CHECK(h.audit_calls[0].detail == "referrer_check_unavailable");
+    auto still_pack = h.product_pack_store->get(pack_id);
+    REQUIRE(still_pack.has_value());
+    CHECK(still_pack->has_value());
+    auto still_def = h.instructions->get_definition(def_id);
+    REQUIRE(still_def.has_value());
+    CHECK(still_def->has_value());
+    auto still_frag = policies.get_fragment("own-frag-broken");
+    REQUIRE(still_frag.has_value());
+    CHECK(still_frag->has_value());
+}
+
+// N2-7: a foreign workflow whose steps use TWO of the pack's definitions is one blocker, listed and
+// counted once. Turns red if the handler stops de-duplicating by (kind, id): the message would say
+// "2 items" and list the workflow twice.
+TEST_CASE("N2-7: a foreign referrer that uses two of a pack's definitions is listed and counted "
+          "once",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ScheduleEngine schedules{pool};
+    PolicyStore policies{pool};
+    REQUIRE(schedules.is_open());
+    REQUIRE(policies.is_open());
+    WorkflowEngine* wf_for_lookup = nullptr;
+    auto lookup = [&](const std::string& id,
+                      const yuzu::server::DefinitionReferrerExclusions& exclusions) {
+        return yuzu::server::make_definition_referrers_fn(&schedules, wf_for_lookup,
+                                                          &policies)(id, exclusions);
+    };
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, lookup);
+    wf_for_lookup = h.workflows.get();
+
+    std::vector<std::string> def_ids;
+    auto install_fn = [&](const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        InstructionDefinition d;
+        d.name = "own-def-" + std::to_string(def_ids.size());
+        d.type = "question";
+        d.plugin = "os_info";
+        d.action = "os_name";
+        auto id = h.instructions->create_definition(d);
+        if (id)
+            def_ids.push_back(*id);
+        return id;
+    };
+    const std::string bundle = "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: two-defs\n"
+                               "version: 1.0.0\ndescription: d\n---\n"
+                               "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
+                               "name: own-def-0\n---\n"
+                               "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
+                               "name: own-def-1\n";
+    auto installed = h.product_pack_store->install(bundle, install_fn);
+    REQUIRE(installed.has_value());
+    REQUIRE(def_ids.size() == 2);
+    auto foreign = h.workflows->create_workflow(
+        "apiVersion: yuzu.io/v1alpha1\nkind: Workflow\nmetadata:\n  displayName: two-step\n"
+        "spec:\n  steps:\n    - instruction: " + def_ids[0] + "\n    - instruction: " + def_ids[1] +
+        "\n");
+    REQUIRE(foreign.has_value());
+
+    auto blocked = h.sink.Delete("/api/product-packs/" + *installed);
+    REQUIRE(blocked);
+    CHECK(blocked->status == 409);
+    const auto msg = nlohmann::json::parse(blocked->body).at("error").at("message").get<std::string>();
+    CHECK(msg.find("1 item still uses one of its definitions") != std::string::npos);
+    const auto first = msg.find("workflow " + *foreign);
+    REQUIRE(first != std::string::npos);
+    CHECK(msg.find("workflow " + *foreign, first + 1) == std::string::npos);
+}
+
+namespace {
+yuzu::server::DefinitionReferrersFn::Result null_fn_target(const std::string&) {
+    return std::vector<yuzu::server::DefinitionReferrer>{};
+}
+yuzu::server::DefinitionReferrersFn::Result null_fn_target2(
+    const std::string&, const yuzu::server::DefinitionReferrerExclusions&) {
+    return std::vector<yuzu::server::DefinitionReferrer>{};
+}
+// Functors whose explicit operator bool says "empty" (or "wired"), one per call arity.
+template <bool Wired> struct FlagOne {
+    explicit operator bool() const { return Wired; }
+    yuzu::server::DefinitionReferrersFn::Result operator()(const std::string&) const {
+        return std::vector<yuzu::server::DefinitionReferrer>{};
+    }
+};
+template <bool Wired> struct FlagTwo {
+    explicit operator bool() const { return Wired; }
+    yuzu::server::DefinitionReferrersFn::Result
+    operator()(const std::string&, const yuzu::server::DefinitionReferrerExclusions&) const {
+        return std::vector<yuzu::server::DefinitionReferrer>{};
+    }
+};
+} // namespace
+
+// N2-6: wrapping an EMPTY callable must leave the lookup unwired (`!fn`), not a truthy wrapper that
+// throws bad_function_call when a handler calls it. Both converting constructors (one-argument and
+// two-argument) are covered for every kind of empty callable. Turns red if either constructor goes
+// back to wrapping unconditionally (an unwired lookup would read as wired and the handlers would
+// skip their fail-closed 503), or if its guard stops recognising a null function pointer, an empty
+// std::function or a functor whose explicit operator bool is false.
+TEST_CASE("N2-6: a DefinitionReferrersFn built from an empty callable is unwired",
+          "[referrers][workflow]") {
+    using Fn = yuzu::server::DefinitionReferrersFn;
+    using One = std::function<Fn::Result(const std::string&)>;
+    using Two = std::function<Fn::Result(const std::string&, const Fn::Exclusions&)>;
+    CHECK_FALSE(Fn(One{}));
+    CHECK_FALSE(Fn(Two{}));
+    Fn::Result (*null_one)(const std::string&) = nullptr;
+    Fn::Result (*null_two)(const std::string&, const Fn::Exclusions&) = nullptr;
+    CHECK_FALSE(Fn(null_one));
+    CHECK_FALSE(Fn(null_two));
+    CHECK_FALSE(Fn(FlagOne<false>{}));
+    CHECK_FALSE(Fn(FlagTwo<false>{}));
+    // A real callable stays wired and is called.
+    CHECK(Fn(One{null_fn_target}));
+    CHECK(Fn(Two{null_fn_target2}));
+    CHECK(Fn(&null_fn_target));
+    CHECK(Fn(&null_fn_target2));
+    CHECK(Fn(FlagOne<true>{}));
+    CHECK(Fn(FlagTwo<true>{}));
+    CHECK(Fn([](const std::string&) { return Fn::Result{std::vector<yuzu::server::DefinitionReferrer>{}}; }));
+    CHECK(Fn([](const std::string&, const Fn::Exclusions&) {
+        return Fn::Result{std::vector<yuzu::server::DefinitionReferrer>{}};
+    }));
+    CHECK(Fn(&null_fn_target)("x").has_value());
+    CHECK(Fn(&null_fn_target2)("x").has_value());
+}
+
+// N3-5: describe_pack_uninstall_blockers pinned directly (no store): the three-policy boundary and
+// the lower-bound overflow, id-and-name naming with the empty-name fallback, the CWE-117 fold of a
+// hostile policy id or name, the delete-the-policy sentence only when a policy holds a fragment, and
+// the singular and plural count wording. Each CHECK turns red on deleting its production line: the
+// `shown` cap or the `, +N` tail in held_by_suffix, the `name.empty()` branch, the log_token folds,
+// the `policy_held` ternary and the `== 1` wording in describe_pack_uninstall_blockers.
+TEST_CASE("N3-5: describe_pack_uninstall_blockers names holding policies and states the rest",
+          "[referrers][workflow]") {
+    using yuzu::server::DefinitionReferrer;
+    using yuzu::server::HeldByPolicy;
+    using yuzu::server::describe_pack_uninstall_blockers;
+    const auto frag = [](std::vector<HeldByPolicy> held) {
+        DefinitionReferrer r;
+        r.kind = "policy fragment";
+        r.id = "frag-1";
+        r.held_by = std::move(held);
+        return r;
+    };
+
+    SECTION("exactly three policies are all named, no overflow tail") {
+        const auto m = describe_pack_uninstall_blockers(
+            {frag({{"p1", "Alpha"}, {"p2", "Beta"}, {"p3", "Gamma"}})});
+        CHECK(m.find("policy fragment frag-1 (used by policy p1 (Alpha), p2 (Beta), p3 (Gamma))") !=
+              std::string::npos);
+        CHECK(m.find("+") == std::string::npos);
+    }
+    SECTION("a fourth policy is counted, not named") {
+        const auto m = describe_pack_uninstall_blockers(
+            {frag({{"p1", "Alpha"}, {"p2", "Beta"}, {"p3", "Gamma"}, {"p4", "Delta"}})});
+        CHECK(m.find("(used by policy p1 (Alpha), p2 (Beta), p3 (Gamma), +1)") != std::string::npos);
+        CHECK(m.find("p4") == std::string::npos);
+        CHECK(m.find("Delta") == std::string::npos);
+    }
+    SECTION("an empty name falls back to the id alone") {
+        const auto m = describe_pack_uninstall_blockers({frag({{"p1", ""}, {"p2", "Beta"}})});
+        CHECK(m.find("(used by policy p1, p2 (Beta))") != std::string::npos);
+        CHECK(m.find("p1 (") == std::string::npos);
+    }
+    SECTION("a hostile policy id or name is folded") {
+        const auto m = describe_pack_uninstall_blockers(
+            {frag({{"p 1,x=y\nz", "na me,a=b\nresult=ok"}})});
+        CHECK(m.find('\n') == std::string::npos);
+        CHECK(m.find("p 1") == std::string::npos);
+        CHECK(m.find("na me") == std::string::npos);
+        CHECK(m.find("a=b") == std::string::npos);
+        CHECK(m.find("x=y") == std::string::npos);
+    }
+    SECTION("the delete-the-policy sentence appears only when a policy holds a fragment") {
+        DefinitionReferrer wf;
+        wf.kind = "workflow";
+        wf.id = "wf-1";
+        const auto without = describe_pack_uninstall_blockers({wf});
+        CHECK(without.find("delete that policy, then retry") == std::string::npos);
+        CHECK(without.find("used by policy") == std::string::npos);
+        const auto with = describe_pack_uninstall_blockers({wf, frag({{"p1", "Alpha"}})});
+        CHECK(with.find("delete that policy, then retry") != std::string::npos);
+        // A fragment referrer with no holding policy is a plain referrer: no sentence either.
+        CHECK(describe_pack_uninstall_blockers({frag({})}).find("delete that policy") ==
+              std::string::npos);
+    }
+    SECTION("singular and plural counts") {
+        DefinitionReferrer a;
+        a.kind = "schedule";
+        a.id = "s1";
+        DefinitionReferrer b = a;
+        b.id = "s2";
+        const auto one = describe_pack_uninstall_blockers({a});
+        CHECK(one.find("1 item still uses one of its definitions") != std::string::npos);
+        const auto two = describe_pack_uninstall_blockers({a, b});
+        CHECK(two.find("2 items still use one of its definitions") != std::string::npos);
+        CHECK(two.find("the pack was NOT uninstalled; ") == 0);
+    }
+}
+
+// Fail closed: a failing or unwired lookup is a 503 and nothing is deleted, but only for a pack that
+// carries an InstructionDefinition (a workflow-only pack never consults it, so the ADR-0064 tests
+// above run unwired). Turns red if the handler reads an error or an unset function as "no referrers".
+TEST_CASE("M2-2: a failing or unwired referrer lookup 503s the uninstall of a pack with a "
+          "definition and deletes nothing",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::DefinitionReferrersFn lookup;
+    SECTION("failing") {
+        lookup = [](const std::string&)
+            -> std::expected<std::vector<yuzu::server::DefinitionReferrer>, std::string> {
+            return std::unexpected(std::string("schedule read failed"));
+        };
+    }
+    SECTION("unwired") {}
+    ExecHarness h(pool, true, nullptr, true, true, true, /*with_product_pack_store=*/true, {}, {},
+                  false, {}, {}, {}, {}, lookup);
+    auto install = h.sink.Post("/api/product-packs", kPackWithDefinition, "text/x-yaml");
+    REQUIRE(install);
+    REQUIRE(install->status == 201);
+    const auto pack_id = nlohmann::json::parse(install->body).at("id").get<std::string>();
+    const auto def_id = pack_definition_id(*h.product_pack_store, pack_id);
+    h.audit_calls.clear();
+
+    auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(del);
+    CHECK(del->status == 503);
+    CHECK(del->body.find("nothing was uninstalled") != std::string::npos);
+    auto still_def = h.instructions->get_definition(def_id);
+    REQUIRE(still_def.has_value());
+    CHECK(still_def->has_value());
+    // The pack record survives too (N1-6c): a half-uninstalled pack would lose its row.
+    auto still_pack = h.product_pack_store->get(pack_id);
+    REQUIRE(still_pack.has_value());
+    CHECK(still_pack->has_value());
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].result == "error");
+}
+
+// An unreferenced pack uninstalls exactly as before (the no-change half of M2-2).
+TEST_CASE("M2-2: a pack whose definition nothing references uninstalls unchanged",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, true, nullptr, true, true, true, /*with_product_pack_store=*/true, {}, {},
+                  false, {}, {}, {}, {},
+                  [](const std::string&)
+                      -> std::expected<std::vector<yuzu::server::DefinitionReferrer>, std::string> {
+                      return std::vector<yuzu::server::DefinitionReferrer>{};
+                  });
+    auto install = h.sink.Post("/api/product-packs", kPackWithDefinition, "text/x-yaml");
+    REQUIRE(install);
+    REQUIRE(install->status == 201);
+    const auto pack_id = nlohmann::json::parse(install->body).at("id").get<std::string>();
+    auto del = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(del);
+    CHECK(del->status == 200);
 }

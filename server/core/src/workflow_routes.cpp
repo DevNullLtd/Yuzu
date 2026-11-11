@@ -48,6 +48,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -261,6 +262,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* product_pack_store = deps.product_pack_store;
     auto* instruction_store = deps.instruction_store;
     auto* policy_store = deps.policy_store;
+    auto referrers_fn = deps.referrers_fn; // M2: the pack uninstall's definition-referrer guard
     auto* approval_manager = deps.approval_manager;
     auto* response_store = deps.response_store;
     const auto* forensics_plugins = deps.forensics_plugins; // #4990
@@ -4477,9 +4479,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // DELETE /api/product-packs/:id -- uninstall product pack
     sink.Delete(R"(/api/product-packs/([^/]+))", [perm_fn, audit_fn, emit_fn, product_pack_store,
-                                                  instruction_store, policy_store,
-                                                  workflow_engine](const httplib::Request& req,
-                                                                   httplib::Response& res) {
+                                                  instruction_store, policy_store, workflow_engine,
+                                                  referrers_fn](const httplib::Request& req,
+                                                                httplib::Response& res) {
         if (!perm_fn(req, res, "ProductPack", "Delete"))
             return;
         if (!product_pack_store) {
@@ -4489,6 +4491,112 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
+
+        // M2: refuse BEFORE the first item is deleted (uninstall() deletes items one at a time, so
+        // a refusal part-way would leave a half-uninstalled pack). A pack whose InstructionDefinition
+        // is still named by a schedule, a workflow or a policy fragment is not uninstalled; the
+        // pack's OWN workflow items and the own policy fragments no policy uses do not count, they
+        // are removed by this same uninstall. A pack that carries no InstructionDefinition item
+        // skips the lookup. Advisory-not-transactional: a schedule created after the check is not
+        // seen.
+        {
+            auto pack = product_pack_store->get(id);
+            if (!pack) {
+                // Same classification and audit as the uninstall's own read failure below; the
+                // check could not run, so nothing is deleted.
+                const std::string client_msg = product_pack_client_message(
+                    "DELETE /api/product-packs/:id", pack.error());
+                audit_fn(req, "product_pack.uninstall", "denied", "ProductPack", id, client_msg);
+                res.status = product_pack_error_status(pack.error());
+                res.set_content(detail::a4_error(res, client_msg), "application/json");
+                return;
+            }
+            if (*pack) {
+                std::unordered_set<std::string> own_workflows, own_fragments;
+                bool has_definition = false;
+                for (const auto& item : (*pack)->items) {
+                    if (item.kind == "Workflow")
+                        own_workflows.insert(item.item_id);
+                    else if (item.kind == "PolicyFragment")
+                        own_fragments.insert(item.item_id);
+                    else if (item.kind == "InstructionDefinition")
+                        has_definition = true;
+                }
+                std::vector<DefinitionReferrer> blocking;
+                const auto refuse = [&](int status, const char* audit_result,
+                                        const char* audit_detail, std::string_view message) {
+                    audit_fn(req, "product_pack.uninstall", audit_result, "ProductPack", id,
+                             audit_detail);
+                    res.status = status;
+                    res.set_content(detail::a4_error(res, message), "application/json");
+                };
+                if (has_definition) {
+                    if (!referrers_fn)
+                        return refuse(503, "error", "referrer_check_unwired",
+                                      "definition reference check not configured; nothing was "
+                                      "uninstalled");
+                    // The pack's own items are left out of the lookup INSIDE its capped queries
+                    // (a filter applied to the capped answer would let a pack with many own
+                    // workflows fill the window and hide a foreign referrer). Workflows go in the
+                    // same uninstall (a soft delete that never refuses). A fragment does NOT when
+                    // a policy still uses it (PolicyStore::delete_fragment refuses and the
+                    // uninstall tolerates that), so it stays live and is counted like any other
+                    // referrer; a policy read that fails is a 503, never "unreferenced".
+                    DefinitionReferrerExclusions exclusions;
+                    exclusions.workflow_ids = std::move(own_workflows);
+                    // fragment id -> the policies that use it (id and name), for the 409 text
+                    std::unordered_map<std::string, std::vector<HeldByPolicy>> policy_held;
+                    for (const auto& fragment_id : own_fragments) {
+                        if (!policy_store)
+                            return refuse(503, "error", "referrer_check_unwired",
+                                          "definition reference check not configured; nothing was "
+                                          "uninstalled");
+                        auto used = policy_store->query_policies(PolicyQuery{
+                            .fragment_filter = fragment_id,
+                            .limit = static_cast<int>(kMaxHeldByPoliciesNamed) + 1});
+                        if (!used)
+                            return refuse(503, "error", "referrer_check_unavailable",
+                                          "definition reference check unavailable; nothing was "
+                                          "uninstalled");
+                        if (used->empty())
+                            exclusions.fragment_ids.insert(fragment_id);
+                        else {
+                            auto& holders = policy_held[fragment_id];
+                            for (const auto& policy : *used)
+                                holders.push_back({policy.id, policy.name});
+                        }
+                    }
+                    for (const auto& item : (*pack)->items) {
+                        if (item.kind != "InstructionDefinition")
+                            continue;
+                        auto referrers = referrers_fn(item.item_id, exclusions);
+                        if (!referrers)
+                            return refuse(503, "error", "referrer_check_unavailable",
+                                          "definition reference check unavailable; nothing was "
+                                          "uninstalled");
+                        // A foreign referrer can name two of the pack's definitions: list it
+                        // (and count it) once.
+                        for (auto& r : *referrers) {
+                            const bool seen = std::any_of(
+                                blocking.begin(), blocking.end(), [&](const DefinitionReferrer& b) {
+                                    return b.kind == r.kind && b.id == r.id;
+                                });
+                            if (seen)
+                                continue;
+                            if (r.kind == "policy fragment") {
+                                if (const auto held = policy_held.find(r.id);
+                                    held != policy_held.end())
+                                    r.held_by = held->second;
+                            }
+                            blocking.push_back(std::move(r));
+                        }
+                    }
+                }
+                if (!blocking.empty())
+                    return refuse(409, "denied", "referenced",
+                                  describe_pack_uninstall_blockers(blocking));
+            }
+        }
 
         // Uninstall callback: delegate to the appropriate store (same dispatch install's
         // compensate_fn uses — see make_item_delete_fn's doc comment for the per-kind
