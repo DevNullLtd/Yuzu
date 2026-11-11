@@ -124,7 +124,7 @@ std::string pack_advisory_note(const DefinitionPackAdvisoryFn& fn,
 }
 
 namespace {
-/// "(used by policy <id> (<name>), <id>, +N)": the policies holding a pack-own fragment alive, at
+/// "(used by policy <id> (<name>), <id>, +N)": the policies holding a policy fragment alive, at
 /// most `kMaxHeldByPoliciesNamed` of them, each id and name bounded and folded; the name is left
 /// out when empty. `N` is a lower bound (the caller reads one policy past the cap). Empty when
 /// `held_by` is.

@@ -159,8 +159,8 @@ apply_definition_update_body(const nlohmann::json& body, InstructionDefinition& 
 /// `type`, `plugin`, `action`, `approval_mode` or `concurrency_mode` against `before` AND `before`
 /// carries a non-empty `yaml_source`, this clears `def.yaml_source` (the columns become the
 /// authority, which is already the state of every definition created through the JSON routes) and
-/// returns true. An edit to `enabled` and the rest leaves it alone. Called by the v1 PUT,
-/// the legacy `PUT /api/instructions/{id}` and the MCP `update_definition` only; a YAML save is the YAML authority and never calls it.
+/// returns true. An edit to `enabled` and the rest leaves it alone. Called by the v1 PUT
+/// and the MCP `update_definition` only; a YAML save is the YAML authority and never calls it.
 /// `describe_dispatch_binding_change` then ends the audit detail with `yaml_source cleared
 /// yaml_source_bytes=<n> yaml_source_sha256=<hex>` (the cleared text's size and digest) and, just
 /// before it, names which of `name`, `version`, `type` and `description` changed.
@@ -171,10 +171,9 @@ apply_definition_update_body(const nlohmann::json& body, InstructionDefinition& 
 /// a human must approve it: `plugin`, `action`, `approval_mode`, `concurrency_mode`, `enabled`
 /// (instruction_execute.cpp binds the first four into the effect; `enabled` gates dispatch).
 /// `type` is deliberately NOT recorded: it only labels the definition. Empty when none changed. Format: `field: old -> new` entries joined
-/// by `; ` (each value through `log_token`, CWE-117). Shared by the legacy `PUT
-/// /api/instructions/{id}` and dashboard YAML-save success rows and the v1/MCP twins' rows, so an
-/// approval downgrade (`always` -> `auto`), a repoint or a concurrency change is visible in the
-/// audit trail on every surface. (The YAML save cannot change `enabled`: it carries it forward.)
+/// by `; ` (each value through `log_token`, CWE-117). Shared by the v1 and MCP
+/// twins' update rows, so an approval downgrade (`always` -> `auto`), a repoint or a concurrency
+/// change is visible in their audit trail. (The legacy dashboard routes do not record it.)
 /// An update that emptied a non-empty `yaml_source` (`clear_stale_yaml_source`) first names which of
 /// `name`, `version` and `type` changed (`old -> new`, as above) and that the `description` did
 /// (`description: changed <old> -> <new> bytes`, sizes only), then ends the text with

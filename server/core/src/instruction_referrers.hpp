@@ -40,13 +40,14 @@ class ProductPackStore;
 class ScheduleEngine;
 class WorkflowEngine;
 
-/// The most policies a pack-uninstall refusal names per held fragment; the rest are counted
-/// (`+N`). The uninstall handler reads one policy more than this per fragment, so `N` is a LOWER
-/// BOUND (it never exceeds 1): it says "at least one more", not how many.
+/// The most policies a refusal names per held fragment; the rest are counted (`+N`). A caller that
+/// fills `held_by` reads one policy more than this per fragment, so `N` is a LOWER BOUND (it never
+/// exceeds 1): it says "at least one more", not how many.
 inline constexpr std::size_t kMaxHeldByPoliciesNamed = 3;
 
-/// A policy that uses a pack-own policy fragment. The refusal names it `<id> (<name>)`: the id is
-/// what the delete route takes, the name is what the operator recognises.
+/// A policy that uses a policy fragment that is still a referrer. The refusal names it
+/// `<id> (<name>)`: the id is what the delete route takes, the name is what the operator
+/// recognises.
 struct HeldByPolicy {
     std::string id;
     std::string name; ///< may be empty (then only the id is named)
@@ -55,9 +56,8 @@ struct HeldByPolicy {
 struct DefinitionReferrer {
     std::string kind; ///< "schedule", "workflow" or "policy fragment"
     std::string id;
-    /// Set only for a policy fragment that policies still use, when the lookup was given
-    /// exclusions (below): the policies that use it, which is why it is still a referrer. Empty
-    /// everywhere else.
+    /// Filled by a caller that wants to name the policies that keep a policy fragment alive (the
+    /// lookup itself never sets it). Empty everywhere else.
     std::vector<HeldByPolicy> held_by{};
 };
 

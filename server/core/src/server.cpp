@@ -23055,8 +23055,8 @@ private:
         // instruction-set authoring routes. Same store, same permission gate and same audit sink
         // as the legacy cluster above; audit-first on every write.
         {
-            // UP-6: the SAME referrer lookup built before the legacy routes (see there) is shared
-            // here and with the MCP delete_definition (wired into mcp_server_ below).
+            // UP-6: the SAME referrer lookup built above is shared here and with the MCP
+            // delete_definition (wired into mcp_server_ below).
             yuzu::server::instruction_authoring::RouteDeps authoring_deps;
             authoring_deps.perm_fn = [this](const httplib::Request& req, httplib::Response& res,
                                             const std::string& securable_type,

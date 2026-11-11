@@ -1641,7 +1641,7 @@ TEST_CASE("ProductPackStore::packs_containing_item matches kind and item id and 
     CHECK(err.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
 }
 
-// N1-6d. The glue the three DELETE routes share: make_definition_pack_advisory_fn asks the pack
+// N1-6d. The glue the v1 and MCP DELETE paths share: make_definition_pack_advisory_fn asks the pack
 // store for the kind "InstructionDefinition" with a window of 20, and pack_advisory_note names five
 // of them and counts the rest. Turns red if the kind literal changes (the Workflow pack with the
 // same item id would be listed instead), if the window is not 20, or if the note stops counting.

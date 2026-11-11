@@ -1592,6 +1592,90 @@ TEST_CASE("DELETE /api/v1/instructions/{id}: the success row notes the containin
     CHECK_FALSE(w.get(id).has_value());
 }
 
+// The referrer lookup's two call forms and its policy naming. The v1 and MCP deletes call the
+// one-argument form; the exclusion form and `held_by` are the library half a caller that removes
+// related rows together with the definition uses, so they are pinned here on their own.
+TEST_CASE("DefinitionReferrersFn: the two call forms, and an empty callable stays unwired",
+          "[instruction_authoring][referrers]") {
+    SECTION("a one-argument callable ignores the exclusions") {
+        int calls = 0;
+        DefinitionReferrersFn fn{[&](const std::string& id) -> DefinitionReferrersFn::Result {
+            ++calls;
+            return std::vector<DefinitionReferrer>{{"schedule", id + "-s", {}}};
+        }};
+        REQUIRE(static_cast<bool>(fn));
+        DefinitionReferrerExclusions ex;
+        ex.workflow_ids = {"w1"};
+        const auto plain = fn("d1");
+        const auto excl = fn("d1", ex);
+        REQUIRE((plain && excl));
+        CHECK(plain->size() == 1);
+        CHECK(excl->size() == 1);
+        CHECK(calls == 2);
+    }
+    SECTION("a two-argument callable receives the exclusions, and fn(id) passes none") {
+        DefinitionReferrerExclusions seen;
+        bool called = false;
+        DefinitionReferrersFn fn{[&](const std::string&, const DefinitionReferrerExclusions& ex)
+                                     -> DefinitionReferrersFn::Result {
+            called = true;
+            seen = ex;
+            return std::vector<DefinitionReferrer>{};
+        }};
+        DefinitionReferrerExclusions ex;
+        ex.workflow_ids = {"w1", "w2"};
+        ex.fragment_ids = {"f1"};
+        REQUIRE(fn("d1", ex).has_value());
+        CHECK(called);
+        CHECK(seen.workflow_ids == ex.workflow_ids);
+        CHECK(seen.fragment_ids == ex.fragment_ids);
+        REQUIRE(fn("d1").has_value());
+        CHECK(seen.workflow_ids.empty());
+        CHECK(seen.fragment_ids.empty());
+    }
+    SECTION("a default, null, null-function-pointer or empty std::function stays unwired") {
+        CHECK_FALSE(static_cast<bool>(DefinitionReferrersFn{}));
+        CHECK_FALSE(static_cast<bool>(DefinitionReferrersFn{nullptr}));
+        using OneArg = DefinitionReferrersFn::Result (*)(const std::string&);
+        CHECK_FALSE(static_cast<bool>(DefinitionReferrersFn{static_cast<OneArg>(nullptr)}));
+        CHECK_FALSE(static_cast<bool>(DefinitionReferrersFn{
+            std::function<DefinitionReferrersFn::Result(const std::string&)>{}}));
+        CHECK_FALSE(static_cast<bool>(DefinitionReferrersFn{
+            std::function<DefinitionReferrersFn::Result(const std::string&,
+                                                        const DefinitionReferrerExclusions&)>{}}));
+    }
+}
+
+TEST_CASE("describe_definition_referrers: a held_by list names policies, bounded and folded",
+          "[instruction_authoring][referrers]") {
+    SECTION("no held_by: the plain kind and id list") {
+        const auto text = describe_definition_referrers({{"schedule", "s1", {}}});
+        CHECK(text.find("schedule s1") != std::string::npos);
+        CHECK(text.find("used by policy") == std::string::npos);
+    }
+    SECTION("up to the cap are named as id (name), the name folded; a nameless policy is its id") {
+        const auto text = describe_definition_referrers(
+            {{"policy fragment", "f1", {{"p1", "Disk check"}, {"p2", ""}}}});
+        CHECK(text.find("policy fragment f1 (used by policy p1 (Disk_check), p2)") !=
+              std::string::npos);
+        CHECK(text.find("+") == std::string::npos);
+    }
+    SECTION("past the cap the rest are counted") {
+        std::vector<HeldByPolicy> held;
+        for (std::size_t i = 0; i < kMaxHeldByPoliciesNamed + 1; ++i)
+            held.push_back({"p" + std::to_string(i), ""});
+        const auto text = describe_definition_referrers({{"policy fragment", "f1", held}});
+        CHECK(text.find(", +1)") != std::string::npos);
+        CHECK(text.find("p3") == std::string::npos);
+    }
+    SECTION("a control byte in a policy name never reaches the text") {
+        const auto text = describe_definition_referrers(
+            {{"policy fragment", "f1", {{"p1", std::string("a\x1b[31mb\nc")}}}});
+        CHECK(text.find('\x1b') == std::string::npos);
+        CHECK(text.find('\n') == std::string::npos);
+    }
+}
+
 // UP-6 wiring tripwire: an unwired referrer lookup fails CLOSED (503), so a server.cpp that stops
 // wiring it would not leak a delete, it would make every delete refuse. This pins that both
 // transports are handed the SAME lookup built from the real stores.
@@ -1604,17 +1688,13 @@ TEST_CASE("instruction authoring: wiring -- server.cpp builds the referrer looku
     std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(in.is_open());
     const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    const std::array<std::string_view, 8> kNeedles = {
+    const std::array<std::string_view, 5> kNeedles = {
         "make_definition_referrers_fn(\n            schedule_engine_.get(), "
         "workflow_engine_.get(), policy_store_.get())",
         "authoring_deps.referrers_fn = definition_referrers_fn;",
         "mcp_server_->set_definition_referrers_fn(definition_referrers_fn);",
-        // M2: the SAME closure also guards the released legacy DELETE and the pack uninstall.
-        ".referrers_fn = definition_referrers_fn,\n",
-        "wf_deps.referrers_fn = definition_referrers_fn;",
-        // M2-3: and the advisory pack lookup reaches all three delete paths.
+        // The advisory pack lookup reaches both delete paths.
         "authoring_deps.pack_advisory_fn = definition_pack_advisory_fn;",
-        ".pack_advisory_fn = definition_pack_advisory_fn,\n",
         "mcp_server_->set_definition_pack_advisory_fn(definition_pack_advisory_fn);"};
     const auto wired = [&](const std::string& text) {
         return std::all_of(kNeedles.begin(), kNeedles.end(), [&](std::string_view n) {
