@@ -133,8 +133,9 @@ TEST_CASE("ResponseStore: bad-path constructor (unroutable DSN) is closed",
     // Reads degrade to nullopt; ingest/reap are silent no-ops.
     CHECK_FALSE(store.query("cmd-x", kAllRows).has_value());
     CHECK(store.total_count(kAllRows) == 0);
-    CHECK_FALSE(store.store(StoredResponse{})); // not persisted: no throw, and the caller is told
-    store.reap_expired();                       // must not throw/crash
+    // Not persisted: no throw, and the caller is told.
+    CHECK(store.store(StoredResponse{}) == StoreOutcome::Failed);
+    store.reap_expired(); // must not throw/crash
 }
 
 TEST_CASE("ResponseStore: store and retrieve", "[pg][response_store]") {
@@ -4076,34 +4077,51 @@ TEST_CASE("ResponseStore: a capped stream finalizes in place and replay cannot g
     CHECK(cap_dropped(f.metrics) == 3.0);
 }
 
-// store() reports whether the frame is durable: the terminal ingest sites record a lost answer
-// from it. False when the store is closed (see the bad-path test), a NUL is in an identity field
-// or the transaction fails; true for a persisted frame and for a terminal frame the cap refused
-// because the pair already holds its terminal row.
-TEST_CASE("ResponseStore: store reports whether the frame is durable",
+// The durable view of each outcome: only a lost frame (a failed write, or a cap-refused
+// non-terminal frame) counts as dropped; a cap-refused terminal frame leaves its answer durable.
+TEST_CASE("StoreOutcome: only a lost frame is not durable", "[response_store][store_outcome]") {
+    CHECK(store_outcome_durable(StoreOutcome::Stored));
+    CHECK(store_outcome_durable(StoreOutcome::CappedTerminal));
+    CHECK_FALSE(store_outcome_durable(StoreOutcome::CappedRunning));
+    CHECK_FALSE(store_outcome_durable(StoreOutcome::Failed));
+}
+
+// store() reports what it did with the frame: the ingest sites record a lost answer from it.
+// Failed when the store is closed (see the bad-path test), a NUL is in an identity field or the
+// transaction fails; CappedTerminal for a terminal frame the cap refused because the pair already
+// holds its terminal row; CappedRunning for a non-terminal frame the cap refused (its output is
+// lost).
+TEST_CASE("ResponseStore: store reports the outcome of the frame",
           "[pg][response_store][cap]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     CapFixture f(db.dsn(), 4);
 
-    CHECK(f.store.store(cap_frame("cmd-ret", "agent-1", 1, "exec-1")));
+    CHECK(f.store.store(cap_frame("cmd-ret", "agent-1", 1, "exec-1")) == StoreOutcome::Stored);
     CHECK(cap_rows(f.store, "cmd-ret", "agent-1") == 1);
 
     auto nul = cap_frame("cmd-ret", "agent-2", 1);
     nul.agent_id = std::string("agent") + '\0' + "2";
-    CHECK_FALSE(f.store.store(nul));
+    CHECK(f.store.store(nul) == StoreOutcome::Failed);
     auto nul_instruction = cap_frame("cmd-ret", "agent-3", 1);
     nul_instruction.instruction_id = std::string("cmd-ret") + '\0' + "x";
-    CHECK_FALSE(f.store.store(nul_instruction));
+    CHECK(f.store.store(nul_instruction) == StoreOutcome::Failed);
 
-    // Fill the pair with RUNNING rows, finalize them in place, then replay a terminal frame: the
-    // cap refuses it, but the pair already holds a terminal row, so the answer is durable.
+    // Fill the pair with RUNNING rows: a further RUNNING frame is refused and its output is lost.
     for (int i = 0; i < 4; ++i)
-        REQUIRE(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 0, "exec-2")));
+        REQUIRE(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 0, "exec-2")) ==
+                StoreOutcome::Stored);
+    CHECK(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 0, "exec-2")) ==
+          StoreOutcome::CappedRunning);
+    CHECK(cap_rows(f.store, "cmd-ret-cap", "agent-1") == 4); // refused, not grown
+
+    // Finalize the retained rows in place, then replay a terminal frame: the cap refuses it, but
+    // the pair already holds a terminal row, so the answer is durable.
     REQUIRE(f.store.finalize_terminal_status("cmd-ret-cap", "agent-1", 1, "", "exec-2", 0) ==
             ResponseStore::FinalizeResult::Updated);
-    CHECK(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 1, "exec-2")));
-    CHECK(cap_rows(f.store, "cmd-ret-cap", "agent-1") == 4); // refused, not grown
-    CHECK(cap_dropped(f.metrics) == 1.0);
+    CHECK(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 1, "exec-2")) ==
+          StoreOutcome::CappedTerminal);
+    CHECK(cap_rows(f.store, "cmd-ret-cap", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 2.0);
 }
 
 TEST_CASE("ResponseStore: the row cap is per (instruction, agent) pair",

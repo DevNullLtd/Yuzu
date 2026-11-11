@@ -612,11 +612,11 @@ const std::vector<pg::PgMigration>& migrations() {
         // command outbox compares it against the value stamped on a row at first send to bound a
         // redrive (see command_replay_horizon.hpp). DDL only, no table rewrite, instant.
         {9, "CREATE SEQUENCE IF NOT EXISTS dispatch_seq;"},
-        // v10: whether the agent's terminal answer was persisted by the response store. The
-        // tracker counts an agent as responded once its terminal status row is written, but the
-        // response row is a separate write that can fail; this flag is written in the SAME
-        // upsert as the status, so a result-set fill can tell a counted answer that has no
-        // stored row. Constant default: metadata-only ADD COLUMN, no rewrite.
+        // v10: whether any frame of the agent's answer was NOT kept by the response store (a
+        // failed write, or a cap refusal of a non-terminal frame). The tracker counts an agent as
+        // responded once its terminal status row is written, but the response rows are separate
+        // writes that can fail; this flag is written in the SAME upsert as the status and is
+        // sticky, so a result-set fill can tell a counted answer that is missing stored output. Constant default: metadata-only ADD COLUMN, no rewrite.
         {10,
          "ALTER TABLE agent_exec_status ADD COLUMN IF NOT EXISTS response_dropped BOOLEAN NOT NULL "
          "DEFAULT false;"},
@@ -1019,7 +1019,7 @@ ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
         s.agents_success = exec->agents_success;
         s.agents_failure = exec->agents_failure;
         s.progress_pct = s.agents_targeted > 0 ? (s.agents_responded * 100 / s.agents_targeted) : 0;
-        // Agents counted as responded whose terminal response was not persisted. A failed count
+        // Agents whose response the store did not fully keep (sticky flag). A failed count
         // reads 1 ("not known to be zero"): the caller uses this to refuse a completeness claim.
         pg::PgResult dropped = pg::exec_params(
             lease.get(),
@@ -1359,13 +1359,10 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
             "                                AND excluded.status = 'running' "
             "                             THEN agent_exec_status.plugin_result_status "
             "                             ELSE excluded.plugin_result_status END, "
-            // A later terminal write replaces the flag (a redelivered terminal frame whose
-            // response was stored clears it); a stale 'running' write keeps the terminal row's.
-            "  response_dropped=CASE WHEN agent_exec_status.status IN "
-            "                           ('success','failure','timeout','rejected') "
-            "                           AND excluded.status = 'running' "
-            "                        THEN agent_exec_status.response_dropped "
-            "                        ELSE excluded.response_dropped END "
+            // STICKY for every status: once a frame of this agent's answer was not kept, no
+            // later write (terminal, running or a redelivery) clears it, because a later stored
+            // frame cannot restore the lost one. Written in this same upsert as the status.
+            "  response_dropped=(agent_exec_status.response_dropped OR excluded.response_dropped) "
             "RETURNING status, exit_code, completed_at, error_detail, plugin_result_status",
             std::vector<std::string>{
                 execution_id, s.agent_id, s.status,

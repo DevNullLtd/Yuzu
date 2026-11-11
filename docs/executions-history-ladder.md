@@ -750,14 +750,18 @@ LISTEN/NOTIFY-plus-cursor-poll loop from it.
   `yuzu_exec_outbox_reap_total`, `yuzu_exec_outbox_reap_clock_anomaly_total`,
   `yuzu_exec_outbox_store_degrade_total`.
 
-## Terminal answers the response store did not persist
+## Response frames the response store did not keep
 
 The tracker counts an agent as responded when its terminal `agent_exec_status` row is written, and
-the response row is a separate write that can fail. `ResponseStore::store` therefore returns whether
-the frame was persisted, and the two terminal ingest sites in `agent_service_impl.cpp` (Subscribe
-and the gateway path) pass a failed store or finalize to `notify_exec_tracker`, which sets
-`AgentExecStatus::response_dropped` in the SAME upsert as the status (migration v10). The flag is
-not part of any event payload, so the outbox contract is unchanged; a later terminal write replaces
-it. `ExecutionTracker::get_summary` reports the count as `agents_response_dropped`, and the
-result-set fill adds it to the unanswered agents, so a set whose member answer was lost is recorded
-as incomplete. A new terminal-ingest site must pass the same fact.
+the response rows are separate writes that can fail. `ResponseStore::store` therefore returns a
+`StoreOutcome`: a frame is lost when the write failed, or when the per-pair cap refused a
+non-terminal frame (a capped terminal frame stays durable, since the cap admits one only while no
+terminal row exists). The ingest sites in `agent_service_impl.cpp` (Subscribe and the gateway path,
+for streaming and terminal frames alike) pass that loss, or a failed finalize of a terminal answer,
+to `notify_exec_tracker`, which sets `AgentExecStatus::response_dropped` in the SAME upsert as the
+status (migration v10). The flag is sticky: the stored value is the OR of every write for the
+agent, so a later write, terminal or not, never clears it (a stored later frame cannot restore a
+lost earlier one). It is not part of any event payload, so the outbox contract is unchanged.
+`ExecutionTracker::get_summary` reports the count as `agents_response_dropped`, and the result-set
+fill adds it to the unanswered agents, so a set whose member answer was lost is recorded as
+incomplete. A new response-ingest site must pass the same fact.

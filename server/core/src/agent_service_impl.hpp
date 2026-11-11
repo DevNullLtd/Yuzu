@@ -726,9 +726,10 @@ private:
     /// (rides the wire response independent of the correlation table). See
     /// those methods' doc comments.
     ///
-    /// `response_dropped` is true only for a terminal frame whose response row the response store
-    /// did not persist; the tracker records it with the agent's status (same upsert) so the fill of
-    /// a result set can count that agent as unanswered. RUNNING and out-of-band callers omit it.
+    /// `response_dropped` is true when the frame the response store was given for this response
+    /// was not kept (a failed write, a lost terminal answer, or a cap-refused non-terminal frame);
+    /// the tracker records it with the agent's status (same upsert) and never clears it, so the
+    /// fill of a result set can count that agent as unanswered. Out-of-band callers omit it.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
                              const pb::CommandResponse& resp, const ResponseProvenance& prov,
                              bool response_dropped = false);

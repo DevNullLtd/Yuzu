@@ -4908,6 +4908,26 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     CHECK(marked < 1200);
 }
 
+TEST_CASE("ingest: every response-store site records a lost frame beside the agent's status",
+          "[result_set][async][response_dropped]") {
+    // The four ingest sites (Subscribe and gateway, RUNNING and terminal) have no seam a test
+    // can drive; pin them lexically. Each stores the frame, turns the outcome into the dropped
+    // flag, and hands the flag to the tracker so it lands in the same upsert as the status.
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/agent_service_impl.cpp", std::ios::binary);
+    REQUIRE(in.good());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const auto src = ss.str();
+    const auto count = [&](const std::string& needle) {
+        std::size_t n = 0;
+        for (auto at = src.find(needle); at != std::string::npos; at = src.find(needle, at + 1))
+            ++n;
+        return n;
+    };
+    CHECK(count("response_dropped = !store_outcome_durable(response_store_->store(sr));") == 4);
+    CHECK(count("resp, prov, response_dropped);") == 4);
+}
+
 TEST_CASE("materialise: a success-status error| answer under the default matcher is a member "
           "because matching decides before failing",
           "[pg][result_set][async][echo][agents_failed]") {

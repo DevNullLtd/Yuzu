@@ -131,10 +131,10 @@ struct ExecutionSummary {
     int agents_success{0};
     int agents_failure{0};
     int progress_pct{0};
-    /// Agents counted in `agents_responded` whose terminal response the response store did not
-    /// persist (their status row says `response_dropped`). Their answer is missing from every
-    /// stored-response read, so a consumer building membership from stored rows must treat each as
-    /// unanswered. 1 when the count itself could not be read.
+    /// Agents whose response the response store did not fully keep (their status row says
+    /// `response_dropped`: a terminal answer or a streamed frame is missing). Their answer is
+    /// missing from every stored-response read, so a consumer building membership from stored rows
+    /// must treat each as unanswered. 1 when the count itself could not be read.
     int agents_response_dropped{0};
 };
 
@@ -154,9 +154,10 @@ struct AgentExecStatus {
     /// sdk/include/yuzu/plugin.h). 0 (PLUGIN_RESULT_UNDECLARED) for legacy
     /// rows and for any response whose plugin never reported a typed status.
     int plugin_result_status{0};
-    /// True when the terminal frame this status came from was NOT persisted by the response store
-    /// (ingest-time failure). Written in the same upsert as the status; a later terminal write
-    /// with a stored response clears it. Not part of the event payload.
+    /// True when the frame this status came from was NOT kept by the response store (an ingest-time
+    /// failure, or a cap refusal of a non-terminal frame). Written in the same upsert as the
+    /// status and STICKY: the stored value is the OR of every write, so no later write clears it.
+    /// Not part of the event payload.
     bool response_dropped{false};
 };
 

@@ -1621,7 +1621,12 @@ grpc::Status AgentServiceImpl::Subscribe(
             // Publish each row as its own SSE event
             publish_output_rows(agent_id, plugin, resp.output());
 
-            // Store streaming response
+            // Store streaming response. A frame the store did not keep (a failed write, or a cap
+            // refusal) carries output no stored-response read will return: `response_dropped`
+            // records it beside the agent's status (same tracker upsert), and the tracker keeps
+            // it for the rest of the execution, so a result-set fill cannot read the agent as
+            // having fully answered.
+            bool response_dropped = false;
             if (response_store_) {
                 StoredResponse sr;
                 sr.instruction_id = resp.command_id();
@@ -1634,7 +1639,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                 // command_execution record so the executions detail drawer
                 // can correlate exactly, on any replica.
                 sr.execution_id = prov.execution_id;
-                response_store_->store(sr);
+                response_dropped = !store_outcome_durable(response_store_->store(sr));
             }
 
             // registry.write audit rows (RUNNING frames carry the plugin output).
@@ -1646,7 +1651,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // UAT 2026-05-06 #8: notify the executions tracker so the
             // drawer's per-agent KPI table populates and the SSE
             // `agent-transition` event fires for live updates.
-            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
             if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
@@ -1718,7 +1723,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                     sr.plugin = plugin_name;
                     sr.error_detail = err_detail;
                     sr.execution_id = current_exec;
-                    response_dropped = !response_store_->store(sr);
+                    response_dropped = !store_outcome_durable(response_store_->store(sr));
                 } else if (finalize_result == FR::Error) {
                     // Already logged inside the store; do NOT insert (would re-create the
                     // sentinel). The terminal answer is not durable, so say so.
@@ -2026,6 +2031,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         const std::string& plugin = prov.plugin;
         publish_output_rows(agent_id, plugin, resp.output());
 
+        bool response_dropped = false; // a frame the store did not keep; see the Subscribe twin
         if (response_store_) {
             StoredResponse sr;
             sr.instruction_id = resp.command_id();
@@ -2037,7 +2043,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             // PR 2 / HA WS-1(1b): streaming response — keep the mapping
             // until completion (PG-backed, shared across replicas).
             sr.execution_id = prov.execution_id;
-            response_store_->store(sr);
+            response_dropped = !store_outcome_durable(response_store_->store(sr));
         }
 
         // registry.write audit rows. No gRPC context on the gateway path to carry an
@@ -2046,7 +2052,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         (void)audit_registry_frame(agent_id, resp, plugin);
 
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
-        notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+        notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
         if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
@@ -2100,7 +2106,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                 sr.plugin = gw_plugin;
                 sr.error_detail = err_detail;
                 sr.execution_id = current_exec;
-                response_dropped = !response_store_->store(sr);
+                response_dropped = !store_outcome_durable(response_store_->store(sr));
             } else if (finalize_result == FR::Error) {
                 response_dropped = true;
             }

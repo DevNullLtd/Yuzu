@@ -420,13 +420,13 @@ SERVER_MUTATIONS = [
     # a Subscribe hook moved after the notification
     (
         r"(if \(!audit_registry_frame\(agent_id, resp, (?:prov\.)?plugin\) && !audit_failed_signalled\) \{[^}]*\})"
-        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov\);)",
+        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov(?:, response_dropped)?\);)",
         r"\3\2\1",
     ),
     # a gateway hook moved after the notification
     (
         r"(\(void\)audit_registry_frame\(agent_id, resp, (?:prov\.)?plugin\);)"
-        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov\);)",
+        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov(?:, response_dropped)?\);)",
         r"\3\2\1",
     ),
     # a gateway hook deleted
@@ -508,7 +508,7 @@ SERVER_MUTATIONS = [
         "notify_exec_tracker(resp.command_id(), agent_id, resp);\n\n        std::string status_str",
     ),
     # a fifth output-storing site appears
-    (r"response_store_->store\(sr\);", "response_store_->store(sr);\nresponse_store_->store(sr);"),
+    (r"response_store_->store\(sr\)", "response_store_->store(sr);\nresponse_store_->store(sr)"),
     # the hook reads the raw store instead of the weak one
     (r"registry_audit_store_\.lock\(\)", "std::shared_ptr<AuditStore>(audit_store_, [](AuditStore*) {})"),
     # the rows are charged without the overflow key: agents past the exact table share ONE allowance
