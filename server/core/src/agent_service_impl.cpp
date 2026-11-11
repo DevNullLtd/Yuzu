@@ -83,6 +83,9 @@ namespace {
 // bound as one agent, plugin_result_audit.hpp).
 static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
               "the registry audit budget must key on a whole agent id");
+// The unverified-frame record keeps any enrolled agent id as a pair (a longer one fails closed).
+static_assert(UnverifiedFrameRegistry::kMaxAgentIdBytes == auth::kMaxAgentIdLength,
+              "the unverified-frame record must keep every enrolled agent id");
 
 // Persists the `registry.write` audit rows one stored output frame owes (see
 // plugin_result_audit.hpp for the binding: a minted registry command id AND an agent-stamped
@@ -1598,9 +1601,10 @@ grpc::Status AgentServiceImpl::Subscribe(
                                     /*response_dropped=*/false);
                 continue;
             }
-            // Stored under the unverified label, which the result-set fill never reads, and
-            // reaching no tracker row: the pair's terminal frame reports it (take_unverified_frame).
-            if (!prov.verified())
+            // A failed provenance lookup: stored under the unverified label, which the result-set
+            // fill never reads, and reaching no tracker row, so the pair's terminal frame reports
+            // it (unverified_frame_seen). An unrecorded id can never reach a tracker row: not noted.
+            if (prov.outcome == ProvenanceOutcome::kLookupDegraded)
                 note_unverified_frame(resp.command_id(), agent_id);
 
             // Track first response for server-side latency
@@ -1736,9 +1740,11 @@ grpc::Status AgentServiceImpl::Subscribe(
                 }
                 // FR::Updated → row already updated in place, no insert.
             }
-            // An earlier RUNNING frame of this agent stored as unverified is absent from the
-            // result-set fill's read: the answer is not fully stored. Always consumed.
-            if (take_unverified_frame(resp.command_id(), agent_id))
+            // An earlier RUNNING frame of this agent whose provenance lookup failed is absent from
+            // the result-set fill's read: the answer is not fully stored. Checked, not consumed:
+            // notify_exec_tracker below forgets the record only once a tracker row carries the
+            // flag, so a terminal frame it cannot record leaves the record for a replay.
+            if (unverified_frame_seen(resp.command_id(), agent_id))
                 response_dropped = true;
 
             // A terminal frame that carries output AND the agent-stamped action owes its audit
@@ -2021,7 +2027,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                                 /*response_dropped=*/false);
             return;
         }
-        if (!prov.verified()) // see the Subscribe twin
+        if (prov.outcome == ProvenanceOutcome::kLookupDegraded) // see the Subscribe twin
             note_unverified_frame(resp.command_id(), agent_id);
 
         // Track first response for server-side latency
@@ -2124,7 +2130,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             }
             // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
-        if (take_unverified_frame(resp.command_id(), agent_id)) // see the Subscribe twin
+        if (unverified_frame_seen(resp.command_id(), agent_id)) // see the Subscribe twin
             response_dropped = true;
 
         // A terminal frame that carries output owes its audit rows too (see the Subscribe twin;
@@ -2292,17 +2298,26 @@ int64_t steady_seconds_now() {
 
 void AgentServiceImpl::note_unverified_frame(const std::string& command_id,
                                              const std::string& agent_id) {
-    const std::size_t evicted = unverified_frames_.note(command_id, agent_id, steady_seconds_now());
-    if (evicted > 0)
+    const auto noted = unverified_frames_.note(command_id, agent_id, steady_seconds_now());
+    if (noted.evicted > 0)
         metrics_
             .counter("yuzu_server_response_ingest_dropped_total",
                      {{"reason", "unverified_registry_overflow"}})
-            .increment(static_cast<double>(evicted));
+            .increment(static_cast<double>(noted.evicted));
+    if (noted.skipped)
+        metrics_
+            .counter("yuzu_server_response_ingest_dropped_total",
+                     {{"reason", "unverified_registry_skipped"}})
+            .increment();
+    if (noted.latched)
+        spdlog::warn("[ingest] the unverified-frame record cannot keep an entry: every agent "
+                     "answer recorded in the next {} s is reported as not fully stored (agent={})",
+                     UnverifiedFrameRegistry::kDefaultMaxAgeSeconds, yuzu::log_id_token(agent_id));
 }
 
-bool AgentServiceImpl::take_unverified_frame(const std::string& command_id,
+bool AgentServiceImpl::unverified_frame_seen(const std::string& command_id,
                                              const std::string& agent_id) {
-    return unverified_frames_.consume(command_id, agent_id, steady_seconds_now());
+    return unverified_frames_.contains(command_id, agent_id, steady_seconds_now());
 }
 
 void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
@@ -2479,7 +2494,10 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     default:
         return;
     }
-    tracker->update_agent_status(execution_id, s);
+    // The row now carries the dropped-answer flag (sticky), so the record of an earlier unverified
+    // frame of this pair has done its job; a failed upsert keeps it for a replayed terminal frame.
+    if (tracker->update_agent_status(execution_id, s) && response_dropped)
+        unverified_frames_.forget(command_id, agent_id);
 }
 
 void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const std::string& plugin,

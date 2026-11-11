@@ -513,8 +513,9 @@ public:
     /// not re-reduce a value equal to the persisted text, so a caller that passes raw Forensics
     /// text publishes it to the outbox and the bus on its first write. A lexical gate
     /// (`tests/test_forensics_tier_wiring_lexical.py`) pins exactly one caller; a second caller
-    /// needs a reviewed edit there.
-    void update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
+    /// needs a reviewed edit there. True when the status row was written (false when the tracker
+    /// is closed or the upsert failed twice).
+    bool update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
 
     /// PR 2: set agents_targeted post-creation. Used by the workflow execute

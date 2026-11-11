@@ -47,19 +47,29 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
 ### `AgentServiceImpl::unverified_frames_` (bounded in-memory registry)
 - **Site:** member of `AgentServiceImpl`, type `UnverifiedFrameRegistry`
   (`unverified_frame_registry.hpp`). Written by `note_unverified_frame` at the two RUNNING ingest
-  sites (Subscribe and gateway) when the frame's provenance is unverified; read and erased by
-  `take_unverified_frame` at the two terminal ingest sites.
-- **Owner type:** owned by value by the service; `std::map` entries plus a `std::mutex`, no thread,
-  no callback, no handle.
-- **Bound:** 4,096 entries (oldest evicted, counted as
-  `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`) and one hour
-  per entry (expired on every `note` and `consume`, against `steady_clock` seconds).
+  sites (Subscribe and gateway) only when the frame's provenance lookup failed
+  (`ProvenanceOutcome::kLookupDegraded`); read without erasing by `unverified_frame_seen` at the
+  two terminal ingest sites; an entry is erased by `notify_exec_tracker` only after
+  `ExecutionTracker::update_agent_status` wrote a row carrying a true `response_dropped`.
+- **Owner type:** owned by value by the service; `std::map`/`std::set` entries plus a `std::mutex`,
+  no thread, no callback, no handle.
+- **Bound:** 64 entries per agent (a new one evicts that agent's own oldest), 4,096 entries in all
+  (oldest evicted); a command id over 128 bytes or an agent id over 256 bytes is never kept as an
+  entry. Each eviction is counted as
+  `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}` and each id it
+  could not keep as `{reason="unverified_registry_skipped"}`. Evicted or unkeepable pairs fail
+  closed: their command id is remembered (at most 1,024, so at most 128 KiB of id bytes) and reads
+  as not fully stored for every agent; a command id it cannot remember, or a full command set, sets
+  one latch under which every pair reads as not fully stored. Entries, remembered commands and the
+  latch last one hour (expired on every `note` and `contains`, against `steady_clock` seconds).
+  Total held bytes are bounded by the entry and command caps times the id caps.
 - **Lock:** its own `mu_`, held only for the map operations; no other lock is taken under it and it
   is never held across I/O.
-- **Release point:** each entry on consume, expiry or eviction; the whole registry with the service.
-  It has the same lifetime as the service's other members (for example `cmd_times_mu_`), so the
-  detached gateway-forward threads that reach `process_gateway_response` are bounded by the same
-  service-lifetime ordering as those members.
+- **Release point:** each entry on a recorded flag, expiry or eviction; the whole registry with the
+  service. The detached gateway-forward threads that reach `process_gateway_response` are NOT
+  bounded by the service's lifetime: they are the known #3279 residual (the gateway-forward note
+  near the top of `agent_service_impl.cpp`, above `audit_registry_frame`), and this member shares
+  that residual with `this`, `metrics_` and every other member those threads touch.
 - **Failure cleanup:** RAII only; nothing persists.
 
 ### Borrowed `const ForensicsPluginSet*` on the result-set producers

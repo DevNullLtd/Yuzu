@@ -768,12 +768,21 @@ it to the unanswered agents, and retries on the next tick when the count is unre
 member answer was lost is therefore recorded as incomplete. A new response-ingest site must pass the
 same fact.
 
-A non-terminal frame whose provenance could not be resolved is stored under the unverified label,
-which the fill never reads, and reaches no tracker row (it carries no execution id). Each ingest
-path records such a frame per (command id, agent id) in an in-memory registry
-(`unverified_frame_registry.hpp`, at most 4,096 entries and one hour per entry), and the same pair's
-terminal frame consumes the record and reports `response_dropped`. When the registry is full the
-oldest record is evicted and counted as
-`yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Residual: the
-registry is per process, so a restart, or a terminal frame served by a different replica than the
-non-terminal one, loses the record and the set can read as complete without that frame's output.
+A non-terminal frame whose provenance lookup failed (`ProvenanceOutcome::kLookupDegraded`) is
+stored under the unverified label, which the fill never reads, and reaches no tracker row (it
+carries no execution id). Each ingest path records such a frame per (command id, agent id) in an
+in-memory registry (`unverified_frame_registry.hpp`); a frame with no dispatch record at all is not
+recorded, because it can never reach a tracker row. The same pair's terminal frame checks the
+record without erasing it and reports `response_dropped`; the record is erased only after the
+tracker row has been written with that flag, so a terminal frame whose own lookup or tracker write
+fails leaves the record for a replayed terminal frame. The registry is bounded and fails closed:
+64 entries per agent (one agent's frames evict only its own oldest entries), 4,096 in all, a
+command id over 128 bytes or an agent id over 256 bytes is never kept as an entry, and one hour per
+entry. A pair it evicts or cannot keep has its command id remembered (at most 1,024 commands), and
+every agent of that command then reports `response_dropped`; when even that cannot be kept, a
+one-hour latch makes every terminal answer report `response_dropped`. Over-reporting a set as
+partial is the safe direction. Evictions count as
+`yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`, ids it could
+not keep as `{reason="unverified_registry_skipped"}`. Residual: the record is held in the server
+process, so a restart, or a terminal frame served by a different replica than the non-terminal
+one, loses it and the set can read as complete without that frame's output.

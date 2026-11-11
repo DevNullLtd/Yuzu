@@ -542,15 +542,17 @@ private:
     /// gauge. Caller holds `cmd_times_mu_`.
     void publish_send_times_gauge_locked();
 
-    /// Non-terminal frames whose provenance was unresolved, per (command id, agent id), until the
-    /// same pair's terminal frame reports them as a lost answer (`response_dropped`). Bounded and
-    /// self-locking (unverified_frame_registry.hpp); lives and dies with this service.
+    /// Non-terminal frames whose provenance lookup failed, per (command id, agent id), until a
+    /// tracker row of the same pair records them as a lost answer (`response_dropped`). Bounded,
+    /// fails closed, self-locking (unverified_frame_registry.hpp); lives and dies with this service.
     UnverifiedFrameRegistry unverified_frames_;
-    /// Records an unverified RUNNING frame; counts a capacity eviction as
-    /// `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`.
+    /// Records a RUNNING frame whose provenance lookup failed; counts an eviction as
+    /// `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}` and a
+    /// pair it could not keep as `{reason="unverified_registry_skipped"}`.
     void note_unverified_frame(const std::string& command_id, const std::string& agent_id);
-    /// True (and forgets the record) when an unverified RUNNING frame of this pair was seen.
-    [[nodiscard]] bool take_unverified_frame(const std::string& command_id,
+    /// True when the pair's answer must be reported as not fully stored. Erases nothing:
+    /// `notify_exec_tracker` forgets the pair once a tracker row has recorded the flag.
+    [[nodiscard]] bool unverified_frame_seen(const std::string& command_id,
                                              const std::string& agent_id);
     // The former in-process `cmd_execution_ids_` map (command_id ->
     // execution_id) moved to Postgres (HA WS-1(1b), ADR-2002 section 5) —
@@ -742,8 +744,10 @@ private:
     /// was not kept (a failed write, a lost terminal answer, or a cap-refused non-terminal frame);
     /// the tracker records it with the agent's status (same upsert) and never clears it, so the
     /// fill of a result set can count that agent as unanswered. A terminal frame also reports an
-    /// earlier non-terminal frame of the same agent whose provenance was unresolved (stored under
-    /// the unverified label, so absent from the fill's read). Keepalive callers pass false.
+    /// earlier non-terminal frame of the same agent whose provenance lookup failed (stored under
+    /// the unverified label, so absent from the fill's read); once the tracker row has recorded a
+    /// true flag, the record of that frame is forgotten (never earlier, and never on an early
+    /// return or a failed upsert). Keepalive callers pass false.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
                              const pb::CommandResponse& resp, const ResponseProvenance& prov,
                              bool response_dropped);

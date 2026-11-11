@@ -806,40 +806,130 @@ TEST_CASE("unanswered_agent_count: a counted answer whose response was not store
     CHECK(unanswered_agent_count(3, 1, true, -4) == 2);
 }
 
-// The registry the ingest paths use to carry an unverified non-terminal frame to the same agent's
-// terminal frame (UP-1). The clock is injected, so expiry is tested without waiting.
-TEST_CASE("UnverifiedFrameRegistry: a noted pair is consumed once",
+// The registry the ingest paths use to carry a non-terminal frame whose provenance lookup failed
+// to the same agent's terminal frame (UP-1). The clock is injected, so expiry is tested without
+// waiting. Every case where it cannot keep an entry must fail closed (report the answer dropped).
+using yuzu::server::UnverifiedFrameRegistry;
+
+TEST_CASE("UnverifiedFrameRegistry: a noted pair is reported until forgotten",
           "[result_set][unverified_frames]") {
-    yuzu::server::UnverifiedFrameRegistry reg;
-    CHECK(reg.note("cmd-1", "agent-a", 100) == 0);
-    CHECK(reg.note("cmd-1", "agent-a", 101) == 0); // a repeat keeps one entry
+    UnverifiedFrameRegistry reg;
+    CHECK(reg.note("cmd-1", "agent-a", 100).evicted == 0);
+    CHECK(reg.note("cmd-1", "agent-a", 101).evicted == 0); // a repeat keeps one entry
     CHECK(reg.size() == 1);
-    CHECK_FALSE(reg.consume("cmd-1", "agent-b", 102)); // another agent of the same command
-    CHECK_FALSE(reg.consume("cmd-2", "agent-a", 102)); // another command of the same agent
-    CHECK(reg.consume("cmd-1", "agent-a", 102));
-    CHECK_FALSE(reg.consume("cmd-1", "agent-a", 103)); // reported to one terminal frame only
+    CHECK_FALSE(reg.contains("cmd-1", "agent-b", 102)); // another agent of the same command
+    CHECK_FALSE(reg.contains("cmd-2", "agent-a", 102)); // another command of the same agent
+    // Checking erases nothing: a terminal frame that could not be recorded leaves the entry, so a
+    // replayed terminal frame still reports it.
+    CHECK(reg.contains("cmd-1", "agent-a", 102));
+    CHECK(reg.contains("cmd-1", "agent-a", 103));
+    CHECK(reg.size() == 1);
+    reg.forget("cmd-1", "agent-b"); // another pair: no effect
+    CHECK(reg.size() == 1);
+    reg.forget("cmd-1", "agent-a"); // recorded: erased
+    CHECK_FALSE(reg.contains("cmd-1", "agent-a", 104));
     CHECK(reg.size() == 0);
 }
 
-TEST_CASE("UnverifiedFrameRegistry: the capacity evicts the oldest entry and reports it",
+TEST_CASE("UnverifiedFrameRegistry: a repeated note keeps the first-seen time",
           "[result_set][unverified_frames]") {
-    yuzu::server::UnverifiedFrameRegistry reg(2, 3600);
-    CHECK(reg.note("cmd", "a1", 10) == 0);
-    CHECK(reg.note("cmd", "a2", 11) == 0);
-    CHECK(reg.note("cmd", "a3", 12) == 1);
-    CHECK(reg.size() == 2);
-    CHECK_FALSE(reg.consume("cmd", "a1", 13)); // the oldest was evicted
-    CHECK(reg.consume("cmd", "a2", 13));
-    CHECK(reg.consume("cmd", "a3", 13));
+    UnverifiedFrameRegistry reg(16, 60);
+    (void)reg.note("cmd", "agent-a", 1000);
+    (void)reg.note("cmd", "agent-a", 1050); // must not restart the age
+    CHECK(reg.contains("cmd", "agent-a", 1059));
+    CHECK_FALSE(reg.contains("cmd", "agent-a", 1060)); // 60 s after the FIRST note
 }
 
 TEST_CASE("UnverifiedFrameRegistry: an entry past the age bound is forgotten",
           "[result_set][unverified_frames]") {
-    yuzu::server::UnverifiedFrameRegistry reg(16, 60);
-    CHECK(reg.note("cmd", "old", 1000) == 0);
-    CHECK(reg.note("cmd", "new", 1050) == 0);
-    CHECK_FALSE(reg.consume("cmd", "old", 1060)); // exactly at the bound: expired
-    CHECK(reg.consume("cmd", "new", 1060));
-    CHECK(reg.note("cmd", "late", 2000) == 0);
+    UnverifiedFrameRegistry reg(16, 60);
+    (void)reg.note("cmd", "old", 1000);
+    (void)reg.note("cmd", "new", 1050);
+    CHECK(reg.size() == 2);
+    // Expiry alone (no forget) removes the old entry: exactly at the bound it is gone.
+    CHECK_FALSE(reg.contains("cmd", "old", 1060));
+    CHECK(reg.size() == 1);
+    CHECK(reg.contains("cmd", "new", 1060));
+    (void)reg.note("cmd", "late", 2000);
     CHECK(reg.size() == 1); // expiry runs on note too
+}
+
+TEST_CASE("UnverifiedFrameRegistry: an evicted pair still reads as not fully stored",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(2, 3600);
+    CHECK(reg.note("cmd-a", "a1", 10).evicted == 0);
+    CHECK(reg.note("cmd-b", "a2", 11).evicted == 0);
+    const auto third = reg.note("cmd-c", "a3", 12);
+    CHECK(third.evicted == 1);
+    CHECK_FALSE(third.latched);
+    CHECK(reg.size() == 2);
+    // The oldest pair was evicted, but its command is remembered: every agent of it reports.
+    CHECK(reg.contains("cmd-a", "a1", 13));
+    CHECK(reg.contains("cmd-a", "other-agent", 13));
+    CHECK(reg.contains("cmd-b", "a2", 13));
+    CHECK(reg.contains("cmd-c", "a3", 13));
+    CHECK_FALSE(reg.contains("cmd-d", "a1", 13));
+    // The remembered command ages out like an entry, counted from the eviction (t=12).
+    CHECK(reg.contains("cmd-a", "a1", 12 + 3599));
+    CHECK_FALSE(reg.contains("cmd-a", "a1", 12 + 3600));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: one agent's flood evicts only its own entries",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(100, 3600, 3, 50);
+    (void)reg.note("cmd-b", "agent-b", 1);
+    for (int i = 0; i < 10; ++i)
+        CHECK(reg.note("flood-" + std::to_string(i), "agent-a", 2 + i).evicted ==
+              std::size_t{i < 3 ? 0u : 1u});
+    CHECK(reg.size() == 4); // agent-a holds its cap of three, agent-b its one entry
+    reg.forget("cmd-b", "agent-a"); // not agent-b's pair
+    CHECK(reg.contains("cmd-b", "agent-b", 20));
+    reg.forget("cmd-b", "agent-b");
+    CHECK_FALSE(reg.contains("cmd-b", "agent-b", 20)); // it was an entry, never a remembered command
+    // agent-a's evicted commands still read as not fully stored.
+    CHECK(reg.contains("flood-0", "agent-a", 20));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: an id it cannot keep fails closed",
+          "[result_set][unverified_frames]") {
+    SECTION("an agent id longer than any enrolled one remembers the command") {
+        UnverifiedFrameRegistry reg;
+        const std::string long_agent(UnverifiedFrameRegistry::kMaxAgentIdBytes + 1, 'x');
+        const auto r = reg.note("cmd", long_agent, 100);
+        CHECK(r.skipped);
+        CHECK_FALSE(r.latched);
+        CHECK(reg.size() == 0);
+        CHECK(reg.contains("cmd", "any-agent", 101));
+        CHECK_FALSE(reg.contains("other-cmd", "any-agent", 101));
+    }
+    SECTION("a command id longer than any minted one sets the latch") {
+        UnverifiedFrameRegistry reg(16, 60);
+        const std::string long_cmd(UnverifiedFrameRegistry::kMaxCommandIdBytes + 1, 'c');
+        const auto r = reg.note(long_cmd, "agent-a", 100);
+        CHECK(r.skipped);
+        CHECK(r.latched);
+        CHECK(reg.size() == 0);
+        CHECK(reg.contains("any-cmd", "any-agent", 159)); // every pair, for the age bound
+        CHECK_FALSE(reg.contains("any-cmd", "any-agent", 160));
+    }
+    SECTION("a command id at the bound is kept as an entry") {
+        UnverifiedFrameRegistry reg;
+        const std::string cmd(UnverifiedFrameRegistry::kMaxCommandIdBytes, 'c');
+        CHECK_FALSE(reg.note(cmd, "agent-a", 100).skipped);
+        CHECK(reg.size() == 1);
+    }
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a full set of remembered commands sets the latch",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(1, 60, 1, 2);
+    (void)reg.note("c0", "a", 100);
+    CHECK_FALSE(reg.note("c1", "a", 101).latched); // evicts c0: one remembered command
+    CHECK_FALSE(reg.note("c2", "a", 102).latched); // evicts c1: two
+    const auto r = reg.note("c3", "a", 103);       // evicts c2: three > 2, the oldest is dropped
+    CHECK(r.latched);
+    CHECK(reg.contains("never-seen", "b", 104));   // the latch covers every pair
+    CHECK(reg.contains("c0", "a", 104));           // including the dropped command
+    CHECK_FALSE(reg.note("c4", "a", 105).latched); // already set: not reported again
+    CHECK_FALSE(reg.contains("never-seen", "b", 103 + 60 + 2)); // the latch ages out
 }

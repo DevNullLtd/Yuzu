@@ -1433,10 +1433,10 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
     return persisted_status;
 }
 
-void ExecutionTracker::update_agent_status(const std::string& execution_id,
+bool ExecutionTracker::update_agent_status(const std::string& execution_id,
                                            const AgentExecStatus& s) {
     if (!open_)
-        return;
+        return false;
 
     // Retry once on failure, same rationale as refresh_counts's
     // own retry (governance adversarial review, PR review 2026-08-31,
@@ -1454,7 +1454,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
                       "execution_id={} agent_id={} — this agent's status is NOT recorded and "
                       "will not be reconciled (agents do not re-send)",
                       execution_id, s.agent_id);
-        return;
+        return false;
     }
 
     // Per-device concurrency claim release (ADR-1007): the same terminal set
@@ -1513,6 +1513,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
     // preserving the documented client-visible event ordering
     // (executions-history ladder PR 3 publisher invariant).
     refresh_counts(execution_id);
+    return true;
 }
 
 bool ExecutionTracker::set_agents_targeted(const std::string& execution_id, int agents_targeted) {

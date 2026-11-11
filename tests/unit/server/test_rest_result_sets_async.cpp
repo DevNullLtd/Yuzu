@@ -5029,10 +5029,48 @@ TEST_CASE("ingest: every response-store site records a lost frame beside the age
     CHECK(count_in(src, "else if (finalize_result == FR::Error) {") == 2);
     CHECK(count_in(src, "resp, prov, response_dropped);") == 4);
     CHECK(count_in(src, "resp, prov, /*response_dropped=*/false);") == 2);
-    CHECK(count_in(src, "if (!prov.verified()) note_unverified_frame(resp.command_id(), agent_id);") ==
-          2);
-    CHECK(count_in(src, "if (take_unverified_frame(resp.command_id(), agent_id)) "
-                        "response_dropped = true;") == 2);
+}
+
+TEST_CASE("ingest: a failed provenance lookup is carried to the terminal answer in order",
+          "[result_set][async][response_dropped][unverified_frames]") {
+    // The record is written only for a failed lookup, right after the keepalive branch (never for
+    // a keepalive), on both paths; each terminal site checks it before the tracker call, and the
+    // record is forgotten only inside notify_exec_tracker, after a tracker write that carried
+    // the flag.
+    const auto src = normalised_source("agent_service_impl.cpp");
+    const std::string note =
+        "if (prov.outcome == ProvenanceOutcome::kLookupDegraded) "
+        "note_unverified_frame(resp.command_id(), agent_id);";
+    CHECK(count_in(src, note) == 2);
+    CHECK(count_in(src, "note_unverified_frame(resp.command_id(), agent_id);") == 2);
+    CHECK(count_in(src, "/*response_dropped=*/false); continue; } " + note) == 1);
+    CHECK(count_in(src, "/*response_dropped=*/false); return; } " + note) == 1);
+
+    const std::string peek =
+        "if (unverified_frame_seen(resp.command_id(), agent_id)) response_dropped = true;";
+    const std::string notify =
+        "notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);";
+    CHECK(count_in(src, peek) == 2);
+    std::size_t sites = 0;
+    for (auto at = src.find(peek); at != std::string::npos; at = src.find(peek, at + 1)) {
+        const auto notify_at = src.find(notify, at);
+        REQUIRE(notify_at != std::string::npos);
+        CHECK(notify_at - at < 600); // the registry audit hook, nothing else, in between
+        ++sites;
+    }
+    CHECK(sites == 2);
+    CHECK(count_in(src, "if (tracker->update_agent_status(execution_id, s) && response_dropped) "
+                        "unverified_frames_.forget(command_id, agent_id);") == 1);
+    CHECK(count_in(src, "unverified_frames_.forget(") == 1);
+}
+
+TEST_CASE("create: every async producer snapshots its parent's completeness",
+          "[result_set][async][agents_failed]") {
+    // REST and MCP each have an echo-query and an inventory producer that copy the parent's
+    // counters onto the child at create time.
+    CHECK(count_in(normalised_source("rest_api_v1.cpp"), "inherit_completeness(") +
+              count_in(normalised_source("mcp_server.cpp"), "inherit_completeness(") ==
+          4);
 }
 
 TEST_CASE("materialise: a success-status error| answer under the default matcher is a member "
