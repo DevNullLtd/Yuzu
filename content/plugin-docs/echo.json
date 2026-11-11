@@ -2848,7 +2848,8 @@
       "changelog.d/7371-echo-rollup-only-ui.changed.md",
       "changelog.d/7371-echo-rollup-only-ui.removed.md",
       "changelog.d/7420-echo-followups-mixed.changed.md",
-      "changelog.d/7420-echo-followups-mixed.fixed.md"
+      "changelog.d/7420-echo-followups-mixed.fixed.md",
+      "changelog.d/7466-echo-mcp-hourly-rows.changed.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",
