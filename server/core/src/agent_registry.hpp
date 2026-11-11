@@ -1470,10 +1470,10 @@ public:
 
     /// Bounds the `plugin` label of `yuzu_fleet_plugin_init_failed` to these names (lowercase, as
     /// `catalogue_plugin_names` returns them; plugin_init_failed_labels.hpp). The heartbeat tag is
-    /// agent-supplied, so without a set an agent chooses the labels; with one, a well-formed token
-    /// that is not in it is summed under `plugin="unknown"` and counted in
-    /// `yuzu_fleet_plugin_init_failed_rejected`. A store that is never given a set keeps the
-    /// unbounded behaviour (first 64 names, the rest under `other`). Call once at boot, before the
+    /// agent-supplied, so an agent must never choose the labels: a well-formed token that is not in
+    /// the set is summed under `plugin="unknown"` and counted in
+    /// `yuzu_fleet_plugin_init_failed_rejected`. A store that is never given a set (production
+    /// always gives one) fails closed: every name reads as unknown. Call once at boot, before the
     /// first sweep.
     void set_known_plugins(std::vector<std::string> names);
 
@@ -1534,7 +1534,7 @@ private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
     CorruptionSink corruption_sink_;
-    std::optional<std::set<std::string, std::less<>>> known_plugins_; // guarded by mu_
+    std::set<std::string, std::less<>> known_plugins_; // guarded by mu_; empty = nothing known
 
     /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
     /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},

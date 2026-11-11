@@ -2169,16 +2169,16 @@ TEST_CASE("REAL AgentHealthStore: plugin_init_failed stays absent-not-zero besid
     CHECK(series_val(out, init_failed_series("unknown")) == 1.0);
 }
 
-TEST_CASE("REAL AgentHealthStore: a store with no catalogue wired keeps the unbounded labelling",
+TEST_CASE("REAL AgentHealthStore: a store with no catalogue wired fails closed, every name unknown",
           "[health_store][echo][real]") {
     AgentHealthStore store; // set_known_plugins never called
     yuzu::MetricsRegistry metrics;
     beat_tags(store, "a", {{"yuzu.plugins_failed", "not_in_any_catalogue"}});
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     const auto out = metrics.serialize();
-    CHECK(series_val(out, init_failed_series("not_in_any_catalogue")) == 1.0);
-    CHECK_FALSE(has_series(out, init_failed_series("unknown")));
-    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 0.0);
+    CHECK_FALSE(has_series(out, init_failed_series("not_in_any_catalogue")));
+    CHECK(series_val(out, init_failed_series("unknown")) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
 }
 
 TEST_CASE("REAL AgentHealthStore: corruption candidates are surfaced, not deduped",

@@ -2374,8 +2374,9 @@ void AgentHealthStore::set_corruption_sink(CorruptionSink sink) {
 
 void AgentHealthStore::set_known_plugins(std::vector<std::string> names) {
     std::lock_guard lock(mu_);
-    known_plugins_.emplace(std::make_move_iterator(names.begin()),
-                           std::make_move_iterator(names.end()));
+    known_plugins_.clear();
+    known_plugins_.insert(std::make_move_iterator(names.begin()),
+                          std::make_move_iterator(names.end()));
 }
 
 void AgentHealthStore::remove(const std::string& agent_id) {
@@ -2904,8 +2905,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                     continue; // already counted for this agent this sweep
                 // The label is server-chosen: a name the catalogue does not know is summed
                 // under "unknown" (not a catalogue name, so it can never collide with one),
-                // never given a series of its own. With no set wired the token is labelled.
-                if (known_plugins_ && !known_plugins_->contains(tok)) {
+                // never given a series of its own (an unwired store knows no names).
+                if (!known_plugins_.contains(tok)) {
                     ++plugin_init_unknown;
                     agent_unknown = true;
                     continue;
@@ -3368,34 +3369,16 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     if (dedup_rows_reported)
         metrics.gauge(kDedupRowsMaxGauge).set(static_cast<double>(dedup_rows_max));
     {
-        constexpr std::size_t kMaxPluginLabels = 64;
-        std::size_t n = 0;
-        // With a catalogue set wired every label is a name the SERVER knows, so the label set
-        // is bounded by the catalogue (about 75 names) and no agent can fill a cap to displace
-        // a real plugin: the 64 cap applies only to the unwired fallback, where the first 64
-        // names are labelled and the remainder is summed under "other" as before. Unknown
-        // names are summed under "unknown", never "other", so a real plugin named "other"
-        // is never overwritten.
-        const std::size_t label_cap = known_plugins_ ? plugin_init_failed.size() : kMaxPluginLabels;
-        int64_t overflow = 0;
-        for (const auto& [plugin, count] : plugin_init_failed) {
-            if (n < label_cap) {
-                metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
-                    .set(static_cast<double>(count));
-                ++n;
-            } else {
-                overflow += count;
-            }
-        }
-        if (known_plugins_) {
-            const int64_t unknown = plugin_init_unknown + overflow;
-            if (unknown > 0)
-                metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", kUnknownPluginLabel}})
-                    .set(static_cast<double>(unknown));
-        } else if (overflow > 0) {
-            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", "other"}})
-                .set(static_cast<double>(overflow));
-        }
+        // Every label is a name the SERVER knows (the catalogue, about 75 names), so the label
+        // set is bounded without a cap an agent could fill to displace a real plugin. Names the
+        // catalogue does not know are summed under "unknown", never "other", so a real plugin
+        // named "other" is never overwritten.
+        for (const auto& [plugin, count] : plugin_init_failed)
+            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
+                .set(static_cast<double>(count));
+        if (plugin_init_unknown > 0)
+            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", kUnknownPluginLabel}})
+                .set(static_cast<double>(plugin_init_unknown));
         // Fixed label set, published every sweep including 0 (no clear needed).
         metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectUnknownPlugin}})
             .set(static_cast<double>(plugin_reject_unknown));
