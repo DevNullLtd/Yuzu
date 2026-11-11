@@ -5007,6 +5007,9 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     const auto forced_at = src.find(forced_fill_count, materialized_at);
     REQUIRE(forced_at != std::string::npos);
     CHECK(forced_at - materialized_at < 400); // after the materialized counter, before the else
+    const auto else_at = src.find("} else {", materialized_at);
+    REQUIRE(else_at != std::string::npos);
+    CHECK(else_at > forced_at); // inside the successful fill, not the materialize_failed branch
     // The parent's completeness is snapshotted onto the pending row at create time
     // (inherit_completeness); the tick never reads the parent.
     CHECK(src.find("fold_parent_completeness") == std::string::npos);

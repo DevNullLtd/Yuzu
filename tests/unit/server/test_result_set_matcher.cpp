@@ -1052,12 +1052,12 @@ TEST_CASE("UnverifiedFrameRegistry: concurrent note contains and forget stay con
                 reg.forget(cmd, agent);
         }
     });
-    std::size_t seen = 0;
     for (int i = 0; i < 5000; ++i)
-        seen += reg.contains("c" + std::to_string(i % 200), "a" + std::to_string(i % 13), i) ? 1 : 0;
+        (void)reg.contains("c" + std::to_string(i % 200), "a" + std::to_string(i % 13), i);
     writer.join();
-    CHECK(seen <= 5000);
     CHECK(reg.size() <= 64);
+    // The writer's last pair (i = 4999, never forgotten) is still reported after the join.
+    CHECK(reg.contains("c" + std::to_string(4999 % 200), "a" + std::to_string(4999 % 13), 4999));
 }
 
 TEST_CASE("UnverifiedFrameRegistry: a full set of remembered commands sets the latch",

@@ -3139,7 +3139,8 @@ TEST_CASE("ExecutionTracker: WS-2a the state write and its event append are "
     AgentExecStatus as;
     as.agent_id = "agent-1";
     as.status = "success";
-    tracker.update_agent_status(*id, as); // append fails -> whole txn rolls back
+    // The append fails, the whole txn rolls back, and the caller is told the write failed.
+    CHECK_FALSE(tracker.update_agent_status(*id, as));
 
     // Strengthened assertion (governance quality-engineer): distinguish a
     // genuine rollback (read succeeds, zero rows) from a verification read that
