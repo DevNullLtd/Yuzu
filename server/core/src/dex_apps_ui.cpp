@@ -28,7 +28,7 @@
 
 namespace yuzu::server {
 
-// Shared with dex_routes.cpp (declared in dex_routes.hpp).
+// Defined in dex_routes.cpp; hand-declared here as in dex_app_perf_ui.cpp and dex_perf_ui.cpp.
 std::string dex_window_token(int window_days);
 std::string dex_subnav(const std::string& active, int window_days);
 
@@ -373,10 +373,21 @@ std::string score_cell(const DexStabilityFigures& f, const RowCtx& c) {
            ded + "</details></td>";
 }
 
+// "Last seen": the date and the time sit in separate no-wrap spans, so a narrow column breaks
+// between them and never inside the date. Each part is a literal substring of the REST value.
+std::string last_seen_text(const std::string& ts) {
+    if (ts.empty())
+        return "unknown";
+    const auto t = ts.find('T');
+    if (t == std::string::npos)
+        return "<span class=\"nw\">" + esc(ts) + "</span>";
+    return "<span class=\"nw\">" + esc(ts.substr(0, t)) + "</span> <span class=\"nw\">" +
+           esc(ts.substr(t + 1)) + "</span>";
+}
+
 std::string figure_cells(const DexStabilityFigures& f, const RowCtx& c) {
     return score_cell(f, c) + count_cells(f) + devices_cell(f) + share_cell(f, c) + rate_cell(f, c) +
-           "<td class=\"gp-mute\">" + (f.last_seen.empty() ? std::string("unknown") : esc(f.last_seen)) +
-           "</td>";
+           "<td class=\"gp-mute\">" + last_seen_text(f.last_seen) + "</td>";
 }
 
 std::string app_body(const DexAppStability& a, const DexAppsModel& m, const std::string& window) {

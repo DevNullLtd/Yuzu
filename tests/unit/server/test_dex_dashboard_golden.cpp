@@ -78,6 +78,8 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <limits>
+#include <map>
 #include <optional>
 #include <regex>
 #include <set>
@@ -1393,6 +1395,55 @@ TEST_CASE("DEX apps UI: the population sits beside every share and rate", "[dex]
     CHECK(contains(page, "<b>Population</b> 50 devices online now (all platforms)."));
 }
 
+TEST_CASE("DEX apps UI: Devices affected and the share keep the total and online figures apart",
+          "[dex][apps_ui]") {
+    // Rows of their own: populated_rows() has online == affected everywhere, which a swap of the two
+    // figures cannot show. Application: 9 affected, 4 online. Its version: 6 affected, 3 online.
+    auto app = apps_total_row("lag.exe", 12, 3, 9, 10, 3, 1, 1, "2026-10-14T01:00:00Z");
+    app.affected_online = 4;
+    auto ver = apps_version_row("lag.exe", "2.0", 8, 2, 6, 8, 2, "2026-10-14T02:00:00Z");
+    ver.affected_online = 3;
+    const auto model = model_of({app, ver}, 50);
+    const auto page = render_dex_apps_fragment(model, 7, "all");
+    const auto j = json::parse(dex_apps_json(model));
+    REQUIRE(j["apps"].size() == 1);
+    REQUIRE(j["apps"][0]["versions"].size() == 1);
+
+    auto check_row = [&](const std::string& shown_version, const json& o, int64_t affected, int64_t online) {
+        INFO("row lag.exe / '" << shown_version << "'");
+        CHECK(o["distinct_devices"].get<int64_t>() == affected);
+        CHECK(o["distinct_devices_online"].get<int64_t>() == online);
+        CHECK(o["share_affected"]["estimate"].get<double>() == static_cast<double>(online) / 50.0);
+        const auto devices = cell(page, "lag.exe", shown_version, kColDevices);
+        CHECK(contains(devices, "<span class=\"v\">" + std::to_string(affected) + "</span>"));
+        CHECK(contains(devices, "<span class=\"s nw\">" + std::to_string(online) + " online</span>"));
+        // the share's numerator is the online figure, said beside the population
+        CHECK(contains(cell(page, "lag.exe", shown_version, kColShare),
+                       "<span class=\"s\">" + std::to_string(online) + " of 50 online</span>"));
+    };
+    check_row("", j["apps"][0], 9, 4);
+    check_row("2.0", j["apps"][0]["versions"][0], 6, 3);
+}
+
+TEST_CASE("DEX apps UI: a non-finite interval value reads in words, never inf or nan", "[dex][apps_ui]") {
+    // Defensive twin of the REST serializer, which sends a non-finite estimate or upper as null.
+    auto model = populated_model();
+    const std::string subject = model.apps[0].subject;
+    REQUIRE(model.apps[0].figures.share_affected);
+    REQUIRE(model.apps[0].figures.rate_per_1000);
+    model.apps[0].figures.share_affected->upper = std::numeric_limits<double>::infinity();
+    model.apps[0].figures.rate_per_1000->estimate = std::numeric_limits<double>::quiet_NaN();
+    const auto page = render_dex_apps_fragment(model, 7, "all");
+    const auto share = cell(page, subject, "", kColShare);
+    const auto rate = cell(page, subject, "", kColRate);
+    CHECK(contains(share, "no upper bound"));
+    CHECK(contains(rate, "no estimate"));
+    for (const char* bad : {"inf", "nan"}) {
+        CHECK_FALSE(contains(share, bad));
+        CHECK_FALSE(contains(rate, bad));
+    }
+}
+
 TEST_CASE("DEX apps UI: every withheld score reads in words and the token is escaped", "[dex][apps_ui]") {
     struct Case {
         const char* token;
@@ -1464,8 +1515,12 @@ TEST_CASE("DEX apps UI: the page equals GET /api/v1/dex/apps, per row and per co
         const auto col = [&](int c) { return cell(page, subject, shown_version, c); };
         CHECK(has_number(col(kColCrashes), std::to_string(o["crashes"].get<int64_t>())));
         CHECK(has_number(col(kColHangs), std::to_string(o["hangs"].get<int64_t>())));
-        CHECK(has_number(col(kColDevices), std::to_string(o["distinct_devices"].get<int64_t>())));
-        CHECK(has_number(col(kColDevices), std::to_string(o["distinct_devices_online"].get<int64_t>())));
+        // Anchored to the markup, so the total and the online figure cannot stand in for each other.
+        CHECK(contains(col(kColDevices),
+                       "<span class=\"v\">" + std::to_string(o["distinct_devices"].get<int64_t>()) + "</span>"));
+        CHECK(contains(col(kColDevices), "<span class=\"s nw\">" +
+                                             std::to_string(o["distinct_devices_online"].get<int64_t>()) +
+                                             " online</span>"));
         for (const char* k : {"estimate", "lower", "upper"}) {
             CHECK(has_number(col(kColShare), fig(o["share_affected"][k].get<double>() * 100.0)));
             CHECK(has_number(col(kColRate), fig(o["rate_per_1000"][k].get<double>())));
@@ -1477,7 +1532,12 @@ TEST_CASE("DEX apps UI: the page equals GET /api/v1/dex/apps, per row and per co
             else
                 CHECK(contains(col(kColScore), "not assessed")); // an unassessed deduction has no points
         }
-        CHECK(contains(col(kColLastSeen), o["last_seen"].get<std::string>()));
+        // Last seen: the REST timestamp split at its 'T', each half in its own no-wrap span, in order.
+        const std::string ts = o["last_seen"].get<std::string>();
+        const auto t = ts.find('T');
+        REQUIRE(t != std::string::npos);
+        CHECK(contains(col(kColLastSeen), "<span class=\"nw\">" + ts.substr(0, t) +
+                                              "</span> <span class=\"nw\">" + ts.substr(t + 1) + "</span>"));
     };
     for (const auto& a : j["apps"]) {
         const std::string subject = a["subject"];
@@ -1519,7 +1579,8 @@ TEST_CASE("DEX apps UI: payload key-set parity, both directions", "[dex][apps_ui
                 flatten(e, prefix + "[]");
         }
     };
-    flatten(json::parse(dex_apps_json(populated_model())), "");
+    const auto payload = json::parse(dex_apps_json(populated_model()));
+    flatten(payload, "");
 
     std::set<std::string> shown;
     for (const char* k : {"window", "apps", "apps_total", "apps_truncated", "population", "population_basis",
@@ -1527,9 +1588,13 @@ TEST_CASE("DEX apps UI: payload key-set parity, both directions", "[dex][apps_ui
                           "crash_source_coverage.macos", "crash_source_coverage.linux", "policy",
                           "policy.source", "policy.revision", "policy.fault", "policy.tiers"})
         shown.insert(k);
-    for (const char* t : {"excellent", "good", "fair", "poor"})
+    // population_basis is shown in words, in the Population caption: the next case binds each token to
+    // its caption words.
+    for (const char* t : {"excellent", "good", "fair"})
         for (const char* f : {"", ".edge", ".name"})
             shown.insert(std::string("policy.tiers.") + t + f);
+    shown.insert("policy.tiers.poor");
+    shown.insert("policy.tiers.poor.name");
     auto figures = [&](const std::string& p) {
         for (const char* k : {"crashes", "hangs", "distinct_devices", "distinct_devices_online", "last_seen",
                               "share_affected", "rate_per_1000", "score", "score.score", "score.band",
@@ -1545,7 +1610,10 @@ TEST_CASE("DEX apps UI: payload key-set parity, both directions", "[dex][apps_ui
     for (const char* k : {"subject", "profile", "versions", "version_count", "versions_truncated"})
         shown.insert(std::string("apps[].") + k);
     shown.insert("apps[].versions[].version");
-    const std::set<std::string> declared_omitted; // nothing is omitted today
+    // Declared omitted, one reason each. policy.tiers.poor.edge: Poor's lower edge is the fixed floor of 0,
+    // not a stored field (dex_read_model.cpp), so the page prints "<Poor> below <Fair edge>" and never
+    // this key. The omission holds only while that floor is 0, pinned below.
+    const std::set<std::string> declared_omitted = {"policy.tiers.poor.edge"};
 
     std::set<std::string> accounted = shown;
     accounted.insert(declared_omitted.begin(), declared_omitted.end());
@@ -1553,15 +1621,39 @@ TEST_CASE("DEX apps UI: payload key-set parity, both directions", "[dex][apps_ui
         INFO("payload key '" << p << "' is neither shown nor declared omitted");
         CHECK(accounted.count(p) == 1);
     }
-    for (const auto& p : accounted) {
+    for (const auto& p : shown) {
         INFO("page map names '" << p << "' but the payload no longer carries it");
         CHECK(published.count(p) == 1);
     }
+    for (const auto& p : declared_omitted) {
+        INFO("declared omitted '" << p << "' but the payload no longer carries it (stale declaration)");
+        CHECK(published.count(p) == 1);
+        CHECK(shown.count(p) == 0);
+    }
+    CHECK(payload["policy"]["tiers"]["poor"]["edge"] == 0.0); // a non-zero floor fails until the page prints it
 
     // The one page figure with no Apps-REST key: the interval confidence level.
     for (const auto& p : published)
         CHECK(p.find("confidence") == std::string::npos);
     CHECK(contains(render_dex_apps_fragment(populated_model(), 7, "all"), "Intervals at 95% confidence"));
+}
+
+TEST_CASE("DEX apps UI: population_basis is shown in words in the Population caption, per scope",
+          "[dex][apps_ui]") {
+    // Test-local table of basis token to caption words; a token with no entry fails.
+    const std::map<std::string, std::string> words = {{"all_online", "all platforms"},
+                                                      {"windows_online", "Windows"},
+                                                      {"macos_online", "macOS"},
+                                                      {"linux_online", "Linux"}};
+    for (const char* scope : {"all", "windows", "macos", "linux"}) {
+        INFO("scope = " << scope);
+        const auto model = model_of(populated_rows(), 50, scope);
+        const auto basis = json::parse(dex_apps_json(model))["population_basis"].get<std::string>();
+        const auto it = words.find(basis);
+        REQUIRE(it != words.end());
+        CHECK(contains(render_dex_apps_fragment(model, 7, scope),
+                       "<b>Population</b> 50 devices online now (" + it->second + ")."));
+    }
 }
 
 TEST_CASE("DEX apps UI: a non-zero figure never prints as zero", "[dex][apps_ui]") {
@@ -1613,6 +1705,7 @@ TEST_CASE("DEX apps UI: agent-reported and customer-authored strings are escaped
     CHECK(contains(page, "&lt;i&gt;"));
     CHECK(contains(page, "&lt;script&gt;&quot;x"));
     CHECK(contains(page, "a&amp;b"));
+    CHECK(contains(page, "<span class=\"nw\">&lt;ts&gt;</span>")); // no 'T': one span around the escaped whole
     // the drill hx-get carries the percent-encoded subject
     CHECK(contains(page, "/fragments/dex/app?name=%3Cscript%3E%22x&window=7d"));
     // an empty subject is words, not a link
@@ -1651,8 +1744,8 @@ TEST_CASE("DEX apps UI: the pre-rendered page stays under its size ceiling", "[d
 
 namespace {
 struct AppsRouteFixture {
-    yuzu::server::test::TestRouteSink sink;
     DexRoutes routes;
+    yuzu::server::test::TestRouteSink sink; // after the route owner: its handlers capture `routes`
     std::vector<std::pair<std::string, std::string>> calls; // (window, scope) the API saw
     DexAppsModel next = populated_model();
 
