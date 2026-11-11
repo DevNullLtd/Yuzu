@@ -318,7 +318,11 @@ public:
     /// the pair's newest retained row (the one before the gap) so a reader can tell the tail
     /// was dropped.
     /// Exact semantics: response_cap_rules.hpp.
-    void store(const StoredResponse& resp);
+    /// Returns false when the frame was not persisted (store not open, a NUL in an identity
+    /// field, or the transaction failed); true otherwise, including a frame the per-pair cap
+    /// refused (a refused terminal frame means the pair already holds a terminal row). Callers
+    /// that do not need the outcome may ignore it.
+    bool store(const StoredResponse& resp);
 
     /// Tri-state outcome of `finalize_terminal_status` so callers can
     /// distinguish "we updated rows in place" from "no matching RUNNING

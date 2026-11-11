@@ -19040,15 +19040,18 @@ private:
                             // Targeted agents that never answered: absent from a set filled at
                             // the timeout, and not counted in agents_failed. Never 0 without
                             // proof that every agent answered.
-                            int64_t targeted = 0, responded = 0;
+                            int64_t targeted = 0, responded = 0, dropped = 0;
                             if (execution_tracker_) {
                                 auto sum = execution_tracker_->get_summary(p.source_execution_id);
                                 targeted = sum.agents_targeted;
                                 responded = sum.agents_responded;
+                                dropped = sum.agents_response_dropped;
                                 terminal = targeted > 0 && responded >= targeted;
                             }
+                            // An agent counted as responded whose answer was not persisted is
+                            // absent from the stored rows the membership is built from: unanswered.
                             int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
-                                targeted, responded, execution_tracker_ != nullptr);
+                                targeted, responded, execution_tracker_ != nullptr, dropped);
                             const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
                             if (!terminal && !timed_out)
                                 continue;

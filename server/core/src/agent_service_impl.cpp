@@ -1671,7 +1671,10 @@ grpc::Status AgentServiceImpl::Subscribe(
             const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
             const std::string sink_error = failure_text_for_sinks(prov.plugin, resp);
 
-            // Store completion response
+            // Store completion response. `response_dropped` records that this terminal answer was
+            // NOT persisted (a failed store or finalize); the tracker keeps it beside the agent's
+            // status so a result-set fill does not count the agent as having answered.
+            bool response_dropped = false;
             if (response_store_) {
                 const std::string& plugin_name = prov.plugin;
                 std::string err_detail;
@@ -1715,11 +1718,13 @@ grpc::Status AgentServiceImpl::Subscribe(
                     sr.plugin = plugin_name;
                     sr.error_detail = err_detail;
                     sr.execution_id = current_exec;
-                    response_store_->store(sr);
+                    response_dropped = !response_store_->store(sr);
+                } else if (finalize_result == FR::Error) {
+                    // Already logged inside the store; do NOT insert (would re-create the
+                    // sentinel). The terminal answer is not durable, so say so.
+                    response_dropped = true;
                 }
                 // FR::Updated → row already updated in place, no insert.
-                // FR::Error → already logged inside the store; do NOT
-                //             insert — would re-create the sentinel.
             }
 
             // A terminal frame that carries output AND the agent-stamped action owes its audit
@@ -1733,7 +1738,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // UAT 2026-05-06 #8: notify the executions tracker on terminal
             // status so the drawer's per-agent KPI flips to its terminal
             // state and the SSE `agent-transition` event fires.
-            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
             std::string status_str =
                 (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
@@ -2061,6 +2066,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
         const std::string sink_error = failure_text_for_sinks(prov.plugin, resp);
 
+        bool response_dropped = false; // see the Subscribe twin
         if (response_store_) {
             const std::string& gw_plugin = prov.plugin;
             std::string err_detail;
@@ -2094,7 +2100,9 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                 sr.plugin = gw_plugin;
                 sr.error_detail = err_detail;
                 sr.execution_id = current_exec;
-                response_store_->store(sr);
+                response_dropped = !response_store_->store(sr);
+            } else if (finalize_result == FR::Error) {
+                response_dropped = true;
             }
             // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
@@ -2104,7 +2112,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         (void)audit_registry_frame(agent_id, resp, prov.plugin);
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
-        notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+        notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
         std::string status_str = (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
         metrics_.counter("yuzu_commands_completed_total", {{"status", status_str}}).increment();
@@ -2243,7 +2251,7 @@ std::string AgentServiceImpl::failure_text_for_sinks(const std::string& plugin,
 void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
                                            const std::string& agent_id,
                                            const pb::CommandResponse& resp,
-                                           const ResponseProvenance& prov) {
+                                           const ResponseProvenance& prov, bool response_dropped) {
     // Atomic snapshot — detached gateway-forward worker threads spawned
     // by ServerImpl::forward_gateway_pending outlive gRPC's Shutdown
     // drain (those threads are *clients* of the gateway, not server-side
@@ -2384,6 +2392,7 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // #4990: shown at the Execution:Read tier (drawer, execution status, event stream and outbox),
     // below the Forensics tier of the plugin's own rows; see failure_text_for_sinks.
     s.error_detail = failure_text_for_sinks(prov.plugin, resp);
+    s.response_dropped = response_dropped;
     switch (resp.status()) {
     case pb::CommandResponse::RUNNING:
         s.status = "running";

@@ -725,8 +725,13 @@ private:
     /// `renew_concurrency_claim_by_command`, keyed on `command_id` alone
     /// (rides the wire response independent of the correlation table). See
     /// those methods' doc comments.
+    ///
+    /// `response_dropped` is true only for a terminal frame whose response row the response store
+    /// did not persist; the tracker records it with the agent's status (same upsert) so the fill of
+    /// a result set can count that agent as unanswered. RUNNING and out-of-band callers omit it.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
-                             const pb::CommandResponse& resp, const ResponseProvenance& prov);
+                             const pb::CommandResponse& resp, const ResponseProvenance& prov,
+                             bool response_dropped = false);
 
     /// #4990: the failure text of a terminal frame in the form the server's own derived sinks may
     /// carry: the execution tracker (and through it the drawer, the event stream and the outbox),

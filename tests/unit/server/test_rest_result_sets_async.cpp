@@ -4878,9 +4878,13 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     const auto src = ss.str();
     CHECK(src.find("result_set_store_->materialize(p.id, members, agents_failed,") !=
           std::string::npos);
-    CHECK(src.find("const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(") !=
+    CHECK(src.find("int64_t agents_unanswered = rs_matcher::unanswered_agent_count(") !=
           std::string::npos);
-    CHECK(src.find("targeted, responded, execution_tracker_ != nullptr);") != std::string::npos);
+    CHECK(src.find("targeted, responded, execution_tracker_ != nullptr, dropped);") !=
+          std::string::npos);
+    CHECK(src.find("dropped = sum.agents_response_dropped;") != std::string::npos);
+    CHECK(src.find("agents_failed += (*parent)->agents_failed;") != std::string::npos);
+    CHECK(src.find("agents_unanswered += (*parent)->agents_unanswered;") != std::string::npos);
     CHECK(src.find("agents_failed = found->agents_failed;") != std::string::npos);
     // The truncated branch: between its `if` and the line that adopts the membership, the set
     // is marked failed and the branch ends in `continue;` with nothing but the closing brace

@@ -504,10 +504,10 @@ void seed_response_facet_metrics(yuzu::MetricsRegistry& m) {
 
 // ── Ingest (fail-soft) ────────────────────────────────────────────────────────
 
-void ResponseStore::store(const StoredResponse& resp) {
+bool ResponseStore::store(const StoredResponse& resp) {
     if (!open_) {
         note_ingest_dropped(metrics_, kReasonStoreNotOpen);
-        return;
+        return false;
     }
 
     // #2691 (UP-5, widened by Gate 8 security-guardian): reject before
@@ -524,7 +524,7 @@ void ResponseStore::store(const StoredResponse& resp) {
                      "instruction_id/execution_id/plugin/agent_id (agent={})",
                      ::yuzu::log_id_token(resp.agent_id));
         note_ingest_dropped(metrics_, kReasonMalformedIdentity);
-        return;
+        return false;
     }
 
     const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -814,7 +814,7 @@ void ResponseStore::store(const StoredResponse& resp) {
                      ::yuzu::log_id_token(resp.instruction_id),
                      ::yuzu::log_id_token(resp.agent_id), pool_.last_error());
         note_ingest_dropped(metrics_, reached_txn ? kReasonQueryError : kReasonPoolTimeout);
-        return;
+        return false;
     }
     if (capped) {
         // The counter is unsampled; only the log line is budgeted (bounded_audit_budget.hpp), so
@@ -830,11 +830,14 @@ void ResponseStore::store(const StoredResponse& resp) {
                          "agent={}; frame dropped",
                          max_rows_per_agent_, ::yuzu::log_id_token(resp.instruction_id),
                          ::yuzu::log_id_token(resp.agent_id));
-        return;
+        // A refused TERMINAL frame means the pair already holds a terminal row (response_cap_rules),
+        // so its answer is durable; a refused RUNNING frame carries no terminal answer.
+        return true;
     }
     note_facets_dropped(metrics_, kFacetDropValueTooLong, facets_too_long);
     note_facets_dropped(metrics_, kFacetDropCap, facets_capped);
     note_facets_dropped(metrics_, kFacetDropBatchFailed, facets_batch_failed);
+    return true;
 }
 
 ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(

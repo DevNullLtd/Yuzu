@@ -21,3 +21,23 @@ New or modified owned resources in `server/core/src/` (`result_set_store.cpp`,
   use depends on completeness.
 - **Release point:** scope exit.
 - **Failure cleanup:** RAII only.
+
+### Persisted column `agent_exec_status.response_dropped`
+- **Site:** migration v10 in `execution_tracker.cpp`, written by `upsert_agent_status_once` in the
+  same transaction and the same statement as the agent's status, before the outbox append (the
+  outbox contract is unchanged: the event payload does not carry it).
+- **Owner type:** the existing `execution_tracker` schema; the column lives and dies with its row.
+- **Release point:** the row's own deletion; a later terminal write for the same agent replaces it.
+- **Transfer:** never. Counted by `ExecutionTracker::get_summary` into
+  `ExecutionSummary::agents_response_dropped` (a read-only count under the existing lease).
+- **Failure cleanup:** a failed upsert rolls back with the status; the migration is a
+  constant-default `ADD COLUMN`.
+
+### Completeness inherited from a parent set
+- **Site:** `CreateRequest::agents_failed` / `agents_unanswered`, set by `inherit_completeness` at
+  the inventory producers and persisted by `insert_row_impl` in the same insert as the row; the
+  asynchronous fill pass in `server.cpp` adds the parent's counters (read through `get`) to its own
+  before `materialize`.
+- **Owner type:** plain integers on a request or local value; no handle.
+- **Release point:** scope exit.
+- **Failure cleanup:** a degraded parent read skips the set for that tick; it retries on the next.

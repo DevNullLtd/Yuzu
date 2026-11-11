@@ -749,3 +749,15 @@ LISTEN/NOTIFY-plus-cursor-poll loop from it.
   not compliance evidence; the reap never touches authoritative state). Metrics:
   `yuzu_exec_outbox_reap_total`, `yuzu_exec_outbox_reap_clock_anomaly_total`,
   `yuzu_exec_outbox_store_degrade_total`.
+
+## Terminal answers the response store did not persist
+
+The tracker counts an agent as responded when its terminal `agent_exec_status` row is written, and
+the response row is a separate write that can fail. `ResponseStore::store` therefore returns whether
+the frame was persisted, and the two terminal ingest sites in `agent_service_impl.cpp` (Subscribe
+and the gateway path) pass a failed store or finalize to `notify_exec_tracker`, which sets
+`AgentExecStatus::response_dropped` in the SAME upsert as the status (migration v10). The flag is
+not part of any event payload, so the outbox contract is unchanged; a later terminal write replaces
+it. `ExecutionTracker::get_summary` reports the count as `agents_response_dropped`, and the
+result-set fill adds it to the unanswered agents, so a set whose member answer was lost is recorded
+as incomplete. A new terminal-ingest site must pass the same fact.

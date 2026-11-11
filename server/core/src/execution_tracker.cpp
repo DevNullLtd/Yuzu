@@ -612,6 +612,14 @@ const std::vector<pg::PgMigration>& migrations() {
         // command outbox compares it against the value stamped on a row at first send to bound a
         // redrive (see command_replay_horizon.hpp). DDL only, no table rewrite, instant.
         {9, "CREATE SEQUENCE IF NOT EXISTS dispatch_seq;"},
+        // v10: whether the agent's terminal answer was persisted by the response store. The
+        // tracker counts an agent as responded once its terminal status row is written, but the
+        // response row is a separate write that can fail; this flag is written in the SAME
+        // upsert as the status, so a result-set fill can tell a counted answer that has no
+        // stored row. Constant default: metadata-only ADD COLUMN, no rewrite.
+        {10,
+         "ALTER TABLE agent_exec_status ADD COLUMN response_dropped BOOLEAN NOT NULL "
+         "DEFAULT false;"},
     };
     return kMigrations;
 }
@@ -1011,6 +1019,16 @@ ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
         s.agents_success = exec->agents_success;
         s.agents_failure = exec->agents_failure;
         s.progress_pct = s.agents_targeted > 0 ? (s.agents_responded * 100 / s.agents_targeted) : 0;
+        // Agents counted as responded whose terminal response was not persisted. A failed count
+        // reads 1 ("not known to be zero"): the caller uses this to refuse a completeness claim.
+        pg::PgResult dropped = pg::exec_params(
+            lease.get(),
+            "SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
+            "WHERE execution_id = $1 AND response_dropped",
+            std::vector<std::string>{id});
+        s.agents_response_dropped = (dropped.status() == PGRES_TUPLES_OK && PQntuples(dropped.get()) == 1)
+                                        ? static_cast<int>(to_i64(col(dropped.get(), 0, 0)))
+                                        : 1;
     }
     return s;
 }
@@ -1311,8 +1329,8 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
             conn,
             "INSERT INTO execution_tracker.agent_exec_status "
             "(execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
-            " exit_code, error_detail, plugin_result_status) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) "
+            " exit_code, error_detail, plugin_result_status, response_dropped) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::boolean) "
             "ON CONFLICT (execution_id, agent_id) DO UPDATE SET "
             // Terminal status is STICKY (CHAOS-TTL-1 keepalive hardening,
             // #3784): a stale 'running' write arriving AFTER a real terminal
@@ -1340,14 +1358,21 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
             "                                ('success','failure','timeout','rejected') "
             "                                AND excluded.status = 'running' "
             "                             THEN agent_exec_status.plugin_result_status "
-            "                             ELSE excluded.plugin_result_status END "
+            "                             ELSE excluded.plugin_result_status END, "
+            // A later terminal write replaces the flag (a redelivered terminal frame whose
+            // response was stored clears it); a stale 'running' write keeps the terminal row's.
+            "  response_dropped=CASE WHEN agent_exec_status.status IN "
+            "                           ('success','failure','timeout','rejected') "
+            "                           AND excluded.status = 'running' "
+            "                        THEN agent_exec_status.response_dropped "
+            "                        ELSE excluded.response_dropped END "
             "RETURNING status, exit_code, completed_at, error_detail, plugin_result_status",
             std::vector<std::string>{
                 execution_id, s.agent_id, s.status,
                 std::to_string(s.dispatched_at > 0 ? s.dispatched_at : now),
                 std::to_string(s.first_response_at > 0 ? s.first_response_at : now),
                 std::to_string(s.completed_at), std::to_string(s.exit_code), s.error_detail,
-                std::to_string(s.plugin_result_status)});
+                std::to_string(s.plugin_result_status), s.response_dropped ? "true" : "false"});
         if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
             return false;
 
