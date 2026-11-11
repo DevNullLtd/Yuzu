@@ -259,11 +259,11 @@ TEST_CASE("expand_ecosystem_tokens: one exact-size allocation",
 
 TEST_CASE("kSoftwareKinds and kSoftwareSources: UI vocabulary tables",
           "[server][software_catalog][ui_vocab]") {
-    SECTION("kinds are exactly app, pkg, package, feat, in order") {
+    SECTION("kinds are exactly app, pkg, package, feat, driver, in order") {
         std::vector<std::string> values;
         for (const auto& k : kSoftwareKinds)
             values.emplace_back(k.value);
-        CHECK(values == std::vector<std::string>{"app", "pkg", "package", "feat"});
+        CHECK(values == std::vector<std::string>{"app", "pkg", "package", "feat", "driver"});
     }
     SECTION("the pkg tooltip names the MSI, snap and flatpak products it covers") {
         const auto it = std::find_if(kSoftwareKinds.begin(), kSoftwareKinds.end(),
@@ -273,7 +273,7 @@ TEST_CASE("kSoftwareKinds and kSoftwareSources: UI vocabulary tables",
         CHECK(it->tooltip.find("snap") != std::string_view::npos);
         CHECK(it->tooltip.find("flatpak") != std::string_view::npos);
     }
-    SECTION("sources are exactly the ten collector sources, in order") {
+    SECTION("sources are exactly the eleven collector sources, in order") {
         std::vector<std::string> values;
         for (const auto& s : kSoftwareSources)
             values.emplace_back(s.value);
@@ -282,6 +282,6 @@ TEST_CASE("kSoftwareKinds and kSoftwareSources: UI vocabulary tables",
                             "pkg_inventory.packages", "pkg_inventory.store_packages",
                             "windows_optional_features.list", "msi_packages.list_inventory",
                             "runtimes.python", "middleware.ibm_mq", "runtimes.dotnet",
-                            "runtimes.jvm"});
+                            "runtimes.jvm", "hardware.drivers_inventory"});
     }
 }

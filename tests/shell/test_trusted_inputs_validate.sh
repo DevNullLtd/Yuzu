@@ -19,6 +19,9 @@
 #   push               -> checkout_ref is a BRANCH REF (attached HEAD, so the
 #                         branch-switch wipe still works), checkout_sha is the
 #                         event commit, base_sha falls back to the event commit
+#   workflow_dispatch  -> (direct; no approved sha) accepted ONLY on dev/main,
+#                         where it behaves like push; any other ref refused
+#                         before anything is pinned
 #   pull_request       -> checkout_ref is the event SHA (immune to GitHub
 #                         re-minting refs/pull/N/merge), and equals checkout_sha
 #                         so `Verify resolved checkout` compares like with like;
@@ -145,6 +148,25 @@ if [[ "$(out_of checkout_ref)" =~ ^[0-9a-fA-F]{40}$ ]]; then
 else
   printf '  [pass] push checkout_ref is not a bare SHA\n'; pass=$((pass+1))
 fi
+
+echo "-- workflow_dispatch (direct): accepted on dev/main only, branch ref like push --"
+# The daily release-legs dispatch targets dev; a by-hand run may target main.
+# Every other ref is refused fail-closed before anything is pinned (defence in
+# depth behind the ` [dispatch]` job-name suffix; docs/ci-architecture.md Tier 2b).
+for ref in refs/heads/dev refs/heads/main; do
+  run_validate workflow_dispatch "$ref" "$SHA_EVENT" "" ""
+  check "dispatch on $ref exits 0"                "0"         "$rc"
+  check "dispatch on $ref pins the branch ref"    "$ref"      "$(out_of checkout_ref)"
+  check "dispatch on $ref pins the event commit"  "$SHA_EVENT" "$(out_of checkout_sha)"
+  check "dispatch on $ref is untrusted execution" "false"     "$(out_of trusted_execution)"
+done
+for ref in refs/heads/feat/x refs/heads/trusted-fork/pr-2832 refs/pull/2832/merge refs/heads/devx refs/tags/v1.0.0; do
+  run_validate workflow_dispatch "$ref" "$SHA_EVENT" "" ""
+  assert_refused "dispatch on $ref refused" "may be dispatched directly only on refs/heads/dev or refs/heads/main"
+done
+# A push on an arbitrary ref is NOT affected by the dispatch guard.
+run_validate push "refs/heads/feat/x" "$SHA_EVENT" "" ""
+check "push on a feature ref still exits 0" "0" "$rc"
 
 echo "-- pull_request: must pin to the event SHA, immune to refs/pull/N/merge re-minting --"
 run_validate pull_request "refs/pull/2832/merge" "$SHA_EVENT" "" "$SHA_BASE"

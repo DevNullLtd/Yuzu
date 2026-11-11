@@ -617,7 +617,7 @@ jobs:
       - name: Assert runner disk (>= 45 GB free)
         run: |
           # This is a THIRD persistent build tree (build-windows-asan/) next
-          # to ci.yml's build-windows-{debug,release}/ on the same shared,
+          # to ci.yml's build-windows-agent-{debug,release}/ on the same shared,
           # persistent, clean:false Wee Tam disk, on top of the shared
           # vcpkg_installed/ and ccache trees — fail fast rather than hitting
           # "no space left on device" 30-80 minutes into a 90-minute run.

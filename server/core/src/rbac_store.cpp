@@ -805,9 +805,8 @@ void RbacStore::seed_defaults() {
         // committing, matching the UP-3 discipline PgPool::run_in_txn enforces
         // centrally for every OTHER write path in this store — a failed
         // statement must not be followed by commit() (PgTxn::commit() on an
-        // aborted transaction still returns PGRES_COMMAND_OK while silently
-        // performing a rollback; calling it unconditionally would have been
-        // correct-by-accident, not by contract).
+        // aborted transaction rolls back and returns false; checking first keeps
+        // the failure attributable to the statement that caused it).
         if (!exec("INSERT INTO rbac_store.role_permissions (role_name, securable_type, "
                   "operation, effect) SELECT $1, $2, $3, 'allow' WHERE NOT EXISTS ("
                   "  SELECT 1 FROM rbac_store.revoked_seed_defaults "

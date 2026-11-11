@@ -108,11 +108,11 @@ The action's response gains four lines per source (so 16 new lines total for the
 
 ```
 config|process_enabled|true
-config|process_live_rows|18402
+config|process_rows|18402
 config|process_oldest_ts|1730000000
 config|process_paused_at|0           # 0 = never; otherwise the ts when last set to false
 config|tcp_enabled|false
-config|tcp_live_rows|4193
+config|tcp_rows|4193
 config|tcp_oldest_ts|1733000000
 config|tcp_paused_at|1735689600
 ...
@@ -487,7 +487,10 @@ Per `docs/observability-conventions.md`:
 > otherwise only ever writes `requested`. The fragment counts an audit-store refusal
 > (the `attempted` row could not be stored, `503`, #3619) as `audit_unavailable`, a
 > value REST never writes; `yuzu_echo_source_reenable_total`
-> uses the same value. `success` and `agent_not_connected` are comparable; nothing else
+> uses the same value. Both surfaces write a dispatch chokepoint denial's own reason
+> token (`forbidden`, `approval_required`, `anonymous_operator`, `kill_switched`,
+> `unclassified`, `ambiguous`; #7114) when the seam refuses the pair before targeting;
+> those six are comparable. `yuzu_echo_scan_dispatched_total` writes the same six tokens when the scan's own dispatch is refused (the scan answers `Not permitted: <token>` and stores no scan state), and the Echo SQL console audits such a refusal as `echo.sql` `result=failure` (#7114). `success` and `agent_not_connected` are comparable; nothing else
 > is, and there is no `surface` label to split them.
 
 > The PR-H viewer ships with **no process-tree metrics yet** (a dashboard read surface); the render-duration histogram + a dispatch counter + a node-count histogram are a tracked SRE follow-up. The seed-age gauge from the original design is removed (there is no seed).

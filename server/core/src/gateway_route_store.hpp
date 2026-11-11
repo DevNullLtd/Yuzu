@@ -568,7 +568,8 @@ struct RouteRow {
     /// stays): the agent registered with the pre-rename plugin name `tar`.
     /// `lookup_route`/`lookup_routes` fill it; it exists so the HA directory dispatch path,
     /// which has no AgentSession, can still write the legacy plugin name on the wire. Written
-    /// only by `register_fresh`.
+    /// by `register_fresh` and refreshed by `set_legacy_echo_wire_name` when a known session
+    /// re-announces.
     bool legacy_echo_wire_name{false};
 };
 
@@ -610,6 +611,17 @@ public:
     [[nodiscard]] std::expected<RegisterFreshResult, GatewayRouteStoreError>
     register_fresh(std::string_view agent_id, std::string_view session_id,
                    bool legacy_echo_wire_name = false);
+
+    /// Echo rename, upgrade window (removed with the other legacy-name shims): re-state the
+    /// `legacy_echo_wire_name` flag for a session that re-announces (ProxyRegister adopting a
+    /// presented session id) instead of registering fresh, so a plugin list that changed under
+    /// the same session cannot leave the directory row rewriting Echo commands to the old name.
+    /// Session-guarded like `announce_connected`: a row now held by a DIFFERENT session is left
+    /// untouched, and `updated_at` (the tombstone purge clock) is not bumped. The returned bool
+    /// is whether a row matched (`agent_id` + `session_id`).
+    [[nodiscard]] std::expected<bool, GatewayRouteStoreError>
+    set_legacy_echo_wire_name(std::string_view agent_id, std::string_view session_id,
+                              bool legacy_echo_wire_name);
 
     /// Record that `session_id`'s connection is fully established on
     /// `cluster_id`/`gateway_node`, with a lease valid for `lease_ttl_secs`.
