@@ -64,6 +64,8 @@
 #include "test_rbac_admin_surface_harness.hpp" // AuditRecord, RbacStoreOnAuthPool, RbacRoleHarness (A1 Step 6.1 extraction)
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
@@ -1747,10 +1749,13 @@ TEST_CASE("MCP unassign_rbac_role C1(c): removing the fleet's real "
 // up an out-of-band/custom role grant) and previously reached a SUCCESSFUL
 // Administrator-revoke audit row completely raw. ───────────────────────────
 
-TEST_CASE("MCP unassign_rbac_role C5: a CRLF/ANSI-escape role is neutralized "
-          "in the audit detail of a successful (idempotent no-op) revoke, "
-          "never embedded raw",
+TEST_CASE("MCP unassign_rbac_role C5: a CRLF/ANSI-escape role is refused as invalid params "
+          "and never reaches an audit row raw",
           "[pg][mcp][rbac][a2]") {
+    // Contract change: this case used to assert that such a role was accepted as an idempotent
+    // no-op and neutralized in the success row's detail. A role carrying a control byte is now
+    // refused as invalid params, so the audit row is a fixed-text denial that carries no part of
+    // the role at all.
     RbacRoleHarness h;
     h.make_caller_admin(/*rbac_on=*/false);
 
@@ -1759,17 +1764,24 @@ TEST_CASE("MCP unassign_rbac_role C5: a CRLF/ANSI-escape role is neutralized "
     auto res = h.mcp_call_tool_approved("unassign_rbac_role",
                                         {{"principal_id", "jane"}, {"role", evil_role}});
     REQUIRE(res);
-    CHECK(res->body.find("\"error\"") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 
     bool found = false;
     for (const auto& a : h.audit_log) {
-        if (a.action != "rbac.role.unassigned" || a.result != "success")
+        CHECK(a.result != "success");
+        if (a.action != "rbac.role.unassigned")
             continue;
         found = true;
-        CHECK(a.detail.find(yuzu::server::audit_token(evil_role)) != std::string::npos);
+        CHECK(a.result == "denied");
+        CHECK(a.detail == "invalid_role_name");
         CHECK(a.detail.find('\r') == std::string::npos);
         CHECK(a.detail.find('\n') == std::string::npos);
         CHECK(a.detail.find('\x1B') == std::string::npos);
+        CHECK(a.target_id.find('\r') == std::string::npos);
+        CHECK(a.target_id.find('\x1B') == std::string::npos);
     }
     CHECK(found);
 }
@@ -2317,4 +2329,284 @@ TEST_CASE("assign_management_group_role's input schema still offers only Operato
     for (const auto& v : schema["properties"]["role_name"]["enum"])
         roles.push_back(v.get<std::string>());
     CHECK(roles == std::vector<std::string>{"Operator", "Viewer"});
+}
+
+// ── Role-name validation on the role-removal surface ────────────────────────
+//
+// The role argument of the role-removal tool is deliberately free text (so it can clean up an
+// out-of-band grant). These cases pin: a role carrying a NUL or other control byte is refused as
+// invalid params, the refusal is audited as denied, the grants are untouched, and the plain
+// spelling behaves as before.
+
+namespace {
+
+const std::string kRoleWithNul("Administrator\0x", 15);
+
+bool holds_role(RbacRoleHarness& h, const std::string& principal, const std::string& role) {
+    for (const auto& pr : h.rbac->get_principal_roles("user", principal))
+        if (pr.role_name == role)
+            return true;
+    return false;
+}
+
+bool any_success_row(const RbacRoleHarness& h) {
+    return std::any_of(h.audit_log.begin(), h.audit_log.end(),
+                       [](const AuditRecord& a) { return a.result == "success"; });
+}
+
+} // namespace
+
+TEST_CASE("MCP unassign_rbac_role: a role with an embedded NUL is refused as invalid params and "
+          "audited as denied",
+          "[pg][mcp][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", "admin", "Administrator"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "otheradmin", "Administrator"}).has_value());
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "admin"}, {"role", kRoleWithNul}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(holds_role(h, "admin", "Administrator"));
+    CHECK(holds_role(h, "otheradmin", "Administrator"));
+
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "rbac.role.unassigned");
+    CHECK(h.audit_log.back().result == "denied");
+    CHECK(h.audit_log.back().target_id == "admin");
+    CHECK(h.audit_log.back().detail == "invalid_role_name");
+    CHECK_FALSE(any_success_row(h));
+}
+
+TEST_CASE("MCP unassign_rbac_role: a role with an embedded NUL is refused and every grant stays",
+          "[pg][mcp][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("soleadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "soleadmin", "Administrator"}).has_value());
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "soleadmin"}, {"role", kRoleWithNul}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(holds_role(h, "soleadmin", "Administrator"));
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().result == "denied");
+    CHECK(h.audit_log.back().detail == "invalid_role_name");
+    CHECK_FALSE(any_success_row(h));
+}
+
+TEST_CASE("MCP unassign_rbac_role: any control byte in the role is refused as invalid params",
+          "[pg][mcp][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", "jane", "Operator"}).has_value());
+
+    const std::string bad = GENERATE(std::string("Operator\x07"), std::string("Operator\x1b[0m"),
+                                     std::string("Operator\n"), std::string("Operator\r\n"),
+                                     std::string("Oper\tator"), std::string("Operator\x7f"),
+                                     std::string("\x01Operator"));
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "jane"}, {"role", bad}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(holds_role(h, "jane", "Operator"));
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().result == "denied");
+    CHECK(h.audit_log.back().detail == "invalid_role_name");
+    CHECK_FALSE(any_success_row(h));
+}
+
+TEST_CASE("MCP unassign_rbac_role: removing the caller's own Administrator grant is still refused",
+          "[pg][mcp][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", "admin", "Administrator"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "otheradmin", "Administrator"}).has_value());
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "admin"}, {"role", "Administrator"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(holds_role(h, "admin", "Administrator"));
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().result == "denied");
+    CHECK(h.audit_log.back().detail == "self_admin_unassign_blocked");
+    CHECK_FALSE(any_success_row(h));
+}
+
+TEST_CASE("MCP unassign_rbac_role: removing the fleet's last Administrator grant is still "
+          "refused",
+          "[pg][mcp][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("soleadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "soleadmin", "Administrator"}).has_value());
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "soleadmin"}, {"role", "Administrator"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(res->body.find("zero administrators") != std::string::npos);
+    CHECK(holds_role(h, "soleadmin", "Administrator"));
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().result == "denied");
+    CHECK_FALSE(any_success_row(h));
+    CHECK(h.metrics.counter("yuzu_server_rbac_last_admin_guard_refused_total",
+                            {{"transport", "mcp"}})
+             .value() == 1);
+}
+
+TEST_CASE("MCP unassign_rbac_role: the audit row names the removed role",
+          "[pg][mcp][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", "jane", "Operator"}).has_value());
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "jane"}, {"role", "Operator"}});
+    REQUIRE(res);
+    CHECK(res->body.find("\"unassigned\":true") != std::string::npos);
+    CHECK_FALSE(holds_role(h, "jane", "Operator"));
+
+    const auto it = std::find_if(h.audit_log.begin(), h.audit_log.end(), [](const AuditRecord& a) {
+        return a.action == "rbac.role.unassigned" && a.result == "success";
+    });
+    REQUIRE(it != h.audit_log.end());
+    CHECK(it->target_id == "jane");
+    CHECK(it->detail == "Operator; removed=true");
+}
+
+TEST_CASE("RbacStore::unassign_role: a role with an embedded NUL or control byte is refused and "
+          "no grant changes",
+          "[pg][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("soleadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "soleadmin", "Administrator"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "jane", "Operator"}).has_value());
+
+    const std::string bad_admin = GENERATE(kRoleWithNul, std::string("Administrator\x01"),
+                                           std::string("Administrator\n"));
+    auto r = h.rbac->unassign_role("user", "soleadmin", bad_admin);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("invalid role name") != std::string::npos);
+    CHECK(holds_role(h, "soleadmin", "Administrator"));
+
+    auto r2 = h.rbac->unassign_role("user", "jane", std::string("Operator\0z", 10));
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(holds_role(h, "jane", "Operator"));
+}
+
+TEST_CASE("MCP unassign_rbac_role: a clean role name that does not exist (spaces, non-ASCII) is an "
+          "idempotent no-op that reports removed=false",
+          "[pg][mcp][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", "jane", "Operator"}).has_value());
+
+    const std::string role = "Nonexistent Role \xC3\xA9";
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "jane"}, {"role", role}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE_FALSE(body.contains("error"));
+    REQUIRE(body.contains("result"));
+    const auto& payload = body["result"]["structuredContent"];
+    CHECK(payload["unassigned"] == true);
+    CHECK(payload["principal_id"] == "jane");
+    CHECK(payload["role"] == role);
+
+    // The unrelated grant is untouched.
+    CHECK(holds_role(h, "jane", "Operator"));
+
+    // The audit detail is the role name as the audit-token mapping renders it (spaces become
+    // underscores, well-formed UTF-8 passes through), followed by the fixed removed flag.
+    const auto it = std::find_if(h.audit_log.begin(), h.audit_log.end(), [](const AuditRecord& a) {
+        return a.action == "rbac.role.unassigned" && a.result == "success";
+    });
+    REQUIRE(it != h.audit_log.end());
+    CHECK(it->target_id == "jane");
+    CHECK(it->detail == "Nonexistent_Role_\xC3\xA9; removed=false");
+}
+
+TEST_CASE("RbacStore::unassign_role: a principal field with an embedded NUL or control byte is "
+          "refused and no grant changes",
+          "[pg][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.auth_db->upsert_user("soleadmin", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "soleadmin", "Administrator"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "jane", "Operator"}).has_value());
+
+    SECTION("a principal id carrying a NUL or control byte") {
+        const std::string bad_id = GENERATE(std::string("jane\0x", 6), std::string("jane\x01"),
+                                            std::string("jane\n"), std::string("jane\x7f"));
+        auto r = h.rbac->unassign_role("user", bad_id, "Operator");
+        REQUIRE_FALSE(r.has_value());
+        CHECK_THAT(r.error(), Catch::Matchers::ContainsSubstring("invalid principal"));
+    }
+
+    SECTION("a principal type carrying a NUL or control byte") {
+        const std::string bad_type = GENERATE(std::string("user\0x", 6), std::string("user\x01"),
+                                              std::string("user\r\n"));
+        auto r = h.rbac->unassign_role(bad_type, "jane", "Operator");
+        REQUIRE_FALSE(r.has_value());
+        CHECK_THAT(r.error(), Catch::Matchers::ContainsSubstring("invalid principal"));
+    }
+
+    SECTION("a role carrying a control byte keeps its own refusal text") {
+        auto r = h.rbac->unassign_role("user", "jane", std::string("Operator\x01"));
+        REQUIRE_FALSE(r.has_value());
+        CHECK_THAT(r.error(), Catch::Matchers::ContainsSubstring("invalid role name"));
+    }
+
+    CHECK(holds_role(h, "jane", "Operator"));
+    CHECK(holds_role(h, "soleadmin", "Administrator"));
+}
+
+TEST_CASE("MCP unassign_rbac_role: a principal_id with a control byte is refused as invalid params "
+          "and the raw value reaches no audit row",
+          "[pg][mcp][rbac][a2][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    REQUIRE(h.rbac->assign_role({"user", "jane", "Operator"}).has_value());
+
+    const std::string bad_id = GENERATE(std::string("jane\0x", 6), std::string("jane\nx"),
+                                        std::string("jane\x1b" "[0m"), std::string("jane\x7f"));
+    // The refusal comes BEFORE the approval gate, so no ticket is minted: a direct call is the
+    // right shape (the ticket-then-recall helper would fail on its first step).
+    auto res = h.mcp_call_tool("unassign_rbac_role",
+                               {{"principal_id", bad_id}, {"role", "Operator"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(holds_role(h, "jane", "Operator"));
+    CHECK_FALSE(any_success_row(h));
+    for (const auto& a : h.audit_log) {
+        CHECK(a.target_id.find(bad_id) == std::string::npos);
+        CHECK(a.detail.find(bad_id) == std::string::npos);
+        CHECK(a.target_id.find('\0') == std::string::npos);
+        CHECK(a.target_id.find('\x1b') == std::string::npos);
+        CHECK(a.detail.find('\x1b') == std::string::npos);
+    }
 }

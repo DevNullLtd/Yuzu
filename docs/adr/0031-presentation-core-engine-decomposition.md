@@ -193,6 +193,11 @@ agent connections; it does not move northbound.
 linkage included — must pass before this leg is committed to. The `#375` history (grpc/protobuf/
 abseil static linkage on Windows MSVC) is the reason this is a gate and not an assumption.
 
+> **Update (2026-11-10): G10 amended by ADR-0035** (`0035-server-is-linux-only-windows-is-agent-only.md`,
+> accepted 2026-11-10, Decision 6). The server role, presentation included, is Linux-only, so the
+> "MSVC static linkage included" clause is void and the Drogon canary is Linux-only. The rest of G10
+> stands.
+
 **Size this honestly: G10 gates the linkage, not the port.** Choosing Drogon avoids a *language*
 port — the C++ stays C++ — but it is still a **framework** port. Every handler registration across
 the 25 `register_routes` families, the `*_ui.cpp` renderers, and the 5k-plus lines of

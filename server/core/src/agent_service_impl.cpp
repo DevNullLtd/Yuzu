@@ -2244,7 +2244,21 @@ std::string AgentServiceImpl::failure_text_for_sinks(const std::string& plugin,
         return {};
     std::string text = resp.error().message();
     if (!forensics_plugins_ || forensics_plugins_->contains(plugin))
-        text = sanitize_forensics_error_detail(text);
+        return sanitize_forensics_error_detail(text);
+    // Every sink of this text (tracker row, outbox, bus, notification, analytics, webhook) binds
+    // or embeds it as text, and a NUL byte cannot be stored in a text column. Replace it with
+    // U+FFFD so the status is always recorded; the rest of the message is kept as sent.
+    if (text.find('\0') != std::string::npos) {
+        std::string cleaned;
+        cleaned.reserve(text.size() + 8);
+        for (const char c : text) {
+            if (c == '\0')
+                cleaned += "\xEF\xBF\xBD";
+            else
+                cleaned += c;
+        }
+        text = std::move(cleaned);
+    }
     return text;
 }
 

@@ -1373,8 +1373,13 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
                 std::to_string(s.first_response_at > 0 ? s.first_response_at : now),
                 std::to_string(s.completed_at), std::to_string(s.exit_code), s.error_detail,
                 std::to_string(s.plugin_result_status), s.response_dropped ? "true" : "false"});
-        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+            // Keep the reason visible: a refused statement is otherwise only a bare `false` here.
+            if (res.status() != PGRES_TUPLES_OK)
+                spdlog::warn("ExecutionTracker: agent status upsert failed: {}",
+                             PQresultErrorMessage(res.get()));
             return false;
+        }
 
         // The ACTUALLY-PERSISTED status (#3784 UP-2): captured unconditionally
         // because the caller uses it to gate concurrency-claim release/renewal,

@@ -53,6 +53,7 @@
 #include "settings_model.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_deployment_store.hpp"
+#include "software_list_model.hpp" // component_row_json: the serialiser the components row schema mirrors
 #include "pg/pg_pool.hpp" // an unparseable-conninfo pool backs the unopened stand-in stores
 #include "test_route_sink.hpp"
 
@@ -525,6 +526,17 @@ TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the au
     const std::string d503 = rsp["503"].value("description", "");
     CHECK(d503.find("pending-approval count unreadable") != std::string::npos);
     CHECK(d503.find("retry_after_ms 5000") != std::string::npos);
+    // The permission-class refusals (#7110, #7114) answer 403, so the 403 text names them and the
+    // 503 text (fleet-state facts) does not.
+    REQUIRE(rsp.contains("403"));
+    const std::string d403 = rsp["403"].value("description", "");
+    CHECK(d403.find("permission_revoked") != std::string::npos);
+    CHECK(d403.find("dispatch_denied") != std::string::npos);
+    // Every chokepoint token the route maps to 403, and the approval-mode arm of permission_revoked.
+    CHECK(d403.find("anonymous_operator") != std::string::npos);
+    CHECK(d403.find("role-gated") != std::string::npos);
+    CHECK(d503.find("permission_revoked") == std::string::npos);
+    CHECK(d503.find("dispatch_denied") == std::string::npos);
     const std::string d500 = rsp["500"].value("description", "");
     CHECK(d500.find("dispatch_unconfigured") != std::string::npos);
     CHECK(d500.find("dispatch_exception") != std::string::npos);
@@ -565,6 +577,11 @@ TEST_CASE("openapi_spec_json(): POST /commands documents the dispatch_exception 
     CHECK(d500.find("lower bound") != std::string::npos);
     CHECK(d500.find("only when the write succeeds") != std::string::npos);
     CHECK(d500.find("cancel_execution") != std::string::npos);
+    // The 403 text names the two post-row refusals the top description states (#7110, #7114).
+    REQUIRE(rsp.contains("403"));
+    const std::string d403 = rsp["403"].value("description", "");
+    CHECK(d403.find("permission_revoked") != std::string::npos);
+    CHECK(d403.find("dispatch_denied") != std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out request and every refusal",
@@ -1105,6 +1122,33 @@ TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are 
     // function the test below exercises on a synthetic template, where the exact bound holds).
     const auto& built = yuzu::server::openapi_spec_with_guides_json();
     CHECK(built.capacity() - built.size() < built.size() / 2);
+}
+
+TEST_CASE("openapi_spec_json(): the components lookup row is typed and its keys are exactly component_row_json's",
+          "[openapi][software]") {
+    const json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/inventory/software/components"));
+    const auto& data = spec["paths"]["/inventory/software/components"]["get"]["responses"]["200"]
+                           ["content"]["application/json"]["schema"]["properties"]["data"];
+    const auto& item = data["properties"]["components"]["items"];
+    REQUIRE(item.contains("properties")); // an untyped {"type":"object"} row would fail here
+    std::set<std::string> documented;
+    for (const auto& [k, v] : item["properties"].items())
+        documented.insert(k);
+    std::set<std::string> required;
+    for (const auto& k : item["required"])
+        required.insert(k.get<std::string>());
+    std::set<std::string> served;
+    for (const auto& [k, v] : yuzu::server::software_list::component_row_json(
+                                  yuzu::server::SoftwareComponentRow{}, {})
+                                  .items())
+        served.insert(k);
+    CHECK(documented == served);
+    CHECK(required == served); // the serialiser emits every key on every row
+    CHECK(item["properties"]["status"]["enum"] == json::array({"current", "unconfirmed", "disabled"}));
+    CHECK(item["properties"]["hostname"]["nullable"] == true);
+    CHECK(item["properties"]["last_seen"]["nullable"] == true);
 }
 
 TEST_CASE("expand_ecosystem_tokens(): the output is allocated once at its final size",
@@ -1880,7 +1924,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"22a3dbe209974a9b\"";
+    static const std::string kOperationIdChecksum = "\"49349789b29c5fda\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));

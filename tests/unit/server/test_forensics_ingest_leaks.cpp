@@ -1370,3 +1370,47 @@ TEST_CASE("the plugins behind the frozen internal-consumer reads are not Forensi
         CHECK_FALSE(set.contains(check.plugin));
     }
 }
+
+// An agent failure text containing an embedded NUL byte must still settle the agent's status row:
+// a NUL cannot be stored in a text column, so the ingest replaces it (U+FFFD) before any sink
+// binds the text, and the rest of the message is kept as sent.
+TEST_CASE("tracker error_detail: a message with an embedded NUL is recorded with the byte replaced",
+          "[pg][server][forensics_tier][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, forensics_leaks_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LiveBusHarness h;
+    h.svc.set_forensics_plugin_set(&test::forensics_plugin_set());
+    ExecutionEventBus exec_bus;
+    yuzu::test::TrackerScope ts{h.svc, pool, &exec_bus};
+
+    const std::string with_nul("before\0after", 12);
+    const auto run = [&](const std::string& command_id, const std::string& message) {
+        const auto exec_id = ts.make_exec();
+        record_for_prefix(h.svc, command_id, exec_id);
+        h.svc.process_gateway_response("agent-1", failure_frame(command_id, message));
+        return exec_id;
+    };
+
+    SECTION("an ordinary plugin: the status row exists, terminal, NUL replaced, text kept") {
+        const auto exec_id = run(std::string{test::kOrdinaryPlugin} + "-0nul1", with_nul);
+        const auto statuses = ts.tracker->get_agent_statuses(exec_id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].status == "failure");
+        CHECK(statuses[0].exit_code == 3);
+        CHECK(statuses[0].error_detail == "before\xEF\xBF\xBD" "after");
+        CHECK(outbox_data(pool, exec_id).find("failure") != std::string::npos);
+    }
+    SECTION("a Forensics plugin: still reduced to the bounded token, status kept") {
+        const auto exec_id = run(std::string{test::kForensicsPlugin} + "-0nul2", with_nul);
+        const auto statuses = ts.tracker->get_agent_statuses(exec_id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].status == "failure");
+        CHECK(statuses[0].error_detail == "forensics_error");
+    }
+    SECTION("control: a clean ordinary message is unchanged") {
+        const auto exec_id = run(std::string{test::kOrdinaryPlugin} + "-0nul3", kFreeText);
+        const auto statuses = ts.tracker->get_agent_statuses(exec_id);
+        REQUIRE(statuses.size() == 1);
+        CHECK(statuses[0].error_detail == kFreeText);
+    }
+}

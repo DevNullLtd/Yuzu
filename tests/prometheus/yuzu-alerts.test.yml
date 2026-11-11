@@ -7610,6 +7610,149 @@ tests:
           - labels: 'ALERTS{alertname="YuzuSoftwareNormalizationFailing", alertstate="firing", instance="s1", severity="warning"}'
             value: 1
 
+  # ── YuzuInventoryComponentRollupStale / YuzuInventoryComponentRollupFailing (SAM-17) ──
+  #
+  # The components rollup rides the catalogue rollup thread: hourly, one outcome increment per
+  # refresh, both outcome series and the stamp seeded at 0 at thread start. The Stale rule is the
+  # CatalogRollupStale shape (7200 s, `> 0` guard), the Failing rule the NormalizationFailing
+  # shape (increase()[3h] >= 2, for 10m); the cases mirror the normalisation group above.
+
+  # Healthy: the stamp tracks wall-clock and no refresh has failed. Both rules stay quiet.
+  - interval: 1m
+    name: components rollup - a healthy hourly refresh is quiet
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0+60x240"
+      - series: 'yuzu_inventory_component_rollup_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuInventoryComponentRollup.*", alertstate="firing"}'
+        eval_time: 3h50m
+        exp_samples: []
+
+  # Stale: s2's stamp tracks wall-clock for 60m then freezes at 3600; quiet under two cadences,
+  # firing after the age passes 7200 s plus the 10m hold. s1 sits at the seeded 0 forever
+  # (building, or never succeeded): the `> 0` guard keeps the Stale rule quiet. RED against
+  # dropping the guard.
+  - interval: 1m
+    name: components rollup - stale fires after two cadences and not while building
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_last_success_timestamp{job="yuzu",instance="s1"}'
+        values: "0x300"
+      - series: 'yuzu_inventory_component_rollup_last_success_timestamp{job="yuzu",instance="s2"}'
+        values: "0+60x60 3600x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupStale", alertstate="firing", instance="s1"}'
+        eval_time: 4h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupStale", alertstate="firing", instance="s2"}'
+        eval_time: 2h50m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupStale", alertstate="firing", instance="s2"}'
+        eval_time: 3h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupStale", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+
+  # Failing: two failed hourly refreshes inside one 3h window fire after the hold; the leading
+  # zeros are the thread-start seed.
+  - interval: 1m
+    name: components rollup - two failed hourly refreshes fire
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x60 2x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 2h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # Failing: ONE isolated failure followed by successes never fires.
+  - interval: 1m
+    name: components rollup - one isolated hourly failure stays quiet
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x59 1x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing"}'
+        eval_time: 80m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # Failing, sustained outage at a 61 m period (the real shape of an outage): a [2h] window
+  # holds only ONE increment for two minutes of every period and would reset `for`; [3h]
+  # always holds two, so the alert stays firing from 132 m. Mirrors the normalisation case.
+  - interval: 1m
+    name: components rollup - a sustained outage at a 61 minute period fires continuously
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "0x60 1x60 2x60 3x60 4x60 5x60 6x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 100m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 140m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 182m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 243m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 304m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 330m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # Failing, positive baseline: the counter already sits at 1 (an earlier failure aged out of
+  # the window) and ONE new failure steps it to 2. increase() extrapolates the single increment
+  # to a little above 1; `> 1` would fire, `>= 2` stays quiet.
+  - interval: 1m
+    name: components rollup - one failure after an aged-out earlier failure stays quiet
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "1x59 2x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing"}'
+        eval_time: 80m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # Failing, positive baseline: two failures on top of an aged-out earlier one (1 -> 2 -> 3)
+  # still fire after the hold.
+  - interval: 1m
+    name: components rollup - two failures after an aged-out earlier failure fire
+    input_series:
+      - series: 'yuzu_inventory_component_rollup_total{job="yuzu",instance="s1",outcome="error"}'
+        values: "1x59 2x60 3x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing"}'
+        eval_time: 2h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryComponentRollupFailing", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
   # ── YuzuDedupStoreDegraded (#3663) ───────────────────────────────────────
   #
   # yuzu_fleet_agents_dedup_store_degraded counts agents whose durable command-dedup store never

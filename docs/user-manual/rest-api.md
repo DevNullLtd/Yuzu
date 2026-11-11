@@ -629,7 +629,7 @@ A run reaches agents attached to **this server process** only. `skipped_offline`
 
 #### `POST /api/v1/hardware/{id}/sync`
 
-Requests an on-demand agent sync for one device. **Permission:** `Execution:Execute` scoped to the device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The body, the `202` and the `409` are described in the OpenAPI document. A device id longer than 256 bytes or containing a byte below `0x20` is a `400`, answered before the permission check and with no audit row (the same id rule as `GET /api/v1/hardware/{id}`, including the registration note there). **Audit:** `inventory.sync.request` (see [audit-log.md](audit-log.md)).
+Requests an on-demand agent sync for one device. **Permission:** `Execution:Execute` scoped to the device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The body, the `202` and the `409` are described in the OpenAPI document. A device id longer than 256 bytes or containing a byte below `0x20` is a `400`, answered before the permission check and with no audit row (the same id rule as `GET /api/v1/hardware/{id}`, including the registration note there). **Audit:** `inventory.sync.request` (see [audit-log.md](audit-log.md)). The route decides the per-device `Execution:Execute` permission again after the `requested` row is stored: a permission withdrawn in between answers the permission gate's own `403`, writes `result=failure` with `detail` `permission_revoked` (a row that cannot be stored puts `Sec-Audit-Failed: true` on the `403`, since it is the only record that the sync was not requested of the agent) and dispatches nothing (the sync dispatches as the server's own system caller, so this is the only place the operator's grant is decided after the row). The boundary of the recheck is stated under `POST /api/v1/instructions/{id}/execute` ("Refused after the audit row").
 
 ---
 
@@ -712,6 +712,8 @@ Create a new management group.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:** `400` if the name is empty or already used by another group (`a group with that name already exists`; the MCP tools answer the same conflict as invalid params with no retry hint), or if the parent is missing, would be too deep, or the body is not valid.
 
 ---
 
@@ -909,6 +911,8 @@ Add an agent to a static management group.
 }
 ```
 
+**Errors:** `400` if `agent_id` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.add_member`, `result=denied`, `detail=invalid_agent_id`). `404` if the group does not exist (no audit row, no retry hint). `503` if the store could not apply the add (audited `result=failure`, `detail=store_error`, with a retry hint). `added: true` and the success audit row are only produced after the store reports the add. The MCP twin `add_management_group_member` refuses and answers the same cases (see `mcp.md`).
+
 ---
 
 #### `DELETE /api/v1/management-groups/{id}/members/{agent_id}`
@@ -925,6 +929,8 @@ Remove an agent from a management group.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:** `400` if `agent_id` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.remove_member`, `result=denied`, `detail=invalid_agent_id`); a member whose stored id already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `removed: true` and the success audit row are only produced after the store reports the removal.
 
 ---
 
@@ -1007,6 +1013,8 @@ Assign a role to a principal within this management group. Only the `Operator` a
 }
 ```
 
+**Other errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte (audited `management_group.assign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`), or if any of the three is not valid UTF-8; `400` (no audit row) if `principal_type` is anything other than `user` or `group` (`engine` is refused by the store with its own `400`, since engine principals cannot hold scoped role assignments); once the body is a JSON object whose `principal_type`, `principal_id` and `role_name`, where present, are strings, with `principal_id` and `role_name` present (`400`, no row, otherwise), the permission check comes first, so a caller without rights on the group gets `403` and no `management_group.*` audit row whatever the field values hold (the permission check writes its own `auth.*` denied row); `404` if the group does not exist (no audit row, no retry hint); `503` if the store could not apply the assignment (audited `result=failure`, `detail=store_error`, with a retry hint). `assigned: true` and the success audit row are only produced after the store reports the assignment.
+
 ---
 
 #### `DELETE /api/v1/management-groups/{id}/roles`
@@ -1033,6 +1041,8 @@ Remove a role assignment from this management group.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:** `400` if `role_name`, `principal_id` or `principal_type` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.unassign_role`, `result=denied`, `detail=invalid_role_name`, `invalid_principal_id` or `invalid_principal_type`); a grant whose stored `principal_id` or `role_name` already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `unassigned: true` and the success audit row are only produced after the store reports the removal.
 
 ---
 
@@ -2988,7 +2998,10 @@ a principal).
 }
 ```
 
-**Errors:** `400` — invalid JSON, missing `role`, unknown role name, or the
+**Errors:** `400` — invalid JSON, missing `role`, a `role` containing a NUL,
+other control byte (0x01-0x1F) or DEL (audited `result=denied`,
+`detail=invalid_role_name`, checked before the principal and role are looked
+up), unknown role name, or the
 role is admin/built-in/otherwise rejected by `validate_assignment` (design
 §4.2 — always a `4xx`, never a `500`); `401`/`403` — not authenticated, missing
 `Security:Write`, an engine session, or MFA step-up required/failed; `404` — no active (live,
@@ -3017,7 +3030,9 @@ Unassign a fleet-wide role from an engine principal.
 ```
 
 **Errors:** the call is idempotent: a role that was not held also answers `200`
-(`removed=false` appears only in the audit detail). `401` or `403`: not
+(`removed=false` appears only in the audit detail). `400`: the `{role}` contains a
+NUL, other control byte (0x01-0x1F) or DEL (audited `result=denied`,
+`detail=invalid_role_name`). `401` or `403`: not
 authenticated, missing `Security:Write`, an engine session, or MFA step-up
 required or failed. `503`: the RBAC store is unavailable or the query failed.
 Audited
@@ -3902,7 +3917,9 @@ The request body is required: send `{}` when you have no `agent_ids`, `scope` or
 
 **Order of checks.** The first refusal wins, and nothing before the audit row dispatches, creates an execution row, or queues an approval: the gate, the depth guard (`400` `body_depth`) and JSON parse (`400` `invalid_json`), the definition id (`400` `invalid_definition_id` when the id in the path holds a control character (any byte below `0x20` or equal to `0x7F`, NUL included) or is not valid UTF-8 (for example the overlong `%C0%80` or a lone `%FF`, which the HTTP layer decodes to raw bytes); it is refused before the definition is looked up, with no retry hint: the store binds the id as a C string, so `foo\0xyz` would otherwise resolve the definition `foo` while the audit row recorded a different string, and invalid UTF-8 would otherwise reach Postgres and read as a retryable `503` for an input that can never succeed), the definition lookup (`404` `not_found`; `503` `store_unavailable`, `retry_after_ms: 5000` when the store read fails, or `retry_after_ms: null` with a remediation saying retrying will not help when the store was never wired, a server defect), the dispatch chokepoint's dry run for the definition's `plugin.action` (`403` `forbidden` / `approval_required` / `kill_switched`, `400` `unclassified` / `ambiguous`, `403` `anonymous_operator`), the body shape, the stored `parameter_schema` (`400` `param_schema`; a stored schema that cannot be prepared is `500` `param_schema_invalid`, fail closed), the destructive targeting rules above, the definition's `approval_mode`, the audit row, then dispatch. A required server component that was never wired (`reason` `misconfigured`, `authorizer_unconfigured`, `validators_unconfigured` or `dispatch_unconfigured`) is a `500` with `retry_after_ms: null` and a remediation saying it is a server configuration defect: retrying will not help; an unwired capability classifier is the same kind of defect but answers `503` `classifier_unavailable` (also `retry_after_ms: null`). The definition-id check is specific to the v1 route and the MCP twin; the legacy `POST /api/instructions/{id}/execute` does not apply it.
 
-**`approval_mode`.** `auto` dispatches. `always`, any unrecognised value, and `role-gated` for a caller who is not an effective administrator answer **`202`** and dispatch nothing. `role-gated` lets an administrator (including an active JIT elevation) through. A non-auto definition with no approval manager is `503` `approval_unavailable` with `retry_after_ms: null`: an unwired approval manager is a server defect that does not clear by itself, so the `remediation` says retrying will not help and to report it to the server operator. **Per-principal cap.** A caller who already holds about 25 pending approvals (a per-principal soft bound over unexpired rows of every approval origin; the MCP `execute_instruction_definition` tool and the MCP approval-ticket mint apply the same bound from one shared constant) is refused with **`429`** `approval_cap_reached` before any approval is created; `retry_after_ms` is `null` because only a reviewer handling the pending requests, or their 7-day expiry, frees a slot, so a blind retry loop cannot succeed. If the shared approval queue is full (1000 pending across every principal) the call is refused **`503`** `approval_queue_full` with `retry_after_ms: null` and a `remediation` saying a human reviewer must decide pending approvals: only a reviewer, or the 7-day expiry, frees a slot, so a retry loop cannot succeed. A store fault while creating the approval stays `500` `approval_submit_failed` with `retry_after_ms: 5000`. If the approval store cannot be read to count the caller's pending approvals (a pool timeout or query failure), the call is refused **`503`** `approval_unavailable` with `retry_after_ms: 5000` and no approval is created: the cap fails closed and never treats an unreadable count as zero. The check reads the count and then submits, so concurrent requests from one caller can briefly exceed the bound (the shared 1000-row queue bounds the total on one server replica (submissions are serialised inside a replica, but replicas do not coordinate, so a multi-replica deployment can briefly exceed it)), and the legacy `POST /api/instructions/{id}/execute` does not apply it. Other principals are unaffected by one caller's count, and the refusal is audited (`instruction.execute` `denied`, detail `reason=approval_cap_reached`) and counted on `yuzu_server_approval_submit_refused_total{reason="approval_cap_reached"}`. The `202` ticket cannot be redeemed through the API: it is a request for an operator to review, not a token that releases this call, so re-send the request after the definition is changed or the approval is handled out of band. The pending approval records the definition, the scope expression and the definition's resolved `target_plugin` / `target_action` (for the reviewer's context only), and nothing else: it does NOT approve the `agent_ids` or the `params` of the request that created it, so a reviewer is not approving those, and any future redemption path must bind them (a bound request) before it ships.
+**`approval_mode`.** `auto` dispatches. `always`, any unrecognised value, and `role-gated` for a caller who is not an effective administrator answer **`202`** and dispatch nothing. `role-gated` lets an administrator (including an active JIT elevation) through, and that standing is decided again on the re-derived caller after the audit row and the execution row (**Refused after the audit row**, below): if it lapsed while they were written, the call is refused `403` `permission_revoked` and no approval is queued. A non-auto definition with no approval manager is `503` `approval_unavailable` with `retry_after_ms: null`: an unwired approval manager is a server defect that does not clear by itself, so the `remediation` says retrying will not help and to report it to the server operator. **Per-principal cap.** A caller who already holds about 25 pending approvals (a per-principal soft bound over unexpired rows of every approval origin; the MCP `execute_instruction_definition` tool and the MCP approval-ticket mint apply the same bound from one shared constant) is refused with **`429`** `approval_cap_reached` before any approval is created; `retry_after_ms` is `null` because only a reviewer handling the pending requests, or their 7-day expiry, frees a slot, so a blind retry loop cannot succeed. If the shared approval queue is full (1000 pending across every principal) the call is refused **`503`** `approval_queue_full` with `retry_after_ms: null` and a `remediation` saying a human reviewer must decide pending approvals: only a reviewer, or the 7-day expiry, frees a slot, so a retry loop cannot succeed. A store fault while creating the approval stays `500` `approval_submit_failed` with `retry_after_ms: 5000`. If the approval store cannot be read to count the caller's pending approvals (a pool timeout or query failure), the call is refused **`503`** `approval_unavailable` with `retry_after_ms: 5000` and no approval is created: the cap fails closed and never treats an unreadable count as zero. The check reads the count and then submits, so concurrent requests from one caller can briefly exceed the bound (the shared 1000-row queue bounds the total on one server replica (submissions are serialised inside a replica, but replicas do not coordinate, so a multi-replica deployment can briefly exceed it)), and the legacy `POST /api/instructions/{id}/execute` does not apply it. Other principals are unaffected by one caller's count, and the refusal is audited (`instruction.execute` `denied`, detail `reason=approval_cap_reached`) and counted on `yuzu_server_approval_submit_refused_total{reason="approval_cap_reached"}`. The `202` ticket cannot be redeemed through the API: it is a request for an operator to review, not a token that releases this call, so re-send the request after the definition is changed or the approval is handled out of band. The pending approval records the definition, the scope expression and the definition's resolved `target_plugin` / `target_action` (for the reviewer's context only), and nothing else: it does NOT approve the `agent_ids` or the `params` of the request that created it, so a reviewer is not approving those, and any future redemption path must bind them (a bound request) before it ships.
+
+**Refused after the audit row.** Three refusals can follow the `requested` row, all permanent (`retry_after_ms: null`; retrying will not help until the cause changes, which for a `gate=exception` row, a store fault inside the recheck, is when the store recovers), and all leave a `failure` row (`denied` on the legacy `POST /api/instructions/{id}/execute`, which also makes no same-principal check: it re-decides its route gate and the definition's approval mode on the caller it derives): `permission_revoked` when the caller's `Execution:Execute` permission was withdrawn after the route's first decision, when the credentials resolve again to a different principal, when the recheck itself threw (a store fault, refused like a withdrawn permission; the `failure` row adds `gate=exception`), or when the administrator standing a `role-gated` definition took at the first decision has lapsed (the re-derived caller is not an effective administrator: the `failure` row carries `gate=approval_mode mode=role-gated`, and no approval is queued, because the rows already exist); the dispatch dry run repeated after the writes refusing the definition's `plugin.action` for the re-derived caller, answered with `error.reason` set to the dry run's own token (`approval_required`, `forbidden`, `kill_switched`, `anonymous_operator` as `403`; `unclassified`, `ambiguous` as `400`) and a `failure` row `reason=<token>`; and `dispatch_denied` when the dispatch chokepoint itself refuses the command at send time, answered as a zero-reach `403` with `error.reason` `dispatch_denied` instead of the `503` `no_agents_reached` an unreachable fleet gets. `POST /api/v1/commands` reports the same post-write dry-run refusal as `403` `permission_revoked` (its `failure` row carries `gate=dispatch dispatch_reason=<token>`); the instruction twins report the dry run's own token. For `permission_revoked` the route decides its own permission again and re-derives the caller (the same principal is required) after its last own write (the `requested` row, then the execution row it creates) and before the dispatch is built: a refusal sends nothing, writes the `failure` row (its `detail` names the execution) and attempts to cancel the execution row it had created; a cancel that fails is logged and counted on `yuzu_exec_tracker_bookkeeping_failed_total{op="mark_cancelled"}`, and the row stays `running` until the stuck-execution reaper closes it (the failure row's `execution_id=` names it). **Boundary of the recheck:** the dispatch chokepoint authorizes the command and then writes its own dispatch-provenance record before the send; that one write is not decided again, so a permission withdrawn inside it is not caught here. It is a known limit of the dispatch chokepoint and is not re-decided by these routes. The definition is likewise the one read at entry: a definition edited inside the window is dispatched as it was read. The same boundary applies to every post-row recheck in this manual (`POST /api/v1/commands`, `POST /api/v1/echo/retention-paused/purge`, `POST /api/v1/dex/devices/{id}/live`, the legacy `POST /api/instructions/{id}/execute` and the MCP twin); `POST /api/v1/hardware/{id}/sync` dispatches as the server's own caller, so its recheck repeats only its per-device gate and the chokepoint's write is not on the operator's path at all. **Not decided again after their writes:** `POST /api/command` and MCP `execute_instruction` (one permission decision, before their writes), the fleet-wide hardware sync (a server-run job) and each step of a workflow run (run as the caller admitted at entry; the per-step pre-send check is the chokepoint's own). On `POST /api/v1/echo/retention-paused/purge`, `POST /api/v1/dex/devices/{id}/live` and `POST /api/v1/hardware/{id}/sync` the recheck has no catch: a store fault inside it answers a generic `500` and leaves the `requested` row with no outcome row (the dashboard's Echo re-enable and purge arms share that shape); on `POST /api/v1/commands`, the instruction-execute twins and the legacy `POST /api/instructions/{id}/execute` the same fault is refused as `permission_revoked` (`gate=exception` on the row).
 
 **Audit.** Action `instruction.execute`, target `instruction`/`{id}`. The `requested` row is written **before** dispatch, and it is the only row guaranteed to exist before the effect. Every row this route writes ends with `correlation_id=<id>`, the value of the response's `X-Correlation-Id` header and of the error body's `correlation_id`, so a `requested` row with no outcome row pairs with the error the caller saw (the legacy route's rows carry no such token). Refusals that come earlier than `requested` write a `denied` row too: the body depth guard (`body_depth`), JSON parse (`invalid_json`), a definition id with a control byte (below `0x20` or `0x7F`) or invalid UTF-8 (`invalid_definition_id`, detail `reason=invalid_definition_id definition=<cleaned id>`), an unknown definition (`not_found`) and every refusal the dispatch dry run and the validation steps make (`failure` for a stored schema that cannot be used or an approval that could not be queued), and `pending` marks a `202`. For an id refused as malformed (a control byte or invalid UTF-8), or one holding a C1 control, U+2028 or U+2029 (valid, so looked up as usual), `target_id` and the `definition=` token carry the same FOLDED string (each unsafe byte of a malformed id, and each C1 control, U+2028 or U+2029 code point, becomes one `_`; space, `=` and `,` also become `_`, and only an ordinary unfolded id keeps them). The fold is lossy: a malformed id's row carries `reason=invalid_definition_id`, but a VALID id holding a C1 control, U+2028 or U+2029 follows the normal path, so its `target_id`, `definition=` and `reason` (for example `not_found`) are identical to those of the legitimate name it folds to and no field separates them; a pre-core refusal (`invalid_json`, `body_depth`) of any such id likewise cannot be told by `target_id` from a refusal of that name. A `denied` row that cannot be stored sets `Sec-Audit-Failed: true` on the refusal, which stays as it was. These refusals write **no** `instruction.execute` row: the permission gate (its own denials are `auth.permission_required` rows), a definition-store fault, and a server that is missing a required component of the definition lookup, authorizer, validator cache, classifier or dispatch. A definition that needs approval is different when the approval manager or the pending-approval counter is not wired, or the caller's pending count cannot be read: that writes a `failure` row with `reason=approval_unavailable` before the `503`, and a caller at the per-principal bound or a full approval queue leaves a `denied` row (`approval_cap_reached`, `approval_queue_full`). After the dispatch comes `success` or `failure`. If the `requested` row cannot be stored the call is `503` `audit_unavailable` with `Sec-Audit-Failed: true` and **nothing is dispatched**. A server with no audit sink wired answers the same `503` `audit_unavailable` (with `retry_after_ms: null`, a configuration defect) right after the permission check. A later best-effort row that fails to store sets `Sec-Audit-Failed: true` on the response; the command already ran.
 
@@ -3938,7 +3955,7 @@ The request body is required: send `{}` when you have no `agent_ids`, `scope` or
 }
 ```
 
-**Zero agents reached** is an error, discriminated by `error.reason`: `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os` and `no_agents_reached` are `503`. `retry_after_ms` is `5000` for `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
+**Zero agents reached** is an error, discriminated by `error.reason`: `dispatch_denied` is `403` (the dispatch chokepoint refused the command for the caller at send time); `invalid_scope` is `400`; `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `quarantined`, `plugin_not_found`, `kill_switched_os` and `no_agents_reached` are `503`. `retry_after_ms` is `5000` for `containment_unreadable`, `route_unreadable`, `os_gate_unreadable` and `no_agents_reached`, and `null` for the permanent causes (`dispatch_denied`, `invalid_scope`, `quarantined`, `plugin_not_found`, `kill_switched_os`), where retrying the same request cannot succeed. The error object also carries `command_id`, `execution_id` (the cancelled execution row) and the counts `agents_quarantined`, `agents_unknown_plugin`, `agents_kill_switched_os`. `no_agents_reached` includes the case where a per-device claim excluded every target.
 
 Other errors use the A4 envelope with a `reason`: `500` `dispatch_exception` (the dispatch threw; a `failure` audit row with `reason=dispatch_exception` is written). The execution row is **not** cancelled: whether any agent already received the command is unknown, so the row is left `running` and results from any agent that did receive it are still recorded against it. The error carries two typed fields, so nothing has to be parsed out of the remediation text: `error.execution_id` (always present for this refusal; an empty string when no execution row exists) and `error.agents_sent` (present only when the send path had accepted the command for at least one agent before the failure; a lower bound, because a send in flight when the dispatch threw is not counted; a gateway-routed agent counts once its command is queued for forwarding, which can still fail). The `failure` audit row carries `agents_sent=<n>` (before `correlation_id=`) whenever at least one send was accepted by the send path, whether or not the count could be stored, and it is written before the count is stored. The remediation depends on what happened:
 
@@ -6703,6 +6720,8 @@ Trigger a directory sync. Requires `Directory:Write`. Also available from **Sett
 
 **Response (200):** `{"status": "completed", "provider": "entra", "user_count": <n>, "group_count": <n>}`
 
+`user_count` and `group_count` are the users and groups this sync stored (the same numbers as `applied_users` and `applied_groups` in the audit detail), not a second read of the status row. A record with a NUL byte in a key field is skipped and a NUL in a display field is replaced, so the counts can be lower than the tenant's; the skipped count is in the audit detail and in the status row's `last_error` note (`<n> record(s) skipped, <m> field(s) sanitized (embedded NUL)`) on a `completed` status.
+
 **Response (409, ADR-1007):** `{"error": "sync already in progress"}` — `sync_entra` holds a single in-process re-entrancy guard for the duration of one sync call; a second `POST` that arrives while a sync is already running is rejected immediately rather than racing it. See "Diagnosing a stuck directory sync" in `docs/user-manual/server-admin.md` for how long a legitimate sync can hold the guard and what a stuck one looks like. Not queued or retried automatically — the caller decides when to retry.
 
 **Response (400):** malformed body, or a missing required Entra field.
@@ -6711,7 +6730,7 @@ Trigger a directory sync. Requires `Directory:Write`. Also available from **Sett
 
 **Response (503):** `directory_sync` is unavailable (store not open), or the `result=attempted` audit row written before the sync could not be persisted (`Sec-Audit-Failed: true`; no upstream call is made).
 
-**Response (500):** a genuine sync failure (e.g. Graph API error) — the error message is passed through from `sync_entra`'s result.
+**Response (500):** a genuine sync failure (e.g. Graph API error) — the error message is passed through from `sync_entra`'s result. A snapshot in which every user record, or every group record, would be skipped is refused the same way (`refusing to apply a snapshot in which every user record was skipped`, or `... every group record ...`); the stored roster is left unchanged and the status row reads `failed` with that text.
 
 #### `GET /api/directory/users`
 
@@ -6723,7 +6742,7 @@ List directory-synced users from the last successful sync. Requires `Directory:R
 
 #### `GET /api/directory/status`
 
-Sync status plus the last-synced group list (there is no separate `GET /api/directory/groups` route — groups are embedded here). Requires `Directory:Read`.
+Sync status plus the last-synced group list (there is no separate `GET /api/directory/groups` route — groups are embedded here). Requires `Directory:Read`. On a `completed` status a non-empty `last_error` is a count note (`<n> record(s) skipped, <m> field(s) sanitized (embedded NUL)`), not a failure.
 
 **Response (200):** `{"provider","status","last_sync_at","user_count","group_count","last_error","groups":[{"id","display_name","description","mapped_role","synced_at"}]}`
 
@@ -6777,7 +6796,7 @@ Every call is audited (`directory.users.view`) — this closes a real pre-existi
 
 #### `GET /api/v1/directory/status`
 
-REST v1 twin of `GET /api/directory/status` above (#4031), with a real MCP twin (`get_directory_status`). No per-person PII (counts + synced-group metadata only) — unaudited, matching the legacy route's own posture.
+REST v1 twin of `GET /api/directory/status` above (#4031), with a real MCP twin (`get_directory_status`). No per-person PII (counts + synced-group metadata only) — unaudited, matching the legacy route's own posture. As on the legacy route, a non-empty `last_error` on a `completed` status is a count note, not a failure.
 
 **Permission:** `Directory:Read`
 
@@ -7368,6 +7387,8 @@ rule classifies a repeat of the key, so the replay says `completed` for a retrie
 
 **Nothing reached `503`:** if the run started but no step reached any agent, the answer is `503`
 with `error.reason` and `error.execution_id` (the run exists and is readable). The reasons are
+`dispatch_denied` (the dispatch chokepoint refused a step for the caller at send time: the pre-send
+check passed, so the caller's grant or the action's gate moved between the two),
 `containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached` (offline
 devices, or a per-device concurrency claim), `quarantined`, `plugin_not_found`, `kill_switched_os`,
 `late_denied`, `deadline_exceeded` (the 60 second run budget ended the run before any step reached
@@ -7382,7 +7403,7 @@ start another under a new key.
 
 *Without a key* nothing was sent, so a retry is safe for the causes that carry `retry_after_ms: 5000`
 (`containment_unreadable`, `route_unreadable`, `os_gate_unreadable`, `no_agents_reached`);
-`quarantined`, `plugin_not_found`, `kill_switched_os`, `late_denied`, `deadline_exceeded` and
+`dispatch_denied`, `quarantined`, `plugin_not_found`, `kill_switched_os`, `late_denied`, `deadline_exceeded` and
 `run_failed` are permanent (`retry_after_ms: null`). Send a key anyway: it is what makes a lost
 answer safe to ask about.
 
@@ -8466,6 +8487,8 @@ surfaces, not reads. `from-echo-query` runs SQL on Echo agents; `from-instructio
 runs an `InstructionDefinition` and filters responders by `matcher`; `{id}/re-eval`
 re-runs a set's own source query and creates a **sibling** (same parent, new id).
 
+A NUL byte in the `name`, in the `sql` of `from-echo-query`, in an instruction parameter (name or value) of `from-instruction-result`, or in `parent_id` is refused with `400` (`RESULT_SET_BAD_REQUEST`) before an execution row is written or anything is dispatched, so a command is never run and then reported as failed because the result-set row could not be stored. The refusal is audited as `result_set.create` with `result=denied` and `reason=field_contains_nul`. The MCP twins refuse it as invalid params (-32602) with the same audit row.
+
 **Permission:** `Execution:Execute`, **confined per device**
 
 > **Per-device confinement (#1788).** These routes admit on a global
@@ -8523,6 +8546,7 @@ re-eval, unchanged.
 |---|---|
 | 409 | `RESULT_SET_NOT_READY` — `parent_id` names a set that is still `pending` or has `failed`; wait until it is `materialized`. A materialized parent that is incomplete is accepted and the new set inherits its `agents_failed` and `agents_unanswered` |
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
+| 400 | `RESULT_SET_BAD_REQUEST`: a NUL byte in the `name`, in the `sql` of `from-echo-query`, in an instruction parameter (name or value), or in `parent_id`; nothing is dispatched and the refusal is audited `result_set.create\|denied`, `reason=field_contains_nul`. On `re-eval`, a NUL in the stored `sql` or parameters is refused the same way |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 400 | `RESULT_SET_REEVAL_STALE_SOURCE` — on `from-echo-query`, the `sql` reads a raw capture table (a `$<Source>_Live` name or a `<source>_live` table); on `from-instruction-result`, an `echo.sql` definition's SQL does (the `params.sql` value, else the definition's declared default: the text the dashboard submits for a canned query; a default is never injected at dispatch, so a dispatch without `sql` is answered with an error by the agent and counted in `agents_failed`); on `re-eval`, the stored SQL does (for an `instruction_result` set, the stored `sql` param, else that same declared default). Echo keeps roll-up tiers only, so such a query answers with no rows and the set would be silently empty. Nothing is dispatched; query the hourly roll-up instead (for example `$Process_Hourly`). A match inside a comment, or inside a longer string literal (`'see process_live'`), is not a reference; a single-quoted token that is exactly a raw table name (`'process_live'`, `'$Process_Live'`) is one wherever it stands, because SQLite reads such a token as the table after `FROM`, `JOIN`, `IN` and in other positions, so `FROM 'process_live'` and `x IN 'process_live'` are refused, and so is a string literal equal to a raw table name (`WHERE name = 'process_live'`), the price of a rule that does not depend on position. This is a behaviour change for a stale client that stored a set over a `$<Source>_Live` name |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `re-eval` only, the original's live parent set was deleted and its persisted `scope_input_id` shows it was narrowed at creation (#4306) — audited `result_set.create\|denied`, `reason=parent_gone` |
@@ -8679,6 +8703,9 @@ Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareIn
 | `name` | string | No | Exact software-name filter |
 | `agent_id` | string | No | Exact agent filter |
 | `version` | string | No | Exact version filter. A **present-empty** value (`?version=`) selects only the rows with an empty version; omit the parameter for any version |
+| `match` | `exact` \| `prefix` \| `contains` | No | How `name` matches (default `exact`). `prefix` is a case-sensitive literal prefix, `contains` a case-insensitive literal substring (`%` and `_` are not wildcards). Both need `name` |
+| `version_min` / `version_max` | string | No | Inclusive version bounds under the catalogue comparator (`1.10` is above `1.9`; `2.0` is above `2.0-rc1`). Need `name` with `match=exact`; not combined with `version` |
+| `status` | `current` \| `unconfirmed` \| `disabled` | No | Row status filter. **Never applied by default**: unconfirmed rows are returned unless you ask otherwise |
 | `q` | string | No | Case-insensitive literal substring over name, publisher, ecosystem and source (`%`/`_` are not wildcards; clamped to 128 bytes) |
 | `kind` / `ecosystem` | string | No | Exact filters; an empty value means no filter |
 | `source` | string | No | Exact source filter. `source` is an **open set** (`<plugin>.<action>`), never an enum |
@@ -8686,7 +8713,7 @@ Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareIn
 | `cursor` | string | No | Opaque `next_cursor` from the previous page (see below) |
 | `format` | `json` \| `csv` | No | Selects **export mode**: a single response of up to 10000 rows |
 
-`q`, `kind`, `ecosystem` and `source` are **REST-only** on this route: its MCP twin `query_installed_software` takes `name`, `agent_id`, `version`, `limit` and `cursor` only (see [mcp.md](mcp.md)).
+`q`, `kind`, `ecosystem`, `source`, `match`, `version_min`, `version_max` and `status`, and every lookup field and the `totals` block below, are **REST-only** on this route until its MCP twin catches up: its MCP twin `query_installed_software` takes `name`, `agent_id`, `version`, `limit` and `cursor` only (see [mcp.md](mcp.md)).
 
 Omit `name` and `agent_id` for a fleet-wide scan. A parameter that is not valid UTF-8 or contains a NUL byte, an `agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, a `name`/`version` over 1024 bytes, a non-integer `limit`, an unknown `format` or a refused `cursor` is a `400` (never a retryable `503`). An unknown `kind` or `ecosystem` value is not refused: it matches nothing and returns an empty `200` (the OpenAPI enum is descriptive, not enforced).
 
@@ -8699,32 +8726,65 @@ Omit `name` and `agent_id` for a fleet-wide scan. A parameter that is not valid 
       {"agent_id": "agent-001", "name": "bash", "version": "5.2.21", "publisher": "Fedora Project",
        "install_date": "2026-01-15", "kind": "package", "ecosystem": "rpm", "epoch": "0",
        "release": "3.fc40", "arch": "x86_64", "signature_status": "signed",
-       "distro_id": "fedora", "distro_version": "40", "source": "pkg_inventory.packages"},
-      {"agent_id": "agent-002", "name": "Google Chrome", "version": "124.0", "publisher": "Google LLC",
-       "install_date": "2026-01-15", "kind": "app", "ecosystem": "windows", "epoch": "",
-       "release": "", "arch": "", "signature_status": "", "distro_id": "", "distro_version": "",
-       "source": "installed_apps.list_inventory"}
+       "distro_id": "fedora", "distro_version": "40", "source": "pkg_inventory.packages",
+       "hostname": "build-01", "last_seen": 1767225600, "status": "current",
+       "last_confirmed_at": 1767225600, "install_type": "package", "install_scope": "machine",
+       "install_location": "", "instance_key": "3f1c9a0e5b7d2c48a1e6f0d9b4c7a2e5d8f1b3c6a9e2d5f8b1c4e7a0d3f6b9c2"},
+      {"agent_id": "agent-002", "name": "bash", "version": "5.2.26", "publisher": "via:brew",
+       "install_date": "2026-01-15", "kind": "package", "ecosystem": "brew", "epoch": "",
+       "release": "", "arch": "arm64", "signature_status": "", "distro_id": "", "distro_version": "",
+       "source": "pkg_inventory.packages",
+       "hostname": null, "last_seen": 1767139200, "status": "unconfirmed",
+       "last_confirmed_at": null, "install_type": "package", "install_scope": "machine",
+       "install_location": "/opt/homebrew/Cellar/bash/5.2.26", "instance_key": "9b2e4d7a1c6f3e8b5a0d2c7f4e1b8a3d6c9f2e5b8a1d4c7f0e3b6a9d2c5f8e1b"}
     ],
     "count": 2,
     "next_cursor": "d2:0f3a9c1d5b7e2a64:MzpnaXQfOTphZ2VudC0wMDIfMTo1HzE6MB8",
     "devices_omitted": 0,
+    "totals": {"installs": 1240, "devices": 1198, "as_of": 1767222000},
     "result_truncated_by_cap": true
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
+(An exact-name lookup by an unfiltered caller, so `totals` is served from the hourly rollup; `as_of` is that refresh's epoch. A confined caller gets the same rows with `"totals": null, "totals_omitted": "scope"`. The second row's device has a blank roster hostname, so `hostname` is `null`, and its facet has never confirmed the row, so `status` is `unconfirmed`.)
+
 Every row carries the **blob-v2 package fields** (`kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`) alongside the original four. A field the source ecosystem does not store is `""` — **never synthesised** (a Windows/macOS app row is honestly empty on every NEVRA/signature/distro field, as in the second example above). These 8 keys are **always present in every row** (never absent) — integration code should test for an empty-string value, not key absence. See `docs/user-manual/inventory.md` for the full per-ecosystem availability matrix.
 
-Every row carries `source` — the `<plugin>.<action>` that produced it (an **open set**; `""` for rows ingested before the field existed). Rows therefore have **14 fields**.
+Every row carries `source` — the `<plugin>.<action>` that produced it (an **open set**; `""` for rows ingested before the field existed). The original row has **14 fields** (the lookup fields below make 22).
 
 `publisher` is an unverified attribution and is never empty: the declared vendor, else the origin label `via:<ecosystem>` (for example `via:snap`) when the source declares none.
 
+**Lookup fields.** Each row also carries eight fields that answer "which devices, polled when, in what state":
+
+| Field | Meaning |
+|---|---|
+| `hostname` | The hostname from the device table's roster (the same 30-day roster the dashboard's Software devices table reads, so an offline device keeps its name), or `null` when the roster does not know the device or its roster row has no hostname recorded (a blank name reads as unknown, as on the dashboard). One roster read per page, capped at the 100,000 most recently seen devices: on a fleet past that cap the older devices read `null` (at the 2M-endpoint target that is about 95% of the fleet, so there `agent_id` is the device key to join on, not `hostname`), and a failed roster read also yields `null` on a `200` (the row's other fields are authoritative; `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}` counts the failure). `null` therefore means "no hostname available", not "no such device" |
+| `last_seen` | Epoch seconds of the device's last accepted installed-software report (the last poll), or `null` if it never synced |
+| `status` | `current` when the row's collection facet last reported a `full` or `delta` section; `disabled` when that facet is switched off; `unconfirmed` for anything else, including a device with no facet record (for example one still reporting the older blob format). **An `unconfirmed` row may be stale or missing: it is never proof of absence** |
+| `last_confirmed_at` | Epoch seconds the facet last confirmed a `full` or `delta` section, or `null` if never |
+| `install_type`, `install_scope`, `install_location`, `instance_key` | The server-derived install classification, the scope (`machine`), the install path and the row's stable identity hash. `install_location` is stored as the agent sent it and served to every `Inventory:Read` holder admitted by the gate (a confined caller sees only its own rows' paths). The control is on the agent: its blob-v3 installed-software writer keeps a location only under a machine-scope root and blanks every other path before it is sent (ADR-0016 §8, the 2026-11-09 update), so a per-user path can appear here only from an agent that does not apply that rule. A component's `path` and `anchor_app` on the components route carry no such allowlist yet (no agent reports components until the component producer ships, which must apply it) |
+
+Rows therefore have **22 fields**; the original 14 are unchanged. `format=csv` carries the same 22 columns (`hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,instance_key` after the original header), so an external consumer that pinned 14 columns must read by header name.
+
+**Version ranges.** `version_min` and `version_max` are resolved against the title's distinct versions **within the caller's scope** under the catalogue's transitive comparator, for **every** caller (an unfiltered caller resolves against the whole fleet; a confined caller against its own devices only); the resolved set is a query predicate only and never appears in a response. The versions are read **live** from the installed-software table (not from the hourly catalogue), so a version first reported since the last refresh is inside the range, and a range works before the first catalogue refresh. A title with 2000 or more distinct versions in that scope cannot be resolved and answers `400` (`version range not resolvable for this title; use version=`); because the read is scoped, a confined caller is answered for a title with 2000 versions outside its scope exactly as for an unknown title (an empty `200`), so the refusal never tells it anything about devices it cannot see. A degraded version read is a `503` with `retry_after_ms`.
+
+**Totals.** The response carries a `totals` block, `{installs, devices, as_of}`, **only** when the caller has unfiltered (global) access **and** the request is `name` with `match=exact`, optionally with one version filter (`version`, or `version_min`/`version_max`). `installs` counts install **rows** (a device with two architectures counts twice; unlike the catalogue routes' and `query_software_catalogue`'s `installs`, which count distinct devices, so the two can differ for one title and both are exact), `devices` counts **distinct devices**, and `as_of` is the catalogue refresh epoch the figure was read from, or `null` when it was computed live (any version filter). Both figures are exact: a device on two versions inside a range counts once in `devices`. A title first reported after the last hourly refresh reads `installs: 0, devices: 0` with that refresh's `as_of` until the next refresh, even though the rows on the page are live; a version filter reads live and is not affected. A live figure runs under a 5-second statement bound: on a title with millions of install rows (about 5M) it times out every time, so that `503` is deterministic and retrying does not clear it; page or export the rows instead. The live reads have no in-flight bound of their own, so sustained version-filtered lookups on such a title (about 3 requests per second of 5-second reads) can occupy the whole database connection pool; this ceiling is recorded, not measured (ADR-0016, "Recorded limits of the lookup surface"). In every other case `totals` is `null` and `totals_omitted` says why:
+
+| `totals_omitted` | Meaning |
+|---|---|
+| `scope` | The caller is confined to management groups or a service tag. A fleet total cannot be confined (ADR-0017), so a confined caller gets **rows but no total**. `null` here means *not shown*, **never zero** |
+| `filters` | The request is not a plain exact-name lookup (`agent_id`, `q`, `status`, `kind`, `ecosystem`, `source`, or a `prefix`/`contains` match) |
+| `building` | The rollup the figure comes from has never been computed since the schema was created or upgraded: its freshness stamp is persisted, so a fresh deployment reads `building` until the rollup thread's first refresh completes (one runs at server start, then hourly), a restart after a completed refresh does not return to `building`, and a refresh that fails after a success keeps the last-good figures with an aging `as_of` instead. Only a lookup with no version filter reads the rollup; rows, exports and any version-filtered lookup are live and unaffected. On a fleet above the catalogue ceiling (about 6,000 endpoints at about 450 install rows each, about 4,700 for Windows endpoints that also report MSI products; read either figure as plus or minus 40%, see [inventory.md](inventory.md) "Scale ceiling") the first refresh never completes and this value is permanent until the rollup is made incremental, so do not loop on it; add a version filter (for example `version_min=0`) to get a live figure there. There is no manual refresh trigger: a restart runs one at once |
+
+A degraded totals read is a `503` with `retry_after_ms`, never a `null` a client could read as zero. CSV exports carry no totals.
+
 **Pagination (keyset).** `next_cursor` is non-null when more rows may exist (`result_truncated_by_cap: true` is set at the same moment — also in export mode); pass it back as `cursor` to continue. The cursor is **opaque** — never parse it. It is bound to the filter set: a malformed cursor, or one issued for a different filter set, is a `400` (`invalid cursor` / `cursor was issued for a different filter set`), never a silent restart. Under push-down the cursor is the last row of the page. When the page was post-filtered (below), a page can be short or empty while `next_cursor` is non-null — keep paging until `next_cursor` is `null`; that cursor never names a row you were not served (see the Scope paragraph).
 
-**Scope (`devices_omitted` — re-specified).** The gate's composed `meet(management-group, service-scope)` visibility set is **pushed into SQL** (`agent_id = ANY(...)`) for up to 10 000 visible devices, so a confined caller (management-group-confined operator or a correctly-confined service-scoped token) gets **complete pages of its own devices** and nothing is hidden. `devices_omitted` is the count of distinct devices hidden by the **in-process post-filter** used only for a scope wider than that bound. It is `0` under push-down, so there an empty page means no matching software in your scope. Above 10 000 visible devices it is a distinct-device count **within the scanned window(s)** and still signals that out-of-scope matches exist (bounded and audited). A `denied` audit row is written when it is greater than `0`, or when the request names an `agent_id` outside the caller's scope (the response is then empty with `devices_omitted` unchanged; the row says `agent_id outside the caller's scope`). On a wide scope the page is refilled with at most four bounded store reads, so a page can be empty with a non-null `next_cursor`; the cursor then re-anchors at the last row **you were served** (or at the start) and carries a count of the rows scanned since, which the next request passes over — no identifier, name or version of an out-of-scope row is ever in it. A row inserted inside that skipped span during a walk can be missed or repeated, the same class as the `install_id` churn already noted for concurrent resyncs; a wide-scope walk is best-effort under concurrent change, because the count is of positions: deleting an out-of-scope row inside the skipped span between pages, or widening the caller's scope between pages, can make the next page skip or repeat a row. A long run of out-of-scope rows costs proportionally more to resume, and a statement timeout there degrades the page to a 503 (tracked in #5698). An export on a wide scope reads at most four bounded windows, so it can hold fewer than `limit` rows with `X-Result-Truncated-By-Cap` set. `result_truncated_by_cap` is present only when more rows may exist (push-down: `count == limit`; wide scope: the page filled early or the read bound was reached). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
+**Scope (`devices_omitted` — re-specified).** The gate's composed `meet(management-group, service-scope)` visibility set is **pushed into SQL** (`agent_id = ANY(...)`) for up to 10 000 visible devices, so a confined caller (management-group-confined operator or a correctly-confined service-scoped token) gets **complete pages of its own devices** and nothing is hidden. `devices_omitted` is the count of distinct devices hidden by the **in-process post-filter** used only for a scope wider than that bound. It is `0` under push-down, so there an empty page means no matching software in your scope. Above 10 000 visible devices it is a distinct-device count **within the scanned window(s)** and still signals that out-of-scope matches exist (bounded and audited). A `denied` audit row is written when it is greater than `0`, or when the request names an `agent_id` outside the caller's scope (the response is then empty with `devices_omitted` unchanged; the row says `agent_id outside the caller's scope`). On a wide scope the page is refilled with at most four bounded store reads, so a page can be empty with a non-null `next_cursor`; the cursor then re-anchors at the last row **you were served** (or at the start) and carries a count of the rows scanned since, which the next request passes over — no identifier, name or version of an out-of-scope row is ever in it. A row inserted inside that skipped span during a walk can be missed or repeated, the same class as the `install_id` churn already noted for concurrent resyncs; a wide-scope walk is best-effort under concurrent change, because the count is of positions: deleting an out-of-scope row inside the skipped span between pages, or widening the caller's scope between pages, can make the next page skip or repeat a row. A long run of out-of-scope rows costs proportionally more to resume, and a statement timeout there degrades the page to a 503 (tracked in #5698). On that path `devices_omitted` counts only the out-of-scope devices whose rows the request's own predicates selected (with a version range, a device holding a version that is also present in the caller's scope, since the range set is resolved over the caller's rows), so it is a lower bound on the hidden devices, not a fleet count. A `version_min` / `version_max` range is resolved in one live read over the caller's **whole** scope pushed as one array (the 10 000-device bound does not apply to that read; there is no post-filter alternative for a cut set) under the 5-second statement bound, so a very large scope can answer a retryable `503` there where an unfiltered caller would not. An export on a wide scope reads at most four bounded windows, so it can hold fewer than `limit` rows with `X-Result-Truncated-By-Cap` set. `result_truncated_by_cap` is present only when more rows may exist (push-down: `count == limit`; wide scope: the page filled early or the read bound was reached). `audit_persisted: false` is present only when the audit row could not be persisted (set-and-proceed posture — the data is still served, the lost-evidence flag is surfaced honestly).
 
-**Export mode.** `format=csv` returns `text/csv; charset=utf-8` with `Content-Disposition: attachment; filename="software-installs.csv"` and the header row `agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,signature_status,distro_id,distro_version,source`; `format=json` returns the usual object. `limit` is the **total** row cap (default and maximum 10000); when more rows may exist the response carries `X-Result-Truncated-By-Cap: true` and `X-Next-Cursor: <cursor>` (CSV, whose body then ends with a `# result_truncated_by_cap cause=row_cap` trailer record of 14 fields) or `result_truncated_by_cap: true` and `next_cursor` (JSON); pass the cursor back as `cursor` with the same `format` to read on. Exports are audited as `inventory.software.export` and are REST-only (an agent pages the same data through the MCP cursor). Service-scoped tokens stay admitted — confined — on this route, **including export**, unlike the two catalogue routes below.
+**Export mode.** `format=csv` returns `text/csv; charset=utf-8` with `Content-Disposition: attachment; filename="software-installs.csv"` and the 22-column header row `agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,signature_status,distro_id,distro_version,source,hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,instance_key`; `format=json` returns the usual object. `limit` is the **total** row cap (default and maximum 10000); when more rows may exist the response carries `X-Result-Truncated-By-Cap: true` and `X-Next-Cursor: <cursor>` (CSV, whose body then ends with a `# result_truncated_by_cap cause=row_cap` trailer record of 22 fields) or `result_truncated_by_cap: true` and `next_cursor` (JSON); pass the cursor back as `cursor` with the same `format` to read on. Exports are audited as `inventory.software.export` and are REST-only (an agent pages the same data through the MCP cursor). Service-scoped tokens stay admitted — confined — on this route, **including export**, unlike the two catalogue routes below.
 
 **Audit.** Every call that is served writes a `success` row — `inventory.software.query`, or `inventory.software.export` in export mode (continuation pages carry `page=continuation` in the detail), with the target `fleet` / `agent=<id>` / `name=<n>` (`name=<n>;agent=<id>` when both are set) plus the active filters; a `400` writes nothing. Because the cursor is opaque but unauthenticated (a hand-made well-formed cursor is accepted), per-call audit is what keeps a forged cursor from walking the fleet unrecorded.
 
@@ -8734,12 +8794,48 @@ Every row carries `source` — the `<plugin>.<action>` that produced it (an **op
 
 | Status | Condition |
 |---|---|
-| 400 | `limit` is not a valid integer, `format` is not `json`/`csv`, or the `cursor` is malformed / was issued for a different filter set; a parameter that is not valid UTF-8 or contains a NUL byte; or an over-long value (`agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, `name`/`version` over 1024 bytes) |
+| 400 | `limit` is not a valid integer, `format` is not `json`/`csv`, or the `cursor` is malformed / was issued for a different filter set; a parameter that is not valid UTF-8 or contains a NUL byte; or an over-long value (`agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, `name`/`version` over 1024 bytes); an unknown `match` or `status`; a `version_min` or `version_max` without `name` and `match=exact`, or `version` together with a range; or a range that cannot be resolved |
 | 401 | Unauthenticated |
 | 403 | No management-group grant for `Inventory:Read`; or a service-scoped token whose RBAC/ITServiceOwner grant is missing, or whose RBAC enforcement is disabled fleet-wide (a service-scoped token always hard-denies when RBAC is off) |
 | 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded (including a failed read of the `ITServiceOwner` ceiling for a service-scoped token), the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
 
 On a `503` the store (or the confinement check itself) could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
+
+#### `GET /api/v1/inventory/software/components`
+
+Looks up **components**: libraries and similar artefacts found inside an application, one row per (device, component path), from the component inventory of the typed store. No agent reports components yet, so an empty answer is expected until the component producer ships.
+
+**Permission and scope:** exactly the raw installs route above: `Inventory:Read` through `require_fleet_read` as the sole gate, rows confined to the caller's management groups and service tag on every page, a denied named `agent_id` answered with an empty page and a `denied` audit row.
+
+**Query parameters:** `name` (with `match=exact|prefix|contains`, default `exact`; `prefix` is a case-sensitive literal prefix, `contains` a case-insensitive literal substring), `kind`, `version`, `version_min` / `version_max` (the bounds are inclusive under the catalogue comparator; they need `name` with `match=exact`, and resolve against the component's distinct versions within the caller's scope, read live, with the same 2000-version limit and the same confined-caller rule as the installs route), `agent_id`, `q` (literal substring over name, path and anchor application), `status`, `limit` (default 100, max 1000), `cursor`, `format=json|csv`. Repeated parameters keep the first value.
+
+**Response (200):** `{"data": {"components": [...], "count", "next_cursor", "devices_omitted", "totals", "totals_omitted"?, "result_truncated_by_cap"?}}`. Each component row carries `agent_id`, `hostname` (`null` if unknown), `last_seen` (the device's last accepted installed-software report, `null` if never), `kind`, `name`, `version`, `version_source`, `path`, `anchor_app`, `first_seen`, `status` and `component_last_confirmed_at` (`null` if never; the installs route calls the same stamp `last_confirmed_at`). `hostname` follows the installs route (the device table's roster). `status` is derived from the device's `component_inventory` facet exactly as on the installs route; unconfirmed rows are **included by default** and `status=current` excludes them.
+
+```json
+{
+  "data": {
+    "components": [
+      {"agent_id": "agent-001", "hostname": "build-01", "last_seen": 1767225600, "kind": "jar",
+       "name": "log4j-core", "version": "2.14.1", "version_source": "manifest",
+       "path": "/opt/app/lib/log4j-core-2.14.1.jar", "anchor_app": "/opt/app",
+       "first_seen": 1767139200, "status": "current", "component_last_confirmed_at": 1767225600}
+    ],
+    "count": 1,
+    "next_cursor": null,
+    "devices_omitted": 0,
+    "totals": {"instances": 1, "devices": 1, "devices_unconfirmed": 0, "as_of": 1767222000}
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+(`name=log4j-core&kind=jar` by an unfiltered caller: the totals come from the components rollup, so `as_of` is set. With a version filter, or without `kind`, the figure is live and `as_of` is `null`.)
+
+**Totals.** `totals` is `{instances, devices, devices_unconfirmed, as_of}` and follows the installs route's rule: served only to an unfiltered (global) caller for `name` with `match=exact`, optionally with `kind` and one version filter; otherwise `null` with `totals_omitted` of `scope`, `filters` or `building`. `instances` counts component rows, `devices` distinct devices, `devices_unconfirmed` the distinct devices whose status is not `current`. A `kind` with no version filter is served from the hourly components rollup (`as_of` is its refresh epoch; `building` until the first refresh); a kind and name first reported after the last hourly refresh reads `instances: 0, devices: 0` with that refresh's `as_of` until the next refresh, even though the rows on the page are live. Any version filter, or no `kind`, is a live exact count (`as_of` is `null`) under the same 5-second bound and the same deterministic-`503`-on-a-very-large-name caveat as the installs route. The components rollup is one `GROUP BY` over the component table and meets its 60-second statement limit near 11M component rows (about 1M devices with 10 components each, measured at 44-47 s for 8.8M rows); past that the first refresh never completes and the kind-and-name totals stay `building` while rows and live totals are unaffected (ADR-0016 records the upgrade path). A degraded totals read is a `503` with `retry_after_ms`.
+
+**Export and audit.** `format=csv` returns the 12-column `text/csv` `agent_id,hostname,last_seen,kind,name,version,version_source,path,anchor_app,first_seen,status,component_last_confirmed_at`; `limit` is the total cap (default and max 10000), and a capped export carries `X-Result-Truncated-By-Cap`, `X-Next-Cursor` and an in-band trailer record, as the installs export does. Every served call is audited as `inventory.components.view` (`inventory.components.export` for an export; continuation pages carry `page=continuation`); a `400` writes nothing.
+
+**Errors:** as the installs route: `400` for a malformed parameter, `version_min` or `version_max` without `name` and `match=exact`, an unresolvable range or a refused cursor; `401`; `403`; `503` (store, last-poll, version or totals read degraded) with `retry_after_ms`, **never an empty 200**.
 
 #### `GET /api/v1/inventory/software/catalogue`
 
@@ -8793,7 +8889,7 @@ A repeated parameter, a parameter that is not valid UTF-8 or contains a NUL byte
 }
 ```
 
-- `totals{titles,installs}` cover **every row matching the filters**, not just this page (same predicate as the rows), so a client can say "N of M". `installs` sums each title's exact distinct-device count (a device carrying two matching titles counts twice); unfiltered, it equals `kpis.installs`.
+- `totals{titles,installs}` cover **every row matching the filters**, not just this page (same predicate as the rows), so a client can say "N of M". `installs` sums each title's exact distinct-device count (a device carrying two matching titles counts twice); unfiltered, it equals `kpis.installs`. This is a DEVICE count per title; the lookup route's `totals.installs` (`GET /api/v1/inventory/software`, above) counts install ROWS, so the two can differ for one title and both are exact.
 - `titles[].publisher` is the declared vendor when any row of the title has one, else the origin label `via:<ecosystem>`. `kpis.publishers` counts distinct declared vendors and excludes labels. `q` matches the publisher text literally, so `q=via:` lists the label-only titles.
 - `kpis` is present on the **first fleet page only** — it is `null` on continuation pages and on the per-device view. The headline numbers come from the hourly refresh; percentages are derived (`os_pct` of installs, rounded; `stay_current.pct` is `null` when no title has a known version; `sprawl.pct` to one decimal). `coverage` is **counts**, not a ratio: `reporting` = devices with stored inventory, `connected` = devices currently connected (a registry read, `null` when unavailable), `stale` = devices not seen in 48 hours (`null` when that bounded count is unavailable). There is deliberately no coverage percentage — no honest denominator exists. `building: true` with zero counts means the rollup has never been computed: the JSON page is still a `200` (the page must render), but the fleet `format=csv` export is a `503` until the first refresh lands, because an empty file would read as "no titles" (the per-device export's rows and counts do not depend on the rollup and it still answers `200`; its `newest_version` column is blank until the first refresh). If the `503` persists past one hourly refresh the catalogue is not building but failing (a fleet above the ~6,000-endpoint refresh ceiling, #5545, or a database role without `TEMPORARY`): see [inventory.md](inventory.md) "Scale ceiling" and `yuzu_inventory_catalog_rollup_total{outcome="error"}`, and do not retry in a loop.
 - **Cursor.** `next_cursor` is non-null when the page is full. It is bound to the filter set **and to the catalogue refresh generation** (`kpis.refreshed_at`, 1-second granularity — two refreshes inside one second share a generation). A malformed cursor, a cursor from a different filter set, or one issued **before the latest refresh** is a `400` (`invalid cursor` / `cursor was issued for a different filter set` / `cursor predates the current catalogue refresh; restart from the first page`) — a client holding a stale cursor restarts from the first page. If a refresh lands *during* a first-page read the server re-reads once; a second move is a `503`.
@@ -8941,7 +9037,7 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget` and `appx`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx` and `kernel_module`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
 
 A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
@@ -9055,7 +9151,7 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | Parameter | Meaning |
 |---|---|
 | `family` | One family id from the curated table; omitted or empty means every family. An unknown id is a `400`. |
-| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
+| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx`, `kernel_module`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
 
 ```json
 {
@@ -9423,6 +9519,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | 400 | `RESULT_SET_TOO_MANY_MEMBERS` (`device_ids` exceeds the per-set cap), or another `ResultSetError` (every non-quota `create_materialized` failure — including a store-level error — maps to `400`, not `503`) |
 | 400 | `name`/`source_kind` present but not a JSON string, or over the MCP-matching length cap (`name` 256 bytes, `source_kind` 64 bytes) - checked before `create_materialized` is ever called, not a `ResultSetError` (#4373) |
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but empty/non-string. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
+| 400 | `RESULT_SET_BAD_REQUEST`: a NUL byte in `name`, `source_kind` or `parent_id`; nothing is created and the refusal is audited `result_set.create\|denied`, `reason=field_contains_nul source_kind=<kind>` (the same row the producers write) |
 | 400 | `RESULT_SET_UNKNOWN_DEVICE_ID` (#4983) — a non-empty `device_ids` contains an id that does not exist, or exists but is outside the caller's own scope; the offending id(s) are named in the error message (the caller's own submitted list, so echoing them back is not a disclosure) — checked after the size cap and before `create_materialized`, so an oversized array is rejected for that reason first |
 | 400 | `RESULT_SET_DEVICE_ID_TOO_LONG` (#4983) — a `device_ids` entry exceeds 256 bytes; checked before both the per-set member-count cap and the existence/scope lookup above |
 | 403 | Service-scoped API token |
@@ -12042,9 +12139,9 @@ Dispatches a read-only instruction to the live agent **now** and synchronously r
 - **Query parameter:** `kind` — **required**. `uptime` dispatches `os_info/uptime`; `processes` dispatches `processes/list_hashed` (`proc|pid|name|sha256|path`; the SHA-256 is of each on-disk executable, resolved from the kernel, not argv[0], bounded at 512 MiB per image).
 - **Dashboard-only kinds:** the dashboard **"Get live info"** grid renders ten additional card kinds (`process_tree`, `services`, `users`, `netconfig`, `arp`, `dns_cache`, `listening`, `connections`, `capture_sources`, `disk`). These are **not yet available on this REST endpoint** — passing any of them returns `400`. REST/JSON parity for all ten is deferred to [#1649](https://github.com/Tr3kkR/Yuzu/issues/1649); to probe e.g. the process tree via REST today, dispatch `processes/list_tree` directly through the async execution surface.
 - **Response:** `data` object — `kind=uptime` → `{kind, uptime_display, uptime_seconds}`; `kind=processes` → `{kind, processes[].pid/name/sha256/path}`.
-- **Errors:** `400` — `kind` missing/unrecognised. `403` — outside the operator's scope, or missing `Execution:Execute`. `429` — too many concurrent live queries server-wide (back off `retry_after_ms`). `502` — the device reported an error or the query failed. `503` — the device is offline (no connected agent), **or** `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (the command is **not** dispatched — see Audit). `504` — the device did not respond within the timeout (`retry_after_ms`).
+- **Errors:** `400` — `kind` missing/unrecognised. `403` — outside the operator's scope, missing `Execution:Execute`, or the dispatch chokepoint refused the pair for the caller (an A4 error whose message is `dispatch denied: reason=<token>`; `500` for `unclassified` / `ambiguous`, a server catalogue fault, with a remediation that says to report it to the administrator). `429` — too many concurrent live queries server-wide (back off `retry_after_ms`). `502` — the device reported an error or the query failed. `503` — the device is offline (no connected agent), **or** `503` + `Sec-Audit-Failed: true` when the audit row cannot persist (the command is **not** dispatched — see Audit). `504` — the device did not respond within the timeout (`retry_after_ms`).
 - **Headers:** `X-Correlation-Id` is echoed on **every** response path.
-- **Audit:** emits `device.live.uptime` or `device.live.processes` (`target_type=Agent`, `target_id=<agent_id>`, `result=requested`, `detail` carries `cid=<correlation_id>`) **before** the command is dispatched — the operator's *request* is the works-council-relevant event, kept separately countable per kind. **Fail-closed:** if the audit row cannot persist, the endpoint returns `503` + `Sec-Audit-Failed: true` and the command is **not** dispatched (no usage-class probe without durable evidence). The dispatch outcome (reached an agent / offline) is carried by the HTTP response, not the audit row; `command_id` is recoverable from the response store / metrics by `cid`.
+- **Audit:** emits `device.live.uptime` or `device.live.processes` (`target_type=Agent`, `target_id=<agent_id>`, `result=requested`, `detail` carries `cid=<correlation_id>`) **before** the command is dispatched — the operator's *request* is the works-council-relevant event, kept separately countable per kind. **Fail-closed:** if the audit row cannot persist, the endpoint returns `503` + `Sec-Audit-Failed: true` and the command is **not** dispatched (no usage-class probe without durable evidence). The dispatch outcome (reached an agent / offline) is carried by the HTTP response, not the audit row; `command_id` is recoverable from the response store / metrics by `cid`. **Recheck after the row (#7110):** once the `requested` row is stored the route decides both scoped permissions again and resolves the caller again (the one dispatched). A permission withdrawn in between answers the permission gate's own `403`, writes `result=failure` with `detail` `permission_revoked cid=<correlation_id>` (`caller_unresolved cid=<correlation_id>` when the caller no longer resolves; a row that cannot be stored puts `Sec-Audit-Failed: true` on the answer, since it is the only record that nothing was sent) and dispatches nothing (`permission_revoked` and `caller_unresolved` are audit-detail tokens, not response fields). Both kinds classify `Inventory:Read` with no execute gate, so this recheck is the only place the two named grants are decided after the row. This route runs no pre-send dry run, so the dispatch chokepoint alone decides the pair's `Inventory:Read`: a refusal there (#7114) answers the A4 `403` above, writes `result=failure` with `detail` `dispatch_denied reason=<token> cid=<correlation_id>` and is never reported as the retryable `503` offline device. The boundary of the recheck is stated under `POST /api/v1/instructions/{id}/execute` ("Refused after the audit row"). The `kind` label of `yuzu_server_live_requests_total` is `uptime`, `processes` or `unknown` (any other `kind` value is counted as `unknown`).
 
 > **Scope boundary.** This is the **interactive, single-device** probe and is **concurrency-capped server-wide** (over-budget callers get `429`). It is **not** the fleet-scale path — do not fan a synchronous `/live` call out across thousands of devices. To read many devices at once, dispatch the equivalent read-only instruction to a *scope* via the async execution surface and collect results by `execution_id` (the cap deliberately keeps fan-out off this endpoint).
 
@@ -12944,6 +13041,7 @@ carries `Sec-Audit-Failed: true` and the `requested` row remains the evidence. A
 | `400` | `destructive_untargeted`, `forensic_untargeted` | See above. |
 | `400` | `unclassified`, `ambiguous` | The `plugin`/`action` pair is not in the capability catalogue. |
 | `401` | `principal_changed` | The request's credentials resolved to two different principals; retry. |
+| `403` | `permission_revoked` | The caller's permission was withdrawn between the `requested` audit row and the dispatch: the route decides the session, its own `Execution:Execute` gate, the pair's permission and the dispatch admission a second time after its last own write (the `requested` row and the execution row), deriving the caller from the session as it resolves then (a JIT elevation that lapsed in between is gone), and a refusal writes a `command.dispatch` `failure` row (`reason=permission_revoked gate=<session\|route\|securable\|dispatch\|exception>`; `session` means the credentials no longer resolve, or resolve to a different principal, after the rows (before them the same case is `401` `principal_changed`); plus `dispatch_reason=<token>` for `dispatch`, which also counts `yuzu_server_dispatch_denied_total`; `exception` means the recheck itself threw: refused, nothing sent), cancels the execution row and dispatches nothing. Permanent: retrying will not help until the permission is granted again. The boundary of the recheck is stated under `POST /api/v1/instructions/{id}/execute` ("Refused after the audit row"). |
 | `403` | `forbidden`, `approval_required`, `kill_switched`, `anonymous_operator` | The dispatch check refused the caller; `approval_required` means this route creates no approval ticket and accepts none, so dispatch as an administrator; `POST /api/instructions/{id}/execute` dispatches through the same gate, and an approval created there cannot be redeemed yet (#6064). No `permission` field is returned. |
 | `404` | `destructive_no_visible_target` | See above. |
 | `503` | `audit_unavailable` | The `requested` row could not be stored; nothing was sent. Carries `retry_after_ms`. |
@@ -12956,6 +13054,7 @@ marked cancelled), `agents_reached: 0` and the withheld counts in the `error` ob
 
 | Order | `reason` | Status | `retry_after_ms` | Meaning |
 |---|---|---|---|---|
+| 0 | `dispatch_denied` | `403` | `null` | The dispatch chokepoint refused the `plugin`/`action` pair for the caller when the command was sent (for example `approval_required`), after the pre-send admission check had passed: an authorization denial, never unreachability. Permanent: retrying alone will not help. |
 | 1 | `invalid_scope` | `400` | `null` | The scope expression did not parse; fix it. |
 | 2 | `containment_unreadable` | `503` | `5000` | The quarantine state is unreadable; dispatch fails closed. |
 | 3 | `route_unreadable` | `503` | `5000` | The gateway routing directory could not be read for some targets. |
@@ -13181,6 +13280,21 @@ Execute an instruction definition by dispatching it to agents. Requires `Executi
 - `params` (optional): an object of parameters passed to the plugin. When the definition stores a
   `parameter_schema`, it is validated against that schema (below). Omitted and `null` mean "no params".
 
+**Decided again after the execution row (#7110).** The execution row is this route's last own write
+before the send. Once it exists the route decides `Execution:Execute` again and, for a `role-gated`
+definition, decides again on the caller it derives at that point whether that caller is an effective
+administrator (the same predicate the v1 twin uses). A grant or an elevation withdrawn in between
+answers `403` (A4 envelope, message `permission revoked after the request was recorded`), writes an
+`instruction.execute` row with `result=denied` and `detail` `reason=permission_revoked gate=route
+execution_id=<id>` or `reason=permission_revoked gate=approval_mode mode=role-gated execution_id=<id>`,
+cancels the execution row and dispatches nothing; no approval is queued (the row already exists). A
+recheck that itself throws (a store fault while the caller is derived or either gate is decided) is
+refused the same way, with `gate=exception` on the row, instead of the generic `500` a dispatch fault
+answers. The
+boundary of the recheck is stated under `POST /api/v1/instructions/{id}/execute` ("Refused after the
+audit row"); this route still reports a command the dispatch chokepoint refuses at send time as "no
+agents reached" (`503`).
+
 **Response (200):**
 ```json
 {
@@ -13388,10 +13502,26 @@ primitive (empty `scope_expression` targets every agent; `requires_approval` def
 string, `null`, boolean, array, out-of-range value or a number that does not fit (`4294967297`
 minutes used to become an every-minute schedule) is `400` and nothing is created (#4644).
 
+A NUL byte in `name`, `definition_id`, `frequency_type`, `time_of_day` or `scope_expression` is `400`
+and nothing is created (audited `schedule.create`, `result=denied`, `detail=field_contains_nul`). A
+value the store refuses as invalid text (for example a byte sequence that is not valid UTF-8) or as a
+constraint violation is also `400`, audited `result=denied`, `detail=invalid_field_value` (empty target,
+the value is never echoed). A body that is not valid JSON is `400` with the fixed message
+`invalid JSON in request body`, and no audit row. A store fault before any write (the database is not open, or the
+insert failed) answers `503` with `retry_after_ms` and is audited `result=failure`,
+`detail=store_error`; nothing was created and a retry is safe. A fault after the insert ran (the
+transaction did not report success) answers `503` with `error.outcome` set to `unknown` and **no**
+`retry_after_ms`, audited `result=failure`, `detail=outcome_unknown`: the schedule may or may not
+exist, so list schedules before creating it again.
+
 #### `DELETE /api/schedules/{id}`
 
 Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another
-principal is left untouched (reports `deleted: false`, same as a nonexistent id).
+principal is left untouched (reports `deleted: false`, same as a nonexistent id). A store
+fault answers `503` (audited `schedule.delete`, `result=failure`, `detail=store_error`, with
+`retry_after_ms`), not the `deleted: false` answer; the check that tells the two apart is a read of
+that one id for you as owner, so it does not depend on how many schedules exist. An id containing a
+NUL or other control byte is `400` (audited `result=denied`, `detail=invalid_schedule_id`).
 
 #### `POST /api/schedules/{id}/enable`
 
@@ -13400,10 +13530,17 @@ disabling) additionally requires `Execution:Execute`, since enabling arms the sc
 fire — an operator can always disable a schedule to stop it even without
 `Execution:Execute`.
 
-`enabled` is a JSON boolean, or the integer `0` (disable) or `1` (enable). An omitted key or a blank
-(empty or whitespace-only) body enables, as before. A string (including the old `"true"` / `"false"` encoding), any other number,
-`null`, an array or object, or a body that is truncated or not a JSON object is `400` and the schedule
-is neither armed nor changed: `{"enabled":0}` used to arm it (#4644).
+`enabled` is a JSON boolean, the integer `0` (disable) or `1` (enable), or the exact lowercase string
+`"true"` or `"false"` (accepted so that a client that sends text can still disable a schedule). An omitted
+key or a blank (empty or whitespace-only) body enables, as before. Any other string (`"True"`, `"0"`, an
+empty string), any other number, `null`, an array or object, or a body that is truncated or not a JSON
+object is `400` and the schedule is neither armed nor changed: `{"enabled":0}` used to arm it (#4644).
+
+A schedule id containing a NUL or other control byte is `400` (audited `result=denied`,
+`detail=invalid_schedule_id`). When the change is not applied, the route answers `404` for a
+schedule you cannot see, or `503` for a store fault (audited `result=failure`,
+`detail=store_error`, with `retry_after_ms`), instead of `200` with the requested state. `200` and
+the success audit row mean the change was applied.
 
 ---
 
@@ -14271,6 +14408,8 @@ curl -X POST https://yuzu.example.com/api/dashboard/echo-execute \
 1. A `<thead>` element with `hx-swap-oob="innerHTML:#echo-results-head"` containing dynamic column headers derived from the query result schema.
 2. An SSE stream setup that delivers result rows as `<tr>` fragments.
 
+A command the dispatch chokepoint refuses for the caller (#7114) is answered `200` with an error span `Not permitted: <reason token>` (`data-reason` carries the token), never `No agents connected`: `echo.sql` classifies `Infrastructure:Read` while this route gates on `Execution:Execute`, so a holder of only the second is refused on every call. It is audited as `echo.sql` `result=failure` with `detail` `reason=dispatch_denied dispatch_reason=<token>`. `POST /api/dashboard/execute` answers the same way and audits `command.dispatch` `result=failure` with `detail` `reason=dispatch_denied dispatch_reason=<token> <plugin>:<action>`.
+
 **Safety controls:**
 - Server-side: validates SELECT-only queries and applies a keyword blocklist (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, REINDEX).
 - Agent-side: untrusted queries run on a dedicated **read-only** SQLite connection through a `sqlite3` authorizer that permits only `SELECT`/`READ` of registry-known warehouse tables (`$Process_Live`, `$TCP_Hourly`, …) and scalar/aggregate functions. Writes, `ATTACH`, `PRAGMA`, schema-table reads (`sqlite_master`) and multi-statement input are denied at prepare time, and common table expressions (`WITH`), `NATURAL` and `USING` joins and bound-parameter markers are refused before the query is prepared (a query that starts with `WITH` gets `only SELECT queries are allowed`) — the read-only connection makes writes structurally impossible regardless of the query text. `$`-prefixed table names are translated in code and inside quoted identifiers, never inside a string literal or a comment, so the executed query always matches the validated form. Queries exceeding 4KB are rejected. A blocked query returns `query rejected: operation or table not permitted`.
@@ -14299,9 +14438,9 @@ Dispatch an `echo.status` command to the operator's visible-agent set and record
 
 **Request:** no parameters. The dispatch gates on the *global* `Execution:Execute` permission; management-group confinement of the dispatch target is **not yet effective** (ADR-0017 — a confined operator is denied at the global gate, not narrowed). When RBAC is disabled, the target is the full enrolled fleet.
 
-**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder.
+**Response:** HTML fragment showing the dispatched-agent count or an empty-state placeholder. A scan the dispatch chokepoint refuses for the caller (#7114; `echo.status` classifies `Infrastructure:Read`, so a holder of only `Execution:Execute` is refused on every scan) answers `Not permitted: <reason token>` (`data-reason` carries the token) and an error toast instead of the empty-state placeholder, stores no scan state and counts `yuzu_echo_scan_dispatched_total{result="<token>"}`.
 
-**Audit:** Emits `echo.status.scan` with detail `dispatched to <N> agent(s) in scope`.
+**Audit:** Emits `echo.status.scan` with detail `dispatched to <N> agent(s) in scope`, or `result=failure` with detail `reason=dispatch_denied dispatch_reason=<token>` when the chokepoint refused the scan.
 
 #### `POST /fragments/echo/retention-paused/reenable`
 
@@ -14322,6 +14461,7 @@ Dispatch a single-device `echo.configure` with `<source>_enabled=true`. Per-sour
 - 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
 - 503 with `Sec-Audit-Failed: true`, the body `The audit record could not be stored, so nothing was sent. Retry once the audit store recovers.` (`data-reason="audit_unavailable"`) and the same text as an `HX-Trigger` error toast, when the `attempted` audit row cannot be stored (#3619). Nothing is dispatched. Counted as `yuzu_echo_source_reenable_total{result="audit_unavailable"}`.
 - The permission gate's refusal (normally `403`) when `Execution:Execute` was withdrawn while the `attempted` row was being stored (#3619). Nothing is dispatched; audited as `result=failure` with `detail` `permission_revoked device=<id> source=<src>` and counted as `yuzu_echo_source_reenable_total{result="denied"}`.
+- `403` with an `HX-Trigger` error toast and a `data-reason` fragment naming the chokepoint's refusal (`forbidden`, `approval_required`, `anonymous_operator` or `kill_switched`) when the dispatch itself was refused; `500` for `unclassified` / `ambiguous` (the pair is a server literal, so a catalogue miss is a server fault). The arm reports the real refusal and no longer answers it as `agent_not_connected`. Audited as `result=failure` with `detail` `dispatch_denied reason=<token> device=<id> source=<src>` and counted as `yuzu_echo_source_reenable_total{result="<token>"}`.
 
 **Audit:** Emits `echo.source.reenable` with `result=attempted` (same `detail`) once every check has passed (a request those checks refuse writes none) and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
 
@@ -14349,12 +14489,13 @@ Dispatch a single-device `echo.purge_source` that **permanently drops every ware
 - 503 if command dispatch is unavailable.
 - 503 with `Sec-Audit-Failed: true`, the body `The audit record could not be stored, so nothing was sent. Retry once the audit store recovers.` (`data-reason="audit_unavailable"`) and the same text as an `HX-Trigger` error toast, when the `attempted` audit row cannot be stored (#3619). Nothing is purged. Counted as `yuzu_echo_source_purge_total{result="audit_unavailable"}`.
 - The permission gate's refusal (normally `403`) when `Infrastructure:Delete` was withdrawn while the `attempted` row was being stored (#3619). Nothing is purged; audited as `result=failure` with `detail` `permission_revoked device=<id> source=<src>` and counted as `yuzu_echo_source_purge_total{result="denied"}`.
+- `403` with an `HX-Trigger` error toast and a `data-reason` fragment naming the chokepoint's refusal (`forbidden`, `approval_required`, `anonymous_operator` or `kill_switched`) when the dispatch itself was refused; `500` for `unclassified` / `ambiguous`. The arm reports the real refusal and no longer answers it as `agent_not_connected`. Nothing is purged; audited as `result=failure` with `detail` `dispatch_denied reason=<token> device=<id> source=<src>` and counted as `yuzu_echo_source_purge_total{result="<token>"}`.
 
 **Audit:** Emits `echo.source.purge` with `result=attempted` (same `detail`) once every check has passed (a request those checks refuse writes none) and before the dispatch, then `result=success` and `detail` carrying `device=<id> source=<src>` on success (`rbac_denied` on the permission gate; `result=failure` with `scope_violation`/`agent_not_connected` on rejected attempts). Dispatch is fire-and-forget: `rows_deleted` is computed agent-side and appears in the command's **response record** (keyed by `command_id`), not in this dispatch audit row; the audit row records the dispatch, never the agent's outcome.
 
 **What the agent reports (the response record):** one JSON line, `{"source":"<name>","rows_deleted":<n>,"status":"purged","dictionary_pending":<true|false>}`, or an `error|...` line (`source_not_paused`, `config_unreadable`, an unknown source). `status` `purged` means the source's rows are deleted. The interned strings only those rows referenced are swept afterwards under a 60 s deadline: when the sweep ran out of time or failed, `dictionary_pending` is `true` and the record's result status is `CONSTRAINED` (the status alone reaches the server; the completeness and the status detail, `echo:purge_dictionary_pending`, are in the agent's log). **A pending result is not a complete erasure**: the strings stay on the device until the weekly dictionary sweep, or until the purge is run again (a rerun deletes nothing twice and finishes the sweep). An automation that promises erasure must read `dictionary_pending`, not `status` alone. One further limit: a write-ahead-log checkpoint that finds the file busy right after the purge leaves the deleted pages in the log until the next checkpoint, and the reply still says `purged` (the agent logs a warning).
 
-**Metric:** `yuzu_echo_source_purge_total{result}` (counter) — counts dispatch outcomes.
+**Metric:** `yuzu_echo_source_purge_total{result}` (counter) — counts dispatch outcomes. `result` is one of `success`, `agent_not_connected`, `invalid_input`, `denied` (the route's own gates: the per-device scope gate before and after the `requested` row, unwired dispatch or scope gate, a lost `requested` row, an unresolved caller) or a dispatch chokepoint denial's own reason token (`forbidden`, `approval_required`, `anonymous_operator`, `kill_switched`, `unclassified`, `ambiguous`; #7114).
 
 **Agent version:** requires an agent that implements the `echo.purge_source` action (v0.14.0+). An older agent returns `error|unknown action: purge_source` in its response record (no crash); because dispatch is fire-and-forget the dashboard still shows "Purge dispatched" — verify the outcome via **Scan**.
 
@@ -14375,6 +14516,9 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 - **202 Accepted** — `{"data":{"command_id","device_id","source","agents_reached"},"meta":{"api_version":"v1"}}`. Async: the agent computes `rows_deleted` and `dictionary_pending` (and the agent-side `source_not_paused` refusal if the source was re-enabled, or `config_unreadable` if the enable flag could not be read) into the command's **response record** — poll it by `command_id`; it is not in the 202 body. `dictionary_pending` `true` (with a `CONSTRAINED` result status on the record) means the rows are gone but the strings they referenced stay until the weekly sweep or a rerun of the purge: not a complete erasure (see the fragment route above). `X-Correlation-Id` header on every response.
 - **400** — invalid JSON / missing `device_id`/`source` / source not in the allowlist (A4 error envelope).
 - **403 / 404** — permission denied or device out of scope (scoped gate; A4 envelope).
+- **403 from the scoped gate (after the audit row)** — the per-device `Infrastructure:Delete` grant (or a JIT elevation) was withdrawn between the `requested` audit row and the dispatch: the route decides the scoped gate a second time after the row is stored (its only own write); the gate's own `403` body is the answer, a `failure` audit row with detail `permission_revoked` closes the row that already exists (`Sec-Audit-Failed: true` on the `403` when that row cannot be stored), `yuzu_echo_source_purge_total{result="denied"}` is counted and nothing is dispatched. `permission_revoked` is an audit-detail token: the response carries no `error.reason` field. The boundary of the recheck is stated under `POST /api/v1/instructions/{id}/execute` ("Refused after the audit row").
+- **Caller no longer resolves** — the caller is resolved again after the `requested` row; when that fails the resolver answers (an authentication refusal), a `failure` row `caller_unresolved device=<id> source=<src> cid=<correlation-id>` closes the `requested` row (`caller_unresolved` is an audit-detail token; the response is the resolver's own authentication refusal), `yuzu_echo_source_purge_total{result="denied"}` is counted and nothing is dispatched.
+- **A4 `403` from the dispatch chokepoint** — the chokepoint refused the `echo.purge_source` pair for the caller (for example `approval_required`); the A4 error message is `dispatch denied: reason=<token>` with the chokepoint's remediation (the token is in the message only: there is no `error.reason` field). `500` for `unclassified` / `ambiguous` (a server catalogue fault: the pair is a server literal; the remediation then says to report it to the administrator, not to correct a plugin or action name). Audited as `failure` with the audit-detail token `dispatch_denied reason=<token>` and counted on `yuzu_echo_source_purge_total{result="<token>"}`; it is no longer reported as a `404` offline device.
 - **404** — dispatch reached zero agents (device offline).
 - **503** — command dispatch unavailable, or the audit row could not be persisted (`Sec-Audit-Failed` header; the purge is **not** dispatched without durable evidence).
 
@@ -14408,7 +14552,7 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 
 **Request:** no parameters.
 
-**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `result_truncated_by_cap` (#4644) is `true` when the scan's response read hit the 10,000-row or 50 MiB payload cap, so `rows` and the counters are partial: dropped responses read as agents that never answered, i.e. as "collecting normally". It is distinct from `store_degraded` (the read failed outright), but a cut scan ALSO reports `store_degraded: true` so a client that predates `result_truncated_by_cap` still sees an incomplete result; test `result_truncated_by_cap` first to tell a cut from a failed read. A client that retries on `store_degraded` should not retry a cut scan: the read is capped the same way each time, so only a narrower scan (a smaller management group) changes the result, whereas a failed read may succeed on retry. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/echo/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
+**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","result_truncated_by_cap","rows":[{"agent_id","agent_display","source","paused_at","hourly_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. Each row's `hourly_rows` is the number of rows in the source's hourly roll-up tier (`-1` when the agent did not report it); it is not a count of raw capture rows. `result_truncated_by_cap` (#4644) is `true` when the scan's response read hit the 10,000-row or 50 MiB payload cap, so `rows` and the counters are partial: dropped responses read as agents that never answered, i.e. as "collecting normally". It is distinct from `store_degraded` (the read failed outright), but a cut scan ALSO reports `store_degraded: true` so a client that predates `result_truncated_by_cap` still sees an incomplete result; test `result_truncated_by_cap` first to tell a cut from a failed read. A client that retries on `store_degraded` should not retry a cut scan: the read is capped the same way each time, so only a narrower scan (a smaller management group) changes the result, whereas a failed read may succeed on retry. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/echo/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
 
 **Headers:** `Cache-Control: no-store, private` + `Vary: Cookie` — per-operator-scoped data, same UP-11 posture as the fragment.
 
