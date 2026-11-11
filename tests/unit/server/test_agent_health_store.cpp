@@ -2148,6 +2148,24 @@ TEST_CASE("REAL AgentHealthStore: plugin_init_failed_rejected is published every
         CHECK(series_val(metrics.serialize(), rejected_series(r)) == 0.0);
 }
 
+TEST_CASE("REAL AgentHealthStore: an empty token carries no name and is not malformed",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    // An empty token between commas and a trailing comma are ignored: both real names are
+    // labelled and no reason counts the agent.
+    beat_tags(store, "a", {{"yuzu.plugins_failed", "echo,,wmi,"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+    CHECK(series_val(out, init_failed_series("echo")) == 1.0);
+    CHECK(series_val(out, init_failed_series("wmi")) == 1.0);
+    CHECK(count_init_failed_series(out) == 2);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 0.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 0.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 0.0);
+}
+
 TEST_CASE("REAL AgentHealthStore: plugin_init_failed stays absent-not-zero beside the rejected gauge",
           "[health_store][echo][real]") {
     AgentHealthStore store;

@@ -25,8 +25,9 @@ inline constexpr const char* kPluginInitFailedRejectedGauge = "yuzu_fleet_plugin
 inline constexpr const char* kPluginInitFailedRejectedHelp =
     "Agents whose latest yuzu.plugins_failed heartbeat tag carried at least one token that did not "
     "become a plugin label, by reason: unknown_plugin (well formed, but not a plugin in the "
-    "server's catalogue; summed under plugin=unknown), malformed (not 1 to 64 characters of "
-    "letters, digits or underscore), over_cap (more than 32 tokens, the rest not read). Published "
+    "server's catalogue; summed under plugin=unknown), malformed (longer than 64 characters or "
+    "containing a character outside letters, digits and underscore; an empty token between commas "
+    "carries no name and is ignored), over_cap (more than 32 tokens, the rest not read). Published "
     "every sweep, 0 included; >0 means an agent is sending names the server does not know, or "
     "forged ones";
 inline constexpr const char* kRejectUnknownPlugin = "unknown_plugin";
