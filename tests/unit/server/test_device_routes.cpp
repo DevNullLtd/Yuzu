@@ -669,7 +669,7 @@ TEST_CASE("device live capture_sources: echo status -> read-only source table", 
     CHECK(r->body.find("/echo") != std::string::npos);                  // configure-on-Echo link
 }
 
-TEST_CASE("device live capture_sources: row count reads <src>_rows then <src>_live_rows",
+TEST_CASE("device live capture_sources: row count reads <src>_rows only",
           "[device][routes]") {
     const auto count_cell = [](const std::string& status) {
         LiveHarness h;
@@ -682,19 +682,18 @@ TEST_CASE("device live capture_sources: row count reads <src>_rows then <src>_li
     // Only the new key: fails if the <src>_rows lookup is removed.
     CHECK(count_cell("config|process_enabled|true\nconfig|process_rows|4321")
               .find("<td class=\"ls-num\">4321</td>") != std::string::npos);
-    // Only the one-release alias: the agent has not moved to the roll-up store, so its raw-row
-    // figure is not shown under the hourly label: a dash with the reason, never the number.
-    const auto alias_only = count_cell("config|process_enabled|true\nconfig|process_live_rows|8765");
-    CHECK(alias_only.find("8765") == std::string::npos);
-    CHECK(alias_only.find("title=\"This device runs an agent without the roll-up tables; upgrade "
-                          "the agent\">&mdash;") != std::string::npos);
-    // Both present: the new key wins and the agent is not flagged.
+    // Only the retired `<src>_live_rows` spelling: not read, so a dash, never the number.
+    const auto retired = count_cell("config|process_enabled|true\nconfig|process_live_rows|8765");
+    CHECK(retired.find("8765") == std::string::npos);
+    CHECK(retired.find("&mdash;") != std::string::npos);
+    CHECK(retired.find("without the roll-up tables") == std::string::npos);
+    // Both present: `<src>_rows` is the count.
     const auto both = count_cell(
         "config|process_enabled|true\nconfig|process_live_rows|1\nconfig|process_rows|2");
     CHECK(both.find("<td class=\"ls-num\">2</td>") != std::string::npos);
     CHECK(both.find("<td class=\"ls-num\">1</td>") == std::string::npos);
     CHECK(both.find("without the roll-up tables") == std::string::npos);
-    // Neither: a dash, not a zero, and no agent note.
+    // Neither: a dash, not a zero.
     const auto neither = count_cell("config|process_enabled|true");
     CHECK(neither.find("&mdash;") != std::string::npos);
     CHECK(neither.find("without the roll-up tables") == std::string::npos);

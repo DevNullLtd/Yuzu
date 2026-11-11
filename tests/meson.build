@@ -1397,7 +1397,7 @@ echo_test_exe = executable(
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
     'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
-    'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, shim views
+    'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, retired names
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -3459,6 +3459,17 @@ test('release artifact gate',
   args: [files('test_check_release_artifacts.py')],
   suite: 'docs',
   timeout: 60,
+)
+
+# Agent-only Windows and macOS releases (ADR-0035 ladder step 2): release.yml's
+# Windows/macOS jobs build no server and no server installer, the old archive
+# names are gone, and every place that names a platform archive agrees on one
+# set. Lints source text with a mutation self-test.
+test('agent-only release lint',
+  _python3_test,
+  args: [files('test_release_agent_only.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
