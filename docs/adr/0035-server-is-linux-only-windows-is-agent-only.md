@@ -381,7 +381,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    packages"), remove the Windows server runbook from `docs/user-manual/server-admin.md`, and close
    #5325 and #1835 as resolved by removal.
 
-   *Status: done in this change (PR `#PENDING`).* As implemented, with these deviations and
+   *Status: done — #7523.* As implemented, with these deviations and
    additions:
    - **The Windows DLL sweep is unchanged.** `release.yml` copies every DLL in
      `vcpkg_installed/x64-windows/bin`, and that tree keeps the server ports until step 3, so the
@@ -422,7 +422,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      CA directory, so a Windows server's restored database could not sign agent certificates or
      publish CRLs. Carrying data over would need a server change; none is planned. Re-pointing an
      already-enrolled agent or gateway at a different server has no supported procedure either,
-     so the guidance treats them as new installations (follow-up issue to be filed with the PR).
+     so the guidance treats them as new installations (follow-ups #7524, and #7525 for a Windows agent's non-default CA).
    - **#5325 and #1835** are closed as resolved by removal when this change merges.
    - Proof without an RC (owner decision, 2026-11-11): the static pins, plus a Windows rehearsal of
      the agent-only build, packaging and installer on a build box. The first stable tag after this
