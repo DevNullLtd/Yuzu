@@ -5030,6 +5030,8 @@ TEST_CASE("result-set producers refuse a pending parent and inherit an incomplet
         CHECK(status == 409);
         CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
               std::string::npos);
+        CHECK(j["error"]["message"].get<std::string>().find("wait until it is materialized") !=
+              std::string::npos);
         std::string next;
         CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 1); // the parent only
     }
@@ -5040,11 +5042,15 @@ TEST_CASE("result-set producers refuse a pending parent and inherit an incomplet
         CHECK(status == 409);
         CHECK(h.calls.empty());
     }
-    SECTION("from-inventory-query refuses a failed parent") {
+    SECTION("from-inventory-query refuses a failed parent and says to re-create it") {
         h.store->mark_failed(pending->id, "bound exceeded");
         int status = 0;
-        h.post("/api/v1/result-sets/from-inventory-query", inv_body, status);
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", inv_body, status);
         CHECK(status == 409);
+        const auto msg = j["error"]["message"].get<std::string>();
+        CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
+        CHECK(msg.find("re-create it") != std::string::npos);
+        CHECK(msg.find("wait until") == std::string::npos);
     }
     SECTION("from-inventory-query inherits a partial parent's counters") {
         REQUIRE(h.store->materialize(pending->id, {}, 2, 3).has_value());

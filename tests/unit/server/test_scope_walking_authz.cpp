@@ -228,11 +228,17 @@ TEST_CASE("evaluate_scope: a result set that is not ready or is incomplete is no
         REQUIRE(expr.has_value());
         return registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
     };
-    auto aborts_unusable = [&](const std::string& text, const std::string& id) {
+    // A pending set may still fill (transient); a failed set, or an incomplete one where a missing
+    // member would match, will not change by retrying (permanent). The detail names the caller's
+    // own set and the cause.
+    auto aborts_unusable = [&](const std::string& text, const std::string& id,
+                               const std::string& cause) {
         auto r = eval(text);
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error().kind == ScopeEvalError::Kind::ResultSetUnusable);
-        CHECK(r.error().detail == id);
+        CHECK(r.error().kind == (cause == "pending"
+                                     ? ScopeEvalError::Kind::ResultSetUnusable
+                                     : ScopeEvalError::Kind::ResultSetUnusablePermanent));
+        CHECK(r.error().detail == "cause=" + cause + " result_set=" + id);
     };
 
     auto pending = store.create_pending(async_req("p"), "exec-p");
@@ -251,14 +257,14 @@ TEST_CASE("evaluate_scope: a result set that is not ready or is incomplete is no
     REQUIRE(store.materialize(complete->id, {"agent-win"}, 0, 0).has_value());
 
     SECTION("NOT over a pending, failed, partial or timed-out set aborts") {
-        aborts_unusable("NOT from_result_set:" + pending->id, pending->id);
-        aborts_unusable("NOT from_result_set:" + failed->id, failed->id);
-        aborts_unusable("NOT from_result_set:" + partial->id, partial->id);
-        aborts_unusable("NOT from_result_set:" + timed_out->id, timed_out->id);
+        aborts_unusable("NOT from_result_set:" + pending->id, pending->id, "pending");
+        aborts_unusable("NOT from_result_set:" + failed->id, failed->id, "failed");
+        aborts_unusable("NOT from_result_set:" + partial->id, partial->id, "incomplete");
+        aborts_unusable("NOT from_result_set:" + timed_out->id, timed_out->id, "incomplete");
     }
     SECTION("a positive reference to a pending or failed set also aborts (no membership yet)") {
-        aborts_unusable("from_result_set:" + pending->id, pending->id);
-        aborts_unusable("from_result_set:" + failed->id, failed->id);
+        aborts_unusable("from_result_set:" + pending->id, pending->id, "pending");
+        aborts_unusable("from_result_set:" + failed->id, failed->id, "failed");
     }
     SECTION("NOT over a complete set resolves to the complement") {
         auto r = eval("NOT from_result_set:" + complete->id);
@@ -279,23 +285,23 @@ TEST_CASE("evaluate_scope: a result set that is not ready or is incomplete is no
         auto r = eval("NOT NOT from_result_set:" + partial->id);
         REQUIRE(r.has_value());
         CHECK(has(*r, "agent-win"));
-        aborts_unusable("NOT NOT NOT from_result_set:" + partial->id, partial->id);
+        aborts_unusable("NOT NOT NOT from_result_set:" + partial->id, partial->id, "incomplete");
     }
     SECTION("mixed: A AND NOT incomplete aborts, A AND positive incomplete resolves") {
-        aborts_unusable("ostype != \"x\" AND NOT from_result_set:" + partial->id, partial->id);
+        aborts_unusable("ostype != \"x\" AND NOT from_result_set:" + partial->id, partial->id, "incomplete");
         auto r = eval("hostname != \"x\" AND from_result_set:" + partial->id);
         REQUIRE(r.has_value());
     }
     SECTION("an OR branch does not hide a NOT over an incomplete set") {
-        aborts_unusable("ostype != \"x\" OR NOT from_result_set:" + partial->id, partial->id);
+        aborts_unusable("ostype != \"x\" OR NOT from_result_set:" + partial->id, partial->id, "incomplete");
     }
     SECTION("the same incomplete set used in both polarities aborts") {
         aborts_unusable("from_result_set:" + partial->id + " AND NOT from_result_set:" + partial->id,
-                        partial->id);
+                        partial->id, "incomplete");
     }
     SECTION("an inverted comparison or a wrapped atom needs a complete set") {
-        aborts_unusable("STARTSWITH(from_result_set:" + partial->id + ", \"r\")", partial->id);
-        aborts_unusable("LEN(from_result_set:" + partial->id + ") == 0", partial->id);
+        aborts_unusable("STARTSWITH(from_result_set:" + partial->id + ", \"r\")", partial->id, "incomplete");
+        aborts_unusable("LEN(from_result_set:" + partial->id + ") == 0", partial->id, "incomplete");
     }
     SECTION("a non-owner never learns the state of another operator's pending set") {
         auto expr = yuzu::scope::parse("NOT from_result_set:" + pending->id);

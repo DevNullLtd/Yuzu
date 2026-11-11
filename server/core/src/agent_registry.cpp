@@ -1988,6 +1988,19 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                 if (rs_members.contains(rsid))
                     continue;
                 auto mem = rs_store->member_set_owned(rsid, owner);
+                // An owned set that cannot be used as scope. The caller passed the owner check,
+                // so the id and cause go in the detail (fixed tokens, the id neutralised). A
+                // pending set may fill (transient); a failed set, or an incomplete one where a
+                // missing member would match, will not change by retrying (permanent). An
+                // expected state, so a warning, not an error.
+                const auto unusable = [&rsid, &owner](ScopeEvalError::Kind kind,
+                                                      std::string_view cause) {
+                    spdlog::warn("AgentRegistry::evaluate_scope: result-set {} (owner={}) cannot "
+                                 "be used as scope (cause={}) — aborting scope evaluation",
+                                 ::yuzu::log_id_token(rsid), ::yuzu::log_id_token(owner), cause);
+                    return std::unexpected(ScopeEvalError{
+                        kind, "cause=" + std::string(cause) + " result_set=" + audit_token(rsid)});
+                };
                 if (!mem) {
                     // #4981 PR-1 A1/A3: member_set_owned's rewritten single-
                     // statement query now type-distinguishes a genuine DB
@@ -2007,13 +2020,11 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                     // a SUCCESSFUL empty membership, not an error).
                     // A set that is not ready (pending or failed) has no usable membership;
                     // it is owned (the owner check ran first), so naming it leaks nothing.
-                    if (mem.error() == ResultSetError::NotReady) {
-                        spdlog::error("AgentRegistry::evaluate_scope: result-set '{}' (owner={}) "
-                                      "is not ready — aborting scope evaluation",
-                                      rsid, owner);
-                        return std::unexpected(
-                            ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusable, rsid});
-                    }
+                    if (mem.error() == ResultSetError::NotReady)
+                        return unusable(ScopeEvalError::Kind::ResultSetUnusable, "pending");
+                    if (mem.error() == ResultSetError::Failed)
+                        return unusable(ScopeEvalError::Kind::ResultSetUnusablePermanent,
+                                        "failed");
                     const bool owner_check_failed = mem.error() == ResultSetError::NotFound ||
                                                     mem.error() == ResultSetError::NotOwner;
                     spdlog::error("AgentRegistry::evaluate_scope: member_set_owned {} for "
@@ -2025,14 +2036,10 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                                                           : ScopeEvalError::Kind::StoreDegraded,
                                       rsid});
                 }
-                if (!mem->complete && std::ranges::find(needs_complete, rsid) != needs_complete.end()) {
-                    spdlog::error("AgentRegistry::evaluate_scope: result-set '{}' (owner={}) is "
-                                  "incomplete and referenced where a missing member would match "
-                                  "— aborting scope evaluation",
-                                  rsid, owner);
-                    return std::unexpected(
-                        ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusable, rsid});
-                }
+                // Incomplete and referenced where a missing member would match (under NOT, LEN,
+                // STARTSWITH): only re-running the producer changes that.
+                if (!mem->complete && std::ranges::find(needs_complete, rsid) != needs_complete.end())
+                    return unusable(ScopeEvalError::Kind::ResultSetUnusablePermanent, "incomplete");
                 // #4981 PR-1 A4: touch EVERY owned result (empty or not) — an
                 // owned-but-empty set is now a real, distinguishable success
                 // case (A1), not indistinguishable from not-owned, so it

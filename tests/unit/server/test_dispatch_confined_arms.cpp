@@ -739,6 +739,7 @@ TEST_CASE("resolve_scope_targets: a ResultSetUnusable registry evaluation aborts
     CHECK(aborted_reason == "result_set_unusable");
     REQUIRE(result.abort_reason.has_value());
     CHECK(*result.abort_reason == ScopeAbortReason::ResultSetUnusable);
+    CHECK(result.abort_detail == "rs_x"); // the registry's detail is carried for this reason
 }
 
 TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwise",
@@ -765,6 +766,14 @@ TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwis
     CHECK(std::string(to_string(Kind::ResultSetUnusable)) == "result_set_unusable");
     // A pending set may fill, so a retry can succeed: transient, not permanent.
     CHECK_FALSE(scope_abort_is_permanent(Kind::ResultSetUnusable));
+    // A failed set, or an incomplete one under NOT, does not change by retrying: permanent, with
+    // the same wire reason.
+    CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) ==
+          to_string(to_abort_reason(Kind::ResultSetUnusablePermanent)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) == "result_set_unusable");
+    CHECK(to_abort_reason(Kind::ResultSetUnusablePermanent) ==
+          ScopeAbortReason::ResultSetUnusablePermanent);
+    CHECK(scope_abort_is_permanent(Kind::ResultSetUnusablePermanent));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

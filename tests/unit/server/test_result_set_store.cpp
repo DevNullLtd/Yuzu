@@ -973,13 +973,13 @@ TEST_CASE("ResultSetStore: member_set_owned refuses a set that is not materializ
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ResultSetError::NotReady);
     }
-    SECTION("failed -> NotReady") {
+    SECTION("failed -> Failed, distinct from pending") {
         auto rs = store.create_pending(pending_req("failed-set"), "exec-f");
         REQUIRE(rs.has_value());
         store.mark_failed(rs->id, "bound exceeded");
         auto r = store.member_set_owned(rs->id, "alice");
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error() == ResultSetError::NotReady);
+        CHECK(r.error() == ResultSetError::Failed);
     }
     SECTION("a non-owner of a pending set still sees NotOwner") {
         auto rs = store.create_pending(pending_req("foreign-pending"), "exec-o");
@@ -1139,6 +1139,10 @@ TEST_CASE("parent_may_seed admits only a materialized parent", "[result_set][par
     CHECK_FALSE(parent_may_seed(row));
     row.status = ResultSetStatus::Failed;
     CHECK_FALSE(parent_may_seed(row));
+    // The refusal says what to do: re-create a failed parent, wait for a pending one.
+    CHECK(parent_not_ready_message(row) == kParentFailedMessage);
+    row.status = ResultSetStatus::Pending;
+    CHECK(parent_not_ready_message(row) == kParentPendingMessage);
 
     ResultSet parent;
     parent.agents_failed = 3;

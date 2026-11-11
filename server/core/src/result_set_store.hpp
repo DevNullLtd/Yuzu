@@ -218,9 +218,12 @@ enum class ResultSetError {
     Pinned,
     TooManyMembers,
     DbError,
-    /// The set exists and is owned, but is not `materialized` (still `pending`, or `failed`), so
-    /// its membership carries no information. Returned by `member_set_owned` only.
-    NotReady
+    /// The set exists and is owned, but is still `pending`: it has no membership yet, and may
+    /// fill. Returned by `member_set_owned` only.
+    NotReady,
+    /// The set exists and is owned, but its fill `failed`: it never will have a membership.
+    /// Returned by `member_set_owned` only.
+    Failed
 };
 
 const char* to_string(ResultSetError e);
@@ -244,14 +247,22 @@ struct CreateRequest {
 /// `materialized`. A `pending` set has no members yet and a `failed` one never will, so
 /// seeding from either would read as an empty (complete) membership. Every producer that
 /// accepts a `parent_id` applies this right after its owner check and before it reads the
-/// parent's members; a refusal is the shared `kParentNotReadyMessage` (REST 409, MCP -32602).
+/// parent's members; a refusal is `parent_not_ready_message(parent)` (REST 409, MCP -32602).
 inline bool parent_may_seed(const ResultSet& parent) noexcept {
     return parent.status == ResultSetStatus::Materialized;
 }
 
-inline constexpr std::string_view kParentNotReadyMessage =
-    "RESULT_SET_NOT_READY: the parent result set is not materialized (still pending or "
-    "failed); wait until its status is materialized";
+/// The refusal for a parent `parent_may_seed` rejects, by the parent's status: a pending parent
+/// may still fill (wait), a failed one never will (re-create it).
+inline constexpr std::string_view kParentPendingMessage =
+    "RESULT_SET_NOT_READY: the parent result set is still pending; wait until it is "
+    "materialized";
+inline constexpr std::string_view kParentFailedMessage =
+    "RESULT_SET_NOT_READY: the parent result set failed and will never be materialized; "
+    "re-create it";
+[[nodiscard]] inline std::string_view parent_not_ready_message(const ResultSet& parent) noexcept {
+    return parent.status == ResultSetStatus::Failed ? kParentFailedMessage : kParentPendingMessage;
+}
 
 /// Carry a parent's completeness onto a child created from its members: a child is never
 /// more complete than the parent it was narrowed from. Every producer whose members come from
@@ -407,9 +418,9 @@ public:
     /// contract exists to prevent. Callers MUST abort (not dispatch) on ANY
     /// `std::unexpected` from this method.
     ///
-    /// A set that is not `materialized` (pending or failed) returns
-    /// `std::unexpected(ResultSetError::NotReady)`: its membership says nothing about the
-    /// fleet. A `materialized` set returns its members with `complete` false when any agent
+    /// A set that is not `materialized` returns `std::unexpected(ResultSetError::NotReady)` while
+    /// pending and `std::unexpected(ResultSetError::Failed)` once its fill failed: its membership
+    /// says nothing about the fleet. A `materialized` set returns its members with `complete` false when any agent
     /// failed or went unanswered; the caller decides whether an incomplete set is usable.
     std::expected<OwnedMembers, ResultSetError>
     member_set_owned(const std::string& id, const std::string& owner);

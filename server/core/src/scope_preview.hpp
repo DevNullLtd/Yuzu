@@ -75,6 +75,9 @@ struct ScopePreviewOutcome {
     std::string detail;                     // kInvalidExpression / kEvaluationAborted
     std::vector<std::string> failing_refs;  // kEvaluationAborted, OwnerCheckFailed only
     std::optional<ScopeEvalError::Kind> abort_kind; // kEvaluationAborted only
+    /// kEvaluationAborted with `result_set_unusable` only: `cause=<pending|failed|incomplete>
+    /// result_set=<id>` (ScopeLadderResult::abort_detail); empty otherwise.
+    std::string abort_detail;
     nlohmann::json payload;                 // kOk only
 };
 

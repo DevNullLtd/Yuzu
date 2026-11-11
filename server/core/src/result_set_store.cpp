@@ -82,6 +82,7 @@ const char* to_string(ResultSetError e) {
     case ResultSetError::DbError:
         return "RESULT_SET_DB_ERROR";
     case ResultSetError::NotReady:
+    case ResultSetError::Failed:
         return "RESULT_SET_NOT_READY";
     }
     return "RESULT_SET_DB_ERROR";
@@ -722,8 +723,14 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
         return std::unexpected(ResultSetError::NotOwner);
     // Only a `materialized` set has a membership that means anything: a pending set has none
     // yet and a failed set never will. Both are errors here, never an empty success.
-    if (result_set_status_from(PQgetvalue(res.get(), 0, 2)) != ResultSetStatus::Materialized)
+    switch (result_set_status_from(PQgetvalue(res.get(), 0, 2))) {
+    case ResultSetStatus::Materialized:
+        break;
+    case ResultSetStatus::Pending:
         return std::unexpected(ResultSetError::NotReady);
+    case ResultSetStatus::Failed:
+        return std::unexpected(ResultSetError::Failed);
+    }
     OwnedMembers out;
     out.complete =
         to_i64(PQgetvalue(res.get(), 0, 3)) == 0 && to_i64(PQgetvalue(res.get(), 0, 4)) == 0;
