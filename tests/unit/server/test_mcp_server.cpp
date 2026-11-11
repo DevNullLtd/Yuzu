@@ -52864,15 +52864,45 @@ TEST_CASE("MCP create_result_set: a pending parent is refused with RESULT_SET_NO
     McpTestServer ts;
     ts.result_set_store_for_test = rs_bundle.get();
     ts.start("supervised"); // create_result_set is Infrastructure:Write, above the operator tier
-    auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"name":"child","device_ids":[],"parent_id":")" +
-        parent->id + R"("}}})");
-    REQUIRE(res);
-    auto body = nlohmann::json::parse(res->body);
-    REQUIRE(body.contains("error"));
-    CHECK(body["error"]["code"] == kInvalidParams);
-    CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
-          std::string::npos);
+    const auto create_child = [&ts](const std::string& parent_id) {
+        return ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"name":"child","device_ids":[],"parent_id":")" +
+            parent_id + R"("}}})");
+    };
+
+    SECTION("a pending parent is refused and the message says to wait") {
+        auto res = create_child(parent->id);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        const auto msg = body["error"]["message"].get<std::string>();
+        CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
+        CHECK(msg.find("wait until it is materialized") != std::string::npos);
+    }
+    SECTION("a failed parent is refused and the message says to re-create it") {
+        rs_bundle.get()->mark_failed(parent->id, "bound exceeded");
+        auto res = create_child(parent->id);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        const auto msg = body["error"]["message"].get<std::string>();
+        CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
+        CHECK(msg.find("re-create it") != std::string::npos);
+    }
+    SECTION("control: a materialized parent is accepted as lineage with no inherited counters") {
+        REQUIRE(rs_bundle.get()->materialize(parent->id, {"a1"}, 2, 3).has_value());
+        auto res = create_child(parent->id);
+        REQUIRE(res);
+        auto payload = operator_surface_payload(res);
+        auto child = rs_bundle.get()->get(payload["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        REQUIRE(child->has_value());
+        CHECK((*child)->parent_id == parent->id);
+        CHECK((*child)->agents_failed == 0);
+        CHECK((*child)->agents_unanswered == 0);
+    }
 }
 
 // The async producers and re-eval refuse a pending parent before dispatching anything.
@@ -52997,6 +53027,19 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a pending parent is refus
         CHECK(body["error"]["code"] == kInvalidParams);
         CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
               std::string::npos);
+        std::string next;
+        CHECK(rs_bundle.get()->list_by_owner("test-user", "", 50, next).size() == 1);
+    }
+    SECTION("a failed parent is refused and the message says to re-create it") {
+        rs_bundle.get()->mark_failed(parent->id, "bound exceeded");
+        auto res = ts.call(request);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        const auto msg = body["error"]["message"].get<std::string>();
+        CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
+        CHECK(msg.find("re-create it") != std::string::npos);
         std::string next;
         CHECK(rs_bundle.get()->list_by_owner("test-user", "", 50, next).size() == 1);
     }

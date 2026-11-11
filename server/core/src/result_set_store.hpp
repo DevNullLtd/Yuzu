@@ -110,6 +110,7 @@
 #include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -248,7 +249,7 @@ struct CreateRequest {
 /// seeding from either would read as an empty (complete) membership. Every producer that
 /// accepts a `parent_id` applies this right after its owner check and before it reads the
 /// parent's members; a refusal is `parent_not_ready_message(parent)` (REST 409, MCP -32602).
-inline bool parent_may_seed(const ResultSet& parent) noexcept {
+[[nodiscard]] inline bool parent_may_seed(const ResultSet& parent) noexcept {
     return parent.status == ResultSetStatus::Materialized;
 }
 

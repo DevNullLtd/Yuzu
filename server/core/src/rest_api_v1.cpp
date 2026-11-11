@@ -14883,7 +14883,7 @@ void RestApiV1::register_routes(
             // A Forensics-tier plugin's stored responses are withheld from result-set membership,
             // so a set built from one would fill empty while every agent counts as answered.
             // Refuse before any execution row or dispatch (re-eval reaches here too).
-            if (!yuzu::server::plugin_may_seed_result_set(plugin, forensics_plugins)) {
+            if (!plugin_may_seed_result_set(plugin, forensics_plugins)) {
                 bool audit_ok = true;
                 if (audit_fn)
                     audit_ok = audit_fn(req, "result_set.create", "denied", "ResultSet", "",
@@ -14891,7 +14891,7 @@ void RestApiV1::register_routes(
                                             std::string(src_kind));
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
-                rs_err(res, 400, std::string(yuzu::server::kSourceNotSupportedMessage));
+                rs_err(res, 400, kSourceNotSupportedMessage);
                 return;
             }
             // #1788: these three producers are OPERATOR dispatch surfaces that

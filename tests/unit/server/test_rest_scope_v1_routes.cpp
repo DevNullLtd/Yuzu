@@ -594,3 +594,56 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview 503s on a degraded result-set st
     auto body = nlohmann::json::parse(r->body);
     CHECK(body["error"]["retry_after_ms"] == 5000);
 }
+
+// A referenced set the caller owns but cannot use as scope: a pending one may still fill
+// (transient, retry hint 5000), a failed one, or an incomplete one under NOT, will not change by
+// retrying (permanent, retry_after_ms null, remediation to re-run the producer). The message names
+// the set and the cause.
+TEST_CASE("scope v1: POST /api/v1/scope/preview 503s result_set_unusable with an honest retry hint",
+          "[pg][rest][scope][v1][result_set_unusable]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "tester"; // matches ScopeV1Harness's fixed auth_fn username
+    cr.source_kind = std::string(source_kind::kEchoQuery);
+    cr.source_payload = R"({"sql":"SELECT 1"})";
+    auto set = store.create_pending(cr, "exec-unusable");
+    REQUIRE(set.has_value());
+
+    ScopeV1Harness h{/*wire_fleet_read=*/true, /*wire_scope_evaluate=*/true, &store};
+    h.fleet_gate = authz::FleetReadGate{.admitted = true, .scope = std::nullopt};
+    const auto preview = [&h](const std::string& expression) {
+        auto r = h.sink.Post("/api/v1/scope/preview",
+                             nlohmann::json({{"expression", expression}}).dump());
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        return nlohmann::json::parse(r->body);
+    };
+
+    SECTION("a pending set is transient") {
+        auto body = preview("from_result_set:" + set->id);
+        CHECK(body["error"]["retry_after_ms"] == 5000);
+        const auto msg = body["error"]["message"].get<std::string>();
+        CHECK(msg.find("result_set_unusable") != std::string::npos);
+        CHECK(msg.find("cause=pending result_set=" + set->id) != std::string::npos);
+    }
+    SECTION("a failed set is permanent") {
+        store.mark_failed(set->id, "bound exceeded");
+        auto body = preview("from_result_set:" + set->id);
+        CHECK(body["error"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["message"].get<std::string>().find("cause=failed") !=
+              std::string::npos);
+        CHECK(body.dump().find("re-run the producer") != std::string::npos);
+    }
+    SECTION("an incomplete set under NOT is permanent") {
+        REQUIRE(store.materialize(set->id, {"agent-001"}, 1, 0).has_value());
+        auto body = preview("NOT from_result_set:" + set->id);
+        CHECK(body["error"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["message"].get<std::string>().find("cause=incomplete") !=
+              std::string::npos);
+    }
+}

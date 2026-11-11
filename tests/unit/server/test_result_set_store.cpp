@@ -973,7 +973,7 @@ TEST_CASE("ResultSetStore: member_set_owned refuses a set that is not materializ
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ResultSetError::NotReady);
     }
-    SECTION("failed -> Failed, distinct from pending") {
+    SECTION("failed -> Failed and distinct from pending") {
         auto rs = store.create_pending(pending_req("failed-set"), "exec-f");
         REQUIRE(rs.has_value());
         store.mark_failed(rs->id, "bound exceeded");

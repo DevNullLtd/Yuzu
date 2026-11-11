@@ -4918,23 +4918,80 @@ TEST_CASE("materialise: a success answer whose schema lacks the matcher column i
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
 
-TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",
-          "[result_set][async][agents_failed]") {
-    // The tick has no seam a test can drive (it is a lambda on the server's maintenance thread),
-    // so this pins the two lines lexically: the materialize call carries agents_failed, and a
-    // truncated read is marked failed instead of materialized.
-    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/server.cpp", std::ios::binary);
+namespace {
+// The text of a server source with `//` comments removed and every whitespace run collapsed to one
+// space (none after `(` or before `)`), so a pin matches a statement however it is wrapped, and a
+// comment between two pinned statements cannot satisfy or break the pin.
+std::string normalised_source(const std::string& file) {
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/" + file, std::ios::binary);
     REQUIRE(in.good());
     std::ostringstream ss;
     ss << in.rdbuf();
-    const auto src = ss.str();
-    CHECK(src.find("result_set_store_->materialize(p.id, members, agents_failed,") !=
-          std::string::npos);
-    CHECK(src.find("int64_t agents_unanswered = rs_matcher::unanswered_agent_count(") !=
-          std::string::npos);
-    CHECK(src.find("targeted, responded, execution_tracker_ != nullptr, dropped);") !=
-          std::string::npos);
-    CHECK(src.find("dropped = *lost;") != std::string::npos);
+    const std::string src = ss.str();
+    std::string out;
+    out.reserve(src.size());
+    bool space = false;
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        const char c = src[i];
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i + 1 < src.size() && src[i + 1] != '\n')
+                ++i;
+            space = true;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            space = true;
+            continue;
+        }
+        if (space && !out.empty() && out.back() != '(' && c != ')')
+            out += ' ';
+        space = false;
+        out += c;
+    }
+    return out;
+}
+
+std::size_t count_in(const std::string& text, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",
+          "[result_set][async][agents_failed]") {
+    // The tick has no seam a test can drive (it is a lambda on the server's maintenance thread),
+    // so this pins its statements over whitespace-normalised source: the cheap skip runs first,
+    // the dropped-answer count only after it (an unreadable count retries next tick, never reads
+    // as zero), the members read after both, and the whole materialize call carries both counters.
+    const auto src = normalised_source("server.cpp");
+    const std::string skip_then_count =
+        "const bool timed_out = now - p.created_at > kPendingTimeoutSeconds; "
+        "if (!terminal && !timed_out) continue; "
+        "if (execution_tracker_) { const auto lost = "
+        "execution_tracker_->count_response_dropped(p.source_execution_id); "
+        "if (!lost) { spdlog::warn(";
+    const auto skip_at = src.find(skip_then_count);
+    REQUIRE(skip_at != std::string::npos);
+    CHECK(count_in(src, skip_then_count) == 1);
+    const std::string after_warn =
+        "continue; } dropped = *lost; } "
+        "const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(targeted, "
+        "responded, execution_tracker_ != nullptr, dropped);";
+    const auto unanswered_at = src.find(after_warn, skip_at);
+    REQUIRE(unanswered_at != std::string::npos);
+    CHECK(unanswered_at - skip_at < 600); // the warn's arguments, nothing else, in between
+    const auto members_at = src.find("result_set_members(*response_store_, forensics_plugins(), p)",
+                                     unanswered_at);
+    REQUIRE(members_at != std::string::npos);
+    CHECK(members_at - unanswered_at < 2000);
+    // get_summary no longer carries the count: the tick reads it only for a set about to fill.
+    CHECK(src.find("agents_response_dropped") == std::string::npos);
+    const std::string materialize_call =
+        "if (result_set_store_->materialize(p.id, members, agents_failed, agents_unanswered)) {";
+    CHECK(count_in(src, materialize_call) == 1);
+    CHECK(src.find(materialize_call, members_at) != std::string::npos);
     // The parent's completeness is snapshotted onto the pending row at create time
     // (inherit_completeness); the tick never reads the parent.
     CHECK(src.find("fold_parent_completeness") == std::string::npos);
@@ -4952,29 +5009,30 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     const auto cont = branch.rfind("continue;");
     REQUIRE(cont != std::string::npos);
     CHECK(cont > marked);
-    CHECK(branch.substr(cont + std::string("continue;").size()).find_first_not_of(" \t\r\n}") ==
+    CHECK(branch.substr(cont + std::string("continue;").size()).find_first_not_of(" }") ==
           std::string::npos);
-    CHECK(marked < 1200);
+    CHECK(marked < 800);
 }
 
 TEST_CASE("ingest: every response-store site records a lost frame beside the agent's status",
           "[result_set][async][response_dropped]") {
     // The four ingest sites (Subscribe and gateway, RUNNING and terminal) have no seam a test
-    // can drive; pin them lexically. Each stores the frame, turns the outcome into the dropped
-    // flag, and hands the flag to the tracker so it lands in the same upsert as the status.
-    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/agent_service_impl.cpp", std::ios::binary);
-    REQUIRE(in.good());
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    const auto src = ss.str();
-    const auto count = [&](const std::string& needle) {
-        std::size_t n = 0;
-        for (auto at = src.find(needle); at != std::string::npos; at = src.find(needle, at + 1))
-            ++n;
-        return n;
-    };
-    CHECK(count("response_dropped = !store_outcome_durable(response_store_->store(sr));") == 4);
-    CHECK(count("resp, prov, response_dropped);") == 4);
+    // can drive; pin them over whitespace-normalised source. Each stores the frame, turns the
+    // outcome into the dropped flag, and hands the flag to the tracker so it lands in the same
+    // upsert as the status; both terminal sites also mark a failed finalize as dropped and report
+    // an earlier unverified streaming frame of the same agent.
+    const auto src = normalised_source("agent_service_impl.cpp");
+    CHECK(count_in(src, "response_dropped = !store_outcome_durable(response_store_->store(sr));") ==
+          4);
+    CHECK(count_in(src, "} else if (finalize_result == FR::Error) { response_dropped = true; }") ==
+          2);
+    CHECK(count_in(src, "else if (finalize_result == FR::Error) {") == 2);
+    CHECK(count_in(src, "resp, prov, response_dropped);") == 4);
+    CHECK(count_in(src, "resp, prov, /*response_dropped=*/false);") == 2);
+    CHECK(count_in(src, "if (!prov.verified()) note_unverified_frame(resp.command_id(), agent_id);") ==
+          2);
+    CHECK(count_in(src, "if (take_unverified_frame(resp.command_id(), agent_id)) "
+                        "response_dropped = true;") == 2);
 }
 
 TEST_CASE("materialise: a success-status error| answer under the default matcher is a member "

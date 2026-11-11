@@ -143,8 +143,8 @@ int echo_row_count(std::string_view output);
 /// response the response store did not persist: their answer is not in the stored rows), floored
 /// at 1: with no tracker data, or none targeted, completeness cannot be proven, so the set reads
 /// "not known complete" rather than complete. Never 0 while `dropped > 0`.
-inline int64_t unanswered_agent_count(int64_t targeted, int64_t responded, bool tracker_present,
-                                      int64_t dropped = 0) {
+[[nodiscard]] inline int64_t unanswered_agent_count(int64_t targeted, int64_t responded,
+                                                    bool tracker_present, int64_t dropped = 0) {
     const int64_t lost = dropped > 0 ? dropped : 0;
     if (tracker_present && targeted > 0 && responded >= targeted && lost == 0)
         return 0;

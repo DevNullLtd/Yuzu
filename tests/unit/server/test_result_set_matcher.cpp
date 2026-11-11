@@ -787,15 +787,15 @@ TEST_CASE("unanswered_agent_count: terminal is zero and unproven completion is a
     CHECK(unanswered_agent_count(3, 1, true) == 2);
     CHECK(unanswered_agent_count(1, 1, true) == 0);
     CHECK(unanswered_agent_count(3, 5, true) == 0);
-    CHECK(unanswered_agent_count(0, 0, true) >= 1);
-    CHECK(unanswered_agent_count(3, 3, false) >= 1);
-    CHECK(unanswered_agent_count(0, 0, false) >= 1);
+    CHECK(unanswered_agent_count(0, 0, true) == 1);
+    CHECK(unanswered_agent_count(3, 3, false) == 1);
+    CHECK(unanswered_agent_count(0, 0, false) == 1);
 }
 
 TEST_CASE("unanswered_agent_count: a counted answer whose response was not stored is unanswered",
           "[result_set][rs_matcher][agents_unanswered]") {
     // Every targeted agent responded, but one terminal answer was lost on ingest.
-    CHECK(unanswered_agent_count(1, 1, true, 1) >= 1);
+    CHECK(unanswered_agent_count(1, 1, true, 1) == 1);
     CHECK(unanswered_agent_count(3, 3, true, 2) == 2);
     // Dropped answers add to agents that never responded; the two sets are disjoint.
     CHECK(unanswered_agent_count(5, 3, true, 1) == 3);

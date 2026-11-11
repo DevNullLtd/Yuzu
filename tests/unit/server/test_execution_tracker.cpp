@@ -1401,6 +1401,102 @@ TEST_CASE("ExecutionTracker: a lost streaming frame survives the agent's termina
     CHECK(tracker.count_response_dropped(*id_result) == 1);
 }
 
+// The dropped count is exact: zero for an execution whose agents all had their answers kept,
+// and one per agent whose answer was not (never a floor or a "not known" stand-in).
+TEST_CASE("ExecutionTracker: count_response_dropped is exact per execution",
+          "[pg][execution_tracker][response_dropped]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto clean_exec = tracker.create_execution(make_execution());
+    auto lossy_exec = tracker.create_execution(make_execution());
+    REQUIRE(clean_exec.has_value());
+    REQUIRE(lossy_exec.has_value());
+
+    // No agent rows yet: zero, not "unknown".
+    CHECK(tracker.count_response_dropped(*clean_exec) == 0);
+
+    AgentExecStatus kept;
+    kept.agent_id = "agent-kept";
+    kept.status = "success";
+    tracker.update_agent_status(*clean_exec, kept);
+    AgentExecStatus clean;
+    clean.agent_id = "agent-clean";
+    clean.status = "failure";
+    tracker.update_agent_status(*clean_exec, clean);
+    CHECK(tracker.count_response_dropped(*clean_exec) == 0);
+
+    AgentExecStatus lost;
+    lost.agent_id = "agent-lost";
+    lost.status = "success";
+    lost.response_dropped = true;
+    tracker.update_agent_status(*lossy_exec, lost);
+    tracker.update_agent_status(*lossy_exec, kept);
+    CHECK(tracker.count_response_dropped(*lossy_exec) == 1);
+    // The other execution is unaffected by this one's lost answer.
+    CHECK(tracker.count_response_dropped(*clean_exec) == 0);
+}
+
+// Migration v10 adds response_dropped. Roll the recorded version back to 9 and drop the column, as
+// a database last opened by the previous build would be, then open the tracker twice: the first
+// open applies v10 and reads the old row as not dropped, the second applies nothing and keeps the
+// flag written after the first. A migration-in-substance case, so it takes the migration macro.
+TEST_CASE("ExecutionTracker: migration v10 applies on a v9 database and old rows read not dropped",
+          "[pg][execution_tracker][migration][response_dropped]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    const auto scalar = [&db](const std::string& sql) {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.ok());
+        return PQntuples(r.get()) > 0 ? std::string(PQgetvalue(r.get(), 0, 0)) : std::string();
+    };
+    std::string exec_id;
+    {
+        pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ExecutionTracker tracker{pool};
+        REQUIRE(tracker.is_open());
+        auto id = tracker.create_execution(make_execution());
+        REQUIRE(id.has_value());
+        exec_id = *id;
+        AgentExecStatus old_row;
+        old_row.agent_id = "agent-old";
+        old_row.status = "success";
+        tracker.update_agent_status(exec_id, old_row);
+    }
+    scalar("ALTER TABLE execution_tracker.agent_exec_status DROP COLUMN response_dropped");
+    scalar("UPDATE public.schema_meta SET version = 9 WHERE store = 'execution_tracker'");
+    const std::string column_count_sql =
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+        "'execution_tracker' AND table_name = 'agent_exec_status' AND column_name = "
+        "'response_dropped'";
+    REQUIRE(scalar(column_count_sql) == "0");
+
+    for (int open = 0; open < 2; ++open) {
+        INFO("open " << open);
+        pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ExecutionTracker tracker{pool};
+        REQUIRE(tracker.is_open());
+        CHECK(scalar(column_count_sql) == "1");
+        CHECK(scalar("SELECT version FROM public.schema_meta WHERE store = "
+                     "'execution_tracker'") == "10");
+        CHECK(scalar("SELECT response_dropped::text FROM execution_tracker.agent_exec_status "
+                     "WHERE agent_id = 'agent-old'") == "false");
+        if (open == 0) {
+            CHECK(tracker.count_response_dropped(exec_id) == 0);
+            AgentExecStatus lost;
+            lost.agent_id = "agent-new";
+            lost.status = "success";
+            lost.response_dropped = true;
+            tracker.update_agent_status(exec_id, lost);
+        }
+        CHECK(tracker.count_response_dropped(exec_id) == 1);
+    }
+}
+
 TEST_CASE("ExecutionTracker: a later frame overwrites the typed status via ON CONFLICT (CC-07)",
           "[pg][execution_tracker][cc07]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
