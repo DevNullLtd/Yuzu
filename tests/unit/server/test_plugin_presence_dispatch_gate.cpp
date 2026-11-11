@@ -562,7 +562,7 @@ TEST_CASE("an agent reporting only the retired `tar` plugin does not count as ha
     CHECK(std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end());
 }
 
-TEST_CASE("an agent reporting `echo` has it, and send_to / send_to_all write `echo` to the wire",
+TEST_CASE("an agent reporting `echo` has it and send_to / send_to_all write `echo` to the wire",
           "[server][dispatch][registry][echo_rename]") {
     EventBus bus;
     yuzu::MetricsRegistry metrics;
