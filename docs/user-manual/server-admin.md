@@ -763,12 +763,6 @@ typically within seconds.
 **What to do.** Treat `503` on these two routes as retryable infrastructure degradation, distinct from
 a genuine `409`/`400`. No action needed if your automation already retries on `503` generically.
 
-**Also: a result set that is not ready or is incomplete.** Both routes also answer this `503` when the
-policy's scope references a result set that is still pending, has failed, or is incomplete and is
-referenced under `NOT` (reason `result_set_unusable`). A pending set clears once it is materialized; a
-failed set, or an incomplete set under `NOT`, does not clear by retrying: re-run the producer that
-created the set. See [upgrading.md](upgrading.md).
-
 ### vNEXT — server TLS listeners now pin a fixed TLS 1.2 cipher allow-list; a previously-set `GRPC_SSL_CIPHER_SUITES` no longer applies (#4722; breaking)
 
 **What changed.** The server now unconditionally overwrites `GRPC_SSL_CIPHER_SUITES` in its own process environment before any gRPC call, and applies the same six-suite ECDHE TLS 1.2 allow-list to the HTTPS dashboard listener and its certificate hot-reload validation. It self-checks the resolved policy at boot and refuses to start if the allow-list resolves to zero usable TLS 1.2 ciphers on the local OpenSSL build. See [TLS policy](tls.md) for the exact list and what CI proves about it.
