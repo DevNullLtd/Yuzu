@@ -38714,7 +38714,7 @@ TEST_CASE("MCP create_result_set: a malformed or empty parent_id is refused with
 // Roll-up only: a result set reports the failure signal, and a set stored over a raw capture table
 // is refused rather than re-run to an empty membership. The nine row schemas share one macro, so one
 // tool pins the fields.
-TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed, agents_unanswered and partial as required",
+TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed and agents_unanswered and partial as required",
           "[mcp][integration][result-sets][agents_failed]") {
     McpTestServer ts;
     ts.start();
