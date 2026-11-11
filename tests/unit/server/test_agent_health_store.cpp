@@ -2009,6 +2009,21 @@ TEST_CASE("catalogue_plugin_names skips the __-prefixed protocol names",
         CHECK_FALSE(n.starts_with("__"));
 }
 
+TEST_CASE("every catalogue row's plugin name is already lowercase",
+          "[health_store][echo][real]") {
+    // Dispatch folds plugin-name case, but the label match is an exact lookup against the
+    // lowercased catalogue set. That is sound only while every shipped name is lowercase: a
+    // future mixed-case plugin name would never get its own series, so fail loudly here.
+    static const yuzu::server::CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
+    std::size_t rows = 0;
+    registry.for_each_row([&](const yuzu::server::CommandCapability& cap) {
+        ++rows;
+        INFO("plugin: " << std::string{cap.plugin});
+        CHECK(yuzu::server::ascii_lower(cap.plugin) == std::string{cap.plugin});
+    });
+    CHECK(rows > 0);
+}
+
 TEST_CASE("REAL AgentHealthStore: yuzu_fleet_plugin_init_failed is per plugin, bounded by the catalogue, absent-not-zero",
           "[health_store][echo][corruption][real]") {
     REQUIRE(catalogue_names().size() > 70); // the fleet-wide case below uses 70 distinct names
@@ -2156,6 +2171,45 @@ TEST_CASE("REAL AgentHealthStore: plugin_init_failed_rejected is published every
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     for (const char* r : reasons)
         CHECK(series_val(metrics.serialize(), rejected_series(r)) == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a 64-character token is accepted, a 65-character one is malformed",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    // Exactly 64 well-formed characters is a token: not malformed, and (not in the catalogue)
+    // counted once as unknown_plugin, summed under plugin="unknown".
+    beat_tags(store, "edge", {{"yuzu.plugins_failed", std::string(64, 'x')}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    auto out = metrics.serialize();
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 0.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
+    CHECK(series_val(out, init_failed_series("unknown")) == 1.0);
+
+    beat_tags(store, "edge", {{"yuzu.plugins_failed", std::string(65, 'x')}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 0.0);
+    CHECK_FALSE(has_series(out, init_failed_series("unknown")));
+}
+
+TEST_CASE("REAL AgentHealthStore: one agent with two rejection reasons is counted once per reason",
+          "[health_store][echo][real]") {
+    AgentHealthStore store;
+    store.set_known_plugins(catalogue_names());
+    yuzu::MetricsRegistry metrics;
+    // Two unknown names and two malformed ones from the SAME agent: each reason counts that
+    // agent once, not once per token; the unknown tokens still sum to 2 under plugin="unknown".
+    beat_tags(store, "both", {{"yuzu.plugins_failed", "nosuchplugin_1,bad-name,nosuchplugin_2,also bad,echo"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const auto out = metrics.serialize();
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectUnknownPlugin)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectMalformed)) == 1.0);
+    CHECK(series_val(out, rejected_series(yuzu::server::kRejectOverCap)) == 0.0);
+    CHECK(series_val(out, init_failed_series("unknown")) == 2.0);
+    CHECK(series_val(out, init_failed_series("echo")) == 1.0);
 }
 
 TEST_CASE("REAL AgentHealthStore: an empty token carries no name and is not malformed",
