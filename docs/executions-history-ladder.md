@@ -777,14 +777,16 @@ in-memory registry (`unverified_frame_registry.hpp`); a frame with no dispatch r
 recorded, because it can never reach a tracker row. The same pair's terminal frame checks the
 record without erasing it and reports `response_dropped`; the record is erased only after the
 tracker row has been written with that flag, so a terminal frame whose own lookup or tracker write
-fails leaves the record for a replayed terminal frame. The registry is bounded and fails closed:
-64 entries per agent (one agent's frames evict only its own oldest entries), 4,096 in all, a
-command id over 128 bytes or an agent id over 256 bytes is never kept as an entry, and one hour per
-entry. A pair it evicts or cannot keep has its command id remembered (at most 1,024 commands), and
-every agent of that command then reports `response_dropped`; when even that cannot be kept, a
-one-hour latch makes every terminal answer report `response_dropped`. Over-reporting a set as
-partial is the safe direction. Evictions count as
-`yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`, ids it could
-not keep as `{reason="unverified_registry_skipped"}`. Residual: the record is held in the server
-process, so a restart, or a terminal frame served by a different replica than the non-terminal
-one, loses it and the set can read as complete without that frame's output.
+fails leaves the record for a replayed terminal frame. A lost answer whose tracker row could not be
+written (`update_agent_status` returned false) is recorded in the same registry, so a later terminal
+or replayed frame of the pair still reports it. The registry keys on fixed-size digests of the ids
+and is bounded and fails closed: 64 entries per agent, 4,096 in all, one hour per entry. An agent
+past its own 64 is marked (at most 1,024 markers), and every answer of that agent then reports
+`response_dropped`: a flooding agent affects only its own answers. An entry evicted by the 4,096
+cap has its command id remembered (at most 1,024 commands), and every agent of that command then
+reports `response_dropped`. When a marker or a command cannot be kept, a one-hour latch makes every
+terminal answer report `response_dropped`; only this and a remembered command reach other agents.
+Over-reporting a set as partial is the safe direction. Evictions count as
+`yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Residual: the
+record is held in the server process, so a restart, or a terminal frame served by a different
+replica than the non-terminal one, loses it and the set can read as complete without that frame's output.

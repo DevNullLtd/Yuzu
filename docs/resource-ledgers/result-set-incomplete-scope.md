@@ -48,21 +48,27 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
 - **Site:** member of `AgentServiceImpl`, type `UnverifiedFrameRegistry`
   (`unverified_frame_registry.hpp`). Written by `note_unverified_frame` at the two RUNNING ingest
   sites (Subscribe and gateway) only when the frame's provenance lookup failed
-  (`ProvenanceOutcome::kLookupDegraded`); read without erasing by `unverified_frame_seen` at the
-  two terminal ingest sites; an entry is erased by `notify_exec_tracker` only after
+  (`ProvenanceOutcome::kLookupDegraded`), and by `notify_exec_tracker` when a frame the store did
+  not keep could not be recorded on a tracker row either (`update_agent_status` returned false) and
+  the registry does not already report the pair; read without erasing by `unverified_frame_seen` at
+  the two terminal ingest sites; an entry is erased by `notify_exec_tracker` only after
   `ExecutionTracker::update_agent_status` wrote a row carrying a true `response_dropped`.
-- **Owner type:** owned by value by the service; `std::map`/`std::set` entries plus a `std::mutex`,
-  no thread, no callback, no handle.
-- **Bound:** 64 entries per agent (a new one evicts that agent's own oldest), 4,096 entries in all
-  (oldest evicted); a command id over 128 bytes or an agent id over 256 bytes is never kept as an
-  entry. Each eviction is counted as
-  `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}` and each id it
-  could not keep as `{reason="unverified_registry_skipped"}`. Evicted or unkeepable pairs fail
-  closed: their command id is remembered (at most 1,024, so at most 128 KiB of id bytes) and reads
-  as not fully stored for every agent; a command id it cannot remember, or a full command set, sets
-  one latch under which every pair reads as not fully stored. Entries, remembered commands and the
-  latch last one hour (expired on every `note` and `contains`, against `steady_clock` seconds).
-  Total held bytes are bounded by the entry and command caps times the id caps.
+- **Owner type:** owned by value by the service; `std::map`/`std::set` entries keyed by 64-bit
+  digests of the ids (`std::hash<std::string_view>`, in process only) plus a `std::mutex`, no
+  thread, no callback, no handle.
+- **Bound:** 64 entries per agent, 4,096 entries in all, 1,024 agent markers and 1,024 remembered
+  commands, every one a fixed-size node (two 64-bit digests or one, plus a time and a sequence), so
+  held memory does not depend on id length (well under 1 MiB at the caps). A new entry past an
+  agent's own cap evicts that agent's oldest entry and marks the agent (every pair of a marked agent
+  reads as not fully stored; a flooding agent affects only its own pairs); past the global cap the
+  oldest entry is evicted and its command remembered (every agent of it reads as not fully stored).
+  A full marker set or command set sets one latch under which every pair reads as not fully stored:
+  only these reach other agents. Each eviction is counted as
+  `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Entries,
+  markers, remembered commands and the latch last one hour (expired on every `note` and `contains`,
+  against `steady_clock` seconds). `note` inserts into its three indexes or none, and sets a marker
+  or remembers a command before it erases the entry that stands for it, so an allocation failure
+  leaves no orphan and loses no record.
 - **Lock:** its own `mu_`, held only for the map operations; no other lock is taken under it and it
   is never held across I/O.
 - **Release point:** each entry on a recorded flag, expiry or eviction; the whole registry with the
@@ -84,3 +90,11 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
   `mcp_server_` in `ServerImpl`, so it is destroyed after both surfaces and after the HTTP server
   whose handler threads run the lambdas; it is immutable after construction, so no lock is needed.
 - **Failure cleanup:** none; a null pointer (an unwired test harness only) refuses nothing.
+
+### Function-local `static RefusalLogThrottle` log limiters
+- **Site:** `unreadable_log` in the result-set fill lambda (`server.cpp`) and `marker_log` in
+  `AgentServiceImpl::note_unverified_frame` (`agent_service_impl.cpp`).
+- **Owner type:** function-local statics; a bounded map (at most 1,024 keys, its own mutex) of the
+  last warn time per set id or agent id. Only the log line is limited; counters record every case.
+- **Release point:** static destruction at process exit.
+- **Failure cleanup:** none needed; a full map demotes the line, never grows.

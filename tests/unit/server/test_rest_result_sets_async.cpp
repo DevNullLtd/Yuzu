@@ -5066,9 +5066,18 @@ TEST_CASE("ingest: a failed provenance lookup is carried to the terminal answer 
         ++sites;
     }
     CHECK(sites == 2);
-    CHECK(count_in(src, "if (tracker->update_agent_status(execution_id, s) && response_dropped) "
-                        "unverified_frames_.forget(command_id, agent_id);") == 1);
+    // A lost answer whose tracker row could not be written is noted instead (only when the record
+    // does not already hold it), so a later terminal or replayed frame still reports it.
+    CHECK(count_in(src, "const bool recorded = tracker->update_agent_status(execution_id, s); "
+                        "if (response_dropped) { if (recorded) "
+                        "unverified_frames_.forget(command_id, agent_id); "
+                        "else if (!unverified_frame_seen(command_id, agent_id)) "
+                        "note_unverified_frame(command_id, agent_id); }") == 1);
     CHECK(count_in(src, "unverified_frames_.forget(") == 1);
+    CHECK(count_in(src, "update_agent_status(") == 1);
+    // Three note sites (two failed lookups, one failed tracker write) plus the definition.
+    CHECK(count_in(src, "note_unverified_frame(") == 4);
+    CHECK(count_in(src, "note_unverified_frame(command_id, agent_id);") == 1);
 }
 
 TEST_CASE("create: every async producer snapshots its parent's completeness",

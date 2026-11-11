@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server::rs_matcher;
@@ -888,62 +889,124 @@ TEST_CASE("UnverifiedFrameRegistry: an evicted pair still reads as not fully sto
     CHECK_FALSE(reg.contains("cmd-a", "a1", 12 + 3600));
 }
 
-TEST_CASE("UnverifiedFrameRegistry: one agent's flood evicts only its own entries",
+TEST_CASE("UnverifiedFrameRegistry: an agent past its own cap is marked and other agents are "
+          "unaffected",
           "[result_set][unverified_frames]") {
     UnverifiedFrameRegistry reg(100, 3600, 3, 50);
     (void)reg.note("cmd-b", "agent-b", 1);
-    for (int i = 0; i < 10; ++i)
-        CHECK(reg.note("flood-" + std::to_string(i), "agent-a", 2 + i).evicted ==
-              std::size_t{i < 3 ? 0u : 1u});
+    for (int i = 0; i < 10; ++i) {
+        const auto r = reg.note("many-" + std::to_string(i), "agent-a", 2 + i);
+        CHECK(r.evicted == std::size_t{i < 3 ? 0u : 1u});
+        CHECK(r.marked == (i == 3)); // set once, then refreshed
+        CHECK_FALSE(r.latched);
+    }
     CHECK(reg.size() == 4); // agent-a holds its cap of three, agent-b its one entry
+    // agent-a's marker covers every answer of agent-a, including commands it never sent.
+    CHECK(reg.contains("many-0", "agent-a", 20));
+    CHECK(reg.contains("never-sent", "agent-a", 20));
+    // Nothing reaches another agent: no remembered command and no latch.
+    CHECK_FALSE(reg.contains("many-0", "agent-b", 20));
+    CHECK_FALSE(reg.contains("never-sent", "agent-c", 20));
     reg.forget("cmd-b", "agent-a"); // not agent-b's pair
     CHECK(reg.contains("cmd-b", "agent-b", 20));
     reg.forget("cmd-b", "agent-b");
-    CHECK_FALSE(reg.contains("cmd-b", "agent-b", 20)); // it was an entry, never a remembered command
-    // agent-a's evicted commands still read as not fully stored.
-    CHECK(reg.contains("flood-0", "agent-a", 20));
+    CHECK_FALSE(reg.contains("cmd-b", "agent-b", 20));
+    // The marker ages out counted from its last refresh (t=11).
+    CHECK(reg.contains("never-sent", "agent-a", 11 + 3599));
+    CHECK_FALSE(reg.contains("never-sent", "agent-a", 11 + 3600));
 }
 
-TEST_CASE("UnverifiedFrameRegistry: an id it cannot keep fails closed",
+TEST_CASE("UnverifiedFrameRegistry: a full set of agent markers sets the latch",
           "[result_set][unverified_frames]") {
-    SECTION("an agent id longer than any enrolled one remembers the command") {
-        UnverifiedFrameRegistry reg;
-        const std::string long_agent(UnverifiedFrameRegistry::kMaxAgentIdBytes + 1, 'x');
-        const auto r = reg.note("cmd", long_agent, 100);
-        CHECK(r.skipped);
-        CHECK_FALSE(r.latched);
-        CHECK(reg.size() == 0);
-        CHECK(reg.contains("cmd", "any-agent", 101));
-        CHECK_FALSE(reg.contains("other-cmd", "any-agent", 101));
-    }
-    SECTION("a command id longer than any minted one sets the latch") {
-        UnverifiedFrameRegistry reg(16, 60);
-        const std::string long_cmd(UnverifiedFrameRegistry::kMaxCommandIdBytes + 1, 'c');
-        const auto r = reg.note(long_cmd, "agent-a", 100);
-        CHECK(r.skipped);
-        CHECK(r.latched);
-        CHECK(reg.size() == 0);
-        CHECK(reg.contains("any-cmd", "any-agent", 159)); // every pair, for the age bound
-        CHECK_FALSE(reg.contains("any-cmd", "any-agent", 160));
-    }
-    SECTION("a command id at the bound is kept as an entry") {
-        UnverifiedFrameRegistry reg;
-        const std::string cmd(UnverifiedFrameRegistry::kMaxCommandIdBytes, 'c');
-        CHECK_FALSE(reg.note(cmd, "agent-a", 100).skipped);
-        CHECK(reg.size() == 1);
-    }
+    UnverifiedFrameRegistry reg(100, 60, 1, 64, 2);
+    (void)reg.note("c0", "a", 100);
+    CHECK(reg.note("c1", "a", 101).marked); // a's own cap of one: a is marked
+    (void)reg.note("c0", "b", 102);
+    const auto b = reg.note("c1", "b", 103);
+    CHECK(b.marked);
+    CHECK_FALSE(b.latched); // two markers fit
+    CHECK_FALSE(reg.contains("c9", "z", 103));
+    (void)reg.note("c0", "c", 104);
+    const auto c = reg.note("c1", "c", 105); // a third marker: the oldest is dropped
+    CHECK(c.latched);
+    CHECK(reg.contains("c9", "z", 106)); // the latch covers every pair
+    CHECK(reg.contains("c9", "a", 106)); // including the dropped marker's agent
+    CHECK_FALSE(reg.contains("c9", "z", 105 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a long id is kept as a fixed-size entry",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(16, 60);
+    const std::string long_cmd(100000, 'c');
+    const std::string long_agent(100000, 'a');
+    const auto r = reg.note(long_cmd, long_agent, 100);
+    CHECK(r.evicted == 0);
+    CHECK_FALSE(r.latched);
+    CHECK(reg.size() == 1);
+    CHECK(reg.contains(long_cmd, long_agent, 101));
+    CHECK_FALSE(reg.contains("other-cmd", "other-agent", 101)); // no latch
+    reg.forget(long_cmd, long_agent);
+    CHECK(reg.size() == 0);
+}
+
+TEST_CASE("UnverifiedFrameRegistry: ids that share a digest only over-report",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(16, 60, 64, 1024, 1024, +[](std::string_view) -> uint64_t {
+        return 7;
+    });
+    (void)reg.note("cmd-1", "agent-a", 100);
+    CHECK(reg.contains("cmd-2", "agent-b", 101)); // reported, never missed
+    CHECK(reg.note("cmd-2", "agent-b", 102).evicted == 0); // read as the same pair
+    CHECK(reg.size() == 1);
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a lost answer noted after a failed tracker write reaches the "
+          "replayed terminal frame",
+          "[result_set][unverified_frames]") {
+    // notify_exec_tracker notes the pair when the store did not keep the frame and the tracker
+    // row could not be written either; the replayed terminal frame then reads it, and it is
+    // erased only after a tracker write that carried the flag.
+    UnverifiedFrameRegistry reg;
+    CHECK_FALSE(reg.contains("cmd", "agent-a", 100)); // the caller notes only when not held
+    (void)reg.note("cmd", "agent-a", 100);
+    CHECK(reg.contains("cmd", "agent-a", 101)); // replayed terminal frame: still dropped
+    CHECK(reg.contains("cmd", "agent-a", 102)); // its write failed too: still held
+    reg.forget("cmd", "agent-a");               // a write that carried the flag
+    CHECK_FALSE(reg.contains("cmd", "agent-a", 103));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: concurrent note contains and forget stay consistent",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(64, 3600, 8, 32, 32);
+    std::thread writer([&reg] {
+        for (int i = 0; i < 5000; ++i) {
+            const std::string cmd = "c" + std::to_string(i % 200);
+            const std::string agent = "a" + std::to_string(i % 13);
+            (void)reg.note(cmd, agent, i);
+            if (i % 3 == 0)
+                reg.forget(cmd, agent);
+        }
+    });
+    std::size_t seen = 0;
+    for (int i = 0; i < 5000; ++i)
+        seen += reg.contains("c" + std::to_string(i % 200), "a" + std::to_string(i % 13), i) ? 1 : 0;
+    writer.join();
+    CHECK(seen <= 5000);
+    CHECK(reg.size() <= 64);
 }
 
 TEST_CASE("UnverifiedFrameRegistry: a full set of remembered commands sets the latch",
           "[result_set][unverified_frames]") {
-    UnverifiedFrameRegistry reg(1, 60, 1, 2);
-    (void)reg.note("c0", "a", 100);
-    CHECK_FALSE(reg.note("c1", "a", 101).latched); // evicts c0: one remembered command
-    CHECK_FALSE(reg.note("c2", "a", 102).latched); // evicts c1: two
-    const auto r = reg.note("c3", "a", 103);       // evicts c2: three > 2, the oldest is dropped
+    // Distinct agents, so every eviction is by the global cap of one entry.
+    UnverifiedFrameRegistry reg(1, 60, 64, 2);
+    (void)reg.note("c0", "a0", 100);
+    CHECK_FALSE(reg.note("c1", "a1", 101).latched); // evicts c0: one remembered command
+    CHECK_FALSE(reg.note("c2", "a2", 102).latched); // evicts c1: two
+    const auto r = reg.note("c3", "a3", 103);       // evicts c2: three > 2, the oldest is dropped
     CHECK(r.latched);
+    CHECK_FALSE(r.marked);                          // a global eviction never marks an agent
     CHECK(reg.contains("never-seen", "b", 104));   // the latch covers every pair
-    CHECK(reg.contains("c0", "a", 104));           // including the dropped command
-    CHECK_FALSE(reg.note("c4", "a", 105).latched); // already set: not reported again
+    CHECK(reg.contains("c0", "a0", 104));          // including the dropped command
+    CHECK_FALSE(reg.note("c4", "a4", 105).latched); // already set: not reported again
     CHECK_FALSE(reg.contains("never-seen", "b", 103 + 60 + 2)); // the latch ages out
 }

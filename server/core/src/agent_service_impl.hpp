@@ -542,13 +542,14 @@ private:
     /// gauge. Caller holds `cmd_times_mu_`.
     void publish_send_times_gauge_locked();
 
-    /// Non-terminal frames whose provenance lookup failed, per (command id, agent id), until a
-    /// tracker row of the same pair records them as a lost answer (`response_dropped`). Bounded,
-    /// fails closed, self-locking (unverified_frame_registry.hpp); lives and dies with this service.
+    /// Answers that may be missing from the response store (a non-terminal frame whose provenance
+    /// lookup failed, or a frame the store did not keep whose tracker row could not be written),
+    /// per (command id, agent id), until a tracker row of the same pair records them as a lost
+    /// answer (`response_dropped`). Bounded, fails closed, self-locking
+    /// (unverified_frame_registry.hpp); lives and dies with this service.
     UnverifiedFrameRegistry unverified_frames_;
-    /// Records a RUNNING frame whose provenance lookup failed; counts an eviction as
-    /// `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}` and a
-    /// pair it could not keep as `{reason="unverified_registry_skipped"}`.
+    /// Records such a pair; counts an eviction as
+    /// `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`.
     void note_unverified_frame(const std::string& command_id, const std::string& agent_id);
     /// True when the pair's answer must be reported as not fully stored. Erases nothing:
     /// `notify_exec_tracker` forgets the pair once a tracker row has recorded the flag.

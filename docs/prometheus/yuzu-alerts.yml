@@ -3850,7 +3850,7 @@ groups:
       # drop rather than being summed together.
       - alert: YuzuResponseIngestDrops
         expr: |
-          sum(rate(yuzu_server_response_ingest_dropped_total{reason!~"malformed_identity_field|per_agent_cap|unverified_registry_overflow|unverified_registry_skipped"}[5m])) by (reason) > 0
+          sum(rate(yuzu_server_response_ingest_dropped_total{reason!~"malformed_identity_field|per_agent_cap|unverified_registry_overflow"}[5m])) by (reason) > 0
         for: 10m
         labels:
           severity: warning
@@ -3862,8 +3862,8 @@ groups:
             — malformed_identity_field and per_agent_cap excluded, those are
             agent behaviour, not store unhealth; see
             YuzuResponseMalformedIdentityDrops and
-            YuzuResponsePerAgentCapDrops for those cases; the two
-            unverified_registry reasons are reported by
+            YuzuResponsePerAgentCapDrops for those cases;
+            unverified_registry_overflow is reported by
             YuzuUnverifiedFrameRecordOverflow).
             The executions ladder still tracks the commands, but drawer/Echo
             result history is lossy — check PostgreSQL pool saturation / health.
@@ -3923,7 +3923,7 @@ groups:
       # `for`: one increase already means sets were reported partial.
       - alert: YuzuUnverifiedFrameRecordOverflow
         expr: |
-          sum(increase(yuzu_server_response_ingest_dropped_total{reason=~"unverified_registry_overflow|unverified_registry_skipped"}[1h])) by (reason) > 0
+          sum(increase(yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}[1h])) by (reason) > 0
         labels:
           severity: info
         annotations:

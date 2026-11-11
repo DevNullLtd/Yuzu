@@ -2564,8 +2564,8 @@ public:
         metrics_.describe("yuzu_server_response_ingest_dropped_total",
                           "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
                           "by reason (store_not_open/pool_acquire_timeout/query_error/"
-                          "malformed_identity_field/per_agent_cap/unverified_registry_overflow/"
-                          "unverified_registry_skipped) - the executions ladder still tracks the "
+                          "malformed_identity_field/per_agent_cap/unverified_registry_overflow) "
+                          "- the executions ladder still tracks the "
                           "command; a sustained non-zero rate means drawer/Echo result history is "
                           "silently lossy. malformed_identity_field is distinct: an "
                           "instruction_id/execution_id/plugin containing an embedded NUL byte was "
@@ -2573,10 +2573,10 @@ public:
                           "here means an agent sent a malformed identity field, not store "
                           "unhealth. per_agent_cap is likewise agent behaviour: an agent exceeded "
                           "the per-(command, agent) row cap (--response-max-rows-per-agent), "
-                          "not store unhealth. unverified_registry_overflow / "
-                          "unverified_registry_skipped count a record of a streaming frame whose "
-                          "provenance lookup failed that was evicted or could not be kept (not a "
-                          "row): the affected answers are reported as not fully stored",
+                          "not store unhealth. unverified_registry_overflow is not a row either: "
+                          "it counts entries evicted from the in-memory record of answers that may "
+                          "be missing (a streaming frame whose provenance lookup failed); the "
+                          "affected answers are reported as not fully stored instead",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "
@@ -2602,7 +2602,7 @@ public:
         // spurious always-zero series for a reason it can never emit.
         for (const auto reason :
              {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field",
-              "per_agent_cap", "unverified_registry_overflow", "unverified_registry_skipped"})
+              "per_agent_cap", "unverified_registry_overflow"})
             metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_response_read_degrade_total",

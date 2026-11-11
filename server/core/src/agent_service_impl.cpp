@@ -83,9 +83,6 @@ namespace {
 // bound as one agent, plugin_result_audit.hpp).
 static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
               "the registry audit budget must key on a whole agent id");
-// The unverified-frame record keeps any enrolled agent id as a pair (a longer one fails closed).
-static_assert(UnverifiedFrameRegistry::kMaxAgentIdBytes == auth::kMaxAgentIdLength,
-              "the unverified-frame record must keep every enrolled agent id");
 
 // Persists the `registry.write` audit rows one stored output frame owes (see
 // plugin_result_audit.hpp for the binding: a minted registry command id AND an agent-stamped
@@ -2304,11 +2301,16 @@ void AgentServiceImpl::note_unverified_frame(const std::string& command_id,
             .counter("yuzu_server_response_ingest_dropped_total",
                      {{"reason", "unverified_registry_overflow"}})
             .increment(static_cast<double>(noted.evicted));
-    if (noted.skipped)
-        metrics_
-            .counter("yuzu_server_response_ingest_dropped_total",
-                     {{"reason", "unverified_registry_skipped"}})
-            .increment();
+    // The counter is the evidence for every eviction; these lines name the agent only when a
+    // marker or the latch is first set (at most one line per 10 min per agent for a marker).
+    if (noted.marked) {
+        static RefusalLogThrottle marker_log(std::chrono::seconds(600));
+        if (marker_log.should_warn(agent_id))
+            spdlog::warn("[ingest] the unverified-frame record is full for agent={}: every answer "
+                         "of that agent recorded in the next {} s is reported as not fully stored",
+                         yuzu::log_id_token(agent_id),
+                         UnverifiedFrameRegistry::kDefaultMaxAgeSeconds);
+    }
     if (noted.latched)
         spdlog::warn("[ingest] the unverified-frame record cannot keep an entry: every agent "
                      "answer recorded in the next {} s is reported as not fully stored (agent={})",
@@ -2496,8 +2498,15 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     }
     // The row now carries the dropped-answer flag (sticky), so the record of an earlier unverified
     // frame of this pair has done its job; a failed upsert keeps it for a replayed terminal frame.
-    if (tracker->update_agent_status(execution_id, s) && response_dropped)
-        unverified_frames_.forget(command_id, agent_id);
+    // A lost answer whose row could not be written is recorded instead, so a later terminal or
+    // replayed frame of the pair still reports it.
+    const bool recorded = tracker->update_agent_status(execution_id, s);
+    if (response_dropped) {
+        if (recorded)
+            unverified_frames_.forget(command_id, agent_id);
+        else if (!unverified_frame_seen(command_id, agent_id))
+            note_unverified_frame(command_id, agent_id);
+    }
 }
 
 void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const std::string& plugin,
