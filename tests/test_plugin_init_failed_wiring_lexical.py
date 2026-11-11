@@ -12,14 +12,15 @@ Required (comments stripped, whitespace/line-wrap tolerant; the wiring, thread-s
 recompute tokens are matched with string, raw-string and character literal contents blanked, so a
 statement spelt inside a literal cannot stand in for the call):
   * `health_store_.set_known_plugins(catalogue_plugin_names(capability_registry_))` exists EXACTLY
-    once, and the registry it reads is composed (declared) in the same file;
+    once, and no other call of `set_known_plugins(` with any argument exists, and the registry it reads is composed (declared) in the same file;
   * that statement precedes the start of health_recompute_thread_ (which itself starts at exactly
     one site) and every health_store_.recompute_metrics( call;
   * both metrics_.describe registrations (yuzu_fleet_plugin_init_failed and
     kPluginInitFailedRejectedGauge) exist.
 
-Lexical only: it cannot see a statement that is present but in a branch that never runs
-(review-enforced). The companion tests/test_plugin_init_failed_wiring_lexical_selftest.py deletes
+Lexical only: it cannot see a statement that is present but in a branch that never runs, so an
+`#if 0` wrapper, an `if (false)` body or a lambda that is never called leave it green
+(review-enforced residuals). The companion tests/test_plugin_init_failed_wiring_lexical_selftest.py deletes
 each required statement in memory and requires the gate to name it.
 
 Usage: python3 -I tests/test_plugin_init_failed_wiring_lexical.py
@@ -110,6 +111,11 @@ REQUIRED: list[tuple[str, str, str]] = [
 COUNTED: list[tuple[str, str, int, str]] = [
     ("wire-once", r"(?P<k>" + _WIRE + r")", 1,
      "set_known_plugins is called at exactly one site, once, at boot (a second call would race the sweep)"),
+    # ANY call of the setter, whatever its argument: a later `set_known_plugins({})` would re-empty
+    # the set the real call filled, and every real plugin would read "unknown".
+    ("wire-any-arg", r"(?P<k>health_store_\.set_known_plugins\()", 1,
+     "set_known_plugins is called with any argument at exactly one site (a second call, even with "
+     "another set, would replace the catalogue)"),
     ("anchor-thread", r"(?P<k>" + _THREAD + r")", 1,
      "the health recompute thread starts at exactly one site (wire-before-thread measures against it)"),
 ]

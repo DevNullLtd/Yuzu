@@ -61,12 +61,27 @@ def main() -> int:
         expect("wire-once" in ids(g.problems_canonical(code + stmt, lit)), "a duplicated wiring call was NOT detected")
         expect("anchor-thread" in ids(g.problems_canonical(code + "health_recompute_thread_=std::thread(", lit)),
                "a second thread start was NOT detected")
+        # A later call with another argument (the set re-emptied) is a second site of the setter.
+        for arg in ("{}", "std::vector<std::string>{}", "other_names()"):
+            expect("wire-any-arg" in ids(g.problems_canonical(
+                code[:wire.end()] + f"health_store_.set_known_plugins({arg});" + code[wire.end():], lit)),
+                f"a second set_known_plugins({arg}) call was NOT detected")
         moved = code[:wire.start()] + code[wire.end():thread.end()] + stmt + code[thread.end():]
         expect("wire-before-thread" in ids(g.problems_canonical(moved, lit)),
                "a wiring moved after the thread start was NOT detected")
         early = code[:wire.start()] + "health_store_.recompute_metrics(metrics_,w);" + code[wire.start():]
         expect("wire-before-sweep" in ids(g.problems_canonical(early, lit)),
                "a recompute call ahead of the wiring was NOT detected")
+
+    # Deleting the first occurrence of each counted site must be named by that row.
+    for rid, pat, _want, _why in g.COUNTED:
+        m = re.search(pat, code, re.S)
+        if not m:
+            expect(False, f"{rid}: counted pattern no longer matches the real source (stale pattern)")
+            continue
+        a, b = m.span("k")
+        expect(rid in ids(g.problems_canonical(code[:a] + code[b:], lit)),
+               f"{rid}: deleting its only occurrence was NOT detected")
 
     # Inert text must not stand in for the call: a comment, an ordinary string literal and a raw
     # string literal each replace the real statement and must turn the gate red. Likewise a
@@ -96,7 +111,7 @@ def main() -> int:
     if FAILURES:
         print(f"{len(FAILURES)} selftest failure(s)", file=sys.stderr)
         return 1
-    print(f"OK: selftest ({len(g.REQUIRED)} deletions, {len(g.COUNTED)} counts, 3 orderings, 4 inert-text replacements, literal cases)")
+    print(f"OK: selftest ({len(g.REQUIRED)} deletions, {len(g.COUNTED)} counts, 3 orderings, 3 re-empty mutants, 4 inert-text replacements, literal cases)")
     return 0
 
 
