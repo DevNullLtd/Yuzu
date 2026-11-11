@@ -4963,25 +4963,32 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
           "[result_set][async][agents_failed]") {
     // The tick has no seam a test can drive (it is a lambda on the server's maintenance thread),
     // so this pins its statements over whitespace-normalised source: the cheap skip runs first,
-    // the dropped-answer count only after it (an unreadable count retries next tick, never reads
-    // as zero), the members read after both, and the whole materialize call carries both counters.
+    // the dropped-answer count only after it (an unreadable count retries next tick and never
+    // reads as zero, until fill_count_decision fills the set as incomplete), the members read
+    // after both, and the whole materialize call carries both counters.
     const auto src = normalised_source("server.cpp");
     const std::string skip_then_count =
         "const bool timed_out = now - p.created_at > kPendingTimeoutSeconds; "
         "if (!terminal && !timed_out) continue; "
         "if (execution_tracker_) { const auto lost = "
         "execution_tracker_->count_response_dropped(p.source_execution_id); "
-        "if (!lost) { spdlog::warn(";
+        "const auto use = rs_matcher::fill_count_decision(lost, now - p.created_at, "
+        "kPendingTimeoutSeconds * 3); "
+        "if (!lost) { static RefusalLogThrottle unreadable_log(std::chrono::seconds(30)); "
+        "if (unreadable_log.should_warn(p.id)) spdlog::warn(";
     const auto skip_at = src.find(skip_then_count);
     REQUIRE(skip_at != std::string::npos);
     CHECK(count_in(src, skip_then_count) == 1);
-    const std::string after_warn =
-        "continue; } dropped = *lost; } "
+    const auto retry_at = src.find("if (!use) continue; if (!lost) metrics_", skip_at);
+    REQUIRE(retry_at != std::string::npos);
+    CHECK(retry_at - skip_at < 900); // the throttled warn's arguments, nothing else, in between
+    const std::string after_count =
+        "dropped = *use; } "
         "const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(targeted, "
         "responded, execution_tracker_ != nullptr, dropped);";
-    const auto unanswered_at = src.find(after_warn, skip_at);
+    const auto unanswered_at = src.find(after_count, retry_at);
     REQUIRE(unanswered_at != std::string::npos);
-    CHECK(unanswered_at - skip_at < 600); // the warn's arguments, nothing else, in between
+    CHECK(unanswered_at - retry_at < 300); // the count_unreadable counter, nothing else
     const auto members_at = src.find("result_set_members(*response_store_, forensics_plugins(), p)",
                                      unanswered_at);
     REQUIRE(members_at != std::string::npos);

@@ -380,6 +380,8 @@ Prometheus metrics:
 
 Enforcement of the per-operator 10,000 cap and the per-operator pin cap fires `result_set_quota_rejected` so SREs can see runaway scripts before they wedge the table.
 
+`yuzu_result_sets_total{result="count_unreadable"}` counts a pending set the fill pass filled as incomplete because the tracker's dropped-answer count stayed unreadable for three pending timeouts (15 minutes) after the set was created; until then the pass retries the set on each tick, logging at most one warning per set every 30 seconds. The same set is also counted under `materialized` (or `materialize_failed`).
+
 ## 10. Reference walkthrough — Chrome IR
 
 Operator detects a CVE in a specific Chrome version that drops a known-bad DLL on disk. The IOCs are:

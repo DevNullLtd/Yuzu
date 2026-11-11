@@ -162,6 +162,7 @@
 #include "saml_provider.hpp"
 #include "quarantine_store.hpp"
 #include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
+#include "refusal_log_throttle.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_members.hpp" // #4990
 #include "result_set_store.hpp"
@@ -19069,17 +19070,33 @@ private:
                                 continue;
                             // Only a set about to be filled pays for the dropped-answer count. A
                             // count that cannot be read skips the set for this tick (it retries on
-                            // the next), never reads as zero and never pins the set as incomplete.
+                            // the next) and never reads as zero; once the set is three timeouts
+                            // old it is filled as incomplete instead of staying pending.
                             if (execution_tracker_) {
                                 const auto lost =
                                     execution_tracker_->count_response_dropped(p.source_execution_id);
+                                const auto use = rs_matcher::fill_count_decision(
+                                    lost, now - p.created_at, kPendingTimeoutSeconds * 3);
                                 if (!lost) {
-                                    spdlog::warn("result set {}: dropped-answer count for execution "
-                                                 "{} unreadable; fill retried next tick",
-                                                 p.id, p.source_execution_id);
-                                    continue;
+                                    static RefusalLogThrottle unreadable_log(
+                                        std::chrono::seconds(30));
+                                    if (unreadable_log.should_warn(p.id))
+                                        spdlog::warn("result set {}: dropped-answer count for "
+                                                     "execution {} unreadable; {} (at most one "
+                                                     "log per 30 s per set)",
+                                                     p.id, p.source_execution_id,
+                                                     use ? "filled as incomplete"
+                                                         : "fill retried next tick");
                                 }
-                                dropped = *lost;
+                                if (!use)
+                                    continue;
+                                if (!lost)
+                                    metrics_
+                                        .counter("yuzu_result_sets_total",
+                                                 {{"source_kind", p.source_kind},
+                                                  {"result", "count_unreadable"}})
+                                        .increment();
+                                dropped = *use;
                             }
                             // An agent counted as responded whose answer was not persisted is
                             // absent from the stored rows the membership is built from: unanswered.

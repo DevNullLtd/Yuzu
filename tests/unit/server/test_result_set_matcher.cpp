@@ -15,6 +15,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -804,6 +806,18 @@ TEST_CASE("unanswered_agent_count: a counted answer whose response was not store
     CHECK(unanswered_agent_count(3, 3, true) == 0);
     // A negative count never lowers the result.
     CHECK(unanswered_agent_count(3, 1, true, -4) == 2);
+}
+
+TEST_CASE("fill_count_decision: an unreadable count waits then fills as incomplete",
+          "[result_set][agents_failed]") {
+    // A readable count is used as is, at any age.
+    CHECK(fill_count_decision(std::optional<int64_t>{0}, 10, 900) == std::optional<int64_t>{0});
+    CHECK(fill_count_decision(std::optional<int64_t>{3}, 5000, 900) == std::optional<int64_t>{3});
+    // Unreadable: skipped for this tick up to and including the give-up age.
+    CHECK(fill_count_decision(std::nullopt, 0, 900) == std::nullopt);
+    CHECK(fill_count_decision(std::nullopt, 900, 900) == std::nullopt);
+    // Past it: filled with one lost answer, so the set reads incomplete.
+    CHECK(fill_count_decision(std::nullopt, 901, 900) == std::optional<int64_t>{1});
 }
 
 // The registry the ingest paths use to carry a non-terminal frame whose provenance lookup failed

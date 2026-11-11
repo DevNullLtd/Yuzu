@@ -153,4 +153,18 @@ int echo_row_count(std::string_view output);
     return total > 1 ? total : 1;
 }
 
+/// The dropped-answer count the fill uses for a set that is due (terminal or timed out), from the
+/// tracker's count (`nullopt` when it could not be read) and the set's age in seconds. A readable
+/// count is used as is. An unreadable one skips the set for this tick (`nullopt`) until the set is
+/// older than `give_up_after_s`; past that the set is filled with a count of 1, so it reads
+/// incomplete rather than staying pending until its expiry.
+[[nodiscard]] constexpr std::optional<int64_t>
+fill_count_decision(std::optional<int64_t> count, int64_t age_s, int64_t give_up_after_s) noexcept {
+    if (count)
+        return *count;
+    if (age_s > give_up_after_s)
+        return int64_t{1};
+    return std::nullopt;
+}
+
 } // namespace yuzu::server::rs_matcher

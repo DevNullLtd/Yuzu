@@ -764,7 +764,9 @@ agent, so a later write, terminal or not, never clears it (a stored later frame 
 lost earlier one). It is not part of any event payload, so the outbox contract is unchanged.
 `ExecutionTracker::count_response_dropped` returns the count (`nullopt` when it cannot be read), and
 the result-set fill asks for it only once the execution is terminal or the set has timed out, adds
-it to the unanswered agents, and retries on the next tick when the count is unreadable. A set whose
+it to the unanswered agents, and retries on the next tick when the count is unreadable (after
+three pending timeouts it fills the set with one unanswered agent instead, so it reads incomplete
+rather than staying pending). A set whose
 member answer was lost is therefore recorded as incomplete. A new response-ingest site must pass the
 same fact.
 
