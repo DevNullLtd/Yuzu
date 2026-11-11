@@ -5763,7 +5763,8 @@ TEST_CASE("collector: a plugin whose execute throws is constrained rc=-1 and lea
     Collector c({{"installed_apps", &kThrowingIa}}, must_complete_tuning());
     const auto got = c.collect();
     REQUIRE(got.has_value());
-    const V3Sec* a = find_sec(sections_of(got->first), kFacetApps);
+    const auto secs = sections_of(got->first); // named: `a` points into it
+    const V3Sec* a = find_sec(secs, kFacetApps);
     REQUIRE(a != nullptr);
     CHECK(a->status == "constrained");
     CHECK(a->token == "rc=-1");
