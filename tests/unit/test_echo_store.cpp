@@ -4833,6 +4833,88 @@ TEST_CASE("adopt_legacy_echo_db: an owner-verified echo.db with a foreign sideca
     CHECK(names_with_prefix(d.path(), "echo.db-wal.planted-").empty());
 }
 
+// Heal x marker compounds. The heal runs before the marker decision, so a planted echo.db is set
+// aside even when the adoption is then refused for want of a matching marker: the refusal must say
+// that no LEGACY file moved and that a foreign file may have (it is logged), and the legacy files
+// (tar.db, the WAL awaiting adoption) stay exactly as they were.
+TEST_CASE("adopt_legacy_echo_db: a planted echo.db is set aside, then a lone WAL with no marker fails closed (#6695, #6752)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal"); // the interrupted step, no marker
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(echo_db, "planted by another account");
+    const auto tar_before = slurp_file(d.path() / "tar.db");
+    const auto wal_before = slurp_file(d.path() / "echo.db-wal");
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(
+        echo_db, probe_by_name({{"echo.db", EchoFileOwner::foreign}}));
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("no adoption marker") != std::string::npos);
+    CHECK(adopted.error().find("no legacy files were moved") != std::string::npos);
+    CHECK(adopted.error().find("moved aside") != std::string::npos);
+    const auto planted = names_with_prefix(d.path(), "echo.db.planted-");
+    REQUIRE(planted.size() == 1);
+    CHECK(slurp_file(d.path() / planted[0]) == "planted by another account");
+    CHECK_FALSE(fs::exists(echo_db));
+    CHECK(slurp_file(d.path() / "tar.db") == tar_before);
+    CHECK(slurp_file(d.path() / "echo.db-wal") == wal_before);
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: a planted echo.db is set aside, then a lone WAL with a stale marker fails closed (#6695, #6752)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal");
+    write_adoption_marker(d.path());
+    // tar.db changes after the marker was written: the marker no longer matches it.
+    fs::last_write_time(d.path() / "tar.db",
+                        fs::last_write_time(d.path() / "tar.db") - std::chrono::hours(1));
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(echo_db, "planted by another account");
+    const auto tar_before = slurp_file(d.path() / "tar.db");
+    const auto wal_before = slurp_file(d.path() / "echo.db-wal");
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(
+        echo_db, probe_by_name({{"echo.db", EchoFileOwner::foreign}}));
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("records a different") != std::string::npos);
+    CHECK(adopted.error().find("no legacy files were moved") != std::string::npos);
+    CHECK(adopted.error().find("moved aside") != std::string::npos);
+    const auto planted = names_with_prefix(d.path(), "echo.db.planted-");
+    REQUIRE(planted.size() == 1);
+    CHECK(slurp_file(d.path() / planted[0]) == "planted by another account");
+    CHECK_FALSE(fs::exists(echo_db));
+    CHECK(slurp_file(d.path() / "tar.db") == tar_before);
+    CHECK(slurp_file(d.path() / "echo.db-wal") == wal_before);
+}
+
+// A foreign echo.db-wal colliding with tar.db-wal, with a marker that matches tar.db: the planted
+// sidecar is set aside alone and the legacy WAL is adopted (the marker does not change the heal).
+TEST_CASE("adopt_legacy_echo_db: a colliding foreign echo.db-wal with a matching marker is set aside and the legacy WAL adopted (#6695, #6752)",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    write_adoption_marker(d.path());
+    const auto echo_db = d.path() / "echo.db";
+    spit_file(d.path() / "echo.db-wal", "planted sidecar");
+
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(
+                echo_db, probe_by_name({{"echo.db-wal", EchoFileOwner::foreign}}))
+                .has_value());
+    const auto planted = names_with_prefix(d.path(), "echo.db-wal.planted-");
+    REQUIRE(planted.size() == 1);
+    CHECK(slurp_file(d.path() / planted[0]) == "planted sidecar");
+    CHECK(names_with_prefix(d.path(), "echo.db.planted-").empty());
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "tar.db-wal"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting")); // spent
+    auto db = EchoDatabase::open(echo_db);
+    REQUIRE(db.has_value());
+    CHECK(db->get_config("wal_marker", "") == "x"); // the legacy WAL came along, not the plant
+}
+
 #ifdef _WIN32
 // A sidecar that cannot be renamed is COPIED into the quarantine set, and a copy takes the
 // directory's inherited ACL (here an inheritable BUILTIN\Users read ACE, as C:\ProgramData has),
