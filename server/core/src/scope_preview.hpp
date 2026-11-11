@@ -30,10 +30,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "authz_model.hpp"
@@ -64,10 +66,11 @@ class ResultSetStore;
 ///
 /// `abort_kind` (#4981 fix-round) carries the SAME abort reason as `detail`,
 /// but as the typed `ScopeEvalError::Kind` rather than a raw string — pass it
-/// to `scope_abort_is_permanent()` (`scope_eval_error.hpp`) instead of
-/// hand-rolling a `detail == "principal_unresolved" || detail == "unresolvable"`
-/// string comparison at each call site, which cannot warn a caller that a
-/// future 6th `Kind` value landed unclassified. `detail` is left exactly as
+/// to `scope_abort_is_permanent()` (`scope_eval_error.hpp`) or
+/// `scope_abort_advice()` (below) instead of hand-rolling a
+/// `detail == "principal_unresolved" || detail == "unresolvable"` string
+/// comparison at each call site, which cannot warn a caller that a further
+/// `Kind` value (there are seven today) landed unclassified. `detail` is left exactly as
 /// it was (existing wording/values are relied on elsewhere) — this is
 /// additive, not a replacement.
 struct ScopePreviewOutcome {
@@ -80,6 +83,26 @@ struct ScopePreviewOutcome {
     std::string abort_detail;
     nlohmann::json payload;                 // kOk only
 };
+
+/// What a scope preview tells the caller after an evaluation abort (the REST and MCP
+/// `preview_scope_targets` handlers share it): the remediation, and the retry hint, which is
+/// present only for a transient abort.
+struct ScopeAbortAdvice {
+    std::string_view remediation;
+    std::optional<std::int64_t> retry_after_ms; ///< nullopt: no retry hint (null on the wire)
+};
+[[nodiscard]] inline ScopeAbortAdvice scope_abort_advice(std::optional<ScopeEvalError::Kind> kind,
+                                                         std::int64_t transient_retry_ms) {
+    if (kind == ScopeEvalError::Kind::ResultSetUnusablePermanent)
+        return {"re-run the producer that created the set, then use the new set", std::nullopt};
+    if (kind == ScopeEvalError::Kind::ResultSetUnusable)
+        return {"wait until the set is materialized, then retry", transient_retry_ms};
+    if (kind && scope_abort_is_permanent(*kind))
+        return {"this is a permanent condition and will NOT clear on retry; escalate to an "
+                "operator",
+                std::nullopt};
+    return {"retry once the server reports ready", transient_retry_ms};
+}
 
 /// Injected so this pure module never binds directly to `AgentRegistry`
 /// (keeps this header's dependency list light — see the file header). A

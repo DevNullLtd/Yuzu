@@ -1,9 +1,6 @@
 #pragma once
 
-#include <cstdint>
-#include <optional>
 #include <string>
-#include <string_view>
 
 /// @file scope_eval_error.hpp
 /// The typed failure surface for `AgentRegistry::evaluate_scope`/
@@ -134,26 +131,6 @@ inline bool scope_abort_is_permanent(ScopeEvalError::Kind k) {
         return false;
     }
     return false;
-}
-
-/// What a scope preview tells the caller after an evaluation abort (the REST and MCP
-/// `preview_scope_targets` handlers share it): the remediation, and the retry hint, which is
-/// present only for a transient abort.
-struct ScopeAbortAdvice {
-    std::string_view remediation;
-    std::optional<std::int64_t> retry_after_ms; ///< nullopt: no retry hint (null on the wire)
-};
-[[nodiscard]] inline ScopeAbortAdvice scope_abort_advice(std::optional<ScopeEvalError::Kind> kind,
-                                                         std::int64_t transient_retry_ms) {
-    if (kind == ScopeEvalError::Kind::ResultSetUnusablePermanent)
-        return {"re-run the producer that created the set, then use the new set", std::nullopt};
-    if (kind == ScopeEvalError::Kind::ResultSetUnusable)
-        return {"wait until the set is materialized, then retry", transient_retry_ms};
-    if (kind && scope_abort_is_permanent(*kind))
-        return {"this is a permanent condition and will NOT clear on retry; escalate to an "
-                "operator",
-                std::nullopt};
-    return {"retry once the server reports ready", transient_retry_ms};
 }
 
 } // namespace yuzu::server

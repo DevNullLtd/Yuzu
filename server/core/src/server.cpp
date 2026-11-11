@@ -15135,8 +15135,9 @@ private:
     // referenced set is absent/expired/not owned — including the Finding A
     // TOCTOU case), "presence_degraded" (#4981 PR-1 B, the cross-replica
     // presence read could not answer), "result_set_unusable" (a referenced
-    // set is not ready, or is incomplete under a NOT), or "unresolvable" (a store the atom
-    // needs was never wired at this call site). Without this, a dispatch
+    // set is not ready, or is incomplete where a missing member would match,
+    // for example under NOT, LEN or STARTSWITH), or "unresolvable" (a store
+    // the atom needs was never wired at this call site). Without this, a dispatch
     // silently reduced to 0 targets by an ABORT is indistinguishable in
     // telemetry/audit from a genuine "0 agents matched" (UP-12) — an operator
     // investigating "why did my command reach nobody" would find nothing. The

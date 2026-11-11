@@ -596,9 +596,10 @@ TEST_CASE("scope v1: POST /api/v1/scope/preview 503s on a degraded result-set st
 }
 
 // A referenced set the caller owns but cannot use as scope: a pending one may still fill
-// (transient, retry hint 5000), a failed one, or an incomplete one under NOT, will not change by
-// retrying (permanent, retry_after_ms null, remediation to re-run the producer). The message names
-// the set and the cause.
+// (transient, retry hint 5000), a failed one, or an incomplete one where a missing member would
+// match (for example under NOT, LEN or STARTSWITH), will not change by retrying (permanent,
+// retry_after_ms null, remediation to re-run the producer). The message names the set and the
+// cause.
 TEST_CASE("scope v1: POST /api/v1/scope/preview 503s result_set_unusable with an honest retry hint",
           "[pg][rest][scope][v1][result_set_unusable]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);

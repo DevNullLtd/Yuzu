@@ -3915,30 +3915,40 @@ groups:
             already at the cap also counts here. Attribute with a server log
             grep for "per-agent row cap (" (one line carries the cap, the instruction and the agent).
 
-      # Companion: the in-memory record of streaming frames whose provenance
-      # lookup failed (unverified_frame_registry.hpp) evicted or could not keep
-      # an entry. It fails closed, so no answer is lost from a result set's
-      # completeness, but the affected sets read partial. Excluded from
-      # YuzuResponseIngestDrops above: no store remediation applies. No long
-      # `for`: one increase already means sets were reported partial.
+      # Companion: the in-memory record of answers that may be missing
+      # (unverified_frame_registry.hpp) evicted an entry. It fails closed, so
+      # no answer is lost from a result set's completeness, but the affected
+      # sets read partial. Excluded from YuzuResponseIngestDrops above: no
+      # store remediation applies. No long `for`: one increase already means
+      # sets were reported partial.
       - alert: YuzuUnverifiedFrameRecordOverflow
         expr: |
           sum(increase(yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}[1h])) by (reason) > 0
         labels:
           severity: info
         annotations:
-          summary: "The record of streaming frames with a failed provenance lookup overflowed"
+          summary: "The record of answers that may be missing overflowed"
           description: >-
-            The server could not keep every record of a streaming response
-            frame whose provenance lookup failed, so it reported the affected
-            agents' answers as not fully stored. Either an agent is sending
-            many frames with command ids the server cannot look up, or the
-            provenance lookup was degraded (database pool or query failures)
-            while streaming commands ran. Result sets filled in the next hour
-            from the affected commands read partial; re-run those commands
-            once the cause is resolved. Check the server log for
-            "unverified-frame record" and the provenance outcome counter
-            yuzu_server_response_provenance_total{outcome="lookup_degraded"}.
+            The server could not keep every record of an answer that may be
+            missing from the response store, so it reported more answers as
+            not fully stored. The cause is a degraded provenance read: check
+            yuzu_exec_correlation_read_degrade_total{reason} first, then
+            yuzu_server_response_provenance_total{outcome="lookup_degraded"}
+            and PostgreSQL pool health. One agent sending many streaming
+            frames while the read is degraded only amplifies it. Effect: an
+            agent past its own share is marked, and for up to an hour that
+            agent's answers read as not fully stored, so result sets it
+            contributes to read partial. When the record as a whole is full,
+            the evicted entry's command is remembered and every agent's
+            answer to it reads as not fully stored. When too many agents are
+            marked or too many commands remembered, a global latch is set:
+            for up to an hour every result set filled reads partial, and NOT,
+            LEN and STARTSWITH scopes over those sets are refused with no
+            retry hint. Re-run the affected
+            commands once the cause is resolved. The server log names the
+            agent when its marker is first set (at most once per 10 minutes
+            per agent) and when the latch first sets ("unverified-frame
+            record"); otherwise this counter is the evidence.
 
       - alert: YuzuResponseReadDegrade
         expr: |

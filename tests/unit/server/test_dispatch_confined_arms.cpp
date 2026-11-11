@@ -766,8 +766,8 @@ TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwis
     CHECK(std::string(to_string(Kind::ResultSetUnusable)) == "result_set_unusable");
     // A pending set may fill, so a retry can succeed: transient, not permanent.
     CHECK_FALSE(scope_abort_is_permanent(Kind::ResultSetUnusable));
-    // A failed set, or an incomplete one under NOT, does not change by retrying: permanent, with
-    // the same wire reason.
+    // A failed set, or an incomplete one where a missing member would match (for example under
+    // NOT, LEN or STARTSWITH), does not change by retrying: permanent, with the same wire reason.
     CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) ==
           to_string(to_abort_reason(Kind::ResultSetUnusablePermanent)));
     CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) == "result_set_unusable");

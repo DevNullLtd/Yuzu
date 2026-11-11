@@ -84,7 +84,8 @@ enum class ScopeAbortReason {
     Unresolvable,
     PresenceDegraded,
     ResultSetUnusable,          ///< a referenced set is still pending (transient)
-    ResultSetUnusablePermanent, ///< failed, or incomplete under NOT (permanent); same wire reason
+    ResultSetUnusablePermanent, ///< failed, or incomplete where a missing member would match
+                                ///< (for example NOT, LEN or STARTSWITH); permanent; same wire reason
 };
 
 /// Audit-log string vocabulary for `ScopeAbortReason` — MUST agree pairwise
