@@ -193,7 +193,8 @@ struct AsyncHarness {
 
     explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true,
                           InventoryStore* inv = nullptr, bool with_exec_visible = true,
-                          bool with_fleet_read_fn = true, bool with_all_agent_ids_fn = true)
+                          bool with_fleet_read_fn = true, bool with_all_agent_ids_fn = true,
+                          bool with_forensics_set = false)
         : inventory(inv), wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible),
           wire_fleet_read_fn(with_fleet_read_fn), wire_all_agent_ids_fn(with_all_agent_ids_fn) {
         permit_exec = true; // each harness starts permissive
@@ -288,6 +289,11 @@ struct AsyncHarness {
                 [this]() -> std::vector<std::string> { return all_agent_ids_override; });
         }
 
+        // The real catalogue-derived Forensics set, as the server wires it before the routes. Off by
+        // default: only the Forensics-source refusal cases need it.
+        if (with_forensics_set)
+            api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr, /*response_store=*/nullptr, instr.get(),
@@ -364,11 +370,11 @@ std::string make_cert_instruction(InstructionStore& s) {
     REQUIRE(id.has_value());
     return *id;
 }
-std::string make_instruction(InstructionStore& s) {
+std::string make_instruction(InstructionStore& s, const char* plugin = "filehash") {
     InstructionDefinition def;
     def.name = "Chrome hash check";
     def.version = "1.0";
-    def.plugin = "filehash";
+    def.plugin = plugin;
     def.action = "check";
     def.type = "action";
     def.description = "hash check";
@@ -1083,6 +1089,34 @@ TEST_CASE("from-instruction-result: 202 pending with operator matcher persisted"
     auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
     REQUIRE(row->matcher.find("sha256") != std::string::npos);
     REQUIRE(row->matcher.find("value_set") != std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a Forensics-tier plugin is refused before any execution "
+          "row or dispatch and an ordinary plugin proceeds",
+          "[pg][result_set][async][instruction][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool, true, nullptr, true, true, true, /*with_forensics_set=*/true);
+    const auto forensics_id = make_instruction(*h.instr, yuzu::server::test::kForensicsPlugin);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result",
+                    R"({"instruction_id":")" + forensics_id + R"("})", status);
+    REQUIRE(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find(
+              std::string(yuzu::server::kSourceNotSupportedMessage)) != std::string::npos);
+    CHECK(h.calls.empty());                         // nothing was sent
+    CHECK(h.tracker->query_executions({}).empty()); // and no execution row was created
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail.find("reason=forensics_source") != std::string::npos);
+
+    // The control: an ordinary plugin on the same harness is dispatched.
+    const auto ordinary_id = make_instruction(*h.instr, yuzu::server::test::kOrdinaryPlugin);
+    j = h.post("/api/v1/result-sets/from-instruction-result",
+               R"({"instruction_id":")" + ordinary_id + R"("})", status);
+    REQUIRE(status == 202);
+    CHECK(h.calls.size() == 1);
 }
 
 TEST_CASE("from-instruction-result: a column matcher is bound to the declared columns; "
@@ -4481,6 +4515,24 @@ std::string seed_instruction_result(AsyncHarness& h, const std::string& instruct
 }
 
 } // namespace
+
+TEST_CASE("re-eval: a stored set whose definition names a Forensics-tier plugin is refused "
+          "and never re-dispatched",
+          "[pg][result_set][async][reeval][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool, true, nullptr, true, true, true, /*with_forensics_set=*/true);
+    const auto forensics_id = make_instruction(*h.instr, yuzu::server::test::kForensicsPlugin);
+    const auto id = seed_instruction_result(h, forensics_id, nlohmann::json::object());
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find(
+              std::string(yuzu::server::kSourceNotSupportedMessage)) != std::string::npos);
+    CHECK(h.calls.empty());
+    CHECK(h.tracker->query_executions({}).empty());
+}
 
 TEST_CASE("re-eval: a set stored over a raw capture table is refused with RESULT_SET_REEVAL_STALE_SOURCE",
           "[pg][result_set][async][reeval][echo][stale_source]") {

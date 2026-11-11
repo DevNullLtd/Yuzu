@@ -64,6 +64,7 @@
 #include "openapi_spec_access.hpp" // openapi_spec_json()
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "result_set_members.hpp" // kSourceNotSupportedMessage (Forensics-tier source refusal)
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
 #include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
@@ -38713,7 +38714,7 @@ TEST_CASE("MCP create_result_set: a malformed or empty parent_id is refused with
 // Roll-up only: a result set reports the failure signal, and a set stored over a raw capture table
 // is refused rather than re-run to an empty membership. The nine row schemas share one macro, so one
 // tool pins the fields.
-TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed and partial as required",
+TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed, agents_unanswered and partial as required",
           "[mcp][integration][result-sets][agents_failed]") {
     McpTestServer ts;
     ts.start();
@@ -38726,8 +38727,10 @@ TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed
             schema = &t["outputSchema"];
     REQUIRE(schema != nullptr);
     CHECK((*schema)["properties"]["agents_failed"]["type"] == "integer");
+    CHECK((*schema)["properties"]["agents_unanswered"]["type"] == "integer");
     CHECK((*schema)["properties"]["partial"]["type"] == "boolean");
     const auto& req = (*schema)["required"];
+    CHECK(std::find(req.begin(), req.end(), "agents_unanswered") != req.end());
     CHECK(std::find(req.begin(), req.end(), "agents_failed") != req.end());
     CHECK(std::find(req.begin(), req.end(), "partial") != req.end());
 }
@@ -41221,6 +41224,66 @@ TEST_CASE("MCP create_result_set_from_instruction_result: a column matcher is bo
         CHECK(body["error"]["code"] == kInvalidParams);
     }
     CHECK(dispatches == before);
+}
+
+TEST_CASE("MCP create_result_set_from_instruction_result: a Forensics-tier plugin is refused "
+          "before any execution row or dispatch and an ordinary plugin proceeds",
+          "[pg][mcp][integration][result-sets]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    const auto make_def = [&](const char* plugin) {
+        yuzu::server::InstructionDefinition def;
+        def.name = std::string("source ") + plugin;
+        def.version = "1.0";
+        def.plugin = plugin;
+        def.action = "list";
+        def.type = "question";
+        def.description = "test";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        return *created;
+    };
+    const std::string forensics_id = make_def(yuzu::server::test::kForensicsPlugin);
+    const std::string ordinary_id = make_def(yuzu::server::test::kOrdinaryPlugin);
+    int dispatches = 0;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatches;
+        return {.sent = 1, .command_id = "cmd-src-" + std::to_string(dispatches)};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const auto call = [&](const std::string& instruction_id) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":")" +
+            instruction_id + R"("}}})");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto executions = [&] { return tracker_bundle.get()->query_executions({}).size(); };
+
+    auto body = call(forensics_id);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find(
+              std::string(yuzu::server::kSourceNotSupportedMessage)) != std::string::npos);
+    CHECK(dispatches == 0);   // nothing was sent
+    CHECK(executions() == 0); // and no execution row was created
+
+    body = call(ordinary_id);
+    REQUIRE_FALSE(body.contains("error"));
+    CHECK(dispatches == 1);
 }
 
 TEST_CASE("MCP result-sets: the 3 async producers derive the caller's confined exec_visible "

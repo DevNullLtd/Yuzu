@@ -47,6 +47,7 @@
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_matcher.hpp"        // validate_matcher: admission check of a caller matcher (#4644)
+#include "result_set_members.hpp"        // plugin_may_seed_result_set: Forensics-tier source refusal
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
 #include "revocation_source_admin_gate.hpp" // ADR-0070 R1: decide_admin + RevocationSourceService (shared REST+MCP)
@@ -710,8 +711,8 @@ static_assert(kMaxFacetValueBytes == 2048,
 // nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
 // array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
 // #undef'd right after it.
-#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica, and false for a failed set"})j"
-#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a set filled before this release, and 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a set filled before this release, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. False for a set filled before this release, and false for a failed set"})j"
+#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","agents_unanswered","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents",
      "List the connected agents the caller may read, with hostname, OS, architecture, "
@@ -1619,7 +1620,7 @@ static const ToolDef kTools[] = {
      "the server only length-checks (max 100000 bytes). Membership is every agent that "
      "returned >=1 row (include_empty=true widens to every responder); an agent whose "
      "query failed is not a member, and the filled set reports how many in agents_failed "
-     "with partial=true (an execution with more than 100000 stored answers marks the set "
+     "(and the agents that never answered in agents_unanswered) with partial=true (an execution with more than 100000 stored answers marks the set "
      "failed instead, with agents_failed 0 and the reason in the server log). SQL that "
      "reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
@@ -1654,10 +1655,10 @@ static const ToolDef kTools[] = {
      "else the definition's own default) reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
      "RESULT_SET_REEVAL_STALE_SOURCE and nothing is dispatched, the same as "
-     "create_result_set_from_echo_query. If the definition runs a Forensics-tier "
-     "plugin (an action on the Forensics securable) the set materializes with no members "
-     "for every creator, because the materializer never reads Forensics-tier output; an "
-     "empty set from such a definition says nothing about the fleet. A definition whose "
+     "create_result_set_from_echo_query. A definition that runs a Forensics-tier "
+     "plugin is refused with RESULT_SET_SOURCE_NOT_SUPPORTED (-32602) before anything is "
+     "dispatched, because the stored responses of such a plugin are withheld from "
+     "result-set membership. A definition whose "
      "plugin.action is gated (admin or approval) is refused for a non-admin caller with a "
      "permission-denied error whose error.data.reason is approval_required (permanent, "
      "retry_after_ms null): an approval ticket never lifts that gate for this tool, so a "
@@ -15477,6 +15478,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (rs_params_have_nul(params)) {
                     rs_refuse_nul("parameters", src_kind);
+                    return;
+                }
+                // A Forensics-tier plugin's stored responses are withheld from result-set
+                // membership, so a set built from one would fill empty while every agent counts
+                // as answered: refused before any execution row or dispatch (REST twin: run_async).
+                if (!plugin_may_seed_result_set(plugin, forensics_plugins_)) {
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   "reason=forensics_source source_kind=" + audit_token(src_kind));
+                    // retry-hint-exempt: caller-input rejection (an unsupported source), not a
+                    // transient fault.
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   std::string(kSourceNotSupportedMessage)),
+                                    "application/json");
                     return;
                 }
                 if (!result_set_store_ || !execution_tracker) {
