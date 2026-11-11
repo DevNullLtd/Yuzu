@@ -1565,7 +1565,7 @@ flip, with a red-first test each:
     that carry rules, runs over an empty key registry), in `guaranteed-state.md`'s "What a full
     push does on the agent" paragraph and its "Reading the rebuild line (#5719)" subsection, in
     `upgrading.md`'s "Behaviour change: Guardian full_sync agent log lines and in-place `rule:`
-    rows (#4415)" entry (the "Second new line on every full push (#5719)" bullet), in this
+    rows (#4415)" entry (the "Second new line on every applied full push (#5719)" bullet), in this
     document's flip precondition (b) beside AC-18 ("while it is false the line prints
     `path=legacy` and `rebuilt 0`"), and in the code comments of `guardian_rebuild_tally.hpp`
     (contract item (g)) and of the three counter accessors in `guardian_spark_runtime.hpp`. Each
@@ -1688,7 +1688,11 @@ flip, with a red-first test each:
     (`health_probe_failures`, `sweep_snapshot_failures`, `sweep_health_query_failures`) count the
     previously silent catches around the key-health probe and sweep; nothing in this tree reads
     them outside the tests, so they are not on the heartbeat and not on `/metrics`. The line is
-    logged on every production full push but is inactive there: the counts it reports come only
+    logged on every production full push that reaches the end of its rule loop (a rejected push,
+    or one the retry gate suppresses as an identical retry, logs neither this line nor the
+    preserved one, so a missing line for one push is not by itself evidence of a fault; the
+    first flipped-rig run saw one such silent push, cause not confirmed) but is inactive there:
+    the counts it reports come only
     from the Spark attach path, which is reached only while `prefer_spark_` is true: while it is false the line
     prints `path=legacy` and `rebuilt 0`, and `rebuilt 0` on `path=legacy` does not mean nothing
     was rebuilt (every carried rule that has a legacy guard is still stopped and re-armed on each full push).

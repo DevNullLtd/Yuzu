@@ -3514,7 +3514,7 @@ unchanged rules that motivated them runs only on the Spark path, which productio
 - **New line on every full push.** `Guardian: full_sync preserved N rule(s) (skipped re-arm) ids=[...] more=M`
   is logged by every agent on every full push that reaches the end of its rule loop. Use it as the
   full-push marker instead. Legacy-path agents always log `preserved 0`.
-- **Second new line on every full push (#5719).** `Guardian: full_sync rebuilt N rule(s) (rebuild attempted): path=legacy first_attach=0 content_changed=0 key_busy=0 ...`
+- **Second new line on every applied full push (#5719).** `Guardian: full_sync rebuilt N rule(s) (rebuild attempted): path=legacy first_attach=0 content_changed=0 key_busy=0 ...`
   is logged beside the preserved line, on the same condition, and gives the arm path and a count per
   reason a carried rule was rebuilt instead of skipped. After a count above zero, every group
   except `first_attach` and `content_changed` is followed by `ids=[...]` naming the rules; a group

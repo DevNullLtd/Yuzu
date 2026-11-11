@@ -2703,8 +2703,11 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         //  - The count includes Pending/Accepted outcomes that may still fail asynchronously
         //    (hence "rebuild attempted"): there is no pending split.
         //  - Only a full_sync logs it. A delta push and the boot re-arm loop populate the tally
-        //    but never log it, and an apply_rules that returns early on a persist failure (the
-        //    put_rule_locked return above) logs neither this line nor the preserved one.
+        //    but never log it, and an apply_rules that returns early logs neither this line nor
+        //    the preserved one: a persist failure (the put_rule_locked return above), a
+        //    rejection (engine stopped, a generation that moves backwards, an invalid or
+        //    duplicate rule id), or a push decide_retry() Suppresses as an identical retry,
+        //    which returns before the rule loop runs.
         //  - A wedge re-observation carries no reason and appears in neither line.
         try {
             // The path marker uses the SAME expression reconcile_rule_locked uses to choose the
