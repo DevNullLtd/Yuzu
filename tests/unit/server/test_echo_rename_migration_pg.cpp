@@ -218,7 +218,9 @@ TEST_CASE("Echo rename: instruction_store v3 rewrites ids and plugin and require
         yuzu::server::InstructionStore store{pool};
         REQUIRE(store.is_open());
     }
-    CHECK(version_of(dsn, "instruction_store") == "3");
+    // v3 is the rename step; later migrations (v4 last_version, ...) follow it: a floor, not the
+    // head (a literal head breaks on every new migration).
+    CHECK(std::stoi(version_of(dsn, "instruction_store")) >= 3);
 
     const auto col = [&](const char* id, const char* column) {
         return one(dsn, std::string("SELECT ") + column +
@@ -322,7 +324,9 @@ TEST_CASE("Echo rename: instruction_store v3 scopes the block-list rule and tole
         yuzu::server::InstructionStore store{pool};
         REQUIRE(store.is_open());
     }
-    CHECK(version_of(dsn, "instruction_store") == "3");
+    // v3 is the rename step; later migrations (v4 last_version, ...) follow it: a floor, not the
+    // head (a literal head breaks on every new migration).
+    CHECK(std::stoi(version_of(dsn, "instruction_store")) >= 3);
 
     const auto yaml = [&](const char* id) {
         return one(dsn, std::string("SELECT yaml_source FROM "
@@ -368,7 +372,9 @@ TEST_CASE("Echo rename: instruction_store v3 moves an operator Echo definition's
         yuzu::server::InstructionStore store{pool};
         REQUIRE(store.is_open());
     }
-    CHECK(version_of(dsn, "instruction_store") == "3");
+    // v3 is the rename step; later migrations (v4 last_version, ...) follow it: a floor, not the
+    // head (a literal head breaks on every new migration).
+    CHECK(std::stoi(version_of(dsn, "instruction_store")) >= 3);
 
     const auto col = [&](const char* column) {
         return one(dsn, std::string("SELECT ") + column +
@@ -406,7 +412,9 @@ TEST_CASE("Echo rename: the migrated crossplatform.tar.query row equals the fres
         yuzu::server::InstructionStore store{pool};
         REQUIRE(store.is_open());
     }
-    CHECK(version_of(dsn, "instruction_store") == "3");
+    // v3 is the rename step; later migrations (v4 last_version, ...) follow it: a floor, not the
+    // head (a literal head breaks on every new migration).
+    CHECK(std::stoi(version_of(dsn, "instruction_store")) >= 3);
     CHECK(one(dsn, "SELECT count(*) FROM instruction_store.instruction_definitions WHERE id = "
                    "'crossplatform.tar.query'") == "0");
 

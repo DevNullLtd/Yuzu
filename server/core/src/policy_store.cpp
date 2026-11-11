@@ -604,6 +604,40 @@ PolicyStore::get_fragment(const std::string& id) const {
     return std::optional<PolicyFragment>{read_fragment(res.get(), 0)};
 }
 
+std::expected<std::vector<std::string>, PolicyReadError>
+PolicyStore::fragments_referencing_instruction(
+    const std::string& instruction_id, int limit,
+    const std::unordered_set<std::string>& exclude_ids) const {
+    if (!open_) {
+        spdlog::warn("PolicyStore::fragments_referencing_instruction: store not open");
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("PolicyStore::fragments_referencing_instruction: no connection in time ({})",
+                     pool_.last_error());
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    std::vector<std::string_view> excluded(exclude_ids.begin(), exclude_ids.end());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id FROM policy_store.policy_fragments WHERE (check_instruction = $1 "
+        "OR fix_instruction = $1 OR post_check_instruction = $1) "
+        "AND NOT (id = ANY($3::text[])) ORDER BY id ASC LIMIT $2",
+        std::vector<std::string>{instruction_id, std::to_string(std::max(limit, 1)),
+                                 pg::to_text_array(excluded)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("PolicyStore::fragments_referencing_instruction: query failed: {}",
+                     PQerrorMessage(lease.get()));
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    std::vector<std::string> ids;
+    ids.reserve(static_cast<size_t>(PQntuples(res.get())));
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        ids.emplace_back(PQgetvalue(res.get(), i, 0));
+    return ids;
+}
+
 bool PolicyStore::delete_fragment(const std::string& id) {
     if (!open_)
         return false;

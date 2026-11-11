@@ -112,7 +112,7 @@ struct InstructionDefinition {
     int response_ttl_days{90};
     std::string created_by;
     int64_t created_at{0};
-    int64_t updated_at{0};
+    int64_t updated_at{0}; ///< monotonic version token (see update_definition), epoch seconds at best
     // Extended fields (Phase 2)
     std::string yaml_source;      // verbatim YAML (source of truth)
     // JSON Schema for parameters. create_definition treats empty as "{}" (no schema);
@@ -259,8 +259,13 @@ public:
     /// `expected_updated_at` is an optimistic-concurrency check: when set, the UPDATE only
     /// applies if the stored row still carries that `updated_at`, otherwise the error is
     /// `kConflictPrefix`-tagged ("modified since it was loaded") and nothing is written.
-    /// ponytail: `updated_at` is epoch SECONDS, so two saves inside one second both pass;
-    /// a version column would close it but needs a migration.
+    /// `updated_at` is a MONOTONIC VERSION TOKEN, not a wall-clock reading: every write of a
+    /// definition row (update, and `delete_set`'s member unlink) sets it to
+    /// `GREATEST(now, previous + 1)`, and a re-create of a deleted id floors it above the deleted
+    /// row's last token (kept on the tombstone). So it moves on every change, even inside one
+    /// second, two writers holding the same token can never both match, and a token read before a
+    /// delete never matches the re-created row. It tracks the clock only while writes are
+    /// further apart than a second.
     std::expected<void, std::string>
     update_definition(const InstructionDefinition& def,
                       std::optional<std::int64_t> expected_updated_at = std::nullopt);
@@ -269,7 +274,13 @@ public:
     /// `unexpected(msg)` (prefixed `kInstructionStoreDbErrorPrefix`) is a genuine failure.
     /// Stamps `deleted_seed_content` in the SAME transaction as the delete (ADR-0058
     /// seed-suppression) under `kSeedCoordLockSql`.
-    std::expected<void, std::string> delete_definition(const std::string& id);
+    /// `expected_updated_at`, when set, makes the delete conditional on the stored version token
+    /// (the same token `update_definition` checks): a row that moved on is NOT deleted and the
+    /// error is `kConflictPrefix`-tagged; an absent row stays `not_found` either way. Unset =
+    /// unconditional (the legacy DELETE and pack uninstall pass none and keep their id-only semantics).
+    std::expected<void, std::string>
+    delete_definition(const std::string& id,
+                      std::optional<std::int64_t> expected_updated_at = std::nullopt);
 
     // Import/Export
 
@@ -314,6 +325,12 @@ public:
     ///     `incomplete signing metadata` (distinct error message).
     ///   * Signature/publicKey wrong length → reject before allocation
     ///     (DoS amplification guard).
+    ///
+    /// Bounds (this signature-gated variant only; the trusted seed is exempt): `name` 128,
+    /// `version` 64 and `instruction_set_id` 128 bytes, and a non-empty `plugin` / `action` must
+    /// meet `check_dispatch_identifier` (the SIGNED yaml's values are checked too, since the
+    /// binding takes them verbatim); `action` is lowercased. `description` is deliberately not
+    /// bounded (bundled definitions carry long ones). The caller stamps `created_by`.
     std::expected<std::string, std::string> import_definition_json(const std::string& json);
 
     /// Trusted-content variant — bypasses the signature gate AND routes through the seed-aware
@@ -367,8 +384,9 @@ private:
     std::expected<std::string, std::string> validate_and_prepare(InstructionDefinition& def) const;
 
     // Executes the INSERT for an already-validated definition. `is_seed=false` (every normal
-    // caller: create_definition, and import_definition_json's signed path) is a plain
-    // `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id`, no lock, no tombstone consultation.
+    // caller: create_definition, and import_definition_json) takes `kSeedCoordLockSql`
+    // first, then one `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id` whose `updated_at` is
+    // floored above a tombstone's last_version (no tombstone SKIP: a deleted id can be re-created).
     // `is_seed=true` (import_definition_json_trusted only) takes `kSeedCoordLockSql` first, then
     // checks `deleted_seed_content` before inserting — ADR-0058.
     std::expected<std::string, std::string> insert_definition_row(const InstructionDefinition& def,

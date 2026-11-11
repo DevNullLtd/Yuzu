@@ -26,6 +26,7 @@
  * itself was retired (chore/retire-migrate-from-sqlite-batch-b, #3623).
  */
 
+#include "instruction_referrers.hpp" // make_definition_pack_advisory_fn / pack_advisory_note (N1-6d)
 #include "product_pack_store.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -1587,4 +1588,117 @@ TEST_CASE("REST: POST /api/product-packs survives invalid UTF-8 reflected into a
     REQUIRE_NOTHROW(body = nlohmann::json::parse(res->body));
     REQUIRE(body.contains("errors"));
     REQUIRE(body["errors"].size() == 1);
+}
+
+// M2-3. packs_containing_item is one bounded SELECT: it matches on (kind, item_id), is capped by
+// `limit`, orders by pack id, and reports a store that is not open as an error, never as an empty
+// answer. Turns red if the kind predicate or the LIMIT is dropped.
+TEST_CASE("ProductPackStore::packs_containing_item matches kind and item id and honours the limit "
+          "and errors when the store is not open",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    // Every document installs under the item id "shared-def", whatever its kind.
+    const auto shared_id = [](const std::string&,
+                              const std::string&) -> std::expected<std::string, std::string> {
+        return std::string{"shared-def"};
+    };
+    const auto pack_yaml = [](const std::string& name, const std::string& kind) {
+        return "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: " + name +
+               "\nversion: 1.0.0\ndescription: d\n---\napiVersion: yuzu.io/v1alpha1\nkind: " + kind +
+               "\nname: item-" + name + "\n";
+    };
+    auto a = store.install(pack_yaml("pack-a", "InstructionDefinition"), shared_id);
+    auto b = store.install(pack_yaml("pack-b", "InstructionDefinition"), shared_id);
+    auto w = store.install(pack_yaml("pack-w", "Workflow"), shared_id);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    REQUIRE(w.has_value());
+
+    auto both = store.packs_containing_item("InstructionDefinition", "shared-def", 10);
+    REQUIRE(both.has_value());
+    std::vector<std::string> expected{*a, *b};
+    std::sort(expected.begin(), expected.end());
+    CHECK(*both == expected); // the Workflow pack with the same item id is not included
+
+    auto capped = store.packs_containing_item("InstructionDefinition", "shared-def", 1);
+    REQUIRE(capped.has_value());
+    CHECK(capped->size() == 1);
+    CHECK((*capped)[0] == expected[0]);
+
+    auto none = store.packs_containing_item("InstructionDefinition", "no-such-item", 10);
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+
+    PgPool dead{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    ProductPackStore closed{dead};
+    auto err = closed.packs_containing_item("InstructionDefinition", "shared-def", 10);
+    REQUIRE_FALSE(err.has_value());
+    CHECK(err.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
+}
+
+// N1-6d. The glue the three DELETE routes share: make_definition_pack_advisory_fn asks the pack
+// store for the kind "InstructionDefinition" with a window of 20, and pack_advisory_note names five
+// of them and counts the rest. Turns red if the kind literal changes (the Workflow pack with the
+// same item id would be listed instead), if the window is not 20, or if the note stops counting.
+TEST_CASE("make_definition_pack_advisory_fn asks for InstructionDefinition packs 20 at a time and "
+          "pack_advisory_note names five and counts the rest",
+          "[product_pack_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    const auto shared_id = [](const std::string&,
+                              const std::string&) -> std::expected<std::string, std::string> {
+        return std::string{"shared-def"};
+    };
+    const auto pack_yaml = [](const std::string& name, const std::string& kind) {
+        return "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: " + name +
+               "\nversion: 1.0.0\ndescription: d\n---\napiVersion: yuzu.io/v1alpha1\nkind: " + kind +
+               "\nname: item-" + name + "\n";
+    };
+    for (int i = 0; i < 22; ++i)
+        REQUIRE(store.install(pack_yaml("def-pack-" + std::to_string(i), "InstructionDefinition"),
+                              shared_id)
+                    .has_value());
+    REQUIRE(store.install(pack_yaml("wf-pack", "Workflow"), shared_id).has_value());
+
+    const auto fn = yuzu::server::make_definition_pack_advisory_fn(&store);
+    const auto ids = fn("shared-def");
+    REQUIRE(ids.has_value());
+    CHECK(ids->size() == 20); // the window: 22 packs match, the Workflow pack never does
+    const auto note = yuzu::server::pack_advisory_note(fn, "shared-def");
+    CHECK(note.starts_with("packs="));
+    CHECK(note.ends_with(",+15")); // 20 found, 5 named
+    CHECK(std::count(note.begin(), note.end(), ',') == 5);
+
+    // An unwired store is an error result the note drops (the delete is never affected).
+    const auto unwired = yuzu::server::make_definition_pack_advisory_fn(nullptr);
+    CHECK_FALSE(unwired("shared-def").has_value());
+    CHECK(yuzu::server::pack_advisory_note(unwired, "shared-def").empty());
+}
+
+// N1-6d. Pack ids come from the store but reach the audit detail through log_token: a control
+// byte, an escape or a newline in one never survives into the row. Turns red if the fold is removed.
+TEST_CASE("pack_advisory_note folds a hostile pack id and never throws", "[product_pack_store]") {
+    const yuzu::server::DefinitionPackAdvisoryFn hostile =
+        [](const std::string&) -> std::expected<std::vector<std::string>, std::string> {
+        return std::vector<std::string>{"evil\x1b[31m\npack"};
+    };
+    const auto note = yuzu::server::pack_advisory_note(hostile, "d");
+    CHECK(note.starts_with("packs="));
+    CHECK(note.find('\x1b') == std::string::npos);
+    CHECK(note.find('\n') == std::string::npos);
+
+    const yuzu::server::DefinitionPackAdvisoryFn throwing =
+        [](const std::string&) -> std::expected<std::vector<std::string>, std::string> {
+        throw std::runtime_error("boom");
+    };
+    CHECK(yuzu::server::pack_advisory_note(throwing, "d").empty());
 }

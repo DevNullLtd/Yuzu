@@ -42,6 +42,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -92,6 +93,16 @@ public:
     [[nodiscard]] std::expected<std::optional<PolicyFragment>, PolicyReadError>
     get_fragment(const std::string& id) const;
     [[nodiscard]] bool delete_fragment(const std::string& id);
+    /// Ids of the fragments whose check, fix or post-check names `instruction_id` (an instruction
+    /// DEFINITION id), at most `limit` of them. The evaluator resolves those three fields by
+    /// definition id, so a fragment pointing at a deleted definition silently stops maturing
+    /// verdicts. `exclude_ids` are left out INSIDE the query, so an excluded row never takes one
+    /// of the `limit` slots. `kDegraded` = the question could not be answered; it is never an
+    /// empty list.
+    [[nodiscard]] std::expected<std::vector<std::string>, PolicyReadError>
+    fragments_referencing_instruction(
+        const std::string& instruction_id, int limit,
+        const std::unordered_set<std::string>& exclude_ids = {}) const;
 
     /// Extract the operator-facing fragment name from a YAML source string
     /// without parsing the entire fragment. Used by route handlers that
