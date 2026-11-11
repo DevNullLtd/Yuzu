@@ -14,11 +14,16 @@
 /// example workflow-step ids and `polchk-`, `bundle-`, `preflight-` and `deployment-` ids) are never
 /// forgotten; they age out after `max_age_s`.
 ///
-/// Ids are kept as fixed-width 64-bit digests (in-process only, never persisted or compared across
-/// processes), so memory per entry does not depend on what an agent sends. Two ids with the same
-/// digest read as one, which only over-reports, with one exception: forgetting a pair also erases a
-/// different pair whose two digests both match, which needs two ids the server issued to the same
-/// agent within `max_age_s` to share a 64-bit digest.
+/// Keys (in process only, never persisted or compared across processes): the EXACT agent id, and a
+/// 64-bit digest of the command id salted with a random per-process value. Entries, the per-agent
+/// index and the agent markers all compare agent ids byte for byte, so nothing one agent sends can
+/// read, erase or mark another agent's entry. Agent ids are at most `kMaxAgentIdBytes` (Register
+/// refuses a longer one, `auth::kMaxAgentIdLength`), which bounds what an entry or marker holds; a
+/// longer id is never stored: noting one sets the global latch (fail closed). Two command ids with
+/// the same digest read as one command: within one agent's own pairs forgetting one also erases the
+/// other, and a remembered command also covers the other; neither reaches another agent's entry.
+/// The salt keeps such a collision from being computed ahead of time; the digest is not a
+/// cryptographic MAC.
 ///
 /// Bounded, and FAILS CLOSED whenever it cannot keep a record (it over-reports an answer as not
 /// fully stored rather than lose one):
@@ -32,6 +37,8 @@
 /// - a full marker set or a full command set cannot take another: either one sets a global latch
 ///   for `max_age_s` seconds during which `contains` is true for every pair. Only these two cases
 ///   affect agents other than the one that sent the frames.
+/// Memory is bounded, about 4 MiB worst case at the default caps with every agent id at the
+/// 256-byte bound (an estimate from allocation sizes measured on one platform, not a guarantee).
 /// Every entry, marker, remembered command and latch is dropped `max_age_s` seconds after it was set
 /// (the result-set fill runs within minutes of a dispatch, so an older one no longer changes any
 /// fill). Lives in process memory only: a restart, or a terminal frame served by another replica,
@@ -44,7 +51,9 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <random>
 #include <set>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -57,11 +66,20 @@ public:
     static constexpr std::size_t kDefaultCommandCapacity = 1024;
     static constexpr std::size_t kDefaultMarkerCapacity = 1024;
     static constexpr int64_t kDefaultMaxAgeSeconds = 3600;
+    /// The longest agent id kept (equal to `auth::kMaxAgentIdLength`, asserted where both are
+    /// visible).
+    static constexpr std::size_t kMaxAgentIdBytes = 256;
 
-    /// The id digest. Tests may inject one to force collisions.
-    using Digest = uint64_t (*)(std::string_view);
-    static uint64_t default_digest(std::string_view id) noexcept {
-        return static_cast<uint64_t>(std::hash<std::string_view>{}(id));
+    /// The command-id digest, given the per-process salt. Tests may inject one to force collisions.
+    using CommandDigest = uint64_t (*)(uint64_t salt, std::string_view command_id);
+    /// FNV-1a over the id, started from the salt.
+    static uint64_t default_command_digest(uint64_t salt, std::string_view id) noexcept {
+        uint64_t h = salt ^ 0xcbf29ce484222325ULL;
+        for (const unsigned char c : id) {
+            h ^= c;
+            h *= 0x100000001b3ULL;
+        }
+        return h;
     }
 
     struct NoteResult {
@@ -75,29 +93,35 @@ public:
                                      std::size_t per_agent_capacity = kDefaultPerAgentCapacity,
                                      std::size_t command_capacity = kDefaultCommandCapacity,
                                      std::size_t marker_capacity = kDefaultMarkerCapacity,
-                                     Digest digest = &default_digest)
+                                     CommandDigest command_digest = &default_command_digest)
         : capacity_(std::max<std::size_t>(capacity, 1)), max_age_s_(max_age_s),
           per_agent_capacity_(std::max<std::size_t>(per_agent_capacity, 1)),
           command_capacity_(std::max<std::size_t>(command_capacity, 1)),
-          marker_capacity_(std::max<std::size_t>(marker_capacity, 1)), digest_(digest) {}
+          marker_capacity_(std::max<std::size_t>(marker_capacity, 1)),
+          command_digest_(command_digest), salt_(random_salt()) {}
 
     /// Record a pair whose answer may be missing, seen at `now_s`. A pair already present keeps its
     /// first-seen time.
     [[nodiscard]] NoteResult note(std::string_view command_id, std::string_view agent_id,
                                   int64_t now_s) {
-        const Key key{digest_(command_id), digest_(agent_id)};
+        const KeyView view{command_digest_(salt_, command_id), agent_id};
         std::lock_guard lock(mu_);
         expire_locked(now_s);
         NoteResult out;
-        if (by_key_.contains(key))
+        if (agent_id.size() > kMaxAgentIdBytes) {
+            // Not reachable (Register refuses such an id); never stored, so fail closed for all.
+            out.latched = latch_locked(now_s);
             return out;
-        if (auto own = by_agent_.find(key.second);
+        }
+        if (by_key_.contains(view))
+            return out;
+        if (auto own = by_agent_.find(agent_id);
             own != by_agent_.end() && own->second.size() >= per_agent_capacity_) {
             // Evict this agent's own oldest entry; the agent's marker, set first so a failed
             // allocation loses nothing, stands for it.
-            const auto oldest = by_key_.find(by_age_.at(*own->second.begin()));
-            const bool was_marked = markers_.contains(key.second);
-            if (markers_.remember(key.second, now_s, next_seq_++, marker_capacity_))
+            const auto oldest = by_age_.at(*own->second.begin());
+            const bool was_marked = markers_.contains(agent_id);
+            if (markers_.remember(std::string(agent_id), now_s, next_seq_++, marker_capacity_))
                 out.latched |= latch_locked(now_s);
             out.marked = !was_marked;
             erase_locked(oldest);
@@ -105,13 +129,14 @@ public:
         }
         // Insert into all three indexes or none (an allocation failure leaves no orphan).
         const uint64_t seq = next_seq_++;
-        const auto entry = by_key_.emplace(key, Entry{now_s, seq}).first;
+        const auto entry =
+            by_key_.emplace(Key{view.first, std::string(agent_id)}, Entry{now_s, seq}).first;
         try {
-            by_age_.emplace(seq, key);
-            by_agent_[key.second].insert(seq);
+            by_age_.emplace(seq, entry);
+            by_agent_[entry->first.second].insert(seq);
         } catch (...) {
             by_age_.erase(seq);
-            if (auto own = by_agent_.find(key.second); own != by_agent_.end()) {
+            if (auto own = by_agent_.find(agent_id); own != by_agent_.end()) {
                 own->second.erase(seq);
                 if (own->second.empty())
                     by_agent_.erase(own);
@@ -120,7 +145,7 @@ public:
             throw;
         }
         while (by_key_.size() > capacity_) {
-            const auto oldest = by_key_.find(by_age_.begin()->second);
+            const auto oldest = by_age_.begin()->second;
             if (commands_.remember(oldest->first.first, now_s, next_seq_++, command_capacity_))
                 out.latched |= latch_locked(now_s);
             erase_locked(oldest); // after its command is remembered: nothing is lost on a throw
@@ -134,19 +159,19 @@ public:
     /// nothing.
     [[nodiscard]] bool contains(std::string_view command_id, std::string_view agent_id,
                                 int64_t now_s) {
-        const Key key{digest_(command_id), digest_(agent_id)};
+        const KeyView view{command_digest_(salt_, command_id), agent_id};
         std::lock_guard lock(mu_);
         expire_locked(now_s);
-        return now_s < latched_until_s_ || markers_.contains(key.second) ||
-               commands_.contains(key.first) || by_key_.contains(key);
+        return now_s < latched_until_s_ || markers_.contains(agent_id) ||
+               commands_.contains(view.first) || by_key_.contains(view);
     }
 
     /// Erase the pair's entry (once its flag is recorded). A marker, a remembered command and the
     /// latch stay until they expire: they stand for other pairs too.
     void forget(std::string_view command_id, std::string_view agent_id) {
-        const Key key{digest_(command_id), digest_(agent_id)};
+        const KeyView view{command_digest_(salt_, command_id), agent_id};
         std::lock_guard lock(mu_);
-        if (auto it = by_key_.find(key); it != by_key_.end())
+        if (auto it = by_key_.find(view); it != by_key_.end())
             erase_locked(it);
     }
 
@@ -157,26 +182,49 @@ public:
     }
 
 private:
-    using Key = std::pair<uint64_t, uint64_t>; // (command digest, agent digest)
+    using Key = std::pair<uint64_t, std::string>;          // (salted command digest, agent id)
+    using KeyView = std::pair<uint64_t, std::string_view>; // the same, for a lookup
+    /// Orders `Key` and `KeyView` alike, so a lookup never copies the agent id.
+    struct KeyLess {
+        using is_transparent = void;
+        template <class A, class B> bool operator()(const A& a, const B& b) const {
+            return a.first != b.first ? a.first < b.first
+                                      : std::string_view(a.second) < std::string_view(b.second);
+        }
+    };
     struct Entry {
         int64_t seen_s{0};
         uint64_t seq{0};
     };
+    using Entries = std::map<Key, Entry, KeyLess>;
 
-    /// Digests kept for `max_age_s` after they were last set, oldest dropped past a capacity.
-    class AgedSet {
+    static uint64_t random_salt() noexcept {
+        try {
+            std::random_device rd;
+            return (static_cast<uint64_t>(rd()) << 32) ^ rd();
+        } catch (...) {
+            return 0; // the exact agent key, not the salt, keeps agents apart
+        }
+    }
+
+    /// Ids kept for `max_age_s` after they were last set, oldest dropped past a capacity.
+    template <class Id> class AgedSet {
     public:
-        bool contains(uint64_t id) const { return items_.contains(id); }
+        template <class K> bool contains(const K& id) const { return items_.contains(id); }
 
         /// Sets (or refreshes) `id`. True when the set was full and dropped its oldest member.
-        bool remember(uint64_t id, int64_t now_s, uint64_t seq, std::size_t capacity) {
+        bool remember(Id id, int64_t now_s, uint64_t seq, std::size_t capacity) {
             if (auto it = items_.find(id); it != items_.end()) {
-                by_age_.erase(it->second.seq);
-                items_.erase(it);
+                // Refresh in place: re-keying the age node allocates nothing, so it cannot throw.
+                auto node = by_age_.extract(it->second.seq);
+                node.key() = seq;
+                by_age_.insert(std::move(node));
+                it->second = Item{now_s, seq};
+                return false;
             }
-            const auto item = items_.emplace(id, Item{now_s, seq}).first;
+            const auto item = items_.emplace(std::move(id), Item{now_s, seq}).first;
             try {
-                by_age_.emplace(seq, id);
+                by_age_.emplace(seq, item);
             } catch (...) {
                 items_.erase(item);
                 throw;
@@ -194,7 +242,7 @@ private:
         void expire(int64_t now_s, int64_t max_age_s) {
             while (!by_age_.empty()) {
                 const auto oldest = by_age_.begin();
-                if (now_s - items_.at(oldest->second).at_s < max_age_s)
+                if (now_s - oldest->second->second.at_s < max_age_s)
                     break;
                 items_.erase(oldest->second);
                 by_age_.erase(oldest);
@@ -206,11 +254,12 @@ private:
             int64_t at_s{0};
             uint64_t seq{0};
         };
-        std::map<uint64_t, Item> items_;
-        std::map<uint64_t, uint64_t> by_age_; // seq -> id, oldest first
+        using Items = std::map<Id, Item, std::less<>>;
+        Items items_;
+        std::map<uint64_t, typename Items::iterator> by_age_; // seq -> item, oldest first
     };
 
-    void erase_locked(std::map<Key, Entry>::iterator it) {
+    void erase_locked(Entries::iterator it) {
         const uint64_t seq = it->second.seq;
         if (auto own = by_agent_.find(it->first.second); own != by_agent_.end()) {
             own->second.erase(seq);
@@ -232,11 +281,7 @@ private:
     // practice; a clock step back only delays expiry (never drops a fresh entry early).
     void expire_locked(int64_t now_s) {
         while (!by_age_.empty()) {
-            const auto it = by_key_.find(by_age_.begin()->second);
-            if (it == by_key_.end()) { // not reachable: the indexes change together
-                by_age_.erase(by_age_.begin());
-                continue;
-            }
+            const auto it = by_age_.begin()->second;
             if (now_s - it->second.seen_s < max_age_s_)
                 break;
             erase_locked(it);
@@ -250,13 +295,14 @@ private:
     const std::size_t per_agent_capacity_;
     const std::size_t command_capacity_;
     const std::size_t marker_capacity_;
-    const Digest digest_;
+    const CommandDigest command_digest_;
+    const uint64_t salt_;
     mutable std::mutex mu_;
-    std::map<Key, Entry> by_key_;
-    std::map<uint64_t, Key> by_age_;                    // insertion order: oldest first
-    std::map<uint64_t, std::set<uint64_t>> by_agent_;   // each agent's entries, oldest first
-    AgedSet markers_;  // agents that lost an entry to their own cap
-    AgedSet commands_; // commands of entries evicted by the global cap
+    Entries by_key_;
+    std::map<uint64_t, Entries::iterator> by_age_;                    // insertion order: oldest first
+    std::map<std::string, std::set<uint64_t>, std::less<>> by_agent_; // each agent's entries, oldest first
+    AgedSet<std::string> markers_; // agents that lost an entry to their own cap
+    AgedSet<uint64_t> commands_;   // commands of entries evicted by the global cap
     int64_t latched_until_s_{0};
     uint64_t next_seq_{0};
 };

@@ -53,12 +53,15 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
   the registry does not already report the pair; read without erasing by `unverified_frame_seen` at
   the two terminal ingest sites; an entry is erased by `notify_exec_tracker` only after
   `ExecutionTracker::update_agent_status` wrote a row carrying a true `response_dropped`.
-- **Owner type:** owned by value by the service; `std::map`/`std::set` entries keyed by 64-bit
-  digests of the ids (`std::hash<std::string_view>`, in process only) plus a `std::mutex`, no
-  thread, no callback, no handle.
+- **Owner type:** owned by value by the service; `std::map`/`std::set` entries keyed by the exact
+  agent id and a 64-bit digest of the command id salted with a random per-process value (in
+  process only), plus a `std::mutex`, no thread, no callback, no handle.
 - **Bound:** 64 entries per agent, 4,096 entries in all, 1,024 agent markers and 1,024 remembered
-  commands, every one a fixed-size node (two 64-bit digests or one, plus a time and a sequence), so
-  held memory does not depend on id length (well under 1 MiB at the caps). A new entry past an
+  commands. An entry and a marker hold the agent id, which Register bounds to 256 bytes
+  (`auth::kMaxAgentIdLength`, asserted equal to the registry's `kMaxAgentIdBytes`); a longer id is
+  never stored and sets the latch instead. Held memory is bounded, about 4 MiB worst case with every
+  structure full and every agent id at 256 bytes (an estimate from allocation sizes measured on one
+  platform). A new entry past an
   agent's own cap evicts that agent's oldest entry and marks the agent (every pair of a marked agent
   reads as not fully stored; a flooding agent affects only its own pairs); past the global cap the
   oldest entry is evicted and its command remembered (every agent of it reads as not fully stored).

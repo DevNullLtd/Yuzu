@@ -83,6 +83,10 @@ namespace {
 // bound as one agent, plugin_result_audit.hpp).
 static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
               "the registry audit budget must key on a whole agent id");
+// The unverified-frame registry keeps exact agent ids up to the enrolment bound (a longer one is
+// never stored and fails closed).
+static_assert(UnverifiedFrameRegistry::kMaxAgentIdBytes == auth::kMaxAgentIdLength,
+              "the unverified-frame registry must keep every enrolled agent id whole");
 
 // Persists the `registry.write` audit rows one stored output frame owes (see
 // plugin_result_audit.hpp for the binding: a minted registry command id AND an agent-stamped

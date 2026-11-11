@@ -779,8 +779,10 @@ record without erasing it and reports `response_dropped`; the record is erased o
 tracker row has been written with that flag, so a terminal frame whose own lookup or tracker write
 fails leaves the record for a replayed terminal frame. A lost answer whose tracker row could not be
 written (`update_agent_status` returned false) is recorded in the same registry, so a later terminal
-or replayed frame of the pair still reports it. The registry keys on fixed-size digests of the ids
-and is bounded and fails closed: 64 entries per agent, 4,096 in all, one hour per entry. An agent
+or replayed frame of the pair still reports it. The registry keys on the exact agent id and a
+salted digest of the command id, so one agent's frames never read or erase another agent's record.
+It is bounded (about 4 MiB worst case, an estimate) and fails closed: 64 entries per agent, 4,096
+in all, one hour per entry. An agent
 past its own 64 is marked (at most 1,024 markers), and every answer of that agent then reports
 `response_dropped`: a flooding agent affects only its own answers. An entry evicted by the 4,096
 cap has its command id remembered (at most 1,024 commands), and every agent of that command then

@@ -934,30 +934,74 @@ TEST_CASE("UnverifiedFrameRegistry: a full set of agent markers sets the latch",
     CHECK_FALSE(reg.contains("c9", "z", 105 + 60));
 }
 
-TEST_CASE("UnverifiedFrameRegistry: a long id is kept as a fixed-size entry",
+TEST_CASE("UnverifiedFrameRegistry: a long command id and a 256-byte agent id round-trip",
           "[result_set][unverified_frames]") {
     UnverifiedFrameRegistry reg(16, 60);
     const std::string long_cmd(100000, 'c');
-    const std::string long_agent(100000, 'a');
-    const auto r = reg.note(long_cmd, long_agent, 100);
+    const std::string agent(UnverifiedFrameRegistry::kMaxAgentIdBytes, 'a');
+    const auto r = reg.note(long_cmd, agent, 100);
     CHECK(r.evicted == 0);
     CHECK_FALSE(r.latched);
     CHECK(reg.size() == 1);
-    CHECK(reg.contains(long_cmd, long_agent, 101));
+    CHECK(reg.contains(long_cmd, agent, 101));
+    CHECK_FALSE(reg.contains(long_cmd, agent.substr(1), 101)); // a prefix is another agent
     CHECK_FALSE(reg.contains("other-cmd", "other-agent", 101)); // no latch
-    reg.forget(long_cmd, long_agent);
+    reg.forget(long_cmd, agent);
     CHECK(reg.size() == 0);
 }
 
-TEST_CASE("UnverifiedFrameRegistry: ids that share a digest only over-report",
+TEST_CASE("UnverifiedFrameRegistry: an agent id past the bound is never stored and fails closed",
           "[result_set][unverified_frames]") {
-    UnverifiedFrameRegistry reg(16, 60, 64, 1024, 1024, +[](std::string_view) -> uint64_t {
-        return 7;
-    });
-    (void)reg.note("cmd-1", "agent-a", 100);
-    CHECK(reg.contains("cmd-2", "agent-b", 101)); // reported, never missed
-    CHECK(reg.note("cmd-2", "agent-b", 102).evicted == 0); // read as the same pair
+    UnverifiedFrameRegistry reg(16, 60);
+    const std::string too_long(UnverifiedFrameRegistry::kMaxAgentIdBytes + 1, 'a');
+    const auto r = reg.note("cmd", too_long, 100);
+    CHECK(r.latched);
+    CHECK(reg.size() == 0);
+    CHECK(reg.contains("cmd", too_long, 101));
+    CHECK(reg.contains("other-cmd", "other-agent", 101)); // the latch covers every pair
+    CHECK_FALSE(reg.contains("other-cmd", "other-agent", 100 + 60));
+}
+
+// Every command id shares one digest here, so only the exact agent id tells pairs apart.
+static uint64_t colliding_command_digest(uint64_t, std::string_view) { return 7; }
+
+TEST_CASE("UnverifiedFrameRegistry: with colliding command digests one agent never erases or reads "
+          "another agent's entry",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(16, 60, 64, 1024, 1024, &colliding_command_digest);
+    (void)reg.note("cmd-1", "agent-b", 100);
+    CHECK_FALSE(reg.contains("cmd-1", "agent-a", 101)); // agent-a does not see agent-b's entry
+    CHECK_FALSE(reg.contains("cmd-2", "agent-a", 101));
+    reg.forget("cmd-1", "agent-a"); // agent-a's recorded terminal frame
+    reg.forget("cmd-2", "agent-a");
+    CHECK(reg.contains("cmd-1", "agent-b", 102)); // agent-b's entry survives
     CHECK(reg.size() == 1);
+    // Within one agent a shared digest reads as the same pair.
+    CHECK(reg.contains("cmd-2", "agent-b", 102));
+    CHECK(reg.note("cmd-2", "agent-b", 103).evicted == 0);
+    CHECK(reg.size() == 1);
+}
+
+TEST_CASE("UnverifiedFrameRegistry: two agents of one command are kept apart by the exact agent id",
+          "[result_set][unverified_frames]") {
+    // An agent id chosen to look like another agent's (one character apart) is another agent.
+    UnverifiedFrameRegistry reg;
+    (void)reg.note("cmd-issued-1", "host-B-7f3a9c21", 100);
+    CHECK_FALSE(reg.contains("cmd-issued-1", "host-B-7f3a9c22", 101));
+    reg.forget("cmd-issued-1", "host-B-7f3a9c22");
+    CHECK(reg.contains("cmd-issued-1", "host-B-7f3a9c21", 102));
+    CHECK(reg.size() == 1);
+}
+
+TEST_CASE("UnverifiedFrameRegistry: an agent marker covers only that exact agent id",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(100, 3600, 1, 50, 50);
+    (void)reg.note("c0", "agent-a", 1);
+    CHECK(reg.note("c1", "agent-a", 2).marked);
+    CHECK(reg.contains("never-sent", "agent-a", 3));
+    CHECK_FALSE(reg.contains("never-sent", "agent-b", 3)); // one character apart
+    CHECK_FALSE(reg.contains("never-sent", "agent-", 3));  // a prefix
+    CHECK_FALSE(reg.contains("never-sent", "agent-aa", 3));
 }
 
 TEST_CASE("UnverifiedFrameRegistry: a lost answer noted after a failed tracker write reaches the "
