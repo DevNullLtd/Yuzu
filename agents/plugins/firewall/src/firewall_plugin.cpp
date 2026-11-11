@@ -1811,6 +1811,14 @@ private:
 
 constexpr NET_FW_PROFILE_TYPE2 kQuarantineProfiles[] = {
     NET_FW_PROFILE2_DOMAIN, NET_FW_PROFILE2_PRIVATE, NET_FW_PROFILE2_PUBLIC};
+// The local policy store per profile, same order (StandardProfile is the Private profile).
+// The store that `put_Default*Action` writes and `Get-NetFirewallProfile -PolicyStore
+// PersistentStore` reads; a missing value there is "not configured".
+constexpr const wchar_t* kLocalProfileKeys[] = {
+    L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\DomainProfile",
+    L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\StandardProfile",
+    L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\PublicProfile"};
+static_assert(std::size(kLocalProfileKeys) == std::size(kQuarantineProfiles));
 // The prior-policy image is indexed by the same profile position.
 static_assert(std::tuple_size_v<fq::WinPriorPolicy> == std::size(kQuarantineProfiles));
 static_assert(std::tuple_size_v<fq::WinSwitchReading> == std::size(kQuarantineProfiles));
@@ -1939,9 +1947,6 @@ template <class Fn>
 [[nodiscard]] fq::WinAction to_win_action(NET_FW_ACTION a) {
     return a == NET_FW_ACTION_ALLOW ? fq::WinAction::allow : fq::WinAction::block;
 }
-[[nodiscard]] NET_FW_ACTION to_net_fw_action(fq::WinAction a) {
-    return a == fq::WinAction::allow ? NET_FW_ACTION_ALLOW : NET_FW_ACTION_BLOCK;
-}
 
 class WinLeg final : public fq::Leg {
 public:
@@ -2022,15 +2027,24 @@ public:
 
         // 2. Capture the prior profile policy, write-once, BEFORE any write.
         fq::WinPriorPolicy prior{};
+        // get_Default*Action returns the EFFECTIVE value, so whether a LOCAL value exists is
+        // read from the local store: absent = not configured (a release deletes instead of
+        // pinning), unreadable = unknown (the image is refused, never guessed).
         for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
-            NET_FW_ACTION in = NET_FW_ACTION_BLOCK, out = NET_FW_ACTION_BLOCK;
-            const HRESULT hi = policy->get_DefaultInboundAction(kQuarantineProfiles[i], &in);
-            const HRESULT ho = policy->get_DefaultOutboundAction(kQuarantineProfiles[i], &out);
-            // S_FALSE passes SUCCEEDED() but means "not found": only S_OK is a reading.
-            if (hi == S_OK)
-                prior[i].in = to_win_action(in);
-            if (ho == S_OK)
-                prior[i].out = to_win_action(out);
+            const auto capture = [&](const wchar_t* name, bool inbound) {
+                const auto local = read_policy_dword(kLocalProfileKeys[i], name);
+                if (!local.readable)
+                    return fq::WinAction::unknown;
+                if (!local.value)
+                    return fq::WinAction::not_configured;
+                NET_FW_ACTION act = NET_FW_ACTION_BLOCK;
+                const HRESULT hr = inbound ? policy->get_DefaultInboundAction(kQuarantineProfiles[i], &act)
+                                           : policy->get_DefaultOutboundAction(kQuarantineProfiles[i], &act);
+                // S_FALSE passes SUCCEEDED() but means "not found": only S_OK is a reading.
+                return hr == S_OK ? to_win_action(act) : fq::WinAction::unknown;
+            };
+            prior[i].in = capture(L"DefaultInboundAction", true);
+            prior[i].out = capture(L"DefaultOutboundAction", false);
         }
         const std::string prior_key{fq::kWinPriorPolicyKey};
         // A KV fault is not "no image": storing the quarantine policy over the real
@@ -2272,11 +2286,8 @@ public:
             result.notes.emplace_back("storage_unreadable=1");
         } else if (prior || !ours_at_start->empty()) {
             for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
-                const auto want = fq::win_release_policy(prior, i);
-                if (policy->put_DefaultInboundAction(kQuarantineProfiles[i],
-                                                     to_net_fw_action(want.in)) != S_OK ||
-                    policy->put_DefaultOutboundAction(kQuarantineProfiles[i],
-                                                      to_net_fw_action(want.out)) != S_OK) {
+                if (!restore_default(*policy.get(), i, L"DefaultInboundAction", prior, true) ||
+                    !restore_default(*policy.get(), i, L"DefaultOutboundAction", prior, false)) {
                     ++tally.policy_restore_failed;
                     result.notes.emplace_back(
                         std::format("policy_restore_failed={}", fq::kWinProfileLabels[i]));
@@ -2387,6 +2398,22 @@ private:
         NET_FW_MODIFY_STATE state = NET_FW_MODIFY_STATE_OK;
         return policy.get_LocalPolicyModifyState(&state) == S_OK &&
                state == NET_FW_MODIFY_STATE_GP_OVERRIDE;
+    }
+
+    /// Puts one default-action slot back: deletes the local value when the slot had none
+    /// before (ERROR_FILE_NOT_FOUND = already gone), else writes the explicit action.
+    [[nodiscard]] static bool restore_default(INetFwPolicy2& policy, std::size_t i, const wchar_t* name,
+                                       const std::optional<fq::WinPriorPolicy>& prior,
+                                       bool inbound) {
+        const auto op = fq::win_release_slot_op(prior, i, inbound);
+        if (op == fq::WinSlotOp::delete_local) {
+            const LONG rc = RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kLocalProfileKeys[i], name);
+            return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND;
+        }
+        const NET_FW_ACTION act =
+            op == fq::WinSlotOp::write_allow ? NET_FW_ACTION_ALLOW : NET_FW_ACTION_BLOCK;
+        return (inbound ? policy.put_DefaultInboundAction(kQuarantineProfiles[i], act)
+                        : policy.put_DefaultOutboundAction(kQuarantineProfiles[i], act)) == S_OK;
     }
 
     /// One policy-store DWORD. `readable` is false for any failure but "not there": a

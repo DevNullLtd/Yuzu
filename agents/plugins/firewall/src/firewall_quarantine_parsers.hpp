@@ -1717,7 +1717,10 @@ struct WinReleaseDecision {
     return d;
 }
 
-enum class WinAction : std::uint8_t { unknown, allow, block };
+/// `not_configured`: the profile had NO local value for that direction (the effective
+/// action came from the OS default or a lower-precedence source), so a release deletes the
+/// local value instead of pinning one.
+enum class WinAction : std::uint8_t { unknown, allow, block, not_configured };
 struct WinProfilePolicy {
     WinAction in = WinAction::unknown;
     WinAction out = WinAction::unknown;
@@ -1728,7 +1731,10 @@ using WinPriorPolicy = std::array<WinProfilePolicy, 3>; // Domain, Private, Publ
 inline constexpr std::array<std::string_view, 3> kWinProfileNames{"domain", "private", "public"};
 
 [[nodiscard]] constexpr std::string_view to_string(WinAction a) noexcept {
-    return a == WinAction::allow ? "allow" : a == WinAction::block ? "block" : "unknown";
+    return a == WinAction::allow           ? "allow"
+           : a == WinAction::block         ? "block"
+           : a == WinAction::not_configured ? "notconfigured"
+                                           : "unknown";
 }
 
 [[nodiscard]] constexpr bool is_complete_prior_policy(const WinPriorPolicy& p) noexcept {
@@ -1746,7 +1752,7 @@ inline constexpr std::array<std::string_view, 3> kWinProfileNames{"domain", "pri
 }
 
 [[nodiscard]] inline std::string serialize_prior_policy(const WinPriorPolicy& p) {
-    std::string out = "v=1\n";
+    std::string out = "v=2\n";
     for (std::size_t i = 0; i < 3; ++i) {
         out += std::format("{}.in={}\n", kWinProfileNames[i], to_string(p[i].in));
         out += std::format("{}.out={}\n", kWinProfileNames[i], to_string(p[i].out));
@@ -1755,7 +1761,9 @@ inline constexpr std::array<std::string_view, 3> kWinProfileNames{"domain", "pri
 }
 
 /// nullopt unless all six values are present and valid: an incomplete image is
-/// never replayed (a guess at the missing half could weaken the host).
+/// never replayed (a guess at the missing half could weaken the host). `v=2` added
+/// `notconfigured`; a `v=1` image recorded only the effective action, so it is refused
+/// rather than read as "a local value existed" or as "not configured".
 [[nodiscard]] inline std::optional<WinPriorPolicy> parse_prior_policy(std::string_view text) {
     WinPriorPolicy p{};
     bool seen_v = false;
@@ -1769,7 +1777,7 @@ inline constexpr std::array<std::string_view, 3> kWinProfileNames{"domain", "pri
         const auto key = line.substr(0, eq);
         const auto val = line.substr(eq + 1);
         if (key == "v") {
-            if (seen_v || val != "1")
+            if (seen_v || val != "2")
                 return std::nullopt;
             seen_v = true;
             continue;
@@ -1779,6 +1787,8 @@ inline constexpr std::array<std::string_view, 3> kWinProfileNames{"domain", "pri
             a = WinAction::allow;
         else if (val == "block")
             a = WinAction::block;
+        else if (val == "notconfigured")
+            a = WinAction::not_configured;
         else
             return std::nullopt;
         bool matched = false;
@@ -1935,6 +1945,26 @@ win_merge_disabled_list(std::vector<WinListedRule> stored,
     const auto& p = (*prior)[profile_index];
     return {p.in == WinAction::allow ? WinAction::allow : WinAction::block,
             p.out == WinAction::allow ? WinAction::allow : WinAction::block};
+}
+
+/// What a release does to one default-action slot: write an explicit value, or delete
+/// the local value (the slot had none before the quarantine).
+enum class WinSlotOp : std::uint8_t { write_allow, write_block, delete_local };
+
+/// The decision per slot. Not configured before -> delete; an explicit value -> write it;
+/// `unknown` (parse_prior_policy never yields one) and no image -> win_release_policy's
+/// safe-side write, never a guess at "not configured".
+[[nodiscard]] constexpr WinSlotOp win_release_slot_op(const std::optional<WinPriorPolicy>& prior,
+                                                      std::size_t profile_index,
+                                                      bool inbound) noexcept {
+    if (prior && profile_index < prior->size()) {
+        const auto& p = (*prior)[profile_index];
+        if ((inbound ? p.in : p.out) == WinAction::not_configured)
+            return WinSlotOp::delete_local;
+    }
+    const auto want = win_release_policy(prior, profile_index);
+    return (inbound ? want.in : want.out) == WinAction::allow ? WinSlotOp::write_allow
+                                                              : WinSlotOp::write_block;
 }
 
 inline constexpr std::array<std::string_view, 3> kWinProfileLabels{"Domain", "Private", "Public"};

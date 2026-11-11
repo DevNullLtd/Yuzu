@@ -946,9 +946,13 @@ TEST_CASE("windows: prior policy image and the write-once decision", "[agent][fi
     CHECK_FALSE(is_quarantine_shaped(p));
 
     // an incomplete image is never replayed
-    CHECK_FALSE(parse_prior_policy("v=1\ndomain.in=allow\n"));
+    CHECK_FALSE(parse_prior_policy("v=2\ndomain.in=allow\n"));
     CHECK_FALSE(parse_prior_policy(text + "public.in=allow\n")); // duplicate
     CHECK_FALSE(parse_prior_policy("v=2\n"));
+    // a v=1 image recorded only the effective action: refused, never read as "not configured"
+    CHECK_FALSE(parse_prior_policy(std::string(text).replace(0, 3, "v=1")));
+    CHECK_FALSE(parse_prior_policy(std::string(text).replace(0, 3, "v=3")));
+    CHECK_FALSE(parse_prior_policy(std::string(text).substr(4))); // no v= header at all
     CHECK_FALSE(parse_prior_policy(std::string(text).replace(text.find("allow"), 5, "maybe")));
     WinPriorPolicy partial = p;
     partial[1].out = WinAction::unknown;
@@ -1075,6 +1079,41 @@ TEST_CASE("windows: the disabled-rule list is written on the first apply and onl
         CHECK(over.over_cap);
         CHECK(over.grew);
     }
+}
+
+TEST_CASE("windows: a not-configured slot round-trips and releases by deleting the local value",
+          "[agent][firewall_quarantine]") {
+    WinPriorPolicy p{};
+    p[0] = {WinAction::not_configured, WinAction::not_configured};
+    p[1] = {WinAction::not_configured, WinAction::allow};
+    p[2] = {WinAction::block, WinAction::not_configured};
+    const auto text = serialize_prior_policy(p);
+    CHECK(text.starts_with("v=2\n"));
+    const auto back = parse_prior_policy(text);
+    REQUIRE(back);
+    CHECK(*back == p);
+    CHECK(is_complete_prior_policy(p));
+    CHECK_FALSE(is_quarantine_shaped(p));
+
+    // not configured before -> delete; explicit before -> write that value
+    CHECK(win_release_slot_op(p, 0, true) == WinSlotOp::delete_local);
+    CHECK(win_release_slot_op(p, 0, false) == WinSlotOp::delete_local);
+    CHECK(win_release_slot_op(p, 1, true) == WinSlotOp::delete_local);
+    CHECK(win_release_slot_op(p, 1, false) == WinSlotOp::write_allow);
+    CHECK(win_release_slot_op(p, 2, true) == WinSlotOp::write_block);
+    CHECK(win_release_slot_op(p, 2, false) == WinSlotOp::delete_local);
+
+    // unknown, no image and an out-of-range profile never guess "not configured"
+    WinPriorPolicy odd{};
+    CHECK(win_release_slot_op(odd, 0, true) == WinSlotOp::write_block);
+    CHECK(win_release_slot_op(odd, 0, false) == WinSlotOp::write_block);
+    CHECK(win_release_slot_op(std::nullopt, 0, true) == WinSlotOp::write_block);
+    CHECK(win_release_slot_op(std::nullopt, 0, false) == WinSlotOp::write_allow);
+    CHECK(win_release_slot_op(p, 3, true) == WinSlotOp::write_block);
+    // an image with an unknown slot is not complete, so it is never stored
+    CHECK_FALSE(parse_prior_policy(std::string(text).replace(text.find("notconfigured"), 13, "unknown")));
+    CHECK(decide_prior_store(false, false, odd) == PriorStore::refuse_incomplete);
+    CHECK(decide_prior_store(false, true, p) == PriorStore::store);
 }
 
 TEST_CASE("windows: release restores the captured policy; the default applies only without an image",
