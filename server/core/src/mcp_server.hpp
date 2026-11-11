@@ -47,6 +47,7 @@
 #include "fleet_topology_store.hpp" // #2146 Batch B3: FleetTopologyStore + merge_offline_topology
 #include "offline_endpoint_store.hpp" // #2146 Batch B3: OfflineEndpoint -- see set_viz_deps below
 #include "guaranteed_state_store.hpp"
+#include "instruction_referrers.hpp" // DefinitionReferrersFn
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
 #include "kek_routes.hpp" // KekOps / KekOpResult (#2395 track C): reused, not redefined
@@ -543,6 +544,18 @@ public:
     /// `instruction.executed`. Best effort, after the effect; unset = no event. MUST be called
     /// before the server starts listening.
     void set_emit_event_fn(EmitEventFn fn) { emit_event_fn_ = std::move(fn); }
+    /// What still references a definition (UP-6): `delete_definition` refuses a referenced one.
+    /// Unset or failing is a retryable store fault and nothing is deleted. Same instance as the
+    /// v1 DELETE twin's `RouteDeps::referrers_fn`.
+    void set_definition_referrers_fn(DefinitionReferrersFn fn) {
+        definition_referrers_fn_ = std::move(fn);
+    }
+
+    /// The advisory pack lookup (M2-3): `delete_definition`'s success row notes `packs=<ids>`.
+    /// Unset or failing = no note. Same instance as the v1 DELETE twin's `pack_advisory_fn`.
+    void set_definition_pack_advisory_fn(DefinitionPackAdvisoryFn fn) {
+        definition_pack_advisory_fn_ = std::move(fn);
+    }
 
     /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
     /// ADR-0017 list-admit resolver for list_upload_grants, backing
@@ -1409,6 +1422,8 @@ private:
     config::Backing runtime_config_{};
     ExecutionMutationPorts execution_mutation_ports_for_test_{}; // see set_execution_mutation_ports_for_test
     EmitEventFn emit_event_fn_;                                  // see set_emit_event_fn
+    DefinitionReferrersFn definition_referrers_fn_;              // see set_definition_referrers_fn
+    DefinitionPackAdvisoryFn definition_pack_advisory_fn_;       // see set_definition_pack_advisory_fn
     UploadGrantStore* upload_grant_store_{nullptr};
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.

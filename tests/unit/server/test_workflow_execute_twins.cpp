@@ -5361,4 +5361,7 @@ TEST_CASE("kEmittedEvents names workflow.executed once, so its failure counter h
           "[workflow][twin][events]") {
     CHECK(std::count(kEmittedEvents.begin(), kEmittedEvents.end(), "workflow.executed") == 1);
     CHECK(kEmittedEvents.back() == "other");
+    // The instruction-definition authoring twins (#2146 batch C) each have their own series too.
+    for (const char* name : {"instruction.created", "instruction.updated", "instruction.deleted"})
+        CHECK(std::count(kEmittedEvents.begin(), kEmittedEvents.end(), name) == 1);
 }

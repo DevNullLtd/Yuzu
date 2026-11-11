@@ -741,6 +741,7 @@ yuzu_server_core_lib = static_library(
     'src/instruction_store.cpp',
     'src/instruction_yaml.cpp',
     'src/instruction_definition_model.cpp', # #4029: shared REST v1 + MCP builder
+    'src/instruction_referrers.cpp', # #2146 UP-6: what still references a definition (delete guard)
     'src/execution_tracker.cpp',
     'src/execution_model.cpp',
     'src/healthcheck_probe.cpp', # #5906: yuzu-server --healthcheck transport
@@ -1079,8 +1080,10 @@ yuzu_server_routes_lib = static_library(
     'src/settings_pki_ui.cpp',
     'src/execution_mutation.cpp', # cancel/rerun REST v1 + MCP twins: one admit-audit-effect sequence
     'src/mcp_instruction_execute.cpp', # MCP twin of POST /api/instructions/{id}/execute: bounds + JSON-RPC rendering over instruction_execute
+    'src/mcp_instruction_authoring.cpp', # MCP twins of the instruction-definition / instruction-set authoring routes (#2146 batch C): store sequences + JSON-RPC rendering
     'src/command_v1_routes.cpp', # POST /api/v1/commands: the REST v1 twin of /api/command + MCP execute_instruction (#2146)
     'src/instruction_execute_routes.cpp', # POST /api/v1/instructions/{id}/execute
+    'src/instruction_authoring_routes.cpp', # v1 definition + instruction-set authoring twins (#2146 batch C)
   ),
   include_directories: yuzu_server_core_incs,
   cpp_args: yuzu_server_core_cpp_args,

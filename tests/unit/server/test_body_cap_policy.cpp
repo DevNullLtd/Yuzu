@@ -240,6 +240,16 @@ constexpr ExpectedResolution kExpected[] = {
     // execute_instruction). requires_measurable like the /mcp/ row; segment-boundary probe below.
     {"POST",   "/api/v1/commands",                                     4u * 1024 * 1024, true,  "commands"},
     {"POST",   "/api/v1/commandsevil",                                 4u * 1024 * 1024, false, "default"},
+    // #2146 batch C: the v1 instruction authoring twins resolve to the catch-all default. Import is
+    // deliberately 4 MiB here against the legacy route's 16 MiB (owner ruling; the MCP twin is
+    // capped at 4 MiB by its transport); the lookalike proves a sibling is not caught by a prefix.
+    {"POST",   "/api/v1/instructions",                                 4u * 1024 * 1024, false, "default"},
+    {"POST",   "/api/v1/instructions/import",                          4u * 1024 * 1024, false, "default"},
+    {"POST",   "/api/v1/instructions/yaml",                            4u * 1024 * 1024, false, "default"},
+    {"POST",   "/api/v1/instructions/validate-yaml",                   4u * 1024 * 1024, false, "default"},
+    {"PUT",    "/api/v1/instructions/abc123",                          4u * 1024 * 1024, false, "default"},
+    {"POST",   "/api/v1/instruction-sets",                             4u * 1024 * 1024, false, "default"},
+    {"POST",   "/api/v1/instructions/importevil",                      4u * 1024 * 1024, false, "default"},
     // Catch-all default — ordinary JSON/form traffic.
     {"POST",   "/api/v1/some-ordinary-mutation-route",    4u * 1024 * 1024,   false, "default"},
     {"GET",    "/api/v1/devices",                         4u * 1024 * 1024,   false, "default"},

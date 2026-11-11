@@ -59,8 +59,14 @@ namespace {
 constexpr std::string_view kFleet[] = {"list_agents", "get_agent_details"};
 constexpr std::string_view kTags[] = {"get_tags", "search_agents_by_tag", "set_tag", "delete_tag"};
 // #4029: export_definition joins the family — same domain, same securable.
-constexpr std::string_view kDefinitions[] = {"list_definitions", "get_definition",
-                                             "export_definition", "list_schedules"};
+// #2146 batch C: the nine authoring twins (definition create/update/delete/import/YAML save and
+// validate, instruction-set list/create/delete) join the family - same domain, same securables.
+constexpr std::string_view kDefinitions[] = {
+    "list_definitions",        "get_definition",         "export_definition",
+    "list_schedules",          "create_definition",      "update_definition",
+    "delete_definition",       "import_definition",      "save_definition_yaml",
+    "validate_definition_yaml", "list_instruction_sets", "create_instruction_set",
+    "delete_instruction_set"};
 // #4029: product packs are a distinct catalog domain (installed bundles of
 // InstructionDefinition/PolicyFragment/Policy/Workflow documents), own
 // securable (ProductPack), own family.
@@ -330,8 +336,9 @@ constexpr std::string_view kCryptoDashboard[] = {
 constexpr std::array<ToolFamily, 42> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
-    {"Instructions & schedules", "instruction definitions, their full export, and recurring "
-                                 "schedules",
+    {"Instructions & schedules", "instruction definitions (read, create, edit, delete, import, "
+                                 "YAML save and validate), instruction sets, their full export, "
+                                 "and recurring schedules",
      kDefinitions},
     {"Product packs", "installed bundles of instruction/policy/workflow content", kProductPacks},
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},

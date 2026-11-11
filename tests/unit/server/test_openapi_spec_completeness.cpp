@@ -377,6 +377,21 @@ TEST_CASE("openapi_spec_json(): info.description states the cookie-session same-
                            "server state") != std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): the strict instruction create requests are closed schemas",
+          "[openapi]") {
+    // The routes refuse an unknown key (build_*_from_*_body), so a schema that omits
+    // additionalProperties:false would tell a generated client the opposite.
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& schemas = spec["components"]["schemas"];
+    for (const char* name : {"InstructionsDefinitionCreateRequest", "InstructionSetCreateRequest"}) {
+        INFO(name);
+        REQUIRE(schemas.contains(name));
+        REQUIRE(schemas[name].contains("additionalProperties"));
+        CHECK(schemas[name]["additionalProperties"] == false);
+    }
+}
+
 TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave 7 PR7.2)",
           "[openapi][app_usage]") {
     const auto& spec_json = yuzu::server::openapi_spec_json();
@@ -1880,7 +1895,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"3f52c4da8daaf692\"";
+    static const std::string kOperationIdChecksum = "\"64ad6d3ced74f7e4\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));

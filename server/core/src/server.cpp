@@ -105,6 +105,8 @@
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "instruction_execute_ports.hpp"  // #2146: shared core of the instruction-definition execute twins
+#include "instruction_referrers.hpp" // make_definition_referrers_fn (UP-6)
+#include "instruction_authoring_routes.hpp" // v1 definition + instruction-set authoring twins (#2146 batch C)
 #include "instruction_execute_routes.hpp" // POST /api/v1/instructions/{id}/execute
 #include "instruction_store.hpp"
 #include "on_behalf_guard.hpp"
@@ -1704,7 +1706,8 @@ public:
         metrics_.describe(yuzu::server::kEventEmitFailedMetric,
                           "Legacy-equivalent platform events (execution.created, "
                           "execution.completed, command.dispatched, instruction.executed, "
-                          "approval.created, workflow.executed) that the v1 REST and MCP twins "
+                          "approval.created, workflow.executed, instruction.created, "
+                          "instruction.updated, instruction.deleted) that the v1 REST and MCP twins "
                           "tried to publish "
                           "after a successful effect and whose emit hook THREW (a payload "
                           "serialisation or hook defect). NOT an analytics-drop signal: the "
@@ -17457,6 +17460,16 @@ private:
                              .nvd_sync = nvd_sync_.get(),
                          });
 
+        // UP-6: ONE referrer lookup and ONE advisory pack lookup, built here (their stores are
+        // members constructed in the ctor, long before this) and handed to every consumer: the v1
+        // DELETE twin and MCP delete_definition, so neither can disagree about what blocks a
+        // delete. The lookups hold raw store pointers, the same lifetime the route lambdas'
+        // other store pointers already rely on.
+        DefinitionReferrersFn definition_referrers_fn = make_definition_referrers_fn(
+            schedule_engine_.get(), workflow_engine_.get(), policy_store_.get());
+        DefinitionPackAdvisoryFn definition_pack_advisory_fn =
+            make_definition_pack_advisory_fn(product_pack_store_.get());
+
         // #2542 PR-7: the 13-route Instruction Definitions + Instruction
         // Sets API cluster, extracted onto the same inline_sink seam.
         yuzu::server::instruction::register_instruction_routes(
@@ -23038,6 +23051,36 @@ private:
                 instr_exec_sink, std::move(instr_exec_deps));
         }
 
+        // #2146 batch C: the v1 REST twins of the legacy instruction-definition and
+        // instruction-set authoring routes. Same store, same permission gate and same audit sink
+        // as the legacy cluster above; audit-first on every write.
+        {
+            // UP-6: the SAME referrer lookup built before the legacy routes (see there) is shared
+            // here and with the MCP delete_definition (wired into mcp_server_ below).
+            yuzu::server::instruction_authoring::RouteDeps authoring_deps;
+            authoring_deps.perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                            const std::string& securable_type,
+                                            const std::string& operation) {
+                return require_permission(req, res, securable_type, operation);
+            };
+            authoring_deps.audit_fn = [this](const httplib::Request& req, const std::string& action,
+                                             const std::string& result,
+                                             const std::string& target_type,
+                                             const std::string& target_id,
+                                             const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
+            };
+            authoring_deps.resolve_session_fn = resolve_session_fn;
+            authoring_deps.emit_event_fn = emit_event_fn;
+            authoring_deps.store = instruction_store_.get();
+            authoring_deps.referrers_fn = definition_referrers_fn;
+            authoring_deps.pack_advisory_fn = definition_pack_advisory_fn;
+            authoring_deps.metrics = &metrics_;
+            HttplibRouteSink authoring_sink{*web_server_};
+            yuzu::server::instruction_authoring::register_instruction_authoring_routes(
+                authoring_sink, std::move(authoring_deps));
+        }
+
         // -- Register MCP server routes ----------------------------------------
 
         if (cfg_.mcp_disable) {
@@ -23141,6 +23184,9 @@ private:
             // Legacy-equivalent events for cancel_execution, record_execution_rerun and
             // execute_instruction_definition (event_emit.hpp).
             mcp_server_->set_emit_event_fn(emit_event_fn);
+            // UP-6: the SAME referrer lookup the v1 DELETE twin uses (authoring_deps above).
+            mcp_server_->set_definition_referrers_fn(definition_referrers_fn);
+            mcp_server_->set_definition_pack_advisory_fn(definition_pack_advisory_fn);
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit

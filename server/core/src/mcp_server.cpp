@@ -12,6 +12,7 @@
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
 #include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
 #include "mcp_instruction_execute.hpp" // execute_instruction_definition: bounds + rendering over instruction_execute (#2146)
+#include "mcp_instruction_authoring.hpp" // the nine instruction-definition / instruction-set authoring twins (#2146 batch C)
 #include "mcp_jsonrpc.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
@@ -4824,6 +4825,236 @@ static const ToolDef kTools[] = {
      R"j("administrator":{"type":"string","enum":["may","may_not","unconfirmed"],"description":"Advisory. may: the RBAC administration routes would admit this credential's durable authority now (excludes the MCP tier and approval ladder, REST MFA step-up and the enforcement change's destination-regime refusal). may_not: they would refuse it. unconfirmed: a required store could not answer; retry later and do not read it as may_not. Advisory only, never a go signal for a mutation. Treat an unrecognised value as unconfirmed"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"False when either audit row (rbac.enforcement.read or mcp.get_rbac_enforcement) failed to persist; the data is still returned. True when both persisted, or when no audit sink is wired"})j"
      R"j(},"required":["enabled","unconfirmed","administrator","audit_persisted"],"additionalProperties":false})j"},
+    // ── #2146 batch C: the instruction-definition / instruction-set authoring twins ─────────────
+    // MCP twins of the nine v1 REST routes in instruction_authoring_routes.cpp (and the legacy
+    // /api/instructions and /api/instruction-sets writes). Legacy kTools[] path, helper TU
+    // mcp_instruction_authoring.{hpp,cpp}; the input bounds below are the MCP schema contract AND
+    // are re-enforced by the shared builders (a test binds the constants to these literals).
+    // Appended at the VERY END of kTools[] per the standing governance note above.
+    {"create_definition",
+     "Create an instruction definition: a stored, named plugin.action that schedules, workflows "
+     "and operators run by id (discover_instructions and list_definitions find one; "
+     "execute_instruction_definition runs one). Creating one runs nothing. Required: name, type, "
+     "plugin. id is optional (omitted: the server generates one; a duplicate id is a conflict, and "
+     "the ids \".\" and \"..\" are refused). "
+     "approval_mode defaults to auto, and AUTO MEANS A LATER RUN OF THIS DEFINITION BY AN "
+     "EXISTING SCHEDULE, A WORKFLOW OR AN OPERATOR-TIER TOKEN NEEDS NO HUMAN APPROVAL: set "
+     "role-gated or always for anything that changes a device. No parameter_schema, "
+     "result_schema or yaml_source is accepted here: save_definition_yaml stores a YAML "
+     "source but does not set the parameter_schema or result_schema columns, and only "
+     "import_definition carries them. Bounds: plugin and action 1 to 128 characters of A-Z a-z 0-9 "
+     "_ . -, name 128, description 512, gather_ttl_seconds 1 to 86400, response_ttl_days 1 to "
+     "3650; an unknown or mistyped field is refused with -32602, never dropped. SUPERVISED tier "
+     "only (operator and readonly tokens are refused). Approval-gated: the first call returns "
+     "approval_required (-32006) with an approval_id; after an admin approves it, re-call with "
+     "the SAME arguments plus that approval_id. Audited: an instruction.create row is written "
+     "BEFORE the change, and the change is refused (retryable, nothing changed) if that row "
+     "cannot be stored; audit_persisted:false means only the outcome row was lost after the "
+     "change was made. Returns {id}. Mirrors POST /api/v1/instructions. Requires "
+     "InstructionDefinition:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Optional definition id (omit to have the server generate one); letters, digits, underscore, dot, hyphen"},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"Display name"},)j"
+     R"j("version":{"type":"string","minLength":1,"maxLength":64,"description":"Definition version, e.g. 1.0 (create default 1.0)"},)j"
+     R"j("type":{"type":"string","enum":["question","action"],"description":"question reads state, action changes it"},)j"
+     R"j("plugin":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Agent plugin name"},)j"
+     R"j("action":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Plugin action name (stored lowercased)"},)j"
+     R"j("description":{"type":"string","maxLength":512,"description":"Free text"},)j"
+     R"j("enabled":{"type":"boolean","description":"Whether the definition can be run (create default true)"},)j"
+     R"j("instruction_set_id":{"type":"string","maxLength":128,"description":"Id of the instruction set this definition belongs to (list_instruction_sets); an empty string on update clears the membership"},)j"
+     R"j("gather_ttl_seconds":{"type":"integer","minimum":1,"maximum":86400,"description":"How long a run gathers responses (create default 300)"},)j"
+     R"j("response_ttl_days":{"type":"integer","minimum":1,"maximum":3650,"description":"How long responses are kept (create default 90)"},)j"
+     R"j("approval_mode":{"type":"string","enum":["auto","role-gated","always"],"description":"Whether a RUN of this definition needs a human: auto never, role-gated unless the caller is an administrator, always every run. Create default auto"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["name","type","plugin"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id"],"additionalProperties":false})j"},
+
+    {"update_definition",
+     "Edit an existing instruction definition by id: only the fields you send change (name, "
+     "version, type, plugin, action, description, enabled, instruction_set_id, "
+     "gather_ttl_seconds, response_ttl_days, approval_mode; the id cannot change). plugin, "
+     "action, approval_mode and enabled decide what a later run executes and whether a human "
+     "must approve it: setting approval_mode to auto, or repointing plugin or action, lets an "
+     "existing schedule or an operator-tier run execute WITHOUT a human, which is why this is "
+     "approval-gated and why the audit row records each of those four changes as old -> new. The "
+     "parameter_schema, result_schema and response templates are not touched. A stored YAML "
+     "source is kept unless the update changes name, description, version, type, plugin, action or "
+     "approval_mode, which clears it "
+     "so that a later save_definition_yaml round trip cannot revert the edit (a change to "
+     "enabled alone keeps it); use save_definition_yaml to change the YAML. expected_updated_at is the updated_at you read "
+     "from get_definition and is REQUIRED (-32602 without it, before any approval is created): the "
+     "approval is for that version, and if the row has changed since the call is refused as a "
+     "conflict and nothing is written. SUPERVISED tier only (operator and readonly tokens are "
+     "refused). Approval-gated: "
+     "the first call returns approval_required (-32006) with an approval_id; after an admin "
+     "approves it, re-call with the SAME arguments plus that approval_id. Audited: an "
+     "instruction.update row is written BEFORE the change, and the change is refused (retryable, "
+     "nothing changed) if that row cannot be stored; audit_persisted:false means only the "
+     "outcome row was lost after the change was made. Returns {id, updated:true}; an unknown id "
+     "is -32602 not_found. Mirrors PUT /api/v1/instructions/{id}. Requires "
+     "InstructionDefinition:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Id of the definition to edit"},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"Display name"},)j"
+     R"j("version":{"type":"string","minLength":1,"maxLength":64,"description":"Definition version, e.g. 1.0 (create default 1.0)"},)j"
+     R"j("type":{"type":"string","enum":["question","action"],"description":"question reads state, action changes it"},)j"
+     R"j("plugin":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Agent plugin name"},)j"
+     R"j("action":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Plugin action name (stored lowercased)"},)j"
+     R"j("description":{"type":"string","maxLength":512,"description":"Free text"},)j"
+     R"j("enabled":{"type":"boolean","description":"Whether the definition can be run (create default true)"},)j"
+     R"j("instruction_set_id":{"type":"string","maxLength":128,"description":"Id of the instruction set this definition belongs to (list_instruction_sets); an empty string on update clears the membership"},)j"
+     R"j("gather_ttl_seconds":{"type":"integer","minimum":1,"maximum":86400,"description":"How long a run gathers responses (create default 300)"},)j"
+     R"j("response_ttl_days":{"type":"integer","minimum":1,"maximum":3650,"description":"How long responses are kept (create default 90)"},)j"
+     R"j("approval_mode":{"type":"string","enum":["auto","role-gated","always"],"description":"Whether a RUN of this definition needs a human: auto never, role-gated unless the caller is an administrator, always every run. Create default auto"},)j"
+     R"j("expected_updated_at":{"type":"integer","minimum":0,"description":"The updated_at read from get_definition; REQUIRED at the supervised tier; a changed row is refused as a conflict"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"updated":{"const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id","updated"],"additionalProperties":false})j"},
+
+    {"delete_definition",
+     "Delete an instruction definition by id. A definition bundled with the server is TOMBSTONED "
+     "rather than just removed: it does not reappear on the next boot, and only re-importing or "
+     "re-creating it brings it back. The id comes from list_definitions or discover_instructions. "
+     "A definition that a schedule, a live workflow or a policy fragment still names is refused "
+     "(-32602, reason referenced, at most 20 referrers listed) and nothing is deleted: remove or "
+     "repoint each referrer first. expected_updated_at is the updated_at you read from "
+     "get_definition and is REQUIRED (-32602 without it, before any approval is created): the "
+     "approval is for that version, and if the row has changed or been re-created since, the call "
+     "is refused as a conflict (-32602, reason conflict) or not_found, before any approval is "
+     "created or spent, and nothing is deleted. Every delete is approval-gated at the supervised "
+     "tier. SUPERVISED tier only "
+     "(operator and readonly tokens are refused). The first call returns approval_required "
+     "(-32006) with an approval_id; after an admin approves it, re-call with the SAME arguments "
+     "plus that approval_id. Audited: an instruction.delete row is written BEFORE the change, and the "
+     "change is refused (retryable, nothing changed) if that row cannot be stored; "
+     "audit_persisted:false means only the outcome row was lost after the change was made. "
+     "Returns {id, deleted:true}; an unknown id is -32602 not_found and nothing changes. Mirrors "
+     "DELETE /api/v1/instructions/{id}. Requires InstructionDefinition:Delete.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Id of the definition to delete"},)j"
+     R"j("expected_updated_at":{"type":"integer","minimum":0,"description":"The updated_at read from get_definition; REQUIRED at the supervised tier; a changed or re-created row is refused as a conflict"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"deleted":{"const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id","deleted"],"additionalProperties":false})j"},
+
+    {"import_definition",
+     "Import an instruction definition from a document: the definition object that "
+     "export_definition returns (its data object when read over REST), plus optional signature "
+     "and publicKey. An export carries NO signature or publicKey; a signed document is "
+     "produced outside the product. An unsigned document is refused unless the server runs "
+     "with --allow-unsigned-definitions, and a signed one is verified against the publicKey "
+     "SUPPLIED IN THE DOCUMENT, so the signature proves the document was not altered after "
+     "signing, NOT who signed it or that the signer is trusted (there is no trust anchor): a "
+     "holder of InstructionDefinition:Write can sign with a key of their own, and unsigned "
+     "create_definition and save_definition_yaml are separate authoring paths. For a signed document plugin, action and approval_mode "
+     "are taken from the verified YAML and an envelope that disagrees is refused. A duplicate id "
+     "is a conflict. The whole request is at most 4 MiB over MCP (the legacy REST "
+     "/api/instructions/import admits 16 MiB; POST /api/v1/instructions/import admits 4 MiB). "
+     "The document is passed to the store as sent; one the store refuses is -32602 carrying the "
+     "store's own message. The approval ticket binds a SHA-256 of the document, not the document "
+     "itself, so the re-call must send the identical document. SUPERVISED tier "
+     "only (operator and readonly tokens are refused). Approval-gated: the first call returns "
+     "approval_required (-32006) with an approval_id; after an admin approves it, re-call with "
+     "the SAME arguments plus that approval_id. Audited: an instruction.import row is written "
+     "BEFORE the change, and the change is refused (retryable, nothing changed) if that row "
+     "cannot be stored; audit_persisted:false means only the outcome row was lost after the "
+     "change was made. Returns {id}. Mirrors POST /api/v1/instructions/import. Requires "
+     "InstructionDefinition:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("document":{"type":"object","description":"The definition object export_definition returns (id, name, version, type, plugin, action, yaml_source, ...) and, for a signed import, signature and publicKey (hex Ed25519) added outside the product; an export has neither"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["document"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id"],"additionalProperties":false})j"},
+
+    {"save_definition_yaml",
+     "Create or update an instruction definition from a YAML document (the Instruction Engine "
+     "format: apiVersion yuzu.io/v1alpha1, kind InstructionDefinition). id omitted or empty: "
+     "CREATE (the YAML's metadata.id is honoured, a duplicate is a conflict, absent means the "
+     "server generates one). id given: UPDATE that definition; the YAML's metadata.id, if "
+     "present, must equal it, and the columns the YAML cannot express (enabled, "
+     "instruction_set_id, TTLs, schemas, response templates) are kept. A YAML that sets "
+     "approval_mode auto, or repoints the plugin or action, changes what a later schedule or "
+     "operator-tier run executes without a human, so this is approval-gated and an update's "
+     "audit row records those changes as old -> new. updated_at is the updated_at you read from "
+     "get_definition and is REQUIRED when id is given (-32602 without it, before any approval "
+     "is created): the approval is for that version, and a changed row is refused as a "
+     "conflict. The approval ticket binds a SHA-256 of the YAML, not the YAML itself. The YAML is validated first "
+     "(validate_definition_yaml returns the same errors): invalid is -32602 with the list in "
+     "error.data.errors and nothing is saved. At most 1 MiB of YAML. SUPERVISED tier only "
+     "(operator and readonly tokens are refused). Approval-gated: the first call returns "
+     "approval_required (-32006) with an approval_id; after an admin approves it, re-call with "
+     "the SAME arguments plus that approval_id. Audited: an instruction.create or "
+     "instruction.update row is written BEFORE the change, and the change is refused (retryable, "
+     "nothing changed) if that row cannot be stored; audit_persisted:false means only the "
+     "outcome row was lost after the change was made. Returns {id, created} (created is false "
+     "for an update). Mirrors POST /api/v1/instructions/yaml. Requires "
+     "InstructionDefinition:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("yaml_source":{"type":"string","minLength":1,"maxLength":1048576,"description":"The definition YAML document"},)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Id of the definition to UPDATE; omit or leave empty to create"},)j"
+     R"j("updated_at":{"type":"integer","minimum":0,"description":"The updated_at read from get_definition; REQUIRED when id is given (update); a changed row is refused as a conflict"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["yaml_source"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"created":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id","created"],"additionalProperties":false})j"},
+
+    {"validate_definition_yaml",
+     "Check a definition YAML document WITHOUT saving anything. Returns {valid, errors}: errors "
+     "lists every reason the document would be refused (empty when valid). It is the validator "
+     "save_definition_yaml runs first, so a valid result means the save will not fail validation "
+     "(it can still conflict on an id or a stale updated_at). No store is read or written. "
+     "Read-only. Mirrors POST /api/v1/instructions/validate-yaml, with a JSON answer in place of "
+     "the dashboard's HTML. Requires InstructionDefinition:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("yaml_source":{"type":"string","maxLength":1048576,"description":"The definition YAML document (at most 1 MiB)"})j"
+     R"j(},"required":["yaml_source"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"valid":{"type":"boolean"},"errors":{"type":"array","items":{"type":"string"},"description":"Every reason the document would be refused; empty when valid"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["valid","errors"],"additionalProperties":false})j"},
+
+    {"list_instruction_sets",
+     "List instruction sets, the named groups a definition can belong to (instruction_set_id on "
+     "a definition). Returns {sets:[{id,name,description,created_by,created_at}], count}: a live "
+     "read of the store at call time, not a snapshot, and an empty sets array with count 0 means "
+     "no set exists (a failed read is an error, never an empty list). The list is not paged. Use it to find the id that "
+     "create_definition or update_definition takes as instruction_set_id and that "
+     "delete_instruction_set deletes; it lists sets only (the definitions are in list_definitions). "
+     "Read-only. Mirrors GET /api/v1/instruction-sets. Requires InstructionSet:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j(},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"sets":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"created_by":{"type":"string"},"created_at":{"type":"integer"}},"required":["id","name","description","created_by","created_at"]}},"count":{"type":"integer","minimum":0},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["sets","count"],"additionalProperties":false})j"},
+
+    {"create_instruction_set",
+     "Create an instruction set: a named group that definitions join through instruction_set_id. "
+     "Membership grants nothing: a set carries no authorization, so creating one changes no "
+     "one's access. name is required (at most 128 characters), description optional (at most "
+     "512); an unknown or mistyped field is refused with -32602. SUPERVISED tier only (operator "
+     "and readonly tokens are refused); unlike the definition writes this is NOT approval-gated, "
+     "so it runs on the first call. Audited: an instruction_set.create row is written BEFORE the "
+     "change, and the change is refused (retryable, nothing changed) if that row cannot be "
+     "stored; audit_persisted:false means only the outcome row was lost after the change was "
+     "made. Returns {id}. Mirrors POST /api/v1/instruction-sets. Requires InstructionSet:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"Set name"},)j"
+     R"j("description":{"type":"string","maxLength":512,"description":"Free text"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"Accepted for uniformity with the other authoring tools. This tool is not approval-gated, so no ticket is ever issued for it and the value is ignored."})j"
+     R"j(},"required":["name"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id"],"additionalProperties":false})j"},
+
+    {"delete_instruction_set",
+     "Delete an instruction set by id (list_instruction_sets supplies the id). Member definitions are NOT deleted: their "
+     "instruction_set_id is cleared, so they become ungrouped. A set bundled with the server is "
+     "TOMBSTONED and does not reappear on the next boot. Every delete is approval-gated at the "
+     "supervised tier. SUPERVISED tier only (operator and readonly tokens are refused). The "
+     "first call returns approval_required (-32006) with an approval_id; after an admin approves "
+     "it, re-call with the SAME id plus that approval_id. Audited: an instruction_set.delete row "
+     "is written BEFORE the change, and the change is refused (retryable, nothing changed) if "
+     "that row cannot be stored; audit_persisted:false means only the outcome row was lost after "
+     "the change was made. Returns {id, deleted:true}; an unknown id is -32602 not_found and "
+     "nothing changes. Mirrors DELETE /api/v1/instruction-sets/{id}. Requires "
+     "InstructionSet:Delete.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Id of the set to delete (list_instruction_sets)"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"deleted":{"const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id","deleted"],"additionalProperties":false})j"},
 };
 #undef YUZU_MCP_RESULT_SET_ROW_PROPS
 #undef YUZU_MCP_RESULT_SET_ROW_REQUIRED
@@ -4847,6 +5078,11 @@ static const char* const kWriteToolsRaw[] = {
     "sync_hardware_software",
     "set_tag",         "delete_tag",     "execute_instruction", "execute_instruction_definition",
     "execute_workflow",
+    // #2146 batch C: instruction-definition and instruction-set authoring twins. The five
+    // definition writes (+ deletes) are supervised-only and ticketed (mcp_policy.hpp
+    // requires_approval); create_instruction_set is supervised-only but unticketed.
+    "create_definition", "update_definition", "delete_definition", "import_definition",
+    "save_definition_yaml", "create_instruction_set", "delete_instruction_set",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle", "issue_code_signing_cert", "import_ca_chain",
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
@@ -4987,6 +5223,20 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_definitions", {"InstructionDefinition", "Read"}},
     {"get_definition", {"InstructionDefinition", "Read"}},
     {"export_definition", {"InstructionDefinition", "Read"}},
+    // #2146 batch C: the authoring twins. The REST twins gate on the plain, global pair, which a
+    // service-scoped token cannot clear (kServiceScopeGlobalSafe is seeded empty), so every row is
+    // the default `denied` class: `confined` would claim a per-agent mechanism that gate does not
+    // have. validate_definition_yaml is the REST validate-yaml pair (InstructionDefinition:Read).
+    // Do NOT add any of them to kServiceScopeGlobalSafe.
+    {"create_definition", {"InstructionDefinition", "Write"}},
+    {"update_definition", {"InstructionDefinition", "Write"}},
+    {"delete_definition", {"InstructionDefinition", "Delete"}},
+    {"import_definition", {"InstructionDefinition", "Write"}},
+    {"save_definition_yaml", {"InstructionDefinition", "Write"}},
+    {"validate_definition_yaml", {"InstructionDefinition", "Read"}},
+    {"list_instruction_sets", {"InstructionSet", "Read"}},
+    {"create_instruction_set", {"InstructionSet", "Write"}},
+    {"delete_instruction_set", {"InstructionSet", "Delete"}},
     {"list_product_packs", {"ProductPack", "Read"}},
     {"get_product_pack", {"ProductPack", "Read"}},
     // #1634 (adversarial-review C3/D7) — migrated onto fleet_read_fn_, which
@@ -5851,6 +6101,20 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
     {"get_definition", {ToolEffect::ReadOnly, true, "Get instruction definition"}},
     {"export_definition", {ToolEffect::ReadOnly, true, "Export instruction definition"}},
+    // #2146 batch C: authoring twins. create_* are additive (a new row; a duplicate id is refused);
+    // update/import/save-yaml replace or add what a later run executes and are not idempotent in the
+    // hint's sense (each is an audited, event-emitting write, and a YAML save without an id creates
+    // a new definition every time); deletes are destructive and idempotent (a second delete only
+    // answers not found).
+    {"create_definition", {ToolEffect::Additive, false, "Create instruction definition"}},
+    {"update_definition", {ToolEffect::Destructive, false, "Update instruction definition"}},
+    {"delete_definition", {ToolEffect::Destructive, true, "Delete instruction definition"}},
+    {"import_definition", {ToolEffect::Destructive, false, "Import instruction definition"}},
+    {"save_definition_yaml", {ToolEffect::Destructive, false, "Save instruction definition from YAML"}},
+    {"validate_definition_yaml", {ToolEffect::ReadOnly, true, "Validate instruction definition YAML"}},
+    {"list_instruction_sets", {ToolEffect::ReadOnly, true, "List instruction sets"}},
+    {"create_instruction_set", {ToolEffect::Additive, false, "Create instruction set"}},
+    {"delete_instruction_set", {ToolEffect::Destructive, true, "Delete instruction set"}},
     {"list_product_packs", {ToolEffect::ReadOnly, true, "List product packs"}},
     {"get_product_pack", {ToolEffect::ReadOnly, true, "Get product pack"}},
     {"query_responses", {ToolEffect::ReadOnly, true, "Query responses"}},
@@ -9755,6 +10019,113 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     }
 
+                    // #2146 batch C: the instruction authoring tools that carry a ticket. Three
+                    // checks run HERE, before a ticket is minted or consumed (the sg-b1 order:
+                    // schema above, then RBAC, then the call's own preconditions), so a call that
+                    // is going to be refused creates no approval row and burns no approval.
+                    {
+                        namespace iauth_pre = yuzu::server::mcp::instruction_authoring;
+                        const bool authoring_ticketed =
+                            tool_name == "create_definition" || tool_name == "update_definition" ||
+                            tool_name == "delete_definition" || tool_name == "import_definition" ||
+                            tool_name == "save_definition_yaml" ||
+                            tool_name == "delete_instruction_set";
+                        if (authoring_ticketed) {
+                            // UP-3: RBAC FIRST, on the pair the handler gates on (the registry
+                            // row the tier ladder above just used). Without it a principal with
+                            // no grant mints up to the pending cap of tickets for a human to
+                            // approve, and the handler's own check then refuses the recall and the
+                            // approval is spent. perm_fn writes its own refusal row and body; the
+                            // handler keeps its check as defence in depth.
+                            if (!perm_fn(req, res, std::string(sec_type), std::string(sec_op)))
+                                return;
+                            // At the supervised tier the human approves ONE VERSION: an update
+                            // without the version token is refused (owner ruling).
+                            if (const auto missing = iauth_pre::missing_version_token(tool_name, args)) {
+                                const std::string cid = yuzu::server::detail::make_correlation_id();
+                                count_denial("yuzu_mcp_tool_args_invalid_total", nullptr);
+                                const bool audit_ok = mcp_audit(
+                                    "denied", "reason=version_token_required correlation_id=" + cid);
+                                res.set_content(
+                                    a4_error(kInvalidParams, *missing,
+                                             "read the definition with get_definition and re-call "
+                                             "with its updated_at; no approval ticket was created "
+                                             "or consumed",
+                                             -1, cid, audit_ok, "version_token_required"),
+                                    "application/json");
+                                return;
+                            }
+                            // UP-6: a delete of a definition that schedules, workflows or policy
+                            // fragments still name is refused here, before a ticket is minted or
+                            // consumed (the handler checks again). Nothing is written but the generic
+                            // mcp.* row below.
+                            if (tool_name == "delete_definition") {
+                                if (const auto refusal = iauth_pre::delete_referrer_refusal(
+                                        param_str(args, "id"), definition_referrers_fn_,
+                                        instruction_store)) {
+                                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                                    // The reason follows the refusal: referenced, or the
+                                    // lookup itself unavailable (unwired or failing).
+                                    const char* reason =
+                                        refusal->kind == iauth_pre::Kind::kReferenced
+                                            ? "referenced"
+                                            : "lookup_unavailable";
+                                    const bool audit_ok = mcp_audit(
+                                        std::string(iauth_pre::generic_audit_result(refusal->kind)),
+                                        std::string("reason=") + reason + " correlation_id=" + cid);
+                                    const auto rendered = iauth_pre::render(*refusal, cid, !audit_ok);
+                                    res.set_content(error_response(id, rendered.code, rendered.message,
+                                                                   rendered.data_json),
+                                                    "application/json");
+                                    return;
+                                }
+                            }
+                            // UP-12: the human approves ONE VERSION, so a token that already
+                            // does not match the stored row (changed, deleted, or re-created
+                            // since the caller read it) is refused here, before a ticket is
+                            // minted OR consumed: a stale token burns no approval. Best effort
+                            // (the handler still enforces the token atomically). An unreadable
+                            // store fails closed and consumes nothing.
+                            if (const auto stale = iauth_pre::stale_version_refusal(
+                                    tool_name, args, instruction_store)) {
+                                const std::string cid = yuzu::server::detail::make_correlation_id();
+                                const char* reason =
+                                    stale->kind == iauth_pre::Kind::kNotFound   ? "not_found"
+                                    : stale->kind == iauth_pre::Kind::kConflict ? "stale_version"
+                                                                                : "store_unavailable";
+                                const bool audit_ok = mcp_audit(
+                                    std::string(iauth_pre::generic_audit_result(stale->kind)),
+                                    std::string("reason=") + reason + " correlation_id=" + cid);
+                                const auto rendered = iauth_pre::render(*stale, cid, !audit_ok);
+                                res.set_content(error_response(id, rendered.code, rendered.message,
+                                                               rendered.data_json),
+                                                "application/json");
+                                return;
+                            }
+                            // UP-1: bind a DIGEST of the large argument, not its bytes, so a 4 MiB
+                            // document neither lands in approvals.scope_expression nor travels to
+                            // every approvals list. The recall computes the same subject from its
+                            // own arguments, so the binding to the exact bytes is unchanged.
+                            if (iauth_pre::ticket_binds_digest(tool_name)) {
+                                const auto subject = iauth_pre::ticket_subject(tool_name, args);
+                                if (!subject) {
+                                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                                    const bool audit_ok = mcp_audit(
+                                        "failure", "reason=digest_unavailable correlation_id=" + cid);
+                                    res.set_content(
+                                        a4_error(kInternalError,
+                                                 "the approval subject could not be computed",
+                                                 "retry shortly; no approval ticket was created or "
+                                                 "consumed",
+                                                 mcp::kMcpStoreFaultRetryMs, cid, audit_ok,
+                                                 "digest_unavailable"),
+                                        "application/json");
+                                    return;
+                                }
+                                canon = *subject;
+                            }
+                        }
+                    }
                     // #3893 fix round (Doomgoose review, blocking findings
                     // 1+2): generalized from the #3687 Gate 6 UP-5 fix,
                     // execute_instruction-only, to every dispatch-capable
@@ -10580,7 +10951,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // NOTE: the per-handler perm_fn (real RBAC op) has not run
                     // yet; a tier-allows-but-RBAC-denies token can mint→approve→
                     // then 403 at the handler, burning the ticket. Rare, flows
-                    // from the deliberate two-gate (tier then RBAC) split.
+                    // from the deliberate two-gate (tier then RBAC) split. Exceptions
+                    // that run perm_fn BEFORE the mint (so a no-grant caller never gets
+                    // a ticket): execute_instruction_definition, execute_workflow, the
+                    // definition-resolved result-set producers and the six ticketed
+                    // authoring tools (the block above the dispatch-pair check).
                 }
             }
 
@@ -11274,6 +11649,176 @@ McpServer::HandlerFn McpServer::build_handler(
                 res.set_content(
                     success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
                     "application/json");
+                return;
+            }
+
+            // ── #2146 batch C: instruction-definition / instruction-set authoring twins ──
+            // Nine tools, one runner. The helper TU (mcp_instruction_authoring.cpp) owns the store
+            // sequences, the audit-first rows and the JSON-RPC rendering; the shared request
+            // builders (instruction_definition_model.hpp) are the SAME code the v1 REST routes call.
+            // Each branch below pins its OWN declared (securable, operation) pair: the tier
+            // (readonly/operator refused for every write), the approval ticket (C8, for the
+            // definition writes and every delete) and the service-scope default-deny all ran in
+            // the generic C8 block above; tier_allows/perm_fn here are the defence-in-depth pair
+            // every sibling tool carries. The ungated create_instruction_set and the Read tools got
+            // NO C8 schema check, so the helper validates every argument itself.
+            namespace iauth = yuzu::server::mcp::instruction_authoring;
+            auto run_instruction_authoring =
+                [&](const std::function<iauth::Result(const iauth::Ports&)>& op) {
+                    iauth::Ports ports;
+                    ports.store = instruction_store;
+                    ports.referrers_fn = definition_referrers_fn_;
+                    ports.pack_advisory_fn = definition_pack_advisory_fn_;
+                    ports.created_by = session->username;
+                    // The consumed ticket, if the C8 gate spent one for this call (C-6).
+                    if (approval_ticket_just_consumed)
+                        ports.approval_id = param_str(args, "approval_id");
+                    // try_persist_audit, not a bare audit_fn call: a throwing sink refuses the
+                    // write like a failed row, never escapes the handler as a bare 500. An
+                    // UNWIRED sink leaves Ports::audit unset, so every write refuses and the error
+                    // carries no retry hint (a configuration fault, as the REST twins' 503):
+                    // try_persist_audit reads a null sink as "audit off" and returns true, which
+                    // would let a write proceed with no attempted row. Production always wires
+                    // it (server.cpp), so this guards a misconfigured embedder.
+                    if (audit_fn)
+                        ports.audit = [&](std::string_view action, std::string_view result_word,
+                                          std::string_view target_type,
+                                          const std::string& target_id,
+                                          const std::string& detail) {
+                            return yuzu::server::detail::try_persist_audit(
+                                audit_fn, req, std::string(action), std::string(result_word),
+                                std::string(target_type), target_id, detail);
+                        };
+                    // The legacy routes' instruction.created / .updated / .deleted.
+                    ports.emit = bind_event_emit(emit_event_fn_, req, metrics);
+                    const iauth::Result out = op(ports);
+                    const bool generic_ok = mcp_audit(std::string(iauth::generic_audit_result(out.kind)));
+                    const auto rendered = iauth::render(
+                        out, yuzu::server::detail::make_correlation_id(), !generic_ok);
+                    res.set_content(
+                        rendered.is_error
+                            ? error_response(id, rendered.code, rendered.message, rendered.data_json)
+                            : success_response(id, tool_result(rendered.payload_json,
+                                                               kObjectOutputSchema)),
+                        "application/json");
+                };
+
+            if (tool_name == "create_definition") {
+                if (!tier_allows(tier, "InstructionDefinition", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::create_definition(args, ports); });
+                return;
+            }
+
+            if (tool_name == "update_definition") {
+                if (!tier_allows(tier, "InstructionDefinition", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::update_definition(args, ports); });
+                return;
+            }
+
+            if (tool_name == "delete_definition") {
+                if (!tier_allows(tier, "InstructionDefinition", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Delete"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::delete_definition(args, ports); });
+                return;
+            }
+
+            if (tool_name == "import_definition") {
+                // The ONLY signature-gated authoring surface: import_definition_json, never the
+                // _trusted variant (mcp_instruction_authoring.hpp).
+                if (!tier_allows(tier, "InstructionDefinition", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::import_definition(args, ports); });
+                return;
+            }
+
+            if (tool_name == "save_definition_yaml") {
+                if (!tier_allows(tier, "InstructionDefinition", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::save_definition_yaml(args, ports); });
+                return;
+            }
+
+            if (tool_name == "validate_definition_yaml") {
+                if (!tier_allows(tier, "InstructionDefinition", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports&) { return iauth::validate_definition_yaml(args); });
+                return;
+            }
+
+            if (tool_name == "list_instruction_sets") {
+                if (!tier_allows(tier, "InstructionSet", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionSet", "Read"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::list_instruction_sets(ports); });
+                return;
+            }
+
+            if (tool_name == "create_instruction_set") {
+                if (!tier_allows(tier, "InstructionSet", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionSet", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::create_instruction_set(args, ports); });
+                return;
+            }
+
+            if (tool_name == "delete_instruction_set") {
+                if (!tier_allows(tier, "InstructionSet", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionSet", "Delete"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::delete_instruction_set(args, ports); });
                 return;
             }
 
