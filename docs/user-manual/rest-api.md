@@ -8740,7 +8740,7 @@ Every row carries `source` — the `<plugin>.<action>` that produced it (an **op
 | `last_seen` | Epoch seconds of the device's last accepted installed-software report (the last poll), or `null` if it never synced |
 | `status` | `current` when the row's collection facet last reported a `full` or `delta` section; `disabled` when that facet is switched off; `unconfirmed` for anything else, including a device with no facet record (for example one still reporting the older blob format). **An `unconfirmed` row may be stale or missing: it is never proof of absence** |
 | `last_confirmed_at` | Epoch seconds the facet last confirmed a `full` or `delta` section, or `null` if never |
-| `install_type`, `install_scope`, `install_location`, `instance_key` | The server-derived install classification, the scope (`machine`), the install path and the row's stable identity hash. `install_location` is stored as the agent sent it and served to every `Inventory:Read` holder admitted by the gate (a confined caller sees only its own rows' paths). The control is on the agent: its blob-v3 installed-software writer (delivered by the sibling agent-side change, which lands before any agent sends this field) keeps a location only under a machine-scope root and blanks every other path before it is sent (ADR-0016 §8, the 2026-11-09 update), so a per-user path can appear here only from an agent that does not apply that rule. A component's `path` and `anchor_app` on the components route carry no such allowlist yet (no agent reports components until the component producer ships, which must apply it) |
+| `install_type`, `install_scope`, `install_location`, `instance_key` | The server-derived install classification, the scope (`machine`), the install path and the row's stable identity hash. `install_location` is stored as the agent sent it and served to every `Inventory:Read` holder admitted by the gate (a confined caller sees only its own rows' paths). The control is on the agent: its blob-v3 installed-software writer keeps a location only under a machine-scope root and blanks every other path before it is sent (ADR-0016 §8, the 2026-11-09 update), so a per-user path can appear here only from an agent that does not apply that rule. A component's `path` and `anchor_app` on the components route carry no such allowlist yet (no agent reports components until the component producer ships, which must apply it) |
 
 Rows therefore have **22 fields**; the original 14 are unchanged. `format=csv` carries the same 22 columns (`hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,instance_key` after the original header), so an external consumer that pinned 14 columns must read by header name.
 
@@ -9013,7 +9013,7 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget` and `appx`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx` and `kernel_module`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
 
 A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
@@ -9127,7 +9127,7 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | Parameter | Meaning |
 |---|---|
 | `family` | One family id from the curated table; omitted or empty means every family. An unknown id is a `400`. |
-| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
+| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx`, `kernel_module`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
 
 ```json
 {

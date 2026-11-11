@@ -19,9 +19,9 @@
 // What lives here: the field positions, the level vocabulary, the `>= 4
 // fields` and `same action` rules. What does NOT: line splitting (the
 // collector splits on the raw '|' and hands over tokens), and what a level
-// MEANS for a cycle -- that is the collector's per-action policy table
-// (ConstrainedPolicy), so parse_status_row returns field 4 at every level and
-// the caller decides whether it surfaces as a reason.
+// MEANS for the report -- the collector sends a constrained level as a
+// status-only section for that source, so parse_status_row returns field 4 at
+// every level and the caller decides whether it surfaces as a reason.
 //
 // ESCAPING. Free text goes through yuzu::util::safe_output_field, which is
 // DOCUMENTED LOSSY (sdk/include/yuzu/string_utils.hpp): a literal backslash

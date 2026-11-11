@@ -262,10 +262,10 @@
   "readme": "agents/plugins/windows_optional_features/README.md",
   "result_status": [
     {
-      "completeness": "—",
+      "completeness": "FULL",
       "provenance": "—",
-      "status": "`UNDECLARED` (agent-derived `OK`)",
-      "when": "a clean `list`/`info` read — the DISM call succeeded and the feature row(s) were written"
+      "status": "`OK`",
+      "when": "a clean `list`/`info` read — the DISM call succeeded and the feature row(s) were written. The installed-software sync reads this declaration: an answer that declares no completeness is not trusted as complete. The sample capture below predates it and shows `UNDECLARED / UNKNOWN`; it is refreshed at the next Windows recapture"
     },
     {
       "completeness": "PARTIAL",
