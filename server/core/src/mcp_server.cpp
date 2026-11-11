@@ -711,7 +711,7 @@ static_assert(kMaxFacetValueBytes == 2048,
 // nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
 // array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
 // #undef'd right after it.
-#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a set filled before this release, and 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a set filled before this release, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. False for a set filled before this release, and false for a failed set"})j"
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. A set created from a parent's members carries the parent's counters, summed along a lineage, so partial is the reliable signal. False for a failed set"})j"
 #define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","agents_unanswered","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents",
@@ -1554,7 +1554,11 @@ static const ToolDef kTools[] = {
      "it still resolves store-only. See docs/asset-tagging-guide.md \"Tag source precedence\". A "
      "from_result_set:<id> atom referencing a result set that is absent, expired, or not owned "
      "by the caller aborts with kInvalidParams (RESULT_SET_NOT_FOUND) rather than silently "
-     "matching nothing or everything. REST v1 twin: POST /api/v1/scope/preview.",
+     "matching nothing or everything. An owned set that is still pending aborts with "
+     "kInternalError result_set_unusable and retry_after_ms 5000; one that has failed, or is "
+     "incomplete (partial) and referenced under NOT, LEN or STARTSWITH, aborts as "
+     "result_set_unusable with retry_after_ms null (re-run the producer that created the set). "
+     "REST v1 twin: POST /api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
@@ -1564,8 +1568,8 @@ static const ToolDef kTools[] = {
     // v1 had a full 12-operation API with zero MCP tools before this batch.
     // Every tool below shares the SAME `ResultSet` row shape (id/name/
     // owner_principal/created_at/ttl_at/last_used_at/pinned/parent_id/
-    // source_kind/status/source_execution_id/device_count/agents_failed/partial) as its REST v1
-    // twin — both surfaces call the SAME result_set_json() builder
+    // source_kind/status/source_execution_id/device_count/agents_failed/agents_unanswered/partial)
+    // as its REST v1 twin — both surfaces call the SAME result_set_json() builder
     // (result_set_model.hpp), so the shape cannot drift.
 
     {"list_result_sets",
@@ -1585,7 +1589,10 @@ static const ToolDef kTools[] = {
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
      "new set onto an owned existing set. A non-empty device_ids is checked against the "
      "fleet — any id that does not exist or is not visible to the caller rejects the whole "
-     "request (RESULT_SET_UNKNOWN_DEVICE_ID). REST v1 twin: POST /api/v1/result-sets. "
+     "request (RESULT_SET_UNKNOWN_DEVICE_ID). A parent_id that is pending or failed is "
+     "refused -32602 RESULT_SET_NOT_READY (wait for a pending parent, re-create a failed one); "
+     "the new set does not inherit the parent's agents_failed or agents_unanswered, since its "
+     "members are the given device_ids. REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
@@ -1604,7 +1611,9 @@ static const ToolDef kTools[] = {
      "or for failing to parse as JSON at all, this call refuses (kInternalError) rather than "
      "materialise a result set narrower than the true match set (#4496, extended by the #4496 "
      "follow-up for the parse-error cause; each cause is its own distinctly-named refusal "
-     "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
+     "reason - query_truncated/poison_excluded/parse_error_excluded). A parent_id that is "
+     "pending or failed is refused -32602 RESULT_SET_NOT_READY; the new set inherits the "
+     "parent's agents_failed and agents_unanswered. REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. JSON integers are exact; every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is -32602: send an integer, or send the decimal as a string under > >= < <= (at most 15 significant digits, a magnitude below 2^53, not subnormal, within the range of a double), where == and != stay a text compare; write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as 1e16 (read exactly). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
@@ -1628,8 +1637,10 @@ static const ToolDef kTools[] = {
      "$Process_Hourly. Dispatches to "
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
-     "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
+     "nothing is refused (400), never silently widened. A parent_id that is pending or failed "
+     "is refused -32602 RESULT_SET_NOT_READY before anything is dispatched; the new set "
+     "carries the parent's agents_failed and agents_unanswered from creation. REST v1 twin: "
+     "POST /api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
      "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
      "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
@@ -1650,7 +1661,9 @@ static const ToolDef kTools[] = {
      "output row satisfies the operator-supplied matcher (column/op/value); omitting matcher "
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
-     "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
+     "create_result_set_from_echo_query, including the RESULT_SET_NOT_READY refusal of a pending "
+     "or failed parent and the inherited agents_failed and agents_unanswered. Find valid "
+     "instruction_id values via list_definitions "
      "or discover_instructions — do not guess. An echo.sql definition whose SQL (params.sql, "
      "else the definition's own default) reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
@@ -1702,6 +1715,9 @@ static const ToolDef kTools[] = {
      "narrowed to a parent set at creation time and that parent has since been deleted, this "
      "REFUSES (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than silently broadcasting "
      "to every visible device (#4306) — create a new set from the intended parent instead. "
+     "An original whose parent is pending or failed is refused -32602 RESULT_SET_NOT_READY, "
+     "and an instruction_result original whose definition runs a Forensics-tier plugin is "
+     "refused -32602 RESULT_SET_SOURCE_NOT_SUPPORTED, both before anything is dispatched. "
      "An instruction_result source whose definition's plugin.action is gated (admin or "
      "approval) is refused for a non-admin caller (permission denied, "
      "error.data.reason=approval_required, retry_after_ms null): an approval ticket never "

@@ -214,7 +214,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS agents_failed BIGINT NOT NULL "
          "DEFAULT 0;"},
         // v5: targeted agents that never answered before an async set was filled at the pending
-        // timeout (see ResultSet::agents_unanswered). Rows filled earlier read 0.
+        // timeout (see ResultSet::agents_unanswered). Constant default: metadata-only ADD COLUMN.
         {5,
          "ALTER TABLE result_sets ADD COLUMN IF NOT EXISTS agents_unanswered BIGINT NOT NULL "
          "DEFAULT 0;"},

@@ -61,3 +61,16 @@ their unit tests. No thread, socket, descriptor, callback, `FILE*` or SQLite han
   detached gateway-forward threads that reach `process_gateway_response` are bounded by the same
   service-lifetime ordering as those members.
 - **Failure cleanup:** RAII only; nothing persists.
+
+### Borrowed `const ForensicsPluginSet*` on the result-set producers
+- **Site:** REST `run_async` (`rest_api_v1.cpp`) captures the route's `forensics_plugins` pointer by
+  value; MCP `rs_run_async` (`mcp_server.cpp`) reads `forensics_plugins_` through its `this` borrow.
+  Both pass it to `plugin_may_seed_result_set` (`result_set_members.hpp`) to refuse a Forensics-tier
+  source before any dispatch.
+- **Owner type:** borrowed, never owned and never released by either surface. The pointee is
+  `ServerImpl::forensics_plugin_set_` (`std::optional<ForensicsPluginSet>`), derived once in the
+  constructor; the server refuses to start without it, and it is wired before the routes register.
+- **Lifetime:** `forensics_plugin_set_` is declared before `web_server_`, `rest_api_v1_` and
+  `mcp_server_` in `ServerImpl`, so it is destroyed after both surfaces and after the HTTP server
+  whose handler threads run the lambdas; it is immutable after construction, so no lock is needed.
+- **Failure cleanup:** none; a null pointer (an unwired test harness only) refuses nothing.
