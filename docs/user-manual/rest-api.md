@@ -8544,7 +8544,7 @@ re-eval, unchanged.
 
 | Status | Reason |
 |---|---|
-| 409 | `RESULT_SET_NOT_READY` — `parent_id` names a set that is still `pending` or has `failed`; wait until it is `materialized`. A materialized parent that is incomplete is accepted and the new set inherits its `agents_failed` and `agents_unanswered` |
+| 409 | `RESULT_SET_NOT_READY` — `parent_id` (on `re-eval`, the original's own parent) names a set that is still `pending` or has `failed`; wait until it is `materialized`. A materialized parent that is incomplete is accepted and the new set inherits its `agents_failed` and `agents_unanswered` |
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent set; or missing `sql` / `instruction_id`. `parent_id` exceeding 64 bytes also returns 400, but without this code prefix (bare "parent_id must be at most 64 bytes") |
 | 400 | `RESULT_SET_BAD_REQUEST`: a NUL byte in the `name`, in the `sql` of `from-echo-query`, in an instruction parameter (name or value), or in `parent_id`; nothing is dispatched and the refusal is audited `result_set.create\|denied`, `reason=field_contains_nul`. On `re-eval`, a NUL in the stored `sql` or parameters is refused the same way |
 | 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB, or `params` is present but not a JSON object. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
@@ -9526,6 +9526,7 @@ Create a result set directly from a pre-computed device-id list (e.g. an operato
 | 403 | `MCP token tier does not allow Infrastructure:Write` — an MCP-tiered bearer whose tier disallows this operation (`readonly`/`operator`; #5047). The caller's actual tier is not echoed in this message; it is recorded in the audit row only. |
 | 403 | (#4983) the caller lacks `Infrastructure:Read` — only reachable when `device_ids` is non-empty; a request without it never consults this gate |
 | 404 | `parent_id` supplied but not owned/found |
+| 409 | `RESULT_SET_NOT_READY` — `parent_id` names a set that is still `pending` or has `failed`; wait until it is `materialized`. A materialized parent that is incomplete is accepted; the new set is lineage-linked only and does not inherit its `agents_failed` and `agents_unanswered`, because its members are the supplied `device_ids` |
 | 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
 | 503 | `RESULT_SET_TIER_POLICY_UNAVAILABLE` — the tier/approval check is misconfigured (server-side wiring fault, not a caller error; unreachable in a correctly-configured deployment) |
 | 503 | (#4983) The `device_ids` existence/scope check itself is unwired or its backing agent registry is unavailable — only reachable when `device_ids` is non-empty; a request without it is unaffected |
