@@ -27,9 +27,10 @@ inline constexpr const char* kPluginInitFailedRejectedHelp =
     "become a plugin label, by reason: unknown_plugin (well formed, but not a plugin in the "
     "server's catalogue; summed under plugin=unknown), malformed (longer than 64 characters or "
     "containing a character outside letters, digits and underscore; an empty token between commas "
-    "carries no name and is ignored), over_cap (more than 32 tokens, the rest not read). Published "
-    "every sweep, 0 included; >0 means an agent is sending names the server does not know, or "
-    "forged ones";
+    "carries no name and is ignored), over_cap (more than 32 tokens, the rest not read). The unit "
+    "is agents, one per reason however many tokens an agent sent; plugin=unknown on "
+    "yuzu_fleet_plugin_init_failed instead sums tokens. Published every sweep, 0 included; >0 "
+    "means an agent is sending names the server does not know, or forged ones";
 inline constexpr const char* kRejectUnknownPlugin = "unknown_plugin";
 inline constexpr const char* kRejectMalformed = "malformed";
 inline constexpr const char* kRejectOverCap = "over_cap";

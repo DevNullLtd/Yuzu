@@ -7995,9 +7995,10 @@ groups:
             For more than 10 minutes, about {{ $value }} agent(s) (summed across core replicas,
             so a failover can count one twice for a few minutes) have reported that plugin
             {{ $labels.plugin }} failed init (heartbeat tag yuzu.plugins_failed); it is loaded
-            but not running, as distinct from not installed. plugin="unknown" is the sum over
-            well-formed names the server's plugin catalogue does not know (the agent log names
-            them; yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The
+            but not running, as distinct from not installed. plugin="unknown" sums the
+            well-formed names the server's plugin catalogue does not know, counted as reported
+            names (tokens), so one agent can add several (the agent log names them;
+            yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The
             runbook link is the Echo upgrade note; for any other plugin the agent log
             is the source. For plugin="echo" the usual causes are a failed tar.db adoption after
             the rename (including a sidecar present under both names) and a corrupt echo.db that
