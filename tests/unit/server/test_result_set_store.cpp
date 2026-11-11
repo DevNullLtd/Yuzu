@@ -605,9 +605,11 @@ TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op 
 // Migration v5 adds agents_unanswered. Roll the recorded version back to 4 and drop the column,
 // as a database last opened by the previous build would be, then open the store twice: the first
 // open applies v5 and reads the old row as complete, the second applies nothing and keeps data.
+// A migration-in-substance case, so it takes the migration macro (a fresh database, skipped on
+// Windows by default) rather than the pre-migrated template.
 TEST_CASE("ResultSetStore: migration v5 applies on a v4 database and old rows read complete",
           "[pg][result_set][migration][agents_unanswered]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     std::string old_id;
     {
         PgPool pool{{.conninfo = db.dsn(), .size = 2}};
