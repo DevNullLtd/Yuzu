@@ -1026,19 +1026,86 @@ TEST_CASE("UnverifiedFrameRegistry: a pair noted while its agent marker covers i
           "marker",
           "[result_set][unverified_frames]") {
     // notify_exec_tracker notes a lost answer even when the pair already reads as not fully
-    // stored: the marker that covers it may expire before a fresh entry would.
-    UnverifiedFrameRegistry reg(100, 60, 1, 50, 50);
+    // stored: the marker that covers it may expire before a fresh entry would. A cap of two, and
+    // the agent below it when the pair is noted, so the note inserts without refreshing the marker.
+    UnverifiedFrameRegistry reg(100, 60, 2, 50, 50);
     (void)reg.note("c0", "agent-a", 1);
-    CHECK(reg.note("c1", "agent-a", 2).marked); // marker set at t=2
+    (void)reg.note("c1", "agent-a", 2);
+    CHECK(reg.note("c2", "agent-a", 3).marked); // evicts c0: marker set at t=3
+    reg.forget("c2", "agent-a");                // agent-a now holds one entry (c1)
     CHECK(reg.contains("lost", "agent-a", 50)); // covered by the marker
-    (void)reg.note("lost", "agent-a", 50);      // a fresh entry (evicts c1, refreshes the marker)
-    CHECK(reg.contains("lost", "agent-a", 50 + 59));
+    const auto r = reg.note("lost", "agent-a", 50);
+    CHECK(r.evicted == 0); // inserted below the cap: the marker is not refreshed
+    CHECK(reg.size() == 2);
+    CHECK_FALSE(reg.contains("other", "agent-a", 50 + 59)); // the marker ended at t=63
+    CHECK(reg.contains("lost", "agent-a", 50 + 59));         // the fresh entry still covers
     CHECK_FALSE(reg.contains("lost", "agent-a", 50 + 60));
-    // Without the fresh note the marker alone would have ended at t=62.
-    UnverifiedFrameRegistry only_marker(100, 60, 1, 50, 50);
-    (void)only_marker.note("c0", "agent-a", 1);
-    (void)only_marker.note("c1", "agent-a", 2);
-    CHECK_FALSE(only_marker.contains("lost", "agent-a", 62 + 1));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a pair noted while the latch covers it outlives the latch",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(100, 60, 1, 64, 1);
+    (void)reg.note("c0", "a", 0);
+    (void)reg.note("c1", "a", 1); // marker a
+    (void)reg.note("c0", "b", 2);
+    CHECK(reg.note("c1", "b", 3).latched);   // a second marker past a cap of one: latch until t=63
+    CHECK(reg.contains("lost", "z", 50));    // covered by the latch
+    CHECK(reg.note("lost", "z", 50).evicted == 0);
+    CHECK_FALSE(reg.contains("other", "y", 50 + 59)); // the latch has ended
+    CHECK(reg.contains("lost", "z", 50 + 59));         // the fresh entry still covers
+    CHECK_FALSE(reg.contains("lost", "z", 50 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a pair noted while its remembered command covers it outlives "
+          "the command",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(1, 60, 64, 50, 50);
+    (void)reg.note("cA", "a0", 0);
+    CHECK(reg.note("cB", "a1", 2).evicted == 1); // evicts cA: cA remembered until t=62
+    CHECK(reg.contains("cA", "z", 50));          // covered by the remembered command
+    (void)reg.note("cA", "z", 50);               // evicts cB (cA is not refreshed)
+    CHECK_FALSE(reg.contains("cA", "other", 50 + 59)); // the remembered command has ended
+    CHECK(reg.contains("cA", "z", 50 + 59));            // the fresh entry still covers
+    CHECK_FALSE(reg.contains("cA", "z", 50 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a refreshed marker no longer holds back the expiry of a later "
+          "one",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(100, 60, 1, 50, 50);
+    (void)reg.note("c0", "x", 0);
+    CHECK(reg.note("c1", "x", 10).marked); // marker x at t=10
+    (void)reg.note("c0", "y", 15);
+    CHECK(reg.note("c1", "y", 20).marked); // marker y at t=20
+    (void)reg.note("c2", "x", 30);         // refreshes marker x to t=30
+    CHECK_FALSE(reg.contains("never-sent", "y", 20 + 60)); // y ends behind the refreshed x
+    CHECK(reg.contains("never-sent", "x", 20 + 60));
+    CHECK(reg.contains("never-sent", "x", 30 + 59));
+    CHECK_FALSE(reg.contains("never-sent", "x", 30 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a refreshed remembered command no longer holds back the expiry "
+          "of a later one",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(1, 60, 64, 50, 50);
+    (void)reg.note("cA", "a0", 10);
+    (void)reg.note("cB", "a1", 15); // evicts cA: cA remembered at t=15
+    (void)reg.note("cC", "a2", 20); // evicts cB: cB at t=20
+    (void)reg.note("cA", "a3", 25); // evicts cC: cC at t=25
+    (void)reg.note("cX", "a4", 30); // evicts cA/a3: cA refreshed to t=30
+    CHECK_FALSE(reg.contains("cB", "other", 20 + 60)); // cB ends behind the refreshed cA
+    CHECK(reg.contains("cA", "other", 20 + 60));
+    CHECK_FALSE(reg.contains("cC", "other", 25 + 60));
+    CHECK(reg.contains("cA", "other", 30 + 59));
+    CHECK_FALSE(reg.contains("cA", "other", 30 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: the command digest depends on the salt",
+          "[result_set][unverified_frames]") {
+    CHECK(UnverifiedFrameRegistry::default_command_digest(1, "cmd-1") !=
+          UnverifiedFrameRegistry::default_command_digest(2, "cmd-1"));
+    CHECK(UnverifiedFrameRegistry::default_command_digest(1, "cmd-1") ==
+          UnverifiedFrameRegistry::default_command_digest(1, "cmd-1"));
 }
 
 TEST_CASE("UnverifiedFrameRegistry: concurrent note contains and forget stay consistent",
