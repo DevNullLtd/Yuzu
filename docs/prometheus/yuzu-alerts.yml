@@ -7972,9 +7972,12 @@ groups:
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
 
       # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the
-      # description carries the Echo remedy. The plugin label is agent-supplied: agent-minted
-      # names can push a real plugin past the 64-name cut into plugin="other" (server fix tracked
-      # separately). The family is absent-not-zero, so a clean fleet
+      # description carries the Echo remedy. The plugin label is bounded to the server's own
+      # plugin catalogue: the server labels a reported name only when the catalogue knows it and
+      # sums every other well-formed name under plugin="unknown", so an agent cannot push a real
+      # plugin out of its own label (yuzu_fleet_plugin_init_failed_rejected counts the agents
+      # sending names that were not labelled). Whether a listed plugin really failed is still
+      # the agent's word. The family is absent-not-zero, so a clean fleet
       # returns no series and the rule stays quiet (max_over_time over an absent series is
       # absent too).
       #
@@ -7992,17 +7995,19 @@ groups:
             For more than 10 minutes, about {{ $value }} agent(s) (summed across core replicas,
             so a failover can count one twice for a few minutes) have reported that plugin
             {{ $labels.plugin }} failed init (heartbeat tag yuzu.plugins_failed); it is loaded
-            but not running, as distinct from not installed. plugin="other" is the sum over
-            plugins past the first 64 names the server labels per sweep; the agent log names
-            them. The runbook link is the Echo upgrade note; for any other plugin the agent log
+            but not running, as distinct from not installed. plugin="unknown" is the sum over
+            well-formed names the server's plugin catalogue does not know (the agent log names
+            them; yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The
+            runbook link is the Echo upgrade note; for any other plugin the agent log
             is the source. For plugin="echo" the usual causes are a failed tar.db adoption after
             the rename (including a sidecar present under both names) and a corrupt echo.db that
             could not be moved aside; the upgrade notes cover adoption under 'Two cases the
             agent refuses, and what to do', and the corrupt-database case is under
             Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack
             of free space is not counted here (#7290). The value and the plugin label are
-            agent-self-reported: agent-minted names can displace a real plugin into
-            plugin="other", so the label is not authoritative.
+            agent-self-reported: the server bounds the label to its catalogue, so an agent
+            cannot displace a real plugin, but it can still report a real plugin's name as
+            failed, or not report a failure, so the signal is not authoritative.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
 
   - name: yuzu-web-writes
