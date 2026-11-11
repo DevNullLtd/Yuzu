@@ -4196,8 +4196,14 @@ TEST_CASE("EchoDatabase: a link swapped in at echo.db-wal before the claim trave
     bool fired = false;
     OpenSeams seams;
     seams.quarantine_ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& ec) {
-        fired = true;
-        fs::create_symlink(victim, wal, planted);
+        // Plant the link on the FIRST claim only. Where the sidecar is claimed by a hard link
+        // too (Windows), the seam runs again for the planted `-wal` itself, and a second
+        // create_symlink over the name it already holds reports file_exists, which
+        // skip_unless_symlink_capable rightly treats as a set-up defect.
+        if (!fired) {
+            fired = true;
+            fs::create_symlink(victim, wal, planted);
+        }
         fs::create_hard_link(from, to, ec);
     };
 
