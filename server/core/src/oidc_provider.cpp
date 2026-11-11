@@ -923,6 +923,9 @@ std::string_view truncate_utf8(std::string_view s, std::size_t max) {
 constexpr const char* kEgressRefusedReason = OidcProvider::kEgressRefused;
 constexpr const char* kEgressCleartextPublicReason = OidcProvider::kEgressCleartextPublicRefused;
 constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
+// The lookup was refused because the pool was full or no worker could be created (POSIX only).
+// Nothing was learned about the name, so callers must not remember it as a failure.
+constexpr const char* kEgressLookupBusyReason = "the host name lookup was not started";
 
 // Decides where ONE fetch may connect, BEFORE any socket exists. A host that is an IP literal is
 // classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver might
@@ -1411,8 +1414,16 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
     } else {
         std::vector<ResolvedAddress> resolved;
         const int dns_timeout_sec = std::max(1, (dns_timeout_ms + 999) / 1000);
+#ifdef _WIN32
         if (!resolve_host_addresses(host, dns_timeout_sec, resolved) || resolved.empty())
             return std::unexpected(kEgressUnresolvedReason);
+#else
+        const auto status = resolve_host_addresses_status(host, dns_timeout_sec, resolved);
+        if (status == net::ResolveStatus::kBusy)
+            return std::unexpected(kEgressLookupBusyReason);
+        if (status != net::ResolveStatus::kOk || resolved.empty())
+            return std::unexpected(kEgressUnresolvedReason);
+#endif
         for (const auto& address : resolved) {
             char text[INET6_ADDRSTRLEN] = {};
             if (address.family == AF_INET) {
@@ -2615,7 +2626,10 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
             spdlog::error("OidcProvider: discovery failed for issuer {}: {}",
                           ::yuzu::log_key_token(config_.issuer),
                           ::yuzu::log_key_token(doc.error()));
-            discovery_retry_after_ = std::chrono::steady_clock::now() + discovery_retry_window_;
+            // A refusal because the lookup pool was full learned nothing about the issuer, so it
+            // is retried on the next attempt rather than remembered for the window.
+            if (doc.error().find(kEgressLookupBusyReason) == std::string::npos)
+                discovery_retry_after_ = std::chrono::steady_clock::now() + discovery_retry_window_;
             return std::unexpected(std::string(kDiscoveryUnavailable));
         }
         // IdP-controlled values: neutralize control bytes and Unicode line breaks for the log

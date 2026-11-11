@@ -1170,6 +1170,8 @@ net::ResolveResult resolve_result(net::ResolveStatus status, std::vector<std::st
 }
 
 constexpr const char* kUnresolved = "the host name did not resolve";
+// A refused lookup (full pool, no worker): nothing was learned about the name.
+constexpr const char* kBusyReason = "the host name lookup was not started";
 
 std::expected<std::vector<std::string>, std::string> vet_name(const std::string& host,
                                                               int timeout_ms = 1000) {
@@ -1307,7 +1309,8 @@ TEST_CASE("OIDC resolver: a lookup answer round-trips to the bytes the vetting c
     CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
 }
 
-TEST_CASE("OIDC resolver: every status but an answer is the unresolved reason",
+TEST_CASE("OIDC resolver: every status but an answer is a fixed reason, and only a refused "
+          "lookup is told apart",
           "[oidc][oidc_egress][oidc_resolver]") {
     Nat64CacheReset cache;
     auto pool = std::make_shared<net::ResolverPool>(4);
@@ -1318,7 +1321,7 @@ TEST_CASE("OIDC resolver: every status but an answer is the unresolved reason",
             [status](const std::string&) { return resolve_result(status, {}); }, pool);
         const auto pins = vet_name("gone.test");
         REQUIRE_FALSE(pins.has_value());
-        CHECK(pins.error() == kUnresolved);
+        CHECK(pins.error() == (status == net::ResolveStatus::kBusy ? kBusyReason : kUnresolved));
     }
     CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
 }
@@ -1364,7 +1367,7 @@ TEST_CASE("OIDC resolver: a lookup that never returns fails the fetch at the bou
     REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
 }
 
-TEST_CASE("OIDC resolver: a full pool fails closed at once as unresolved, without waiting",
+TEST_CASE("OIDC resolver: a full pool fails closed at once as not started, without waiting",
           "[oidc][oidc_egress][oidc_resolver]") {
     Nat64CacheReset cache;
     auto pool = std::make_shared<net::ResolverPool>(1);
@@ -1380,7 +1383,7 @@ TEST_CASE("OIDC resolver: a full pool fails closed at once as unresolved, withou
     cap.stop();
 
     REQUIRE_FALSE(pins.has_value());
-    CHECK(pins.error() == kUnresolved);
+    CHECK(pins.error() == kBusyReason);
     CHECK(elapsed < std::chrono::milliseconds(2000)); // refused, not queued and not waited for
     CHECK(st->others.load() == 0);                    // nothing was started
     CHECK(cap.text().find("was not started: the lookup pool (1 slots) is full") !=
@@ -1412,7 +1415,7 @@ TEST_CASE("OIDC resolver: two issuers share one pool - a name under one fills it
     const auto refused = vet_name("b.test");
     cap.stop();
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == kUnresolved);
+    CHECK(refused.error() == kBusyReason);
     CHECK(st->others.load() == 0);
     CHECK(cap.text().find("the lookup pool (2 slots) is full") != std::string::npos);
 
@@ -1566,8 +1569,8 @@ TEST_CASE("OIDC resolver: a probe answered only with unparsable text learns noth
     CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
 }
 
-TEST_CASE("OIDC resolver: discovery refused for a full pool is retried only after its window, "
-          "and Test Connection does not wait for the window",
+TEST_CASE("OIDC resolver: discovery that failed on a real lookup failure is retried only after "
+          "its window, and Test Connection does not wait for the window",
           "[oidc][oidc_egress][oidc_resolver][oidc_discovery]") {
     Nat64CacheReset cache;
     constexpr int kWindowMs = 1500;
@@ -1580,23 +1583,18 @@ TEST_CASE("OIDC resolver: discovery refused for a full pool is retried only afte
     provider.set_discovery_negative_cache_for_test(kWindowMs);
 
     const auto first_attempt = std::chrono::steady_clock::now();
-    {
-        VetThread holder(st->gate, "slow.a.test", 10000);
-        REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
-        CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
-        CHECK(st->others.load() == 0); // refused by the full pool: no lookup was performed
-    }
-    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+    CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+    CHECK(st->others.load() == 1); // the lookup ran and found nothing: the window is armed
 
     if (std::chrono::steady_clock::now() <
         first_attempt + std::chrono::milliseconds(kWindowMs / 2)) {
-        // Inside the window the pool is free, but the failed attempt is not retried.
+        // Inside the window the failed attempt is not retried.
         CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
-        CHECK(st->others.load() == 0);
+        CHECK(st->others.load() == 1);
         // Test Connection calls the static fetch, which has no window: it does look the name up.
         const auto doc = OidcProvider::fetch_discovery_document(issuer, false, false, 1000);
         CHECK_FALSE(doc.has_value());
-        CHECK(st->others.load() == 1);
+        CHECK(st->others.load() == 2);
     } else {
         WARN("the host stalled past half the window: the in-window checks were skipped");
     }
@@ -1609,6 +1607,34 @@ TEST_CASE("OIDC resolver: discovery refused for a full pool is retried only afte
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     CHECK(st->others.load() == seen + 1);
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: discovery refused for a full pool is not remembered - the next attempt "
+          "looks the name up without waiting for the window",
+          "[oidc][oidc_egress][oidc_resolver][oidc_discovery]") {
+    Nat64CacheReset cache;
+    constexpr int kWindowMs = 5000; // never waited out
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    auto st = std::make_shared<LookupState>();
+    st->other_status = net::ResolveStatus::kNotFound;
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    OidcProvider provider(resolver_cfg("https://idp.test"));
+    provider.set_discovery_negative_cache_for_test(kWindowMs);
+
+    const auto started = std::chrono::steady_clock::now();
+    {
+        VetThread holder(st->gate, "slow.a.test", 10000);
+        REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
+        CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+        CHECK(st->others.load() == 0); // refused by the full pool: no lookup was performed
+    }
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+
+    // The pool is free: the very next attempt performs a lookup (the refusal armed no window).
+    CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+    CHECK(st->others.load() == 1);
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(kWindowMs));
     CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
 }
 #endif // !_WIN32
