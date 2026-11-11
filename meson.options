@@ -1,5 +1,6 @@
 option('build_agent',    type: 'boolean', value: true,  description: 'Build the agent daemon')
-option('build_server',   type: 'boolean', value: true,  description: 'Build the server daemon')
+option('server',         type: 'feature', value: 'auto', description: 'Build the server daemon. The server runs on Linux only (ADR-0035): auto builds it on a Linux target and skips it on any other; enabled on a non-Linux target is a configure error')
+option('build_server',   type: 'boolean', value: true,  deprecated: true, description: 'DEPRECATED, use -Dserver. Still honoured: false turns the server off. Kept only because build dirs and branches from before ADR-0035 step 3 store or pass it; deleting it later needs those build dirs wiped or renamed (ADR-0035 step 4)')
 option('build_examples', type: 'boolean', value: true,  description: 'Build the demo example plugins (example, chargen, procfetch, netprobe) -- every other plugin builds regardless of this flag')
 option('build_tests',    type: 'boolean', value: false, description: 'Build unit and integration tests')
 option('build_fuzzers',  type: 'boolean', value: false,

@@ -520,7 +520,7 @@ jobs:
   # Linux TSan job above (+ the fake-mechanism cross-platform tests) carries
   # the data-race half of the coverage.
   #
-  # Agent-only (build_server=false): the spark mechanisms are entirely
+  # Agent-only (the server is off on Windows, ADR-0035): the spark mechanisms are entirely
   # agent-side, and skipping the server halves build time + sidesteps
   # ASan-vs-static-grpc-stack link unknowns for a component this job doesn't
   # need to touch.
@@ -648,9 +648,12 @@ jobs:
           VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-windows
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          # Agent-only vcpkg profile (ADR-0035 step 3), the same as ci.yml's
+          # Windows leg: the two share one vcpkg_installed tree on Wee Tam.
           "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
             --triplet x64-windows \
-            --x-manifest-root="$GITHUB_WORKSPACE"
+            --x-manifest-root="$GITHUB_WORKSPACE" \
+            --x-no-default-features --x-feature=tests
 
       - name: Configure (Meson + ASan)
         env:
@@ -665,7 +668,6 @@ jobs:
           meson setup $reconfig build-windows-asan \
             --buildtype=debugoptimized \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
-            -Dbuild_server=false \
             -Dbuild_tests=true \
             -Db_sanitize=address \
             -Dcpp_args="-D_DISABLE_STRING_ANNOTATION -D_DISABLE_VECTOR_ANNOTATION"

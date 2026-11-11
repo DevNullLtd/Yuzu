@@ -3472,6 +3472,18 @@ test('agent-only release lint',
   timeout: 30,
 )
 
+# The `server` feature option (ADR-0035 ladder step 3): auto turns the server
+# off on a non-Linux target, enabled there is an error, the deprecated
+# `build_server` boolean stays declared and honoured. Lexical pins with a
+# mutation self-test, plus a real configure of this tree for Windows, macOS
+# and Linux targets (skipped without meson and a compiler).
+test('server feature option lint',
+  _python3_test,
+  args: [files('test_server_feature_option.py')],
+  suite: 'docs',
+  timeout: 300,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -4634,9 +4646,10 @@ endif
 # Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
 # runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
 # platform: OS-contract test (docs is OS-independent and Linux-only since 2026-10-21). It is registered
-# only when build_server is on, so since ADR-0035 ladder step 1 (Windows and macOS CI configure with
-# -Dbuild_server=false) it runs on the Linux legs only; its `.exe` probe, MSYS2_ARG_CONV_EXCL and cygpath
-# handling now serve local Windows builds alone. Suite 'platform', not a bare 'server':
+# only when build_server is on, which since ADR-0035 ladder step 3 means a Linux target only (the
+# `server` feature option is off for any other target), so it runs on the Linux legs only; its `.exe`
+# probe, MSYS2_ARG_CONV_EXCL and cygpath handling serve no supported build now and can go when the
+# server's Windows code is removed (ADR-0035 step 5). Suite 'platform', not a bare 'server':
 # scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate labelled
 # only 'server' would fail that check on any leg that registers it.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server

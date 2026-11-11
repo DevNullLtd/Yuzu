@@ -42,8 +42,9 @@ name: "CodeQL"
 #     + build_tests=true + languages c-cpp,actions, and the workflow
 #     matrixed across Linux + Windows runners to close the #ifdef _WIN32
 #     gap that a Linux-only analysis physically cannot reach.
-#   ADR-0035 ladder step 1: the Windows row is configured with
-#     -Dbuild_server=false, so it analyses the agent only; server code
+#   ADR-0035 ladder step 1: the Windows row is configured agent-only
+#     (since step 3 by the server option's auto default), so it analyses
+#     the agent only; server code
 #     (Linux-only under ADR-0035) is CodeQL-scanned on the Linux row only.
 #   2026-10-21 → 2026-11-02: the dev→main promotion (first-party .cpp/.cc files 1157 → 1437)
 #     pushed both legs past the 90-min ceiling; scheduled runs were
@@ -57,7 +58,7 @@ name: "CodeQL"
 #     handling — not style noise like it would be for JS/Python)
 #   - languages: c-cpp,actions on Linux; c-cpp only on Windows (no need
 #     to double-scan the same .github/workflows/*.yml)
-#   - Windows row: agent code only (-Dbuild_server=false, ADR-0035 step 1);
+#   - Windows row: agent code only (no server off Linux, ADR-0035);
 #     server code is scanned on the Linux row only
 #   - -Dbuild_tests=true so the CodeQL tracer observes tests/unit/*.cpp
 #   - Dedicated per-OS build dirs (build-linux-codeql/ + build-windows-codeql/)
@@ -245,6 +246,8 @@ jobs:
             runner: [self-hosted, Linux, X64, yuzu-bigtam-linux]
             triplet: x64-linux
             vcpkg_bin: vcpkg
+            # Full manifest (server + tests): the Linux row analyses the server.
+            vcpkg_features: ""
             build_dir: build-linux-codeql
             category: "/language:c-cpp-linux"
             languages: "c-cpp,actions"
@@ -265,6 +268,9 @@ jobs:
             runner: [self-hosted, Windows, X64, yuzu-weetam-windows]
             triplet: x64-windows
             vcpkg_bin: vcpkg.exe
+            # Agent-only profile (ADR-0035 step 3), the same as every other
+            # Windows workflow on Wee Tam, which share one vcpkg_installed tree.
+            vcpkg_features: "--x-no-default-features --x-feature=tests"
             build_dir: build-windows-codeql
             category: "/language:c-cpp-windows"
             # c-cpp only — no need to double-scan the same
@@ -427,7 +433,7 @@ jobs:
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           "$GITHUB_WORKSPACE/vcpkg/${{ matrix.vcpkg_bin }}" install \
             --triplet ${{ matrix.triplet }} \
-            --x-manifest-root="$GITHUB_WORKSPACE"
+            --x-manifest-root="$GITHUB_WORKSPACE" ${{ matrix.vcpkg_features }}
 
       # Install Erlang/OTP + rebar3 for the gateway custom_target. The
       # meson `gateway` custom_target is scheduled when rebar3 is found AND
@@ -532,14 +538,13 @@ jobs:
           # Note: the gateway custom_target may fail on Windows if
           # rebar3/erl aren't installed on the runner; meson will skip
           # it via the `if command -v rebar3` guard inside meson.build.
-          # -Dbuild_server=false (ADR-0035 ladder step 1): the server is
-          # Linux-only, so this row analyses the agent's Windows code only;
-          # server code is analysed by the Linux row.
+          # Agent only (ADR-0035): the `server` option defaults to auto, which
+          # is off on a Windows target, so this row analyses the agent's
+          # Windows code only; server code is analysed by the Linux row.
           meson setup ${{ matrix.build_dir }} \
             --buildtype=debug \
             -Dcpp_std=vc++latest \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
-            -Dbuild_server=false \
             -Dbuild_tests=true
 
       - name: Build (CodeQL-traced)

@@ -281,6 +281,14 @@ jobs:
       - name: Agent-only release lint
         run: python3 -I tests/test_release_agent_only.py
 
+      # The `server` feature option (ADR-0035 ladder step 3): lexical pins on
+      # meson.options and meson.build's guard, with a mutation self-test. The
+      # behavioural half (a real configure for Windows/macOS/Linux targets)
+      # skips here, where meson is not installed, and runs in `meson test
+      # --suite docs`.
+      - name: Server feature option lint
+        run: python3 -I tests/test_server_feature_option.py
+
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,
       # ratcheted against a by-name baseline that only

@@ -553,24 +553,40 @@ class WorkflowWiringTests(unittest.TestCase):
         return re.findall(r"(?m)^[ \t]*meson setup (?:[^\n]*\\\n)*[^\n]*", body)
 
     def assert_agent_only_setup(self, cmd: str) -> None:
-        """Exactly one build_server token, and it is the plain argument
-        -Dbuild_server=false: not =true, not =falsey, not a second token that
-        overrides it, and not inside a ${{ }} expression that can evaluate
-        to something else on some matrix row."""
-        self.assertEqual(1, cmd.count("build_server"), cmd)
-        self.assertEqual(
-            1, len(re.findall(r"(?<!\S)-Dbuild_server=false(?!\S)", cmd)), cmd
+        """ADR-0035 step 3: the configure names NO server switch at all. The
+        `server` feature option's `auto` turns the server off on a non-Linux
+        target (meson.build), and these legs reconfigure persistent build
+        dirs on Wee Tam: an explicit -Dserver=disabled would be STORED there
+        and break the reconfigure of any branch that predates the option
+        ("Unknown options: server"), and the deprecated -Dbuild_server must
+        not come back either (step 4 deletes it). So neither token, in any
+        spelling, appears in the command."""
+        self.assertNotIn("build_server", cmd)
+        self.assertNotRegex(cmd, r"-Dserver\b", cmd)
+
+    def assert_agent_only_install(self, body: str, where: str) -> None:
+        """ADR-0035 step 3: the leg's one vcpkg install is the agent-only
+        profile, `--x-no-default-features --x-feature=tests`, and never asks
+        for the `server` feature, so libpq, xmlsec and drogon are not
+        installed. On Wee Tam every Windows workflow shares one
+        vcpkg_installed tree per runner workspace, so one leg asking for the
+        full manifest would reinstall the server ports for all of them."""
+        installs = re.findall(
+            r'(?m)^[^\n]*?/vcpkg(?:\.exe)?"? install (?:[^\n]*[\\`]\n)*[^\n]*', body
         )
-        for expr in re.findall(r"\$\{\{.*?\}\}", cmd, flags=re.S):
-            self.assertNotIn("build_server", expr, cmd)
+        self.assertEqual(1, len(installs), f"{where}: expected one vcpkg install: {installs!r}")
+        self.assertRegex(
+            installs[0], r"--x-no-default-features --x-feature=tests(?!\S)", where
+        )
+        self.assertNotRegex(installs[0], r"--x-feature=server\b", where)
 
     def test_server_build_is_linux_only_in_ci(self) -> None:
-        """ADR-0035 ladder step 1: the Windows and macOS legs (and the CodeQL
-        Windows row) configure with -Dbuild_server=false, and no other leg
-        names build_server at all. The Windows leg builds into agent-only dir
-        names, so a stored build_server value can never be shared with a
-        branch that predates the change (Meson keeps stored options across
-        --reconfigure)."""
+        """ADR-0035 ladder steps 1 and 3: the Windows and macOS legs, the
+        CodeQL Windows row and the nightly windows-asan leg configure with no
+        server switch (auto is off off-Linux) and install the agent-only
+        vcpkg profile; no other leg names build_server or -Dserver at all.
+        The Windows leg builds into agent-only dir names, so a build dir
+        configured with the server on (before step 1) is never reused."""
         for job_name in ("windows", "macos"):
             with self.subTest(job=job_name):
                 found = self.meson_setups(self.job("ci.yml", job_name))
@@ -580,6 +596,15 @@ class WorkflowWiringTests(unittest.TestCase):
                     f"configure); a second setup could configure the server: {found!r}",
                 )
                 self.assert_agent_only_setup(found[0])
+                self.assert_agent_only_install(
+                    self.strip_comments(self.job("ci.yml", job_name)), f"ci.yml {job_name}"
+                )
+
+        nightly_asan = self.strip_comments(self.job("nightly.yml", "windows-asan"))
+        nightly_setups = self.meson_setups(nightly_asan)
+        self.assertEqual(1, len(nightly_setups), nightly_setups)
+        self.assert_agent_only_setup(nightly_setups[0])
+        self.assert_agent_only_install(nightly_asan, "nightly.yml windows-asan")
 
         ci_text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         other_jobs = [
@@ -594,6 +619,7 @@ class WorkflowWiringTests(unittest.TestCase):
             with self.subTest(job=job_name):
                 for cmd in self.meson_setups(self.job("ci.yml", job_name)):
                     self.assertNotIn("build_server", cmd)
+                    self.assertNotRegex(cmd, r"-Dserver\b", cmd)
 
         windows = self.strip_comments(self.job("ci.yml", "windows"))
         # The one build-dir assignment is the agent-only name, and the
@@ -659,6 +685,23 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assert_agent_only_setup(cmd)
             else:
                 self.assertNotIn("build_server", cmd)
+                self.assertNotRegex(cmd, r"-Dserver\b", cmd)
+        # CodeQL's one install takes its features from the matrix row: the
+        # Windows row is the agent-only profile, the Linux row the full
+        # manifest (it analyses the server).
+        codeql_code = self.strip_comments(codeql)
+        self.assertEqual(
+            1,
+            len(re.findall(r"vcpkg_bin \}\}\"? install\b|\bvcpkg(?:\.exe)?\"? install\b", codeql_code)),
+        )
+        self.assertRegex(
+            codeql_code,
+            r'--x-manifest-root="\$GITHUB_WORKSPACE" \$\{\{ matrix\.vcpkg_features \}\}\n',
+        )
+        rows = re.findall(r'(?m)^ {12}vcpkg_features: "([^"\n]*)"$', codeql_code)
+        # Matrix order is linux, windows (the setups check above relies on it too).
+        self.assertEqual(["", "--x-no-default-features --x-feature=tests"], rows)
+        self.assertEqual(["linux", "windows"], re.findall(r"(?m)^ {10}- os: (\S+)$", codeql_code))
         # The live yuzu-server.exe smoke rig was server-only (ADR-0035).
         self.assertFalse(
             (ROOT / ".github" / "workflows" / "instructions-windows-validate.yml").exists()
@@ -677,8 +720,8 @@ class WorkflowWiringTests(unittest.TestCase):
             "yuzu_pg_canary",
         )
         # A second configure route (a post-setup `meson configure`, or the
-        # server re-enabled by any spelling) would undo -Dbuild_server=false.
-        forbidden_patterns = (r"build_server\s*=\s*true", r"meson\s+configure")
+        # server named by any spelling) would undo the agent-only configure.
+        forbidden_patterns = (r"build_server", r"-dserver\b", r"meson\s+configure")
         for job_name in ("windows", "macos"):
             body = self.strip_comments(self.job("ci.yml", job_name)).lower()
             for token in forbidden:

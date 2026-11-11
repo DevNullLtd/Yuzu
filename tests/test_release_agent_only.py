@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression net for agent-only Windows and macOS releases (ADR-0035 ladder step 2).
+"""Regression net for agent-only Windows and macOS releases (ADR-0035 ladder steps 2 and 3).
 
 The server is supported on Linux only. release.yml runs only on a tag, so a
 regression in its Windows or macOS job, or a disagreement between the archive
@@ -10,11 +10,14 @@ instead. Stdlib only; no network, no Windows, no macOS.
 What they pin:
 
 - The `build-windows` and `build-macos` jobs of release.yml each configure
-  with exactly one literal `-Dbuild_server=false`, name `build_server`
-  nowhere else, never set it `=true` and never run `meson configure` (the
-  conventions of step 1's ci.yml pin, scripts/ci/test_runner_health_check.py;
-  ladder step 3 renames the switch to the `server` feature option: change
-  both pins with it). Their non-comment lines name no `yuzu-server`,
+  with exactly one literal `-Dserver=disabled` (step 3's feature option),
+  never name the deprecated `build_server` in code, never set `server` to
+  anything else and never run `meson configure`. Their vcpkg install carries
+  `--x-no-default-features` and asks for no `server` feature, so the
+  server-only ports (libpq, xmlsec, drogon) are never installed and their
+  DLLs cannot reach the archive (the ci.yml/codeql/nightly twin of this pin
+  is scripts/ci/test_runner_health_check.py; change both together). Their
+  non-comment lines name no `yuzu-server`,
   `YuzuServerSetup`, `yuzu-server.iss` or `install-server-postgres.sh`,
   except the one exact line of the Windows archive check that FAILS on
   `yuzu-server.exe`.
@@ -134,19 +137,29 @@ def problems(release: str, check: str, bundle: str) -> list:
         if len(setups) != 1:
             found.append(f"{job}: expected one `meson setup`, found {len(setups)}")
         for s in setups:
-            n = len(re.findall(r"-Dbuild_server=false(?![\w=-])", s))
+            n = len(re.findall(r"-Dserver=disabled(?![\w=-])", s))
             if n != 1:
-                found.append(f"{job}: its meson setup carries {n} `-Dbuild_server=false`, expected exactly 1")
-            if "${{" in s and re.search(r"\$\{\{[^}]*build_server", s):
-                found.append(f"{job}: build_server is set from an expression; it must be the literal false")
-        # The same conventions as step 1's ci.yml pin: the switch appears once
-        # in the job, never `=true`, and nothing reconfigures it later.
-        if body.count("build_server") != 1:
-            found.append(f"{job}: `build_server` must appear exactly once (in its meson setup)")
-        if re.search(r"build_server\s*=\s*true", body):
-            found.append(f"{job}: sets build_server=true")
+                found.append(f"{job}: its meson setup carries {n} `-Dserver=disabled`, expected exactly 1")
+        # The switch appears once in the job, only as `disabled`, never from an
+        # expression; the deprecated boolean is gone from code; nothing
+        # reconfigures the build dir later.
+        if len(re.findall(r"-Dserver=", body)) != 1:
+            found.append(f"{job}: `-Dserver=` must appear exactly once (in its meson setup, as disabled)")
+        if re.search(r"-Dserver=(?!disabled(?![\w=-]))", body):
+            found.append(f"{job}: sets -Dserver to something other than the literal disabled")
+        if "build_server" in body:
+            found.append(f"{job}: names the deprecated `build_server` in code; use -Dserver=disabled")
         if re.search(r"\bmeson\s+configure\b", body):
             found.append(f"{job}: runs `meson configure`, which could re-enable the server")
+        # The vcpkg install is the agent-only profile: no server ports.
+        installs = re.findall(r"vcpkg(?:\.exe)?\"? install\b.*?(?=\n\s*\n|\n\s*- name:|\Z)", body, re.S)
+        if len(installs) != 1:
+            found.append(f"{job}: expected one vcpkg install, found {len(installs)}")
+        for inst in installs:
+            if "--x-no-default-features" not in inst:
+                found.append(f"{job}: its vcpkg install lacks --x-no-default-features, so it installs the server ports")
+            if re.search(r"--x-feature=server\b", inst):
+                found.append(f"{job}: its vcpkg install asks for the server feature")
         scan = "\n".join(l for l in body.splitlines() if not ABSENCE_CHECK.match(l))
         for tok in SERVER_TOKENS:
             if tok in scan:
@@ -290,9 +303,17 @@ class ReleaseAgentOnly(unittest.TestCase):
 
     def test_mutations_are_caught(self):
         mutations = {
-            "windows server flag dropped": ("release", "-Dbuild_tests=false `\n            -Dbuild_server=false", "-Dbuild_tests=false"),
-            "macos server flag dropped": ("release", "            -Dbuild_server=false \\\n            -Db_lto=true", "            -Db_lto=true"),
-            "windows server flag doubled": ("release", "-Dbuild_server=false\n", "-Dbuild_server=false `\n            -Dbuild_server=false\n"),
+            "windows server flag dropped": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false"),
+            "macos server flag dropped": ("release", "            -Dserver=disabled \\\n            -Db_lto=true", "            -Db_lto=true"),
+            "windows server flag doubled": ("release", "-Dserver=disabled\n", "-Dserver=disabled `\n            -Dserver=disabled\n"),
+            "windows server flag auto": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false `\n            -Dserver=auto"),
+            "macos back to deprecated boolean": ("release", "            -Dserver=disabled \\\n            -Db_lto=true", "            -Dbuild_server=false \\\n            -Db_lto=true"),
+            "windows deprecated boolean alongside": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false `\n            -Dbuild_server=false `\n            -Dserver=disabled"),
+            "windows server from expression": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false `\n            -Dserver=${{ inputs.server }}"),
+            # Step 3: the vcpkg install is agent-only (no server ports).
+            "windows vcpkg opt-out dropped": ("release", '--x-manifest-root="${{ github.workspace }}" `\n            --x-no-default-features\n', '--x-manifest-root="${{ github.workspace }}"\n'),
+            "macos vcpkg opt-out dropped": ("release", "--x-manifest-root=${{ github.workspace }} \\\n            --x-no-default-features\n", "--x-manifest-root=${{ github.workspace }}\n"),
+            "macos vcpkg server feature asked": ("release", "--x-manifest-root=${{ github.workspace }} \\\n            --x-no-default-features\n", "--x-manifest-root=${{ github.workspace }} \\\n            --x-no-default-features \\\n            --x-feature=server\n"),
             "windows server copy back": ("release", '          Copy-Item "build-windows/agents/core/yuzu-agent.exe"', '          Copy-Item "build-windows/server/core/yuzu-server.exe" "${staging}/bin/"\n          Copy-Item "build-windows/agents/core/yuzu-agent.exe"'),
             "macos server copy back": ("release", "          cp build-macos/agents/core/yuzu-agent \"${STAGING}/bin/\"", "          cp build-macos/server/core/yuzu-server \"${STAGING}/bin/\"\n          cp build-macos/agents/core/yuzu-agent \"${STAGING}/bin/\""),
             "server installer back": ("release", '"deploy\\packaging\\windows\\yuzu-agent.iss"', '"deploy\\packaging\\windows\\yuzu-server.iss"'),
@@ -309,9 +330,9 @@ class ReleaseAgentOnly(unittest.TestCase):
             "server installer required again": ("check", '  "YuzuAgentSetup-*.exe"\n', '  "YuzuAgentSetup-*.exe"\n  "YuzuServerSetup-*.exe"\n'),
             "bundle new name typo": ("bundle", "-p 'yuzu-agent-windows-x64.zip'", "-p 'yuzu-agent-windows-x86.zip'"),
             # Step-1 conventions (C-1): an override or a reconfigure is caught.
-            "windows =true appended": ("release", "-Dbuild_tests=false `\n            -Dbuild_server=false", "-Dbuild_tests=false `\n            -Dbuild_server=false `\n            -Dbuild_server=true"),
-            "macos =true appended": ("release", "            -Dbuild_server=false \\\n            -Db_lto=true", "            -Dbuild_server=false \\\n            -Dbuild_server=true \\\n            -Db_lto=true"),
-            "windows meson configure": ("release", "      - name: Build\n        run: meson compile -C build-windows", "      - name: Reconfigure\n        run: meson configure build-windows -Dbuild_server=true\n\n      - name: Build\n        run: meson compile -C build-windows"),
+            "windows =enabled appended": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false `\n            -Dserver=disabled `\n            -Dserver=enabled"),
+            "macos =enabled appended": ("release", "            -Dserver=disabled \\\n            -Db_lto=true", "            -Dserver=disabled \\\n            -Dserver=enabled \\\n            -Db_lto=true"),
+            "windows meson configure": ("release", "      - name: Build\n        run: meson compile -C build-windows", "      - name: Reconfigure\n        run: meson configure build-windows -Dbuild_tests=true\n\n      - name: Build\n        run: meson compile -C build-windows"),
             # The packaged-archive check (qe-1).
             "verify step removed": ("release", "      - name: Verify the agent runs from the packaged archive", "      - name: Something else"),
             "verify exit check dropped": ("release", "          if ($p.ExitCode -ne 0) { Write-Error", "          if ($false) { Write-Error"),

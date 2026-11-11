@@ -761,14 +761,18 @@ jobs:
 
       - name: Install vcpkg packages
         run: |
+          # Agent-only vcpkg profile (ADR-0035 step 3): no `server` feature
+          # (libpq, xmlsec, drogon) and no `tests` (-Dbuild_tests=false).
           & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
             --triplet x64-windows `
-            --x-manifest-root="${{ github.workspace }}"
+            --x-manifest-root="${{ github.workspace }}" `
+            --x-no-default-features
 
       # Agent only (ADR-0035): the server is supported on Linux only, so the
       # Windows release builds and ships the agent and its plugins, never
-      # yuzu-server.exe. Pinned by tests/test_release_agent_only.py. Ladder
-      # step 3 renames the switch to the `server` feature option.
+      # yuzu-server.exe. -Dserver=disabled is explicit here (this job starts
+      # from a clean checkout, so no stored option can reach an older
+      # branch). Pinned by tests/test_release_agent_only.py.
       - name: Configure (Meson release)
         env:
           CC: ccache cl
@@ -779,7 +783,7 @@ jobs:
             -Dcpp_std=vc++latest `
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=false `
-            -Dbuild_server=false
+            -Dserver=disabled
 
       - name: Build
         run: meson compile -C build-windows -j $env:YUZU_BUILD_JOBS
@@ -862,11 +866,9 @@ jobs:
           Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse | Copy-Item -Destination "${staging}/plugins/"
 
           # Runtime DLLs from vcpkg that plugins/binaries need. This copies
-          # every DLL vcpkg installed, so until ADR-0035 ladder step 3 drops
-          # the server ports from the Windows vcpkg install, the agent archive
-          # still carries server-only DLLs (libpq, drogon, trantor, xmlsec). They
-          # are unused by the agent; pruning them by hand here, with no RC to
-          # prove the list, was judged riskier than one more release with them.
+          # every DLL vcpkg installed; since ADR-0035 step 3 the install above
+          # is agent-only, so the server-only DLLs (libpq, drogon, trantor,
+          # jsoncpp, xmlsec) are no longer installed or shipped.
           $vcpkgBin = "${{ github.workspace }}/vcpkg_installed/x64-windows/bin"
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter "*.dll" | Copy-Item -Destination "${staging}/bin/"
@@ -1169,9 +1171,11 @@ jobs:
           VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-macos
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          # Agent-only vcpkg profile (ADR-0035 step 3), no tests.
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet arm64-osx \
-            --x-manifest-root=${{ github.workspace }}
+            --x-manifest-root=${{ github.workspace }} \
+            --x-no-default-features
 
       - name: Configure (Meson release + LTO)
         env:
@@ -1190,14 +1194,14 @@ jobs:
           # is unchanged.
           # Agent only (ADR-0035): the server is supported on Linux only, so the
           # macOS release never builds or ships yuzu-server. Pinned by
-          # tests/test_release_agent_only.py; ladder step 3 renames the switch
-          # to the `server` feature option.
+          # tests/test_release_agent_only.py. -Dserver=disabled is explicit
+          # (clean checkout, nothing stored).
           meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=release \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=false \
-            -Dbuild_server=false \
+            -Dserver=disabled \
             -Db_lto=true \
             -Dbackend_max_links=1
 
@@ -2575,10 +2579,7 @@ jobs:
           \`yuzu-windows-x64.zip\` and \`yuzu-macos-arm64.tar.gz\` and also
           held the server; update any script that downloads them by name.
 
-          Known limitations: the Windows archive still carries server-side
-          DLLs (\`libpq.dll\`, \`drogon.dll\`, \`trantor.dll\` and the
-          \`libxmlsec1\` DLLs), present but never loaded by the agent. The
-          Windows and macOS SBOMs are generated from the whole build
+          Known limitation: the Windows and macOS SBOMs are generated from the whole build
           workspace, so they list thousands of components the archive does
           not ship or load, the server's dependencies among them; a finding
           in one of those does not apply to the agent.
