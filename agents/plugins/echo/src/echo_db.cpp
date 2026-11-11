@@ -816,7 +816,7 @@ std::expected<bool, std::string> rename_pending(sqlite3* db, const char* from, c
     return !*have_to;
 }
 
-// Schema v9 (upgrade window, removed with the legacy-name shims): a database written before the
+// Schema v9 (kept while a pre-rename database can still exist): a database written before the
 // rename holds tar_state / tar_config / tar_cursor. Rename whichever of them exist, atomically, in
 // one transaction. Skipped when echo_config already exists (a fresh or already-renamed file).
 // An error return makes the caller refuse the open.
@@ -877,7 +877,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         }
     }
 
-    // Upgrade window (removed with the legacy-name shims): agent core adopts a legacy tar.db as
+    // Pre-rename install (kept while a tar.db can still exist): agent core adopts a legacy tar.db as
     // echo.db at boot, before any plugin initialises (adopt_legacy_echo_db). If echo.db is absent
     // and an unadopted tar.db sits beside it, creating a fresh echo.db here would boot the agent
     // with default config and re-enable operator-paused sources (the #559 class). Fail closed.
@@ -1121,22 +1121,6 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         std::string err = err_msg ? err_msg : "unknown error";
         sqlite3_free(err_msg);
         return std::unexpected(std::format("failed to create Echo schema: {}", err));
-    }
-
-    // Set default retention if not already configured
-    {
-        const char* check_sql = "SELECT value FROM echo_config WHERE key = 'retention_days'";
-        sqlite3_stmt* raw_stmt = nullptr;
-        rc = sqlite3_prepare_v2(raw_db, check_sql, -1, &raw_stmt, nullptr);
-        if (rc == SQLITE_OK) {
-            StmtPtr stmt(raw_stmt);
-            if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
-                // No retention_days configured -- set default
-                const char* insert_sql =
-                    "INSERT INTO echo_config (key, value) VALUES ('retention_days', '7')";
-                sqlite3_exec(raw_db, insert_sql, nullptr, nullptr, nullptr);
-            }
-        }
     }
 
     auto db = EchoDatabase{guard.release()};
@@ -1698,25 +1682,6 @@ EchoStats EchoDatabase::stats() {
     {
         const StorageBytes sb = storage_bytes_locked();
         s.db_size_bytes = sb.data_bytes() + sb.wal_bytes;
-    }
-
-    // Retention days from config
-    {
-        const char* sql = "SELECT value FROM echo_config WHERE key = 'retention_days'";
-        sqlite3_stmt* raw_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
-            StmtPtr stmt(raw_stmt);
-            if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-                auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-                if (text) {
-                    try {
-                        s.retention_days = std::stoi(text);
-                    } catch (...) {
-                        s.retention_days = 7;
-                    }
-                }
-            }
-        }
     }
 
     return s;

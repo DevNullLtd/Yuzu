@@ -25,9 +25,13 @@
 #include "device_ci_kinds.hpp"
 #include "device_ci_section_digest.hpp"
 #include "hardware_list_model.hpp"
+#include "hardware_section_integrity.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <yuzu/metrics.hpp>
+
+#include "../test_log_capture.hpp"
 
 #include <algorithm>
 #include <array>
@@ -863,10 +867,38 @@ TEST_CASE("hardware_ci_json: sections_state tells found from absent from degrade
     CHECK_FALSE(hardware_ci_sections_unreadable(untouched));
     CHECK(hardware_ci_json(untouched, 0)["sections_state"] == "degraded");
 
-    // ci readable but no record yet: nothing stored
+    // ci readable but no record yet, sections READ (an answered absence): nothing stored
     HardwareCiDetail none;
     none.ci = std::optional<DeviceCiRecord>{};
+    none.ci_sections = std::vector<DeviceCiSection>{};
     CHECK(hardware_ci_json(none, 0)["sections_state"] == "absent");
+
+    // The same detail with the sections NOT read (#7162): it was a bare default before and read
+    // "absent"; a NotRead state never claims the sections were read, whatever ci says.
+    HardwareCiDetail none_not_read;
+    none_not_read.ci = std::optional<DeviceCiRecord>{};
+    CHECK(hardware_ci_json(none_not_read, 0)["sections_state"] == "degraded");
+}
+
+// #7162: the not-read state is its own value and renders degraded/null, never "absent" and never a
+// new literal (the published enum is found|absent|degraded). `v2_detail({})` is a RecordOnly
+// detail once its sections are reset: a found ci whose sections were never read.
+TEST_CASE(
+    "hardware_ci_json: a RecordOnly detail with a found ci renders degraded with null sections",
+    "[hardware][model][json][sections]") {
+    auto d = v2_detail({});
+    d.ci_sections.reset(); // what CiRead::RecordOnly leaves
+    REQUIRE_FALSE(d.ci_sections.has_value());
+    CHECK_FALSE(hardware_ci_sections_unreadable(d)); // not read is not a failed read
+    const auto j = hardware_ci_json(d, 0);
+    CHECK(j["ci_state"] == "found");
+    CHECK(j["sections_state"] == "degraded");
+    REQUIRE(j["ci"].contains("sections"));
+    CHECK(j["ci"]["sections"].is_null());
+    const auto state = j["sections_state"].get<std::string>();
+    CHECK((state == "found" || state == "absent" || state == "degraded"));
+    // The struct default is NOT READ, not "read and none".
+    CHECK_FALSE(HardwareCiDetail{}.ci_sections.has_value());
 }
 
 // ── #5531: the pure store-to-bit mappings server.cpp's closures delegate to ───
@@ -1200,6 +1232,45 @@ TEST_CASE("classify_hardware_ci_read: found, not found, roster unreadable", "[ha
     }
 }
 
+// #7162: the sections-unreadable decision is the classifier's fourth arm, in one fixed order.
+TEST_CASE("classify_hardware_ci_read: a failed sections read is SectionsUnreadable, after NotFound",
+          "[hardware][model][classify][sections]") {
+    DeviceCiRecord rec;
+    rec.agent_id = "a1";
+    HardwareCiDetail d;
+    d.ci = std::optional<DeviceCiRecord>{rec};
+
+    SECTION("a record whose sections read failed is SectionsUnreadable") {
+        d.ci_sections = std::unexpected(CiReadError::kDegraded);
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::SectionsUnreadable);
+        CHECK(hardware_ci_sections_unreadable(d));
+    }
+    SECTION("sections read, none stored, is Found") {
+        d.ci_sections = std::vector<DeviceCiSection>{};
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::Found);
+    }
+    SECTION("sections NOT READ is Found, never unreadable") {
+        d.ci_sections.reset();
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::Found);
+    }
+    SECTION("precedence: NotFound beats SectionsUnreadable (artificial: nothing else known)") {
+        d.ci = std::optional<DeviceCiRecord>{};
+        d.ci_sections = std::unexpected(CiReadError::kDegraded);
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::NotFound);
+    }
+    SECTION("precedence: RosterUnreadable beats SectionsUnreadable") {
+        d.ci = std::optional<DeviceCiRecord>{};
+        d.identity_degraded = true;
+        d.ci_sections = std::unexpected(CiReadError::kDegraded);
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::RosterUnreadable);
+    }
+    SECTION("an identity row with a failed sections read is still SectionsUnreadable") {
+        d.identity = make_row("a1");
+        d.ci_sections = std::unexpected(CiReadError::kDegraded);
+        CHECK(classify_hardware_ci_read(d) == HardwareCiRead::SectionsUnreadable);
+    }
+}
+
 // ── hardware_ci_json: section edge cases (H.7 Gate 3) ────────────────────────────────────────
 
 // A row shorter than the registry's column count reads the missing trailing cells as null; a longer
@@ -1299,8 +1370,9 @@ TEST_CASE("apply_ci_with_sections_read: a failed record read is a degraded ci an
     apply_ci_with_sections_read(d, std::unexpected(CiReadError::kDegraded));
     REQUIRE_FALSE(d.ci.has_value());
     CHECK(d.ci.error() == CiReadError::kDegraded);
-    REQUIRE(d.ci_sections.has_value());
-    CHECK(d.ci_sections->empty());
+    // No sections read was made: NOT READ (was an empty list before #7162, which read "none
+    // stored").
+    CHECK_FALSE(d.ci_sections.has_value());
     CHECK_FALSE(hardware_ci_sections_unreadable(d)); // ci degraded, not a sections failure
 }
 
@@ -1311,7 +1383,8 @@ TEST_CASE("apply_ci_with_sections_read: an absent record is an answered nullopt 
     REQUIRE(d.ci.has_value());
     CHECK_FALSE(d.ci->has_value());
     REQUIRE(d.ci_sections.has_value());
-    CHECK(d.ci_sections->empty());
+    REQUIRE(d.ci_sections->has_value());
+    CHECK((*d.ci_sections)->empty());
 }
 
 TEST_CASE("apply_ci_with_sections_read: a v2 record moves its sections into ci_sections",
@@ -1326,9 +1399,10 @@ TEST_CASE("apply_ci_with_sections_read: a v2 record moves its sections into ci_s
     CHECK((*d.ci)->chassis_serial == "CHS1");
     CHECK((*d.ci)->sections.empty()); // one home for the rows
     REQUIRE(d.ci_sections.has_value());
-    REQUIRE(d.ci_sections->size() == 2);
-    CHECK((*d.ci_sections)[0].kind == "cpu");
-    CHECK((*d.ci_sections)[1].level == "unavailable");
+    REQUIRE(d.ci_sections->has_value());
+    REQUIRE((*d.ci_sections)->size() == 2);
+    CHECK((**d.ci_sections)[0].kind == "cpu");
+    CHECK((**d.ci_sections)[1].level == "unavailable");
     CHECK_FALSE(hardware_ci_sections_unreadable(d));
 }
 
@@ -1344,7 +1418,8 @@ TEST_CASE("apply_ci_with_sections_read: a v1 record serves no sections even if s
     REQUIRE(d.ci.has_value());
     REQUIRE(d.ci->has_value());
     REQUIRE(d.ci_sections.has_value());
-    CHECK(d.ci_sections->empty());
+    REQUIRE(d.ci_sections->has_value());
+    CHECK((*d.ci_sections)->empty());
     CHECK(hardware_ci_json(d, 0)["sections_state"] == "absent");
 }
 
@@ -1359,8 +1434,9 @@ TEST_CASE("apply_ci_with_sections_read: a failed sections read keeps the error a
     REQUIRE(d.ci.has_value());
     REQUIRE(d.ci->has_value());
     CHECK((*d.ci)->chassis_serial == "CHS1");
-    REQUIRE_FALSE(d.ci_sections.has_value());
-    CHECK(d.ci_sections.error() == CiReadError::kDegraded);
+    REQUIRE(d.ci_sections.has_value());
+    REQUIRE_FALSE(d.ci_sections->has_value());
+    CHECK(d.ci_sections->error() == CiReadError::kDegraded);
     CHECK(hardware_ci_sections_unreadable(d));
 }
 
@@ -1447,8 +1523,8 @@ TEST_CASE("verify_section_row_count: unavailable and permission_denied and unkno
     }
 }
 
-// Kills: a mismatch that reaches the model but not the wire, or one that drops the rows that were read.
-TEST_CASE("hardware_ci_json: a row-count mismatch is served constrained and incomplete with its rows",
+// Kills: a mismatch that reaches the model but not the wire, or one that still serves the rows read (#7165).
+TEST_CASE("hardware_ci_json: a row-count mismatch is served constrained and incomplete with NO rows",
           "[hardware][model][json][sections][row_count]") {
     auto d = v2_detail({counted_section("cpu", "ok", "", 3, 1), counted_section("dimm", "ok", "", 2, 0),
                         counted_section("disk", "ok", "", std::nullopt, 0)});
@@ -1457,7 +1533,8 @@ TEST_CASE("hardware_ci_json: a row-count mismatch is served constrained and inco
     CHECK(cpu["status"] == "constrained");
     CHECK(cpu["complete"] == false);
     CHECK(cpu["reason"] == "server:row_count_mismatch");
-    CHECK(cpu["rows"].size() == 1); // the rows that WERE read are still served
+    CHECK(cpu["rows"].is_array());
+    CHECK(cpu["rows"].empty()); // the one row that remains is WITHHELD (#7165)
     const auto& dimm = section_of(j, "dimm");
     CHECK(dimm["status"] == "constrained");
     CHECK(dimm["complete"] == false);
@@ -1714,6 +1791,282 @@ TEST_CASE("verify_section_content: a count mismatch is reported alone and wins o
     CHECK(verify_section_content(n).reason == "server:content_digest_mismatch");
 }
 
+namespace {
+// A provider that always fails, as sha256_hex does when EVP_Digest returns an error (#7163).
+std::optional<std::string> failing_digest(std::string_view) {
+    return std::nullopt;
+}
+} // namespace
+
+// #7163: the reader's provider-failure branch, reached through the DigestFn seam. A section whose
+// stored digest is intact must NEVER be served ok when the server cannot recompute the digest, and
+// (owner ruling 2026-11-09) it carries its own token: the fault is the server's, not the rows'.
+TEST_CASE("verify_section_content: a failing digest provider is never served ok",
+          "[hardware][model][sections][digest]") {
+    const auto s = digested_section("cpu", "ok", "", cpu_rows(2));
+    REQUIRE(verify_section_content(s).level == "ok"); // the default provider verifies it
+    const auto v = verify_section_content(s, &failing_digest);
+    CHECK(v.level == "constrained");
+    CHECK(v.reason ==
+          "server:content_digest_unverifiable"); // a server fault: not the mismatch token
+    CHECK(v.fault == SectionFault::Unverifiable);
+    // An already-constrained section keeps its level and tokens and gains the digest token.
+    const auto c = digested_section("cpu", "constrained", "server_cap:2", cpu_rows(2));
+    const auto cv = verify_section_content(c, &failing_digest);
+    CHECK(cv.level == "constrained");
+    CHECK(cv.reason == "server_cap:2;server:content_digest_unverifiable");
+    // A section that needs no digest is not touched by a failing provider.
+    auto none = digested_section("cpu", "ok", "", cpu_rows(2));
+    none.content_digest.reset();
+    CHECK(verify_section_content(none, &failing_digest).level == "ok");
+    auto denied = digested_section("cpu", "permission_denied", "x", {});
+    CHECK(verify_section_content(denied, &failing_digest).level == "permission_denied");
+}
+
+// ── #7159: the pure cause, the counter and the sampled WARN ────────────────────────────────────
+
+namespace {
+double integrity_count(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter("yuzu_hardware_section_integrity_total", {{"reason", reason}}).value();
+}
+} // namespace
+
+TEST_CASE(
+    "verify_section_content: the pure cause is None for an intact or agent-constrained section",
+    "[hardware][model][sections][digest][metrics]") {
+    CHECK(verify_section_content(digested_section("cpu", "ok", "", cpu_rows(2))).fault ==
+          SectionFault::None);
+    CHECK(
+        verify_section_content(digested_section("cpu", "constrained", "agent:partial", cpu_rows(2)))
+            .fault == SectionFault::None);
+    auto none = digested_section("cpu", "ok", "", cpu_rows(2));
+    none.content_digest.reset();
+    none.row_count.reset();
+    CHECK(verify_section_content(none).fault == SectionFault::None);
+    CHECK(section_fault_token(SectionFault::None).empty());
+    CHECK(section_fault_label(SectionFault::None).empty());
+}
+
+// The counted cause and the served token come from ONE verdict, so they cannot disagree: for each
+// of the three causes the served reason contains exactly that fault's token, and the label counted
+// for the same section is that fault's label.
+TEST_CASE(
+    "record_section_integrity: the counted cause equals the served token for the same section",
+    "[hardware][model][sections][digest][metrics]") {
+    struct Case {
+        DeviceCiSection section;
+        DigestFn digest;
+        SectionFault expect;
+        const char* label;
+        const char* token;
+    };
+    auto lost = digested_section("cpu", "ok", "", cpu_rows(3));
+    lost.rows.pop_back(); // count and digest both disagree: the count token alone
+    auto edited = digested_section("cpu", "ok", "", cpu_rows(2));
+    edited.rows[0][1] = "Edited"; // same count, different content
+    const auto intact = digested_section("cpu", "ok", "", cpu_rows(2));
+    const Case cases[] = {
+        {lost, nullptr, SectionFault::RowCount, "row_count_mismatch", "server:row_count_mismatch"},
+        {edited, nullptr, SectionFault::Content, "content_digest_mismatch",
+         "server:content_digest_mismatch"},
+        {intact, &failing_digest, SectionFault::Unverifiable, "digest_unverifiable",
+         "server:content_digest_unverifiable"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.label);
+        const auto verdict = verify_section_content(c.section, c.digest);
+        REQUIRE(verdict.fault == c.expect);
+        CHECK(verdict.reason.find(c.token) != std::string::npos);
+        CHECK(section_fault_token(verdict.fault) == c.token);
+        CHECK(section_fault_label(verdict.fault) == c.label);
+        yuzu::MetricsRegistry m;
+        record_section_integrity({c.section}, "agent-1", &m, c.digest);
+        for (const char* reason :
+             {"row_count_mismatch", "content_digest_mismatch", "digest_unverifiable"})
+            CHECK(integrity_count(m, reason) == (std::string_view(reason) == c.label ? 1.0 : 0.0));
+    }
+}
+
+TEST_CASE(
+    "record_section_integrity: one increment per faulted section per call, nothing for intact ones",
+    "[hardware][model][sections][digest][metrics]") {
+    yuzu::MetricsRegistry m;
+    auto lost = digested_section("cpu", "ok", "", cpu_rows(3));
+    lost.rows.pop_back();
+    auto lost_swap = digested_section("swap", "ok", "", Rows{{"a", "1", "2"}});
+    lost_swap.rows.clear();
+    auto edited = digested_section("cpu", "ok", "", cpu_rows(2));
+    edited.rows[0][1] = "Edited";
+    const std::vector<DeviceCiSection> sections = {
+        lost, digested_section("cpu", "ok", "", cpu_rows(2)), lost_swap, edited,
+        digested_section("cpu", "unavailable", "x", {})};
+    record_section_integrity(sections, "agent-1", &m);
+    CHECK(integrity_count(m, "row_count_mismatch") == 2.0);
+    CHECK(integrity_count(m, "content_digest_mismatch") == 1.0);
+    CHECK(integrity_count(m, "digest_unverifiable") == 0.0);
+    // Counts reads composed with a faulted section, not distinct defects: the same call again
+    // doubles it.
+    record_section_integrity(sections, "agent-1", &m);
+    CHECK(integrity_count(m, "row_count_mismatch") == 4.0);
+    // An empty list (a v1 record, or nothing stored) counts nothing; a null registry is safe.
+    yuzu::MetricsRegistry empty;
+    record_section_integrity({}, "agent-1", &empty);
+    CHECK(integrity_count(empty, "row_count_mismatch") == 0.0);
+    record_section_integrity(sections, "agent-1", nullptr);
+}
+
+// The WARN names the device id and the section kind and never the row contents, and is sampled per
+// reason: the leading edge of an episode logs, the rest of that episode does not.
+TEST_CASE(
+    "record_section_integrity: the WARN names agent and kind, never row contents, and is sampled",
+    "[hardware][model][sections][digest][metrics]") {
+    reset_section_integrity_log_state_for_test();
+    auto lost = digested_section("cpu", "ok", "", cpu_rows(3));
+    lost.rows.pop_back();
+    lost.rows[0][1] = "SECRET-CPU-MODEL";
+    std::string logs;
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        record_section_integrity({lost}, "agent-warn", nullptr);
+        record_section_integrity({lost}, "agent-warn", nullptr); // same episode: no second line
+        cap.stop();
+        logs = cap.text();
+    }
+    CHECK(logs.find("agent=agent-warn") != std::string::npos);
+    CHECK(logs.find("kind=cpu") != std::string::npos);
+    CHECK(logs.find("reason=row_count_mismatch") != std::string::npos);
+    CHECK(logs.find("rows withheld") != std::string::npos); // the WARN says what was served (#7165)
+    CHECK(logs.find("SECRET-CPU-MODEL") == std::string::npos);
+    const auto first = logs.find("section integrity fault");
+    REQUIRE(first != std::string::npos);
+    CHECK(logs.find("section integrity fault", first + 1) == std::string::npos); // sampled
+    // A different reason has its own episode and logs on its own leading edge.
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        auto edited = digested_section("cpu", "ok", "", cpu_rows(2));
+        edited.rows[0][1] = "Edited";
+        record_section_integrity({edited}, "agent-warn", nullptr);
+        cap.stop();
+        CHECK(cap.text().find("reason=content_digest_mismatch") != std::string::npos);
+        CHECK(cap.text().find("rows withheld") != std::string::npos);
+        CHECK(cap.text().find("rows served") == std::string::npos);
+    }
+}
+
+// Kills: a series that exists only after its first fault (a dashboard cannot tell "no fault" from
+// "series absent"). The expected labels below are hand-kept on purpose: a new SectionFault must be
+// added here too (the static_assert on kCountedFaults and -Wswitch flag the production side).
+TEST_CASE("register_section_integrity_metrics: pre-seeds one series per counted fault at zero",
+          "[hardware][model][sections][metrics]") {
+    yuzu::MetricsRegistry m;
+    register_section_integrity_metrics(m);
+    const std::string text = m.serialize();
+    std::size_t series = 0;
+    for (const auto fault :
+         {SectionFault::RowCount, SectionFault::Content, SectionFault::Unverifiable}) {
+        const std::string label(section_fault_label(fault));
+        INFO(label);
+        REQUIRE_FALSE(label.empty());
+        CHECK(text.find("yuzu_hardware_section_integrity_total{reason=\"" + label + "\"} 0\n") !=
+              std::string::npos);
+        CHECK(integrity_count(m, label.c_str()) == 0.0);
+    }
+    for (std::size_t at = 0;
+         (at = text.find("yuzu_hardware_section_integrity_total{", at)) != std::string::npos; ++at)
+        ++series;
+    CHECK(series == 3); // exactly one per non-None SectionFault
+    CHECK(text.find("# TYPE yuzu_hardware_section_integrity_total counter") != std::string::npos);
+    CHECK(text.find("# HELP yuzu_hardware_section_integrity_total ") != std::string::npos);
+}
+
+// Kills: an unverifiable provider masking a count mismatch (the count is the more specific report
+// and is checked first), in either order of evaluation.
+TEST_CASE("verify_section_content: a count mismatch with a failing provider reports the count",
+          "[hardware][model][sections][digest]") {
+    auto s = digested_section("cpu", "ok", "", cpu_rows(3));
+    s.rows.pop_back();
+    const auto v = verify_section_content(s, &failing_digest);
+    CHECK(v.fault == SectionFault::RowCount);
+    CHECK(v.reason == "server:row_count_mismatch");
+    CHECK(served_section_verdict(s, &failing_digest).fault == SectionFault::RowCount);
+}
+
+// Each fault token is appended after an agent-reported reason with a ';' and the level is
+// downgraded to constrained, whichever of the three causes it is.
+TEST_CASE("verify_section_content: every fault token is ';'-joined after an agent reason",
+          "[hardware][model][sections][digest]") {
+    auto lost = digested_section("cpu", "ok", "agent:note", cpu_rows(3));
+    lost.rows.pop_back();
+    CHECK(verify_section_content(lost).reason == "agent:note;server:row_count_mismatch");
+    auto edited = digested_section("cpu", "ok", "agent:note", cpu_rows(2));
+    edited.rows[0][1] = "Edited";
+    CHECK(verify_section_content(edited).reason == "agent:note;server:content_digest_mismatch");
+    const auto intact = digested_section("cpu", "ok", "agent:note", cpu_rows(2));
+    const auto u = verify_section_content(intact, &failing_digest);
+    CHECK(u.level == "constrained");
+    CHECK(u.reason == "agent:note;server:content_digest_unverifiable");
+    // An agent-constrained section with an intact digest keeps its reason and is counted as
+    // nothing.
+    const auto agent_only = digested_section("cpu", "constrained", "agent:note", cpu_rows(2));
+    CHECK(served_section_verdict(agent_only).fault == SectionFault::None);
+    CHECK(served_section_verdict(agent_only).reason == "agent:note");
+}
+
+// Kills: the counter counting a fault the body does not carry. A status-only kind (or an
+// unregistered one) is served as stored and never compared, even if a row_count is stored for it;
+// `verify_section_content` alone WOULD flag it, which is why both the body and the counter go
+// through `served_section_verdict`. An unavailable / permission_denied section is likewise never
+// compared.
+TEST_CASE(
+    "served_section_verdict: a non-table or unregistered kind is served as stored, never counted",
+    "[hardware][model][sections][metrics]") {
+    for (const char* kind : {"chassis", "baseboard", "machine_id", "no_such_kind"}) {
+        INFO(kind);
+        auto s = make_section(kind, "ok", "r", {});
+        s.row_count = 3; // a stored count the (empty) rows would disagree with
+        s.content_digest = "v1:" + std::string(64, 'a');
+        const auto v = served_section_verdict(s);
+        CHECK(v.level == "ok");
+        CHECK(v.reason == "r");
+        CHECK(v.fault == SectionFault::None);
+        yuzu::MetricsRegistry m;
+        record_section_integrity({s}, "agent-1", &m);
+        CHECK(integrity_count(m, "row_count_mismatch") == 0.0);
+        CHECK(integrity_count(m, "content_digest_mismatch") == 0.0);
+        CHECK(integrity_count(m, "digest_unverifiable") == 0.0);
+    }
+    // The guard matters: the bare verifier would report the count for a status-only kind.
+    auto chassis = make_section("chassis", "ok", "", {});
+    chassis.row_count = 3;
+    CHECK(verify_section_content(chassis).fault == SectionFault::RowCount);
+    // No rows by contract for these levels: nothing to compare, nothing counted.
+    for (const char* level : {"unavailable", "permission_denied"}) {
+        INFO(level);
+        auto s = digested_section("cpu", level, "x", cpu_rows(2));
+        s.rows.clear();
+        CHECK(served_section_verdict(s).fault == SectionFault::None);
+        CHECK(served_section_verdict(s, &failing_digest).fault == SectionFault::None);
+    }
+}
+
+// SectionFault::None has no sampler: passing it anywhere cannot pollute another reason's WARN
+// state.
+TEST_CASE("served_section_verdict: an intact table-backed section counts nothing and logs nothing",
+          "[hardware][model][sections][metrics]") {
+    reset_section_integrity_log_state_for_test();
+    yuzu::MetricsRegistry m;
+    std::string logs;
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        record_section_integrity({digested_section("cpu", "ok", "", cpu_rows(2))}, "agent-quiet",
+                                 &m);
+        cap.stop();
+        logs = cap.text();
+    }
+    CHECK(logs.find("section integrity fault") == std::string::npos);
+    CHECK(integrity_count(m, "digest_unverifiable") == 0.0);
+}
+
 // Kills: verifying (or downgrading) a section that has no stored digest - the pre-feature path.
 TEST_CASE("verify_section_content: a NULL digest leaves the section as the count rule left it",
           "[hardware][model][sections][digest]") {
@@ -1827,8 +2180,8 @@ TEST_CASE("verify_section_content: a status-only or unregistered kind never take
     CHECK(verify_section_content(u).level == "ok");
 }
 
-// Kills: a mismatch that reaches the model but not the wire, or one that drops the rows read.
-TEST_CASE("hardware_ci_json: a content-digest mismatch is served constrained and incomplete with its rows",
+// Kills: a mismatch that reaches the model but not the wire, or one that still serves the rows (#7165).
+TEST_CASE("hardware_ci_json: a content-digest mismatch is served constrained and incomplete with NO rows",
           "[hardware][model][json][sections][digest]") {
     auto cpu = digested_section("cpu", "ok", "", cpu_rows(2));
     cpu.rows[0][1] = "Edited";
@@ -1838,8 +2191,55 @@ TEST_CASE("hardware_ci_json: a content-digest mismatch is served constrained and
     CHECK(c["status"] == "constrained");
     CHECK(c["complete"] == false);
     CHECK(c["reason"] == "server:content_digest_mismatch");
-    CHECK(c["rows"].size() == 2); // served, but NOT the reported generation: see the verdict doc
+    CHECK(c["rows"].is_array());
+    CHECK(c["rows"].empty()); // NOT the reported generation: withheld (#7165)
     CHECK(section_of(j, "disk")["complete"] == true);
+}
+
+// Kills: withholding only for a section the agent reported `ok`. An agent-reported `constrained`
+// section (here a server cap) with edited rows is just as unreliable, so it is withheld too.
+TEST_CASE("hardware_ci_json: an agent-constrained section with a content mismatch also loses its rows",
+          "[hardware][model][json][sections][digest]") {
+    auto cpu = digested_section("cpu", "constrained", "server_cap:32", cpu_rows(2));
+    cpu.rows[0][1] = "Edited";
+    auto d = v2_detail({std::move(cpu), digested_section("disk", "constrained", "server_cap:32", cpu_rows(0))});
+    const auto j = hardware_ci_json(d, 0);
+    const auto& c = section_of(j, "cpu");
+    CHECK(c["status"] == "constrained");
+    CHECK(c["complete"] == false);
+    CHECK(c["reason"] == "server_cap:32;server:content_digest_mismatch");
+    CHECK(c["rows"].empty());
+}
+
+// The decision is a function of the fault ENUM, not of token text, and every enumerator is pinned:
+// the two mismatches withhold; `unverifiable` (the server could not compare) and `None` serve.
+// Kills: withholding on Unverifiable (rows hidden for a server fault) or on None (all rows hidden).
+TEST_CASE("section_rows_withheld: only the two mismatch faults withhold rows",
+          "[hardware][model][sections][digest]") {
+    CHECK(section_rows_withheld(SectionFault::RowCount));
+    CHECK(section_rows_withheld(SectionFault::Content));
+    CHECK_FALSE(section_rows_withheld(SectionFault::Unverifiable));
+    CHECK_FALSE(section_rows_withheld(SectionFault::None));
+}
+
+// The whole row-serving decision, over every input ci_sections_json feeds it. Kills: withholding
+// for Unverifiable (a server fault) or for None, serving a mismatch, serving rows of a level that
+// has none by contract, and serving rows for a status-only kind (no table).
+TEST_CASE("section_serves_rows: table, stored level and fault together decide",
+          "[hardware][model][sections][digest]") {
+    for (const char* level : {"ok", "constrained"}) {
+        INFO(level);
+        CHECK(section_serves_rows(true, level, SectionFault::None));
+        CHECK(section_serves_rows(true, level, SectionFault::Unverifiable));
+        CHECK_FALSE(section_serves_rows(true, level, SectionFault::RowCount));
+        CHECK_FALSE(section_serves_rows(true, level, SectionFault::Content));
+        CHECK_FALSE(section_serves_rows(false, level, SectionFault::None)); // status-only kind
+    }
+    for (const char* level : {"unavailable", "permission_denied", "", "somethingnew"}) {
+        INFO(level);
+        for (const auto f : {SectionFault::None, SectionFault::Unverifiable})
+            CHECK_FALSE(section_serves_rows(true, level, f));
+    }
 }
 
 // The digest binds n_fields; the INSERT and SELECT use the parsed column list. They must agree for

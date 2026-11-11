@@ -498,9 +498,9 @@ user retries; no re-verify. Counted by
 seed-only by construction: an operator can no longer reset a password by
 editing it, and a password rotated that way before this change reverts on
 upgrade to the stored one (behaviour change — see
-`docs/user-manual/upgrading.md`). The Windows server installer refuses a
-password on an upgrade for the same reason (exit code 11,
-`docs/user-manual/server-admin.md`). cfg-only non-admin accounts are a
+`docs/user-manual/upgrading.md`). The Windows server installer, while it
+shipped (it was discontinued by ADR-0035), refused a password on an upgrade
+for the same reason (exit code 11). cfg-only non-admin accounts are a
 separate gap, mitigated by #5343: only the cfg admin is provisioned on a fresh
 database, so the second first-run account and the installer's `/OPERATOR_USER`
 could never sign in on Postgres, and both generators were removed (a hand-written
@@ -526,9 +526,8 @@ count. It writes no audit row (#5361).
 `kMinPasswordBytes = 12`, `kMaxPasswordBytes = 1024` (bytes). It replaces the
 three hand-copied `< 12` checks; `/login` answers an over-max password like a
 wrong one without running PBKDF2. Body cap: `kBodyCapTable` row `/api/v1/users`
-(any method, 16 KiB, `path_class="users"`). The Windows server installer and
-`generate-config.ps1` enforce the same 1024-byte maximum (UTF-8) on a fresh
-install; the Compose Wizard does not yet (#5363).
+(any method, 16 KiB, `path_class="users"`). The Compose Wizard does not yet
+enforce it (#5363). (The discontinued Windows server installer enforced it.)
 
 **No MCP twin** (ADR-1005 parity-ledger `exception:` rows,
 `docs/api-parity-ledger.md`). Self-service change is permanently excluded: an
@@ -696,7 +695,7 @@ by each handler.
   class (`kPendingRuling`) for routes whose classification is still being
   decided, which the chokepoint treats as exempt: 73 REST rows today, a count
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
-  table has 248 REST rows: 41 `kRequired`, 3 `kOwnGate`, 131 `kExempt` and 73
+  table has 251 REST rows: 41 `kRequired`, 3 `kOwnGate`, 134 `kExempt` and 73
   `kPendingRuling`.
 - **Where it runs.** In `run_post_read_stage` (`step_up_wiring.hpp`), the
   body of the post-read stage `server.cpp` installs through
@@ -896,7 +895,7 @@ by each handler.
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (73 rows: 23 `kExempt`, 50
+  a second table, `step_up_mcp_policy.hpp` (75 rows: 25 `kExempt`, 50
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
   behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
   plus a separate list of tools added after it (today six), legal only for a tool

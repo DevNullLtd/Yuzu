@@ -593,8 +593,8 @@ TEST_CASE("execute_user_query: usage tables are denied to generic echo.sql (#426
     // translates $-names itself (confirmed against its implementation --
     // it passes the raw string straight to sqlite3_prepare_v2), so this
     // query must go through validate_and_translate_sql first, exactly like
-    // the $Usage_Daily denial check above; passing the bare $Process_Live
-    // string here previously hit SQLite's own "near $Process_Live: syntax
+    // the $Usage_Daily denial check above; passing the bare $Process_Hourly
+    // string here would hit SQLite's own "near $Process_Hourly: syntax
     // error" before the authorizer ever ran.
     auto ctrl_sql = validate_and_translate_sql("SELECT COUNT(*) FROM $Process_Hourly");
     REQUIRE(ctrl_sql.has_value());
@@ -789,7 +789,6 @@ TEST_CASE("EchoDatabase: stats returns correct values", "[echo][store][stats]") 
     CHECK(s.oldest_timestamp == 7200);  // bucket starts, not event times
     CHECK(s.newest_timestamp == 10800);
     CHECK(s.db_size_bytes > 0);
-    CHECK(s.retention_days == 7); // default
 }
 
 // =============================================================================
@@ -816,11 +815,10 @@ TEST_CASE("EchoDatabase: config set and get", "[echo][store][config]") {
     CHECK(val == "updated_value");
 }
 
-TEST_CASE("EchoDatabase: default retention_days is 7", "[echo][store][config]") {
+TEST_CASE("EchoDatabase: a fresh database stores no retention_days setting", "[echo][store][config]") {
     auto t = make_test_db();
 
-    auto val = t.db.get_config("retention_days");
-    CHECK(val == "7");
+    CHECK(t.db.get_config("retention_days", "absent") == "absent");
 }
 
 // =============================================================================
@@ -948,6 +946,7 @@ TEST_CASE("execute_user_query: UNION across two allowlisted tables is permitted"
 TEST_CASE("execute_user_query: write statements are denied by the read-only sandbox",
           "[echo][store][sandbox][security]") {
     auto t = make_test_db();
+    REQUIRE(t.db.set_config("sandbox_probe", "7"));
     // These bypass validate_and_translate_sql entirely — the read-only handle and
     // authorizer are the layer under test.
     CHECK_FALSE(t.db.execute_user_query("INSERT INTO echo_config VALUES('k','v')").has_value());
@@ -955,7 +954,7 @@ TEST_CASE("execute_user_query: write statements are denied by the read-only sand
     CHECK_FALSE(t.db.execute_user_query("DELETE FROM echo_config").has_value());
     CHECK_FALSE(t.db.execute_user_query("DROP TABLE echo_config").has_value());
     // The store is untouched.
-    CHECK(t.db.get_config("retention_days") == "7");
+    CHECK(t.db.get_config("sandbox_probe") == "7");
 }
 
 TEST_CASE("execute_user_query: ATTACH / PRAGMA / schema table are denied",
@@ -983,30 +982,41 @@ TEST_CASE("execute_user_query: trailing statement is rejected at prepare",
 // ── validate_and_translate_sql — divergence fix (#631) + existing guards ──────
 
 TEST_CASE("validate_and_translate_sql: $name in code is translated", "[echo][sql][validate]") {
-    auto r = validate_and_translate_sql("SELECT * FROM $Process_Live");
+    auto r = validate_and_translate_sql("SELECT * FROM $Process_Hourly");
     REQUIRE(r.has_value());
-    CHECK(r->find("process_live") != std::string::npos);
-    CHECK(r->find("$Process_Live") == std::string::npos);
+    CHECK(r->find("process_hourly") != std::string::npos);
+    CHECK(r->find("$Process_Hourly") == std::string::npos);
 }
 
 TEST_CASE("validate_and_translate_sql: $name inside a string literal is NOT translated (#631)",
           "[echo][sql][validate][security]") {
     // The placeholder is data, not a table reference: it must survive verbatim so
     // the executed query equals the one that was validated.
-    auto r = validate_and_translate_sql("SELECT '$Process_Live' AS label");
+    auto r = validate_and_translate_sql("SELECT '$Process_Hourly' AS label");
     REQUIRE(r.has_value());
-    CHECK(r->find("$Process_Live") != std::string::npos);
-    CHECK(r->find("process_live") == std::string::npos);
+    CHECK(r->find("$Process_Hourly") != std::string::npos);
+    CHECK(r->find("process_hourly") == std::string::npos);
 }
 
 TEST_CASE("validate_and_translate_sql: unknown $name is rejected", "[echo][sql][validate]") {
     CHECK_FALSE(validate_and_translate_sql("SELECT * FROM $Made_Up").has_value());
 }
 
+TEST_CASE("validate_and_translate_sql: a retired $<Source>_Live name is an unknown table",
+          "[echo][sql][validate]") {
+    // The sixteen raw capture tables are gone, and so are their names: no view stands in for them.
+    for (const char* name : {"$Process_Live", "$TCP_Live", "$Registry_Live", "$Perf_Live"}) {
+        INFO(name);
+        const auto r = validate_and_translate_sql(std::string{"SELECT * FROM "} + name);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == std::string{"unknown table: "} + name);
+    }
+}
+
 TEST_CASE("validate_and_translate_sql: non-SELECT, multi-statement, oversize rejected",
           "[echo][sql][validate][security]") {
-    CHECK_FALSE(validate_and_translate_sql("DELETE FROM $Process_Live").has_value());
-    CHECK_FALSE(validate_and_translate_sql("SELECT * FROM $Process_Live; DROP TABLE echo_config")
+    CHECK_FALSE(validate_and_translate_sql("DELETE FROM $Process_Hourly").has_value());
+    CHECK_FALSE(validate_and_translate_sql("SELECT * FROM $Process_Hourly; DROP TABLE echo_config")
                     .has_value());
     CHECK_FALSE(validate_and_translate_sql(std::string(5000, 'A')).has_value());
 }
@@ -1015,28 +1025,28 @@ TEST_CASE("validate_and_translate_sql: non-SELECT, multi-statement, oversize rej
 
 TEST_CASE("validate_and_translate_sql: $name in a line comment is not translated",
           "[echo][sql][validate][security]") {
-    auto r = validate_and_translate_sql("SELECT 1 -- $Process_Live");
+    auto r = validate_and_translate_sql("SELECT 1 -- $Process_Hourly");
     REQUIRE(r.has_value());
-    CHECK(r->find("$Process_Live") != std::string::npos);
-    CHECK(r->find("process_live") == std::string::npos);
+    CHECK(r->find("$Process_Hourly") != std::string::npos);
+    CHECK(r->find("process_hourly") == std::string::npos);
 }
 
 TEST_CASE("validate_and_translate_sql: $name in a block comment is not translated",
           "[echo][sql][validate][security]") {
-    auto r = validate_and_translate_sql("SELECT /* $Process_Live */ 1");
+    auto r = validate_and_translate_sql("SELECT /* $Process_Hourly */ 1");
     REQUIRE(r.has_value());
-    CHECK(r->find("$Process_Live") != std::string::npos);
-    CHECK(r->find("process_live") == std::string::npos);
+    CHECK(r->find("$Process_Hourly") != std::string::npos);
+    CHECK(r->find("process_hourly") == std::string::npos);
 }
 
 TEST_CASE("validate_and_translate_sql: $name beside an escaped quote is not translated",
           "[echo][sql][validate][security]") {
     // '' is an escaped single quote inside the literal; the whole token is a
-    // string, so $Process_Live within it must survive verbatim.
-    auto r = validate_and_translate_sql("SELECT '$Process_Live''s data' AS x");
+    // string, so $Process_Hourly within it must survive verbatim.
+    auto r = validate_and_translate_sql("SELECT '$Process_Hourly''s data' AS x");
     REQUIRE(r.has_value());
-    CHECK(r->find("$Process_Live") != std::string::npos);
-    CHECK(r->find("process_live") == std::string::npos);
+    CHECK(r->find("$Process_Hourly") != std::string::npos);
+    CHECK(r->find("process_hourly") == std::string::npos);
 }
 
 TEST_CASE("execute_user_query: pragma_table_info table-valued function is denied",
@@ -2067,13 +2077,13 @@ void write_hot_journal(const fs::path& victim, const fs::path& evil, const fs::p
               static_cast<std::streamsize>(records.size()));
 }
 
-// Leaves a CLOSED echo.db at `db` (retention_days = "7") with a hot rollback journal beside it
-// that would rewrite retention_days to "EVIL". `db`'s directory must exist.
+// Leaves a CLOSED echo.db at `db` (journal_probe = "7") with a hot rollback journal beside it
+// that would rewrite journal_probe to "EVIL". `db`'s directory must exist.
 void plant_evil_journal(const fs::path& db) {
     {
         auto created = EchoDatabase::open(db);
         REQUIRE(created.has_value());
-        REQUIRE(created->set_config("retention_days", "7"));
+        REQUIRE(created->set_config("journal_probe", "7"));
     } // closed: the WAL is empty, so the main file holds everything
     const fs::path evil = db.parent_path() / "evil.db";
     fs::copy_file(db, evil, fs::copy_options::overwrite_existing);
@@ -2081,7 +2091,7 @@ void plant_evil_journal(const fs::path& db) {
         yuzu::test::SqliteHandleOwner<sqlite3> owner;
         REQUIRE(sqlite3_open(evil.string().c_str(), &owner.db) == SQLITE_OK);
         REQUIRE(sqlite3_exec(owner.db,
-                             "UPDATE echo_config SET value = 'EVIL' WHERE key = 'retention_days';"
+                             "UPDATE echo_config SET value = 'EVIL' WHERE key = 'journal_probe';"
                              "PRAGMA wal_checkpoint(TRUNCATE);",
                              nullptr, nullptr, nullptr) == SQLITE_OK);
     }
@@ -2103,7 +2113,7 @@ TEST_CASE("EchoDatabase: a hot rollback journal beside echo.db is replayed by op
 
     auto reopened = EchoDatabase::open(db);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->get_config("retention_days", "") == "EVIL");
+    CHECK(reopened->get_config("journal_probe", "") == "EVIL");
 }
 
 // The journal is one of the four files SQLite reads for a database, so quarantine moves it with
@@ -2135,7 +2145,7 @@ TEST_CASE("EchoDatabase: a corrupt echo.db's rollback journal is quarantined wit
     auto reopened = EchoDatabase::open(db);
     REQUIRE(reopened.has_value());
     REQUIRE(reopened->quarantined_this_open().has_value());
-    CHECK(reopened->get_config("retention_days", "") != "EVIL");
+    CHECK(reopened->get_config("journal_probe", "") != "EVIL");
 
     // The journal sits beside the quarantine, byte for byte, and not beside the fresh database.
     const std::string prefix = db.filename().string() + ".corrupt-";
@@ -2517,7 +2527,7 @@ TEST_CASE("EchoDatabase (Windows): a foreign-owned hot journal is replaced, not 
 
     auto reopened = EchoDatabase::open(d.db);
     REQUIRE(reopened.has_value());
-    CHECK(reopened->get_config("retention_days", "") == "7"); // not "EVIL"
+    CHECK(reopened->get_config("journal_probe", "") == "7"); // not "EVIL"
     CHECK(fs::file_size(journal) == 0); // swapped for the protected empty one, which is inert
     const std::string owner = owner_sid(journal);
     CHECK((owner == token_user_sid() || owner == kSystem || owner == kAdministrators));
@@ -3324,8 +3334,8 @@ TEST_CASE("EchoDatabase v7: a failed v8 step blocks the roll-up step and leaves 
 namespace {
 
 // Denies the Nth read of echo_config.value on the FIRST connection a later EchoDatabase::open()
-// creates. Inside open() that connection's reads of the column are, in order: the retention_days
-// probe (1), then the schema_version read (2) that decides whether the version needs writing.
+// creates. Inside open() that connection's first read of the column is the schema_version read
+// (1) that decides whether the version needs writing.
 // A SQLITE_DENY at prepare time makes get_config fall to its default, which is a failed read.
 std::atomic<int> g_value_reads{0};
 std::atomic<int> g_deny_value_read{-1};
@@ -3397,7 +3407,7 @@ TEST_CASE("EchoDatabase: one failed schema_version read at open does not replay 
         const AutoExtensionGuard hook;
         g_value_reads = 0;
         g_denied = false;
-        g_deny_value_read = 2;
+        g_deny_value_read = 1;
         g_instrument_next = true;
         auto db = EchoDatabase::open(tmp);
         g_deny_value_read = -1;
@@ -3526,6 +3536,14 @@ struct ScratchDir {
     [[nodiscard]] const fs::path& path() const { return dir.path; }
 };
 
+// Write the adoption-intent marker exactly as an interrupted adoption would have left it: the
+// current size and mtime of tar.db.
+void write_adoption_marker(const fs::path& dir) {
+    const auto fp = yuzu::agent::detail::legacy_echo_fingerprint(dir / "tar.db");
+    REQUIRE(fp.has_value());
+    spit_file(dir / "echo.db.adopting", *fp);
+}
+
 } // namespace
 
 TEST_CASE("adopt_legacy_echo_db: a crash-shaped tar.db + un-checkpointed WAL opens as echo.db",
@@ -3559,9 +3577,11 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store
     SECTION("sidecar already moved, main file not") {
         ScratchDir d;
         make_legacy_tar_db_with_wal(d.path());
+        write_adoption_marker(d.path()); // what the interrupted run wrote before its first move
         fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal");
         REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
         CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+        CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting")); // spent once the main file moved
         auto db = EchoDatabase::open(d.path() / "echo.db");
         REQUIRE(db.has_value());
         CHECK(db->get_config("wal_marker", "") == "x");
@@ -3576,6 +3596,149 @@ TEST_CASE("adopt_legacy_echo_db: an interrupted adoption resumes", "[echo][store
         CHECK(slurp_file(d.path() / "echo.db") == before);
         CHECK(slurp_file(d.path() / "echo.db-wal") == wal_before);
     }
+}
+
+TEST_CASE("adopt_legacy_echo_db: the adoption marker is written before the first sidecar move "
+          "and survives an interruption",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    // -wal moves (so the marker must already exist), then -shm collides and adoption stops.
+    spit_file(d.path() / "tar.db-shm", "legacy shm");
+    spit_file(d.path() / "echo.db-shm", "foreign shm");
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(fs::exists(d.path() / "echo.db-wal"));       // the first move happened
+    CHECK(fs::exists(d.path() / "echo.db.adopting"));  // and the marker preceded it
+    CHECK(slurp_file(d.path() / "echo.db.adopting") ==
+          *yuzu::agent::detail::legacy_echo_fingerprint(d.path() / "tar.db"));
+
+    // The documented remedy resumes under the surviving marker and spends it.
+    fs::remove(d.path() / "echo.db-shm");
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: an echo.db sidecar beside tar.db without the marker refuses",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db(d.path());
+    spit_file(d.path() / "echo.db-wal", "a log of unknown origin");
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("tar.db") != std::string::npos);
+    CHECK(adopted.error().find("echo.db-wal") != std::string::npos);
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+    CHECK(slurp_file(d.path() / "echo.db-wal") == "a log of unknown origin");
+}
+
+TEST_CASE("adopt_legacy_echo_db: an older agent running between interruption and resume is "
+          "refused and never replayed over",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    // Back-date tar.db so the older agent's write below is distinguishable by mtime on any
+    // filesystem timestamp granularity.
+    fs::last_write_time(d.path() / "tar.db",
+                        fs::last_write_time(d.path() / "tar.db") - std::chrono::hours(1));
+    // Steps 1-2: the marker and the WAL move happen, the power fails before the main rename.
+    write_adoption_marker(d.path());
+    fs::rename(d.path() / "tar.db-wal", d.path() / "echo.db-wal");
+    const auto stale_wal = slurp_file(d.path() / "echo.db-wal");
+    // Step 3: an older agent opens tar.db, writes, and closes cleanly (checkpoint, WAL deleted).
+    {
+        SqliteOwner o;
+        REQUIRE(sqlite3_open((d.path() / "tar.db").string().c_str(), &o.db) == SQLITE_OK);
+        exec_sql(o.db, "PRAGMA journal_mode=WAL");
+        exec_sql(o.db, "INSERT INTO tar_config(key, value) VALUES ('newer', 'yes')");
+    }
+    REQUIRE_FALSE(fs::exists(d.path() / "tar.db-wal"));
+    const auto newer_main = slurp_file(d.path() / "tar.db");
+
+    // Step 4: the re-upgrade must not pair the newer tar.db with the older log.
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("echo.db-wal") != std::string::npos);
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+    CHECK(slurp_file(d.path() / "tar.db") == newer_main);
+    CHECK(slurp_file(d.path() / "echo.db-wal") == stale_wal);
+
+    auto refused = EchoDatabase::open(d.path() / "echo.db");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("not adopted - refusing") != std::string::npos);
+}
+
+TEST_CASE("adopt_legacy_echo_db: an oversized marker reads as a mismatch and refuses",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db(d.path());
+    spit_file(d.path() / "echo.db-wal", "a log of unknown origin");
+    spit_file(d.path() / "echo.db.adopting", std::string(300, 'x'));
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("records a different") != std::string::npos);
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: a stale marker with no echo.db sidecar is rewritten before the "
+          "first move",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    // A marker from an earlier, fully undone attempt (no echo.db sidecar is left) records a
+    // tar.db that no longer exists in that shape: it must not be trusted as this adoption's own.
+    spit_file(d.path() / "echo.db.adopting", "1 2\n");
+    // -wal moves, then -shm collides: the interrupted state shows which marker preceded the move.
+    spit_file(d.path() / "tar.db-shm", "legacy shm");
+    spit_file(d.path() / "echo.db-shm", "foreign shm");
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(fs::exists(d.path() / "echo.db-wal"));
+    CHECK(slurp_file(d.path() / "echo.db.adopting") ==
+          *yuzu::agent::detail::legacy_echo_fingerprint(d.path() / "tar.db"));
+
+    fs::remove(d.path() / "echo.db-shm");
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    CHECK_FALSE(fs::exists(d.path() / "tar.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: a marker that cannot be written refuses before anything moves",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    make_legacy_tar_db_with_wal(d.path());
+    const auto wal = slurp_file(d.path() / "tar.db-wal");
+    // A directory at the marker path: the atomic writer cannot rename its temp file over it.
+    REQUIRE(fs::create_directory(d.path() / "echo.db.adopting"));
+
+    auto adopted = yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db");
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error().find("cannot record the adoption marker") != std::string::npos);
+    CHECK(fs::exists(d.path() / "tar.db"));
+    CHECK(slurp_file(d.path() / "tar.db-wal") == wal);
+    CHECK_FALSE(fs::exists(d.path() / "echo.db"));
+    CHECK_FALSE(fs::exists(d.path() / "echo.db-wal"));
+    CHECK(fs::is_directory(d.path() / "echo.db.adopting"));
+}
+
+TEST_CASE("adopt_legacy_echo_db: a spent marker left behind without a tar.db is deleted at boot",
+          "[echo][store][adopt]") {
+    ScratchDir d;
+    {
+        auto db = EchoDatabase::open(d.path() / "echo.db");
+        REQUIRE(db.has_value());
+    }
+    spit_file(d.path() / "echo.db.adopting", "12345 67890\n");
+    REQUIRE(yuzu::agent::adopt_legacy_echo_db(d.path() / "echo.db").has_value());
+    CHECK_FALSE(fs::exists(d.path() / "echo.db.adopting"));
+    CHECK(fs::exists(d.path() / "echo.db"));
 }
 
 TEST_CASE("adopt_legacy_echo_db: a leftover legacy sidecar without a tar.db is warned about and left",
@@ -5225,7 +5388,7 @@ TEST_CASE("EchoDatabase: an interrupted conversion VACUUM leaves the file intact
     REQUIRE(integrity.has_value());
     REQUIRE(integrity->rows.size() == 1);
     CHECK(integrity->rows[0][0] == "ok");
-    CHECK(db.get_config("retention_days", "") == "7");
+    CHECK(db.get_config("schema_version", "") == "10");
 
     // And the interruption is not sticky: the next attempt converts.
     REQUIRE(db.vacuum_to_incremental());
@@ -5261,7 +5424,7 @@ TEST_CASE("EchoDatabase: a pre-auto_vacuum database converts with one VACUUM",
         CHECK(after.auto_vacuum == 2);
         CHECK(after.freelist_count == 0);
         CHECK(after.page_count < before.page_count);
-        CHECK(db.get_config("retention_days", "") == "7"); // data survived the rebuild
+        CHECK(db.get_config("schema_version", "") == "10"); // data survived the rebuild
 
         // Hygiene calls on a healthy database.
         db.incremental_vacuum(256);

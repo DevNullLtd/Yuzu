@@ -51,6 +51,11 @@ constexpr int kListRowCap = 100000;
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// A failed read of the v2 per-section statements (the section status SELECT or a per-kind row
+// SELECT) after - or, for the standalone `get_device_ci_sections`, instead of - the record read:
+// kept apart from `query_error` (the record read failed) because the two are answered differently
+// (REST 503 / MCP retryable error versus `ci: null`, HTTP 200) and fixed differently.
+constexpr const char* kReasonSectionsQueryError = "sections_query_error";
 // Sample the per-site degrade WARN (leading edge of an episode, then every Nth)
 // so a sustained PG outage during a roster poll cannot flood the log — the counter
 // is the continuous signal, the log a sampled breadcrumb. Values match the
@@ -189,13 +194,16 @@ constexpr const char* kMigrationV2Sql =
 // row written before v3 (unknown) - both read exactly as before (never verified). Nullable with
 // no default and no CHECK: the ALTERs are metadata-only and cannot fail on existing rows.
 // v3 is unreleased, so the digest column is folded into it rather than adding a v4. The ADDs are
-// IF NOT EXISTS so a re-run is harmless, BUT the runner is gated on the recorded version number
-// only (no checksum): a database that already recorded the earlier row_count-only v3 will NOT run
-// this again and lacks content_digest. The constructor's projection check then refuses to open the
-// store (and server.cpp refuses to start the server) with a log line naming device_ci_section. The
-// reset for such a dev/UAT database is in docs/user-manual/upgrading.md ("the server refuses to
-// start on a device inventory schema it cannot read"): UPDATE public.schema_meta SET version = 2
-// WHERE store = 'device_inventory_store', then restart.
+// IF NOT EXISTS so a re-run is harmless, BUT the runner will not run an applied version again: a
+// database that already recorded the earlier row_count-only v3 lacks content_digest. Since #7158
+// the runner's recorded-hash check refuses first when that database recorded the old text AFTER
+// public.yuzu_schema_migrations existed (the log line names the store and v3); a database that
+// applied the old v3 BEFORE the table existed was recorded as first seen with this build's text,
+// so the constructor's projection check refuses it instead, with a log line naming
+// device_ci_section. Either way server.cpp refuses to start the server. The reset for such a
+// dev/UAT database is in docs/user-manual/upgrading.md ("the server refuses to start on a device
+// inventory schema it cannot read"): UPDATE public.schema_meta SET version = 2 WHERE store =
+// 'device_inventory_store', then restart (the re-applied v3 overwrites its recorded hash).
 // Unqualified DDL - the runner sets search_path to the store schema.
 constexpr const char* kMigrationV3Sql =
     "ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, "
@@ -586,7 +594,8 @@ InventoryIngestOutcome DeviceInventoryStore::apply_device_ci(std::string_view ag
             const std::size_t ncol = cols.size();
             // Computed from exactly what is about to be stored (short rows pad, long rows
             // truncate to the registry's columns - the same rule the INSERT applies below).
-            const auto digest = section_content_digest(def, sec.rows);
+            const auto digest =
+                section_content_digest(def, sec.rows, digest_fn_ ? digest_fn_ : &sha256_hex);
             if (!digest) {
                 const bool failed = fail("digest");
                 fail_err = "digest_provider_failed"; // no libpq statement failed: name the cause
@@ -850,7 +859,7 @@ DeviceInventoryStore::get_device_ci_sections(std::string_view agent_id) {
     if (!ok) {
         // Never an empty success on a failed read: a degrade the caller can surface.
         static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+        if (note_read_degrade(metrics_, kReasonSectionsQueryError, s).should_log)
             spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
                          pool_.last_error());
         return std::unexpected(CiReadError::kDegraded);
@@ -923,7 +932,7 @@ DeviceInventoryStore::get_device_ci_with_sections(std::string_view agent_id) {
         // The record read answered; only a section statement failed. Say so - never an
         // empty-sections success - and keep the record the caller may still need.
         static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+        if (note_read_degrade(metrics_, kReasonSectionsQueryError, s).should_log)
             spdlog::warn("DeviceInventoryStore: sections get failed for agent={} ({})", agent_id,
                          pool_.last_error());
         result.record->sections.clear();

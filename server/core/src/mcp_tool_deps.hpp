@@ -12,19 +12,30 @@
 // is the failure docs/api-twin-recipe.md section 1 exists to prevent.
 //
 // ToolDeps holds provider closures and no store instance. The closures are not
-// all reads: audit_fn writes audit rows, `crypto_set_dashboard_layout_fn` writes the
-// CALLER'S OWN /crypto dashboard layout, and the others compose read-only views. A
-// write-capable closure is admitted only when ALL of these hold (the criterion every
-// later family's mutating closure is held to): it is a pure forward of the very same
-// *Api method the REST twin calls, so the two cannot drift; the gate stays central (the
+// all reads: audit_fn and audit_as_session_fn write audit rows,
+// `crypto_set_dashboard_layout_fn` writes the CALLER'S OWN /crypto dashboard layout,
+// `dex_score_policy_apply_fn` writes the fleet-wide DEX score policy, and the others
+// compose read-only views. A
+// write-capable closure is admitted only when it is a pure forward of the very same
+// code the REST twin calls (so the two cannot drift), the gate stays central (the
 // record's securable / operation / ServiceScopeClass drive the generic tier and C8
-// checks, and the closure never re-decides it); and its handler writes its "attempted"
-// audit row BEFORE calling it and refuses to run without an audit sink ("no audit row,
-// no mutation"). Nothing else here dispatches, pushes a tag or mutates a store.
+// checks, and the closure never re-decides it), and the pre-mutation "attempted" audit
+// row is guaranteed. Two shapes meet that:
+//   (i)  a pure forward of the REST twin's `*Api` method, where the HANDLER writes its
+//        "attempted" audit row BEFORE calling the closure and refuses to run without an
+//        audit sink ("no audit row, no mutation");
+//   (ii) a pure forward of the REST twin's shared audit-first apply function (today
+//        `apply_dex_score_policy`), which itself writes "attempted" before touching the
+//        store and fails closed when that row is refused. The audit sink is injected per
+//        request by the handler, which refuses to call the closure without one. The dex
+//        closure is this shape, not literally (i): the guarantee is kept, the handler is
+//        just not the one writing the row.
+// Either way there is one write path and one audit-row shape shared with REST. Nothing
+// else here dispatches, pushes a tag or mutates a store.
 //
 // What a handler must not reach: any store, AgentRegistry, AuthDB, RbacStore, an
-// McpServer member, or any write-capable callable beyond audit_fn and a closure
-// admitted under that criterion. The
+// McpServer member, or any write-capable callable beyond audit_fn, audit_as_session_fn and
+// a closure admitted under that criterion. The
 // file-level half of that rule is a lexical test (test_mcp_dispatch_coverage.cpp):
 // an mcp_tools_*.cpp includes none of *_store.hpp, agent_registry.hpp,
 // mcp_server.hpp, auth_db* or pg/. That test checks DIRECT includes only; a
@@ -41,18 +52,22 @@
 // it; a handler must null-check `ctx.deps` and each closure it uses and answer
 // an internal error rather than an empty result.
 //
-// The type aliases are pinned to their HardwareRoutes / McpServer twins by
-// static_assert in mcp_server.cpp, so a signature change on either side is a
-// build failure, not a silent copy that drifted.
+// The type aliases are pinned to their HardwareRoutes / McpServer / AuthRoutes
+// twins by static_assert in mcp_server.cpp, so a signature change on either side
+// is a build failure, not a silent copy that drifted. The one alias with no twin
+// to pin is SessionFn: it is wired from the member function
+// `AuthRoutes::resolve_session`, which has no alias of its own.
 
 #include "authz_gates.hpp"        // authz::FleetReadGate
 #include "crypto_api.hpp"         // CryptoApi's query / result types (the abstract seam, no store)
 #include "crypto_widget_catalogue.hpp" // crypto_widgets::Access / WidgetGate
+#include "dex_score_policy_writer.hpp"  // DexScorePolicyProvider::ReadFn, the write request / result / audit hook
 #include "hardware_list_model.hpp" // HardwareCiDetail
 #include "inventory_types.hpp"    // InventoryDevicesResult
 #include "quarantine_visible.hpp" // QuarantineListFn
 
 #include <httplib.h>
+#include <yuzu/server/auth.hpp> // auth::Session (the session a session-bound audit writer stamps)
 
 #include <cstdint>
 #include <expected>
@@ -77,7 +92,7 @@ struct ToolDeps {
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
     using RosterFn = std::function<InventoryDevicesResult()>;
-    using CiDetailFn = std::function<HardwareCiDetail(const std::string& agent_id, bool with_sections)>;
+    using CiDetailFn = std::function<HardwareCiDetail(const std::string& agent_id, CiRead read)>;
     using DexScoreFn = std::function<int(const std::string& agent_id)>;
 
     FleetReadFn fleet_read_fn;
@@ -125,6 +140,35 @@ struct ToolDeps {
     CryptoSetLayoutFn crypto_set_dashboard_layout_fn;
     CryptoAccessFn crypto_access_fn;
     UsernameFn username_fn;
+
+    // ── DEX score policy (mcp_tools_dex.cpp) ────────────────────────────────────────────
+    // The OBSERVED store text (what GET /api/v1/dex/score-policy serves) and the ONE write
+    // path (apply_dex_score_policy) with the REST route's store closures, provider and clock
+    // already bound; only the per-request audit sink is passed in. Both are EMPTY when the
+    // deployment has no runtime-config store, and a handler then answers an internal error.
+    using DexScorePolicyReadFn = DexScorePolicyProvider::ReadFn;
+    using DexScorePolicyAuditFn = decltype(DexScorePolicyWriteDeps::audit);
+    using DexScorePolicyApplyFn = std::function<DexScorePolicyWriteResult(
+        const DexScorePolicyWriteRequest&, DexScorePolicyAuditFn)>;
+    DexScorePolicyReadFn dex_score_policy_read_fn;
+    DexScorePolicyApplyFn dex_score_policy_apply_fn;
+    // The caller's session, resolved ONCE per write, and the session-bound audit writer the
+    // domain rows go through (`AuthRoutes::audit_as_session_fn()`, the same std::function type
+    // as `RestApiV1::AuditAsSessionFn`): REST binds every row to the session its route resolved
+    // (#6065 PR-Q), so a credential that lapses mid-request cannot leave a row naming no one
+    // while the write proceeds. `audit_fn` above re-resolves the caller per row.
+    // A handler passes ONLY the session session_fn returned to audit_as_session_fn; the writer
+    // stamps whatever session it is given.
+    // AuditAsSessionFn is pinned to `AuthRoutes::AuditAsSessionFn` by static_assert in
+    // mcp_server.cpp; SessionFn is wired from `AuthRoutes::resolve_session` (a member function,
+    // so there is no alias to pin it to).
+    using SessionFn = std::function<std::optional<auth::Session>(const httplib::Request&)>;
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id, const std::string& detail)>;
+    SessionFn session_fn;
+    AuditAsSessionFn audit_as_session_fn;
 };
 
 } // namespace yuzu::server::mcp

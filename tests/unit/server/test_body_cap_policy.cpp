@@ -20,6 +20,7 @@
 
 #include "body_cap_httplib.hpp"
 #include "body_cap_policy.hpp"
+#include "dex_score_policy_form.hpp"
 #include "post_read_stage_test_support.hpp"
 #include "raw_close_probe.hpp"
 #include "test_loopback_http.hpp"
@@ -36,6 +37,7 @@
 #include <atomic>
 #include <charconv>
 #include <cstddef>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -213,6 +215,12 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/dex/score-policy",                             320u * 1024, true,  "dex_score_policy"},
     {"DELETE", "/api/v1/dex/score-policy",                             320u * 1024, true,  "dex_score_policy"},
     {"PUT",    "/api/v1/dex/score-policyx",                            4u * 1024 * 1024, false, "default"},
+    // body_cap_policy.hpp dex_score_policy_form row: the DEX Scoring tab's three form POSTs
+    // (the whole policy as a urlencoded form). ANY method, measurable; segment boundary probed.
+    {"POST",   "/api/settings/dex-scoring/save",                       512u * 1024, true,  "dex_score_policy_form"},
+    {"POST",   "/api/settings/dex-scoring/preview",                    512u * 1024, true,  "dex_score_policy_form"},
+    {"POST",   "/api/settings/dex-scoring/reset",                      512u * 1024, true,  "dex_score_policy_form"},
+    {"POST",   "/api/settings/dex-scoringx/save",                      4u * 1024 * 1024, false, "default"},
     // body_cap_policy.hpp crypto row - the /crypto REST v1 subtree; PUT dashboard/layout is the
     // only body-bearing route (crypto_widget_catalogue.hpp kLayoutBodyMaxBytes). ANY method.
     {"PUT",    "/api/v1/crypto/dashboard/layout",                      16u * 1024, false, "crypto"},
@@ -285,6 +293,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "guardian_policy_generation",
     "users",
     "dex_score_policy",
+    "dex_score_policy_form",
     "crypto",
     "config",
     "crypto_revocation_sources",
@@ -446,12 +455,101 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // guardian_policy_generation(1: the Guardian policy-generation raise) +
     // users(1: the /api/v1/users subtree, #5342 password routes) +
     // dex_score_policy(1: the DEX score policy document) +
+    // dex_score_policy_form(1: the DEX Scoring tab's form POSTs) +
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // config(1: the /api/v1/config subtree, the runtime-config PUT) +
     // crypto_revocation_sources(1: ADR-0070 R1 registered CRL sources, 192 KiB) +
     // software_curation(1: the curation subtree) + software_alias_pack(1: the pack CSV) +
     // software_collection_settings(1: the collection settings subtree) + default(1).
-    CHECK(std::size(kBodyCapTable) == 41);
+    CHECK(std::size(kBodyCapTable) == 42);
+}
+
+// The dex_score_policy_form row is derived from the document's own limits (body_cap_policy.hpp),
+// not guessed: rebuild the largest form the Scoring tab can submit and pin it under the cap.
+TEST_CASE("resolve_body_cap: the largest legitimate Scoring form fits under its row",
+          "[body_cap][dex]") {
+    using namespace yuzu::server;
+    // Percent-encode everything outside the RFC 3986 unreserved set, brackets and '#' included:
+    // an upper bound on what any browser sends.
+    const auto encode = [](const std::string& s) {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        std::string out;
+        for (const unsigned char c : s) {
+            const bool plain = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                               (c >= 'a' && c <= 'z') || c == '-' || c == '.' || c == '_' ||
+                               c == '~';
+            if (plain) {
+                out += static_cast<char>(c);
+            } else {
+                out += '%';
+                out += kHex[c >> 4];
+                out += kHex[c & 15];
+            }
+        }
+        return out;
+    };
+    const std::string name(kDexPolicyMaxNameBytes, '#');
+    const double long_a = 0.1 + 0.2, long_b = 0.7 + 0.1, long_c = 1.1 + 2.2; // 17 digits each
+    const double full = std::nextafter(1000.0, 0.0), start = std::nextafter(1.0, 2.0);
+
+    DexScorePolicy p;
+    p.tiers.names = {name, name, name, name};
+    p.weights = {long_a, long_b, long_c, long_a};
+    p.model = {1000, full, start};
+    p.interval_confidence = std::nextafter(0.999, 0.0);
+    for (std::size_t i = 0; i < kDexPolicyMaxOverrides; ++i) {
+        DexScoreOverride o;
+        // The longest key, every byte one that encodes to three; the first four bytes spell the
+        // row number in base 4 so the 200 keys stay distinct (a duplicate is not a valid policy).
+        o.image = std::string(kDexPolicyMaxKeyBytes, '#');
+        for (std::size_t d = 0, n = i; d < 4; ++d, n /= 4)
+            o.image[d] = "#%!$"[n % 4];
+        o.excellent = 90.5;
+        o.good = 80.5;
+        o.fair = 70.5;
+        o.names = {name, name, name, name};
+        o.breadth = long_a;
+        o.crashes = long_b;
+        o.hangs = long_c;
+        o.regression = long_a;
+        o.per_device_event_cap = 1000;
+        o.regression_full_ratio = full;
+        o.regression_start_ratio = start;
+        p.overrides.push_back(std::move(o));
+    }
+    REQUIRE_FALSE(dex_score_policy_fault(p)); // the worst case is a document the validator accepts
+
+    auto v = dex_form_values(p); // every field of every row set
+    v["if_match"] = std::string(16, 'f');
+
+    // The same map, as the wire carries it (no Remove ticked), must get through the form parser and
+    // the document builder whole: a legitimate maximal form is never refused by the pair cap or the
+    // index cap, and the document it builds is the policy it was made from.
+    {
+        std::string wire;
+        for (const auto& [k, val] : v)
+            wire += encode(k) + "=" + encode(val) + "&";
+        const auto pairs = dex_form_pairs(wire);
+        CHECK(pairs.size() <= kDexFormMaxPairs);
+        const auto doc = dex_form_to_document(pairs);
+        REQUIRE(doc);
+        CHECK(doc->row_of_override.size() == kDexPolicyMaxOverrides);
+        const auto parsed = dex_score_policy_validate_text(doc->text);
+        REQUIRE(parsed);
+        CHECK(dex_score_policy_canonical(*parsed) == dex_score_policy_canonical(p));
+    }
+
+    for (std::size_t i = 0; i < p.overrides.size(); ++i)
+        v["overrides[" + std::to_string(i) + "].remove"] = "on"; // a ticked Remove box submits too
+    std::size_t bytes = 0;
+    for (const auto& [k, val] : v)
+        bytes += encode(k).size() + 1 + encode(val).size() + 1; // "k=v&"
+
+    // Over the REST row's 320 KiB, so the row cannot quietly shrink back; under its own cap.
+    CHECK(bytes > 320u * 1024);
+    CHECK(bytes <= resolve_body_cap("POST", "/api/settings/dex-scoring/save").max_body_bytes);
+    CHECK(bytes <= resolve_body_cap("POST", "/api/settings/dex-scoring/preview").max_body_bytes);
+    CHECK(bytes <= resolve_body_cap("POST", "/api/settings/dex-scoring/reset").max_body_bytes);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
@@ -462,7 +560,7 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
 // regression on the upload_session opt-in would have shipped with this
 // test green.
 TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_session and "
-         "hardware and dex_score_policy and OFF for every other named class",
+         "hardware and dex_score_policy and dex_score_policy_form and OFF for every other named class",
          "[body_cap]") {
     CHECK(resolve_body_cap("POST", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
@@ -473,6 +571,7 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_sess
     CHECK(resolve_body_cap("GET", "/api/v1/hardware").requires_measurable);
     CHECK(resolve_body_cap("PUT", "/api/v1/dex/score-policy").requires_measurable);
     CHECK(resolve_body_cap("GET", "/api/v1/dex/score-policy").requires_measurable);
+    CHECK(resolve_body_cap("POST", "/api/settings/dex-scoring/save").requires_measurable);
 
     // Public REST (bundles), SCIM, certificate import (REST + dashboard),
     // product-pack/workflow authoring, OTA upload, and plugin-config all

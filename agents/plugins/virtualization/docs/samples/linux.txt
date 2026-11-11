@@ -1,7 +1,19 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-06 · euid 0 · leg-hash d3f729438b24
+captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-11 · euid 104 · leg-hash aec6e0e7930c
 == action=host
 status|host|supported|-
 host|yes|guest|hyperv|-|cpuid|high
 container|no|linux:no_container_marker
+[result_status] OK / FULL / 
+
+== action=wsl
+status|wsl|unsupported|linux:virtualization:wsl:unsupported
+[result_status] UNAVAILABLE / UNKNOWN / linux:virtualization:wsl:unsupported
+
+== action=runtime_posture
+status|runtime_posture|supported|-
+endpoint|unset|-|-
+runtime|docker|detected|present:0660:0:108|absent|-|-
+runtime|podman|not_detected|absent|absent|-|-
+runtime|containerd|detected|present:0660:0:0|absent|-|-
 [result_status] OK / FULL / 
 

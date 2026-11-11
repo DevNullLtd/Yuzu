@@ -547,13 +547,7 @@ TEST_CASE("generate_fold_ddl: every view keeps the registry's columns first, in 
     CHECK(checked == 34);
 }
 
-TEST_CASE("is_fold_view, is_fold_internal_table and legacy_live_shim_names", "[echo][fold][schema]") {
-    const auto shims = legacy_live_shim_names();
-    CHECK(shims.size() == 16);
-    CHECK(std::find(shims.begin(), shims.end(), "usage_live") == shims.end());
-    CHECK(std::find(shims.begin(), shims.end(), "process_live") != shims.end());
-    CHECK(std::find(shims.begin(), shims.end(), "netqual_live") != shims.end());
-
+TEST_CASE("is_fold_view and is_fold_internal_table", "[echo][fold][schema]") {
     CHECK(is_fold_internal_table("echo_dict"));
     CHECK(is_fold_internal_table("echo_fold_seen"));
     CHECK(is_fold_internal_table("process_hourly_r"));
@@ -2369,24 +2363,4 @@ TEST_CASE("synthetic three-day run: every source, every tier equals the independ
     CHECK(f->n("SELECT hour_ts FROM process_hourly WHERE name='late.exe'") == ref_bucket(late, "hourly"));
     CHECK(integrity_violations(*f) == 0);
     CHECK(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value() == std::nullopt);
-}
-
-TEST_CASE("referenced_legacy_live_shims names the retired tables a translated query mentions",
-          "[echo][fold][schema][shim]") {
-    using V = std::vector<std::string>;
-    CHECK(referenced_legacy_live_shims("SELECT * FROM process_live WHERE ts > 1") == V{"process_live"});
-    CHECK(referenced_legacy_live_shims("select count(*) from tcp_live t join process_live p on 1") ==
-          V{"process_live", "tcp_live"}); // shim order, each once
-    CHECK(referenced_legacy_live_shims("SELECT * FROM process_hourly").empty());
-    CHECK(referenced_legacy_live_shims("SELECT * FROM my_process_live").empty());   // not a whole identifier
-    CHECK(referenced_legacy_live_shims("SELECT * FROM process_live_r").empty());    // nor this
-    CHECK(referenced_legacy_live_shims("SELECT * FROM process_livex").empty());     // nor this
-    // every spelling SQLite accepts for the same identifier reaches the shim view
-    CHECK(referenced_legacy_live_shims("SELECT * FROM PROCESS_LIVE") == V{"process_live"});
-    CHECK(referenced_legacy_live_shims("SELECT * FROM \"Process_Live\"") == V{"process_live"});
-    CHECK(referenced_legacy_live_shims("SELECT * FROM [process_live]") == V{"process_live"});
-    CHECK(referenced_legacy_live_shims("SELECT * FROM `Tcp_Live`") == V{"tcp_live"});
-    CHECK(referenced_legacy_live_shims("SELECT * FROM PROCESS_HOURLY").empty());   // an hourly query, any case
-    CHECK(referenced_legacy_live_shims("SELECT * FROM usage_live").empty());        // usage keeps its table
-    CHECK(referenced_legacy_live_shims("").empty());
 }

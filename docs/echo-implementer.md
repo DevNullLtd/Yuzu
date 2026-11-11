@@ -27,8 +27,8 @@ no pre-configuration", which has two distinct uses:
 2. **Cheap inventory snapshots.** The same data — the most recent
    process list, the open TCP connection map, the running services —
    doubles as an always-fresh inventory source for dashboards and
-   compliance evidence. Because the live tier is row-count-bounded, a
-   `SELECT * FROM $Process_Live` always returns "now-ish".
+   compliance evidence. Because every tier is bucketed and bounded, a
+   `SELECT * FROM $Process_Hourly ORDER BY hour_ts DESC LIMIT 20` always returns recent activity.
 
 What Echo is **not**:
 
@@ -347,8 +347,8 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    an average that is not a finite sum is refused before any write to that tier, with the table,
    column and row id named.
 4. Seed the replay ring with the newest 4096 `record_key`s of each cursor source, drop the retired
-   tables, delete the rollup marks, `usage_hwm_id` and `usage_lag_events`, create the empty `$X_Live`
-   shim views (`legacy_live_shim_ddl()`), and write `schema_version` 10.
+   tables, delete the rollup marks, `usage_hwm_id` and `usage_lag_events`, and write
+   `schema_version` 10. No view takes a retired table's name.
 
 A failure at any step, a crash or a power loss before the commit leaves the retired tables intact and the
 next open retries from v9. After the commit `open()` refuses if the connection is not in autocommit mode
@@ -357,7 +357,7 @@ when the volume holds twice the new file free (else it records `auto_vacuum_defe
 maintenance pass retries). The log line carries the duration, rows converted, rows folded, rows
 rejected, replay keys seeded, tables dropped, file sizes and the WAL size at commit. The migration needs
 the retired tables' own column lists, which live in `echo_fold_schema.cpp` (`legacy_live_columns`); they
-are the last copy of the raw schema and exist only to read old files and to answer `$X_Live` reads.
+are the last copy of the raw schema and exist only to read old files.
 
 Three operational facts about the migration. (1) Plugin `init()` blocks for the whole migration:
 `agents/core/src/agent.cpp` runs every plugin's init in its load loop (about :1057-1085), before the
@@ -376,8 +376,7 @@ Consequences for code that reads the store:
   `PendingBaseline` stamps and folds nothing. A fault in either half rolls back both, and the retried
   tick folds both once.
 - `purge_source` deletes the source's `_r` rows and `echo_fold_seen` rows and sweeps the dictionary.
-- The status counts (`<src>_rows`, `<src>_oldest_ts`) read the finest tier; `<src>_live_rows` prints the
-  same figure for one release.
+- The status counts (`<src>_rows`, `<src>_oldest_ts`) read the finest tier.
 - `is_fold_view` is case-sensitive: a query that names a view `Process_Hourly` does not reach it.
 - No fold view may gain a WHERE, JOIN or filter: the pinned column-less `_r` read is sound only
   while every view is a WHERE-less, JOIN-less single-table projection.
@@ -395,7 +394,7 @@ follows it: until then the Echo pages, the process-tree viewer and the canned qu
 registry row (`build_sources()`, section 8) (the tiers' `GranularityDef`s are derived from the
 roll-up declarations, so the registry's tier lists and the declarations cannot drift); a `FoldSourceDef` at the same index in
 `fold_sources()`; a `*_delta` in `echo_fold.hpp`; the count pins in `test_echo_fold.cpp` (17
-sources, 34 tiers, 18 registry tiers, 16 shims); the capability TSV rows and the regenerated
+sources, 34 tiers, 18 registry tiers); the capability TSV rows and the regenerated
 `docs/os-capability-matrix.md`.
 
 ---
@@ -408,7 +407,7 @@ sources, 34 tiers, 18 registry tiers, 16 shims); the capability TSV rows and the
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | echo.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe Echo data, delete `<data_dir>/echo.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
-| **An older agent on a migrated file (not supported)** | An older agent does NOT refuse a v10 `echo.db`: no earlier build checks `schema_version` against a ceiling, so it opens the file, its warehouse DDL fails on the `<source>_live` shim views (`views may not be indexed`) and every collector write errors, so it records nothing and reads only the empty views; nothing is dropped or rewritten, but the install is useless until the file is replaced. Not supported and it will not work: never run an older agent on a migrated file; there is no return to an earlier agent build. An automatic OTA rollback (the updater rolling back a build that failed to verify) lands on the same file and the same applies (`docs/user-manual/upgrading.md` "Returning to an earlier agent build is not supported"). |
+| **An older agent on a migrated file (not supported)** | No earlier build checks `schema_version` against a ceiling, so an older agent opens a v10 file without refusing it. Not supported: never run an older agent on a migrated file; there is no return to an earlier agent build. An automatic OTA rollback (the updater rolling back a build that failed to verify) lands on the same file and the same applies (`docs/user-manual/upgrading.md` "Returning to an earlier agent build is not supported"). |
 | **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (the move is `claim_quarantine_name` / `quarantine_corrupt_db` in `agents/shared/sqlite_quarantine.hpp`, shared with the command-dedup store; a sidecar that can't be renamed is copied to its quarantine name and then removed, so the new DB can't replay it and the evidence is kept when the copy succeeds; on Windows the copied sidecar is re-secured with the protected DACL afterwards, best effort and logged (`secure_quarantined_sidecars`; a quarantine sidecar name that is foreign-owned or carries a second hard link is skipped and logged, because re-securing a hard link would rewrite its target's DACL); a sidecar that can be neither renamed nor copied is still removed and the loss is logged; the claim is bound to the regular file the check judged: `open()` reads its `lstat` identity while the connection still holds it, the claim refuses a link at the name, releases a claim whose name is not that file after the link or whose original is not that file right before it is dropped, and the mode change never follows a link, so a swapped-in link or a second recovery's fresh file at the name is left alone and open fails closed). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms, or a data directory on a filesystem without hard links: the quarantine name is claimed with a hard link so it can never overwrite an earlier quarantine, and there is deliberately no rename fallback), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **A busy database is not a corrupt one** (#7286): `busy_timeout` is set before the integrity check, and if another connection still holds the file past it (`SQLITE_BUSY` / `SQLITE_LOCKED`) open returns a busy error, quarantines nothing and leaves the file in place; the next start retries. **Only an explicit integrity failure quarantines** (a non-`ok` integrity row, `SQLITE_CORRUPT` or `SQLITE_NOTADB`, the command-dedup store's rule): any other failure to read the file (an I/O error, `SQLITE_CANTOPEN`, permission, read-only, disk full, WAL lock `PROTOCOL`) is *unreadable*, so open refuses with `echo.db could not be checked (sqlite rc N)`, quarantines nothing and retries on the next start, because a quarantine would replace a healthy file with a fresh database that re-enables every paused source. **A symlink (or, on Windows, any reparse point such as a junction) at `echo.db` or a sidecar is refused** before anything is opened, moved or secured, and again before the reopen that follows a quarantine; both Echo connections (the main one and the read-only query connection) are opened with `SQLITE_OPEN_NOFOLLOW`, which closes the check-to-open window on POSIX (the Windows VFS ignores the flag; that residual and what bounds it are recorded in the DACL block comment in `echo_db.cpp`); the operator removes the link. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent

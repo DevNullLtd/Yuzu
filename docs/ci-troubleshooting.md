@@ -604,6 +604,88 @@ rebuild on every run and defeats the cache.
 
 ---
 
+## 8. Windows leg rebuilds from scratch, or names `build-windows-debug`, after ADR-0035 step 1
+
+**Symptom:** a Windows MSVC job's `Wipe build-windows/ on branch switch
+(pre-checkout)` step logs
+`removing legacy build-windows-debug/ (per-variant dirs are now build-windows-agent-{debug,release})`,
+and/or the Build step compiles every translation unit. ccache should
+soften this, but its hit rate on the MSVC debug build (`/Zi`) is
+unverified until the first post-cutover run's ccache stats are read, so
+do not assume it is faster than a from-source rebuild. Or, on a branch
+cut before ADR-0035 step 1, the job uses `build-windows-debug` and starts
+cold every time.
+
+**Root cause:** ADR-0035 ladder step 1 made `ci.yml`'s Windows leg
+agent-only (`-Dbuild_server=false`) and moved it to
+`build-windows-agent-{debug,release}`. Meson keeps a stored option across
+`meson setup --reconfigure`, and the branch-switch wipe does not fire on
+detached-HEAD PR checkouts, so a branch that still configures the server
+must never share a build dir with one that does not. The new job deletes
+the old `build-windows-{debug,release}` dirs on every run; a branch that
+predates the change recreates them (cold) on its next run, and the next
+up-to-date run deletes them again. Each runner workspace sees this once
+per old-branch/new-branch alternation; nothing fails. Pushes to `main`
+count as an old branch: until the next `dev`→`main` promotion carries
+this change, a `main` push runs `main`'s older `ci.yml`, which builds in
+`build-windows-{debug,release}`, so it too cold-rebuilds on Wee Tam and
+the next `dev` run deletes those dirs again.
+
+The macOS leg is exempt: it checks out with `actions/checkout`'s default
+`clean: true` and runs a fresh `meson setup build-macos` each run, so no
+stored option carries over between runs.
+
+**Fix:** rebase (or merge `dev` into) the branch. Once every active
+branch is past the change, the legacy dirs stop reappearing. No runner
+action is needed for the cold rebuild itself. Deleting a
+`build-windows-agent-*` dir by hand is safe (the next run rebuilds it
+cold) but does not make the rebuild warmer; it is the fix only for the
+half-deleted case below.
+
+**Warning, not failure: a legacy dir is in use.** The legacy-dir removal
+is best-effort. If a leftover process (a hung test, a debugger, an
+antivirus scan) holds a file open, the step logs
+`::warning::could not fully remove legacy build-windows-debug/ (in use, or no permission); this job does not use it. ...`
+and the job continues; the up-to-date job never reads that dir.
+
+**Half-deleted build dir: `meson setup` fails with "already configured".**
+A cancelled run, or a legacy-dir removal that stopped at a locked file,
+can leave a build dir with `meson-private/` still present but
+`meson-info/` gone. The configure step only passes `--reconfigure` when
+`meson-info/` exists, so the next job that uses that dir fails at
+`Configure (Meson)` with meson's
+`Directory already configured` error (use `--reconfigure` / `--wipe`).
+For a LEGACY dir this hits a branch cut before ADR-0035 step 1, or a
+`main` push before the promotion, on that runner. Recovery, on the
+runner host, once the lock holder has exited: delete exactly the dir the
+error names, e.g. from the runner's workspace
+
+```bash
+rm -rf build-windows-debug          # or build-windows-agent-debug, etc.
+```
+
+and re-run the job; it rebuilds that dir cold. `scripts/ci/runner-reset.sh`
+is NOT a substitute here: it deliberately preserves every `build-*/` dir
+(and `vcpkg/`, `vcpkg_installed/`), so it does not clear a half-deleted
+build dir.
+
+**Rollback.** Revert the step-1 PR; the required-check names are
+unchanged, so branch protection needs no edit. The revert restores
+`instructions-windows-validate.yml` and the Windows pg steps. It leaves
+the `build-windows-agent-*` dirs on each Wee Tam runner: harmless (the
+reverted job does not use them), delete them by hand to reclaim disk
+(`runner-reset.sh` keeps them). The revert stays this cheap only until
+ADR-0035 step 4 deprovisions Wee Tam's Postgres clusters; after that, a
+rollback also needs them re-provisioned.
+
+**Not this entry:** a Windows job whose `Test (non-pg suites)` step fails with
+`--suite ['server-nonpg'] matched ZERO entries` is a branch whose workflow
+selects server suites against an agent-only build dir. That cannot happen
+with the renamed dirs; if it does, a build dir was copied or a
+`-Dbuild_server` value was set by hand — wipe that dir.
+
+---
+
 ## When to add a new entry
 
 Add an entry here if:

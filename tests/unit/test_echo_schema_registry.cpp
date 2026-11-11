@@ -247,7 +247,7 @@ TEST_CASE("Echo schema: the registry source row (PR11.8)", "[echo][schema][regis
     CHECK(def->granularities[0].retention_default == 7776000);
     CHECK(def->granularities[1].suffix == "daily");
     CHECK(is_queryable_table("registry_hourly"));
-    CHECK(is_queryable_table("registry_live")); // the retired raw name answers with an empty shim view
+    CHECK_FALSE(is_queryable_table("registry_live")); // the retired raw name is not queryable
 }
 
 // ── Per-source default-enabled (review R1) ──────────────────────────────────
@@ -324,34 +324,33 @@ TEST_CASE("Echo schema: perf + procperf are supported on Windows AND Linux (proc
 
 TEST_CASE("Echo schema: $Software dollar-names translate and DDL has the columns",
           "[echo][schema][software]") {
-    CHECK(translate_dollar_name("$Software_Live") == "software_live");
+    CHECK_FALSE(translate_dollar_name("$Software_Live").has_value()); // retired raw name
     CHECK(translate_dollar_name("$Software_Daily") == "software_daily");
     CHECK(translate_dollar_name("$Software_Monthly") == "software_monthly");
 
     // The warehouse tables are allowlisted for the read-only echo.sql sandbox.
-    CHECK(is_queryable_table("software_live"));
+    CHECK_FALSE(is_queryable_table("software_live"));
     CHECK(is_queryable_table("software_daily"));
 
-    // The warehouse DDL no longer creates software_live: a roll-up tier is created by the fold
-    // DDL (a table behind a view), and the retired raw name is answered by an empty shim view that
-    // keeps its old columns.
+    // No DDL creates software_live: a roll-up tier is created by the fold DDL (a table behind a
+    // view), and the retired raw name has neither a table nor a view.
     CHECK(generate_warehouse_ddl().find("software_live") == std::string::npos);
+    CHECK(generate_fold_ddl().find("software_live") == std::string::npos);
     CHECK(generate_fold_ddl().find("CREATE TABLE IF NOT EXISTS software_hourly_r") != std::string::npos);
-    CHECK(legacy_live_shim_ddl().find("CREATE VIEW IF NOT EXISTS software_live") != std::string::npos);
-    CHECK(legacy_live_shim_ddl().find("prev_version") != std::string::npos);
+    CHECK(columns_for_table("software_live").empty());
 
-    // live carries the full event columns (machine scope only — no scope/user);
-    // daily/monthly carry the count rollup.
-    auto live_cols = columns_for_table("software_live");
-    for (const auto* c : {"action", "name", "version", "prev_version", "publisher",
-                          "install_date"}) {
-        INFO("software_live column=" << c);
-        CHECK(std::find(live_cols.begin(), live_cols.end(), c) != live_cols.end());
+    // The hourly tier carries the application identity and the event counts (machine scope only
+    // — no scope/user); daily/monthly carry the same count rollup.
+    auto hourly_cols = columns_for_table("software_hourly");
+    for (const auto* c : {"name", "version", "publisher", "install_count", "remove_count",
+                          "upgrade_count"}) {
+        INFO("software_hourly column=" << c);
+        CHECK(std::find(hourly_cols.begin(), hourly_cols.end(), c) != hourly_cols.end());
     }
     // scope/user were dropped with per-user scope (#1620) — they must NOT exist.
     for (const auto* c : {"scope", "user"}) {
-        INFO("software_live must NOT have column=" << c);
-        CHECK(std::find(live_cols.begin(), live_cols.end(), c) == live_cols.end());
+        INFO("software_hourly must NOT have column=" << c);
+        CHECK(std::find(hourly_cols.begin(), hourly_cols.end(), c) == hourly_cols.end());
     }
     auto daily_cols = columns_for_table("software_daily");
     for (const auto* c : {"install_count", "remove_count", "upgrade_count"}) {
@@ -369,7 +368,7 @@ TEST_CASE("Echo schema: usage tables are excluded from the echo.sql allowlist (#
     CHECK_FALSE(is_queryable_table("usage_daily_user"));
 
     // A generic warehouse table stays reachable -- this isn't a broken allowlist.
-    CHECK(is_queryable_table("process_live"));
+    CHECK(is_queryable_table("process_hourly"));
     CHECK(is_queryable_table("echo_config"));
     CHECK(is_queryable_table("echo_cursor"));
 }
@@ -443,14 +442,17 @@ TEST_CASE("Echo schema: netconn source is registered with hourly and daily tiers
         }
     }
 
-    CHECK(translate_dollar_name("$NetConn_Live") == "netconn_live");
-    CHECK(is_queryable_table("netconn_live"));
-    auto cols = columns_for_table("netconn_live");
+    CHECK_FALSE(translate_dollar_name("$NetConn_Live").has_value()); // retired raw name
+    CHECK_FALSE(is_queryable_table("netconn_live"));
+    CHECK(translate_dollar_name("$NetConn_Hourly") == "netconn_hourly");
+    CHECK(is_queryable_table("netconn_hourly"));
+    auto cols = columns_for_table("netconn_hourly");
     // The full column set IS the privacy contract: closed enum/numeric fields
     // only — any free-text addition (SSID, profile name, GUID) must fail here.
-    const std::vector<std::string> expected = {"id",         "ts",       "snapshot_id",
-                                               "action",     "channel",  "category",
-                                               "capability", "iface_kind", "reason_code"};
+    const std::vector<std::string> expected = {
+        "id",         "hour_ts",    "action",   "channel",    "category",
+        "capability", "iface_kind", "reason_code", "phy_type", "auth_alg",
+        "cipher_alg", "event_count", "last_ts"};
     CHECK(cols == expected);
 }
 

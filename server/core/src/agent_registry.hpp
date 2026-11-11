@@ -30,6 +30,7 @@
 #include "command_capability.hpp"
 #include "command_capability_parsers.hpp"
 #include "dispatch_caller.hpp"
+#include "dispatch_denial.hpp"
 #include "event_bus.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5: PresenceIdentity is a value member (presence_cache_)
 #include "scope_eval_error.hpp" // #4981 PR-1: ScopeEvalError, evaluate_scope's typed failure surface
@@ -75,86 +76,6 @@ inline constexpr std::string_view kGatewayWireCapabilityDispatchTagV1{"command_d
 // `encode_dispatch_tag` is a public, pure helper — so the guarantee below is
 // a TYPE invariant (`ClassifiedCommand`'s private constructor), never a
 // string check alone.
-
-/// Why `ServerImpl::build_classified_command` refused a dispatch. Every
-/// value is counted separately by the caller (ADR-0033 §2: "never a
-/// permissive default") — `Unclassified`/`Ambiguous` mirror
-/// `ClassificationError` 1:1; `AnonymousOperator`/`Forbidden` are this
-/// package's own authorization arm.
-enum class DispatchDenialReason : uint8_t {
-    Unclassified,      ///< No `CommandCapability` row matches `plugin.action`
-                       ///< (also raised for a row whose `execute_gate` parsed
-                       ///< as `ExecuteGate::Unspecified` — #1398 defense in
-                       ///< depth; see `command_capability.hpp`. That should be
-                       ///< IMPOSSIBLE by construction — every fragment's own
-                       ///< compile-time sweep makes an omitted `.execute_gate`
-                       ///< a build failure — so reaching this arm at runtime
-                       ///< means that sweep itself is broken, not that this
-                       ///< row is merely unclassified in the ordinary sense).
-    Ambiguous,         ///< Two+ fragments independently declared the same row.
-    AnonymousOperator, ///< `caller.system == false` with an empty `principal`.
-    Forbidden,         ///< Classified, but `caller` may not issue it — either an
-                       ///< operator lacking the resolved securable/operation, or
-                       ///< ANY operator attempting a `system_reserved` row.
-    ApprovalRequired,  ///< #1398: classified and RBAC-authorized, but `cap
-                       ///< .execute_gate` requires proof of an approval
-                       ///< decision (`DispatchCaller::approval_provenance`)
-                       ///< the caller does not carry — `AdminOrApproval`
-                       ///< additionally admits an effective-admin caller with
-                       ///< no provenance at all; `AlwaysApproval` never does.
-                       ///< Deliberately AFTER `Forbidden` in evaluation order:
-                       ///< approval is never a substitute for a missing RBAC
-                       ///< grant, only for the ADDITIONAL gate on top of one.
-    KillSwitched,      ///< Classified and authorized, but the per-action kill
-                       ///< switch is OFF for this `plugin.action` (or the config
-                       ///< store is degraded, which `action_allowed` reports as
-                       ///< disabled — never as enabled; never a protective
-                       ///< action — `yuzu::protective`). Deliberately DISTINCT
-                       ///< from `Forbidden`: this is an operator-thrown
-                       ///< emergency stop, not an authorization verdict, and an
-                       ///< incident review needs to tell the two apart.
-};
-
-/// A refused dispatch. `securable`/`operation` are populated only once
-/// classification itself succeeded — `Unclassified`/`Ambiguous` carry no
-/// resolved securable, there is nothing to name yet (a caller
-/// logging/auditing a denial must branch on `reason` before trusting
-/// `securable`). `AnonymousOperator` and `Forbidden` are raised AFTER
-/// classification resolved, so both DO name the securable the caller failed
-/// to satisfy — that is what makes the audit line actionable.
-///
-/// `securable` owns its characters rather than viewing `CommandCapability`'s
-/// static storage: a denial is the exceptional path, and the consumers
-/// concatenate it into operator-facing messages.
-struct DispatchDenial {
-    DispatchDenialReason reason;
-    std::string securable;
-    authz::Operation operation{authz::Operation::Read};
-};
-
-/// The ONE string form of a `DispatchDenialReason` — snake_case, matching
-/// the existing `yuzu_server_dispatch_denied_total{reason=...}` metric label
-/// values (unchanged by #1398; this function only deduplicates the mapping,
-/// it does not relabel anything already in production dashboards/alerts).
-/// Used for BOTH the metric label and the route-local audit detail
-/// (`server.cpp`'s `/api/command` handler) — an incident review needs the
-/// SAME string in both places to correlate a metric spike with the audit
-/// rows that produced it, and a single source avoids the two silently
-/// drifting apart the way a hand-duplicated switch invites. No `default:`
-/// case (see `authz::to_string` in `authz_model.hpp` for the same pattern)
-/// so `-Werror=switch` catches a future `DispatchDenialReason` enumerator
-/// added here without a matching label.
-[[nodiscard]] constexpr std::string_view to_string(DispatchDenialReason reason) {
-    switch (reason) {
-        case DispatchDenialReason::Unclassified: return "unclassified";
-        case DispatchDenialReason::Ambiguous: return "ambiguous";
-        case DispatchDenialReason::AnonymousOperator: return "anonymous_operator";
-        case DispatchDenialReason::Forbidden: return "forbidden";
-        case DispatchDenialReason::ApprovalRequired: return "approval_required";
-        case DispatchDenialReason::KillSwitched: return "kill_switched";
-    }
-    return "";
-}
 
 /// The pure classify+authorize DECISION `ServerImpl::build_classified_command`
 /// is built around, extracted so it is directly unit-testable without a live
@@ -376,19 +297,6 @@ private:
     std::unordered_set<std::string> kill_switched_os_;
 };
 
-/// Upgrade-window shim, removed with the other legacy-name shims. The wire command for a
-/// session that registered the pre-rename plugin name `tar` must carry `tar`, not `echo`, or the
-/// agent reports plugin-not-found. Returns the command unchanged (a copy) for every other
-/// session and every other plugin. dispatch_tag is deliberately left as computed: the agent
-/// never reads it.
-[[nodiscard]] inline pb::CommandRequest wire_for(bool legacy_echo_wire_name,
-                                                 const ClassifiedCommand& cmd) {
-    pb::CommandRequest out = cmd.wire();
-    if (legacy_echo_wire_name && out.plugin() == "echo")
-        out.set_plugin("tar");
-    return out;
-}
-
 /// #3687 (Gate 6 governance fix): the per-action kill-switch DECISION
 /// `finalize_classified_command` applies (below), extracted to its own
 /// function for the IDENTICAL reason `finalize_classified_command` itself was
@@ -566,10 +474,6 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
-    /// Upgrade-window shim, removed with the other legacy-name shims: the agent registered the
-    /// pre-rename plugin name `tar` (normalised to `echo` in plugin_names/plugin_meta). Commands
-    /// for `echo` are written to it as `tar` (see wire_for). Set only by register_agent.
-    bool legacy_echo_wire_name = false;
     std::unordered_map<std::string, std::string> scopable_tags;
     std::string gateway_node; // Non-empty if agent is connected via gateway
     /// HA WS-4 4.3: the gateway cluster this session's most recent CONNECTED
@@ -964,11 +868,8 @@ public:
     // `send_to` is the sole path for that (this method has no capability
     // advertisement to check, because there is no session to have
     // advertised one).
-    /// `legacy_wire` (Echo-rename upgrade window, removed with the other legacy-name shims) is
-    /// the directory row's `legacy_echo_wire_name`: the target agent registered the pre-rename
-    /// plugin name `tar`.
     bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
-                            const std::string& cluster_id, bool legacy_wire);
+                            const std::string& cluster_id);
 
     struct GatewayPendingCmd {
         std::string agent_id;
@@ -1533,8 +1434,9 @@ public:
     /// memory is per-process and pruned every ~90 s): the sink
     /// (EchoCorruptionAuditGate) owns durable dedup and its own rate limit; a
     /// failed write is retried after the gate's degraded window, and a
-    /// candidate skipped only because the gate's slot was busy is retried on
-    /// the next heartbeat -- see echo_corruption_audit.hpp for the distinction.
+    /// candidate skipped because that agent's lookup was already in flight (or
+    /// the in-flight set is at its bound) is retried on the next heartbeat --
+    /// see echo_corruption_audit.hpp for the distinction.
     /// This is the store's first plugin-specific side-effecting hook -- a
     /// second consumer of the same "surface a candidate, let an injected sink
     /// durably dedup it" shape should generalize this to a small named-sink

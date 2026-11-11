@@ -236,7 +236,7 @@ MCP_REGISTRY_DIR = None
 # with the C++ twin constant `kRegistryDomainFiles` in tests/unit/server/test_mcp_dispatch_coverage.cpp;
 # a new mcp_tool*.hpp header needs `kToolHeaderFiles` there instead (this script does not count headers).
 # tests/test_docs_drift_selftest.py builds its --root fixture from this value, so it self-adjusts.
-MIN_REGISTRY_FILES = 4
+MIN_REGISTRY_FILES = 5
 LEDGER_DOC = ROOT / "docs" / "api-parity-ledger.md"
 
 DOC_BEGIN = ("<!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; "
@@ -509,8 +509,9 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # planned to twinned (POST /api/v1/workflows/{id}/execute + the execute_workflow MCP tool).
 # 206 -> 205 (enforcement read twins, ADR-1005 2026-11-03 entry): get.fragments-access-enforcement flipped from
 # `twinned-rest-only` to `twinned` (GET /api/v1/rbac/enforcement + the get_rbac_enforcement MCP tool, #6033).
-# 206 -> 204 (merge of origin/dev into the workflow execute twin branch): the two flips above are
-# disjoint rows, so 206 - 1 - 1 = 204.
+# 204 -> 208 (DEX Scoring tab): four dashboard routes (GET /fragments/dex/scoring and the save,
+# preview and reset POSTs) born `planned:#6087`, each with its merged REST v1 twin named and the MCP twin owed.
+# 208 -> 204 (#6087): get_/set_/reset_dex_score_policy retire all four (preview twins onto the dry-run PUT).
 BASELINE_UNTWINNED = 204
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
@@ -2388,8 +2389,17 @@ GATE_PARITY_KNOWN_MISMATCHES = {
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
 # gates such as sw_admit, member-function gates) cannot be compared, so it fails closed unless it
 # is named here.
-GATE_PARITY_NO_GATE_MAX = 14
+GATE_PARITY_NO_GATE_MAX = 16
 GATE_PARITY_NO_GATE_ALLOWED = {
+    ("DELETE", "/api/v1/dex/score-policy", "reset_dex_score_policy"): (
+        "the REST handler's Infrastructure:Write check lives in the shared `score_policy_write` "
+        "lambda (perm_fn at its top, rest_api_v1.cpp), which this script's per-route lexical read "
+        "cannot see from the registration lambda. Read in review: REST already applies the MCP "
+        "tier ladder to an MCP-tier token (AuthRoutes::require_tier_policy), so the tool's "
+        "Infrastructure:Delete row (stricter than REST DELETE, which needs Infrastructure:Write "
+        "only) ADDS only a loud GuaranteedState:Read gate and the generic supervised approval "
+        "ticket for a Delete (ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> 16 "
+        "for this pair)"),
     ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent, kToolSecurityRows comment)"),
@@ -2435,6 +2445,14 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "owner-scoped on the session via auth_fn; no RBAC gate call (result-set precedent)"),
     ("POST", "/api/v1/scope/validate", "validate_scope"): (
         "auth_fn only: validates an expression the caller supplied and reads no fleet data"),
+    ("PUT", "/api/v1/dex/score-policy", "set_dex_score_policy"): (
+        "the REST handler's Infrastructure:Write check lives in the shared `score_policy_write` "
+        "lambda (perm_fn at its top, rest_api_v1.cpp), which this script's per-route lexical read "
+        "cannot see from the registration lambda. Read in review: the tool's Infrastructure:Write "
+        "row matches the REST gate, REST already applies the MCP tier ladder to an MCP-tier token "
+        "(AuthRoutes::require_tier_policy), and the tool ADDS only a loud GuaranteedState:Read "
+        "gate (ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> 16 for this "
+        "pair)"),
 }
 
 # Check 7 allowlist: registry tool -> reason, for a tool whose domain test file lacks the
