@@ -130,11 +130,18 @@ info "image=$IMAGE_REF  push=$PUSH  multiarch=$MULTIARCH"
 # the downloadable name; #5141 fixed that). We therefore verify by HASH
 # presence in the signed manifest, never by filename.
 DL="$(mktemp -d "${TMPDIR:-/tmp}/yuzu-agent-bundle.XXXXXX")"
-ARCHIVES="yuzu-linux-x64.tar.gz yuzu-windows-x64.zip yuzu-macos-arm64.tar.gz"
 
+# The Windows and macOS archives are agent-only and named for it since
+# ADR-0035 ladder step 2 (yuzu-agent-windows-x64.zip,
+# yuzu-agent-macos-arm64.tar.gz). Earlier releases name them
+# yuzu-windows-x64.zip / yuzu-macos-arm64.tar.gz and also hold the server,
+# which extract_payload strips, so a hand-run against an older tag still
+# works: both names are requested and whichever exists is used.
 info "Downloading agent artifacts + SHA256SUMS for $VERSION (this is large)..."
 gh release download "$TAG" --repo "$REPO_SLUG" -D "$DL" --clobber \
-  -p 'yuzu-linux-x64.tar.gz' -p 'yuzu-windows-x64.zip' -p 'yuzu-macos-arm64.tar.gz' \
+  -p 'yuzu-linux-x64.tar.gz' \
+  -p 'yuzu-agent-windows-x64.zip' -p 'yuzu-agent-macos-arm64.tar.gz' \
+  -p 'yuzu-windows-x64.zip' -p 'yuzu-macos-arm64.tar.gz' \
   -p 'yuzu-agent_*_amd64.deb' -p 'yuzu-agent-*.x86_64.rpm' \
   -p 'YuzuAgent-*-macos-arm64.pkg' -p 'YuzuAgentSetup-*.exe' \
   -p 'SHA256SUMS' \
@@ -151,6 +158,11 @@ EXE="$(pick 'YuzuAgentSetup-*.exe')"
 [ -n "$PKG" ] || die "no .pkg installer asset on $TAG"
 [ -n "$EXE" ] || die "no Windows installer asset on $TAG"
 [ -s "$DL/SHA256SUMS" ] || die "no SHA256SUMS on $TAG"
+WIN_ZIP="$(pick 'yuzu-agent-windows-x64.zip')"; [ -n "$WIN_ZIP" ] || WIN_ZIP="$(pick 'yuzu-windows-x64.zip')"
+MAC_TGZ="$(pick 'yuzu-agent-macos-arm64.tar.gz')"; [ -n "$MAC_TGZ" ] || MAC_TGZ="$(pick 'yuzu-macos-arm64.tar.gz')"
+[ -n "$WIN_ZIP" ] || die "no Windows archive on $TAG"
+[ -n "$MAC_TGZ" ] || die "no macOS archive on $TAG"
+ARCHIVES="yuzu-linux-x64.tar.gz $WIN_ZIP $MAC_TGZ"
 
 # Verify every artifact by checking its sha256 appears in the signed manifest.
 verify_hash() {
@@ -206,8 +218,8 @@ extract_payload() {
 }
 
 extract_payload linux-x64   yuzu-linux-x64.tar.gz   tar
-extract_payload windows-x64 yuzu-windows-x64.zip    zip
-extract_payload macos-arm64 yuzu-macos-arm64.tar.gz tar
+extract_payload windows-x64 "$WIN_ZIP" zip
+extract_payload macos-arm64 "$MAC_TGZ" tar
 
 cp "$DL/$DEB" "$BUNDLE_ROOT/linux-x64/installers/"
 cp "$DL/$RPM" "$BUNDLE_ROOT/linux-x64/installers/"
