@@ -149,6 +149,22 @@ TEST_CASE("hardware ci page: MCP arguments are refused, not clamped", "[hardware
     CHECK_FALSE(hcp::request_from_args(json{{"limit", INT64_MIN}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"agent_id", 5}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"agent_id", ""}}).has_value());
+    // The fault kind: only the over-long cursor is kCursorTooLong; every other refusal is kOther,
+    // including a wrongly typed cursor and the other two text checks.
+    {
+        const auto too_long = hcp::request_from_args(json{{"cursor", std::string(hcp::kCursorMaxBytes + 1, 'x')}});
+        REQUIRE_FALSE(too_long.has_value());
+        CHECK(too_long.error().fault == hcp::ArgFault::kCursorTooLong);
+        CHECK(too_long.error().message == "invalid cursor; restart from the first page");
+        CHECK(hcp::request_from_args(json{{"cursor", std::string(hcp::kCursorMaxBytes, 'x')}}).has_value());
+        for (const json& other : {json{{"cursor", 7}}, json{{"agent_id", ""}}, json{{"agent_id", "a\nb"}},
+                                  json{{"limit", 0}}}) {
+            INFO(other.dump());
+            const auto r = hcp::request_from_args(other);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().fault == hcp::ArgFault::kOther);
+        }
+    }
     CHECK_FALSE(hcp::request_from_args(json{{"agent_id", "a\tb"}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"cursor", 5}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"cursor", std::string(2049, 'c')}}).has_value());

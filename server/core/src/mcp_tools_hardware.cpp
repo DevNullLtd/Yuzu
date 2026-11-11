@@ -197,9 +197,17 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     // clamp.
     const auto rq = hardware_ci_page::request_from_args(ctx.args);
     if (!rq) {
-        const bool audit_ok = ctx.audit("denied", "invalid arguments: " + rq.error());
+        // An over-long cursor reads exactly like one that fails to decode below: the same
+        // remediation and the same audit detail, so a caller and the audit trail see one refusal.
+        const bool cursor_refused = rq.error().fault == hardware_ci_page::ArgFault::kCursorTooLong;
+        const bool audit_ok = ctx.audit("denied", cursor_refused
+                                                      ? std::string(hardware_ci_page::kCursorRefusedAuditDetail)
+                                                      : "invalid arguments: " + rq.error().message);
         // retry-hint-exempt: caller-input rejection
-        answer(ctx, ctx.a4_error(kInvalidParams, rq.error(), "fix the argument and re-call", -1, {}, audit_ok));
+        answer(ctx, ctx.a4_error(kInvalidParams, rq.error().message,
+                                 cursor_refused ? std::string(hardware_ci_page::kCursorRefusedRemediation)
+                                                : std::string("fix the argument and re-call"),
+                                 -1, {}, audit_ok));
         return;
     }
     const auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope);
@@ -223,11 +231,13 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
             return;
         }
         if (why != ReadError::kDegraded) { // a refused cursor
-            const bool audit_ok = ctx.audit("denied", "invalid arguments: cursor");
+            const bool audit_ok =
+                ctx.audit("denied", std::string(hardware_ci_page::kCursorRefusedAuditDetail));
             // retry-hint-exempt: caller-input rejection
             answer(ctx, ctx.a4_error(kInvalidParams,
                                      std::string(hardware_ci_page::read_error_message(why)),
-                                     "omit cursor to restart from the first page", -1, {}, audit_ok));
+                                     std::string(hardware_ci_page::kCursorRefusedRemediation), -1, {},
+                                     audit_ok));
             return;
         }
         // A failed store read is never an empty page (ADR-0016 section 7).
@@ -410,9 +420,9 @@ constexpr ToolRecord kToolRecords[] = {
      "partition) and installed software use get_hardware_ci. For agentic workers: each page of "
      "the default 100 rows is a large block of personal data in your context, so prefer limit 20 "
      "or less, or an agent_id; use the REST route GET /api/v1/hardware/ci for a bulk pull. "
-     "Read-only. A cursor belongs to the agent_id it was issued with; a malformed cursor, or one "
-     "used with a different agent_id, is -32602: omit cursor to restart. Confined: results are "
-     "narrowed to the devices the caller may read and carry scope_basis authority_scoped (a "
+     "Read-only. A cursor belongs to the agent_id it was issued with; a refused cursor (malformed, "
+     "over 2048 bytes, or used with a different agent_id) is -32602: omit cursor to restart. "
+     "Confined: results are narrowed to the devices the caller may read and carry scope_basis authority_scoped (a "
      "status, set whether or not any device was hidden); no count of hidden devices is ever "
      "returned. Confinement applies only while RBAC enforcement is on: with it off every "
      "non-engine caller the gate admits reads the whole fleet and a service-scoped token is "

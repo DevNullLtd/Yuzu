@@ -2972,6 +2972,55 @@ TEST_CASE("route: GET /api/v1/hardware/ci refuses invalid UTF-8 in agent_id or c
     CHECK(h.audit_full.empty());
 }
 
+// Kills: dropping the `Cache-Control: no-store` of the served page (the rows carry serials, UUIDs
+// and MACs), and spreading it to the refusals or to the per-id route (neither carries it).
+TEST_CASE("route: GET /api/v1/hardware/ci serves a page with Cache-Control no-store and its refusals without",
+          "[hardware][route][rest][ci_page]") {
+    {
+        HwHarness h;
+        seed_ci(h, {"a", "b"});
+        auto ok = h.sink.Get("/api/v1/hardware/ci");
+        REQUIRE(ok);
+        REQUIRE(ok->status == 200);
+        CHECK(ok->get_header_value("Cache-Control") == "no-store");
+        // A named-device read is a served page as well.
+        auto named = h.sink.Get("/api/v1/hardware/ci?agent_id=a");
+        REQUIRE(named);
+        REQUIRE(named->status == 200);
+        CHECK(named->get_header_value("Cache-Control") == "no-store");
+        // The per-id route is unchanged.
+        auto one = h.sink.Get("/api/v1/hardware/a");
+        REQUIRE(one);
+        CHECK_FALSE(one->has_header("Cache-Control"));
+        // A 400 (bad limit) carries no device data and no header.
+        auto bad = h.sink.Get("/api/v1/hardware/ci?limit=abc");
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+        CHECK_FALSE(bad->has_header("Cache-Control"));
+    }
+    {
+        // A 503 for a degraded store, and the withheld page when the audit row does not persist,
+        // carry none either.
+        HwHarness h;
+        seed_ci(h, {"a"});
+        h.ci_store.degraded = true;
+        auto res = h.sink.Get("/api/v1/hardware/ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->has_header("Cache-Control"));
+    }
+    {
+        HwHarness h;
+        seed_ci(h, {"a"});
+        h.audit_should_fail = true;
+        auto res = h.sink.Get("/api/v1/hardware/ci");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->has_header("Cache-Control"));
+        CHECK_FALSE(contains(res->body, "SN-a"));
+    }
+}
+
 TEST_CASE("route: GET /api/v1/hardware/ci withholds the page when the audit row does not persist",
           "[hardware][route][rest][ci_page]") {
     HwHarness h;

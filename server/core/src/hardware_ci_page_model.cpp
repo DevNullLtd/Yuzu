@@ -59,13 +59,18 @@ std::optional<int> parse_rest_limit(std::string_view s) {
 }
 
 // The text checks every channel applies to the two string inputs. nullopt = acceptable.
-std::optional<std::string> text_error(const std::string& agent_id, const std::string& cursor) {
+struct TextFault {
+    std::string message;
+    ArgFault fault{ArgFault::kOther};
+};
+
+std::optional<TextFault> text_error(const std::string& agent_id, const std::string& cursor) {
     if (!valid_text(agent_id) || !valid_text(cursor))
-        return "invalid parameter encoding";
+        return TextFault{"invalid parameter encoding"};
     if (!agent_id.empty() && !id_is_audit_safe(agent_id))
-        return "invalid agent_id";
+        return TextFault{"invalid agent_id"};
     if (cursor.size() > kCursorMaxBytes)
-        return "invalid cursor; restart from the first page";
+        return TextFault{"invalid cursor; restart from the first page", ArgFault::kCursorTooLong};
     return std::nullopt;
 }
 
@@ -82,7 +87,7 @@ std::expected<Request, std::string> parse_params(const Params& p) {
     r.agent_id = first("agent_id");
     r.cursor = first("cursor");
     if (const auto bad = text_error(r.agent_id, r.cursor))
-        return std::unexpected(*bad);
+        return std::unexpected(bad->message);
     if (const std::string limit = first("limit"); !limit.empty()) {
         const auto n = parse_rest_limit(limit);
         if (!n)
@@ -92,22 +97,22 @@ std::expected<Request, std::string> parse_params(const Params& p) {
     return r;
 }
 
-std::expected<Request, std::string> request_from_args(const nlohmann::json& args) {
+std::expected<Request, ArgError> request_from_args(const nlohmann::json& args) {
     Request r;
     if (!args.is_object())
         return r;
     for (const char* key : {"agent_id", "cursor"})
         if (args.contains(key) && !args[key].is_string())
-            return std::unexpected(std::string(key) + " must be a JSON string");
+            return std::unexpected(ArgError{std::string(key) + " must be a JSON string"});
     if (args.contains("agent_id")) {
         r.agent_id = args["agent_id"].get<std::string>();
         if (r.agent_id.empty())
-            return std::unexpected("agent_id must be a non-empty string when given");
+            return std::unexpected(ArgError{"agent_id must be a non-empty string when given"});
     }
     if (args.contains("cursor"))
         r.cursor = args["cursor"].get<std::string>();
     if (const auto bad = text_error(r.agent_id, r.cursor))
-        return std::unexpected(*bad);
+        return std::unexpected(ArgError{bad->message, bad->fault});
     if (args.contains("limit")) {
         const auto& l = args["limit"];
         // nlohmann stores every non-negative integer as unsigned: refuse above INT64_MAX here
@@ -115,10 +120,10 @@ std::expected<Request, std::string> request_from_args(const nlohmann::json& args
         if (!l.is_number_integer() ||
             (l.is_number_unsigned() &&
              l.get<std::uint64_t>() > static_cast<std::uint64_t>(INT64_MAX)))
-            return std::unexpected("limit must be a JSON integer");
+            return std::unexpected(ArgError{"limit must be a JSON integer"});
         const auto n = l.get<std::int64_t>();
         if (n < 1 || n > kPageMax)
-            return std::unexpected("limit must be between 1 and " + std::to_string(kPageMax));
+            return std::unexpected(ArgError{"limit must be between 1 and " + std::to_string(kPageMax)});
         r.limit = static_cast<int>(n);
     }
     return r;

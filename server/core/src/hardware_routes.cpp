@@ -811,6 +811,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             {"data", std::move(data)},
             {"meta", {{"api_version", "v1"}}},
         };
+        // The body carries serials, UUIDs and MACs: no cache (shared or private) may keep it. Set
+        // on the served page only; the refusals above carry no device data, and the per-id route
+        // and the neighbouring REST reads set none.
+        res.set_header("Cache-Control", "no-store");
         // The scalar fields are agent-supplied bytes: a byte that is not valid UTF-8 must not
         // throw out of dump() AFTER the access audit row persisted (the per-id route's rule).
         res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),

@@ -1838,6 +1838,59 @@ TEST_CASE("mcp list_hardware_ci_records: arguments are refused, never clamped, a
     CHECK(cross["error"]["code"] == mcp::kInvalidParams);
 }
 
+// Kills: the two cursor refusals drifting apart again. An over-long cursor (refused while the
+// arguments are read) and one that fails to decode (refused by the page read) give ONE
+// remediation and ONE audit detail, and the same A4 message. A wrongly typed cursor and the
+// other argument refusals keep their own remediation and detail.
+TEST_CASE("mcp list_hardware_ci_records: every refused cursor has one remediation and one audit detail",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    seed(t, {"a", "b"});
+    const json page = t.call("list_hardware_ci_records", {{"limit", 1}});
+    const std::string good = page["result"]["structuredContent"]["next_cursor"];
+    REQUIRE_FALSE(good.empty());
+
+    const std::vector<json> refused_cursors = {
+        {{"cursor", std::string(2049, 'x')}},               // over-long, refused at parse time
+        {{"cursor", "garbage"}},                            // fails to decode
+        {{"agent_id", "a"}, {"cursor", good}},              // issued for another agent_id filter
+    };
+    for (const auto& args : refused_cursors) {
+        INFO(args.dump().substr(0, 80));
+        t.clear_audit();
+        const json r = t.call("list_hardware_ci_records", args);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["message"] == "invalid cursor; restart from the first page");
+        CHECK(r["error"]["data"]["remediation"] == "omit cursor to restart from the first page");
+        REQUIRE(t.generic_details.size() == 1);
+        CHECK(t.generic_details.back() == "invalid arguments: cursor");
+        CHECK(has(t.generic_rows, "mcp.list_hardware_ci_records|denied"));
+        CHECK(t.domain_rows.empty());
+    }
+
+    // The other argument refusals keep "fix the argument and re-call" and their own reason.
+    struct Other {
+        json args;
+        const char* detail;
+    };
+    const std::vector<Other> others = {
+        {{{"limit", 0}}, "invalid arguments: limit must be between 1 and 1000"},
+        {{{"agent_id", ""}}, "invalid arguments: agent_id must be a non-empty string when given"},
+        {{{"agent_id", "a\nb"}}, "invalid arguments: invalid agent_id"},
+        {{{"cursor", 7}}, "invalid arguments: cursor must be a JSON string"},
+    };
+    for (const auto& o : others) {
+        INFO(o.args.dump());
+        t.clear_audit();
+        const json r = t.call("list_hardware_ci_records", o.args);
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["data"]["remediation"] == "fix the argument and re-call");
+        REQUIRE(t.generic_details.size() == 1);
+        CHECK(t.generic_details.back() == o.detail);
+    }
+}
+
 TEST_CASE("mcp list_hardware_ci_records: if either access row does not persist the data is withheld",
           "[mcp][hardware][ci_page][security]") {
     Twin t;

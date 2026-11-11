@@ -69,10 +69,28 @@ struct Request {
 /// `cursor` means "not given". The error is the 400 message.
 [[nodiscard]] std::expected<Request, std::string> parse_params(const Params& p);
 
+/// Which refusal an MCP argument error is, where the caller's remedy differs. `kCursorTooLong` is
+/// the over-long cursor: the same remedy as a cursor that fails to decode (omit it).
+enum class ArgFault { kOther, kCursorTooLong };
+
+/// The kInvalidParams message of a refused MCP request, and what kind of refusal it was.
+struct ArgError {
+    std::string message;
+    ArgFault fault{ArgFault::kOther};
+};
+
+/// Remediation and audit detail for EVERY refused cursor on the MCP channel: an over-long one
+/// (`ArgFault::kCursorTooLong`) and one that fails to decode (`ReadError::kCursorMalformed` or
+/// `kCursorFilterMismatch`). One spelling each, so the two refusals read the same to a caller and
+/// in the audit trail. The detail carries no part of the cursor.
+inline constexpr std::string_view kCursorRefusedRemediation = "omit cursor to restart from the first page";
+inline constexpr std::string_view kCursorRefusedAuditDetail = "invalid arguments: cursor";
+
 /// MCP's STRICT argument read (REST clamps, MCP refuses): a wrong JSON type, a `limit` outside
 /// [1, kPageMax], an empty or unsafe `agent_id`, an over-long cursor or text that cannot be bound
-/// is refused. Unknown names are ignored. The error is the kInvalidParams message.
-[[nodiscard]] std::expected<Request, std::string> request_from_args(const nlohmann::json& args);
+/// is refused. Unknown names are ignored. The error carries the kInvalidParams message and, for
+/// an over-long cursor, `ArgFault::kCursorTooLong`.
+[[nodiscard]] std::expected<Request, ArgError> request_from_args(const nlohmann::json& args);
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
 
