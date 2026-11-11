@@ -37,6 +37,7 @@
 #include "rate_limiter.hpp"
 #include "response_provenance.hpp"
 #include "rundown_gate.hpp"
+#include "unverified_frame_registry.hpp"
 
 namespace yuzu::server {
 
@@ -540,6 +541,17 @@ private:
     /// Publishes the current `cmd_send_times_.size()` to the pending-count
     /// gauge. Caller holds `cmd_times_mu_`.
     void publish_send_times_gauge_locked();
+
+    /// Non-terminal frames whose provenance was unresolved, per (command id, agent id), until the
+    /// same pair's terminal frame reports them as a lost answer (`response_dropped`). Bounded and
+    /// self-locking (unverified_frame_registry.hpp); lives and dies with this service.
+    UnverifiedFrameRegistry unverified_frames_;
+    /// Records an unverified RUNNING frame; counts a capacity eviction as
+    /// `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`.
+    void note_unverified_frame(const std::string& command_id, const std::string& agent_id);
+    /// True (and forgets the record) when an unverified RUNNING frame of this pair was seen.
+    [[nodiscard]] bool take_unverified_frame(const std::string& command_id,
+                                             const std::string& agent_id);
     // The former in-process `cmd_execution_ids_` map (command_id ->
     // execution_id) moved to Postgres (HA WS-1(1b), ADR-2002 section 5) —
     // see ExecutionTracker::record_command_dispatch /
@@ -729,10 +741,12 @@ private:
     /// `response_dropped` is true when the frame the response store was given for this response
     /// was not kept (a failed write, a lost terminal answer, or a cap-refused non-terminal frame);
     /// the tracker records it with the agent's status (same upsert) and never clears it, so the
-    /// fill of a result set can count that agent as unanswered. Out-of-band callers omit it.
+    /// fill of a result set can count that agent as unanswered. A terminal frame also reports an
+    /// earlier non-terminal frame of the same agent whose provenance was unresolved (stored under
+    /// the unverified label, so absent from the fill's read). Keepalive callers pass false.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
                              const pb::CommandResponse& resp, const ResponseProvenance& prov,
-                             bool response_dropped = false);
+                             bool response_dropped);
 
     /// #4990: the failure text of a terminal frame in the form the server's own derived sinks may
     /// carry: the execution tracker (and through it the drawer, the event stream and the outbox),

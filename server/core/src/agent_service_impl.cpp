@@ -1594,9 +1594,14 @@ grpc::Status AgentServiceImpl::Subscribe(
             const ResponseProvenance prov =
                 resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
             if (resp.output() == "__keepalive__") {
-                notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+                notify_exec_tracker(resp.command_id(), agent_id, resp, prov,
+                                    /*response_dropped=*/false);
                 continue;
             }
+            // Stored under the unverified label, which the result-set fill never reads, and
+            // reaching no tracker row: the pair's terminal frame reports it (take_unverified_frame).
+            if (!prov.verified())
+                note_unverified_frame(resp.command_id(), agent_id);
 
             // Track first response for server-side latency
             {
@@ -1731,6 +1736,10 @@ grpc::Status AgentServiceImpl::Subscribe(
                 }
                 // FR::Updated → row already updated in place, no insert.
             }
+            // An earlier RUNNING frame of this agent stored as unverified is absent from the
+            // result-set fill's read: the answer is not fully stored. Always consumed.
+            if (take_unverified_frame(resp.command_id(), agent_id))
+                response_dropped = true;
 
             // A terminal frame that carries output AND the agent-stamped action owes its audit
             // rows too (defence in depth: this agent's terminal frame carries no output); a frame
@@ -2008,9 +2017,12 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         const ResponseProvenance prov =
             resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
         if (resp.output() == "__keepalive__") {
-            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov,
+                                /*response_dropped=*/false);
             return;
         }
+        if (!prov.verified()) // see the Subscribe twin
+            note_unverified_frame(resp.command_id(), agent_id);
 
         // Track first response for server-side latency
         {
@@ -2112,6 +2124,8 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             }
             // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
+        if (take_unverified_frame(resp.command_id(), agent_id)) // see the Subscribe twin
+            response_dropped = true;
 
         // A terminal frame that carries output owes its audit rows too (see the Subscribe twin;
         // the hook has logged any failure (and counted the rows it knows) itself).
@@ -2266,6 +2280,29 @@ std::string AgentServiceImpl::failure_text_for_sinks(const std::string& plugin,
         text = std::move(cleaned);
     }
     return text;
+}
+
+namespace {
+int64_t steady_seconds_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
+void AgentServiceImpl::note_unverified_frame(const std::string& command_id,
+                                             const std::string& agent_id) {
+    const std::size_t evicted = unverified_frames_.note(command_id, agent_id, steady_seconds_now());
+    if (evicted > 0)
+        metrics_
+            .counter("yuzu_server_response_ingest_dropped_total",
+                     {{"reason", "unverified_registry_overflow"}})
+            .increment(static_cast<double>(evicted));
+}
+
+bool AgentServiceImpl::take_unverified_frame(const std::string& command_id,
+                                             const std::string& agent_id) {
+    return unverified_frames_.consume(command_id, agent_id, steady_seconds_now());
 }
 
 void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,

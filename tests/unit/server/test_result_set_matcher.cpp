@@ -10,6 +10,7 @@
  */
 
 #include "result_set_matcher.hpp"
+#include "unverified_frame_registry.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -803,4 +804,42 @@ TEST_CASE("unanswered_agent_count: a counted answer whose response was not store
     CHECK(unanswered_agent_count(3, 3, true) == 0);
     // A negative count never lowers the result.
     CHECK(unanswered_agent_count(3, 1, true, -4) == 2);
+}
+
+// The registry the ingest paths use to carry an unverified non-terminal frame to the same agent's
+// terminal frame (UP-1). The clock is injected, so expiry is tested without waiting.
+TEST_CASE("UnverifiedFrameRegistry: a noted pair is consumed once",
+          "[result_set][unverified_frames]") {
+    yuzu::server::UnverifiedFrameRegistry reg;
+    CHECK(reg.note("cmd-1", "agent-a", 100) == 0);
+    CHECK(reg.note("cmd-1", "agent-a", 101) == 0); // a repeat keeps one entry
+    CHECK(reg.size() == 1);
+    CHECK_FALSE(reg.consume("cmd-1", "agent-b", 102)); // another agent of the same command
+    CHECK_FALSE(reg.consume("cmd-2", "agent-a", 102)); // another command of the same agent
+    CHECK(reg.consume("cmd-1", "agent-a", 102));
+    CHECK_FALSE(reg.consume("cmd-1", "agent-a", 103)); // reported to one terminal frame only
+    CHECK(reg.size() == 0);
+}
+
+TEST_CASE("UnverifiedFrameRegistry: the capacity evicts the oldest entry and reports it",
+          "[result_set][unverified_frames]") {
+    yuzu::server::UnverifiedFrameRegistry reg(2, 3600);
+    CHECK(reg.note("cmd", "a1", 10) == 0);
+    CHECK(reg.note("cmd", "a2", 11) == 0);
+    CHECK(reg.note("cmd", "a3", 12) == 1);
+    CHECK(reg.size() == 2);
+    CHECK_FALSE(reg.consume("cmd", "a1", 13)); // the oldest was evicted
+    CHECK(reg.consume("cmd", "a2", 13));
+    CHECK(reg.consume("cmd", "a3", 13));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: an entry past the age bound is forgotten",
+          "[result_set][unverified_frames]") {
+    yuzu::server::UnverifiedFrameRegistry reg(16, 60);
+    CHECK(reg.note("cmd", "old", 1000) == 0);
+    CHECK(reg.note("cmd", "new", 1050) == 0);
+    CHECK_FALSE(reg.consume("cmd", "old", 1060)); // exactly at the bound: expired
+    CHECK(reg.consume("cmd", "new", 1060));
+    CHECK(reg.note("cmd", "late", 2000) == 0);
+    CHECK(reg.size() == 1); // expiry runs on note too
 }

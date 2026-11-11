@@ -19062,16 +19062,29 @@ private:
                                 auto sum = execution_tracker_->get_summary(p.source_execution_id);
                                 targeted = sum.agents_targeted;
                                 responded = sum.agents_responded;
-                                dropped = sum.agents_response_dropped;
                                 terminal = targeted > 0 && responded >= targeted;
+                            }
+                            const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
+                            if (!terminal && !timed_out)
+                                continue;
+                            // Only a set about to be filled pays for the dropped-answer count. A
+                            // count that cannot be read skips the set for this tick (it retries on
+                            // the next), never reads as zero and never pins the set as incomplete.
+                            if (execution_tracker_) {
+                                const auto lost =
+                                    execution_tracker_->count_response_dropped(p.source_execution_id);
+                                if (!lost) {
+                                    spdlog::warn("result set {}: dropped-answer count for execution "
+                                                 "{} unreadable; fill retried next tick",
+                                                 p.id, p.source_execution_id);
+                                    continue;
+                                }
+                                dropped = *lost;
                             }
                             // An agent counted as responded whose answer was not persisted is
                             // absent from the stored rows the membership is built from: unanswered.
                             const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
                                 targeted, responded, execution_tracker_ != nullptr, dropped);
-                            const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
-                            if (!terminal && !timed_out)
-                                continue;
 
                             // Membership: every responder whose (status,
                             // output) satisfies the pending row's matcher.

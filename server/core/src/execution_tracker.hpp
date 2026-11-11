@@ -131,11 +131,6 @@ struct ExecutionSummary {
     int agents_success{0};
     int agents_failure{0};
     int progress_pct{0};
-    /// Agents whose response the response store did not fully keep (their status row says
-    /// `response_dropped`: a terminal answer or a streamed frame is missing). Their answer is
-    /// missing from every stored-response read, so a consumer building membership from stored rows
-    /// must treat each as unanswered. 1 when the count itself could not be read.
-    int agents_response_dropped{0};
 };
 
 struct AgentExecStatus {
@@ -410,6 +405,12 @@ public:
     [[nodiscard]] std::expected<std::optional<Execution>, std::string>
     get_execution_checked(const std::string& id) const;
     ExecutionSummary get_summary(const std::string& id) const;
+    /// Agents of `execution_id` whose response the response store did not fully keep (their status
+    /// row says `response_dropped`: a terminal answer or a streamed frame is missing). Their answer
+    /// is missing from every stored-response read, so a consumer building membership from stored
+    /// rows must treat each as unanswered. `nullopt` when the count could not be read (store not
+    /// open, no connection, query failure): the caller must not read that as zero.
+    [[nodiscard]] std::optional<int64_t> count_response_dropped(const std::string& execution_id) const;
     std::vector<AgentExecStatus> get_agent_statuses(const std::string& execution_id) const;
     /// #1634 (Doomgoose review finding, important) — degrade-distinguishable
     /// twin of `get_agent_statuses`, for the #1634 visibility/audit call

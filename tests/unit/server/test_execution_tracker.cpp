@@ -1323,7 +1323,7 @@ TEST_CASE("ExecutionTracker: plugin_result_status round-trips through update/get
     CHECK(seen == 2);
 }
 
-TEST_CASE("ExecutionTracker: response_dropped is counted in the summary and is sticky",
+TEST_CASE("ExecutionTracker: response_dropped is counted and is sticky",
           "[pg][execution_tracker][response_dropped]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     ExecutionTracker& tracker = *tracker_bundle;
@@ -1336,8 +1336,8 @@ TEST_CASE("ExecutionTracker: response_dropped is counted in the summary and is s
     kept.status = "success";
     tracker.update_agent_status(*id_result, kept);
 
-    // A terminal write that reports a lost answer still counts as responded; the summary says its
-    // answer is missing.
+    // A terminal write that reports a lost answer still counts as responded; the dropped count says
+    // its answer is missing.
     AgentExecStatus lost;
     lost.agent_id = "agent-lost";
     lost.status = "success";
@@ -1346,7 +1346,7 @@ TEST_CASE("ExecutionTracker: response_dropped is counted in the summary and is s
 
     auto summary = tracker.get_summary(*id_result);
     CHECK(summary.agents_responded == 2);
-    CHECK(summary.agents_response_dropped == 1);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
 
     // No later write clears it: a stale running frame, nor a redelivered terminal one whose
     // response was stored.
@@ -1354,13 +1354,13 @@ TEST_CASE("ExecutionTracker: response_dropped is counted in the summary and is s
     stale.agent_id = "agent-lost";
     stale.status = "running";
     tracker.update_agent_status(*id_result, stale);
-    CHECK(tracker.get_summary(*id_result).agents_response_dropped == 1);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
 
     AgentExecStatus redelivered;
     redelivered.agent_id = "agent-lost";
     redelivered.status = "success";
     tracker.update_agent_status(*id_result, redelivered);
-    CHECK(tracker.get_summary(*id_result).agents_response_dropped == 1);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
 }
 
 TEST_CASE("ExecutionTracker: a lost streaming frame survives the agent's terminal write",
@@ -1377,11 +1377,11 @@ TEST_CASE("ExecutionTracker: a lost streaming frame survives the agent's termina
     running.status = "running";
     running.response_dropped = true;
     tracker.update_agent_status(*id_result, running);
-    CHECK(tracker.get_summary(*id_result).agents_response_dropped == 1);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
 
     running.response_dropped = false;
     tracker.update_agent_status(*id_result, running);
-    CHECK(tracker.get_summary(*id_result).agents_response_dropped == 1);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
 
     // The terminal write carries a stored answer; the flag still holds, because the stored
     // terminal row cannot restore the lost frame.
@@ -1391,14 +1391,14 @@ TEST_CASE("ExecutionTracker: a lost streaming frame survives the agent's termina
     tracker.update_agent_status(*id_result, terminal);
     auto summary = tracker.get_summary(*id_result);
     CHECK(summary.agents_responded == 1);
-    CHECK(summary.agents_response_dropped == 1);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
 
     // An agent whose frames were all kept is unaffected.
     AgentExecStatus clean;
     clean.agent_id = "agent-clean";
     clean.status = "success";
     tracker.update_agent_status(*id_result, clean);
-    CHECK(tracker.get_summary(*id_result).agents_response_dropped == 1);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
 }
 
 TEST_CASE("ExecutionTracker: a later frame overwrites the typed status via ON CONFLICT (CC-07)",

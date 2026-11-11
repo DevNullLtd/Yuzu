@@ -762,6 +762,18 @@ to `notify_exec_tracker`, which sets `AgentExecStatus::response_dropped` in the 
 status (migration v10). The flag is sticky: the stored value is the OR of every write for the
 agent, so a later write, terminal or not, never clears it (a stored later frame cannot restore a
 lost earlier one). It is not part of any event payload, so the outbox contract is unchanged.
-`ExecutionTracker::get_summary` reports the count as `agents_response_dropped`, and the result-set
-fill adds it to the unanswered agents, so a set whose member answer was lost is recorded as
-incomplete. A new response-ingest site must pass the same fact.
+`ExecutionTracker::count_response_dropped` returns the count (`nullopt` when it cannot be read), and
+the result-set fill asks for it only once the execution is terminal or the set has timed out, adds
+it to the unanswered agents, and retries on the next tick when the count is unreadable. A set whose
+member answer was lost is therefore recorded as incomplete. A new response-ingest site must pass the
+same fact.
+
+A non-terminal frame whose provenance could not be resolved is stored under the unverified label,
+which the fill never reads, and reaches no tracker row (it carries no execution id). Each ingest
+path records such a frame per (command id, agent id) in an in-memory registry
+(`unverified_frame_registry.hpp`, at most 4,096 entries and one hour per entry), and the same pair's
+terminal frame consumes the record and reports `response_dropped`. When the registry is full the
+oldest record is evicted and counted as
+`yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Residual: the
+registry is per process, so a restart, or a terminal frame served by a different replica than the
+non-terminal one, loses the record and the set can read as complete without that frame's output.

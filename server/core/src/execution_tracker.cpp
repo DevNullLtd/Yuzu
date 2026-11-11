@@ -1019,18 +1019,26 @@ ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
         s.agents_success = exec->agents_success;
         s.agents_failure = exec->agents_failure;
         s.progress_pct = s.agents_targeted > 0 ? (s.agents_responded * 100 / s.agents_targeted) : 0;
-        // Agents whose response the store did not fully keep (sticky flag). A failed count
-        // reads 1 ("not known to be zero"): the caller uses this to refuse a completeness claim.
-        pg::PgResult dropped = pg::exec_params(
-            lease.get(),
-            "SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
-            "WHERE execution_id = $1 AND response_dropped",
-            std::vector<std::string>{id});
-        s.agents_response_dropped = (dropped.status() == PGRES_TUPLES_OK && PQntuples(dropped.get()) == 1)
-                                        ? static_cast<int>(to_i64(col(dropped.get(), 0, 0)))
-                                        : 1;
     }
     return s;
+}
+
+std::optional<int64_t> ExecutionTracker::count_response_dropped(const std::string& execution_id) const {
+    if (!open_)
+        return std::nullopt;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+    // No index on the flag: the result-set fill pass is the only caller and asks only once the
+    // execution is terminal or timed out, and the scan is bounded by the execution's own rows.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
+        "WHERE execution_id = $1 AND response_dropped",
+        std::vector<std::string>{execution_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return std::nullopt;
+    return to_i64(col(res.get(), 0, 0));
 }
 
 std::optional<std::vector<AgentExecStatus>>

@@ -473,8 +473,9 @@ PROVENANCE_EXACT: dict[str, list[tuple[str, str, int, str]]] = {
         ("prov-notify-sites", r"(?<![:\w])notify_exec_tracker\(", 6,
          "notify_exec_tracker is called at exactly six sites (keepalive, RUNNING, terminal on each path)"),
         ("prov-notify-carries-provenance",
-         r"(?<![:\w])notify_exec_tracker\(resp\.command_id\(\),agent_id,resp,prov(?:,response_dropped)?\)", 6,
-         "every notify_exec_tracker call passes the frame's already-resolved provenance"),
+         r"(?<![:\w])notify_exec_tracker\(resp\.command_id\(\),agent_id,resp,prov,(?:response_dropped|false)\)", 6,
+         "every notify_exec_tracker call passes the frame's already-resolved provenance and an "
+         "explicit dropped-answer flag (false only at the two keepalive sites)"),
         ("prov-plugin-aliases", r"const std::string&(?:plugin|plugin_name|gw_plugin)=prov\.plugin;", 4,
          "the plugin used by the stored row, the live output and the registry audit is the resolved one"),
         ("prov-no-call-in-plugin-assign", r"\b(?:sr|ae)\.plugin=[^;]*\(", 0,

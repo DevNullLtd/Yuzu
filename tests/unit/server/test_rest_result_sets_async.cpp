@@ -4934,7 +4934,7 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
           std::string::npos);
     CHECK(src.find("targeted, responded, execution_tracker_ != nullptr, dropped);") !=
           std::string::npos);
-    CHECK(src.find("dropped = sum.agents_response_dropped;") != std::string::npos);
+    CHECK(src.find("dropped = *lost;") != std::string::npos);
     // The parent's completeness is snapshotted onto the pending row at create time
     // (inherit_completeness); the tick never reads the parent.
     CHECK(src.find("fold_parent_completeness") == std::string::npos);
