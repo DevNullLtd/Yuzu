@@ -45,7 +45,8 @@ struct SyncSource {
 
     /// Why the most recent collect() returned nullopt — a bounded token the
     /// scheduler persists as sync.<name>.last_skip; sources that cannot classify
-    /// leave it unset.
+    /// leave it unset. No in-tree source sets it at present, and emit_sync_skip_tags
+    /// publishes the skip tags only with a reason, so none are published.
     std::function<std::string()> skip_reason;
 
     /// Retry a skipped cycle on the bounded phase-aligned backoff
@@ -62,12 +63,59 @@ struct SyncSource {
     /// Unset (the default) keeps the interval/phase-slot cadence unchanged. A
     /// compile-time default per source: no settings channel pushes it yet.
     std::optional<SyncWindow> window;
+
+    /// Exempt this source from the weekly forced full (kFullFloor). Only for a source whose
+    /// payload heals divergence by itself, section by section: installed_software (blob v3)
+    /// names the facets it holds in its report hash, and the server refuses a delta over a base
+    /// that no longer matches (`installed_software:<facet>` nack -> that facet is resent in
+    /// full), so a weekly blanket resend of every facet would only add load. A force, a
+    /// whole-source nack and a never-acknowledged hash still send full (decide_full).
+    bool no_full_floor{false};
+
+    /// A source that keeps its own per-section state (installed_software, blob v3) is told when
+    /// the scheduler is about to send FULL regardless of what it collects: the operator forced
+    /// the source (request_now), the server nacked the whole source (force_full), or the weekly
+    /// floor is due (never for a no_full_floor source). Called on the ticking thread immediately
+    /// BEFORE collect(), in both tick passes, so a forced send always carries a full payload.
+    /// A never-acknowledged hash does NOT call it: the blob still goes (decide_full), and a
+    /// section the source holds no acknowledged set for is full by the source's own rule, so a
+    /// per-section nack in that window cannot re-force the sections already acknowledged.
+    /// Unset for every other source.
+    std::function<void()> on_force_full;
+
+    /// OR-ed into the full decision after the hash comparison: true when the payload this
+    /// source just collected must reach the server even though its content hash did not move
+    /// (a section whose status or token changed). A source that returns true MUST have put
+    /// something the server can parse in the blob. Unset = the hash alone decides.
+    std::function<bool()> wants_blob;
+
+    /// The acknowledgement of one report that carried this source: the `need_full` tokens that
+    /// name it (the source name itself, or `<name>:<detail>`), empty on a clean acknowledgement.
+    /// Called on the ticking thread BEFORE the scheduler persists its own state, on both the
+    /// clean and the nacked branch. Unset = nothing to commit.
+    std::function<void(const std::vector<std::string>&)> on_ack;
+
+    /// True when the last collect() deliberately left part of the payload for the next one
+    /// (a first contact split over several calls). A clean acknowledgement then re-fires the
+    /// source after kMinTickSeconds instead of at its next regular slot. Unset = false.
+    std::function<bool()> has_more;
 };
 
 /// Sanitise a skip reason for the KV / heartbeat tag: keep [A-Za-z0-9_.:=,-],
 /// replace any other byte with '_', truncate to kPluginHeartbeatMaxValueBytes
 /// (64) bytes.
 YUZU_EXPORT std::string sanitize_skip_reason(std::string_view reason);
+
+/// True for a non-empty run of ASCII digits, at most `max_len` long, with a value above zero
+/// (leading zeros allowed). Gates every KV counter that is published as a heartbeat tag.
+inline bool positive_digits(std::string_view s, std::size_t max_len) {
+    return s.size() <= max_len && s.find_first_not_of("0123456789") == std::string_view::npos &&
+           s.find_first_not_of('0') != std::string_view::npos;
+}
+
+/// The installed_software `__sync__` KV field holding the completeness-unknown count: written by
+/// the collector, read by emit_sync_completeness_unknown_tag.
+inline constexpr char kCompletenessUnknownTotalKey[] = "completeness_unknown_total";
 
 class YUZU_EXPORT SyncScheduler {
 public:
@@ -125,7 +173,8 @@ public:
     static constexpr std::string_view kAllSources{"all"};
 
     /// Hard floor: even with hash-skip, send a full payload at least this often
-    /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4). A
+    /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4), except
+    /// for a source that sets SyncSource::no_full_floor. A
     /// windowed source fires at a local-time moment, so across a spring-forward the 7th
     /// day's fire is an hour short of this floor and the full send lands on the 8th.
     static constexpr std::chrono::seconds kFullFloor{7 * 24 * 60 * 60};
@@ -204,10 +253,17 @@ private:
     /// offset in [0, kCatchUpWindow), and persist it. last_hash and force_full are
     /// left untouched.
     void catch_up_if_overdue(std::size_t idx, std::int64_t now_secs);
+    /// The blanket part of the full decision that does not depend on the collected hash: an
+    /// operator force or a whole-source nack, or the weekly floor. Computed BEFORE collect() so a
+    /// source can be told (SyncSource::on_force_full) and therefore produces a full payload for
+    /// every one of these. decide_full also sends the blob when no hash has ever been
+    /// acknowledged, which is not part of this blanket (see the definition).
+    bool forced_full_due(std::size_t idx, const State& st, std::int64_t now_secs) const;
     /// Hash-skip decision for one source at `now_secs`, given its freshly
     /// collected `hash` — factored out of tick() so the forced-source (pass 1)
     /// and batched (pass 2) paths make the identical decision.
-    bool decide_full(const State& st, const std::string& hash, std::int64_t now_secs) const;
+    bool decide_full(std::size_t idx, const State& st, const std::string& hash,
+                     std::int64_t now_secs) const;
     /// Apply one source's ReportInventory outcome (a name lookup against the
     /// ack's need_full list) to its persisted State — the exact success/nack
     /// state-transition tick() ran inline before this factor-out, now shared by
@@ -254,16 +310,25 @@ void emit_sync_skip_tags(TagMap& tags, const std::vector<std::string>& sources,
         const auto reason = get_fn(SyncScheduler::kv_key(name, "last_skip"));
         if (!streak || !reason || reason->empty() || sanitize_skip_reason(*reason) != *reason)
             continue;
-        if (streak->empty() || streak->size() > 6)
-            continue;
-        bool digits = true;
-        for (char c : *streak)
-            digits = digits && c >= '0' && c <= '9';
-        if (!digits || std::stol(*streak) <= 0)
+        if (!positive_digits(*streak, 6))
             continue;
         tags["yuzu.sync." + name + ".skip_streak"] = *streak;
         tags["yuzu.sync." + name + ".last_skip"] = *reason;
     }
+}
+
+/// Publish the installed_software collector's count of answers that declared no completeness
+/// as the heartbeat tag `yuzu.sync.installed_software.completeness_unknown_total`, read from the
+/// `__sync__` KV the collector persists it in. Emitted only for a positive value of at most nine
+/// ASCII digits; no protobuf field is added (#1567), the same pattern as emit_sync_skip_tags.
+template <typename TagMap>
+void emit_sync_completeness_unknown_tag(
+    TagMap& tags,
+    const std::function<std::optional<std::string>(const std::string& key)>& get_fn) {
+    const auto total =
+        get_fn(SyncScheduler::kv_key("installed_software", kCompletenessUnknownTotalKey));
+    if (total && positive_digits(*total, 9))
+        tags["yuzu.sync.installed_software.completeness_unknown_total"] = *total;
 }
 
 } // namespace yuzu::agent

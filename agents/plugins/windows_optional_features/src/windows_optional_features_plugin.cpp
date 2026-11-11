@@ -76,6 +76,9 @@ int report_dism_outcome(yuzu::CommandContext& ctx, std::string_view action,
     case wof_dism::Outcome::Kind::Ok:
         for (const auto& row : outcome.rows)
             ctx.write_output(row);
+        // A clean pass declares itself complete: the daily sync reads the typed completeness
+        // (an undeclared answer is UNKNOWN, never FULL) before it reports the facet's rows.
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
         return 0;
     case wof_dism::Outcome::Kind::ApiUnavailable:
         ctx.write_output(yuzu::wof::format_unavailable_row(action, "windows:dism:api_unavailable"));
