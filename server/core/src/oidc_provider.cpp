@@ -984,9 +984,9 @@ BoundedLookupHook& bounded_lookup_hook() {
 
 // Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses. On POSIX the caller
 // stops waiting after `timeout_sec` seconds (the lookup itself may run on until the resolver
-// returns, holding one pool slot). A failure is reported as false, or on POSIX as a status by
-// `resolve_host_addresses_status` (name did not resolve, lookup timed out, pool full). Own
-// function per platform because httplib's helper cannot be consumed
+// returns, holding one pool slot). On Windows this is `resolve_host_addresses` and a failure is
+// false; on POSIX it is `resolve_host_addresses_status`, which says why (name did not resolve,
+// lookup timed out, pool full). Own function per platform because httplib's helper cannot be consumed
 // generically: on Windows it returns a GetAddrInfoExW result cast to `addrinfo`, whose layout
 // differs after ai_addr (the blob, blob length and provider fields precede ai_next) and which must
 // be released with FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it

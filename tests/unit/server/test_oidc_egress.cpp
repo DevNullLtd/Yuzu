@@ -193,7 +193,7 @@ TEST_CASE("OIDC egress: a real host name goes through the OS resolver - no test 
 TEST_CASE("OIDC egress: a host name the real OS resolver cannot resolve is its own fixed failure",
           "[oidc][oidc_egress]") {
     // RFC 6761: ".invalid" never resolves. This runs the real resolver (the seam is not set), so
-    // the failure return of resolve_host_addresses is covered on every platform, with or without
+    // the failure return of the OIDC name lookup is covered on every platform, with or without
     // a network. A lookup that times out inside the 1 s budget reads the same.
     MockIdp idp;
     auto doc = OidcProvider::fetch_discovery_document("http://yuzu-no-such-host.invalid:1", false,
@@ -1636,11 +1636,11 @@ TEST_CASE("OIDC resolver: discovery refused for a full pool is not remembered - 
     CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
 }
 
-TEST_CASE("OIDC resolver: an IdP-supplied issuer text that quotes the busy reason still arms the "
-          "discovery window",
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN // uses MockIdp, which the TSan configuration excludes
+TEST_CASE("OIDC resolver: an issuer mismatch arms the discovery window (characterisation)",
           "[oidc][oidc_egress][oidc_resolver][oidc_discovery]") {
-    // The failure is an issuer mismatch whose text carries IdP-controlled bytes. Only the exact
-    // refusal composed by http_get_bounded may skip the window, so this one must arm it.
+    // Characterisation only: a failure that is an issuer mismatch (IdP-controlled text) arms the
+    // window. It does not guard the exact-match test on the pool-full refusal.
     MockIdp idp;
     idp.with([](MockIdp& m) { m.discovery_issuer = "the host name lookup was not started"; });
     auto cfg = resolver_cfg(idp.base());
@@ -1654,4 +1654,5 @@ TEST_CASE("OIDC resolver: an IdP-supplied issuer text that quotes the busy reaso
     CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
     CHECK(idp.discovery_calls.load() == 1);
 }
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
 #endif // !_WIN32
