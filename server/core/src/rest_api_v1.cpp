@@ -15470,6 +15470,10 @@ void RestApiV1::register_routes(
                     rs_err(res, 409, kParentNotReadyMessage);
                     return;
                 }
+                // Lineage only: a directly created set's members are the caller's explicit
+                // device_ids, not a narrowing of the parent's members, so it does not call
+                // inherit_completeness (the inventory and async producers, whose members come from
+                // the parent's, do).
                 cr.parent_id = pid;
                 if (payload.is_object())
                     payload["scope_input_id"] = pid;

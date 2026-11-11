@@ -16095,6 +16095,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
+                    // Lineage only: a directly created set's members are the caller's explicit
+                    // device_ids, not a narrowing of the parent's members, so it does not call
+                    // inherit_completeness (the inventory and async producers, whose members come
+                    // from the parent's, do).
                     cr.parent_id = *pid;
                     // #4306 follow-up: do NOT add the marker for a parent_id
                     // that failed ownership above -- that request is already
