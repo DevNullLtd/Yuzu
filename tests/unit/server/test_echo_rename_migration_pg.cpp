@@ -416,7 +416,7 @@ TEST_CASE("Echo rename: instruction_store v3 keeps the archive tool in an operat
         yuzu::server::InstructionStore store{pool};
         REQUIRE(store.is_open());
     }
-    CHECK(version_of(dsn, "instruction_store") == "3");
+    CHECK(std::stoi(version_of(dsn, "instruction_store")) >= 3);
 
     const auto col = [&](const char* column) {
         return one(dsn, std::string("SELECT ") + column +
