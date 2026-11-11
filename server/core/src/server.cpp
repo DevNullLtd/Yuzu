@@ -19063,6 +19063,7 @@ private:
                             // the timeout, and not counted in agents_failed. Never 0 without
                             // proof that every agent answered.
                             int64_t targeted = 0, responded = 0, dropped = 0;
+                            bool count_unreadable = false; // filled as incomplete without the count
                             if (execution_tracker_) {
                                 auto sum = execution_tracker_->get_summary(p.source_execution_id);
                                 targeted = sum.agents_targeted;
@@ -19089,17 +19090,13 @@ private:
                                                      "execution {} unreadable; {} (at most one "
                                                      "log per 30 s per set)",
                                                      p.id, p.source_execution_id,
-                                                     use ? "filled as incomplete"
+                                                     use ? "the set is filled as incomplete "
+                                                           "once its members are read"
                                                          : "fill retried next tick");
                                 }
                                 if (!use)
                                     continue;
-                                if (!lost)
-                                    metrics_
-                                        .counter("yuzu_result_sets_total",
-                                                 {{"source_kind", p.source_kind},
-                                                  {"result", "count_unreadable"}})
-                                        .increment();
+                                count_unreadable = !lost;
                                 dropped = *use;
                             }
                             // An agent counted as responded whose answer was not persisted is
@@ -19157,6 +19154,13 @@ private:
                                              {{"source_kind", p.source_kind},
                                               {"result", "materialized"}})
                                     .increment();
+                                // Counted once, for the fill that actually happened.
+                                if (count_unreadable)
+                                    metrics_
+                                        .counter("yuzu_result_sets_total",
+                                                 {{"source_kind", p.source_kind},
+                                                  {"result", "count_unreadable"}})
+                                        .increment();
                             } else {
                                 // Don't count a materialization that didn't happen
                                 // (review finding bug_008); surface the failure so

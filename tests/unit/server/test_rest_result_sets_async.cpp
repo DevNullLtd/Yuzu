@@ -4979,16 +4979,15 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     const auto skip_at = src.find(skip_then_count);
     REQUIRE(skip_at != std::string::npos);
     CHECK(count_in(src, skip_then_count) == 1);
-    const auto retry_at = src.find("if (!use) continue; if (!lost) metrics_", skip_at);
+    const auto retry_at = src.find("if (!use) continue; count_unreadable = !lost; "
+                                   "dropped = *use; } "
+                                   "const int64_t agents_unanswered = "
+                                   "rs_matcher::unanswered_agent_count(targeted, responded, "
+                                   "execution_tracker_ != nullptr, dropped);",
+                                   skip_at);
     REQUIRE(retry_at != std::string::npos);
     CHECK(retry_at - skip_at < 900); // the throttled warn's arguments, nothing else, in between
-    const std::string after_count =
-        "dropped = *use; } "
-        "const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(targeted, "
-        "responded, execution_tracker_ != nullptr, dropped);";
-    const auto unanswered_at = src.find(after_count, retry_at);
-    REQUIRE(unanswered_at != std::string::npos);
-    CHECK(unanswered_at - retry_at < 300); // the count_unreadable counter, nothing else
+    const auto unanswered_at = src.find("const int64_t agents_unanswered", retry_at);
     const auto members_at = src.find("result_set_members(*response_store_, forensics_plugins(), p)",
                                      unanswered_at);
     REQUIRE(members_at != std::string::npos);
@@ -4999,6 +4998,15 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
         "if (result_set_store_->materialize(p.id, members, agents_failed, agents_unanswered)) {";
     CHECK(count_in(src, materialize_call) == 1);
     CHECK(src.find(materialize_call, members_at) != std::string::npos);
+    // count_unreadable is counted once, only inside the successful fill, never at the decision.
+    const std::string forced_fill_count =
+        "if (count_unreadable) metrics_ .counter(\"yuzu_result_sets_total\", "
+        "{{\"source_kind\", p.source_kind}, {\"result\", \"count_unreadable\"}}) .increment();";
+    CHECK(count_in(src, "{\"result\", \"count_unreadable\"}") == 1);
+    const auto materialized_at = src.find(materialize_call, members_at);
+    const auto forced_at = src.find(forced_fill_count, materialized_at);
+    REQUIRE(forced_at != std::string::npos);
+    CHECK(forced_at - materialized_at < 400); // after the materialized counter, before the else
     // The parent's completeness is snapshotted onto the pending row at create time
     // (inherit_completeness); the tick never reads the parent.
     CHECK(src.find("fold_parent_completeness") == std::string::npos);
