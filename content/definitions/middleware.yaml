@@ -20,9 +20,9 @@
 ## more `<action>|<title>|<name>|<version>|<install_path>|<edition>` rows. A `supported` status
 ## with zero data rows means no registered installation was found at the places listed above;
 ## a `constrained` status means a read failed or was skipped and the rows may be incomplete --
-## failure never reads as absent. A `constrained` answer withholds every IBM MQ row for that
-## cycle (the daily installed-software sync drops the source), so previously stored rows
-## disappear until the source recovers.
+## failure never reads as absent. A `constrained` answer is sent by the daily
+## installed-software sync as a status-only section (no rows), so previously stored IBM MQ rows
+## are kept and shown as unconfirmed until the source recovers.
 
 ---
 apiVersion: yuzu.io/v1alpha1

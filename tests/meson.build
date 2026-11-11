@@ -360,6 +360,7 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_installed_software_v3.cpp', # SAM-15: the pure blob-v3 writer (installed_software_v3.hpp), server golden parity
     'unit/test_sync_window.cpp', # SAM-19: sync_window.hpp placement + overdue catch-up, fake zone
     'unit/test_inventory_sync_action_table.cpp',
     'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
@@ -4258,6 +4259,29 @@ test('agent guardian sender-refusal wiring lexical gate (#5690)',
 test('agent __sync__.now wiring lexical gate',
   _python3_test,
   args: [files('test_agent_sync_now_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Installed-software worker drain (SAM-15): the collector's detached workers must be drained
+# before any plugin is shut down, on BOTH agent.cpp teardown paths, and the single-flight state
+# must be the agent-owned object the factory receives. The unit tests cover the drain helper;
+# nothing runs the teardown, so this pins the call sites and the ownership. Carries its own
+# in-memory mutation self-test. No build required.
+test('agent installed-software drain wiring lexical gate',
+  _python3_test,
+  args: [files('test_installed_software_drain_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Installed-apps Windows Uninstall roots (SAM-15): windows_roots() is a function-local table in a
+# _WIN32 block and its only unit test is a Windows-only TU, so on any other host nothing observes
+# the absent_ok / degrades_walk flags (the row 1.4 degraded-case rule). This pins the three rows.
+# Carries its own in-memory mutation self-test. No build required.
+test('installed_apps windows roots lexical gate',
+  _python3_test,
+  args: [files('test_windows_uninstall_roots_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
