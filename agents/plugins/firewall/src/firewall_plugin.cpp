@@ -2407,6 +2407,14 @@ private:
                                        bool inbound) {
         const auto op = fq::win_release_slot_op(prior, i, inbound);
         if (op == fq::WinSlotOp::delete_local) {
+            // The running firewall service holds our block in memory and may not reread a
+            // registry delete, so first put the OS default back through the API (inbound
+            // block, outbound allow: what "not configured" resolves to), then remove the
+            // local value so the store reads not configured again.
+            const NET_FW_ACTION os_default = inbound ? NET_FW_ACTION_BLOCK : NET_FW_ACTION_ALLOW;
+            if ((inbound ? policy.put_DefaultInboundAction(kQuarantineProfiles[i], os_default)
+                         : policy.put_DefaultOutboundAction(kQuarantineProfiles[i], os_default)) != S_OK)
+                return false;
             const LONG rc = RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kLocalProfileKeys[i], name);
             return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND;
         }
