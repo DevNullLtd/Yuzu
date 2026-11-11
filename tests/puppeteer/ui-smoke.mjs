@@ -3,13 +3,13 @@
 //   1. NAV CRAWL  every shell nav route answers 200 with the CSP header and no page errors,
 //                 and the discovered set matches EXPECTED (nav drift fails both ways).
 //   2. OVERFLOW   submit controls stay inside their form/dialog and the viewport (#5576).
-//   3. SCENARIOS  stubbed write paths (#6076, add user, #5840, #6074); each forces its own
-//                 precondition with a request stub, nothing is written to the server.
+//   3. SCENARIOS  stubbed write paths (#6076, add user, #5840, #6074) and the DEX Apps tab; each
+//                 forces its own precondition with a request stub, nothing is written to the server.
 // One line per check; exit 1 when any check fails.
 //
 // `--selftest` needs no stack and no login: it proves the checks can fail, against a local
 // fixture server (see the SELFTEST section).
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -266,6 +266,94 @@ async function scenarioPki(page) {
     w.pageErrors().length === 0, JSON.stringify(w.pageErrors()));
 }
 
+// AP-3.2: the DEX Apps tab. Two halves, both always run (a missing element is a FAIL, never a skip):
+//   live    the tab opens against the real server and a platform chip is activated from the keyboard
+//   golden  the committed golden of the production renderer (apps__versions.html, byte-pinned by the
+//           golden unit test) is served through a stub, so the version expander and the score
+//           decomposition are opened and closed on every run, whatever the live stack holds
+// Names the wait that timed out; a bare "Waiting failed" says nothing about which one.
+const at = (what, p) => p.catch((e) => { throw new Error(what + ': ' + (e && e.message ? e.message : e)); });
+
+const APPS_GOLDEN = new URL('../unit/server/golden/dex/apps__versions.html', import.meta.url);
+
+async function openAppsTab(page) {
+  await at('open /dex', visit(page, '/dex'));
+  // Wait for htmx to have bound the tab (it sets its internal data when it processes the swapped
+  // fragment); a click before that is a no-op and the tab never opens.
+  await at('Apps tab bound by htmx', page.waitForFunction(() => {
+    const a = [...document.querySelectorAll('#guardian-detail .gp-subnav a')].find((x) => x.textContent.trim() === 'Apps');
+    return !!a && !!a['htmx-internal-data'];
+  }, { timeout: WAIT_MS }));
+  const tab = await page.evaluateHandle(() =>
+    [...document.querySelectorAll('#guardian-detail .gp-subnav a')].find((a) => a.textContent.trim() === 'Apps'));
+  await tab.click();
+  await at('Apps fragment (#dex-apps)', page.waitForSelector('#dex-apps', { timeout: WAIT_MS }));
+  await at('htmx settled', settled(page));
+}
+
+const windowsChipLit = (page) => page.waitForFunction(() => {
+  const b = [...document.querySelectorAll('#dex-apps button.gp-chip')].find((c) => c.textContent.trim() === 'Windows');
+  return !!b && b.classList.contains('on') && b.getAttribute('aria-pressed') === 'true';
+}, { timeout: WAIT_MS });
+
+// Computed display of the first version row of the first application.
+const versionRowDisplay = (page) => page.$eval('tbody.dx-app .dx-ver', (r) => getComputedStyle(r).display);
+// Whether the first score decomposition is rendered. A closed <details> keeps its content's layout
+// boxes (getClientRects is not empty), so visibility, not geometry, is the test.
+const decompositionShown = (page) => page.$eval('details.dx-score .dx-ded', (d) => d.checkVisibility());
+
+async function scenarioDexApps(page) {
+  const w = watch(page);
+
+  // live: Tab-order equivalent: focus the chip and press Enter, never a mouse click.
+  await openAppsTab(page);
+  await page.evaluate(() => {
+    [...document.querySelectorAll('#dex-apps button.gp-chip')].find((c) => c.textContent.trim() === 'Windows').focus();
+  });
+  await page.keyboard.press('Enter');
+  await at('Windows chip lit', windowsChipLit(page));
+  await at('htmx settled', settled(page));
+  await quiesce(page);
+  check('dex-apps live: the Apps tab opens and the Windows chip lights from the keyboard',
+    w.errors().length === 0, JSON.stringify(w.errors()));
+
+  // golden: the production markup under the real shell and CSP.
+  w.reset();
+  const body = readFileSync(APPS_GOLDEN, 'utf8');
+  await stub(page, { path: '/fragments/dex/apps', status: 200, contentType: 'text/html', body });
+  await openAppsTab(page);
+  const have = await page.evaluate(() => ({
+    tog: !!document.querySelector('details.dx-vx'), sc: !!document.querySelector('details.dx-score'),
+  }));
+  check('dex-apps golden: the page has a versions expander and a score decomposition', have.tog && have.sc,
+    JSON.stringify(have));
+  if (have.tog && have.sc) {
+    const shut = await versionRowDisplay(page);
+    await page.focus('details.dx-vx > summary');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('tbody.dx-app .dx-ver')).display === 'table-row',
+      { timeout: WAIT_MS });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('tbody.dx-app .dx-ver')).display === 'none',
+      { timeout: WAIT_MS });
+    check('dex-apps golden: the versions expander opens and closes from the keyboard', shut === 'none');
+
+    const before = await decompositionShown(page);
+    await page.focus('details.dx-score > summary');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('details.dx-score .dx-ded').checkVisibility(),
+      { timeout: WAIT_MS });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !document.querySelector('details.dx-score .dx-ded').checkVisibility(),
+      { timeout: WAIT_MS });
+    check('dex-apps golden: the score decomposition opens and closes', before === false);
+  }
+  await quiesce(page);
+  check('dex-apps: no page error and no CSP violation across the scenario', w.errors().length === 0,
+    JSON.stringify(w.errors()));
+  clearStubs(page);
+}
+
 // ---- selftest ------------------------------------------------------------------------
 // A gate whose checks can pass vacuously is worse than none, so every crawl and overflow check
 // gets a positive control. A local fixture serves a fake shell (28 nav links, forms) with the
@@ -406,6 +494,7 @@ async function main() {
       ['add-user', scenarioAddUser],
       ['ctrl-k', scenarioCtrlK],
       ['pki', scenarioPki],
+      ['dex-apps', scenarioDexApps],
     ];
     for (const [name, fn] of scenarios) {
       const p = await browser.newPage();

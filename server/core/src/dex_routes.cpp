@@ -2,6 +2,7 @@
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
+#include "dex_apps_ui.hpp"
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
@@ -2084,43 +2085,6 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
     return h;
 }
 
-std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
-                                     int window_days) {
-    std::string h = "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
-    h += dex_subnav("apps", window_days);
-    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Applications</h1></div>"
-         "<div class=\"gp-sub\">Stability per application across the fleet &mdash; crashes &amp; "
-         "hangs, keyed on the process image.</div></div></div>";
-    h += dex_window_chips("/fragments/dex/apps", window_days);
-    if (!store)
-        return h + placeholder("Apps unavailable", "The signal store is not open.");
-    const auto apps = store->dex_top_apps(since, 100);
-    if (apps.empty())
-        return h + placeholder("No data", "No app crashes or hangs recorded in this window.");
-    const std::string w = dex_window_token(window_days);
-    h += "<table class=\"gp-table\"><thead><tr><th>Application</th>"
-         "<th class=\"gp-num\">Crashes</th><th class=\"gp-num\">Hangs</th>"
-         "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
-    for (const auto& a : apps) {
-        const std::string label =
-            a.subject.empty()
-                ? std::string("&lt;unknown&gt;")
-                : drill_link("/fragments/dex/app", "name=" + url_encode(a.subject) + "&window=" + w,
-                             esc(a.subject));
-        h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(a.crashes) +
-             "</td><td class=\"gp-num\">" + num(a.hangs) + "</td><td class=\"gp-num\">" +
-             num(a.distinct_devices) + "</td><td class=\"gp-mute\">" + esc(a.last_seen) +
-             "</td></tr>";
-    }
-    h += "</tbody></table>";
-    h += "<div class=\"gp-note\">Stability by application (crashes + hangs). Devices = blast radius "
-         "(distinct devices); row &rarr; app detail, which cross-links to per-version CPU &amp; "
-         "memory performance. Repository / install / other reliability signals attribute to an app "
-         "once per-event app capture lands (Option&nbsp;D); per-version crash/hang counts on the "
-         "performance page remain a follow-on slice.</div>";
-    return h;
-}
-
 // ── A4: device perf sparklines (federated Echo query) ────────────────────────
 
 namespace {
@@ -2542,11 +2506,20 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     sink.Get("/fragments/dex/apps", [this](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
+        // Canonical window and platform only: the raw params never reach the API or the markup.
+        // Always 200 (htmx drops a non-2xx body), so a failure is an error panel, never a bare status.
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        const std::string since = iso_days_ago(window_days);
-        res.set_content(render_dex_apps_fragment(store_, since, window_days),
-                        "text/html; charset=utf-8");
+        const std::string scope = dex_normalize_apps_scope(
+            req.has_param("platform") ? req.get_param_value("platform") : kDexAppsScopeAll);
+        DexAppsModel model;
+        if (dex_api_ && !scope.empty()) {
+            model = dex_api_->apps(dex_window_token(window_days), scope);
+        } else {
+            model.degraded = true;
+            model.degraded_reason = scope.empty() ? "invalid_scope" : "";
+        }
+        res.set_content(render_dex_apps_fragment(model, window_days, scope), "text/html; charset=utf-8");
     });
 
     // -- Catalogue: family-card grid (View 1) + a family's signals (View 2) --

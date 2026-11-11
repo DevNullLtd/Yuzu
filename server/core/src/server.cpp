@@ -19985,6 +19985,9 @@ private:
             dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
                                          std::move(dex_policy_fn));
         }
+        // The Apps tab reads the same DexApi::apps model as REST and MCP (null store: its error panel).
+        if (dex_routes_)
+            dex_routes_->set_dex_api(dex_api);
         // ADR-0031 WS-A4 (seventh family): the schedule-read API seam — ONE
         // instance backing GET /fragments/schedules (WorkflowRoutes),
         // GET /api/v1/schedules (also WorkflowRoutes), and MCP
