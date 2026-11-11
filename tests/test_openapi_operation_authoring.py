@@ -370,6 +370,7 @@ def selftest():
 
 def main():
     selftest()
+    literal.selftest()  # the docs-lint job runs only this script, so it carries the detector's own self-test
     args = [pathlib.Path(a) for a in sys.argv[1:]]
     source = args[0] if args else SOURCE
     cpp_test = args[1] if len(args) > 1 else CPP_TEST

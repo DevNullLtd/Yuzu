@@ -2079,6 +2079,9 @@ TEST_CASE("config_routes: the v1 200 bodies conform to the served ConfigState an
     const json set_schema = oa::ok_response_schema(spec, "/config/{key}", "put");
     REQUIRE(state_schema.is_object());
     REQUIRE(set_schema.is_object());
+    // A const operator[] on a missing member asserts instead of failing, so require them first.
+    REQUIRE(state_schema.contains("$ref"));
+    REQUIRE(set_schema.contains("$ref"));
     CHECK(state_schema["$ref"] == "#/components/schemas/ConfigState");
     CHECK(set_schema["$ref"] == "#/components/schemas/ConfigSetResult");
 

@@ -2740,6 +2740,20 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
         const json* desc = find_at(spec, {"paths", "/config/{key}", "put", "description"});
         REQUIRE(desc != nullptr);
         CHECK(desc->get<std::string>().find("refused with a 403 on every key") != std::string::npos);
+
+        // The score-policy PUT and DELETE word the audit refusal (5000), the busy writer (2000)
+        // and the one retry rule in prose; the behaviour is pinned at the writer and route level,
+        // and these phrases pin that the served text keeps saying it.
+        for (const char* method : {"put", "delete"}) {
+            INFO("score-policy " << method << " retry wording");
+            const json* d = find_at(spec, {"paths", "/dex/score-policy", method});
+            REQUIRE(d != nullptr);
+            const std::string text = d->dump(); // the sentences sit in the operation and its 200/503
+            CHECK(text.find("Sec-Audit-Failed") != std::string::npos);
+            CHECK(text.find("retry_after_ms 5000") != std::string::npos);
+            CHECK(text.find("2000") != std::string::npos);
+            CHECK(text.find("retry with the old If-Match answers 409") != std::string::npos);
+        }
     }
 }
 
