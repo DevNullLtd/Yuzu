@@ -337,11 +337,20 @@ dashboard: it crawls every route the shell nav links to (200, the `Content-Secur
 header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
 discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
 directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
-and runs five scenarios (four that each force their own precondition, with writes answered by a
-request stub in the browser so nothing reaches the server, and the DEX Apps tab: a live keyboard
-half plus a committed golden page served through a GET stub). The gate first runs
+and runs seven scenarios (four that each force their own precondition, with writes answered by a
+request stub in the browser so nothing reaches the server; the DEX Apps tab: a live keyboard half
+plus a committed golden page served through a GET stub; a held Apps response superseded by Overview;
+and the DEX controls operated from the keyboard). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
-layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
+layout check fails when it should, and that the Apps expander check fails on the committed golden when
+its `:has()` rules are removed; a selftest failure fails the gate.
+
+The selftest half also runs in CI: the path-filtered `ui-smoke-selftest` workflow
+(`.github/workflows/ui-smoke-selftest.yml`) runs `node tests/puppeteer/ui-smoke.mjs --selftest` on a
+hosted `ubuntu-24.04` runner when `server/core/src/*_ui.cpp`, `server/core/static/**`,
+`tests/puppeteer/**`, the Apps goldens or the install script change. It is **not a required check**: it
+is path-filtered, and the `dev` ruleset blocks a merge on a required check that was skipped. The live
+half (the scenarios against a running dashboard) stays in `/test`, because it needs the UAT stack. A failure records FAIL (the
 older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,
 which installs the Node dependencies and Chrome for Testing when absent and proves the browser
 launches headless; if it cannot, the run aborts before the build. A missing

@@ -15,6 +15,7 @@
 
 #include "dex_api_local.hpp"
 
+#include "dex_apps_ui.hpp"             // render_dex_apps_fragment: the panel each cause reaches
 #include "dex_read_builders.hpp"        // build_dex_*_model parity oracles (store-reaching)
 #include "dex_read_model.hpp"          // the pure model structs
 #include "dex_routes.hpp"              // dex_iso_since / dex_window_to_days
@@ -33,13 +34,17 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <latch>
 #include <cstdio>
 #include <expected>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -514,6 +519,7 @@ TEST_CASE("DexApi: apps on a failed store read is degraded, never an empty list"
     const auto m = make_local_dex_api(&store, {})->apps("7d");
     CHECK(m.degraded);
     CHECK(m.apps.empty());
+    CHECK(m.degraded_reason == "query_error"); // a missing table is a query error, not a timeout
 }
 
 TEST_CASE("DexApi: apps caps versions at 20 and flags it", "[pg][dex][apps_model]") {
@@ -1375,3 +1381,262 @@ TEST_CASE("DexApi: a per-application event cap override reaches the store", "[pg
     CHECK(hangs_points(row(mixed, "CapMe.EXE")) == Approx(8.0 * 3 / (20 * 3)));
     CHECK(hangs_points(row(mixed, "app.exe")) == Approx(8.0 * 2 / (20 * 1)));
 }
+
+// -- #7520, #7522: why an Apps read was refused, driven for real -------------------------------
+
+namespace {
+
+using yuzu::server::DexReadFault;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgResult;
+
+double degrade_count(yuzu::MetricsRegistry& metrics, const char* reason) {
+    return metrics
+        .counter("yuzu_server_guardian_read_degrade_total",
+                 {{"reason", reason}, {"source", "guardian_state"}})
+        .value();
+}
+
+// A dedicated connection OUTSIDE every pool under test, so holding a lock on it never takes a lease.
+struct TableLock {
+    PgConn conn;
+    explicit TableLock(const std::string& dsn) : conn{PQconnectdb(dsn.c_str())} {
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    }
+    void hold_observations() {
+        PgResult b{PQexec(conn.get(), "BEGIN")};
+        REQUIRE(b.ok());
+        PgResult l{PQexec(conn.get(),
+                          "LOCK TABLE guaranteed_state_store.guardian_observations IN ACCESS EXCLUSIVE MODE")};
+        REQUIRE(l.ok());
+    }
+    void release() {
+        PgResult r{PQexec(conn.get(), "ROLLBACK")};
+        REQUIRE(r.ok());
+    }
+};
+
+std::string apps_page(const yuzu::server::DexAppsModel& m) {
+    return yuzu::server::render_dex_apps_fragment(m, 7, "windows");
+}
+
+} // namespace
+
+// The issue's "refused in under a second" is asserted as "refused while the lock is still held":
+// this suite bars elapsed-time assertions, and a refusal that returns while four reads are parked
+// on the lock cannot have waited for any of them.
+TEST_CASE("DexApi: budget saturation refuses the fifth read while four are parked on a table lock",
+          "[pg][dex][apps_model][degraded][saturation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the store so it outlives it
+    // The budget of four plus headroom, so no reader waits for a lease, and no lock timeout can cancel
+    // a blocked reader as 55P03.
+    PgPool pool{{.conninfo = db.dsn(), .size = 6, .lock_timeout_ms = 0}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    store.set_metrics(&metrics);
+    // No policy function: the refused read needs no lease (a policy read would take one).
+    const auto api = make_local_dex_api(&store, fleet20);
+
+    TableLock lock(db.dsn());
+    lock.hold_observations();
+    constexpr int kBudget = GuaranteedStateStore::kDexAppsConcurrentReads;
+    std::latch entered(kBudget);
+    store.set_apps_read_barrier_for_test([&] { entered.count_down(); });
+    std::atomic<int> served{0};
+    std::vector<std::thread> readers;
+    for (int i = 0; i < kBudget; ++i)
+        readers.emplace_back([&] {
+            const auto r = store.dex_app_stability_checked("", "windows", 10, 20, 5, {});
+            if (r)
+                served.fetch_add(1);
+        });
+    entered.wait(); // four reads hold their slots; each goes on to block on the table lock
+
+    const double before = degrade_count(metrics, "concurrency_budget");
+    const auto refused = api->apps("7d");
+    CHECK(refused.degraded);
+    CHECK(refused.degraded_reason == "concurrency_budget");
+    CHECK(apps_page(refused).find("Application stability is busy") != std::string::npos);
+    CHECK(degrade_count(metrics, "concurrency_budget") == before + 1.0);
+    CHECK(served.load() == 0); // the lock is still held: nobody has finished
+
+    lock.release();
+    for (auto& t : readers)
+        t.join();
+    store.set_apps_read_barrier_for_test({}); // clear only after the threads joined
+    CHECK(served.load() == kBudget);
+}
+
+// A 1 s statement timeout stands in for the issue's 31 s hold (the production pool's is 30 s).
+TEST_CASE("DexApi: a statement the pool cancels is statement_timeout, and its slot is freed",
+          "[pg][dex][apps_model][degraded][timeout]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    yuzu::MetricsRegistry metrics;
+    PgPool seed_pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore seeder(seed_pool); // seeding stays on the default-timeout store
+    REQUIRE(seeder.is_open());
+    seed_apps_fixture(seeder);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2, .statement_timeout_ms = 1000, .lock_timeout_ms = 0}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    store.set_metrics(&metrics);
+    {
+        // A DSN or PGOPTIONS carrying its own `options` suppresses the pool's value, and the read
+        // would then never be cancelled: fail here instead of hanging.
+        auto lease = pool.try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        PgResult sh{PQexec(lease.get(), "SHOW statement_timeout")};
+        REQUIRE(sh.ok());
+        REQUIRE(std::string(PQgetvalue(sh.get(), 0, 0)) == "1s");
+    }
+    const auto api = make_local_dex_api(&store, fleet20);
+    TableLock lock(db.dsn());
+    lock.hold_observations();
+    const double before = degrade_count(metrics, "statement_timeout");
+    const auto m = api->apps("7d");
+    CHECK(m.degraded);
+    CHECK(m.degraded_reason == "statement_timeout");
+    const std::string page = apps_page(m);
+    CHECK(page.find("Choose a shorter window") != std::string::npos);
+    CHECK(page.find("<tr") == std::string::npos); // never a figure
+    CHECK(degrade_count(metrics, "statement_timeout") == before + 1.0);
+    CHECK(degrade_count(metrics, "query_error") == 0.0);
+    lock.release();
+    // The budget slot was freed: with a budget of one, the next read serves.
+    store.set_apps_read_budget_for_test(1);
+    CHECK_FALSE(api->apps("7d").degraded);
+}
+
+// #7520 asks for each cause to be driven. The read's bounded lease wait (3 s) is clamped by the pool
+// to its saturation fast-fail window (500 ms) when every connection is already out, so the wait is
+// bounded and short; nothing here sleeps.
+TEST_CASE("DexApi: a pool with no free lease is pool_acquire_timeout and the busy panel",
+          "[pg][dex][apps_model][degraded][pool]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    const auto api = make_local_dex_api(&store, fleet20);
+    auto held = pool.try_acquire_for(std::chrono::seconds(5)); // the only lease
+    REQUIRE(held);
+    const auto m = api->apps("7d");
+    CHECK(m.degraded);
+    CHECK(m.degraded_reason == "pool_acquire_timeout");
+    CHECK(apps_page(m).find("Application stability is busy") != std::string::npos);
+}
+
+TEST_CASE("DexApi: a failed query is query_error and the database-read panel",
+          "[pg][dex][apps_model][degraded][query]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    TableLock admin(db.dsn());
+    {
+        PgResult r{PQexec(admin.conn.get(),
+                          "ALTER TABLE guaranteed_state_store.guardian_observations "
+                          "RENAME TO guardian_observations_away")};
+        REQUIRE(r.ok());
+    }
+    const auto fault = store.dex_app_stability_checked("", "windows", 10, 20, 5, {});
+    REQUIRE_FALSE(fault);
+    CHECK(fault.error() == DexReadFault::kQueryError);
+    const auto m = make_local_dex_api(&store, fleet20)->apps("7d");
+    CHECK(m.degraded_reason == "query_error");
+    CHECK(apps_page(m).find("The database read failed") != std::string::npos);
+    {
+        PgResult r{PQexec(admin.conn.get(),
+                          "ALTER TABLE guaranteed_state_store.guardian_observations_away "
+                          "RENAME TO guardian_observations")};
+        REQUIRE(r.ok());
+    }
+    CHECK_FALSE(make_local_dex_api(&store, fleet20)->apps("7d").degraded);
+}
+
+TEST_CASE("DexApi: an unopened store is store_not_open", "[dex][apps_model][degraded]") {
+    // A malformed conninfo never connects, so no database is needed.
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(pool.valid());
+    GuaranteedStateStore store(pool);
+    REQUIRE_FALSE(store.is_open());
+    const auto fault = store.dex_app_stability_checked("", "windows", 10, 20, 5, {});
+    REQUIRE_FALSE(fault);
+    CHECK(fault.error() == DexReadFault::kStoreNotOpen);
+    const auto m = make_local_dex_api(&store, fleet20)->apps("7d");
+    CHECK(m.degraded);
+    CHECK(m.degraded_reason == "store_not_open");
+    CHECK(yuzu::server::dex_degraded_message(m) == "DEX store read degraded (store_not_open)");
+}
+
+TEST_CASE("DexApi: a zero budget is concurrency_budget in the model and its message",
+          "[pg][dex][apps_model][degraded]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    store.set_apps_read_budget_for_test(0);
+    const auto fault = store.dex_app_stability_checked("", "windows", 10, 20, 5, {});
+    REQUIRE_FALSE(fault);
+    CHECK(fault.error() == DexReadFault::kConcurrencyBudget);
+    const auto m = make_local_dex_api(&store, fleet20)->apps("7d");
+    CHECK(m.degraded_reason == "concurrency_budget");
+    CHECK(yuzu::server::dex_degraded_message(m) == "DEX store read degraded (concurrency_budget)");
+}
+
+// -- #7519: the observer provider -----------------------------------------------------------
+
+TEST_CASE("DexApi: the observer provider is called once with the scope's ids and its split reaches "
+          "the model",
+          "[pg][dex][apps_model][observer]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    using yuzu::server::DexObserverState;
+    int calls = 0;
+    std::vector<std::string> seen;
+    const auto observer = [&](const std::vector<std::string>& ids) {
+        ++calls;
+        seen = ids;
+        std::vector<DexObserverState> out(ids.size(), DexObserverState::Armed);
+        if (!out.empty())
+            out.front() = DexObserverState::Disarmed;
+        return out;
+    };
+    const auto api = make_local_dex_api(&store, fleet23, {}, observer);
+    const auto m = api->apps("7d", "linux");
+    REQUIRE_FALSE(m.degraded);
+    CHECK(calls == 1);
+    CHECK(seen == std::vector<std::string>{"l1", "l2"}); // exactly the scope's ids
+    REQUIRE(m.observer_state);
+    REQUIRE(m.observer_state->size() == 1);
+    CHECK((*m.observer_state)[0].platform == "linux");
+    CHECK((*m.observer_state)[0].disarmed == 1);
+    CHECK((*m.observer_state)[0].armed == 1);
+    const auto all = api->apps("7d", "all");
+    REQUIRE(all.observer_state);
+    CHECK(calls == 2);
+    int64_t sum = 0;
+    for (const auto& r : *all.observer_state)
+        sum += r.armed + r.disarmed + r.none_reported;
+    CHECK(sum == *all.population); // the split and the population cannot disagree
+
+    // A refused read never pays the observer pass.
+    store.set_apps_read_budget_for_test(0);
+    const auto refused = api->apps("7d", "all");
+    CHECK(refused.degraded);
+    CHECK_FALSE(refused.observer_state);
+    CHECK(calls == 2);
+    store.set_apps_read_budget_for_test(4);
+
+    // No observer function: unknown, never zero. No fleet source: no ids to ask about.
+    CHECK_FALSE(make_local_dex_api(&store, fleet23)->apps("7d", "all").observer_state);
+    CHECK_FALSE(make_local_dex_api(&store, {}, {}, observer)->apps("7d", "all").observer_state);
+    CHECK(calls == 2);
+}
+
+// The route-level cases (throwing or unwired DexApi) live in test_dex_routes.cpp.

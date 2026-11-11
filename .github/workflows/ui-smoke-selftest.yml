@@ -1,0 +1,46 @@
+name: ui-smoke-selftest
+
+# Runs the browser smoke gate's selftest (tests/puppeteer/ui-smoke.mjs --selftest) when the files that
+# decide whether the DEX Apps expander and the smoke checks can fail change. The selftest needs no
+# stack and no login: it serves a local fixture, so it can run on a hosted runner. It proves the crawl,
+# overflow and Apps-expander checks fail when they should, including against the committed Apps golden
+# with its :has() rules removed.
+#
+# The LIVE half of the smoke (the scenarios against a running dashboard) stays in /test Phase 5: it
+# needs the UAT stack. This workflow is path-filtered, so it must NOT be made a required check: the
+# dev ruleset blocks a merge on a required check that was skipped.
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'server/core/src/*_ui.cpp'
+      - 'server/core/static/**'
+      - 'tests/puppeteer/**'
+      - 'tests/unit/server/golden/dex/apps__*.html'
+      - 'scripts/test/ensure-puppeteer.sh'
+      - '.github/workflows/ui-smoke-selftest.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  selftest:
+    name: ui-smoke selftest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Install puppeteer and Chrome for Testing
+        run: bash scripts/test/ensure-puppeteer.sh
+      - name: Browser smoke selftest
+        run: node tests/puppeteer/ui-smoke.mjs --selftest

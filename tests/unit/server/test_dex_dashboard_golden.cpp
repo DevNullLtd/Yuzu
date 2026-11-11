@@ -55,6 +55,7 @@
  * __policy-refused, __no-population). Its cases are pure (no store, no Postgres): shard C.
  */
 #include "dex_apps_ui.hpp"
+#include "dex_pane.hpp"
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "dex_routes.hpp"
 #include "dex_read_model.hpp"
@@ -71,6 +72,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -245,7 +247,33 @@ std::string context_at(const std::string& s, std::size_t pos, std::size_t ctx = 
 // golden file this run touches and the test FAILS afterwards ON PURPOSE
 // (a golden-file rewrite must never read as a silent pass) — re-run WITHOUT
 // the env var to confirm the freshly written files now compare equal.
+// Invariants every rendered DEX fragment must keep (#7522, #7505), checked on each golden cell:
+//   pane: every control that swaps into the shared pane carries its stale-response guard, so the
+//         count of hx-target="#guardian-detail" equals the count of hx-sync="#guardian-detail:replace";
+//   keyboard: no filter chip and no sub-navigation tab is a bare anchor (an anchor with no href is
+//         not in the tab order), and every chip says whether it is pressed.
+void check_pane_and_keyboard_invariants(const std::string& cell, const std::string& html) {
+    const auto count = [&](const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = html.find(needle); p != std::string::npos; p = html.find(needle, p + needle.size()))
+            ++n;
+        return n;
+    };
+    INFO("golden cell '" << cell << "'");
+    CHECK(count("hx-target=\"#guardian-detail\"") == count("hx-sync=\"#guardian-detail:replace\""));
+    CHECK(count("<a class=\"gp-chip") == 0);
+    std::size_t chips = count("<button type=\"button\" class=\"gp-chip");
+    CHECK(count("aria-pressed=") == chips);
+    const auto nav = html.find("class=\"gp-subnav\"");
+    if (nav != std::string::npos) {
+        const std::string subnav = html.substr(nav, html.find("</div>", nav) - nav);
+        CHECK(subnav.find("<a") == std::string::npos);
+        CHECK(subnav.find("<button type=\"button\"") != std::string::npos);
+    }
+}
+
 void check_golden(const std::string& cell, const std::string& html) {
+    check_pane_and_keyboard_invariants(cell, html);
     const std::string actual = normalize_time(html);
     const auto path = golden_dir() / (cell + ".html");
     if (std::getenv("YUZU_UPDATE_GOLDEN") != nullptr) {
@@ -412,20 +440,20 @@ TEST_CASE("DEX golden: catalogue group fragment — App reliability drill-down, 
              std::string::npos);
         CHECK(html.find("<tr hx-get=\"/fragments/dex/catalogue/signal?type=process.crashed&"
                         "window=all&os=all\" hx-target=\"#guardian-detail\" "
-                        "hx-swap=\"innerHTML\" style=\"cursor:pointer\"><td>App crash</td><td>"
+                        "hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\" style=\"cursor:pointer\"><td>App crash</td><td>"
                         "<span class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">"
                         "Windows</span></td><td class=\"gp-num\">2</td><td class=\"gp-num\">1</td>"
                         "<td class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
         CHECK(html.find("<tr hx-get=\"/fragments/dex/catalogue/signal?type=process.hung&"
                         "window=all&os=all\" hx-target=\"#guardian-detail\" "
-                        "hx-swap=\"innerHTML\" style=\"cursor:pointer\"><td>App hang</td><td>"
+                        "hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\" style=\"cursor:pointer\"><td>App hang</td><td>"
                         "<span class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">"
                         "Windows</span></td><td class=\"gp-num\">1</td><td class=\"gp-num\">1</td>"
                         "<td class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
         // One representative "monitored, quiet" watched row.
         CHECK(html.find("<tr class=\"gp-mute\" hx-get=\"/fragments/dex/catalogue/signal?"
                         "type=process.crashed_managed&window=all&os=all\" "
-                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\" "
                         "style=\"cursor:pointer\"><td>App crash (.NET)</td><td><span "
                         "class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">Windows"
                         "</span></td><td class=\"gp-num\">0</td><td class=\"gp-num\">&mdash;</td>"
@@ -442,7 +470,7 @@ TEST_CASE("DEX golden: catalogue group fragment — App reliability drill-down, 
              std::string::npos);
         CHECK(html.find("<tr hx-get=\"/fragments/dex/catalogue/signal?type=process.crashed&"
                         "window=24h&os=all\" hx-target=\"#guardian-detail\" "
-                        "hx-swap=\"innerHTML\" style=\"cursor:pointer\"><td>App crash</td><td>"
+                        "hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\" style=\"cursor:pointer\"><td>App crash</td><td>"
                         "<span class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">"
                         "Windows</span></td><td class=\"gp-num\">1</td><td class=\"gp-num\">1</td>"
                         "<td class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
@@ -469,14 +497,14 @@ TEST_CASE("DEX golden: catalogue group fragment — App reliability drill-down, 
                         "class=\"l\">Events (window)</div></div>") != std::string::npos);
         CHECK(html.find("<tr class=\"gp-mute\" hx-get=\"/fragments/dex/catalogue/signal?"
                         "type=process.crashed&window=all&os=linux\" "
-                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\" "
                         "style=\"cursor:pointer\"><td>App crash</td><td><span "
                         "class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">Linux"
                         "</span></td><td class=\"gp-num\">0</td><td class=\"gp-num\">&mdash;</td>"
                         "<td>watched</td></tr>") != std::string::npos);
         CHECK(html.find("<tr class=\"gp-mute dx-off\" hx-get=\"/fragments/dex/catalogue/signal?"
                         "type=process.crashed_managed&window=all&os=linux\" "
-                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\" "
                         "style=\"cursor:pointer\"><td>App crash (.NET)</td><td>"
                         "<span class=\"gp-pill draft\">not collected on linux</span></td>"
                         "<td class=\"gp-num\">&mdash;</td><td class=\"gp-num\">&mdash;</td>"
@@ -770,13 +798,11 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
         CHECK(html.find("<b class=\"gp-ok\">2 great</b> &middot; <b "
                         "class=\"gp-drift\">0 fair</b> &middot; <b class=\"gp-err\">"
                         "0 poor</b>.") != std::string::npos);
-        CHECK(html.find("<tr><td><a hx-get=\"/fragments/dex/device?id=dex-gold-1&window=all\" "
-                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                        "style=\"cursor:pointer;\">dex-gold-1</a></td><td class=\"gp-num\">2</td>"
+        CHECK(html.find("<tr><td><button type=\"button\" class=\"dx-lk\" hx-get=\"/fragments/dex/device?id=dex-gold-1&window=all\" "
+                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">dex-gold-1</button></td><td class=\"gp-num\">2</td>"
                         "<td class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
-        CHECK(html.find("<tr><td><a hx-get=\"/fragments/dex/device?id=dex-gold-2&window=all\" "
-                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                        "style=\"cursor:pointer;\">dex-gold-2</a></td><td class=\"gp-num\">1</td>"
+        CHECK(html.find("<tr><td><button type=\"button\" class=\"dx-lk\" hx-get=\"/fragments/dex/device?id=dex-gold-2&window=all\" "
+                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">dex-gold-2</button></td><td class=\"gp-num\">1</td>"
                         "<td class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
         check_golden("overview__win-all_visible-null", html);
     }
@@ -786,9 +812,8 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
         CHECK(html.find("<div class=\"gp-tile\"><div class=\"n good\">98</div><div "
                         "class=\"l\">Overall experience</div><div class=\"sx\">median of 2 "
                         "devices</div></div>") != std::string::npos);
-        CHECK(html.find("<tr><td><a hx-get=\"/fragments/dex/device?id=dex-gold-1&window=24h\" "
-                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                        "style=\"cursor:pointer;\">dex-gold-1</a></td><td class=\"gp-num\">1</td>"
+        CHECK(html.find("<tr><td><button type=\"button\" class=\"dx-lk\" hx-get=\"/fragments/dex/device?id=dex-gold-1&window=24h\" "
+                        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">dex-gold-1</button></td><td class=\"gp-num\">1</td>"
                         "<td class=\"gp-mute\">" + kRecent + "</td></tr>") != std::string::npos);
         check_golden("overview__win-24h_visible-null", html);
     }
@@ -799,7 +824,7 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
     {
         std::set<std::string> visible{"dex-gold-1"};
         const auto html = render_dex_overview_fragment(&store, "", 0, fleet, &visible);
-        CHECK(html.find("dex-gold-1</a></td><td class=\"gp-num\">2</td>") != std::string::npos);
+        CHECK(html.find("dex-gold-1</button></td><td class=\"gp-num\">2</td>") != std::string::npos);
         CHECK(html.find("dex-gold-2") == std::string::npos);
         check_golden("overview__win-all_visible-subset", html);
     }
@@ -827,9 +852,8 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
 
 TEST_CASE("DEX golden: app fragment — null store placeholder (window=24h)", "[dex][golden]") {
     const auto html = render_dex_app_fragment(nullptr, "app1.exe", "24h");
-    CHECK(html == "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
-                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                  "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
+    CHECK(html == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
+                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">&larr; Reliability overview</button><div "
                   "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
                   "is not open.</div>");
     check_golden("app__null_win-24h", html);
@@ -837,9 +861,8 @@ TEST_CASE("DEX golden: app fragment — null store placeholder (window=24h)", "[
 
 TEST_CASE("DEX golden: app fragment — null store placeholder (window=all)", "[dex][golden]") {
     const auto html = render_dex_app_fragment(nullptr, "app1.exe", "all");
-    CHECK(html == "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
-                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                  "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
+    CHECK(html == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
+                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">&larr; Reliability overview</button><div "
                   "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
                   "is not open.</div>");
     check_golden("app__null_win-all", html);
@@ -873,8 +896,8 @@ TEST_CASE("DEX golden: app fragment — app1.exe blast radius, window x visible 
              std::string::npos);
         CHECK(html.find("<tr><td>0xC0000005</td><td>ACCESS_VIOLATION</td><td class=\"gp-num\">3"
                         "</td></tr>") != std::string::npos);
-        CHECK(html.find("dex-gold-1</a></td><td class=\"gp-num\">2</td>") != std::string::npos);
-        CHECK(html.find("dex-gold-2</a></td><td class=\"gp-num\">1</td>") != std::string::npos);
+        CHECK(html.find("dex-gold-1</button></td><td class=\"gp-num\">2</td>") != std::string::npos);
+        CHECK(html.find("dex-gold-2</button></td><td class=\"gp-num\">1</td>") != std::string::npos);
         check_golden("app__win-all_visible-null", html);
     }
     // window=24h: the old crash ages out -> crashes=2, first_seen==last_seen
@@ -893,7 +916,7 @@ TEST_CASE("DEX golden: app fragment — app1.exe blast radius, window x visible 
     {
         std::set<std::string> visible{"dex-gold-1"};
         const auto html = render_dex_app_fragment(&store, "app1.exe", "all", &visible);
-        CHECK(html.find("dex-gold-1</a></td><td class=\"gp-num\">2</td>") != std::string::npos);
+        CHECK(html.find("dex-gold-1</button></td><td class=\"gp-num\">2</td>") != std::string::npos);
         CHECK(html.find("dex-gold-2") == std::string::npos);
         check_golden("app__win-all_visible-subset", html);
     }
@@ -929,9 +952,8 @@ TEST_CASE("DEX golden: app fragment — no crashes/hangs for this app", "[pg][de
 
 TEST_CASE("DEX golden: device fragment — null store placeholder (window=24h)", "[dex][golden]") {
     const auto html = render_dex_device_fragment(nullptr, "dex-gold-1", "24h");
-    CHECK(html == "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
-                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                  "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
+    CHECK(html == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
+                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">&larr; Reliability overview</button><div "
                   "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
                   "is not open.</div>");
     check_golden("device__null_win-24h", html);
@@ -939,9 +961,8 @@ TEST_CASE("DEX golden: device fragment — null store placeholder (window=24h)",
 
 TEST_CASE("DEX golden: device fragment — null store placeholder (window=all)", "[dex][golden]") {
     const auto html = render_dex_device_fragment(nullptr, "dex-gold-1", "all");
-    CHECK(html == "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
-                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                  "style=\"cursor:pointer;\">&larr; Reliability overview</a><div "
+    CHECK(html == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
+                  "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">&larr; Reliability overview</button><div "
                   "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
                   "is not open.</div>");
     check_golden("device__null_win-all", html);
@@ -1064,6 +1085,16 @@ DexAppsModel model_of(const std::vector<DexAppStabilityRow>& rows, std::optional
 
 DexAppsModel populated_model() { return model_of(populated_rows(), 50); }
 
+// The same model with the live observer split set for every scope row (as `LocalDexApi::apps` sets it
+// when an observer source is wired). A model with none serialises `observer_state: null`, which a
+// key-set flatten would see as the bare key and leave the counts unchecked.
+DexAppsModel observed_model() {
+    auto m = populated_model();
+    m.observer_state = std::vector<DexObserverSplit>{{"windows", 31, 2, 5}, {"linux", 0, 3, 1},
+                                                     {"macos", 7, 0, 0}, {"other", 0, 0, 4}};
+    return m;
+}
+
 DexAppsModel degraded_model(const std::string& reason) {
     DexAppsModel m;
     m.degraded = true;
@@ -1089,7 +1120,7 @@ std::string cell(const std::string& page, const std::string& subject, const std:
         at = end;
         const std::size_t head_end = body.find("</tr>");
         const std::string head = body.substr(0, head_end);
-        if (head.find(">" + subject + "</a>") == std::string::npos)
+        if (head.find(">" + subject + "</button>") == std::string::npos)
             continue;
         std::string row = head;
         if (!version.empty()) {
@@ -1187,9 +1218,8 @@ TEST_CASE("DEX apps UI: populated page across the window matrix (goldens)", "[de
     CHECK(count_of(page_all, "hx-get=\"/fragments/dex/apps?window=all&amp;platform=") == 5);
     CHECK(count_of(page_all, "&amp;platform=all\" hx-target") == 5);
     // The drill link keeps its shape; the window is the canonical token.
-    CHECK(contains(page_all, "<a hx-get=\"/fragments/dex/app?name=app1.exe&window=all\" "
-                             "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                             "style=\"cursor:pointer;\">app1.exe</a>"));
+    CHECK(contains(page_all, "<button type=\"button\" class=\"dx-lk\" hx-get=\"/fragments/dex/app?name=app1.exe&window=all\" "
+                             "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">app1.exe</button>"));
     check_golden("apps__win-all", page_all);
 
     const auto page_24h = render_dex_apps_fragment(model, 1, "all");
@@ -1215,9 +1245,14 @@ TEST_CASE("DEX apps UI: failed read states its own words", "[dex][golden][apps_u
     const auto page = render_dex_apps_fragment(degraded_model("score_policy_unavailable"), 7, "windows");
     CHECK(contains(page, "Application stability is unavailable"));
     CHECK(contains(page, "(reason: <code class=\"dx-code\">score_policy_unavailable</code>)"));
-    // A named reason is not a load problem, so no window advice; the remedy still names PostgreSQL.
-    CHECK(contains(page, "Try again in a moment. If it keeps failing, check PostgreSQL health "));
+    // A policy reason is not a load problem, so no window advice; the remedy points at Scoring.
+    CHECK(contains(page, "The stored score policy could not be used, so no figures are shown. Check it in Scoring."));
     CHECK_FALSE(contains(page, "shorter window"));
+    // A reason the page has no wording for keeps the generic text, with the token shown.
+    const auto other = render_dex_apps_fragment(degraded_model("made_up_reason"), 7, "windows");
+    CHECK(contains(other, "Try again in a moment. If it keeps failing, check PostgreSQL health "));
+    CHECK(contains(other, "(reason: <code class=\"dx-code\">made_up_reason</code>)"));
+    CHECK_FALSE(contains(other, "shorter window"));
     // the chips come from the request, not from the default-constructed model's windows scope
     CHECK(contains(page, "class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/apps?window=7d&amp;platform=windows\""));
     check_golden("apps__error", page);
@@ -1248,7 +1283,8 @@ TEST_CASE("DEX apps UI: versions including the unknown-version bucket", "[dex][g
         apps_version_row("chrome.exe", "", 3, 1, 1, 3, 1, "2026-10-12T04:00:00Z"),
     };
     const auto page = render_dex_apps_fragment(model_of(rows, 50), 7, "all");
-    CHECK(contains(page, "<details class=\"dx-vx\"><summary>3 versions</summary></details>"));
+    CHECK(contains(page, "<details class=\"dx-vx\"><summary>3 versions</summary><span class=\"vh\">The version "
+                         "rows follow this row in the table.</span></details>"));
     CHECK(contains(page, "<span class=\"dx-vn unk\">unknown version</span>"));
     CHECK(count_of(page, "<tr class=\"dx-ver\">") == 3);
     // each version row has its own score cell
@@ -1306,8 +1342,10 @@ TEST_CASE("DEX apps UI: custom policy with renamed tiers and an override row",
     CHECK(contains(page, "<span class=\"dx-tag\">override</span>"));
     // the override row names its own tier; the chip tone still follows the closed band token
     CHECK(contains(cell(page, "legacy.exe", "", kColScore), "Stable"));
-    // ...and that name has no key in the Apps payload (it is in GET /api/v1/dex/score-policy)
-    CHECK_FALSE(contains(dex_apps_json(model), "Stable"));
+    // ...and the payload carries that same name as score.tier, so the page and the API agree
+    const auto custom_payload = json::parse(dex_apps_json(model));
+    for (const auto& a : custom_payload["apps"])
+        CHECK(a["score"]["tier"] == (a["subject"] == "legacy.exe" ? "Stable" : "Healthy"));
     CHECK_FALSE(contains(cell(page, "legacy.exe", "", kColScore), "Healthy"));
     CHECK(contains(cell(page, "Teams", "", kColScore), "Healthy"));
     // a custom policy is a valid document, so the page never also claims it was refused
@@ -1633,6 +1671,7 @@ TEST_CASE("DEX apps UI: the tone follows the closed band token and not the tier 
     for (const auto& b : bands) {
         auto model = model_of(populated_rows(), 50, "all", policy);
         model.apps[0].figures.score.band = b.band;
+        model.apps[0].figures.tier = b.name; // the model resolves the name once; the page prints it
         const auto score = cell(render_dex_apps_fragment(model, 7, "all"), model.apps[0].subject, "", kColScore);
         CHECK(contains(score, std::string("<summary class=\"dx-sc ") + b.tone + "\">" + b.name + " "));
     }
@@ -1716,7 +1755,7 @@ TEST_CASE("DEX apps UI: payload key-set parity in both directions", "[dex][apps_
                 flatten(e, prefix + "[]");
         }
     };
-    const auto payload = json::parse(dex_apps_json(populated_model()));
+    const auto payload = json::parse(dex_apps_json(observed_model()));
     flatten(payload, "");
 
     std::set<std::string> shown;
@@ -1726,8 +1765,14 @@ TEST_CASE("DEX apps UI: payload key-set parity in both directions", "[dex][apps_
     for (const char* k : {"window", "apps", "apps_total", "apps_truncated", "population", "population_basis",
                           "crash_source_coverage", "crash_source_coverage.windows",
                           "crash_source_coverage.macos", "crash_source_coverage.linux", "policy",
-                          "policy.source", "policy.revision", "policy.fault", "policy.tiers"})
+                          "policy.source", "policy.revision", "policy.fault", "policy.interval_confidence",
+                          "policy.tiers", "observer_state"})
         shown.insert(k);
+    // observer_state.<platform>.{armed,disarmed,none_reported}: shown in the coverage caption and bound
+    // to its counts in the case "the coverage caption counts the live observers" below.
+    for (const char* p : {"windows", "linux", "macos", "other"})
+        for (const char* f : {"", ".armed", ".disarmed", ".none_reported"})
+            shown.insert(std::string("observer_state.") + p + f);
     for (const char* t : {"excellent", "good", "fair"})
         for (const char* f : {"", ".edge", ".name"})
             shown.insert(std::string("policy.tiers.") + t + f);
@@ -1736,7 +1781,7 @@ TEST_CASE("DEX apps UI: payload key-set parity in both directions", "[dex][apps_
     auto figures = [&](const std::string& p) {
         for (const char* k : {"crashes", "hangs", "distinct_devices", "distinct_devices_online", "last_seen",
                               "share_affected", "rate_per_1000", "score", "score.score", "score.band",
-                              "score.withheld", "score.deductions", "score.deductions[].name",
+                              "score.tier", "score.withheld", "score.deductions", "score.deductions[].name",
                               "score.deductions[].points", "score.deductions[].assessed"})
             shown.insert(p + "." + k);
         for (const char* g : {"share_affected", "rate_per_1000"})
@@ -1770,13 +1815,73 @@ TEST_CASE("DEX apps UI: payload key-set parity in both directions", "[dex][apps_
     }
     CHECK(payload["policy"]["tiers"]["poor"]["edge"] == 0.0); // a non-zero floor fails until the page prints it
 
-    // Two page values have no Apps-REST key. One is the interval confidence level, asserted here. The
-    // other is an override row's resolved tier name: the payload carries only the global tier names
-    // and `profile: override` (asserted in the custom-policy case; the name is in GET
-    // /api/v1/dex/score-policy).
-    for (const auto& p : published)
-        CHECK(p.find("confidence") == std::string::npos);
-    CHECK(contains(render_dex_apps_fragment(populated_model(), 7, "all"), "Intervals at 95% confidence"));
+    // The two values that used to have no payload key are bound to it: the page's confidence level
+    // is policy.interval_confidence, and a row's tier name is its score.tier.
+    const auto page = render_dex_apps_fragment(observed_model(), 7, "all");
+    const double confidence = payload["policy"]["interval_confidence"].get<double>();
+    CHECK(contains(page, "Intervals at " + std::format("{:g}", std::round(confidence * 1000.0) / 10.0) +
+                             "% confidence"));
+    DexPolicyInForce in_force;
+    DexScoreOverride o;
+    o.image = "app1.exe";
+    o.names[0] = "Gold";
+    o.names[1] = "Silver";
+    o.names[2] = "Bronze";
+    o.names[3] = "Tin";
+    in_force.policy.overrides.push_back(o);
+    REQUIRE_FALSE(dex_score_policy_fault(in_force.policy));
+    const auto custom = model_of(populated_rows(), 50, "all", in_force);
+    const auto custom_page = render_dex_apps_fragment(custom, 7, "all");
+    const auto custom_payload = json::parse(dex_apps_json(custom));
+    for (const auto& a : custom_payload["apps"]) {
+        const std::string tier = a["score"]["tier"].get<std::string>();
+        CHECK(contains(cell(custom_page, a["subject"], "", kColScore),
+                       ">" + tier + " " + std::format("{:.1f}", a["score"]["score"].get<double>()) + "</summary>"));
+        for (const auto& v : a["versions"]) {
+            const std::string ver = v["version"].get<std::string>();
+            CHECK(contains(cell(custom_page, a["subject"], ver.empty() ? "unknown version" : ver, kColScore),
+                           ">" + v["score"]["tier"].get<std::string>() + " "));
+        }
+    }
+    for (std::size_t i = 0; i < custom_payload["apps"].size(); ++i)
+        if (custom_payload["apps"][i]["subject"] == "app1.exe")
+            for (std::size_t k = 0; k < payload["apps"].size(); ++k)
+                if (payload["apps"][k]["subject"] == "app1.exe")
+                    CHECK(custom_payload["apps"][i]["score"]["tier"] != payload["apps"][k]["score"]["tier"]);
+}
+
+TEST_CASE("DEX apps UI: the coverage caption counts the live observers and keeps the design sentence",
+          "[dex][apps_ui]") {
+    const auto model = observed_model();
+    const auto payload = json::parse(dex_apps_json(model));
+    const std::map<std::string, std::string> labels = {{"windows", "Windows"}, {"linux", "Linux"},
+                                                       {"macos", "macOS"}, {"other", "Other platforms"}};
+    const auto page = render_dex_apps_fragment(model, 7, "all");
+    CHECK(contains(page, "Complete and partial describe what the agent collects on each platform by design."));
+    CHECK_FALSE(contains(page, "not a live check of each device"));
+    for (const auto& [platform, label] : labels) {
+        const auto& o = payload["observer_state"][platform];
+        CHECK(contains(page, label + " " + std::to_string(o["armed"].get<int64_t>()) + " armed, " +
+                                 std::to_string(o["disarmed"].get<int64_t>()) + " not armed, " +
+                                 std::to_string(o["none_reported"].get<int64_t>()) + " not reporting"));
+    }
+    CHECK(contains(page, "A device that is not armed or not reporting sends no crash or hang signal, so a "
+                         "quiet list does not cover it."));
+    // Every device armed: the warning sentence goes, the counts stay.
+    auto healthy = populated_model();
+    healthy.observer_state = std::vector<DexObserverSplit>{{"windows", 12, 0, 0}};
+    const auto healthy_page = render_dex_apps_fragment(healthy, 7, "windows");
+    CHECK(contains(healthy_page, "Observers now: Windows 12 armed, 0 not armed, 0 not reporting."));
+    CHECK_FALSE(contains(healthy_page, "sends no crash or hang signal"));
+    // Per scope: a platform scope names its one row only.
+    auto linux_only = model_of(populated_rows(), 50, "linux");
+    linux_only.observer_state = std::vector<DexObserverSplit>{{"linux", 1, 2, 3}};
+    const auto linux_page = render_dex_apps_fragment(linux_only, 7, "linux");
+    CHECK(contains(linux_page, "Observers now: Linux 1 armed, 2 not armed, 3 not reporting."));
+    CHECK_FALSE(contains(linux_page, "Windows 1 armed"));
+    // With no observer source the old sentence stays.
+    CHECK(contains(render_dex_apps_fragment(populated_model(), 7, "all"),
+                   "This is what the agent collects on each platform, not a live check of each device."));
 }
 
 TEST_CASE("DEX apps UI: population_basis is shown in words in the Population caption for each scope",
@@ -1838,8 +1943,9 @@ TEST_CASE("DEX apps UI: platform and window chips are native buttons", "[dex][ap
         // exactly one pressed chip per row: the selected platform and the selected window
         CHECK(count_of(page, "aria-pressed=\"true\"") == 2);
         CHECK(count_of(page, "aria-pressed=\"false\"") == 6);
-        CHECK(contains(page, std::string("class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/apps?window=30d&amp;platform=") + sel.platform + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + sel.label + "</button>"));
-        CHECK(contains(page, std::string("class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/apps?window=30d&amp;platform=") + sel.platform + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">30d</button>"));
+        const std::string pane(kDexPaneSwapAttrs);
+        CHECK(contains(page, std::string("class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/apps?window=30d&amp;platform=") + sel.platform + "\"" + pane + ">" + sel.label + "</button>"));
+        CHECK(contains(page, std::string("class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/apps?window=30d&amp;platform=") + sel.platform + "\"" + pane + ">30d</button>"));
         CHECK(contains(page, "button.gp-chip{line-height:inherit;font-variant-numeric:inherit}"));
     }
     // No htmx handler attribute and no script ever ships on this page.
@@ -2030,6 +2136,168 @@ TEST_CASE("DEX apps UI: no DexApi wired or a degraded model is an error panel (2
     CHECK(contains(r->body, "score_policy_invalid"));
     CHECK_FALSE(contains(r->body, "Scoring policy"));
     CHECK_FALSE(contains(r->body, "Population"));
+}
+
+// #7520: one panel per degraded cause, and never a figure.
+TEST_CASE("DEX apps UI: each degraded reason renders its own panel and never a figure", "[dex][apps_ui]") {
+    struct Row {
+        const char* reason;
+        const char* window; // "7d" unless a case needs the shortest window
+        const char* title;
+        const char* sentence;
+    };
+    const Row table[] = {
+        {"concurrency_budget", "7d", "Application stability is busy", "Try again in a moment."},
+        {"pool_acquire_timeout", "7d", "Application stability is busy", "Try again in a moment."},
+        {"statement_timeout", "7d", "Application stability is unavailable",
+         "The read took too long for this window, so no figures are shown. Choose a shorter window "
+         "(30d and All are the slowest)."},
+        {"statement_timeout", "24h", "Application stability is unavailable",
+         "The read took too long for this window, so no figures are shown. This is already the shortest "
+         "window; check PostgreSQL health."},
+        {"score_policy_unavailable", "7d", "Application stability is unavailable",
+         "The stored score policy could not be used, so no figures are shown. Check it in Scoring."},
+        {"score_policy_invalid", "7d", "Application stability is unavailable",
+         "The stored score policy could not be used, so no figures are shown. Check it in Scoring."},
+        {"store_not_open", "7d", "Application stability is unavailable",
+         "The database read failed, so no figures are shown. Check PostgreSQL health."},
+        {"query_error", "7d", "Application stability is unavailable",
+         "The database read failed, so no figures are shown. Check PostgreSQL health."},
+        {"not_wired", "7d", "Application stability is unavailable",
+         "The read could not be completed, so no figures are shown."},
+        {"internal_error", "7d", "Application stability is unavailable",
+         "The read could not be completed, so no figures are shown."},
+        {"made_up_token", "7d", "Application stability is unavailable",
+         "The read could not be completed, so no figures are shown."},
+        {"", "7d", "Application stability is unavailable",
+         "a shorter window reads faster (30d and All are the slowest). If it keeps failing, check "
+         "PostgreSQL health."},
+        {"", "24h", "Application stability is unavailable", "If it keeps failing, check PostgreSQL health."},
+    };
+    for (const auto& row : table) {
+        INFO("reason '" << row.reason << "' window " << row.window);
+        const int days = std::string(row.window) == "24h" ? 1 : 7;
+        const auto page = render_dex_apps_fragment(degraded_model(row.reason), days, "all");
+        CHECK(contains(page, std::string("<b>") + row.title + "</b>"));
+        CHECK(contains(page, row.sentence));
+        CHECK_FALSE(contains(page, "<table"));
+        CHECK_FALSE(contains(page, "<tbody"));
+        CHECK_FALSE(contains(page, "Population"));
+        if (row.reason[0] != '\0')
+            CHECK(contains(page, std::string("<code class=\"dx-code\">") + row.reason + "</code>"));
+        else
+            CHECK_FALSE(contains(page, "reason:"));
+    }
+    // The shorter-window advice never appears for a cause a shorter window does not help.
+    CHECK_FALSE(contains(render_dex_apps_fragment(degraded_model("concurrency_budget"), 7, "all"),
+                         "shorter window"));
+    CHECK_FALSE(contains(render_dex_apps_fragment(degraded_model("store_not_open"), 7, "all"),
+                         "shorter window"));
+}
+
+// #7514: the expander is never empty to assistive technology.
+TEST_CASE("DEX apps UI: the versions expander carries a visually hidden sentence", "[dex][apps_ui]") {
+    const auto page = render_dex_apps_fragment(populated_model(), 7, "all");
+    CHECK(count_of(page, "<details class=\"dx-vx\"><summary>2 versions</summary><span class=\"vh\">The version "
+                         "rows follow this row in the table.</span></details>") == 2);
+    // No version rows were collected: no expander at all, so no stray hidden text.
+    const auto none = render_dex_apps_fragment(
+        model_of({apps_total_row("solo.exe", 1, 0, 1, 1, 0, 0, 1, "2026-10-14T01:00:00Z")}, 50), 7, "all");
+    CHECK_FALSE(contains(none, "The version rows follow"));
+}
+
+// #7505: tabs, chips and links are native buttons.
+TEST_CASE("DEX apps UI: tabs, chips and the application link are native buttons", "[dex][apps_ui]") {
+    const auto page = render_dex_apps_fragment(populated_model(), 7, "all");
+    CHECK_FALSE(contains(page, "<a class=\"gp-chip"));
+    const auto nav = page.find("class=\"gp-subnav\"");
+    REQUIRE(nav != std::string::npos);
+    const std::string subnav = page.substr(nav, page.find("</div>", nav) - nav);
+    CHECK_FALSE(contains(subnav, "<a"));
+    CHECK(count_of(subnav, "<button type=\"button\"") == 10);
+    CHECK(contains(subnav, "<button type=\"button\" class=\"on\" aria-current=\"page\" hx-get=\"/fragments/dex/apps?window=7d\""));
+    CHECK(count_of(page, "aria-pressed=") == 8);
+    // The application link and the Scoring link are buttons that keep the raw name in the URL.
+    CHECK(contains(page, "<button type=\"button\" class=\"dx-lk\" hx-get=\"/fragments/dex/app?name=app1.exe&window=7d\""));
+    CHECK(contains(page, "<button type=\"button\" class=\"dx-lk\" hx-get=\"/fragments/dex/scoring?window=7d\""));
+    // The shared stylesheet gives them a visible focus style.
+    CHECK(contains(page, ".dx-lk:focus-visible"));
+    CHECK(contains(page, ".gp-subnav button:focus-visible"));
+}
+
+// #7535: mark, never strip; text nodes only.
+namespace {
+// Every tag of `html`, `<` through the next `>` (html_escape guarantees no raw `<` or `>` in text).
+bool any_marker_inside_a_tag(const std::string& html) {
+    for (std::size_t at = html.find('<'); at != std::string::npos; at = html.find('<', at + 1)) {
+        const std::size_t end = html.find('>', at);
+        if (end == std::string::npos)
+            return false;
+        if (html.substr(at, end - at).find("&lt;U+") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+constexpr const char* kRlo = "\xE2\x80\xAE";  // U+202E
+constexpr const char* kZwsp = "\xE2\x80\x8B"; // U+200B
+} // namespace
+
+TEST_CASE("DEX apps UI: bidirectional and zero-width characters in a name or version print as markers",
+          "[dex][apps_ui]") {
+    const std::string subject = std::string("bad") + kRlo + "name.exe";
+    const std::string version = std::string("1.0") + kZwsp + ".2";
+    const auto model = model_of(
+        {apps_total_row(subject, 4, 0, 2, 4, 0, 1, 1, "2026-10-14T01:00:00Z"),
+         apps_version_row(subject, version, 4, 0, 2, 4, 0, "2026-10-14T01:00:00Z")},
+        50);
+    const auto page = render_dex_apps_fragment(model, 7, "all");
+    CHECK(contains(page, ">bad&lt;U+202E&gt;name.exe</button>"));
+    CHECK(contains(page, "<span class=\"dx-vn\">1.0&lt;U+200B&gt;.2</span>"));
+    // The drill link's query string still carries the raw bytes: the link must open the right app.
+    CHECK(contains(page, "name=bad%E2%80%AEname.exe"));
+    CHECK_FALSE(any_marker_inside_a_tag(page));
+    CHECK_FALSE(contains(page, kRlo));
+    CHECK_FALSE(contains(page, kZwsp));
+}
+
+TEST_CASE("DEX apps UI: ordinary spaces in a name are never marked", "[dex][apps_ui]") {
+    const std::string subject = "my\xE3\x80\x80" "app.exe"; // U+3000
+    const auto page = render_dex_apps_fragment(
+        model_of({apps_total_row(subject, 1, 0, 1, 1, 0, 0, 1, "2026-10-14T01:00:00Z")}, 50), 7, "all");
+    CHECK(contains(page, ">my\xE3\x80\x80" "app.exe</button>"));
+    CHECK_FALSE(contains(page, "&lt;U+"));
+}
+
+TEST_CASE("DEX overview: a name with control characters prints markers in its text and keeps raw bytes in the "
+          "drill link",
+          "[pg][dex][apps_ui]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, golden_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    const std::string proc = std::string("bad") + kRlo + "name.exe";
+    seed_crash(store, "mk1", "dex-gold-1", proc, "ntdll.dll", "windows", kRecent);
+    DexFleet fleet;
+    fleet.windows_online = 1;
+    fleet.connected_os = {"windows"};
+    fleet.connected_agents = {{"dex-gold-1", "windows"}};
+    const auto html = render_dex_overview_fragment(&store, "", 0, fleet);
+    CHECK(contains(html, ">bad&lt;U+202E&gt;name.exe</button>"));
+    CHECK(contains(html, "name=bad%E2%80%AEname.exe"));
+    CHECK_FALSE(any_marker_inside_a_tag(html));
+    CHECK_FALSE(contains(html, kRlo));
+}
+
+TEST_CASE("DEX apps UI: with control characters in every agent-reported string no DEX fragment marks a tag",
+          "[dex][apps_ui]") {
+    const std::string subject = std::string("s") + kRlo + kZwsp;
+    const auto page = render_dex_apps_fragment(
+        model_of({apps_total_row(subject, 2, 1, 2, 2, 1, 1, 1, "2026-10-14T01:00:00Z"),
+                  apps_version_row(subject, std::string("v") + kZwsp, 2, 1, 2, 2, 1, "2026-10-14T01:00:00Z")},
+                 50),
+                 7, "all");
+    CHECK(contains(page, "&lt;U+202E&gt;&lt;U+200B&gt;"));
+    CHECK_FALSE(any_marker_inside_a_tag(page));
 }
 
 // ─────────────────────────────────────────────────────────────────────────

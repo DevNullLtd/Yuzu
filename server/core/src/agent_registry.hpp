@@ -30,6 +30,7 @@
 #include "command_capability.hpp"
 #include "command_capability_parsers.hpp"
 #include "dispatch_caller.hpp"
+#include "dex_types.hpp" // DexObserverState (pure enum)
 #include "dispatch_denial.hpp"
 #include "event_bus.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5: PresenceIdentity is a value member (presence_cache_)
@@ -1416,6 +1417,11 @@ static_assert(kGuardianBackendPause >= std::chrono::microseconds{1} &&
               "the pause must be real (it is what lets ingest in) and must stay small (it is paid "
               "once per slice on the request thread)");
 
+/// The heartbeat tag the agent's DEX crash and hang observer reports ("1" armed, "0" disarmed).
+/// Emitted on Windows, Linux and macOS agents with the observer enabled; absent otherwise. The
+/// fleet gauge and `AgentHealthStore::dex_observer_for` read this one constant.
+inline constexpr std::string_view kDexObserverArmedTag = "yuzu.dex_observer_armed";
+
 struct AgentHealthSnapshot {
     std::string agent_id;
     std::unordered_map<std::string, std::string> status_tags;
@@ -1500,7 +1506,21 @@ public:
     [[nodiscard]] std::optional<std::string_view>
     guardian_backend_of(const std::string& agent_id, std::chrono::seconds staleness) const;
 
+    /// The DEX observer state of each input id, ALIGNED by index (duplicates and all), read with
+    /// the same slicing, pause and staleness contract as `guardian_backend_for`; pass
+    /// kAgentHealthStaleness. Tag "1" is Armed, "0" is Disarmed; an absent tag, any other value,
+    /// an unknown id or a stale snapshot is NoneReported (an agent that opted out and one on a
+    /// build with no observer are indistinguishable: neither sends the tag). Counts only reach
+    /// the Apps page, never an id. Not for a hot path.
+    [[nodiscard]] std::vector<DexObserverState>
+    dex_observer_for(std::span<const std::string> agent_ids, std::chrono::seconds staleness) const;
+
 private:
+    /// The one sliced read loop behind `guardian_backend_for` and `dex_observer_for`: for each id,
+    /// in order, `fn(snapshot_or_null, now)` runs with mu_ held, mu_ is released between slices.
+    template <typename Fn>
+    void for_each_snapshot_sliced(std::span<const std::string> agent_ids, Fn&& fn) const;
+
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
     CorruptionSink corruption_sink_;

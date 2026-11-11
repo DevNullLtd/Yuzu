@@ -14,6 +14,7 @@
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "test_dex_api_double.hpp"
 #include "test_dex_perf_api_double.hpp"
 #include "test_route_sink.hpp"
 
@@ -232,11 +233,11 @@ TEST_CASE("DEX catalogue grid lists every family + the sub-nav", "[pg][dex][rout
     // The Alerts tab is static chrome: present for every viewer, no capability probe
     // behind it (the Alerts fragment itself shows the role note).
     CHECK(html.find("hx-get=\"/fragments/dex/alerts?window=7d\"") != std::string::npos);
-    CHECK(html.find(">Alerts</a>") != std::string::npos);
+    CHECK(html.find(">Alerts</button>") != std::string::npos);
     // The Scoring tab is static chrome too, placed before Alerts.
     const auto scoring = html.find("hx-get=\"/fragments/dex/scoring?window=7d\"");
     CHECK(scoring != std::string::npos);
-    CHECK(html.find(">Scoring</a>") != std::string::npos);
+    CHECK(html.find(">Scoring</button>") != std::string::npos);
     CHECK(scoring < html.find("hx-get=\"/fragments/dex/alerts?window=7d\""));
     CHECK(html.find("actively monitored") != std::string::npos);
     CHECK(html.find("of 114 signal types") != std::string::npos);
@@ -631,7 +632,7 @@ TEST_CASE("DEX catalogue routes: os=macos param survives route dispatch into bot
     // The macOS chip renders as the ACTIVE chip (proves the route read os=macos,
     // not just defaulted to "all").
     CHECK(grid->body.find(
-              "<a class=\"gp-chip on\" hx-get=\"/fragments/dex/catalogue?window=7d&os=macos\"") !=
+              "<button type=\"button\" class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/catalogue?window=7d&os=macos\"") !=
           std::string::npos);
     CHECK(family_score(grid->body, "Network") == expected); // macOS-scoped score, route → renderer
 
@@ -639,7 +640,7 @@ TEST_CASE("DEX catalogue routes: os=macos param survives route dispatch into bot
     auto group = sink.Get("/fragments/dex/catalogue/group?name=Network&window=7d&os=macos");
     REQUIRE(group);
     CHECK(group->status == 200);
-    CHECK(group->body.find("<a class=\"gp-chip on\" hx-get=\"/fragments/dex/catalogue/group?"
+    CHECK(group->body.find("<button type=\"button\" class=\"gp-chip on\" aria-pressed=\"true\" hx-get=\"/fragments/dex/catalogue/group?"
                            "name=Network&window=7d&os=macos\"") != std::string::npos);
     CHECK(group_score(group->body) == expected);
 }
@@ -1544,7 +1545,7 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") 
                 expected_crashes = a["crashes"].get<int64_t>();
         REQUIRE(expected_crashes > 0);
         const auto& body = apps->body;
-        const auto name_at = body.find(">chrome.exe</a>");
+        const auto name_at = body.find(">chrome.exe</button>"); // the drill link is a native button
         REQUIRE(name_at != std::string::npos);
         const auto row_start = body.rfind("<tr", name_at);
         const auto row_end = body.find("</tr>", name_at);
@@ -3212,4 +3213,79 @@ TEST_CASE("DEX perf devices fragment: a malformed limit is a 400 and a valid one
     auto ok = sink.Get("/fragments/dex/perf/devices?metric=cpu&limit=10");
     REQUIRE(ok);
     CHECK(ok->status != 400);
+}
+
+// -- #7520: nothing escapes the Apps handler ------------------------------------------------
+
+namespace {
+struct AppsRouteHarness {
+    yuzu::server::test::TestRouteSink sink;
+    DexRoutes routes;
+    AppsRouteHarness() {
+        auto okAuth = [](const httplib::Request&, httplib::Response&) {
+            return std::optional<auth::Session>(auth::Session{});
+        };
+        auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                         const std::string&) { return true; };
+        routes.register_routes(sink, okAuth, okPerm, nullptr, []() { return DexFleet{}; }, /*audit_fn=*/{});
+    }
+};
+} // namespace
+
+TEST_CASE("DEX apps route: a DexApi whose apps() throws still answers 200 with a panel",
+          "[dex][routes][apps_model]") {
+    AppsRouteHarness h;
+    int calls = 0;
+    h.routes.set_dex_api(std::make_shared<yuzu::server::test::FnDexApi>(
+        nullptr, nullptr, nullptr, nullptr,
+        [&calls](const std::string&, const std::string&) -> DexAppsModel {
+            ++calls;
+            throw std::runtime_error("boom");
+        }));
+    for (const char* target : {"/fragments/dex/apps", "/fragments/dex/apps?platform=linux&window=30d"}) {
+        auto r = h.sink.Get(target);
+        REQUIRE(r);
+        CHECK(r->status == 200); // htmx drops a 5xx body, which would leave the pane blank
+        CHECK(r->body.find("Application stability is unavailable") != std::string::npos);
+        CHECK(r->body.find("internal_error") != std::string::npos); // the cause, as a code token
+        CHECK(r->body.find("boom") == std::string::npos);            // the exception text stays in the log
+        CHECK(r->body.find("<tr") == std::string::npos);             // never a figure
+    }
+    CHECK(calls == 2);
+}
+
+TEST_CASE("DEX apps route: no DexApi set answers 200 with the not_wired panel",
+          "[dex][routes][apps_model]") {
+    AppsRouteHarness h;
+    auto r = h.sink.Get("/fragments/dex/apps");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("not_wired") != std::string::npos);
+    CHECK(r->body.find("<tr") == std::string::npos);
+    // An invalid platform is still its own panel, even with nothing wired.
+    auto bad = h.sink.Get("/fragments/dex/apps?platform=plan9");
+    REQUIRE(bad);
+    CHECK(bad->body.find("Unknown platform") != std::string::npos);
+}
+
+TEST_CASE("DEX apps route: a degraded model with reason statement_timeout reaches the page as the "
+          "shorter-window panel",
+          "[dex][routes][apps_model]") {
+    AppsRouteHarness h;
+    h.routes.set_dex_api(std::make_shared<yuzu::server::test::FnDexApi>(
+        nullptr, nullptr, nullptr, nullptr,
+        [](const std::string& window, const std::string&) {
+            DexAppsModel m;
+            m.window = window;
+            m.degraded = true;
+            m.degraded_reason = "statement_timeout";
+            return m;
+        }));
+    auto week = h.sink.Get("/fragments/dex/apps?window=7d");
+    REQUIRE(week);
+    CHECK(week->body.find("Choose a shorter window") != std::string::npos);
+    auto day = h.sink.Get("/fragments/dex/apps?window=24h");
+    REQUIRE(day);
+    CHECK(day->body.find("already the shortest window") != std::string::npos);
+    CHECK(day->body.find("Choose a shorter window") == std::string::npos);
 }

@@ -19981,8 +19981,13 @@ private:
             yuzu::server::DexScorePolicyFn dex_policy_fn;
             if (dex_score_policy_provider_)
                 dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
-            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
-                                         std::move(dex_policy_fn));
+            // The observer provider borrows health_store_, which is declared before every holder
+            // of this API (rest_api_v1_, mcp_server_, dex_routes_) and so outlives them.
+            dex_api = make_local_dex_api(
+                guaranteed_state_store_.get(), dex_fleet_fn, std::move(dex_policy_fn),
+                [this](const std::vector<std::string>& ids) {
+                    return health_store_.dex_observer_for(ids, detail::kAgentHealthStaleness);
+                });
         }
         // The Apps tab reads the same DexApi::apps model as REST and MCP (null store: its error panel).
         if (dex_routes_)

@@ -103,6 +103,18 @@ This SQL is unsupported and is not recorded in the in-product audit log, so reco
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build. A replica on an earlier build keeps the earlier behaviour, which is outside the deployment contract; this page does not describe it as supported, and it is not a procedure for a rolling or mixed-version upgrade.
 
+## Behaviour change: HEAD on a dynamic route is answered 405 with `Allow: GET`
+
+**What changed.** Every authenticated dynamic route (`/api/v1/`, the dashboard pages and fragments, `/metrics`) answers `HEAD` with `405 Method Not Allowed` and `Allow: GET`, and the handler is not run. Before, `HEAD` ran the whole handler and discarded the body. The paths that still answer `HEAD` are the four health probes (`/livez`, `/readyz`, `/health`, `/api/health`), static assets, the sign-in pages, and the public CA files (`/api/v1/ca/root`, `/api/v1/ca/crl`). The `Allow` header names `GET` only, even on a path that also accepts writes. Brotli-encoded dynamic responses are now produced at quality 5 instead of the library's maximum (11), so a very large page is about 25 percent larger on the wire and about 250 times cheaper for the server (a 2.5 MB page: about 9 ms of one worker instead of about 2.5 s).
+
+**Action.** An external monitor or load balancer health check that sends `HEAD` to an authenticated route must send `GET` instead (or use `/health`). Nothing else changes: `GET` responses are the same bytes, compressed or not.
+
+## Behaviour change: the DEX Apps payload gains `observer_state`, `policy.interval_confidence` and `score.tier`
+
+**What changed.** `GET /api/v1/dex/apps` and the MCP tool `list_dex_apps` carry three additive keys: `observer_state` (the live count of online devices whose crash and hang observer is armed, not armed or not reporting, per platform; `null` when no observer source is wired), `policy.interval_confidence` and `score.tier` on every application and version score (`null` when the score is withheld). A degraded read's `503` message and MCP error now end with the cause as a token (`concurrency_budget`, `pool_acquire_timeout`, `statement_timeout`, `query_error`, `store_not_open`, `score_policy_unavailable`, `score_policy_invalid`), and `yuzu_server_guardian_read_degrade_total{source="guardian_state"}` now counts a read the database cancelled at its statement timeout under `reason="statement_timeout"` (it was `query_error`).
+
+**Action.** A client that rejects unknown keys must accept the three new ones. An alert keyed on `reason="query_error"` for `source="guardian_state"` sees fewer events; key it on `statement_timeout` as well. No schema change and no setting is reinterpreted.
+
 ## Behaviour change: the DEX Scoring tab edits the score policy from the dashboard
 
 **What changed.** (This section also covers the MCP tools `get_dex_score_policy`, `set_dex_score_policy` and `reset_dex_score_policy`; see **MCP tools** below.) The DEX page gains a **Scoring** tab that shows the score policy in force and edits all of it: tier edges and names, weights, model parameters and per-application overrides, with a pre-save tier-change preview and a reset to the shipped defaults. It writes through the same function as `PUT` and `DELETE /api/v1/dex/score-policy`, so validation, the `If-Match` revision check and the audit rows are the same, and editing needs the same `Infrastructure:Write` grant (viewing needs `GuaranteedState:Read`). See [DEX](dex.md#scoring).

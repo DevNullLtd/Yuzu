@@ -10,6 +10,7 @@
 #include "app_perf_fleet_store.hpp" // AppPerfAppSummary
 #include "dex_app_perf_model.hpp"   // AppPerfVersionSummary, HistPctile
 #include "dex_app_perf_ui.hpp"
+#include "dex_pane.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -21,6 +22,12 @@ using namespace yuzu::server;
 namespace {
 bool has(const std::string& h, const std::string& needle) {
     return h.find(needle) != std::string::npos;
+}
+
+// A pane-swap link as the shared helper emits it (a native button styled as a link).
+std::string link_open(const std::string& hx_get) {
+    return "<button type=\"button\" class=\"dx-lk\" hx-get=\"" + hx_get + "\"" +
+           std::string(kDexPaneSwapAttrs) + ">";
 }
 
 // Exactly one <style> block, and it carries the DEX sheet (a known .dx- rule).
@@ -59,7 +66,7 @@ TEST_CASE("render_dex_app_perf_picker: top-level tab — subnav + Dashboard back
     CHECK(has(h, "gp-subnav"));
     // "App Performance" is the active tab and a SIBLING of "Performance" — both
     // present, not merged (dex_subnav row #4035's picker guard).
-    CHECK(has(h, "class=\"on\" hx-get=\"/fragments/dex/perf/apps"));
+    CHECK(has(h, "class=\"on\" aria-current=\"page\" hx-get=\"/fragments/dex/perf/apps"));
     CHECK(has(h, ">Performance<"));
     CHECK(has(h, ">App Performance<"));
     CHECK(has(h, "href=\"/\">&larr; Console</a>")); // top-level convention, not a sub-fragment back-link
@@ -251,15 +258,15 @@ TEST_CASE("render_dex_app_perf_trend: filtered (active_version set) — banner, 
         CHECK(has(h, "Filtered to version"));
         CHECK(has(h, ">1.2.0.0</span>")); // the banner names the active version
         // "all versions" back-link drops `version=`, no group (fleet scope) — the
-        // exact querystring `all_qs` builds, as its own `<a hx-get="...">`.
-        CHECK(has(h, "<a hx-get=\"/fragments/dex/perf/app?app=chrome.exe&amp;window=7d\" "));
+        // exact querystring `all_qs` builds, as its own link button.
+        CHECK(has(h, link_open("/fragments/dex/perf/app?app=chrome.exe&amp;window=7d")));
         CHECK(has(h, "all versions"));
         // With no groups, the scope selector doesn't render at all, so the ONLY
         // way this exact qs (app+window+version, no group) could appear is as a
         // per-row narrow-to-version link — which must be absent while filtered:
         // the row renders as plain text instead.
-        CHECK_FALSE(has(h, "<a hx-get=\"/fragments/dex/perf/app?app=chrome.exe&amp;window="
-                          "7d&amp;version=1.2.0.0\""));
+        CHECK_FALSE(has(h, link_open("/fragments/dex/perf/app?app=chrome.exe&amp;window=7d&amp;"
+                                      "version=1.2.0.0")));
         CHECK(has(h, "<td><span style=\"font-family:var(--mono)\">1.2.0.0</span>"));
     }
 
@@ -276,8 +283,7 @@ TEST_CASE("render_dex_app_perf_trend: filtered (active_version set) — banner, 
         std::vector<DexGroupOption> groups = {{.id = "g1", .name = "Eng"}};
         const auto h =
             render_dex_app_perf_trend("chrome.exe", {v1}, "g1", groups, 10, 7, "1.2.0.0");
-        CHECK(has(h, "<a hx-get=\"/fragments/dex/perf/app?app=chrome.exe&amp;window=7d&amp;"
-                    "group=g1\" "));
+        CHECK(has(h, link_open("/fragments/dex/perf/app?app=chrome.exe&amp;window=7d&amp;group=g1")));
     }
 
     SECTION("filtered to a version with NO matching rows -> empty-state fallback link "
@@ -291,8 +297,7 @@ TEST_CASE("render_dex_app_perf_trend: filtered (active_version set) — banner, 
         // on its distinct "&larr; all versions" display text, which only the
         // empty-state block emits (the banner's back-link reads "all versions
         // &rarr;" — opposite arrow, opposite word order).
-        CHECK(has(h, "&amp;group=g1\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-                    "style=\"cursor:pointer;\">&larr; all versions</a>"));
+        CHECK(has(h, "&amp;group=g1\"" + std::string(kDexPaneSwapAttrs) + ">&larr; all versions</button>"));
     }
 }
 
@@ -552,4 +557,72 @@ TEST_CASE("render_dex_app_perf_version_devices: empty state, populated rows, tru
     const auto trunc = render_dex_app_perf_version_devices({d1}, /*truncated=*/true);
     CHECK(has(trunc, "capped"));
     CHECK(has(trunc, "highest-CPU"));
+}
+
+// -- #7535: a name is marked in its text, and a value the browser sends back keeps its raw bytes --
+
+namespace {
+constexpr const char* kZwsp = "\xE2\x80\x8B"; // U+200B
+constexpr const char* kRlo = "\xE2\x80\xAE";  // U+202E
+} // namespace
+
+TEST_CASE("render_dex_app_perf_trend: a version with a zero-width character keeps raw bytes in its "
+          "option value and prints a marker in its label and cell",
+          "[dex][app_perf][ui][marking]") {
+    AppPerfVersionSummary v1;
+    v1.version = std::string("1.0") + kZwsp + ".2";
+    v1.latest_day = 200;
+    v1.device_count = 5;
+    v1.cpu_mean = 3.0;
+    std::vector<DexGroupOption> groups;
+    std::vector<std::string> models = {std::string("Lat") + kZwsp + "itude"};
+    const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "", groups, 10, 7, "", models, "");
+    // The Model selector's option: the value the browser sends back is raw, only the label is marked.
+    CHECK(has(h, std::string("<option value=\"Lat") + kZwsp + "itude\">Lat&lt;U+200B&gt;itude</option>"));
+    // The version cell prints the marker; its drill link's query string carries the raw bytes.
+    CHECK(has(h, "1.0&lt;U+200B&gt;.2</span>"));
+    CHECK(has(h, "version=1.0%E2%80%8B.2"));
+    // No marker ever lands inside a tag.
+    for (std::size_t at = h.find('<'); at != std::string::npos; at = h.find('<', at + 1)) {
+        const auto end = h.find('>', at);
+        REQUIRE(end != std::string::npos);
+        INFO(h.substr(at, end - at));
+        CHECK_FALSE(has(h.substr(at, end - at), "&lt;U+"));
+    }
+}
+
+TEST_CASE("render_dex_app_perf_picker: a search query with a zero-width character keeps raw bytes in "
+          "the search box",
+          "[dex][app_perf][ui][marking]") {
+    std::vector<AppPerfAppSummary> apps = {{.app_name = "chrome.exe", .versions = 1, .last_day = 1}};
+    const std::string q = std::string("chr") + kZwsp;
+    const auto h = render_dex_app_perf_picker(apps, false, 7, q);
+    CHECK(has(h, "value=\"" + q + "\""));
+    CHECK_FALSE(has(h, "value=\"chr&lt;U+200B"));
+}
+
+TEST_CASE("render_dex_app_perf_picker: a process name with a bidirectional control prints a marker in "
+          "its cell and carries raw bytes in the drill link",
+          "[dex][app_perf][ui][marking]") {
+    std::vector<AppPerfAppSummary> apps = {
+        {.app_name = std::string("bad") + kRlo + "name.exe", .versions = 1, .last_day = 1}};
+    const auto h = render_dex_app_perf_picker(apps, false, 7);
+    CHECK(has(h, ">bad&lt;U+202E&gt;name.exe</button>"));
+    CHECK(has(h, "app=bad%E2%80%AEname.exe"));
+    CHECK_FALSE(has(h, kRlo));
+}
+
+TEST_CASE("render_dex_app_perf_picker: every control that swaps the pane carries the sync guard",
+          "[dex][app_perf][ui][pane]") {
+    std::vector<AppPerfAppSummary> apps = {{.app_name = "chrome.exe", .versions = 1, .last_day = 1}};
+    const auto h = render_dex_app_perf_picker(apps, false, 7, "chr", "windows", "name");
+    const auto count = [&](const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = h.find(needle); p != std::string::npos; p = h.find(needle, p + needle.size()))
+            ++n;
+        return n;
+    };
+    CHECK(count("hx-target=\"#guardian-detail\"") == count("hx-sync=\"#guardian-detail:replace\""));
+    CHECK(count("hx-sync=") >= 14); // ten tabs, three chips, the search box, the sort select and the drill link
+    CHECK_FALSE(has(h, "<a class=\"gp-chip"));
 }

@@ -15,8 +15,9 @@ calls what, or of declaration order, not of behaviour:
      device_routes.cpp's dashboard row builder `to_device_row`. It is served only by the REST
      `device_agent_row_json` and the two MCP tools, behind the fleet-read gate.
   3. DESTRUCTION ORDER. `ServerImpl::health_store_` must be declared BEFORE each member listed in
-     HOLDERS below (the DeviceApi holders and the other direct borrowers), because
-     `LocalDeviceApi` keeps a `const AgentHealthStore&` and members are destroyed in reverse
+     HOLDERS below (the DeviceApi holders, the DexApi holders whose observer provider borrows it, and
+     the other direct borrowers), because `LocalDeviceApi` keeps a `const AgentHealthStore&`, the
+     DexApi's observer provider captures `this` to reach it, and members are destroyed in reverse
      declaration order. Moving it back below a holder is a use-after-free that only a sanitizer
      run during shutdown would find.
 
@@ -49,12 +50,15 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "server" / "core" / "src"
 
 # The members this gate knows borrow health_store_ (directly or through LocalDeviceApi /
-# LocalNetworkApi): agent_service_ holds &health_store_ (set_health_store), gateway_service_ is built
-# with &health_store_, network_routes_ holds the LocalNetworkApi built from it, heartbeat_ingestion_
-# calls upsert on it. All must be destroyed BEFORE it. A borrower added later is NOT covered until it
-# is added here.
+# LocalNetworkApi / the DexApi's observer provider): agent_service_ holds &health_store_
+# (set_health_store), gateway_service_ is built with &health_store_, network_routes_ holds the
+# LocalNetworkApi built from it, heartbeat_ingestion_ calls upsert on it, and rest_api_v1_,
+# mcp_server_ and dex_routes_ hold the DexApi whose observer provider is a lambda that captures
+# `this` and calls health_store_.dex_observer_for. All must be destroyed BEFORE it. A borrower added
+# later is NOT covered until it is added here.
 HOLDERS = ("rest_api_v1_", "mcp_server_", "device_routes_", "crypto_device_api_",
-           "agent_service_", "gateway_service_", "network_routes_", "heartbeat_ingestion_")
+           "agent_service_", "gateway_service_", "network_routes_", "heartbeat_ingestion_",
+           "dex_routes_")
 STALENESS_CALLS = (
     # (file, call prefix that must be followed by an argument naming the constant)
     ("server.cpp", "recompute_metrics("),
@@ -204,7 +208,8 @@ def problems(files: dict) -> list:
                 found.append(f"server.cpp: holder member {h} not found (renamed? the pin must follow it)")
             elif decl["health_store_"] > decl[h]:
                 found.append(f"server.cpp: health_store_ is declared AFTER {h}: it would be destroyed "
-                             "BEFORE a holder of the DeviceApi (use-after-free at shutdown)")
+                             "BEFORE a holder of the DeviceApi or of the DexApi's observer provider "
+                             "(use-after-free at shutdown)")
     return found
 
 
