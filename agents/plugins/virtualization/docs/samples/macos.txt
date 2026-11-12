@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-08 · euid 501 · leg-hash 2a955b994291
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-10 · euid 501 · leg-hash aec6e0e7930c
 == action=host
 status|host|supported|-
 host|no|bare_metal|Apple Inc.|Mac16,10|sysctl|high
@@ -8,4 +8,8 @@ container|no|macos:no_container_runtime
 == action=wsl
 status|wsl|unsupported|macos:virtualization:wsl:unsupported
 [result_status] UNAVAILABLE / UNKNOWN / macos:virtualization:wsl:unsupported
+
+== action=runtime_posture
+status|runtime_posture|unsupported|macos:virtualization:runtime_posture:unsupported
+[result_status] UNAVAILABLE / UNKNOWN / macos:virtualization:runtime_posture:unsupported
 

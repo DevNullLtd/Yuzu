@@ -10,7 +10,7 @@
  *
  * Schema:
  *   echo_state  — last-known state per collector for diff computation
- *   echo_config — key/value config (retention_days, redaction patterns, etc.)
+ *   echo_config — key/value config (the per-source switches, intervals, redaction patterns, etc.)
  *   echo_cursor — last-persisted cursor JSON per cursor-model source
  *                (echo_cursor.hpp: power, removable, registry)
  *   <src>_<tier>_r, echo_dict, echo_fold_seen — the roll-up tables, and the
@@ -40,6 +40,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <sqlite_quarantine.hpp> // FsOps, the quarantine's filesystem seam carried by OpenSeams
 
 struct sqlite3; // Forward declaration
 
@@ -477,7 +479,6 @@ struct EchoStats {
     /// the WAL file. Free pages are excluded because they are reusable, so this is the figure
     /// the byte budget is enforced against; it is NOT the on-disk file size.
     int64_t db_size_bytes{0};
-    int retention_days{7};
 };
 
 /// Room the WAL file is allowed beyond the data pages: `PRAGMA journal_size_limit` at open, and
@@ -533,7 +534,39 @@ struct OpenSeams {
     /// Called inside the v10 transaction right after the retired tables are dropped; an error it
     /// returns rolls the whole migration back (the crash/rollback test's fault point).
     std::function<std::expected<void, std::string>()> v10_after_drop;
+    /// Called after a corrupt database was quarantined and before the names are checked for a
+    /// link again and reopened (the link-swap test's fault point, #1527).
+    std::function<void()> after_quarantine;
+    /// Called right before every sqlite3_open_v2 on the database name: the main open, the reopen
+    /// after a quarantine and the read-only query connection. It stands in for a swap made after
+    /// the last name check, which is what SQLITE_OPEN_NOFOLLOW closes (#1527). Production never
+    /// sets it.
+    std::function<void()> before_sqlite_open;
+    /// Called after the main connection opened and its file's identity was read, right before
+    /// `PRAGMA integrity_check` runs. It stands in for a name swapped while the check runs: the
+    /// quarantine must then refuse, because the file at the name is not the one SQLite judged
+    /// (#1527). Production never sets it.
+    std::function<void()> before_integrity_check;
+    /// The filesystem steps of the quarantine that follows a corrupt verdict (the hard-link
+    /// claim, a sidecar move, a remove), forwarded to `quarantine_corrupt_db`. An empty member is
+    /// the real call. A test's `link` runs between the verdict and the claim, which is where a
+    /// swapped-in link has to be caught (#1527). Production never sets one.
+    yuzu::shared::sqlite_quarantine::FsOps quarantine_ops;
 };
+
+/// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the
+/// file aside; `busy` and `unreadable` refuse to open and quarantine nothing (a quarantine plus a
+/// fresh file would re-enable every source an operator paused).
+enum class IntegrityCheck {
+    ok,        ///< the check passed
+    busy,      ///< another connection holds the file past the busy timeout (BUSY / LOCKED)
+    corrupt,   ///< a non-"ok" integrity row, or SQLITE_CORRUPT / SQLITE_NOTADB
+    unreadable ///< any other failure to read the file (IOERR, CANTOPEN, PERM, READONLY, FULL, ...)
+};
+
+/// Classify the sqlite result code that a failed `PRAGMA integrity_check` (prepare or step) ended
+/// with. Pure; `rc` may be an extended code, only its primary (low) byte counts. Never returns `ok`.
+IntegrityCheck classify_integrity_rc(int rc) noexcept;
 
 class EchoDatabase {
 public:
@@ -544,7 +577,9 @@ public:
      *
      * On failure the error text says WHY and, where there is one, the remedy: the directory
      * cannot be created, SQLite cannot open the file, a corrupt echo.db could not be moved aside
-     * (#559, refused rather than trusted), a schema transaction wedged, or -- on Windows only --
+     * (#559, refused rather than trusted), the file is busy or could not be read for a reason
+     * that is not corruption (refused, nothing quarantined, retried on the next start, #7286), a
+     * schema transaction wedged, or -- on Windows only --
      * a planted echo.db (refused) or a planted -wal, -shm or -journal that could not be replaced
      * (foreign owner or extra hard link), or -- for a database that still holds the retired raw
      * tables -- a volume with less than twice the file's size (plus its log) free, or a v10 migration that

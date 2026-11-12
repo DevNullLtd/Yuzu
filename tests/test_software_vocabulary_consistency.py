@@ -33,10 +33,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-EXPECTED_KINDS = {"package", "app", "pkg", "feat"}
+EXPECTED_KINDS = {"package", "app", "pkg", "feat", "driver"}
 CATALOG_RULES = "server/core/src/software_catalog_rules.hpp"
 LANE1 = {"rpm", "deb", "apk", "pacman"}
-LANE3_KINDS = {"app", "feat"}
+LANE3_KINDS = {"app", "feat", "driver"}
 
 # Plain patterns only: Path.glob has no brace expansion.
 EMITTER_GLOBS = [
@@ -97,6 +97,19 @@ def extract_enumeration(text, field):
     if len(found) != 1:
         raise AssertionError(f"expected exactly one `{field} (...)` enumeration, found {len(found)}")
     return set(found[0].split("|"))
+
+
+def extract_row_description_enumeration(text, field):
+    """The InstalledSoftwareRow schema spells the field's values in prose,
+    `"<field>": {"type": "string", "description": "a | b | c"}`; exactly one such property or a
+    hard failure. The `kind (a|b)` form above misses it, so it is read separately."""
+    found = re.findall(rf'"{field}": \{{"type": "string", "description": "([a-z_]+(?: \| [a-z_]+)+)"\}}',
+                       text)
+    if len(found) != 1:
+        raise AssertionError(
+            f"expected exactly one `\"{field}\": {{... \"description\": \"a | b\"}}` row property, "
+            f"found {len(found)}")
+    return set(found[0].split(" | "))
 
 
 def extract_json_enums(text, field):
@@ -266,6 +279,8 @@ class VocabularyConsistency(unittest.TestCase):
     def test_openapi_enumeration(self):
         text = read(OPENAPI_SRC)
         self.assertEqual(extract_enumeration(text, "kind"), EXPECTED_KINDS)
+        # The row schema's prose list (InstalledSoftwareRow.kind) is what a client reads first.
+        self.assertEqual(extract_row_description_enumeration(text, "kind"), EXPECTED_KINDS)
 
     def test_json_enum_arrays_equal_vocabulary(self):
         # Anti-vacuous: each source must publish at least one `kind` enum array; every one must

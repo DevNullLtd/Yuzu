@@ -257,7 +257,7 @@ struct LiveUserRow { std::string user, host, logon_type, session; };
 struct LiveNetAddr { std::string adapter, ip; int prefix = 0; std::string gateway; };
 /// One volume's capacity reading (disk_space/free → disk|<path>|<total>|<free>|<percent_used>).
 struct LiveDiskVolume { std::string path; long long total = 0, free = 0; int percent_used = 0; };
-/// One Echo capture source's local state (echo/status → config|<src>_enabled / _live_rows).
+/// One Echo capture source's local state (echo/status → config|<src>_enabled / _rows).
 /// `dollar`/`category` are server-side presentation metadata (the agent schema registry
 /// is not linked into the server, so the source list is hand-held in device_routes.cpp;
 /// only sources the agent actually reports are rendered).
@@ -265,9 +265,6 @@ struct LiveCaptureSource {
     std::string name, dollar, category;
     bool enabled = false;
     long long live_rows = -1; ///< -1 = unknown (no count reported)
-    /// The agent reported `<src>_live_rows` only: it has not moved to the roll-up store, so its
-    /// count is raw capture rows and is not presented as the hourly count.
-    bool pre_rollup_agent = false;
 };
 
 /// PURE renderers — one `.ls-tbl`/tree per card body, dark-theme, CSP-safe.

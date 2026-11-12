@@ -997,12 +997,8 @@ std::string render_device_live_capture_sources(const std::vector<LiveCaptureSour
         const std::string sw = "<span class=\"ls-sw" + std::string(r.enabled ? " on" : "") + "\"></span>";
         const std::string nm = "<span class=\"" + std::string(r.enabled ? "src-on" : "src-off") +
                                "\">" + esc(r.name) + "</span>";
-        const std::string rows_cell =
-            r.pre_rollup_agent
-                ? "<span class=\"gp-mute\" title=\"This device runs an agent without the "
-                  "roll-up tables; upgrade the agent\">&mdash;</span>"
-            : r.live_rows < 0 ? "<span class=\"gp-mute\">&mdash;</span>"
-                              : std::to_string(r.live_rows);
+        const std::string rows_cell = r.live_rows < 0 ? "<span class=\"gp-mute\">&mdash;</span>"
+                                                      : std::to_string(r.live_rows);
         h += "<tr><td>" + sw + "</td><td>" + nm + "</td><td><code>$" + esc(r.dollar) +
              "_Hourly</code></td><td class=\"ls-num\">" + rows_cell +
              "</td><td><span class=\"ls-pill\">" + esc(r.category) + "</span></td></tr>";

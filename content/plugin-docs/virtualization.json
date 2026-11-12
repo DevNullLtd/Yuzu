@@ -27,6 +27,32 @@
       }
     },
     {
+      "action": "runtime_posture",
+      "definition_ids": [
+        "linux.virtualization.runtime_posture"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "no endpoint set (the default) means no socket is ever opened and no container is listed; the runtimes' own default sockets are refused as the endpoint (by path and by inode), and the permission bits plus the operator's proxy are the enforcement, not that check; not_detected means none of a runtime's standard-path artefacts exists, which a stopped, rootless or custom-root runtime also reads; containerd is presence only (its control plane is gRPC, not read); a read failure, a cap, the deadline or an overprivileged default socket reads constrained with a typed token",
+          "mechanism": "stat of the docker, podman and containerd default sockets, config files and data roots (no subprocess, no PATH walk), /etc/docker/daemon.json read through a key allow-list (nlohmann::json), /etc/containers and /etc/containerd presence only, and, only when agent.container_runtime_endpoint names an operator-provided read-only unix socket, four fixed GET requests over it (/version, /info, /containers/json?all=1, /containers/{id}/json) under a 20 s action deadline",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "Linux-only: container-runtime posture is read from Linux paths and a unix socket",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "Linux-only: container-runtime posture is read from Linux paths and a unix socket",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        }
+      }
+    },
+    {
       "action": "wsl",
       "definition_ids": [
         "windows.virtualization.wsl"
@@ -58,7 +84,7 @@
     "**A KVM host reads `bare_metal`; a Xen dom0 reads `guest`/`xen`.** The kind describes what the OS the agent runs on is running under. A Linux KVM host's own CPUID is not virtualised, so it is not detected as a hypervisor host. A Xen dom0 is itself a Xen guest: the hypervisor bit is set, the signature is `XenVMMXenVMM` and `/sys/hypervisor/type` says `xen`, so it reads `guest` with vendor `xen`. Only the Windows Hyper-V root partition is reported as `host_with_hypervisor`.",
     "**Container membership is best effort.** An LXD, Incus or systemd-nspawn system container shows the same cgroup path as a host, so the plugin also reads the type systemd records in `/run/systemd/container`. On cgroup v2 an agent inside a cgroup namespace sees `0::/` whatever it runs in, and a host whose init places the agent at the cgroup root reads the same; both are `unknown` (`linux:virtualization:container:cgroup_root_opaque`) unless a marker file or the systemd record answers, never `no`. A container without a marker file or systemd record (a serverless or hand-rolled runtime) can read `no` when its readable, non-root cgroup path has no recognised runtime signature. Windows containers are not read: the row is always `unknown` with `windows:virtualization:container:not_read`. macOS always reports `no`.",
     "**A customised Hyper-V guest can read as a host.** SMBIOS beats the root-partition bit, so a Hyper-V guest whose SMBIOS strings were changed to a non-VM vendor and which is granted CreatePartitions reads `host_with_hypervisor`. Nested virtualization with a custom SMBIOS is the only known case. In the same way a hypervisor operator who masks both the CPUID hypervisor bit and the SMBIOS strings makes a guest read `bare_metal`; the rows are facts as the machine presents them, not attestation. The `wsl` rows are weaker still, because they are what each user's own hive asserts: the `Lxss` subtree is writable by the user it belongs to, so a `distribution` row is that user's claim, not evidence of what is installed and not tamper evidence, and `DistributionName` and `Flavor` are free text that can carry a personal name (only an e-mail shape is redacted). The keys are opened with `REG_OPTION_OPEN_LINK`, so a registry link planted as `Lxss` or as a `{GUID}` child opens as the link object and is never followed; one probe of each opened key for the `SymbolicLinkValue` marker then detects it and reports `lxss_link` (a link at `Lxss` leaves the profile unread, a link at a `{GUID}` child is an `unknown` row), so a planted link is never a clean result. A plain key that holds a decoy value of that name reads the same way: constrained, never fail-open. The flag and the probe cover the last key of each open only, so a link planted at an ancestor (`Software` through `CurrentVersion`, which the user must delete and recreate in their own hive, breaking their own profile) is still followed within whatever the kernel's hive trust rule allows, exposing at most the five value names this walk reads (`DefaultDistribution` under `Lxss`, and `DistributionName`, `Version`, `State` and `Flavor` under the GUID-shaped children).",
-    "**Cloud-metadata and runtime detection are out of scope.** The plugin does not query a cloud metadata service, and the running state of the WSL utility VM and of its distributions is not read (`wsl` lists what is installed for each user, not what is running). `vendor` is the virtualization platform the SMBIOS table, the CPUID signature or the macOS model names, never the cloud account or instance: it is `aws`, `gce`, `alibaba`, `openstack` or `nutanix` where SMBIOS names one of those platforms, otherwise the hypervisor token (`qemu`, `hyperv`, `kvm` and so on), or `other` where none of them names a listed platform. A product name containing `.metal` (an AWS bare-metal instance type) reads as hardware."
+    "**Cloud metadata and running state are out of scope.** The plugin does not query a cloud metadata service, and the running state of the WSL utility VM and of its distributions is not read (`wsl` lists what is installed for each user, not what is running). `vendor` is the virtualization platform the SMBIOS table, the CPUID signature or the macOS model names, never the cloud account or instance: it is `aws`, `gce`, `alibaba`, `openstack` or `nutanix` where SMBIOS names one of those platforms, otherwise the hypervisor token (`qemu`, `hyperv`, `kvm` and so on), or `other` where none of them names a listed platform. A product name containing `.metal` (an AWS bare-metal instance type) reads as hardware."
   ],
   "definitions": [
     {
@@ -83,6 +109,26 @@
       ]
     },
     {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Reports which container runtimes (docker, podman, containerd) are present on this device, how they are configured from a security point of view, and, only when the operator has provided a read-only runtime endpoint, which containers exist and which risky settings they carry (name, image, state, privileged, network mode and whether a host runtime socket is mounted). Never creates, starts, stops or execs into anything; never emits environment, command line, labels, ports or other mounts. A leading status row states whether the read was complete: constrained means a read failed, a cap was hit or the deadline ran out. The endpoint row says why no container data was read (unset, endpoint_refused, permission_denied, unreachable, not_http). A runtime reads not_detected when none of its standard-path artefacts exists, which is not proof of absence: a stopped, rootless or custom-root runtime can read not_detected.",
+      "display_name": "Container Runtime Posture",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 3600
+      },
+      "id": "linux.virtualization.runtime_posture",
+      "platforms": [
+        "linux"
+      ]
+    },
+    {
       "approval_mode": "role-gated",
       "author_roles": [
         "content-author"
@@ -102,15 +148,15 @@
       ]
     }
   ],
-  "description": "Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions",
-  "how_it_works": "`host` reports whether this device is a virtual machine, which hypervisor it runs under, and whether the agent itself runs in a container, as facts only. It changes nothing and spawns nothing. The first row is always a `status` row saying whether the read was complete, then one `host` row (`is_virtual`, `kind`, `vendor`, `product`, `source`, `confidence`) and one `container` row. `kind` is `guest`, `host_with_hypervisor`, `bare_metal` or `unknown`; a container on a VM reports both facts, because `container` is its own row and not a `kind` value.\n\nThe decision is one table in `virtualization_parsers.hpp`, fed by what each OS shell reads. Linux reads CPUID (x86), the DMI `sys_vendor` and `product_name` attributes, `/sys/hypervisor/type`, the marker files `/.dockerenv` and `/run/.containerenv`, the container type systemd records in `/run/systemd/container` (how an LXD, Incus or systemd-nspawn system container is told from a host, because its cgroup path looks the same), and the agent's own `/proc/self/cgroup` (not PID 1's, which answers a different question when the PID namespace is shared). The `/run/systemd/container` content is never emitted, only the fact that it named a container; `wsl` and an empty file are ignored, so a WSL2 agent is not turned into a container. macOS reads `kern.hv_vmm_present` and `hw.model`. Windows reads CPUID and the SMBIOS System Information table. A Windows machine running Hyper-V, VBS or WSL2 sets the CPUID hypervisor bit yet is the host, not a guest: when the hypervisor signature is `Microsoft Hv`, the interface signature is `Hv#1` and the maximum leaf reaches `0x40000003`, the Hyper-V root-partition bit (leaf `0x40000003` EBX bit 0, CreatePartitions) separates a host (`host_with_hypervisor`, `is_virtual` no) from a guest. Without that discovery contract the bit is never read.\n\nPrecedence: positive identification always beats negative evidence. SMBIOS or the hardware model naming a VM vendor decides first (so VBS nested inside another hypervisor, which sets the root-partition bit, still reads `guest`); then the root-partition bit; then the CPUID hypervisor bit; then a positive OS hint. `bare_metal` is reachable only when no consulted source identifies virtualization, at least one readable source says \"not virtual\", and no host-decision source (SMBIOS, CPUID, OS hint) failed to read; a failed container read makes the status `constrained` but does not block `bare_metal`. `bare_metal` means no virtualization signal was seen, not proof of physical hardware. Anything else is `unknown`, with the reasons on the status row and in the host row's `source` field.\n\n`wsl` (Windows only) lists the WSL distributions of every local user profile. For each real profile (system accounts are skipped) it reads `Software\\Microsoft\\Windows\\CurrentVersion\\Lxss` through the shared `with_user_hive` ladder: the loaded `HKU\\<SID>` hive first, else the profile's `NTUSER.DAT` mounted offline under the process-wide offline-hive lock with the default-on hive-file guard, the same span `installed_apps.list_per_user` uses. The profile list itself (SIDs and folder paths) comes from `HKLM\\...\\ProfileList`. Each child key named by a GUID is one distribution (WSL's own non-GUID children such as `InstallStatus` are skipped); only `DistributionName`, `Version`, `State` and `Flavor` are read, plus the per-user `DefaultDistribution` and the machine-wide WSL package `Version` under `HKLM\\...\\Lxss\\MSI`. Every key under the hive root is opened with `REG_OPTION_OPEN_LINK`, and the `Lxss` key and each distribution key are probed once for the `SymbolicLinkValue` marker of a registry link, so a link planted at either is reported (`lxss_link`) and never read through; the machine-wide `...\\Lxss\\MSI` key is opened the same way but not probed (only an administrator can plant a link there, and it reads as a package version of `-`). The rows are a `status` row, one `summary` row, one `profile` row for each profile that was not reached or whose mount could not be released, and one `distribution` row per distribution, sorted by account then name. Linux and macOS answer one `unsupported` status row. The walk is bounded in work, not in time: one budget per dispatch caps the registry enumeration and value-read calls (4096, the link probes included; opening a key is not counted), a value (4 KiB), rows (1024, which includes the two reserved status and summary rows) and output (256 KiB) across all hives, and each hive is also held to 512 of those calls, 128 rows and 32 KiB so that one hostile hive ends alone. The number of hives mounted is bounded by the profile cap alone, not by the call budget: a dispatch visits at most 512 profiles, so the worst case is 512 serial mount and unload cycles, and a hive with no Lxss key costs no counted call. The lock wait, `RegLoadKeyW` and `RegUnLoadKeyW` have no deadline, exactly as for `installed_apps.list_per_user`. If an unload fails, that profile's `NTUSER.DAT` stays locked and the mount `HKU\\YUZU_HIVE_<SID>_...` is left behind: list `HKU` with `reg query HKU`, find the `YUZU_HIVE_*` key (its exact name is in the agent log) and release it with `reg unload HKU\\<mount>`. Until then that user's next logon gets a temporary profile, and a repeat `wsl` dispatch reports the profile as `mount_failed`. The only automatic cleanup is the Echo plugin's start-up sweep of `YUZU_HIVE_*` mounts, so an agent without Echo loaded needs the manual step. The decision, the bounds and the fake-registry tests are in `virtualization_wsl_parsers.hpp`.\n\n### What you can decide with it\n\n| Question | Linux | macOS | Windows |\n|---|---|---|---|\n| Is this device a VM? | Yes: `is_virtual` yes, no or unknown, with the evidence source and a confidence. | Yes, from `kern.hv_vmm_present` and the model name. | Yes, from CPUID and SMBIOS. |\n| Which hypervisor? | The CPUID signature, a DMI vendor or `/sys/hypervisor/type`. | `apple` for a `VirtualMac*` model, `vmware` for a VMware model string, otherwise `other`. | The CPUID signature or the SMBIOS vendor. |\n| Is the agent in a container? | `yes` on a marker file, a container type in `/run/systemd/container` or a container cgroup path; `no` only when all of those are readable and absent and the cgroup names a real path (a container without a marker file or systemd record can also read `no` when its readable, non-root cgroup path has no recognised runtime signature, caveat 3); otherwise `unknown`. | Always `no`. | Not read: always `unknown`. |\n| Is this a Hyper-V, VBS or WSL2 host? | A WSL2 guest reads `guest` `hyperv`. | n/a | Yes on x86: `host_with_hypervisor`, `is_virtual` no. Not detected on ARM64, which has no CPUID. |\n| Which WSL distributions does each user have? | `wsl`: one `unsupported` row. | `wsl`: one `unsupported` row. | `wsl`: per local profile, the distribution name, WSL version, state, default and flavor, including profiles that are logged off. |\n\n### Diagrams\n\n#### How the kind is decided\n\nThe order matters: a positive identification is never outranked by a negative or missing signal, and an unreadable host-decision source (SMBIOS, CPUID, OS hint) can never be read as \"not virtual\".",
+  "description": "Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions, container-runtime posture",
+  "how_it_works": "`host` reports whether this device is a virtual machine, which hypervisor it runs under, and whether the agent itself runs in a container, as facts only. It changes nothing and spawns nothing. The first row is always a `status` row saying whether the read was complete, then one `host` row (`is_virtual`, `kind`, `vendor`, `product`, `source`, `confidence`) and one `container` row. `kind` is `guest`, `host_with_hypervisor`, `bare_metal` or `unknown`; a container on a VM reports both facts, because `container` is its own row and not a `kind` value.\n\nThe decision is one table in `virtualization_parsers.hpp`, fed by what each OS shell reads. Linux reads CPUID (x86), the DMI `sys_vendor` and `product_name` attributes, `/sys/hypervisor/type`, the marker files `/.dockerenv` and `/run/.containerenv`, the container type systemd records in `/run/systemd/container` (how an LXD, Incus or systemd-nspawn system container is told from a host, because its cgroup path looks the same), and the agent's own `/proc/self/cgroup` (not PID 1's, which answers a different question when the PID namespace is shared). The `/run/systemd/container` content is never emitted, only the fact that it named a container; `wsl` and an empty file are ignored, so a WSL2 agent is not turned into a container. macOS reads `kern.hv_vmm_present` and `hw.model`. Windows reads CPUID and the SMBIOS System Information table. A Windows machine running Hyper-V, VBS or WSL2 sets the CPUID hypervisor bit yet is the host, not a guest: when the hypervisor signature is `Microsoft Hv`, the interface signature is `Hv#1` and the maximum leaf reaches `0x40000003`, the Hyper-V root-partition bit (leaf `0x40000003` EBX bit 0, CreatePartitions) separates a host (`host_with_hypervisor`, `is_virtual` no) from a guest. Without that discovery contract the bit is never read.\n\nPrecedence: positive identification always beats negative evidence. SMBIOS or the hardware model naming a VM vendor decides first (so VBS nested inside another hypervisor, which sets the root-partition bit, still reads `guest`); then the root-partition bit; then the CPUID hypervisor bit; then a positive OS hint. `bare_metal` is reachable only when no consulted source identifies virtualization, at least one readable source says \"not virtual\", and no host-decision source (SMBIOS, CPUID, OS hint) failed to read; a failed container read makes the status `constrained` but does not block `bare_metal`. `bare_metal` means no virtualization signal was seen, not proof of physical hardware. Anything else is `unknown`, with the reasons on the status row and in the host row's `source` field.\n\n`wsl` (Windows only) lists the WSL distributions of every local user profile. For each real profile (system accounts are skipped) it reads `Software\\Microsoft\\Windows\\CurrentVersion\\Lxss` through the shared `with_user_hive` ladder: the loaded `HKU\\<SID>` hive first, else the profile's `NTUSER.DAT` mounted offline under the process-wide offline-hive lock with the default-on hive-file guard, the same span `installed_apps.list_per_user` uses. The profile list itself (SIDs and folder paths) comes from `HKLM\\...\\ProfileList`. Each child key named by a GUID is one distribution (WSL's own non-GUID children such as `InstallStatus` are skipped); only `DistributionName`, `Version`, `State` and `Flavor` are read, plus the per-user `DefaultDistribution` and the machine-wide WSL package `Version` under `HKLM\\...\\Lxss\\MSI`. Every key under the hive root is opened with `REG_OPTION_OPEN_LINK`, and the `Lxss` key and each distribution key are probed once for the `SymbolicLinkValue` marker of a registry link, so a link planted at either is reported (`lxss_link`) and never read through; the machine-wide `...\\Lxss\\MSI` key is opened the same way but not probed (only an administrator can plant a link there, and it reads as a package version of `-`). The rows are a `status` row, one `summary` row, one `profile` row for each profile that was not reached or whose mount could not be released, and one `distribution` row per distribution, sorted by account then name. Linux and macOS answer one `unsupported` status row. The walk is bounded in work, not in time: one budget per dispatch caps the registry enumeration and value-read calls (4096, the link probes included; opening a key is not counted), a value (4 KiB), rows (1024, which includes the two reserved status and summary rows) and output (256 KiB) across all hives, and each hive is also held to 512 of those calls, 128 rows and 32 KiB so that one hostile hive ends alone. The number of hives mounted is bounded by the profile cap alone, not by the call budget: a dispatch visits at most 512 profiles, so the worst case is 512 serial mount and unload cycles, and a hive with no Lxss key costs no counted call. The lock wait, `RegLoadKeyW` and `RegUnLoadKeyW` have no deadline, exactly as for `installed_apps.list_per_user`. If an unload fails, that profile's `NTUSER.DAT` stays locked and the mount `HKU\\YUZU_HIVE_<SID>_...` is left behind: list `HKU` with `reg query HKU`, find the `YUZU_HIVE_*` key (its exact name is in the agent log) and release it with `reg unload HKU\\<mount>`. Until then that user's next logon gets a temporary profile, and a repeat `wsl` dispatch reports the profile as `mount_failed`. The only automatic cleanup is the Echo plugin's start-up sweep of `YUZU_HIVE_*` mounts, so an agent without Echo loaded needs the manual step. The decision, the bounds and the fake-registry tests are in `virtualization_wsl_parsers.hpp`.\n\n`runtime_posture` (Linux only) reports which container runtimes are on this device and how they are set up, as read-only facts. With no endpoint configured, which is the default, the agent never opens a socket: it `stat`s the standard docker, podman and containerd sockets, config files and data roots (no subprocess, no `PATH` walk), reads `/etc/docker/daemon.json` through a fixed key allow-list and only notes the presence of the podman and containerd TOML files. A runtime reads `not_detected` when none of its standard-path artefacts exists, which is a statement about those paths and not proof of absence: a stopped, rootless or custom-root runtime can read `not_detected`. `detected` means at least one standard-path artefact exists, not that the runtime runs or is the only one installed: podman's `/etc/containers/{storage,registries}.conf` and `/var/lib/containers` are shared with CRI-O, buildah and skopeo, so a node that has only one of those can read `podman` `detected`. A data root that sits on, under or above a network mount is not `stat`ed (`<runtime>:network_fs_skipped`), because a `stat` on a dead mount has no deadline. If a default socket is group-connectable by a group the agent holds, or other-writable, the agent reports `<runtime>:overprivileged` by comparing modes and groups; it never probes by connecting.\n\nAn operator opts in per host by setting `YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT` (or `--container-runtime-endpoint`) to ONE read-only unix socket they provide in front of the runtime, in `/etc/yuzu-agent/yuzu-agent.env` or a unit drop-in; the packaged unit is not changed and the agent is never added to the `docker` group. Over that endpoint the agent sends four fixed `GET` requests built from a verb table (`/version`, `/info`, `/containers/json?all=1`, `/containers/{id}/json`), each with `Connection: close`, under one 20 s action deadline. The four runtime default sockets are refused as an endpoint, by normalised path and by inode while they are present (`endpoint_refused`), and the endpoint object must be a socket owned by uid 0, group the agent's effective group, mode `0660`, under root-owned directories that group and other cannot write; the agent connects through the descriptor it checked. That refusal is a structural guard, not the enforcement: the socket's permission bits and the operator's proxy are. The agent knows a default socket only while it exists when the action runs, so a runtime socket at another path (a second listener, a rootless socket under `/run/user/<uid>/`, a TCP listener) is not refused by it. If `connect(2)` rejects the checked descriptor's `/proc/self/fd` form, the request reads `unreachable`; the agent never falls back to connecting by path. The proxy must admit only those four requests, matched exactly on every request, and it does not filter response bodies; a permissive proxy lets a compromised agent reach whatever it permits; the contract, the bounds and the security review are in `docs/virtualization-runtime-posture-design.md`.\n\nContainer rows carry the name, image, state, a privileged flag, the network mode and whether a default runtime socket (or a directory that contains one) is mounted into the container. The agent reads no environment, command line, label, port or other mount. containerd is detected by presence only: its control plane is gRPC, which no plugin links. Only one `runtime_posture` dispatch runs per agent at a time; a concurrent one returns one `constrained` status row with `busy`.\n\n### What you can decide with it\n\n| Question | Linux | macOS | Windows |\n|---|---|---|---|\n| Is this device a VM? | Yes: `is_virtual` yes, no or unknown, with the evidence source and a confidence. | Yes, from `kern.hv_vmm_present` and the model name. | Yes, from CPUID and SMBIOS. |\n| Which hypervisor? | The CPUID signature, a DMI vendor or `/sys/hypervisor/type`. | `apple` for a `VirtualMac*` model, `vmware` for a VMware model string, otherwise `other`. | The CPUID signature or the SMBIOS vendor. |\n| Is the agent in a container? | `yes` on a marker file, a container type in `/run/systemd/container` or a container cgroup path; `no` only when all of those are readable and absent and the cgroup names a real path (a container without a marker file or systemd record can also read `no` when its readable, non-root cgroup path has no recognised runtime signature, caveat 3); otherwise `unknown`. | Always `no`. | Not read: always `unknown`. |\n| Is this a Hyper-V, VBS or WSL2 host? | A WSL2 guest reads `guest` `hyperv`. | n/a | Yes on x86: `host_with_hypervisor`, `is_virtual` no. Not detected on ARM64, which has no CPUID. |\n| Which WSL distributions does each user have? | `wsl`: one `unsupported` row. | `wsl`: one `unsupported` row. | `wsl`: per local profile, the distribution name, WSL version, state, default and flavor, including profiles that are logged off. |\n| Which container runtimes are here, and are any containers risky? | `runtime_posture`: runtime presence and posture from `stat` and `daemon.json`; containers (name, image, state, privileged, network mode, runtime-socket mount) only through an operator-provided read-only endpoint. | `runtime_posture`: one `unsupported` row. | `runtime_posture`: one `unsupported` row. |\n\n### Diagrams\n\n#### How the kind is decided\n\nThe order matters: a positive identification is never outranked by a negative or missing signal, and an unreadable host-decision source (SMBIOS, CPUID, OS hint) can never be read as \"not virtual\".",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "2a955b994291",
+  "leg_hash": "aec6e0e7930c",
   "manifest_version": 1,
   "name": "virtualization",
   "outputs": [
@@ -214,6 +260,107 @@
     {
       "columns": [
         {
+          "description": "Row shape discriminator (field 0). Values: status, endpoint, runtime, config, container.",
+          "example": "container",
+          "name": "row_kind",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": [
+            "status",
+            "endpoint",
+            "runtime",
+            "config",
+            "container"
+          ]
+        },
+        {
+          "description": "status: the literal \"runtime_posture\". endpoint: the endpoint outcome, unset, endpoint_refused, permission_denied, unreachable, not_http or ok. runtime: the runtime, docker, podman or containerd. config: docker for a daemon.json setting, otherwise the runtime that /version identified. container: the runtime that /version identified. For config and container the runtime is docker or podman, or \"-\" when /version did not identify one.",
+          "example": "docker",
+          "name": "field_1",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "status: supported, constrained or unsupported (a leg that threw). endpoint: the refusal reason for endpoint_refused (relative, dotdot, too_long, default_socket, same_inode, not_socket, symlink, owner, group, mode, insecure_ancestor, stat_error), otherwise \"-\". runtime: not_detected, detected or served. config: the setting name, or daemon_json on the one pseudo-row config|docker|daemon_json|malformed that says daemon.json was not usable JSON or held an allow-listed key of the wrong type. container: the first 12 characters of the container id.",
+          "example": "detected",
+          "name": "field_2",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "status: reason token(s) for a non-supported read, \"-\" when complete; every token is linux:virtualization:runtime_posture:<source>:<cause>, where <source> is endpoint, version, info, list, inspect, mountinfo, daemon_json or a runtime name; the source segment is omitted for the action-wide tokens busy, rows_capped, inspect_capped and deadline_exhausted, and inspect:failed:<n> carries a count in place of a cause; tokens look like linux:virtualization:runtime_posture:endpoint:default_socket, linux:virtualization:runtime_posture:version:timeout, linux:virtualization:runtime_posture:info:malformed, linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, \"-\" when it did not answer or its /version named no runtime. runtime: the default socket, present:<mode>:<uid>:<gid>, absent or unreadable (its stat failed). config: the setting value (malformed on the daemon_json pseudo-row). container: the container name.",
+          "example": "present:0660:0:998",
+          "name": "field_3",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "runtime: whether a config file was found, present, absent or unreadable (its read failed). container: the image reference. Not used by the other kinds.",
+          "example": "present",
+          "name": "field_4",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "runtime: the runtime version, filled only on the served row, otherwise \"-\". container: the state, created, running, paused, restarting, removing, exited, dead or invalid. Not used by the other kinds.",
+          "example": "running",
+          "name": "field_5",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "runtime: the API version, filled only on the served row, otherwise \"-\". container: privileged, yes, no or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds.",
+          "example": "no",
+          "name": "field_6",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "container: the network mode, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds.",
+          "example": "bridge",
+          "name": "field_7",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "container: host_runtime_socket_mounted, yes (a mount source is a default runtime socket path or a parent directory of one), no, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). The check covers the default socket paths only. Not used by the other kinds.",
+          "example": "no",
+          "name": "field_8",
+          "platforms": [
+            "linux"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "linux.virtualization.runtime_posture"
+    },
+    {
+      "columns": [
+        {
           "description": "Row shape discriminator (field 0). Values: status, summary, profile, distribution.",
           "example": "distribution",
           "name": "row_kind",
@@ -292,7 +439,7 @@
       "definition_id": "windows.virtualization.wsl"
     }
   ],
-  "outputs_note": "Every row is pipe-delimited and field 0 is the row kind; `-` is an absent value. The first row of a `host` dispatch is always `status|host|<supported\\|constrained\\|unsupported>|<reason or ->`. The `host` row has seven fields: `host|<yes\\|no\\|unknown>|<guest\\|host_with_hypervisor\\|bare_metal\\|unknown>|<vendor>|<product>|<source>|<high\\|medium\\|low>`. `vendor` is the virtualization platform (`kvm`, `hyperv`, `vmware`, `xen`, `virtualbox`, `parallels`, `bhyve`, `qemu`, `acrn`, `aws`, `gce`, `alibaba`, `openstack`, `nutanix`, `apple` or `other`) for a guest or host, and the hardware manufacturer for `bare_metal` and `unknown`. `source` is the evidence that decided the kind (`cpuid`, `smbios`, `sysctl` or `sys_hypervisor`); when the kind is `unknown` it carries the joined host-decision reason tokens instead (container read failures stay on the container row), so the row an operator reads explains itself. The `container` row is `container|<yes\\|no\\|unknown>|<evidence or reason>`. Every OS-supplied value (DMI and SMBIOS strings, the hardware model) is scrubbed (NUL and malformed UTF-8 become `?`) and escaped for the server's pipe grammar.\n\n`wsl` rows (Windows). The first row is `status|wsl|<supported\\|constrained\\|unsupported>|<reason or ->`, then `summary|<distributions>|<wsl2>|<profiles_read>|<profiles_not_loaded>|<package_version or ->`. `distributions` is the number of `distribution` rows emitted. `wsl2` counts version-2 distributions and is NOT a VM count: every WSL 2 distribution shares one utility VM whose running state is readable only through `wsl.exe` or the WSL service, which this plugin does not call. `profiles_read` counts the hives whose Lxss key was read or found absent (an absent key counts: that profile has no WSL); a cap that stops the read inside the key still counts it and is reported by its token. `profiles_not_loaded` counts the profiles whose hive was reached by neither the loaded hive nor the offline mount, including `.bak` entries and invalid SIDs, and the profiles never reached because a dispatch-wide limit stopped the walk (those get no `profile` row: the output budget was spent). `profiles_read` + `profiles_not_loaded` need not equal the profile count: a hive that was reached but whose Lxss key could not be opened, or is a registry link, is in neither, and is reported only by its `hive_access_denied`, `hive_open_failed` or `lxss_link` token (a token carries no account). `package_version` is `-` when unavailable or over 64 bytes. A `profile` row, `profile|<account or ->|<outcome>|<detail or ->`, is emitted only for a profile that was not reached or whose mount could not be released; `outcome` is one of `not_found`, `privilege_missing`, `mount_failed`, `access_denied`, `file_refused`, `unload_failed`, `backup_skipped` or `sid_invalid`, and `detail` is the hive-file guard's reason verbatim for `file_refused` (`hive_path_unc`, `hive_identity_changed` and the others in `agents/shared/win_hive_file_guard.hpp`) and `-` otherwise. An `unload_failed` row means the offline mount was left behind and keeps `NTUSER.DAT` locked until `reg unload HKU\\<mount>` succeeds (find the `YUZU_HIVE_*` key with `reg query HKU`; until then that user's next logon gets a temporary profile and a repeat dispatch reports the profile as `mount_failed`, and only the Echo plugin's start-up sweep cleans up on its own, see How it works); the mount name embeds the SID, so it is written to the agent log only and never to a row. A `distribution` row is `distribution|<account or ->|<name>|<1\\|2\\|unknown>|<installed\\|installing\\|uninstalling\\|converting\\|exporting\\|compacting\\|state_<n>\\|unknown>|<yes\\|no>|<flavor or ->`; `account` is the profile folder name, never the SID, and `yes` marks that account's default distribution. The state names follow the WSL service's own state enum (the public WSL source, `_LxssDistributionState`): `installed` is 1, `installing` 3, `uninstalling` 4, `converting` 5, `exporting` 6 and `compacting` 7; 0 (invalid), 2 (running, a session state) and anything past 7 print as `state_<n>`, and only `installed` has been seen on a measured host. A distribution whose key could not be opened, or is a registry link, is a row with `-` for the name, `unknown` for version and state, and its default flag. Account, distribution name and flavor are e-mail redacted by value (`[redacted-email]`) and every field is scrubbed and escaped for the pipe grammar.",
+  "outputs_note": "Every row is pipe-delimited and field 0 is the row kind; `-` is an absent value. The first row of a `host` dispatch is always `status|host|<supported\\|constrained\\|unsupported>|<reason or ->`. The `host` row has seven fields: `host|<yes\\|no\\|unknown>|<guest\\|host_with_hypervisor\\|bare_metal\\|unknown>|<vendor>|<product>|<source>|<high\\|medium\\|low>`. `vendor` is the virtualization platform (`kvm`, `hyperv`, `vmware`, `xen`, `virtualbox`, `parallels`, `bhyve`, `qemu`, `acrn`, `aws`, `gce`, `alibaba`, `openstack`, `nutanix`, `apple` or `other`) for a guest or host, and the hardware manufacturer for `bare_metal` and `unknown`. `source` is the evidence that decided the kind (`cpuid`, `smbios`, `sysctl` or `sys_hypervisor`); when the kind is `unknown` it carries the joined host-decision reason tokens instead (container read failures stay on the container row), so the row an operator reads explains itself. The `container` row is `container|<yes\\|no\\|unknown>|<evidence or reason>`. Every OS-supplied value (DMI and SMBIOS strings, the hardware model) is scrubbed (NUL and malformed UTF-8 become `?`) and escaped for the server's pipe grammar.\n\n`wsl` rows (Windows). The first row is `status|wsl|<supported\\|constrained\\|unsupported>|<reason or ->`, then `summary|<distributions>|<wsl2>|<profiles_read>|<profiles_not_loaded>|<package_version or ->`. `distributions` is the number of `distribution` rows emitted. `wsl2` counts version-2 distributions and is NOT a VM count: every WSL 2 distribution shares one utility VM whose running state is readable only through `wsl.exe` or the WSL service, which this plugin does not call. `profiles_read` counts the hives whose Lxss key was read or found absent (an absent key counts: that profile has no WSL); a cap that stops the read inside the key still counts it and is reported by its token. `profiles_not_loaded` counts the profiles whose hive was reached by neither the loaded hive nor the offline mount, including `.bak` entries and invalid SIDs, and the profiles never reached because a dispatch-wide limit stopped the walk (those get no `profile` row: the output budget was spent). `profiles_read` + `profiles_not_loaded` need not equal the profile count: a hive that was reached but whose Lxss key could not be opened, or is a registry link, is in neither, and is reported only by its `hive_access_denied`, `hive_open_failed` or `lxss_link` token (a token carries no account). `package_version` is `-` when unavailable or over 64 bytes. A `profile` row, `profile|<account or ->|<outcome>|<detail or ->`, is emitted only for a profile that was not reached or whose mount could not be released; `outcome` is one of `not_found`, `privilege_missing`, `mount_failed`, `access_denied`, `file_refused`, `unload_failed`, `backup_skipped` or `sid_invalid`, and `detail` is the hive-file guard's reason verbatim for `file_refused` (`hive_path_unc`, `hive_identity_changed` and the others in `agents/shared/win_hive_file_guard.hpp`) and `-` otherwise. An `unload_failed` row means the offline mount was left behind and keeps `NTUSER.DAT` locked until `reg unload HKU\\<mount>` succeeds (find the `YUZU_HIVE_*` key with `reg query HKU`; until then that user's next logon gets a temporary profile and a repeat dispatch reports the profile as `mount_failed`, and only the Echo plugin's start-up sweep cleans up on its own, see How it works); the mount name embeds the SID, so it is written to the agent log only and never to a row. A `distribution` row is `distribution|<account or ->|<name>|<1\\|2\\|unknown>|<installed\\|installing\\|uninstalling\\|converting\\|exporting\\|compacting\\|state_<n>\\|unknown>|<yes\\|no>|<flavor or ->`; `account` is the profile folder name, never the SID, and `yes` marks that account's default distribution. The state names follow the WSL service's own state enum (the public WSL source, `_LxssDistributionState`): `installed` is 1, `installing` 3, `uninstalling` 4, `converting` 5, `exporting` 6 and `compacting` 7; 0 (invalid), 2 (running, a session state) and anything past 7 print as `state_<n>`, and only `installed` has been seen on a measured host. A distribution whose key could not be opened, or is a registry link, is a row with `-` for the name, `unknown` for version and state, and its default flag. Account, distribution name and flavor are e-mail redacted by value (`[redacted-email]`) and every field is scrubbed and escaped for the pipe grammar.\n\n`runtime_posture` rows (Linux). The first row is `status|runtime_posture|<supported\\|constrained\\|unsupported>|<reason or ->`, then exactly one `endpoint|<unset\\|endpoint_refused\\|permission_denied\\|unreachable\\|not_http\\|ok>|<reason or ->|<dialect or ->` row, which owns the endpoint outcome (`unset` means no endpoint is configured and no socket was opened; `endpoint_refused` carries one reason: `relative`, `dotdot`, `too_long`, `default_socket`, `same_inode`, `not_socket`, `symlink`, `owner`, `group`, `mode`, `insecure_ancestor` or `stat_error`; `not_http` means connected but `/version` was not a JSON HTTP reply, as a containerd socket is, or its body went over the 1 MiB cap). Then three `runtime|<docker\\|podman\\|containerd>|<not_detected\\|detected\\|served>|<present:<mode>:<uid>:<gid>\\|absent\\|unreadable>|<present\\|absent\\|unreadable>|<version or ->|<api_version or ->` rows that carry detection facts only (`served` means the endpoint's `/version` identified that runtime, and only that row carries the versions; a `/version` reply that names no runtime, that is neither a `Components` element named `Engine` or `Podman Engine` nor a string `ApiVersion`, identifies none, so the endpoint row's dialect is `-` and no row reads `served`; an endpoint failure never changes a runtime row), then `config|<runtime or ->|<key>|<value>` rows (the twelve allow-listed `daemon.json` keys `live-restore`, `userns-remap`, `no-new-privileges`, `icc`, `iptables`, `tls`, `tlsverify`, `data-root`, `log-driver`, `storage-driver`, `selinux-enabled` and `userland-proxy`, where a boolean reads `yes` or `no` and a string is character-checked (a value outside the set reads `invalid`) before it is truncated, plus `hosts_tcp yes\\|no` and counts (digits only) for `hosts`, `insecure-registries` and `registry-mirrors`, and up to three `/info` rows: `rootless`, `cgroup_driver`, `security_options_count`; the runtime of an `/info` row is `-` when `/version` did not identify one, and `daemon.json` rows are always `docker`) and `container|<runtime or ->|<id12>|<name>|<image>|<state>|<privileged yes\\|no\\|unknown>|<network_mode or unknown>|<host_runtime_socket_mounted yes\\|no\\|unknown>` rows. `unknown` means the container was never inspected (the 64-inspection cap, the deadline), its inspection failed, the container was removed before its inspection (a 404), or the reply left that key out (missing or null), and is never rendered as `no`; `host_runtime_socket_mounted` covers the four default socket paths only. Every free-text field is admitted only if every byte is in its character set (otherwise it reads `invalid`) before it is truncated to 256 bytes and escaped; `state` is the closed docker set (`created`, `running`, `paused`, `restarting`, `removing`, `exited`, `dead`), so a podman state outside it reads `invalid` until the real podman answers are recorded.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -302,7 +449,7 @@
     {
       "grant": "`host`: None: CPUID is an unprivileged instruction and the SMBIOS table is read through `GetSystemFirmwareTable`. `wsl`: None beyond what the agent account already holds: the action uses the same `with_user_hive` span `installed_apps.list_per_user` already uses. The `HKLM` ProfileList (profile SIDs and folder paths) and the WSL package `Version` need no privilege, nor does a loaded `HKU\\<SID>` hive; a logged-off profile's `NTUSER.DAT` is mounted offline with `SeBackupPrivilege` and `SeRestorePrivilege`, already held by the agent account and enabled only inside the offline arm, under the process-wide offline-hive lock and the default-on hive-file guard",
       "if_refused": "`host`: `CONSTRAINED` / partial with `windows:virtualization:smbios:<cause>`; the kind is `unknown` unless CPUID or a decoded Type 1 already identifies the machine. `wsl`: a hardened install that strips the two privileges still reads every logged-on profile; a logged-off one is a `profile` row with outcome `privilege_missing` and the token `windows:virtualization:wsl:hive_privilege_missing`. A refused hive file is `file_refused` with the guard's reason, a refused live root `access_denied`; none is read as having no distributions",
-      "measured": "`host`: Measured 2026-11-07 on a Windows 11 host with Hyper-V, VBS and WSL2 enabled, from an elevated interactive session (not LocalSystem): CPUID and the firmware table both answered; whether an unelevated caller gets the table was not measured. `wsl`: Measured 2026-11-08 on the same host as `host`, as LocalSystem (a scheduled task, the agent's own identity), with the native MSVC build. The loaded `HKU` hive of the logged-on profile was read live (the sample); no real account on that host was logged off with a Lxss key, so the offline arm was measured on a disposable local account that had never logged on and was logged off: its `NTUSER.DAT` was mounted and read through `SeBackupPrivilege` and `SeRestorePrivilege`, a registry link planted at the `Lxss` key or at a distribution key was reported as `lxss_link` and never read through (no decoy row appeared), a mount that could not be unloaded gave `hive_unload_failed` with the mount name only in the agent log, and a leftover `YUZU_HIVE_*` mount gave `hive_mount_failed` on the next run; a planted link was not followed by the kernel across hives from a user hive either. The account was removed afterwards",
+      "measured": "`host`: Measured 2026-11-07 on a Windows 11 host with Hyper-V, VBS and WSL2 enabled, from an elevated interactive session (not LocalSystem): CPUID and the firmware table both answered; whether an unelevated caller gets the table was not measured. `wsl`: Measured 2026-11-08 on the same host as `host`, as LocalSystem (a scheduled task, the agent's own identity), with the native MSVC build. The loaded `HKU` hive of the logged-on profile was read live; the published sample was re-captured 2026-11-11 on the same host from an elevated interactive session (a scheduled task), not LocalSystem; no real account on that host was logged off with a Lxss key, so the offline arm was measured on a disposable local account that had never logged on and was logged off: its `NTUSER.DAT` was mounted and read through `SeBackupPrivilege` and `SeRestorePrivilege`, a registry link planted at the `Lxss` key or at a distribution key was reported as `lxss_link` and never read through (no decoy row appeared), a mount that could not be unloaded gave `hive_unload_failed` with the mount name only in the agent log, and a leftover `YUZU_HIVE_*` mount gave `hive_mount_failed` on the next run; a planted link was not followed by the kernel across hives from a user hive either. The account was removed afterwards",
       "os": "Windows",
       "runs_as": "agent daemon (LocalSystem today, `docs/agent-privilege-model.md`)"
     },
@@ -319,6 +466,13 @@
       "measured": "Measured 2026-11-07 inside a WSL2 distribution as root (not the packaged `yuzu-agent` account): `/run/systemd/container` is mode 0644 root:root under a 0755 `/run/systemd`; that kernel exposes no `/sys/class/dmi/id` or `/sys/hypervisor`, so the DMI modes were not measured and the host answer came from CPUID alone",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`)"
+    },
+    {
+      "grant": "None for the default read: `stat` of the sockets, config files and data roots and a bounded read of `/etc/docker/daemon.json`. Opt-in only: an operator-provided read-only unix socket (root-owned, the agent's group, `0660`) set through `YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT`; `connect(2)` needs that socket's write bit, which the packaged unit's `CAP_DAC_READ_SEARCH` does not grant",
+      "if_refused": "A refused `stat` or `daemon.json` read is `CONSTRAINED` / partial with `linux:virtualization:runtime_posture:<source>:<cause>`; a refused connect is the endpoint row `permission_denied` plus the token `version:permission_denied` (`CONSTRAINED`) and changes no runtime row",
+      "measured": "Pending the Linux capture: `connect(2)` to a default runtime socket as an account holding only `CAP_DAC_READ_SEARCH` (expected `EACCES`), and `connect(2)` through `/proc/self/fd/<N>` of an `O_PATH` socket descriptor, are measured on a Linux host before release",
+      "os": "Linux (`runtime_posture`)",
+      "runs_as": "agent daemon, dedicated unprivileged account, never root and never in the `docker` group (`docs/agent-privilege-model.md`)"
     }
   ],
   "readme": "agents/plugins/virtualization/README.md",
@@ -420,10 +574,40 @@
       "when": "Windows `wsl`: one profile's hive reached its own allowance (128 distributions or 32 KiB of rows, or 512 registry calls); the distributions of that hive read before the limit are kept, the rest of it was not read, and the remaining profiles were still read"
     },
     {
+      "completeness": "partial",
+      "provenance": "`linux:virtualization:runtime_posture:daemon_json:<cause>`, `linux:virtualization:runtime_posture:<runtime>:socket:<cause>`, `linux:virtualization:runtime_posture:<runtime>:config:<cause>`, `linux:virtualization:runtime_posture:<runtime>:data_root:<cause>`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux `runtime_posture`: a `stat` or the `daemon.json` read was refused or failed (`<cause>` is `permission_denied`, `eio`, `eloop`, `oversized`, `not_regular`, `malformed` for `daemon_json` (not JSON, or an allow-listed key of the wrong type: the well-typed keys still report beside a `config|docker|daemon_json|malformed` row), or `errno_<n>`); the runtime row's field reads `unreadable`, never `absent`"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:virtualization:runtime_posture:<runtime>:overprivileged`, `linux:virtualization:runtime_posture:<runtime>:network_fs_skipped`, `linux:virtualization:runtime_posture:mountinfo:unreadable`, `linux:virtualization:runtime_posture:busy`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux `runtime_posture`: a default socket the agent could connect to (a held group with the write bit, or other-write), a data root skipped because it is on a network mount, an unreadable mount table, or a dispatch refused because another one is running"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:virtualization:runtime_posture:endpoint:<reason>`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux `runtime_posture`: a configured endpoint was refused (`<reason>` is the `endpoint_refused` reason on the endpoint row, for example `default_socket`, `symlink`, `stat_error`) or is not there (`unreachable`); no request was sent"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:virtualization:runtime_posture:version:<cause>`, `linux:virtualization:runtime_posture:info:<cause>`, `linux:virtualization:runtime_posture:list:<cause>`, `linux:virtualization:runtime_posture:inspect:failed:<n>`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux `runtime_posture`: a reply was non-200 (`http_<status>`), malformed (a key the reader reads is present with another type: `/version` `Version`, `ApiVersion`, `Components`, a `Components` element or its `Name`; `/info` `SecurityOptions`, one of its elements, or `CgroupDriver`; a list entry's `Names`, its first element, `Image` or `State`, where the row is kept; the well-typed keys still report and a missing key only omits its row; nested past 32 levels counts), oversized (`response_oversized`) or the request failed (`timeout`, `unreachable`, `permission_denied`, `not_http`); a `/version` that failed or was not JSON also sets the `endpoint` row; `list:entries_skipped` counts list entries that carried no valid id"
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`linux:virtualization:runtime_posture:rows_capped`, `linux:virtualization:runtime_posture:inspect_capped`, `linux:virtualization:runtime_posture:deadline_exhausted`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux `runtime_posture`: more than 256 containers in a list reply that fit in the 1 MiB body cap (rows kept to 256), more than 64 inspections wanted (the rest `unknown`), or the 20 s action deadline ran out (no further request is sent, every completed row is kept). The body cap is the effective ceiling: `all=1` lists exited containers too (about 2 to 3 KB each), so a host with roughly 350 to 500 containers is answered `list:response_oversized` with no container rows, never 256 of them"
+    },
+    {
       "completeness": "unknown",
-      "provenance": "`linux:virtualization:wsl:unsupported`, `macos:virtualization:wsl:unsupported`",
+      "provenance": "`linux:virtualization:wsl:unsupported`, `macos:virtualization:wsl:unsupported`, `macos:virtualization:runtime_posture:unsupported`, `windows:virtualization:runtime_posture:unsupported`",
       "status": "`UNAVAILABLE`",
-      "when": "`wsl` on Linux or macOS: the action is Windows-only and reads nothing; one `unsupported` status row"
+      "when": "`wsl` on Linux or macOS, or `runtime_posture` on macOS or Windows: the action does not run on that OS and reads nothing; one `unsupported` status row"
     },
     {
       "completeness": "unknown",
@@ -468,15 +652,35 @@
             "status|wsl|unsupported|linux:virtualization:wsl:unsupported"
           ],
           "truncated": false
+        },
+        {
+          "action": "runtime_posture",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 5,
+          "rows": [
+            "status|runtime_posture|supported|-",
+            "endpoint|unset|-|-",
+            "runtime|docker|detected|present:0660:0:108|absent|-|-",
+            "runtime|podman|not_detected|absent|absent|-|-",
+            "runtime|containerd|detected|present:0660:0:0|absent|-|-"
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-11-08",
+        "date": "2026-11-11",
         "host_class": "vm",
-        "leg_hash": "2a955b994291",
+        "leg_hash": "aec6e0e7930c",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
-        "privilege": "euid 0"
+        "privilege": "euid 104"
       }
     },
     "macos": {
@@ -514,12 +718,28 @@
             "status|wsl|unsupported|macos:virtualization:wsl:unsupported"
           ],
           "truncated": false
+        },
+        {
+          "action": "runtime_posture",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "macos:virtualization:runtime_posture:unsupported",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|runtime_posture|unsupported|macos:virtualization:runtime_posture:unsupported"
+          ],
+          "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-11-08",
+        "date": "2026-11-10",
         "host_class": "bare-metal",
-        "leg_hash": "2a955b994291",
+        "leg_hash": "aec6e0e7930c",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501"
@@ -558,19 +778,35 @@
           "row_count": 3,
           "rows": [
             "status|wsl|supported|-",
-            "summary|1|1|6|0|3.0.3.0",
+            "summary|1|1|6|0|3.0.5.0",
             "distribution|jsmith|Ubuntu-26.04|2|installed|yes|ubuntu"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "runtime_posture",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "UNKNOWN",
+            "provenance": "windows:virtualization:runtime_posture:unsupported",
+            "status": "UNAVAILABLE"
+          },
+          "row_count": 1,
+          "rows": [
+            "status|runtime_posture|unsupported|windows:virtualization:runtime_posture:unsupported"
           ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-11-08",
+        "date": "2026-11-11",
         "host_class": "bare-metal",
-        "leg_hash": "2a955b994291",
+        "leg_hash": "aec6e0e7930c",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
-        "privilege": "LocalSystem (elevated; account names replaced with jsmith)"
+        "privilege": "interactive user (elevated; account names replaced with jsmith)"
       }
     }
   },
@@ -592,6 +828,15 @@
       "operation": "Read",
       "risk_tier": "Low",
       "securable": "Inventory"
+    },
+    {
+      "action": "runtime_posture",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
     }
   ],
   "source": {
@@ -600,7 +845,8 @@
     ],
     "changelog": [
       "changelog.d/2026-11-08-virtualization-wsl.added.md",
-      "changelog.d/pr12-1a-virtualization-host.added.md"
+      "changelog.d/pr12-1a-virtualization-host.added.md",
+      "changelog.d/pr12-1b-virtualization-runtime-posture.added.md"
     ],
     "definitions": [
       "content/definitions/virtualization.yaml"
@@ -611,6 +857,7 @@
       "agents/plugins/virtualization/src/virtualization_macos.cpp",
       "agents/plugins/virtualization/src/virtualization_parsers.hpp",
       "agents/plugins/virtualization/src/virtualization_plugin.cpp",
+      "agents/plugins/virtualization/src/virtualization_runtime_parsers.hpp",
       "agents/plugins/virtualization/src/virtualization_win.cpp",
       "agents/plugins/virtualization/src/virtualization_wsl_parsers.hpp"
     ],
@@ -620,15 +867,18 @@
       "tests/test_virtualization_wsl_pin_lexical.py",
       "tests/unit/test_virtualization_local_dispatcher.cpp",
       "tests/unit/test_virtualization_parsers.cpp",
+      "tests/unit/test_virtualization_runtime_legs.cpp",
+      "tests/unit/test_virtualization_runtime_parsers.cpp",
       "tests/unit/test_virtualization_wsl_parsers.cpp"
     ]
   },
-  "version": "1.1.0",
+  "version": "1.2.0",
   "where_the_data_goes": [
     "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `host` is also a gathered definition (`crossplatform.virtualization.host`, 3600s TTL); `wsl` is the role-gated definition `windows.virtualization.wsl` (3600s response window; how often it runs is the operator's scheduling).",
     "**Not consumed by** daily-sync, Echo, DEX, or metrics.",
     "**Sensitivity (`host`).** The `host` rows describe the device, not a person: no account, hostname, serial number, UUID or MAC address is emitted. The Linux leg never reads the root-only `product_serial` and `product_uuid`; on Windows the shared SMBIOS walker decodes the Type 1 serial number and UUID in memory, and the plugin never keeps or emits them. The SMBIOS manufacturer and product (or the macOS model) and the virtualization platform can identify the hardware or cloud provider of a device. The container evidence is a marker path or a runtime name, never a container or pod identifier.",
     "**Sensitivity (`wsl`).** The `wsl` rows are per-user data: the account (the profile folder name) and each distribution name are emitted, which can identify a person; an e-mail-shaped account, distribution name or flavor is replaced by `[redacted-email]`, and any other text is emitted after the pipe-grammar scrub (NUL, CR and LF are scrubbed and the field separator is escaped; a personal name that is not an e-mail address is not redacted). Never emitted: install and disk-image paths (`BasePath`, `VhdFileName`, shortcut and terminal-profile paths), the package family name, default user ids, kernel command lines, NAT addresses, the distribution GUID, any SID, and the offline mount name (it embeds the SID; it goes to the agent log only). The action is gated behind `AdminOrApproval` (definition `approval.mode: role-gated`), on by default, and mounting a logged-off profile's hive changes that hive's sequence number and hash (#4977).",
+    "**Sensitivity (`runtime_posture`).** Container names and image references are emitted as device-scope rows. They are stored responses, readable by every holder of `Response:Read` (which includes the `Viewer` role); the action's `Security:Read` grant governs who may dispatch it, not who may read the stored rows. The honest agent emits no environment, command line, label, port or non-socket mount, but the endpoint filters requests and not responses: an admitted inspect reply carries a container's whole inspect document, which commonly holds credentials in its environment, so a compromised agent holding the endpoint could be handed them. Under the packaged unit that is not new reach (`CAP_DAC_READ_SEARCH` already reads the same documents from the runtime's data root); on a host that took the capability opt-out it is new credential access. The `Security` securable and `ExecuteGate::None` mirror `system_hardening`. Design and review record: `docs/virtualization-runtime-posture-design.md`.",
     "**Siblings:** `hardware` (manufacturer, model and serials of the machine) and `device_identity`; this plugin only says whether that machine is virtual."
   ]
 }

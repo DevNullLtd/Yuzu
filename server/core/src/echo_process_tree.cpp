@@ -1091,16 +1091,6 @@ std::string render_echo_capture_sources(const std::string& device, const std::st
              "</a>";
     h += "</span></div>";
 
-    // An agent without the roll-up tables answers `<src>_live_rows`, not `<src>_rows`: its raw
-    // count is not an hourly row count, so it is never shown as one. One note says why.
-    bool without_rollup = false;
-    for (const auto& m : kSources)
-        if (cfg.count(std::string(m.name) + "_live_rows") && !cfg.count(std::string(m.name) + "_rows"))
-            without_rollup = true;
-    if (without_rollup)
-        h += "<div class=\"echo-tree-warn\">This device runs an agent without the roll-up tables; "
-             "upgrade the agent.</div>";
-
     h += "<div class=\"cards\" id=\"capCards\" data-device=\"" + html_escape(device) + "\">";
 
     // A bucket start as "YYYY-MM-DD HH:MM UTC"; "&mdash;" when the key is absent or unparseable.

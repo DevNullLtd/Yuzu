@@ -1020,6 +1020,7 @@ yuzu_server_routes_lib = static_library(
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',
     'src/dex_app_perf_ui.cpp',
+    'src/dex_apps_ui.cpp',
     'src/dex_perf_ui.cpp',
     'src/network_routes.cpp',
     'src/network_ui.cpp',

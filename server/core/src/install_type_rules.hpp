@@ -26,8 +26,9 @@
 namespace yuzu::server {
 
 /// The closed `install_type` vocabulary (matches the `installed_software_install_type_chk`
-/// CHECK constraint, which additionally admits '' for "not yet derived"). `driver` is reserved
-/// for the drivers facet and `component` for embedded components; no source maps to either yet.
+/// CHECK constraint, which additionally admits '' for "not yet derived"). `driver` is the
+/// install_type of `hardware.drivers_inventory`; `component` is reserved for embedded
+/// components, and no source maps to it yet.
 inline constexpr std::array<std::string_view, 9> kInstallTypes{{
     "msi",
     "installer",
@@ -47,7 +48,7 @@ struct InstallTypeRow {
 
 /// One row per collector source. `pkg_inventory.managers` (the Homebrew presence row) is
 /// stored in installed_software today, so it is typed like the packages it manages.
-inline constexpr std::array<InstallTypeRow, 10> kInstallTypeBySource{{
+inline constexpr std::array<InstallTypeRow, 11> kInstallTypeBySource{{
     {"installed_apps.list_inventory", "installer"},
     {"pkg_inventory.managers", "package_manager"},
     {"pkg_inventory.packages", "package_manager"},
@@ -58,6 +59,7 @@ inline constexpr std::array<InstallTypeRow, 10> kInstallTypeBySource{{
     {"runtimes.dotnet", "runtime"},
     {"runtimes.jvm", "runtime"},
     {"middleware.ibm_mq", "middleware"},
+    {"hardware.drivers_inventory", "driver"},
 }};
 
 /// Fallback for a row whose source is empty (a pre-tail agent) or not in the table.

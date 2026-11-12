@@ -95,9 +95,15 @@ TEST_CASE("os-native lanes are not-assessed with no identity work", "[cpe]") {
     SoftwareEntry choco = pkg("jq", "1.8.2", "chocolatey", "", "pkg");
     SoftwareEntry winget = pkg("Git.Git", "2.50.0", "winget", "", "pkg");
     SoftwareEntry appx = pkg("Microsoft.WindowsCalculator", "11.0", "appx", "", "pkg");
+    // Drivers get no CPE treatment (ruled at the SAM-15 plan gate): `kind` driver wins over a
+    // lane-1 ecosystem (a Linux module is never an rpm/deb package identity), and a Linux kernel
+    // module is os-native by its `kernel_module` ecosystem alone (kind pkg isolates that edit).
+    SoftwareEntry driver_rpm = pkg("e1000e", "3.8.4", "rpm", "", "driver");
+    SoftwareEntry kernel_module = pkg("e1000e", "3.8.4", "kernel_module", "", "pkg");
 
     for (const SoftwareEntry* e : {&win, &mac, &brew, &cask, &receipt, &feat, &feat_rpm, &snap,
-                                   &flatpak_runtime, &msi, &python, &choco, &winget, &appx}) {
+                                   &flatpak_runtime, &msi, &python, &choco, &winget, &appx,
+                                   &driver_rpm, &kernel_module}) {
         auto id = r.resolve(*e);
         REQUIRE(id.outcome == IdentityOutcome::NotAssessed);
         REQUIRE(id.not_assessed_reason == std::string(kReasonOsNative));

@@ -78,9 +78,10 @@ constexpr KeySpec kKeySpecs[] = {
     // F2a PR3 cohort metrics export (Settings -> DEX alerts; next gauge sweep)
     {"dex_cohort_export_key", kAdmin}, // tag key; "" = export disabled (validated on apply)
     // Customer score policy (tiers, names, weights, per-app overrides). JSON document;
-    // route-owned - written only through PUT/DELETE /api/v1/dex/score-policy via
-    // dex_api.cpp's binding, which validates it whole; the generic PUT refuses it. Spelled as
-    // kDexScorePolicyKey in dex_score_policy_json.hpp.
+    // route-owned - written through PUT/DELETE /api/v1/dex/score-policy, the Scoring tab's
+    // POSTs and the MCP tools set_dex_score_policy / reset_dex_score_policy, all over
+    // apply_dex_score_policy, which validates it whole; the generic PUT refuses it. Spelled
+    // as kDexScorePolicyKey in dex_score_policy_json.hpp.
     {"dex_score_policy", ConfigWriteClass::RouteOwned},
 };
 

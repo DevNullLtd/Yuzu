@@ -242,7 +242,6 @@ std::expected<DevicesRequest, std::string> parse_devices_params(const Params& p)
 }
 
 std::optional<std::string> strict_args_error(const nlohmann::json& args) {
-    constexpr std::string_view kKinds[] = {"package", "app", "pkg", "feat"};
     if (!args.is_object())
         return std::nullopt;
     struct StrKey {
@@ -260,8 +259,9 @@ std::optional<std::string> strict_args_error(const nlohmann::json& args) {
         if (args[k.key].get_ref<const std::string&>().size() > k.max)
             return std::string(k.key) + " is too long";
     }
-    if (args.contains("kind") &&
-        std::ranges::find(kKinds, args["kind"].get<std::string>()) == std::end(kKinds))
+    if (args.contains("kind") && std::ranges::none_of(sc::kSoftwareKinds, [&](const auto& k) {
+            return k.value == args["kind"].get<std::string>();
+        }))
         return "kind is not one of the published kinds";
     if (args.contains("ecosystem") &&
         std::ranges::none_of(sc::kEcosystemFamilies, [&](const auto& e) {
@@ -345,12 +345,20 @@ std::string audit_target(const SoftwareFleetQuery& q) {
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
 
+// The kScanLimit text below quotes both numbers.
+static_assert(kWideScopeMaxSkip == 100000 && kScopePushdownMaxIds == 10000,
+              "update the kScanLimit message when either bound changes");
+
 std::string_view cursor_error_message(CursorError e) {
     switch (e) {
     case CursorError::kMalformed:
         return "invalid cursor";
     case CursorError::kFilterMismatch:
         return "cursor was issued for a different filter set";
+    case CursorError::kScanLimit:
+        return "cursor refused: more than 100000 rows outside the caller's scope were passed since "
+               "the last row served; narrow the filter (name, version or agent_id) and restart "
+               "from the first page, or page with a scope of at most 10000 devices";
     case CursorError::kStale:
         break;
     }
@@ -446,6 +454,8 @@ std::expected<DevicesCursor, CursorError> decode_devices_cursor(std::string_view
         return std::unexpected(CursorError::kMalformed);
     if (parts[1] != fp)
         return std::unexpected(CursorError::kFilterMismatch);
+    if (*skip > kWideScopeMaxSkip)
+        return std::unexpected(CursorError::kScanLimit);
     return DevicesCursor{SoftwareCursor{std::string((*fields)[0]), std::string((*fields)[1]), *id},
                          *skip};
 }

@@ -314,17 +314,17 @@ TEST_CASE("Echo warehouse roll-up: arp/dns are hourly only (ADR-0015)",
         CHECK_FALSE(is_fold_view(std::string{source} + "_monthly"));
     }
 
-    // DDL + $-name translation + the read-only authorizer reach the tables, and the retired raw
-    // names answer with an empty shim view rather than failing.
+    // DDL + $-name translation + the read-only authorizer reach the tables; the retired raw
+    // names are not registered.
     CHECK(generate_fold_ddl().find("CREATE VIEW IF NOT EXISTS arp_hourly") != std::string::npos);
-    CHECK(translate_dollar_name("$ARP_Live").value_or("") == "arp_live");
+    CHECK_FALSE(translate_dollar_name("$ARP_Live").has_value());
+    CHECK_FALSE(translate_dollar_name("$DNS_Live").has_value());
     CHECK(translate_dollar_name("$ARP_Hourly").value_or("") == "arp_hourly");
     CHECK(translate_dollar_name("$DNS_Hourly").value_or("") == "dns_hourly");
-    CHECK(is_queryable_table("arp_live"));
+    CHECK_FALSE(is_queryable_table("arp_live"));
     CHECK(is_queryable_table("arp_hourly"));
-    CHECK(is_queryable_table("dns_live"));
+    CHECK_FALSE(is_queryable_table("dns_live"));
     CHECK(is_queryable_table("dns_hourly"));
-    CHECK(legacy_live_shim_ddl().find("CREATE VIEW IF NOT EXISTS arp_live") != std::string::npos);
 }
 
 TEST_CASE("Echo warehouse roll-up: mapdrive is hourly + daily (§3.8)",
@@ -351,13 +351,13 @@ TEST_CASE("Echo warehouse roll-up: mapdrive is hourly + daily (§3.8)",
     // direction participates in the identity.
     CHECK(std::get<std::string>(*acc.key(rows[0], "direction")) == "outbound");
 
-    CHECK(translate_dollar_name("$MapDrive_Live").value_or("") == "mapdrive_live");
+    CHECK_FALSE(translate_dollar_name("$MapDrive_Live").has_value()); // retired raw name
     CHECK(translate_dollar_name("$MapDrive_Hourly").value_or("") == "mapdrive_hourly");
-    CHECK(is_queryable_table("mapdrive_live"));
+    CHECK_FALSE(is_queryable_table("mapdrive_live"));
     CHECK(is_queryable_table("mapdrive_hourly"));
 
     // The tier carries the direction-polymorphic identity columns; the username, provider and
-    // origin of the retired raw rows are not kept (the shim keeps their names for old queries).
+    // origin of the retired raw rows are not kept.
     auto cols = columns_for_table("mapdrive_hourly");
     for (const auto* c : {"direction", "local_mount", "remote_path", "remote_host"}) {
         INFO("mapdrive_hourly column=" << c);
@@ -365,10 +365,5 @@ TEST_CASE("Echo warehouse roll-up: mapdrive is hourly + daily (§3.8)",
     }
     for (const auto* c : {"username", "provider", "origin"})
         CHECK(std::find(cols.begin(), cols.end(), c) == cols.end());
-    auto legacy = columns_for_table("mapdrive_live");
-    for (const auto* c : {"direction", "local_mount", "remote_path", "remote_host", "username",
-                          "provider", "origin"}) {
-        INFO("mapdrive_live (shim) column=" << c);
-        CHECK(std::find(legacy.begin(), legacy.end(), c) != legacy.end());
-    }
+    CHECK(columns_for_table("mapdrive_live").empty());
 }

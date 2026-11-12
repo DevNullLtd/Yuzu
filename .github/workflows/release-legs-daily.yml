@@ -12,6 +12,8 @@ name: Release legs (daily dispatch)
 # release/NDEBUG mode between promotions: release.yml builds with
 # -Dbuild_tests=false. A push to `main` (release promotion) still runs the whole
 # matrix, so every release candidate is built in release mode before it tags.
+# (The Windows and macOS legs build the agent only, as release.yml does since
+# ADR-0035 ladder step 2; the server is built and released on Linux only.)
 #
 # It skips when dev's tip already has a ci.yml dispatch run (legs=release or
 # all) that succeeded or is still in flight, so a quiet day costs nothing; a

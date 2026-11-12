@@ -11,8 +11,10 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <format>
 #include <string_view>
 #include <unordered_set>
 
@@ -54,6 +56,32 @@ constexpr int kMaxGraphPages = 500;
 // bounding peak memory to a recoverable, logged failure rather than an OS
 // OOM-kill of the shared control-plane process.
 constexpr size_t kMaxTotalMemberships = 5'000'000;
+
+// Start of the error text for a snapshot refused because skipping emptied it; the ending names
+// the kind ("user record was skipped" / "group record was skipped").
+constexpr std::string_view kSnapshotRefusedPrefix =
+    "refusing to apply a snapshot in which every ";
+
+// U+FFFD REPLACEMENT CHARACTER, UTF-8 encoded.
+constexpr std::string_view kReplacementChar = "\xEF\xBF\xBD";
+
+// Replaces every NUL byte in `v` with U+FFFD. Returns true when at least one byte was replaced.
+// Postgres text cannot hold a NUL, so text that is kept (and not used as a key) goes through
+// this before it is bound.
+bool replace_nul_with_fffd(std::string& v) {
+    if (v.find('\0') == std::string::npos)
+        return false;
+    std::string out;
+    out.reserve(v.size() + 2 * kReplacementChar.size());
+    for (const char c : v) {
+        if (c == '\0')
+            out += kReplacementChar;
+        else
+            out += c;
+    }
+    v = std::move(out);
+    return true;
+}
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -735,7 +763,8 @@ std::expected<void, std::string> DirectorySync::fetch_paginated(
 // see the file header's transaction-shape note (ADR-0012 §2: never hold a
 // lease across external work).
 
-std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& config) {
+std::expected<DirectorySync::ApplyCounts, std::string>
+DirectorySync::sync_entra(const EntraConfig& config) {
     if (config.tenant_id.empty() || config.client_id.empty() || config.client_secret.empty()) {
         return std::unexpected("Entra config incomplete: tenant_id, client_id, and client_secret required");
     }
@@ -761,8 +790,14 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
     update_status("entra", "running");
     spdlog::info("DirectorySync: starting Entra ID sync for tenant {}", config.tenant_id);
 
+    // Base of every Graph request this sync makes; a test points it at a local server.
+    const std::string graph_base =
+        test_hook_graph_base_url_.empty() ? std::string("https://graph.microsoft.com/v1.0")
+                                          : test_hook_graph_base_url_;
+
     // 1. Acquire access token via client credentials flow
-    auto token_result = acquire_token(config);
+    auto token_result = test_hook_acquire_token_ ? test_hook_acquire_token_(config)
+                                                 : acquire_token(config);
     if (!token_result) {
         auto err = "token acquisition failed: " + token_result.error();
         update_status("entra", "failed", 0, 0, err);
@@ -778,7 +813,8 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
     // (see its own doc comment) — a tenant with more than one page of users
     // must never be silently treated as "that's everyone".
     {
-        std::string users_url = "https://graph.microsoft.com/v1.0/users"
+        std::string users_url = graph_base +
+                                "/users"
                                 "?$select=id,displayName,mail,userPrincipalName,accountEnabled"
                                 "&$top=999";
 
@@ -814,7 +850,8 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
     // nextLink (a fetch problem this sync should abort on, leaving the store
     // untouched).
     {
-        std::string groups_url = "https://graph.microsoft.com/v1.0/groups"
+        std::string groups_url = graph_base +
+                                 "/groups"
                                  "?$select=id,displayName,description"
                                  "&$top=999";
 
@@ -849,8 +886,11 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
     // members" and wipe its real memberships.
     size_t total_memberships = 0;
     for (const auto& g : data.groups) {
-        std::string members_url = "https://graph.microsoft.com/v1.0/groups/" +
-                                  g.id + "/members?$select=id&$top=999";
+        // A group whose id carries a NUL is skipped when the snapshot is applied; there is no
+        // usable id to request its members with.
+        if (g.id.find('\0') != std::string::npos)
+            continue;
+        std::string members_url = graph_base + "/groups/" + g.id + "/members?$select=id&$top=999";
 
         auto& bucket = data.memberships[g.id];
         auto result = fetch_paginated(members_url, access_token,
@@ -862,6 +902,7 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
         if (!result) {
             auto err = "fetching members for group " + g.display_name +
                       " failed: " + result.error();
+            replace_nul_with_fffd(err);
             update_status("entra", "failed", static_cast<int>(data.users.size()),
                           static_cast<int>(data.groups.size()), err);
             spdlog::error("DirectorySync: {}", err);
@@ -880,26 +921,118 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
         }
     }
 
-    // 5. Apply the complete snapshot in one short transaction.
-    auto apply_result = apply_entra_sync(data);
+    // 5. Apply the complete snapshot in one short transaction. The snapshot is moved in and
+    // filtered in place, so the counts to report are captured first (failure path) or taken from
+    // the result (success path: what was actually stored).
+    const int fetched_users = static_cast<int>(data.users.size());
+    const int fetched_groups = static_cast<int>(data.groups.size());
+    auto apply_result = apply_entra_sync(std::move(data));
     if (!apply_result) {
-        auto err = "applying sync result failed: " + apply_result.error();
-        update_status("entra", "failed", static_cast<int>(data.users.size()),
-                      static_cast<int>(data.groups.size()), err);
+        // A refusal (a snapshot that skipping emptied) is recorded as its own text; any other
+        // failure names the step.
+        auto err = apply_result.error().starts_with(kSnapshotRefusedPrefix)
+                       ? apply_result.error()
+                       : "applying sync result failed: " + apply_result.error();
+        if (!update_status("entra", "failed", fetched_users, fetched_groups, err)) {
+            spdlog::warn("DirectorySync: Entra sync failed and the status row could not be "
+                         "updated");
+        }
         spdlog::error("DirectorySync: {}", err);
         return std::unexpected(err);
     }
 
-    update_status("entra", "completed", static_cast<int>(data.users.size()),
-                  static_cast<int>(data.groups.size()));
-    spdlog::info("DirectorySync: Entra sync completed — {} users, {} groups",
-                 data.users.size(), data.groups.size());
-    return {};
+    // The status row reports what was stored. A sync that skipped records or sanitized fields
+    // still completes; the note says so on the row. The counts come from this apply's own
+    // result, never from a cumulative counter, so overlapping syncs cannot mix them.
+    const ApplyCounts applied = *apply_result;
+    std::string note;
+    if (applied.skipped != 0 || applied.sanitized != 0) {
+        note = std::format("{} record(s) skipped, {} field(s) sanitized (embedded NUL)",
+                           applied.skipped, applied.sanitized);
+    }
+    if (!update_status("entra", "completed", applied.users, applied.groups, note)) {
+        // The snapshot is stored; only its status row is stale. The caller still receives the
+        // counts this sync applied.
+        spdlog::warn("DirectorySync: Entra sync stored {} users and {} groups but the status row "
+                     "could not be updated",
+                     applied.users, applied.groups);
+    }
+    spdlog::info("DirectorySync: Entra sync completed: {} users, {} groups", applied.users,
+                 applied.groups);
+    return applied;
 }
 
-std::expected<void, std::string> DirectorySync::apply_entra_sync(const EntraSyncData& data) {
+std::expected<DirectorySync::ApplyCounts, std::string>
+DirectorySync::apply_entra_sync(EntraSyncData data) {
     if (!open_)
         return std::unexpected("directory sync store not open");
+
+    // Postgres text cannot hold an embedded NUL byte, and a JSON "\u0000" escape in an
+    // identity-provider response decodes to one. One such record must not fail the whole
+    // snapshot: a sync that cannot complete leaves users removed upstream in the roster, which
+    // delays deprovisioning. The snapshot is filtered in place:
+    //   * a NUL in a KEY field (user id/upn/email, group id, member id) skips the record (or
+    //     member) and counts it. A skipped record is treated like any record absent from the
+    //     snapshot, so a row it had before is removed by the stale-row delete below, and
+    //     memberships naming a skipped group are dropped with it;
+    //   * a NUL in a display-only field (user display name, group display name, group
+    //     description) is replaced with U+FFFD and counted; the record is kept.
+    const auto has_nul = [](const std::string& v) { return v.find('\0') != std::string::npos; };
+    const std::size_t incoming_users = data.users.size();
+    const std::size_t incoming_groups = data.groups.size();
+    std::uint64_t skipped = 0;
+    std::uint64_t sanitized = 0;
+    skipped += static_cast<std::uint64_t>(std::erase_if(data.users, [&](const DirectoryUser& u) {
+        return has_nul(u.id) || has_nul(u.upn) || has_nul(u.email);
+    }));
+    skipped += static_cast<std::uint64_t>(std::erase_if(
+        data.groups, [&](const DirectoryGroup& g) { return has_nul(g.id); }));
+    for (auto& u : data.users) {
+        if (replace_nul_with_fffd(u.display_name))
+            ++sanitized;
+    }
+    for (auto& g : data.groups) {
+        if (replace_nul_with_fffd(g.display_name))
+            ++sanitized;
+        if (replace_nul_with_fffd(g.description))
+            ++sanitized;
+    }
+    std::unordered_set<std::string> kept_group_ids;
+    kept_group_ids.reserve(data.groups.size());
+    for (const auto& g : data.groups)
+        kept_group_ids.insert(g.id);
+    std::erase_if(data.memberships,
+                  [&](const auto& entry) { return !kept_group_ids.contains(entry.first); });
+    for (auto& [group_id, member_ids] : data.memberships) {
+        skipped += static_cast<std::uint64_t>(
+            std::erase_if(member_ids, [&](const std::string& m) { return has_nul(m); }));
+    }
+    last_sync_skipped_.store(skipped, std::memory_order_relaxed);
+    if (skipped != 0)
+        skipped_records_.fetch_add(skipped, std::memory_order_relaxed);
+    if (sanitized != 0)
+        sanitized_fields_.fetch_add(sanitized, std::memory_order_relaxed);
+
+    // Refuse a snapshot that skipping emptied: applying it would delete every stored row of
+    // that kind. A tenant that really has zero users (or groups) arrives with none, which is
+    // applied; only a non-empty snapshot reduced to nothing is refused, before any write.
+    if (incoming_users > 0 && data.users.empty()) {
+        spdlog::warn("DirectorySync: refusing a snapshot: all {} user record(s) were skipped "
+                     "for an embedded NUL byte",
+                     incoming_users);
+        return std::unexpected(std::string(kSnapshotRefusedPrefix) + "user record was skipped");
+    }
+    if (incoming_groups > 0 && data.groups.empty()) {
+        spdlog::warn("DirectorySync: refusing a snapshot: all {} group record(s) were skipped "
+                     "for an embedded NUL byte",
+                     incoming_groups);
+        return std::unexpected(std::string(kSnapshotRefusedPrefix) + "group record was skipped");
+    }
+    if (skipped != 0 || sanitized != 0) {
+        spdlog::warn("DirectorySync: skipped {} directory record(s) and sanitized {} field(s) "
+                     "with an embedded NUL byte; the rest of the snapshot is applied",
+                     skipped, sanitized);
+    }
 
     // Filter membership pairs to users present in THIS snapshot. Graph's
     // /groups/{id}/members can return non-user directoryObjects (devices,
@@ -942,10 +1075,10 @@ std::expected<void, std::string> DirectorySync::apply_entra_sync(const EntraSync
         // gap is worth closing now — DirectorySync feeds the SOC 2
         // access-review email enrichment, where a deleted-from-Entra user
         // silently staying "synced" forever is a real correctness issue).
-        // Safe to run unconditionally here because sync_entra hard-errors
-        // (never reaches this transaction) on a malformed users OR groups
-        // response — an empty current_user_ids/current_group_ids here means
-        // the tenant genuinely has zero of that kind, not a fetch failure.
+        // An empty current_user_ids/current_group_ids is applied only when the tenant
+        // fetch succeeded and returned zero records of that kind (sync_entra hard-errors,
+        // never reaching this transaction, on a malformed users OR groups response). A
+        // snapshot that skipping emptied was refused before this point.
         // ON DELETE CASCADE removes the deleted rows' memberships.
         if (!delete_stale_rows(conn, "directory_users", current_user_ids))
             return false;
@@ -967,7 +1100,10 @@ std::expected<void, std::string> DirectorySync::apply_entra_sync(const EntraSync
     });
     if (!ok)
         return std::unexpected("transaction failed applying directory sync result");
-    return {};
+    return ApplyCounts{.users = static_cast<int>(data.users.size()),
+                       .groups = static_cast<int>(data.groups.size()),
+                       .skipped = skipped,
+                       .sanitized = sanitized};
 }
 
 // ── LDAP sync (stub) ─────────────────────────────────────────────────────────
@@ -1214,16 +1350,21 @@ std::expected<SyncStatus, DirectoryReadError> DirectorySync::get_status_checked(
 
 // ── Sync status (internal) ──────────────────────────────────────────────────
 
-void DirectorySync::update_status(const std::string& provider, const std::string& status,
+bool DirectorySync::update_status(const std::string& provider, const std::string& status,
                                   int user_count, int group_count,
                                   const std::string& error) {
     if (!open_)
-        return;
+        return false;
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease) {
         spdlog::error("DirectorySync::update_status: could not acquire a connection");
-        return;
+        return false;
     }
+
+    // The error text can embed identity-provider strings; a NUL in it must not stop the status
+    // row from being written.
+    std::string safe_error = error;
+    replace_nul_with_fffd(safe_error);
 
     pg::PgResult r = pg::exec_params(
         lease.get(),
@@ -1235,11 +1376,13 @@ void DirectorySync::update_status(const std::string& provider, const std::string
         "user_count = EXCLUDED.user_count, group_count = EXCLUDED.group_count, "
         "last_error = EXCLUDED.last_error",
         std::vector<std::string>{provider, status, std::to_string(now_epoch()),
-                                 std::to_string(user_count), std::to_string(group_count), error});
+                                 std::to_string(user_count), std::to_string(group_count), safe_error});
     if (!r.ok()) {
         spdlog::error("DirectorySync::update_status: query failed: {}",
                       PQresultErrorMessage(r.get()));
+        return false;
     }
+    return true;
 }
 
 // ── Group-to-role mapping ────────────────────────────────────────────────────

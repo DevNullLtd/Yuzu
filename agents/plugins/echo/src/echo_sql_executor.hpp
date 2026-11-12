@@ -5,7 +5,7 @@
  *
  * Validates operator-submitted SQL queries for safety:
  *  1. SELECT-only (rejects INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/ATTACH/PRAGMA)
- *  2. $-name whitelist translation ($Process_Live -> process_live)
+ *  2. $-name whitelist translation ($Process_Hourly -> process_hourly)
  *  3. Single-statement enforcement
  *
  * Used by the echo.sql plugin action.

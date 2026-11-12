@@ -165,6 +165,12 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    pooled connections carry **no** per-store `search_path`. Bind parameters with
    `pg::exec_params` (`$1..$N`); never string-concat SQL. Mutate-and-return uses `RETURNING`
    (the #1033-banning idiom), never `sqlite3_changes()`.
+   `pg::exec_params` refuses a bound text parameter that contains an embedded NUL byte (a failed
+   result, SQLSTATE 22021, statement not executed) instead of letting libpq cut it at the NUL, so a
+   store that accepts free text still validates or sanitizes first, and treats that failed result as
+   an error, never as "not found" or "not denied". Where the caller logs the Postgres error, a
+   refusal shows up as the store's query-error reason plus the text "parameter $N contains a NUL
+   byte".
 
 5. **Lease discipline** (ADR-0012 §2): every runtime acquire is **bounded**
    (`try_acquire_for(deadline)`) — pick the deadline from posture (hot-path fail-soft: short,
@@ -718,3 +724,9 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   text-array literal for `unnest()`-style batched inserts. Always-quotes, escapes `\` and `"`,
   and **drops `0x00`** — NUL is not transmittable in libpq text format, so callers must not
   rely on NUL surviving the round-trip.
+
+## Routed-concern invariants
+
+Moved verbatim from the `Server storage substrate — PostgreSQL` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+**Server storage substrate — PostgreSQL**; agent stays SQLite (`agent.db` + federated edge warehouse). Server fails closed at boot — NO SQLite fallback — when `--postgres-dsn`/`YUZU_POSTGRES_DSN` is unset/unreachable (ADR-0006/0007). New server stores default to Postgres (no new server SQLite store without an exception ADR); ALL existing server stores migrate — none stays SQLite (ADR-0006 Update). **Auth is now Postgres too (2026-07-16)** — `AuthDB` (schema `auth`) + `ScimStore` (schema `scim_store`) migrated off the former SQLite `auth.db`, closing the last major server-side SQLite exception; fresh-start/no-backfill (matches `ApiTokenStore`'s 4.1 precedent — a legacy `auth.db` is never read on upgrade). Secrets are NEVER a plain Postgres column — verify-only hash or `SecretCodec` envelope blob (SHIPPED, ADR-0010; `AuthDB`/`mfa_totp_secret` is the **first production consumer**); `security-guardian` review on every secret-column migration. Author contract: ADR-0012; recipe: `docs/postgres-store-playbook.md`; ordered queue: `docs/postgres-migration-ladder.md`.

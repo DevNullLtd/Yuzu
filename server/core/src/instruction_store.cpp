@@ -194,7 +194,7 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
 
 // ── Echo rename (upgrade window) ─────────────────────────────────────────────
 
-// The archive-tool guards of scripts/rename-tar-to-echo.py (the PROTECT list's captured-data
+// The archive-tool guards of the retired rename script (its PROTECT list's captured-data
 // and "archive tool: files, commands, package lists, prose" groups), ported as
 // zero-width constraints placed before the bare-word rule. The script masks a protected span and
 // rewrites the rest; the equivalent here is a `tar` that is protected when its left context L
@@ -230,7 +230,7 @@ constexpr const char* kEchoRenameBareTarGuards =
     "\\s*\\|\\s*(?:grep|head|wc|sed|awk|tee|gzip|zstd|xz|sha\\w*)\\y|"
     "\\s+(?:zip|unzip|git|python3-pip|ca-certificates|gzip)\\y)))";
 
-// The token chain the rename script applies to the builtin Echo definitions' prose, as
+// The token chain applied to the builtin Echo definitions' prose, as
 // regexp_replace calls over one column expression. Word boundaries are Postgres ARE `\m` / `\M`.
 std::string echo_rename_text_chain(const std::string& col) {
     std::string e = col;

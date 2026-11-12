@@ -90,11 +90,6 @@ struct FoldSourceDef {
 /// column content.
 [[nodiscard]] bool is_fold_row_table(std::string_view name);
 
-/// The 16 `<src>_live` names: the raw-row tables that roll-up does not keep,
-/// listed so a `$X_Live` read can be answered by an empty view instead of an
-/// error. `usage_live` is excluded: usage keeps its own tables.
-[[nodiscard]] std::vector<std::string> legacy_live_shim_names();
-
 /// One column of a retired raw `<src>_live` table.
 struct LegacyColumn {
     std::string_view name;
@@ -102,27 +97,9 @@ struct LegacyColumn {
 };
 
 /// The columns of the retired raw table `<source>_live` (after its `id`), in the order the
-/// raw store declared them. The v10 migration decodes the raw rows through this list, and the
-/// shim views answer with it, so a `$X_Live` read still sees the names it always did. Empty
-/// for a source that never had a raw table (usage keeps its own, unchanged).
+/// raw store declared them. The v10 migration decodes the raw rows through this list; nothing
+/// else reads it. Empty for a source that never had a raw table (usage keeps its own, unchanged).
 [[nodiscard]] std::vector<LegacyColumn> legacy_live_columns(std::string_view source);
-
-/// `CREATE VIEW IF NOT EXISTS <src>_live AS SELECT <typed NULL AS col, ...> WHERE 0` for each of
-/// the 16 shim names: an empty relation with the legacy column names (`id` first), so a stored
-/// `$X_Live` query returns zero rows with its old `__schema__` line instead of an error. Idempotent.
-[[nodiscard]] std::string legacy_live_shim_ddl();
-
-/// True for a name `legacy_live_shim_ddl` creates.
-[[nodiscard]] bool is_legacy_live_shim(std::string_view name);
-
-/// The shim names `sql` (translated operator SQL, real table names) mentions as whole
-/// identifiers, in shim order. A query over one succeeds with no rows, so the `sql` action
-/// reports it as a CONSTRAINED result (`retired_table:<name>`) rather than let an empty answer
-/// read as "nothing happened". A lexical scan, ASCII case-insensitive like SQLite's own
-/// identifier match, so every spelling SQLite accepts for the name (bare in any case,
-/// double-quoted, bracketed, backticked) is found; a name inside a string literal counts too,
-/// which is a spurious signal at worst, never a missed one.
-[[nodiscard]] std::vector<std::string> referenced_legacy_live_shims(std::string_view sql);
 
 /// Roll one source's rows up from tier `from` into tier `to` ("hourly" -> "daily" or "daily" ->
 /// "monthly"): every row of `<src>_<from>_r` whose bucket is at or above `?1` is UPSERTed into

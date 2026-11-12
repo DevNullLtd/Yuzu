@@ -81,17 +81,20 @@ TEST_CASE("module action/signed tokens are the stable warehouse vocabulary", "[e
 }
 
 TEST_CASE("$Module schema is registered and queryable across all tiers", "[echo][module][schema]") {
-    for (const auto* dn : {"$Module_Live", "$Module_Hourly", "$Module_Daily", "$Module_Monthly"}) {
+    for (const auto* dn : {"$Module_Hourly", "$Module_Daily", "$Module_Monthly"}) {
         INFO("dollar=" << dn);
         auto real = translate_dollar_name(dn);
         REQUIRE(real.has_value());
         CHECK(is_queryable_table(*real));
     }
+    // The retired raw name is not registered.
+    CHECK_FALSE(translate_dollar_name("$Module_Live").has_value());
+    CHECK_FALSE(is_queryable_table("module_live"));
 }
 
-TEST_CASE("module_live carries the M1 columns including module_dir + signing",
+TEST_CASE("module_hourly carries the module identity + signing columns",
           "[echo][module][schema]") {
-    auto cols = columns_for_table("module_live");
+    auto cols = columns_for_table("module_hourly");
     auto has = [&](const std::string& c) {
         return std::find(cols.begin(), cols.end(), c) != cols.end();
     };

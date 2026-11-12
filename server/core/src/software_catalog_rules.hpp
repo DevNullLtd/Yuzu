@@ -48,7 +48,7 @@ struct EcosystemFamily {
 
 /// Row order is the published order of the OpenAPI and MCP ecosystem enums; a mid-table insert
 /// shifts positions, so say so in the changelog.
-inline constexpr std::array<EcosystemFamily, 19> kEcosystemFamilies{{
+inline constexpr std::array<EcosystemFamily, 20> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
     {"msi", "windows"},
@@ -68,6 +68,7 @@ inline constexpr std::array<EcosystemFamily, 19> kEcosystemFamilies{{
     {"chocolatey", "windows"}, // pkg_inventory Windows legs
     {"winget", "windows"},
     {"appx", "windows"},
+    {"kernel_module", "linux"}, // hardware.drivers_inventory (Linux loaded kernel modules)
 }};
 
 /// The table is non-empty, every ecosystem is `[a-z_]+` and every family `[a-z]+` (so none is
@@ -116,19 +117,20 @@ struct VocabEntry {
 };
 
 /// Row order is the order the Kind chips render. A new kind is one row here.
-inline constexpr std::array<VocabEntry, 4> kSoftwareKinds{{
+inline constexpr std::array<VocabEntry, 5> kSoftwareKinds{{
     {"app", "app",
      "applications (Windows and macOS apps, Homebrew casks, store apps, runtimes and middleware)"},
     {"pkg", "pkg",
      "packages: macOS pkgutil receipts, Homebrew formulae, snap and flatpak runtimes, MSI products"},
     {"package", "package", "OS packages (rpm, deb, apk, pacman)"},
     {"feat", "feat", "Windows optional features"},
+    {"driver", "driver", "device drivers (Windows PnP signed drivers, Linux loaded kernel modules)"},
 }};
 
 /// One row per collector source, in the collector's kInventoryActions order
 /// (agents/core/src/sync_source_installed_software.cpp); the vocabulary test compares the ordered
 /// lists. A new source is one row here.
-inline constexpr std::array<VocabEntry, 10> kSoftwareSources{{
+inline constexpr std::array<VocabEntry, 11> kSoftwareSources{{
     {"installed_apps.list_inventory", "installed_apps.list_inventory",
      "Windows Uninstall registry, Linux dpkg/rpm/pacman/apk, macOS applications and installer "
      "receipts"},
@@ -152,6 +154,8 @@ inline constexpr std::array<VocabEntry, 10> kSoftwareSources{{
     {"runtimes.jvm", "runtimes.jvm",
      "Java runtimes and development kits at the standard machine-wide locations (Windows, macOS, "
      "Linux)"},
+    {"hardware.drivers_inventory", "hardware.drivers_inventory",
+     "Windows PnP signed drivers (WMI); Linux loaded kernel modules"},
 }};
 
 /// Non-empty, every value `[a-z_.]+` (the chips splice it into attributes and URLs), non-empty

@@ -144,7 +144,7 @@ Yuzu/
 
 Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
 
-- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.15.0, a fresh-deployment release: it supports initial deployment into a new database only, with no in-place upgrade from, and no return to, 0.14.x or earlier (see [Upgrading](docs/user-manual/upgrading.md#behaviour-change-stored-responses-of-forensics-tier-plugins-need-forensicsread-4990-fresh-deployment-only), Deployment contract).
+- **Release binaries & installers** (server and agent for Linux, agent for Windows and macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.15.0, a fresh-deployment release: it supports initial deployment into a new database only, with no in-place upgrade from, and no return to, 0.14.x or earlier (see [Upgrading](docs/user-manual/upgrading.md#behaviour-change-stored-responses-of-forensics-tier-plugins-need-forensicsread-4990-fresh-deployment-only), Deployment contract).
 - **Container images** (published to GHCR on every tag):
   - `ghcr.io/devnullltd/yuzu-server:<version>`
   - `ghcr.io/devnullltd/yuzu-postgres:<version>`
@@ -250,7 +250,7 @@ meson compile -C build-windows
 | Option | Default | Notes |
 |---|---|---|
 | `-Dbuild_agent` | true | Agent daemon |
-| `-Dbuild_server` | true | Server daemon |
+| `-Dserver` | auto | Server daemon (feature option; Linux only: `auto` builds it on a Linux target and skips it elsewhere, `enabled` elsewhere is an error). The old `-Dbuild_server` boolean is deprecated |
 | `-Dbuild_tests` | false | Catch2 test suite |
 | `-Dbuild_examples` | true | Demo plugins only (`example`, `chargen`, `procfetch`, `netprobe`) — every other plugin builds under `-Dbuild_agent` regardless |
 | `-Db_lto` | false | Link-time optimisation |

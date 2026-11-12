@@ -360,6 +360,7 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_installed_software_v3.cpp', # SAM-15: the pure blob-v3 writer (installed_software_v3.hpp), server golden parity
     'unit/test_sync_window.cpp', # SAM-19: sync_window.hpp placement + overdue catch-up, fake zone
     'unit/test_inventory_sync_action_table.cpp',
     'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
@@ -621,6 +622,8 @@ agent_test_exe = executable(
     'unit/test_shares_local_dispatcher.cpp',        # shares: real plugin via LocalDispatcher + execute seam, unguarded on every OS
     'unit/test_virtualization_parsers.cpp',         # virtualization: pure classifier/vendor tables/CPUID fact builder/row formatters over labelled fixtures; portable
     'unit/test_virtualization_local_dispatcher.cpp',  # virtualization: real plugin via LocalDispatcher + execute seam, unguarded on every OS
+    'unit/test_virtualization_runtime_parsers.cpp',  # virtualization runtime_posture: pure verb table/endpoint decision/JSON readers/field allow-lists/row formatters over labelled fixtures; portable
+    'unit/test_virtualization_runtime_legs.cpp',    # virtualization runtime_posture: OS-free runtime_posture_linux seam over injected fakes (recording transport, fake clock); portable
     'unit/test_virtualization_wsl_parsers.cpp',     # virtualization wsl: Ops-faked Lxss walk + fake hive-access seam (live and offline outcomes) + budget + decide_wsl + row formatters, portable
     'unit/test_remote_access_audit_config_parsers.cpp',  # remote_access_audit: pure sshd_config/Include/service parsers over REAL CAPTURE + labelled fixtures; portable
     'unit/test_remote_access_audit_keys_parsers.cpp',    # remote_access_audit: pure authorized_keys/options/blob decoder/fingerprint over REAL ssh-keygen captures; portable
@@ -1394,7 +1397,7 @@ echo_test_exe = executable(
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
     'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
     'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
-    'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, shim views
+    'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, retired names
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/echo/src/echo_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -1875,6 +1878,7 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_mgmt_group_owner_gate.cpp', # owner-arm predicate: surface, token class, engine, grant rows (pure, no PG)
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_engine_aware_visibility.cpp', # #6204: the engine rule in the username-keyed visibility/dispatch resolvers, against real stores
@@ -2025,6 +2029,7 @@ if build_server
       'unit/server/test_product_pack_store.cpp',
       'unit/server/test_pg_raii.cpp',
       'unit/server/test_pg_pool.cpp',
+      'unit/server/test_pg_exec_params.cpp',
       'unit/server/test_pg_migration_runner.cpp',
       'unit/server/test_pg_hardening.cpp',
       'unit/server/test_pg_migration_skip_predicate.cpp',
@@ -3227,7 +3232,8 @@ if build_server
   # GCC/Clang only: the script reads `*.cpp.o` objects with `nm`; MSVC emits
   # `.obj` files and its runners ship no `nm`, so this test() entry does not
   # exist at all on that toolchain — the Windows leg adds nothing here. The
-  # macOS leg runs it (no by-name filter, full `meson test`); the Linux
+  # macOS leg ran it (no by-name filter, full `meson test`) until ADR-0035
+  # made that leg agent-only (it no longer builds the server); the Linux
   # leg's own non-pg Test step selects `server-checks`-suite tests by an
   # explicit NAME list, which had never named this one (CI-2, 2026-09-28,
   # WS-A4 PR-1 Gate 7 fix round build-ci review) — this test silently never
@@ -3454,6 +3460,29 @@ test('release artifact gate',
   args: [files('test_check_release_artifacts.py')],
   suite: 'docs',
   timeout: 60,
+)
+
+# Agent-only Windows and macOS releases (ADR-0035 ladder step 2): release.yml's
+# Windows/macOS jobs build no server and no server installer, the old archive
+# names are gone, and every place that names a platform archive agrees on one
+# set. Lints source text with a mutation self-test.
+test('agent-only release lint',
+  _python3_test,
+  args: [files('test_release_agent_only.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The `server` feature option (ADR-0035 ladder step 3): auto turns the server
+# off on a non-Linux target, enabled there is an error, the deprecated
+# `build_server` boolean stays declared and honoured. Lexical pins with a
+# mutation self-test, plus a real configure of this tree for Windows, macOS
+# and Linux targets (skipped without meson and a compiler).
+test('server feature option lint',
+  _python3_test,
+  args: [files('test_server_feature_option.py')],
+  suite: 'docs',
+  timeout: 300,
 )
 
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
@@ -4260,6 +4289,29 @@ test('agent __sync__.now wiring lexical gate',
   timeout: 30,
 )
 
+# Installed-software worker drain (SAM-15): the collector's detached workers must be drained
+# before any plugin is shut down, on BOTH agent.cpp teardown paths, and the single-flight state
+# must be the agent-owned object the factory receives. The unit tests cover the drain helper;
+# nothing runs the teardown, so this pins the call sites and the ownership. Carries its own
+# in-memory mutation self-test. No build required.
+test('agent installed-software drain wiring lexical gate',
+  _python3_test,
+  args: [files('test_installed_software_drain_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Installed-apps Windows Uninstall roots (SAM-15): windows_roots() is a function-local table in a
+# _WIN32 block and its only unit test is a Windows-only TU, so on any other host nothing observes
+# the absent_ok / degrades_walk flags (the row 1.4 degraded-case rule). This pins the three rows.
+# Carries its own in-memory mutation self-test. No build required.
+test('installed_apps windows roots lexical gate',
+  _python3_test,
+  args: [files('test_windows_uninstall_roots_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # Command-dedup fleet telemetry (#3663): the agent's `yuzu.dedup_*` heartbeat tags and the
 # server's yuzu_fleet_agents_dedup_* table share no header (no upward server -> agent edge), so
 # nothing in the compiler binds them. This pins that every emitted tag has a server row and vice
@@ -4283,6 +4335,19 @@ test('agent command-dedup fleet telemetry drift gate (#3663)',
 test('guardian_backend reader wiring lexical gate (#2240)',
   _python3_test,
   args: [files('test_guardian_backend_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
+# Agent-decommission cascade wiring (#5675): every field of AgentDecommissionStores must be handed a
+# live store pointer in ServerImpl::decommission_agent (server.cpp). A store registered in the
+# cascade but never wired there is Skipped for every operator decommission, and no unit test sees
+# it (the route test injects its own decommission_fn; the drift guard pins only the COUNT).
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' for the same
+# reason as the gate above.
+test('agent decommission cascade wiring lexical gate (#5675)',
+  _python3_test,
+  args: [files('test_decommission_wiring_lexical.py')],
   suite: 'docs',
   timeout: 60,
 )
@@ -4489,6 +4554,18 @@ test('OpenAPI literal segment size lexical gate',
   timeout: 30,
 )
 
+# Lexical gate: the OpenAPI authoring mistakes test_openapi_spec_completeness.cpp reports one kind
+# per full build (no operationId, an ill-formed or duplicate one, the operationId checksum pin, a
+# success response left untyped and not in kUntyped) are all reported together, before any build.
+# Reads the same literal chain as the segment gate above and the constants out of the C++ test.
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' as above.
+test('OpenAPI operation authoring lexical gate',
+  _python3_test,
+  args: [files('test_openapi_operation_authoring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Lexical gate: the OpenAPI x-yuzu-unavailable markers agree with the stores server.cpp passes to
 # register_routes (a store passed as nullptr <=> its group is marked). Carries its own in-memory
 # mutation self-test. No build required.
@@ -4581,10 +4658,13 @@ endif
 # #5906: `yuzu-server --healthcheck` CLI contract against the real binary (no listener, no
 # Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
 # runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
-# platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
-# it drives the native binary (`.exe` probe, MSYS2_ARG_CONV_EXCL, cygpath). Suite 'platform', not a bare
-# 'server': scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate
-# labelled only 'server' fails that check on the Windows legs.
+# platform: OS-contract test (docs is OS-independent and Linux-only since 2026-10-21). It is registered
+# only when build_server is on, which since ADR-0035 ladder step 3 means a Linux target only (the
+# `server` feature option is off for any other target), so it runs on the Linux legs only; its `.exe`
+# probe, MSYS2_ARG_CONV_EXCL and cygpath handling serve no supported build now and can go when the
+# server's Windows code is removed (ADR-0035 step 4). Suite 'platform', not a bare 'server':
+# scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate labelled
+# only 'server' would fail that check on any leg that registers it.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server
   test('healthcheck CLI contract (#5906)',
     _bash_test,
@@ -4778,6 +4858,23 @@ test('software lookup wiring lexical',
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# yuzu_fleet_plugin_init_failed label catalogue: the one production set_known_plugins(...) line must
+# exist exactly once and precede the health recompute thread (no unit test builds ServerImpl; an
+# unwired store labels every real plugin "unknown"), and both metrics_.describe rows must exist.
+# The selftest deletes each required statement in memory and requires the gate to name it.
+test('plugin init failed wiring lexical',
+  _python3_test,
+  args: [files('test_plugin_init_failed_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('plugin init failed wiring lexical selftest',
+  _python3_test,
+  args: [files('test_plugin_init_failed_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 30,
 )

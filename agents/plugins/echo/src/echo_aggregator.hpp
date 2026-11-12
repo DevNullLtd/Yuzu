@@ -397,10 +397,7 @@ inline constexpr int64_t kBudgetProcPerfHourlyFloorSec = 432000;
 /// Steady-state wall-clock budget for one eviction pass, checked between batches.
 inline constexpr int64_t kBudgetPassDeadlineMs = 2000;
 
-/// echo_config keys written by the budget engine (the first two are cumulative counters).
-/// `budget_evicted_raw_rows_total` is no longer written (there are no raw rows); `status` keeps
-/// printing its stored value for one release so a dashboard keyed on it does not go dark.
-inline constexpr std::string_view kBudgetEvictedRawKey = "budget_evicted_raw_rows_total";
+/// echo_config keys written by the budget engine (the first is a cumulative counter).
 inline constexpr std::string_view kBudgetEvictedHourlyKey = "budget_evicted_hourly_rows_total";
 inline constexpr std::string_view kDbBudgetKey = "db_budget_bytes";
 inline constexpr std::string_view kAutoVacuumDeferredKey = "auto_vacuum_deferred_at";

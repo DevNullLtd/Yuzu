@@ -74,7 +74,7 @@ public:
     /// `result.captured`. Bounded by `capture_cap` — defaults to
     /// kCaptureMaxBytes so the fleet-topology snapshot contract is untouched;
     /// a caller with a larger bounded payload (the installed_software sync's
-    /// v2 rows, whose 12-field output outgrows 2 MiB around ~14k packages)
+    /// rows, whose 13-field output outgrows 2 MiB around ~14k packages)
     /// passes its own cap explicitly rather than raising the shared default.
     Result run(const YuzuPluginDescriptor* descriptor, std::string_view action,
                std::span<const YuzuParam> params = {},

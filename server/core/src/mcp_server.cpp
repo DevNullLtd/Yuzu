@@ -47,6 +47,7 @@
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_matcher.hpp"        // validate_matcher: admission check of a caller matcher (#4644)
+#include "result_set_members.hpp"        // plugin_may_seed_result_set: Forensics-tier source refusal
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
 #include "revocation_source_admin_gate.hpp" // ADR-0070 R1: decide_admin + RevocationSourceService (shared REST+MCP)
@@ -61,6 +62,8 @@
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
 #include "app_usage_store.hpp"            // get_agent_app_usage (wave 7 PR7.2 projection)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+#include "mgmt_group_error.hpp"            // mgmt_group_error_is_store_fault: one classifier for REST and MCP
+#include "rbac_text.hpp"                  // rbac_text_is_clean — identifier check shared with the owner
 #include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
 // ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
 // The SAME pure validation grammar the REST route
@@ -68,6 +71,7 @@
 // handler's pre-validation can never diverge from what the store accepts.
 #include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
+#include "mgmt_group_owner_gate.hpp"        // the one management-group owner-arm predicate
 #include "rbac_admin_predicate.hpp"       // A2: is_rbac_administrator/is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp"      // A2: kRbacAssignableRoles/is_rbac_assignable_role — closed 7-role set
 #include "dex_window.hpp"               // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (pure, store-free/httplib-free window resolver — narrower than dex_routes.hpp, which this file no longer needs)
@@ -708,8 +712,8 @@ static_assert(kMaxFacetValueBytes == 2048,
 // nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
 // array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
 // #undef'd right after it.
-#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica, and false for a failed set"})j"
-#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. A set created from a parent's members carries the parent's counters, summed along a lineage, so partial is the reliable signal. False for a failed set"})j"
+#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","agents_unanswered","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents",
      "List the connected agents the caller may read, with hostname, OS, architecture, "
@@ -958,7 +962,7 @@ static const ToolDef kTools[] = {
      "version (upstream, release stripped), publisher (the declared vendor: rpm VENDOR else PACKAGER, "
      "deb Maintainer, Windows Publisher, macOS signer; or, when the source declares none, the "
      "origin label via:<ecosystem> such as via:brew, which names where the row came from, not a "
-     "vendor), install_date, kind (package|app|pkg|feat), "
+     "vendor), install_date, kind (package|app|pkg|feat|driver), "
      "ecosystem (@@ECOSYSTEM_LIST@@), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "
@@ -1551,7 +1555,11 @@ static const ToolDef kTools[] = {
      "it still resolves store-only. See docs/asset-tagging-guide.md \"Tag source precedence\". A "
      "from_result_set:<id> atom referencing a result set that is absent, expired, or not owned "
      "by the caller aborts with kInvalidParams (RESULT_SET_NOT_FOUND) rather than silently "
-     "matching nothing or everything. REST v1 twin: POST /api/v1/scope/preview.",
+     "matching nothing or everything. An owned set that is still pending aborts with "
+     "kInternalError result_set_unusable and retry_after_ms 5000; one that has failed, or is "
+     "incomplete (partial) and referenced under NOT, LEN or STARTSWITH, aborts as "
+     "result_set_unusable with retry_after_ms null (re-run the producer that created the set). "
+     "REST v1 twin: POST /api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
@@ -1561,8 +1569,8 @@ static const ToolDef kTools[] = {
     // v1 had a full 12-operation API with zero MCP tools before this batch.
     // Every tool below shares the SAME `ResultSet` row shape (id/name/
     // owner_principal/created_at/ttl_at/last_used_at/pinned/parent_id/
-    // source_kind/status/source_execution_id/device_count/agents_failed/partial) as its REST v1
-    // twin — both surfaces call the SAME result_set_json() builder
+    // source_kind/status/source_execution_id/device_count/agents_failed/agents_unanswered/partial)
+    // as its REST v1 twin — both surfaces call the SAME result_set_json() builder
     // (result_set_model.hpp), so the shape cannot drift.
 
     {"list_result_sets",
@@ -1582,7 +1590,10 @@ static const ToolDef kTools[] = {
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
      "new set onto an owned existing set. A non-empty device_ids is checked against the "
      "fleet — any id that does not exist or is not visible to the caller rejects the whole "
-     "request (RESULT_SET_UNKNOWN_DEVICE_ID). REST v1 twin: POST /api/v1/result-sets. "
+     "request (RESULT_SET_UNKNOWN_DEVICE_ID). A parent_id that is pending or failed is "
+     "refused -32602 RESULT_SET_NOT_READY (wait for a pending parent, re-create a failed one); "
+     "the new set does not inherit the parent's agents_failed or agents_unanswered, since its "
+     "members are the given device_ids. REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
@@ -1601,7 +1612,9 @@ static const ToolDef kTools[] = {
      "or for failing to parse as JSON at all, this call refuses (kInternalError) rather than "
      "materialise a result set narrower than the true match set (#4496, extended by the #4496 "
      "follow-up for the parse-error cause; each cause is its own distinctly-named refusal "
-     "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
+     "reason - query_truncated/poison_excluded/parse_error_excluded). A parent_id that is "
+     "pending or failed is refused -32602 RESULT_SET_NOT_READY; the new set inherits the "
+     "parent's agents_failed and agents_unanswered. REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. JSON integers are exact; every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is -32602: send an integer, or send the decimal as a string under > >= < <= (at most 15 significant digits, a magnitude below 2^53, not subnormal, within the range of a double), where == and != stay a text compare; write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as 1e16 (read exactly). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
@@ -1617,7 +1630,7 @@ static const ToolDef kTools[] = {
      "the server only length-checks (max 100000 bytes). Membership is every agent that "
      "returned >=1 row (include_empty=true widens to every responder); an agent whose "
      "query failed is not a member, and the filled set reports how many in agents_failed "
-     "with partial=true (an execution with more than 100000 stored answers marks the set "
+     "(and the agents that never answered in agents_unanswered) with partial=true (an execution with more than 100000 stored answers marks the set "
      "failed instead, with agents_failed 0 and the reason in the server log). SQL that "
      "reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
@@ -1625,8 +1638,10 @@ static const ToolDef kTools[] = {
      "$Process_Hourly. Dispatches to "
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
-     "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
+     "nothing is refused (400), never silently widened. A parent_id that is pending or failed "
+     "is refused -32602 RESULT_SET_NOT_READY before anything is dispatched; the new set "
+     "carries the parent's agents_failed and agents_unanswered from creation. REST v1 twin: "
+     "POST /api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
      "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
      "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
@@ -1647,15 +1662,17 @@ static const ToolDef kTools[] = {
      "output row satisfies the operator-supplied matcher (column/op/value); omitting matcher "
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
-     "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
+     "create_result_set_from_echo_query, including the RESULT_SET_NOT_READY refusal of a pending "
+     "or failed parent and the inherited agents_failed and agents_unanswered. Find valid "
+     "instruction_id values via list_definitions "
      "or discover_instructions — do not guess. An echo.sql definition whose SQL (params.sql, "
      "else the definition's own default) reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
      "RESULT_SET_REEVAL_STALE_SOURCE and nothing is dispatched, the same as "
-     "create_result_set_from_echo_query. If the definition runs a Forensics-tier "
-     "plugin (an action on the Forensics securable) the set materializes with no members "
-     "for every creator, because the materializer never reads Forensics-tier output; an "
-     "empty set from such a definition says nothing about the fleet. A definition whose "
+     "create_result_set_from_echo_query. A definition that runs a Forensics-tier "
+     "plugin is refused with RESULT_SET_SOURCE_NOT_SUPPORTED (-32602) before anything is "
+     "dispatched, because the stored responses of such a plugin are withheld from "
+     "result-set membership. A definition whose "
      "plugin.action is gated (admin or approval) is refused for a non-admin caller with a "
      "permission-denied error whose error.data.reason is approval_required (permanent, "
      "retry_after_ms null): an approval ticket never lifts that gate for this tool, so a "
@@ -1699,6 +1716,9 @@ static const ToolDef kTools[] = {
      "narrowed to a parent set at creation time and that parent has since been deleted, this "
      "REFUSES (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than silently broadcasting "
      "to every visible device (#4306) — create a new set from the intended parent instead. "
+     "An original whose parent is pending or failed is refused -32602 RESULT_SET_NOT_READY, "
+     "and an instruction_result original whose definition runs a Forensics-tier plugin is "
+     "refused -32602 RESULT_SET_SOURCE_NOT_SUPPORTED, both before anything is dispatched. "
      "An instruction_result source whose definition's plugin.action is gated (admin or "
      "approval) is refused for a non-admin caller (permission denied, "
      "error.data.reason=approval_required, retry_after_ms null): an approval ticket never "
@@ -3588,7 +3608,7 @@ static const ToolDef kTools[] = {
      // AFTER the ticket is minted/consumed today — same handler-side pattern
      // as the engine:<slug> form above, just without the prefix.
      R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
-     R"j("role":{"type":"string","minLength":1,"description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
+     R"j("role":{"type":"string","minLength":1,"description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected; a name containing a NUL, other control byte (0x01-0x1F) or DEL is refused as invalid params"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -3603,7 +3623,7 @@ static const ToolDef kTools[] = {
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
-     R"j("role":{"type":"string","minLength":1,"description":"The role name to revoke"})j"
+     R"j("role":{"type":"string","minLength":1,"description":"The role name to revoke; a name containing a NUL, other control byte (0x01-0x1F) or DEL is refused as invalid params"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -3675,7 +3695,7 @@ static const ToolDef kTools[] = {
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","pattern":"^[A-Za-z0-9._-]{1,64}$","description":"Target username"},)j"
-     R"j("role":{"type":"string","minLength":1,"maxLength":64,"description":"The role name to revoke — deliberately NOT restricted to the 7 assignable names (unlike assign_rbac_role): unassign is a pure idempotent DELETE with no privilege granted, so it must stay able to clean up an out-of-band grant (e.g. ITServiceOwner or a custom role assigned by direct SQL) that assign_rbac_role itself could never have created"})j"
+     R"j("role":{"type":"string","minLength":1,"maxLength":64,"description":"The role name to revoke. Any role name is accepted, including one granted out of band (e.g. ITServiceOwner or a custom role assigned by direct SQL), not only the 7 assignable names; the one exception is a name containing a NUL, another control byte (0x01-0x1F) or DEL, which is refused as invalid params"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"})j"
      // audit_persisted deliberately NOT documented here — see
@@ -4137,7 +4157,7 @@ static const ToolDef kTools[] = {
      "keys need an administrator account over REST: /mcp/v1/ requires a token that carries an "
      "MCP tier, and even an administrator token with a tier cannot write them over MCP, so use "
      "PUT /api/v1/config/{key} or the Settings pages; dex_score_policy has its own route and "
-     "answers invalid params. Values are sent as "
+     "answers invalid params (write it with set_dex_score_policy). Values are sent as "
      "strings, e.g. \"90\"; key is 1 to 64 characters from a-z and _, value at most 256 bytes "
      "(a longer value, such as a long dex_alert_routing, goes through PUT /api/v1/config/{key}); "
      "extra arguments are refused. "
@@ -4685,7 +4705,7 @@ static const ToolDef kTools[] = {
      "get_software_versions, or to query_installed_software for the devices carrying it. A "
      "degraded store read is a retryable error, never an empty result. Every call that reaches "
      "the store is audited (mcp.query_software_catalogue).",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat","driver"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
      R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
 
     {"get_software_versions",
@@ -4702,7 +4722,7 @@ static const ToolDef kTools[] = {
      "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
      "query_installed_software lists the devices carrying a version. Audited as "
      "mcp.get_software_versions.",
-     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat","driver"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 
     // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
@@ -6931,30 +6951,53 @@ int mcp_error_for_access_review_msg(const std::string& msg) {
 // still giving the MCP twins an HONEST retry_after_ms on the genuinely
 // transient subset, per A5 (docs/agentic-first-principle.md).
 //
-// Every store write failure the six mutating methods this PR twins
+// Every store write failure the mutating methods
 // (create_group/update_group/add_member/assign_role) can return is either:
-//   - a store-open/pool/query fault: "database not open", "pool acquire timed
-//     out", "failed to resolve ancestor chain (store degraded)", or one of the
-//     "<verb> failed: <pg error>" writes (create/update/add_member/assign_role) —
-//     ALL and ONLY of these contain the substring "failed" somewhere (the
-//     verb-prefixed writes literally say "... failed: ..."; the two exact-match
-//     strings are covered explicitly). Genuinely transient — retryable.
-//   - a validation/business-rule rejection ("group name cannot be empty",
-//     "parent group not found", "maximum hierarchy depth (5) exceeded",
-//     "re-parenting would create a cycle", "engine principals cannot hold
-//     scoped role assignments in this release", or a
-//     RbacStore::validate_assignment message) — none of these contain
-//     "failed". Client error — not retryable, matches REST's 400.
+//   - a store-open/pool/query fault, one of the FIXED messages listed in
+//     mgmt_group_error.hpp ("database not open", "pool acquire timed out", the
+//     "<verb> failed: <pg error>" writes, ...), matched on the message PREFIX only. Genuinely
+//     transient: retryable.
+//   - a validation/business-rule rejection ("group name cannot be empty", "parent group not
+//     found", "maximum hierarchy depth (5) exceeded", "re-parenting would create a cycle",
+//     "engine principals cannot hold scoped role assignments in this release", or a
+//     RbacStore::validate_assignment message, some of which echo caller text such as
+//     "unrecognized principal_type '<value>'"). Client error: not retryable, matches REST's 400.
 struct MgmtGroupErrorInfo {
     int code;
     long retry_after_ms; // -1 => no retry hint (not blindly retryable)
 };
 MgmtGroupErrorInfo classify_mgmt_group_error(const std::string& msg) {
-    if (msg == "database not open" || msg == "pool acquire timed out" ||
-        msg.find("failed") != std::string::npos) {
+    if (mgmt_group_error_is_store_fault(msg))
         return {kInternalError, mcp::kMcpStoreFaultRetryMs};
-    }
     return {kInvalidParams, -1};
+}
+
+// The management-group id fields reach a text bind: a control byte or an invalid
+// UTF-8 sequence is refused as invalid params instead of surfacing as a retryable
+// store fault. Twin: mgmt_text_ok in rest_api_v1.cpp (same rule).
+bool mgmt_text_ok(std::string_view s) {
+    if (!rbac_text_is_clean(s))
+        return false;
+    for (std::size_t i = 0; i < s.size();) {
+        if (static_cast<unsigned char>(s[i]) < 0x80) {
+            ++i;
+            continue;
+        }
+        const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
+        if (len == 0)
+            return false;
+        i += len;
+    }
+    return true;
+}
+
+// True only when the store answered authoritatively that the group does not
+// exist (a failed read is not "absent"). Used after a write failed to tell a
+// missing group (the caller's mistake) from a store fault. Twin: the same check
+// in rest_api_v1.cpp.
+bool mgmt_group_confirmed_absent(const ManagementGroupStore& store, const std::string& group_id) {
+    auto g = store.get_group_checked(group_id);
+    return g.has_value() && !g->has_value();
 }
 
 // KekOpResult::Failure → JSON-RPC error (#2395 track C). Reuses
@@ -13970,12 +14013,9 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── add_management_group_member (B4, #2146 API-parity) ────────
-            // Mirrors POST /api/v1/management-groups/{id}/members. NOTE (out of
-            // scope for this PR, reported rather than silently fixed): the REST
-            // handler calls add_member() and ignores its std::expected result
-            // entirely, always reporting 201 — this tool DOES check it, since
-            // every other MCP write tool in this file does and check-mcp-retry-
-            // hints.py requires an honest outcome on a checked store call.
+            // Mirrors POST /api/v1/management-groups/{id}/members: both check the
+            // store result, and check-mcp-retry-hints.py requires an honest
+            // outcome on a checked store call.
             if (tool_name == "add_management_group_member") {
                 if (!tier_allows(tier, "ManagementGroup", "Write")) {
                     res.set_content(
@@ -14002,6 +14042,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         "group_id and agent_id must each be at most {} bytes", kMgmtGroupIdMaxLen));
                     return;
                 }
+                // Same refusal as the REST twin: a control byte or invalid UTF-8 in an id
+                // is invalid params, audited with a fixed detail (the value is never echoed).
+                if (!mgmt_text_ok(group_id) || !mgmt_text_ok(agent_id)) {
+                    const char* detail_token =
+                        !mgmt_text_ok(agent_id) ? "invalid_agent_id" : "invalid_group_id";
+                    (void)audit_fn(req, "management_group.add_member", "denied", "ManagementGroup",
+                                   audit_token(group_id), detail_token);
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "group_id and agent_id must not contain control characters or "
+                                 "invalid UTF-8"),
+                        "application/json");
+                    return;
+                }
                 if (!mgmt_store) {
                     res.set_content(a4_error(kInternalError, "Management group store unavailable",
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
@@ -14011,13 +14065,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto result = mgmt_store->add_member(group_id, agent_id);
                 if (!result) {
                     const auto info = classify_mgmt_group_error(result.error());
+                    // A well-formed id naming no group fails the membership foreign key:
+                    // not found (the sibling tools' answer), no failure row, no retry hint.
+                    if (info.retry_after_ms > 0 && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
+                        mcp_audit("denied", "group not found");
+                        res.set_content(a4_error(kInvalidParams, "group not found"),
+                                        "application/json");
+                        return;
+                    }
+                    spdlog::warn("add_management_group_member store failure: {}", result.error());
                     const bool audit_ok = audit_fn(req, "management_group.add_member", "failure",
-                                                   "ManagementGroup", group_id, result.error());
+                                                   "ManagementGroup", group_id, "store_error");
                     res.set_content(
-                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
-                                 {}, audit_ok),
+                        a4_error(info.code, "management group store unavailable", "retry shortly",
+                                 /*retry_after_ms=*/info.retry_after_ms, {}, audit_ok),
                         "application/json");
-                    mcp_audit("failure", result.error());
+                    mcp_audit("failure", "store_error");
                     return;
                 }
                 const bool audit_ok = audit_fn(req, "management_group.add_member", "success",
@@ -14081,15 +14144,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 httplib::Response probe; // throwaway: the fleet-wide arm, never sent
                 bool authorized = perm_fn(req, probe, "UserManagement", "Read");
-                if (!authorized && session->token_scope_service.empty()) {
-                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                            gr.role_name == "ITServiceOwner") {
-                            authorized = true;
-                            break;
-                        }
-                    }
-                }
+                if (!authorized)
+                    authorized = group_owner_admits(*mgmt_store, group_id, *session,
+                                                    RbacAdminSurface::kMcp);
                 if (!authorized) {
                     mcp_audit("denied", "forbidden");
                     res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
@@ -14162,6 +14219,31 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+                if (!authorized)
+                    authorized = group_owner_admits(*mgmt_store, group_id, *session,
+                                                    RbacAdminSurface::kMcp);
+                if (!authorized) {
+                    mcp_audit("denied", "forbidden");
+                    res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
+                    return;
+                }
+
+                // After the permission gate, like the REST twin (Dave's review of #7376, item
+                // 1): a caller with no rights gets the permission answer and no row for a
+                // value. Checked before the closed role list so a role name holding a control
+                // byte or invalid UTF-8 is invalid params with its own denied row, not a
+                // permission error.
+                if (!mgmt_text_ok(role_name)) {
+                    (void)audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
+                                   audit_token(group_id), "invalid_role_name");
+                    res.set_content(a4_error(kInvalidParams,
+                                             "invalid role format: role name must be valid text "
+                                             "without control characters"),
+                                    "application/json");
+                    return;
+                }
                 if (role_name != "Operator" && role_name != "Viewer") {
                     mcp_audit("denied", "only Operator and Viewer roles can be delegated");
                     res.set_content(
@@ -14170,20 +14252,22 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
-                httplib::Response probe; // throwaway: the fleet-wide arm, never sent
-                bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-                if (!authorized && session->token_scope_service.empty()) {
-                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                            gr.role_name == "ITServiceOwner") {
-                            authorized = true;
-                            break;
-                        }
-                    }
-                }
-                if (!authorized) {
-                    mcp_audit("denied", "forbidden");
-                    res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
+                // Same refusal as the REST twin: a control byte or invalid UTF-8 in a field
+                // is invalid params, audited with a fixed detail (the value is never echoed).
+                if (!mgmt_text_ok(group_id) || !mgmt_text_ok(principal_type) ||
+                    !mgmt_text_ok(principal_id)) {
+                    const char* detail_token = !mgmt_text_ok(principal_id)
+                                                   ? "invalid_principal_id"
+                                               : !mgmt_text_ok(principal_type)
+                                                   ? "invalid_principal_type"
+                                                   : "invalid_group_id";
+                    (void)audit_fn(req, "management_group.assign_role", "denied", "ManagementGroup",
+                                   audit_token(group_id), detail_token);
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "group_id, principal_id and principal_type must not contain "
+                                 "control characters or invalid UTF-8"),
+                        "application/json");
                     return;
                 }
 
@@ -14196,14 +14280,32 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto result = mgmt_store->assign_role(assignment);
                 if (!result) {
                     const auto info = classify_mgmt_group_error(result.error());
+                    const bool store_fault = info.retry_after_ms > 0;
+                    // A well-formed id naming no group fails the role foreign key: not
+                    // found (the sibling tools' answer), no failure row, no retry hint.
+                    if (store_fault && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
+                        mcp_audit("denied", "group not found");
+                        res.set_content(a4_error(kInvalidParams, "group not found"),
+                                        "application/json");
+                        return;
+                    }
+                    if (store_fault)
+                        spdlog::warn("assign_management_group_role store failure: {}",
+                                     result.error());
+                    // A store fault is audited with a fixed detail and answered with a fixed
+                    // message; a store validation message (no libpq text) is passed through.
+                    const std::string fault_detail = store_fault ? "store_error" : result.error();
                     const bool audit_ok =
                         audit_fn(req, "management_group.assign_role", "failure", "ManagementGroup",
-                                 group_id, result.error());
+                                 group_id, fault_detail);
                     res.set_content(
-                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
-                                 {}, audit_ok),
+                        a4_error(info.code,
+                                 store_fault ? std::string("management group store unavailable")
+                                             : result.error(),
+                                 store_fault ? "retry shortly" : "",
+                                 /*retry_after_ms=*/info.retry_after_ms, {}, audit_ok),
                         "application/json");
-                    mcp_audit("failure", result.error());
+                    mcp_audit("failure", fault_detail);
                     return;
                 }
                 const bool audit_ok =
@@ -15245,29 +15347,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     // null) applies, the transient arm passes a concrete hint.
                     mcp_audit("failure", expression);
                     // #4981 fix-round finding: was a raw string comparison against
-                    // outcome.detail, which cannot warn if a future 6th
-                    // ScopeEvalError::Kind value lands unclassified. Routed
-                    // through the shared, exhaustive scope_abort_is_permanent()
-                    // classifier (scope_eval_error.hpp) instead — see that
-                    // function's doc comment for why OwnerCheckFailed never
-                    // actually reaches here (handled above).
-                    const bool permanent = outcome.abort_kind &&
-                                           yuzu::server::scope_abort_is_permanent(*outcome.abort_kind);
-                    if (permanent) {
-                        res.set_content(
-                            a4_error(kInternalError,
-                                     "scope evaluation unavailable: " + outcome.detail,
-                                     "this is a permanent condition and will NOT clear on "
-                                     "retry; escalate to an operator"),
-                            "application/json");
-                    } else {
-                        res.set_content(
-                            a4_error(kInternalError,
-                                     "scope evaluation unavailable: " + outcome.detail,
-                                     "retry once the server reports ready",
-                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                            "application/json");
-                    }
+                    // outcome.detail, which cannot warn if a further ScopeEvalError::Kind
+                    // value lands unclassified. Routed through scope_abort_advice, over the
+                    // shared, exhaustive scope_abort_is_permanent() classifier
+                    // (scope_eval_error.hpp), shared with the REST twin — see that function's
+                    // doc comment for why OwnerCheckFailed never actually reaches here
+                    // (handled above).
+                    // result_set_unusable names the caller's own set and why (REST twin).
+                    const std::string message =
+                        "scope evaluation unavailable: " + outcome.detail +
+                        (outcome.abort_detail.empty() ? "" : " (" + outcome.abort_detail + ")");
+                    // A pending set is transient (wait for it); a failed or incomplete one is not.
+                    const auto advice = yuzu::server::scope_abort_advice(
+                        outcome.abort_kind, mcp::kMcpStoreFaultRetryMs);
+                    const long retry_ms =
+                        static_cast<long>(advice.retry_after_ms.value_or(-1));
+                    res.set_content(
+                        a4_error(kInternalError, message, advice.remediation, retry_ms),
+                        "application/json");
                     return;
                 }
                 case yuzu::server::ScopePreviewOutcome::Kind::kOk:
@@ -15290,8 +15387,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // producers (matching REST exactly: the synchronous creators
             // below use `rs_load_owned` directly on a canonical id, no alias
             // resolution). Resolves a per-operator alias OR a canonical
-            // "rs_"-prefixed id to a canonical id this session owns.
-            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<std::string> {
+            // "rs_"-prefixed id to the materialized row this session owns.
+            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<ResultSet> {
                 std::string rs_id = raw;
                 if (!raw.starts_with("rs_")) {
                     auto canon = result_set_store_->resolve_alias(session->username, raw);
@@ -15311,7 +15408,42 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return std::nullopt;
-                return rs_id;
+                if (!parent_may_seed(*row)) {
+                    // A pending parent is transient (retry hint), a failed one is not.
+                    const auto advice = parent_not_ready_advice(*row);
+                    const long retry_ms =
+                        static_cast<long>(advice.retry_after_ms.value_or(-1));
+                    res.set_content(
+                        a4_error(kInvalidParams, parent_not_ready_message(*row),
+                                 advice.remediation, retry_ms),
+                        "application/json");
+                    return std::nullopt;
+                }
+                return row; // the caller snapshots its completeness (inherit_completeness)
+            };
+
+            // A NUL byte in a result-set producer input (name, parameters, parent_id) is
+            // refused as invalid params before anything is stored or dispatched. The refusal
+            // writes a denied `result_set.create` row whose detail is fixed (never the value).
+            const auto rs_has_nul = [](std::string_view rs_text) {
+                return rs_text.find('\0') != std::string_view::npos;
+            };
+            const auto rs_params_have_nul =
+                [&rs_has_nul](const std::unordered_map<std::string, std::string>& rs_map) {
+                    for (const auto& [rs_key, rs_val] : rs_map)
+                        if (rs_has_nul(rs_key) || rs_has_nul(rs_val))
+                            return true;
+                    return false;
+                };
+            auto rs_refuse_nul = [&](std::string_view rs_what, std::string_view rs_kind) {
+                (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                               "reason=field_contains_nul source_kind=" + audit_token(rs_kind));
+                // retry-hint-exempt: caller-input rejection (a NUL byte), not a transient fault.
+                res.set_content(
+                    error_response(id, kInvalidParams,
+                                   "RESULT_SET_BAD_REQUEST: " + std::string(rs_what) +
+                                       " must not contain a NUL byte"),
+                    "application/json");
             };
 
             // `rs_run_async`: MCP twin of rest_api_v1.cpp's `run_async` — the
@@ -15332,6 +15464,38 @@ McpServer::HandlerFn McpServer::build_handler(
                                     const std::string& matcher,
                                     const nlohmann::json& args_for_parent,
                                     const std::string& name) {
+                // A NUL byte in the name, a dispatched parameter (key or value) or the
+                // parent_id is refused before anything else runs: no wiring check, alias
+                // lookup, execution row or dispatch. The tool blocks check the caller's
+                // own arguments earlier; this also covers reevaluate_result_set, whose
+                // parameters come from a stored payload that can carry a NUL after JSON
+                // decoding.
+                if (rs_has_nul(name)) {
+                    rs_refuse_nul("name", src_kind);
+                    return;
+                }
+                if (args_for_parent.contains("parent_id") && args_for_parent["parent_id"].is_string() &&
+                    rs_has_nul(args_for_parent["parent_id"].get_ref<const std::string&>())) {
+                    rs_refuse_nul("parent_id", src_kind);
+                    return;
+                }
+                if (rs_params_have_nul(params)) {
+                    rs_refuse_nul("parameters", src_kind);
+                    return;
+                }
+                // A Forensics-tier plugin's stored responses are withheld from result-set
+                // membership, so a set built from one would fill empty while every agent counts
+                // as answered: refused before any execution row or dispatch (REST twin: run_async).
+                if (!plugin_may_seed_result_set(plugin, forensics_plugins_)) {
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   "reason=forensics_source source_kind=" + audit_token(src_kind));
+                    // retry-hint-exempt: caller-input rejection (an unsupported source), not a
+                    // transient fault.
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   std::string(kSourceNotSupportedMessage)),
+                                    "application/json");
+                    return;
+                }
                 if (!result_set_store_ || !execution_tracker) {
                     res.set_content(
                         a4_error(kInternalError,
@@ -15477,14 +15641,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 std::optional<std::string> parent_id;
+                std::optional<ResultSet> parent_row;
                 std::string scope_expr;
                 if (args_for_parent.contains("parent_id") && args_for_parent["parent_id"].is_string() &&
                     !args_for_parent["parent_id"].get<std::string>().empty()) {
-                    auto canon = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
-                    if (!canon)
+                    parent_row = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
+                    if (!parent_row)
                         return; // rs_resolve_owned_parent already wrote the error
-                    parent_id = *canon;
-                    scope_expr = "from_result_set:" + *canon;
+                    parent_id = parent_row->id;
+                    scope_expr = "from_result_set:" + parent_row->id;
                 }
 
                 // Create-before-dispatch (UP2-4): the execution_id must be
@@ -15646,6 +15811,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = name;
                 cr.parent_id = parent_id;
+                // Narrowed to the parent's members: the pending row carries the parent's
+                // completeness from birth (REST twin: run_async).
+                if (parent_row)
+                    inherit_completeness(cr, *parent_row);
                 cr.source_kind = std::string(src_kind);
                 cr.source_payload = source_payload;
                 cr.matcher = matcher;
@@ -15916,6 +16085,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         kResultSetNameMaxLen, kResultSetSourceKindMaxLen));
                     return;
                 }
+                if (rs_has_nul(cr.name)) {
+                    rs_refuse_nul("name", cr.source_kind);
+                    return;
+                }
+                if (rs_has_nul(cr.source_kind)) {
+                    rs_refuse_nul("source_kind", cr.source_kind);
+                    return;
+                }
+                if (pid && rs_has_nul(*pid)) {
+                    rs_refuse_nul("parent_id", cr.source_kind);
+                    return;
+                }
                 if (!result_set_store_) {
                     res.set_content(a4_error(kInternalError, "result-set store unavailable"),
                                     "application/json");
@@ -15928,6 +16109,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto parent = rs_load_owned(*pid);
                     if (!parent)
                         return; // rs_load_owned already wrote the error
+                    if (!parent_may_seed(*parent)) {
+                        // A pending parent is transient (retry hint), a failed one is not.
+                        const auto advice = parent_not_ready_advice(*parent);
+                        const long retry_ms =
+                            static_cast<long>(advice.retry_after_ms.value_or(-1));
+                        res.set_content(
+                            a4_error(kInvalidParams, parent_not_ready_message(*parent),
+                                     advice.remediation, retry_ms),
+                            "application/json");
+                        return;
+                    }
+                    // Lineage only: a directly created set's members are the caller's explicit
+                    // device_ids, not a narrowing of the parent's members, so it does not call
+                    // inherit_completeness (the inventory and async producers, whose members come
+                    // from the parent's, do).
                     cr.parent_id = *pid;
                     // #4306 follow-up: do NOT add the marker for a parent_id
                     // that failed ownership above -- that request is already
@@ -16256,6 +16452,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto parent = rs_load_owned(pid);
                     if (!parent)
                         return;
+                    if (!parent_may_seed(*parent)) {
+                        // A pending parent is transient (retry hint), a failed one is not.
+                        const auto advice = parent_not_ready_advice(*parent);
+                        const long retry_ms =
+                            static_cast<long>(advice.retry_after_ms.value_or(-1));
+                        res.set_content(
+                            a4_error(kInvalidParams, parent_not_ready_message(*parent),
+                                     advice.remediation, retry_ms),
+                            "application/json");
+                        return;
+                    }
+                    // The child is narrowed from this parent, so it is no more complete than
+                    // it (REST twin: from-inventory-query).
+                    inherit_completeness(cr, *parent);
                     cr.parent_id = pid;
                     args["scope_input_id"] = pid;
                     std::unordered_set<std::string> ms;
@@ -16461,6 +16671,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // The sql is the dispatched parameter: a NUL byte is refused here, before the
+                // execution row and the dispatch.
+                if (rs_has_nul(sql)) {
+                    rs_refuse_nul("parameters", source_kind::kEchoQuery);
+                    return;
+                }
                 // Roll-up is the only Echo store: a query over a raw capture table answers
                 // with no rows, so the set would silently be empty (REST twin refuses too).
                 if (yuzu::server::rs_matcher::references_raw_capture_table(sql)) {
@@ -16484,11 +16700,20 @@ McpServer::HandlerFn McpServer::build_handler(
                             std::format("name must be at most {} bytes", kResultSetNameMaxLen));
                         return;
                     }
+                    if (rs_has_nul(name_arg)) {
+                        rs_refuse_nul("name", source_kind::kEchoQuery);
+                        return;
+                    }
                     if (args.contains("parent_id") && args["parent_id"].is_string() &&
                         args["parent_id"].get_ref<const std::string&>().size() >
                             kResultSetParentIdMaxLen) {
                         reject_field_too_large(std::format(
                             "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
+                        return;
+                    }
+                    if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                        rs_has_nul(args["parent_id"].get_ref<const std::string&>())) {
+                        rs_refuse_nul("parent_id", source_kind::kEchoQuery);
                         return;
                     }
                 }
@@ -16548,11 +16773,20 @@ McpServer::HandlerFn McpServer::build_handler(
                             std::format("name must be at most {} bytes", kResultSetNameMaxLen));
                         return;
                     }
+                    if (rs_has_nul(name_arg)) {
+                        rs_refuse_nul("name", source_kind::kInstructionResult);
+                        return;
+                    }
                     if (args.contains("parent_id") && args["parent_id"].is_string() &&
                         args["parent_id"].get_ref<const std::string&>().size() >
                             kResultSetParentIdMaxLen) {
                         reject_field_too_large(std::format(
                             "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
+                        return;
+                    }
+                    if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                        rs_has_nul(args["parent_id"].get_ref<const std::string&>())) {
+                        rs_refuse_nul("parent_id", source_kind::kInstructionResult);
                         return;
                     }
                     if (args.contains("matcher") && args["matcher"].is_object()) {
@@ -16610,6 +16844,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             return;
                         }
                         for (const auto& [k, v] : p.items()) {
+                            if (rs_has_nul(k) ||
+                                (v.is_string() && rs_has_nul(v.get_ref<const std::string&>()))) {
+                                rs_refuse_nul("parameters", source_kind::kInstructionResult);
+                                return;
+                            }
                             if (k.size() > kExecInstrParamKeyMaxLen) {
                                 reject_field_too_large(std::format(
                                     "a params key exceeds {} bytes", kExecInstrParamKeyMaxLen));
@@ -27978,6 +28217,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string principal_id = "engine:" + slug;
+                // `role` is free text within the clean-text rule (no NUL, no C0
+                // control byte, no DEL): refuse anything else before the role
+                // lookup or the store sees it, so assign and unassign agree on
+                // which names are valid. The refusal is audited with a fixed
+                // detail; the raw value is never echoed.
+                if (!rbac_text_is_clean(role_name)) {
+                    (void)audit_fn(req, "engine_principal.role.assigned", "denied",
+                                   "EnginePrincipal", principal_id, "invalid_role_name");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid role format: role name must be valid text "
+                                       "without control characters"),
+                        "application/json");
+                    return;
+                }
 
                 // Target must name a live (non-revoked) engine principal —
                 // MissingOrRevoked/StoreUnreachable per the store's
@@ -28092,6 +28346,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const std::string principal_id = "engine:" + slug;
+                // `role` is free text within the clean-text rule (no NUL, no C0
+                // control byte, no DEL): refuse anything else before the role
+                // lookup or the store sees it, so assign and unassign agree on
+                // which names are valid. The refusal is audited with a fixed
+                // detail; the raw value is never echoed.
+                if (!rbac_text_is_clean(role_name)) {
+                    (void)audit_fn(req, "engine_principal.role.unassigned", "denied",
+                                   "EnginePrincipal", principal_id, "invalid_role_name");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid role format: role name must be valid text "
+                                       "without control characters"),
+                        "application/json");
+                    return;
+                }
                 // Idempotent DELETE (success even if the role was not held).
                 // With the store confirmed open, a !result is a runtime query
                 // failure, not a client error → kInternalError, not kInvalidParams.
@@ -28542,25 +28811,42 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // `role` is free text within the clean-text rule (see below): a value with a NUL
+                // or other control byte is refused as invalid params and the refusal is audited.
+                // An unknown but well-formed name stays an idempotent no-op.
+                if (!rbac_text_is_clean(role_name)) {
+                    (void)audit_fn(req, "rbac.role.unassigned", "denied", "User",
+                                   audit_token(principal_id), "invalid_role_name");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "invalid role format: role name must be valid text "
+                                       "without control characters"),
+                        "application/json");
+                    return;
+                }
+                const std::string role_id = [&] {
+                    auto stored = rbac_store->get_role(role_name);
+                    return stored ? stored->name : role_name;
+                }();
                 // Governance BLOCKING #2 (audit-log-injection, CWE-117):
-                // principal_id is charset-safe past is_valid_username above,
-                // but role_name is DELIBERATELY unrestricted here (schema:
-                // maxLength:64 only, no enum/charset — unlike
-                // assign_rbac_role's closed enum) so this tool can still
-                // clean up an out-of-band grant (a custom role, or
-                // ITServiceOwner, assigned by direct SQL — see this tool's
-                // own schema comment). That means role_name can reach a
-                // SUCCESSFUL Administrator-revoke audit row completely raw
-                // unless neutralized here. Matches this file's established
+                // principal_id is charset-safe past is_valid_username above.
+                // role_name is free text within the clean-text rule (no NUL,
+                // no C0 control byte, no DEL: rbac_text_is_clean above; schema:
+                // maxLength:64, no enum/charset, unlike assign_rbac_role's
+                // closed enum) so this tool can still clean up an out-of-band
+                // grant (a custom role, or ITServiceOwner, assigned by direct
+                // SQL; see this tool's own schema comment). The value is
+                // still neutralised with `audit_token` before it reaches an
+                // audit row. Matches this file's established
                 // `audit_token`/`log_token` convention (web_utils.hpp).
                 const std::string audit_target_id = audit_token(principal_id);
-                const std::string audit_role = audit_token(role_name);
+                const std::string audit_role = audit_token(role_id);
 
                 // Self-target guard (#397/#403 — third call site; shared via
                 // rbac_admin_predicate.hpp's is_self_target). Scoped to
                 // role_name=="Administrator" ONLY — see the REST route's own
                 // comment for why.
-                if (role_name == "Administrator" && is_self_target(*session, principal_id)) {
+                if (role_id == "Administrator" && is_self_target(*session, principal_id)) {
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
                                    "self_admin_unassign_blocked");
                     res.set_content(
@@ -28576,7 +28862,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // zero administrators (a business-rule conflict, not a store
                 // fault) — is_rbac_last_admin_refusal distinguishes them so
                 // only the genuine fault carries a retry hint.
-                auto result = rbac_store->unassign_role("user", principal_id, role_name);
+                auto result = rbac_store->unassign_role("user", principal_id, role_id);
                 if (!result) {
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
                                    result.error());
@@ -28621,7 +28907,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 nlohmann::json payload = {
-                    {"unassigned", true}, {"principal_id", principal_id}, {"role", role_name}};
+                    {"unassigned", true}, {"principal_id", principal_id}, {"role", role_id}};
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
@@ -30464,21 +30750,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Same multi-store (rbac_store + mgmt_store) authority check as
                     // the REST route: fleet-wide ManagementGroup:Write OR the caller
                     // already holding ITServiceOwner on the 'Service: <scope_service>'
-                    // management group (skipped for a service-scoped MCP token).
+                    // management group (the owner arm skips a service-scoped or
+                    // engine-classed session: mgmt_group_owner_gate.hpp).
                     httplib::Response probe; // throwaway: the fleet-wide arm, never sent
                     bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-                    if (!authorized && mgmt_store && session->token_scope_service.empty()) {
+                    if (!authorized && mgmt_store) {
                         auto svc_group = mgmt_store->find_group_by_name("Service: " + scope_service);
-                        if (svc_group) {
-                            for (const auto& gr : mgmt_store->get_group_roles(svc_group->id)) {
-                                if (gr.principal_type == "user" &&
-                                    gr.principal_id == session->username &&
-                                    gr.role_name == "ITServiceOwner") {
-                                    authorized = true;
-                                    break;
-                                }
-                            }
-                        }
+                        if (svc_group)
+                            authorized = group_owner_admits(*mgmt_store, svc_group->id, *session,
+                                                            RbacAdminSurface::kMcp);
                     }
                     if (!authorized) {
                         mcp_audit("denied", "ITServiceOwner authority required");

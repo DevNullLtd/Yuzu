@@ -25,9 +25,10 @@
  * no name. It never reaches the status row.
  *
  * WHAT CONSTRAINS THE ANSWER, token by token. Only an ACCESS or WALK fault constrains (a status
- * token, `constrained`, and the collector then withholds the source); a DATA-SHAPE fault in one
- * stanza beside valid ones is logged and the valid siblings are kept. Failure never reads as
- * absent: nothing below turns an unreadable read into an empty `supported`.
+ * token, `constrained`, and the collector then sends a status-only section for the source); a
+ * DATA-SHAPE fault in one stanza beside valid ones is logged and the valid siblings are kept.
+ * Failure never reads as absent: nothing below turns an unreadable read into an empty
+ * `supported`.
  *
  *   enumerator file absent                              supported, zero rows (none found)
  *   denied / oversized / symlink / network / refused /

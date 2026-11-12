@@ -1026,7 +1026,7 @@ TEST_CASE("render_echo_capture_sources: cards; hourly names; staged toggles; dev
     CHECK(card(html, "dns").find("Hourly</span></dd>") != std::string::npos); // hourly only
 }
 
-TEST_CASE("render_echo_capture_sources: the row count reads <src>_rows and never relabels <src>_live_rows",
+TEST_CASE("render_echo_capture_sources: the row count reads <src>_rows only",
           "[echo][capture-sources]") {
     const auto rows_of = [](const std::string& status) {
         const std::string c = card(render_echo_capture_sources("d", status), "process");
@@ -1034,39 +1034,25 @@ TEST_CASE("render_echo_capture_sources: the row count reads <src>_rows and never
         REQUIRE(b != std::string::npos);
         return c.substr(b, c.find("</dd>", b) - b);
     };
-    const std::string upgrade = "This device runs an agent without the roll-up tables; upgrade the agent";
-    const auto note_count = [&](const std::string& status) {
-        return count_occurrences(render_echo_capture_sources("d", status), upgrade);
-    };
-    // `_rows` alone: shown, no note.
+    // `_rows`: shown.
     CHECK(rows_of("config|process_enabled|true\nconfig|process_rows|111\n").find(">111<") !=
           std::string::npos);
-    CHECK(note_count("config|process_enabled|true\nconfig|process_rows|111\n") == 0);
-    // `_live_rows` alone (an agent without the roll-up tables): the raw count is NOT shown as an
-    // hourly row count; a dash, and ONE note above the cards.
-    const auto alias = rows_of("config|process_enabled|true\nconfig|process_live_rows|222\n");
-    CHECK(alias.find("222") == std::string::npos);
-    CHECK(alias.find("&mdash;") != std::string::npos);
-    CHECK(note_count("config|process_enabled|true\nconfig|process_live_rows|222\n") == 1);
+    // The retired `_live_rows` spelling is not read: unknown is a dash, never its figure, and no
+    // note about the agent is added.
+    const auto retired = rows_of("config|process_enabled|true\nconfig|process_live_rows|222\n");
+    CHECK(retired.find("222") == std::string::npos);
+    CHECK(retired.find("&mdash;") != std::string::npos);
     const std::string html = render_echo_capture_sources(
         "d", "config|process_enabled|true\nconfig|process_live_rows|222\n");
-    CHECK(html.find(upgrade) < html.find("id=\"capCards\"")); // above the cards
-    // Several sources on the same old agent: still one note.
-    CHECK(note_count("config|process_enabled|true\nconfig|process_live_rows|1\n"
-                     "config|tcp_enabled|true\nconfig|tcp_live_rows|2\n") == 1);
-    // Both keys for one source: `_rows` wins and there is nothing to say.
+    CHECK(html.find("without the roll-up tables") == std::string::npos);
+    // Both keys for one source: `_rows` is the count.
     const auto both = rows_of("config|process_enabled|true\nconfig|process_live_rows|222\nconfig|process_rows|111\n");
     CHECK(both.find(">111<") != std::string::npos);
     CHECK(both.find("222") == std::string::npos);
-    CHECK(note_count("config|process_enabled|true\nconfig|process_live_rows|222\nconfig|process_rows|111\n") == 0);
-    // One source answers both while another answers only the alias: the note is for the second.
-    CHECK(note_count("config|process_enabled|true\nconfig|process_rows|111\n"
-                     "config|tcp_enabled|true\nconfig|tcp_live_rows|2\n") == 1);
-    // Neither: unknown is a dash, not a false zero, and not an upgrade claim.
+    // Neither: unknown is a dash, not a false zero.
     const auto none = rows_of("config|process_enabled|true\n");
     CHECK(none.find("&mdash;") != std::string::npos);
     CHECK(none.find(">0<") == std::string::npos);
-    CHECK(note_count("config|process_enabled|true\n") == 0);
     // The old wording is gone.
     CHECK(html.find("live data") == std::string::npos);
 }
@@ -1165,7 +1151,7 @@ TEST_CASE("Echo renderers add no personal-data or privacy or usage-class wording
             "d", "config|process_enabled|true\nconfig|dns_enabled|true\nconfig|arp_enabled|true\n"
                  "config|registry_enabled|true\nconfig|service_enabled|false\n") +
         // the failure, cut, unreadable and old-agent wording added for honest reads
-        render_echo_capture_sources("d", "config|process_enabled|true\nconfig|process_live_rows|1\n") +
+        render_echo_capture_sources("d", "config|process_enabled|true\nconfig|process_rows|1\n") +
         render_echo_read_notes(EchoReadNotes{.unreadable = 2, .cut = true}) +
         render_echo_read_notes(EchoReadNotes{.unreadable = 1, .cut = true}, "Connection results",
                                "connection rows") +

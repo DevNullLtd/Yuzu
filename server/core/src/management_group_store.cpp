@@ -186,6 +186,18 @@ constexpr const char* kGroupCols =
     "id, name, description, parent_id, membership_type, scope_expression, "
     "created_by, created_at, updated_at";
 
+
+/// True when the failed statement broke the UNIQUE constraint on the group name (SQLSTATE 23505
+/// naming `management_groups_name_key`, the name Postgres gives `name TEXT NOT NULL UNIQUE`).
+/// That is the caller's conflict, not a store fault. A hit on any other constraint (the generated
+/// id, say) is not matched: retrying mints a new id, so it stays a store fault.
+bool is_group_name_conflict(const PGresult* r) {
+    const char* state = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+    const char* constraint = PQresultErrorField(r, PG_DIAG_CONSTRAINT_NAME);
+    return state != nullptr && constraint != nullptr && std::string_view(state) == "23505" &&
+           std::string_view(constraint) == "management_groups_name_key";
+}
+
 } // namespace
 
 // ── Construction / teardown ──────────────────────────────────────────────────
@@ -273,9 +285,12 @@ ManagementGroupStore::create_group(const ManagementGroup& group) {
         "created_by, created_at, updated_at) "
         "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::bigint, $9::bigint) RETURNING id",
         params);
-    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
+        if (is_group_name_conflict(r.get()))
+            return std::unexpected("a group with that name already exists");
         return std::unexpected(std::string("failed to create group: ") +
                                PQerrorMessage(lease.get()));
+    }
     return text_col(r.get(), 0, 0);
 }
 
@@ -435,8 +450,11 @@ std::expected<void, std::string> ManagementGroupStore::update_group(const Manage
         "parent_id = $3, membership_type = $4, scope_expression = $5, updated_at = $6::bigint "
         "WHERE id = $7",
         params);
-    if (r.status() != PGRES_COMMAND_OK)
+    if (r.status() != PGRES_COMMAND_OK) {
+        if (is_group_name_conflict(r.get()))
+            return std::unexpected("a group with that name already exists");
         return std::unexpected(std::string("update failed: ") + PQerrorMessage(lease.get()));
+    }
     if (std::string_view(PQcmdTuples(r.get())) == "0")
         return std::unexpected("group not found");
     return {};

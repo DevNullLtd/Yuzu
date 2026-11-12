@@ -30,13 +30,21 @@
 /// the process-wide offline-hive lock and the default-on hive-file guard). It therefore mirrors
 /// `installed_apps.list_per_user`: `Inventory`:Read, default-on, `ExecuteGate::AdminOrApproval`,
 /// no Forensics securable and no kill-switch seed. Linux and macOS answer one `unsupported` row.
+///
+/// `runtime_posture` is ReadOnly/None and Linux-only (macOS and Windows answer one `unsupported`
+/// row). It stats the container runtimes' default sockets and config files and, ONLY when the
+/// operator has set `--container-runtime-endpoint`, sends four fixed GET requests over that one
+/// unix socket (docs/virtualization-runtime-posture-design.md). It reports container posture
+/// (names, images, privileged, network mode, host-socket-mounted), which is security posture rather
+/// than estate inventory, so it is `Security`:Read like `system_hardening` and `app_control` (owner
+/// decision 2026-11-08), ExecuteGate::None, no Forensics securable and no kill-switch seed.
 /// The enforced control is this gate; the definition's `executeRoles` are advisory and follow the
 /// `host` document (`content/definitions/virtualization.yaml`), not `list_per_user`'s narrower list.
 namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueVirtualization{{
+inline constexpr std::array<CommandCapability, 3> kPluginActionCatalogueVirtualization{{
     {
         .plugin = "virtualization",
         .action = "host",
@@ -58,6 +66,17 @@ inline constexpr std::array<CommandCapability, 2> kPluginActionCatalogueVirtuali
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
         .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "virtualization",
+        .action = "runtime_posture",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Security",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 }};
 

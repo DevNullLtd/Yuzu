@@ -126,6 +126,22 @@ inline constexpr const char* kFacetDropBatchFailed = "batch_failed";
 /// server exports the series. Called once at startup from `ServerImpl`.
 void seed_response_facet_metrics(yuzu::MetricsRegistry& m);
 
+/// What `ResponseStore::store` did with a frame. A refusal of a TERMINAL frame by the per-pair cap
+/// is separate from a refusal of a non-terminal one: the first leaves the pair's terminal answer
+/// durable (the cap admits only while no terminal row exists), the second drops a frame whose
+/// output may carry membership.
+enum class StoreOutcome {
+    Stored,         ///< the frame is persisted
+    CappedTerminal, ///< a terminal frame the cap refused: the pair already holds a terminal row
+    CappedRunning,  ///< a non-terminal frame the cap refused: its output is not stored
+    Failed          ///< not persisted (store closed, a NUL in an identity field, or the transaction)
+};
+
+/// True when nothing the frame carried is lost: it is stored, or it is a refused terminal frame.
+[[nodiscard]] constexpr bool store_outcome_durable(StoreOutcome o) noexcept {
+    return o == StoreOutcome::Stored || o == StoreOutcome::CappedTerminal;
+}
+
 struct StoredResponse {
     int64_t id{0};
     std::string instruction_id;
@@ -318,7 +334,9 @@ public:
     /// the pair's newest retained row (the one before the gap) so a reader can tell the tail
     /// was dropped.
     /// Exact semantics: response_cap_rules.hpp.
-    void store(const StoredResponse& resp);
+    /// Returns the outcome (see `StoreOutcome`; `store_outcome_durable` is the one-bit view the
+    /// ingest sites record as a lost answer). Callers that do not need it may ignore it.
+    StoreOutcome store(const StoredResponse& resp);
 
     /// Tri-state outcome of `finalize_terminal_status` so callers can
     /// distinguish "we updated rows in place" from "no matching RUNNING

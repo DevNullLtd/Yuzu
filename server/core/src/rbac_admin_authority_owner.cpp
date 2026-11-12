@@ -5,6 +5,7 @@
 #include "auth_db_sql_helpers.hpp" // kActiveLocalAdminPredicate: ONE copy of the column floor's population
 #include "pg/pg_raii.hpp"
 #include "rbac_store_sql_helpers.hpp"
+#include "rbac_text.hpp"
 
 #include <yuzu/server/auth_db.hpp> // is_valid_username — provision_first_admin's own
                                     // pre-INSERT guard (rbac_admin_predicate.hpp already
@@ -249,6 +250,13 @@ RbacAdminAuthorityOwner::UnassignOutcome
 RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
                                        const std::string& principal_id,
                                        const std::string& role_name) const {
+    // A value that is not clean text is refused up front.
+    if (!rbac_text_is_clean(role_name) || !rbac_text_is_clean(principal_type) ||
+        !rbac_text_is_clean(principal_id)) {
+        UnassignOutcome refused;
+        refused.err = rbac_text_is_clean(role_name) ? "invalid principal" : "invalid role name";
+        return refused;
+    }
     std::optional<std::uint64_t> new_gen;
     bool last_admin_reject = false;
     bool removed = false;

@@ -64,6 +64,7 @@
 #include "openapi_spec_access.hpp" // openapi_spec_json()
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "result_set_members.hpp" // kSourceNotSupportedMessage (Forensics-tier source refusal)
 #include "rest_api_v1.hpp"      // M.9 PR-2b: cross-transport cursor walk (REST + MCP)
 #include "test_forensics_tier_fixture.hpp" // #4990: the Forensics tier fixture
 #include "test_route_sink.hpp"  // M.9 PR-2b: in-process sink for that REST half
@@ -17954,6 +17955,73 @@ TEST_CASE("MCP preview_scope_targets: an unwired ResultSetStore* (unresolvable) 
     CHECK(body["error"]["data"]["retry_after_ms"].is_null());
 }
 
+// A referenced set the caller owns but cannot use as scope (REST twin in
+// test_rest_scope_v1_routes.cpp): a pending one is transient (retry hint), a failed one is
+// permanent (retry_after_ms null, remediation to re-run the producer). The message names the
+// cause and the set.
+TEST_CASE("MCP preview_scope_targets: result_set_unusable carries an honest retry hint",
+          "[pg][mcp][integration][result_set_unusable]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_scope_rs_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user"; // matches the fixture's default mock_username
+    cr.source_kind = std::string(source_kind::kEchoQuery);
+    cr.source_payload = R"({"sql":"SELECT 1"})";
+    auto set = store.create_pending(cr, "exec-unusable");
+    REQUIRE(set.has_value());
+
+    yuzu::server::detail::EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::AgentRegistry registry(bus, metrics);
+    register_scope_preview_mock_fleet(registry);
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = &store;
+    ts.scope_evaluate_fn_for_test = [&](const yuzu::scope::Expression& expr,
+                                        const std::string& principal) {
+        return registry.evaluate_scope(expr, nullptr, nullptr, &store, principal);
+    };
+    ts.start();
+
+    const auto preview = [&ts, &set] {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":28,)"
+            R"("params":{"name":"preview_scope_targets","arguments":)"
+            R"({"expression":"from_result_set:)" +
+            set->id + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        REQUIRE(body["error"].contains("data"));
+        REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+        return body;
+    };
+
+    SECTION("a pending set is transient") {
+        const auto body = preview();
+        const auto msg = body["error"]["message"].get<std::string>();
+        CHECK(msg.find("result_set_unusable") != std::string::npos);
+        CHECK(msg.find("cause=pending result_set=" + set->id) != std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(body["error"]["data"].value("remediation", "") ==
+              "wait until the set is materialized, then retry");
+    }
+    SECTION("a failed set is permanent") {
+        store.mark_failed(set->id, "bound exceeded");
+        const auto body = preview();
+        CHECK(body["error"]["message"].get<std::string>().find("cause=failed result_set=" +
+                                                                set->id) != std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(body["error"]["data"].value("remediation", "") ==
+              "re-run the producer that created the set, then use the new set");
+    }
+}
+
 // ── 22. Multiple sequential requests on same server ─────────────────────────
 
 TEST_CASE("MCP Integration: multiple requests on same server", "[mcp][integration]") {
@@ -19085,7 +19153,7 @@ TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds
         INFO("tool=" << tool);
         const auto& props = schemas.at(tool).at("properties");
         CHECK(props.at("kind").at("enum") ==
-              nlohmann::json::array({"package", "app", "pkg", "feat"}));
+              nlohmann::json::array({"package", "app", "pkg", "feat", "driver"}));
         const auto served = props.at("ecosystem").at("enum").get<std::set<std::string>>();
         CHECK(served == ecosystems);
     }
@@ -26727,6 +26795,47 @@ TEST_CASE("MCP query_installed_software: a wide-scope cursor never names an out-
     CHECK_FALSE(unflagged.contains("audit_persisted"));
 }
 
+TEST_CASE("MCP query_installed_software: a cursor whose skip passes the wide-scope ceiling is "
+          "invalid params; the ceiling itself is served",
+          "[mcp][pg][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<yuzu::server::SoftwareEntry> rows = {{"A", "1.0", "", ""}};
+    REQUIRE(store.apply_installed_software(
+                "agent-1", yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+            yuzu::server::InventoryIngestOutcome::kStored);
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+
+    namespace swc = yuzu::server::software_catalogue;
+    // A well-formed cursor for the unfiltered query whose only defect is its skip.
+    const auto with_skip = [&](std::int64_t skip) {
+        const auto token = swc::encode_devices_cursor(
+            {yuzu::server::SoftwareCursor{}, skip},
+            swc::devices_fingerprint(yuzu::server::SoftwareFleetQuery{}));
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                           R"("params":{"name":"query_installed_software","arguments":)"
+                           R"({"limit":1,"cursor":")" +
+                           token + R"("}}})");
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body);
+    };
+
+    const auto past = with_skip(swc::kWideScopeMaxSkip + 1);
+    REQUIRE(past.contains("error"));
+    CHECK(past["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(past["error"]["message"].get<std::string>() ==
+          swc::cursor_error_message(swc::CursorError::kScanLimit));
+
+    // Honest paging is untouched: a skip AT the ceiling is still served.
+    const auto at = with_skip(swc::kWideScopeMaxSkip);
+    CHECK_FALSE(at.contains("error"));
+}
+
 TEST_CASE("MCP query_installed_software: an explicit out-of-scope agent_id is audited as one denied "
           "row",
           "[mcp][pg][inventory][security]") {
@@ -29237,6 +29346,107 @@ TEST_CASE("MCP list_management_group_roles: neither UserManagement:Read nor "
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["message"] == "forbidden");
+}
+
+// One owner-arm predicate (mgmt_group_owner_gate.hpp), MCP surface: the tier is left to the tool
+// ladder (every /mcp/v1/ session has one), a service-scoped or engine-classed session never
+// reaches the ITServiceOwner-of-this-group arm. The engine cases are harness-only: a real engine
+// token is also stopped by the tier ladder and the engine belt before it gets here.
+TEST_CASE("MCP management-group roles tools: the owner arm refuses an engine-classed session "
+          "and still admits a human session at the same tier",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Owner Arm Engine Group";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    yuzu::server::GroupRoleAssignment owner_grant;
+    owner_grant.group_id = *created;
+    owner_grant.principal_type = "user";
+    owner_grant.principal_id = "test-user";
+    owner_grant.role_name = "ITServiceOwner";
+    REQUIRE(store.assign_role(owner_grant).has_value());
+    // assign_management_group_role needs a non-null rbac_store and never dereferences it on this
+    // path (see the happy-path case below).
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    const std::string list_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":13,)"
+        R"("params":{"name":"list_management_group_roles","arguments":{"group_id":")" +
+        *created + R"("}}})";
+    const std::string assign_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":14,)"
+        R"("params":{"name":"assign_management_group_role",)"
+        R"("arguments":{"group_id":")" +
+        *created + R"(","principal_id":"alice","role_name":"Operator"}}})";
+
+    SECTION("list: readonly-tier engine session holding ITServiceOwner is refused") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &store;
+        ts.mock_principal_kind = "engine";
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !(securable == "UserManagement" && op == "Read");
+        };
+        ts.start("readonly");
+        auto res = ts.call(list_call);
+        REQUIRE(res);
+        // The owner arm's own refusal: a JSON-RPC permission error in a 200 response.
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(body["error"]["message"] == "forbidden");
+    }
+
+    SECTION("assign: engine session holding ITServiceOwner is refused, nothing written") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &store;
+        ts.rbac_store_for_test = &closed_rbac;
+        ts.mock_principal_kind = "engine";
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !(securable == "ManagementGroup" && op == "Write");
+        };
+        ts.start();
+        auto res = ts.call(assign_call);
+        REQUIRE(res);
+        // The owner arm's own refusal: a JSON-RPC permission error in a 200 response.
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(body["error"]["message"] == "forbidden");
+        CHECK(store.get_group_roles(*created).size() == 1); // only the owner row
+    }
+
+    SECTION("a human owner is still admitted on both tools") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &store;
+        ts.rbac_store_for_test = &closed_rbac;
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !((securable == "UserManagement" && op == "Read") ||
+                     (securable == "ManagementGroup" && op == "Write"));
+        };
+        ts.start();
+        auto listed = ts.call(list_call);
+        REQUIRE(listed);
+        REQUIRE(listed->status == 200);
+        auto listed_body = nlohmann::json::parse(listed->body);
+        CHECK(listed_body.contains("result"));
+        auto assigned = ts.call(assign_call);
+        REQUIRE(assigned);
+        REQUIRE(assigned->status == 200);
+        auto assigned_body = nlohmann::json::parse(assigned->body);
+        CHECK(assigned_body.contains("result"));
+        CHECK(store.get_group_roles(*created).size() == 2);
+    }
 }
 
 TEST_CASE("MCP assign_management_group_role: happy path grants Operator, idempotent",
@@ -38713,7 +38923,7 @@ TEST_CASE("MCP create_result_set: a malformed or empty parent_id is refused with
 // Roll-up only: a result set reports the failure signal, and a set stored over a raw capture table
 // is refused rather than re-run to an empty membership. The nine row schemas share one macro, so one
 // tool pins the fields.
-TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed and partial as required",
+TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed and agents_unanswered and partial as required",
           "[mcp][integration][result-sets][agents_failed]") {
     McpTestServer ts;
     ts.start();
@@ -38726,8 +38936,10 @@ TEST_CASE("MCP result-sets: the get_result_set output schema lists agents_failed
             schema = &t["outputSchema"];
     REQUIRE(schema != nullptr);
     CHECK((*schema)["properties"]["agents_failed"]["type"] == "integer");
+    CHECK((*schema)["properties"]["agents_unanswered"]["type"] == "integer");
     CHECK((*schema)["properties"]["partial"]["type"] == "boolean");
     const auto& req = (*schema)["required"];
+    CHECK(std::find(req.begin(), req.end(), "agents_unanswered") != req.end());
     CHECK(std::find(req.begin(), req.end(), "agents_failed") != req.end());
     CHECK(std::find(req.begin(), req.end(), "partial") != req.end());
 }
@@ -41221,6 +41433,66 @@ TEST_CASE("MCP create_result_set_from_instruction_result: a column matcher is bo
         CHECK(body["error"]["code"] == kInvalidParams);
     }
     CHECK(dispatches == before);
+}
+
+TEST_CASE("MCP create_result_set_from_instruction_result: a Forensics-tier plugin is refused "
+          "before any execution row or dispatch and an ordinary plugin proceeds",
+          "[pg][mcp][integration][result-sets]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    const auto make_def = [&](const char* plugin) {
+        yuzu::server::InstructionDefinition def;
+        def.name = std::string("source ") + plugin;
+        def.version = "1.0";
+        def.plugin = plugin;
+        def.action = "list";
+        def.type = "question";
+        def.description = "test";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        return *created;
+    };
+    const std::string forensics_id = make_def(yuzu::server::test::kForensicsPlugin);
+    const std::string ordinary_id = make_def(yuzu::server::test::kOrdinaryPlugin);
+    int dispatches = 0;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatches;
+        return {.sent = 1, .command_id = "cmd-src-" + std::to_string(dispatches)};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const auto call = [&](const std::string& instruction_id) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":")" +
+            instruction_id + R"("}}})");
+        REQUIRE(res);
+        return nlohmann::json::parse(res->body);
+    };
+    const auto executions = [&] { return tracker_bundle.get()->query_executions({}).size(); };
+
+    auto body = call(forensics_id);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find(
+              std::string(yuzu::server::kSourceNotSupportedMessage)) != std::string::npos);
+    CHECK(dispatches == 0);   // nothing was sent
+    CHECK(executions() == 0); // and no execution row was created
+
+    body = call(ordinary_id);
+    REQUIRE_FALSE(body.contains("error"));
+    CHECK(dispatches == 1);
 }
 
 TEST_CASE("MCP result-sets: the 3 async producers derive the caller's confined exec_visible "
@@ -45369,6 +45641,9 @@ TEST_CASE("MCP runtime config: the administrator-only keys are refused with a de
     auto owned = set_runtime_config_call(ts, "dex_score_policy", "{}");
     REQUIRE(owned.contains("error"));
     CHECK(owned["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // The refusal points an MCP caller at the MCP tool, not only at the REST route.
+    CHECK(owned["error"]["message"].get<std::string>().find("set_dex_score_policy") !=
+          std::string::npos);
     for (const auto& entry : ts.audit_log)
         CHECK_FALSE(entry.starts_with("config.update"));
 }
@@ -51987,4 +52262,1017 @@ TEST_CASE("MCP Guardian: tool descriptions carry the never-render-clean rule and
             CHECK(desc.find("reads all-zero here") != std::string::npos);
     }
     CHECK(seen == 3);
+}
+
+// A name with an embedded NUL is refused as invalid params BEFORE any dispatch, on the two async
+// producers and the direct create. The dispatch mock counts sends: nothing may run on an agent and
+// then be reported as failed because the result-set row could not be written.
+TEST_CASE("MCP result-sets: a name with an embedded NUL is rejected before any dispatch",
+          "[pg][mcp][integration][result-sets][validation]") {
+    McpTestServer ts;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-nul-1"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const std::string nul_name = R"("name":"a\u0000b")";
+
+    SECTION("control: a clean name reaches the dispatch mock, so a zero count below is not "
+            "vacuous") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT 1","name":"clean-name"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        CHECK_FALSE(body.contains("error"));
+        CHECK(sends == 1);
+    }
+
+    SECTION("create_result_set_from_echo_query") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT 1",)" +
+            nul_name + R"(}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        INFO("dispatches recorded: " << sends);
+        CHECK(sends == 0);
+    }
+
+    SECTION("create_result_set_from_instruction_result") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"x",)" +
+            nul_name + R"(}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        INFO("dispatches recorded: " << sends);
+        CHECK(sends == 0);
+    }
+
+}
+
+// The direct create is Infrastructure:Write, which the operator tier does not allow; it is exercised
+// at the supervised tier, as the sibling oversized-name test is. Same rule: refused as invalid
+// params, and nothing is dispatched.
+TEST_CASE("MCP result-sets: create_result_set refuses a name with an embedded NUL as invalid params",
+          "[pg][mcp][integration][result-sets][validation]") {
+    McpTestServer ts;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-nul-2"};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"create_result_set","arguments":{"name":"a\u0000b"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(sends == 0);
+}
+
+namespace {
+
+/// A tools/call body whose arguments are built as JSON, so a NUL byte inside a string value is
+/// carried as the \u0000 escape and reaches the handler as a real NUL after parsing.
+std::string rs_tool_call_body(const std::string& tool, const nlohmann::json& arguments, int id = 1) {
+    return nlohmann::json{{"jsonrpc", "2.0"},
+                          {"id", id},
+                          {"method", "tools/call"},
+                          {"params", {{"name", tool}, {"arguments", arguments}}}}
+        .dump();
+}
+
+} // namespace
+
+// A NUL byte in the dispatched parameters (the echo `sql`, an instruction parameter key or
+// value) or in `parent_id` is refused as invalid params before the execution row and before any
+// dispatch, and each refusal writes one denied `result_set.create` row with a fixed detail.
+TEST_CASE("MCP result-sets: a NUL in sql, an instruction parameter or parent_id is refused "
+          "before any dispatch and audited as denied",
+          "[pg][mcp][integration][result-sets][validation]") {
+    McpTestServer ts;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-nul-3"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const std::string with_nul("a\0b", 3);
+
+    // Runs one call that must be refused: invalid params naming the field, nothing dispatched,
+    // exactly one denied row with the fixed detail, and no success row.
+    auto expect_refused = [&](const std::string& tool, const nlohmann::json& arguments,
+                              const std::string& field, const std::string& kind) {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body(tool, arguments));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: " + field + " must not contain a NUL byte");
+        INFO("dispatches recorded: " << sends);
+        CHECK(sends == 0);
+        const auto denied = wf_rows_since(ts, before, "result_set.create|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == "reason=field_contains_nul source_kind=" + kind);
+        CHECK(wf_rows_since(ts, before, "result_set.create|success").empty());
+    };
+
+    SECTION("control: a clean echo query reaches the dispatch mock, so a zero count below is "
+            "not vacuous") {
+        auto res = ts.call(rs_tool_call_body("create_result_set_from_echo_query",
+                                             {{"sql", "SELECT 1"}, {"name", "clean-name"}}));
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(sends == 1);
+    }
+
+    SECTION("create_result_set_from_echo_query: NUL in sql") {
+        expect_refused("create_result_set_from_echo_query", {{"sql", "SELECT 1" + with_nul}},
+                       "parameters", "echo_query");
+    }
+
+    SECTION("create_result_set_from_echo_query: NUL in parent_id") {
+        expect_refused("create_result_set_from_echo_query",
+                       {{"sql", "SELECT 1"}, {"parent_id", "rs_" + with_nul}}, "parent_id",
+                       "echo_query");
+    }
+
+    SECTION("create_result_set_from_echo_query: NUL in name writes the denied row too") {
+        expect_refused("create_result_set_from_echo_query",
+                       {{"sql", "SELECT 1"}, {"name", with_nul}}, "name", "echo_query");
+    }
+
+    SECTION("create_result_set_from_instruction_result: NUL in a parameter value") {
+        expect_refused("create_result_set_from_instruction_result",
+                       {{"instruction_id", "x"}, {"params", {{"k", with_nul}}}}, "parameters",
+                       "instruction_result");
+    }
+
+    SECTION("create_result_set_from_instruction_result: NUL in a parameter key") {
+        expect_refused("create_result_set_from_instruction_result",
+                       {{"instruction_id", "x"}, {"params", {{"k" + with_nul, "v"}}}},
+                       "parameters", "instruction_result");
+    }
+
+    SECTION("create_result_set_from_instruction_result: NUL in parent_id") {
+        expect_refused("create_result_set_from_instruction_result",
+                       {{"instruction_id", "x"}, {"parent_id", "rs_" + with_nul}}, "parent_id",
+                       "instruction_result");
+    }
+
+    SECTION("create_result_set_from_instruction_result: NUL in name writes the denied row too") {
+        expect_refused("create_result_set_from_instruction_result",
+                       {{"instruction_id", "x"}, {"name", with_nul}}, "name",
+                       "instruction_result");
+    }
+}
+
+// The direct create is Infrastructure:Write (supervised tier, as the sibling NUL-name test).
+// A NUL in `name` or `parent_id` is refused as invalid params and audited as denied with the
+// caller's source_kind; no row is stored.
+TEST_CASE("MCP result-sets: create_result_set audits a NUL name, source_kind or parent_id as denied",
+          "[pg][mcp][integration][result-sets][validation]") {
+    McpTestServer ts;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(
+        [](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 1, .command_id = "cmd-nul-4"};
+        },
+        "supervised");
+
+    const std::string with_nul("a\0b", 3);
+
+    auto expect_refused = [&](const nlohmann::json& arguments, const std::string& field) {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("create_result_set", arguments));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: " + field + " must not contain a NUL byte");
+        const auto denied = wf_rows_since(ts, before, "result_set.create|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == "reason=field_contains_nul source_kind=manual_curate");
+        CHECK(wf_rows_since(ts, before, "result_set.create|success").empty());
+    };
+
+    SECTION("NUL in name") {
+        expect_refused({{"name", with_nul}}, "name");
+    }
+
+    SECTION("NUL in parent_id") {
+        expect_refused({{"name", "ok"}, {"parent_id", "rs_" + with_nul}}, "parent_id");
+    }
+
+    SECTION("NUL in source_kind") {
+        const auto before = ts.audit_log.size();
+        const std::string kind_with_nul("echo\0query", 10);
+        auto res = ts.call(rs_tool_call_body("create_result_set",
+                                             {{"name", "ok"}, {"source_kind", kind_with_nul}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: source_kind must not contain a NUL byte");
+        // The audit detail carries the neutralised kind, never the raw byte.
+        const auto denied = wf_rows_since(ts, before, "result_set.create|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == "reason=field_contains_nul source_kind=echo_query");
+        CHECK(wf_rows_since(ts, before, "result_set.create|success").empty());
+    }
+}
+
+// Re-evaluation reads the stored source payload; a NUL that JSON decoding produces from a
+// \u0000 escape in the stored sql or an instruction parameter is refused before the execution
+// row and the dispatch, and audited as denied.
+TEST_CASE("MCP reevaluate_result_set: a NUL in the stored sql or parameters is refused before "
+          "any dispatch and audited as denied",
+          "[pg][mcp][integration][result-sets][validation]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    std::string instruction_id;
+    {
+        yuzu::server::InstructionDefinition def;
+        def.name = "Get OS Version";
+        def.version = "1.0";
+        def.plugin = "os_info";
+        def.action = "version";
+        def.type = "question";
+        def.description = "test";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        instruction_id = *created;
+    }
+
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-nul-5"};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const std::string with_nul("a\0b", 3);
+
+    auto seed = [&](const std::string& kind, const nlohmann::json& payload) {
+        CreateRequest cr;
+        cr.owner_principal = "test-user"; // McpTestServer's default session principal
+        cr.name = "seed";
+        cr.source_kind = kind;
+        cr.source_payload = payload.dump(); // dump() carries the NUL as a \u0000 escape
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+        return seeded->id;
+    };
+
+    auto expect_refused = [&](const std::string& rs_id, const std::string& kind) {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("reevaluate_result_set", {{"id", rs_id}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>() ==
+              "RESULT_SET_BAD_REQUEST: parameters must not contain a NUL byte");
+        INFO("dispatches recorded: " << sends);
+        CHECK(sends == 0);
+        const auto denied = wf_rows_since(ts, before, "result_set.create|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == "reason=field_contains_nul source_kind=" + kind);
+        CHECK(wf_rows_since(ts, before, "result_set.create|success").empty());
+    };
+
+    SECTION("control: a stored clean echo query is re-run, so a zero count below is not "
+            "vacuous") {
+        const auto rs_id = seed(std::string(source_kind::kEchoQuery),
+                                {{"sql", "SELECT 1"}, {"include_empty", false}});
+        auto res = ts.call(rs_tool_call_body("reevaluate_result_set", {{"id", rs_id}}));
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(sends == 1);
+    }
+
+    SECTION("stored echo sql with a NUL") {
+        const auto rs_id = seed(std::string(source_kind::kEchoQuery),
+                                {{"sql", "SELECT 1" + with_nul}, {"include_empty", false}});
+        expect_refused(rs_id, "echo_query");
+    }
+
+    SECTION("stored instruction parameter value with a NUL") {
+        const auto rs_id = seed(std::string(source_kind::kInstructionResult),
+                                {{"instruction_id", instruction_id}, {"params", {{"k", with_nul}}}});
+        expect_refused(rs_id, "instruction_result");
+    }
+}
+
+// ── management-group member and role tools: input refusal, missing group, store fault ──────────
+//
+// A control byte in an id is invalid params with a denied row carrying a fixed token (the value is
+// never echoed), a group id naming no group is the not-found answer (invalid params, no failure
+// row, no retry hint), and a store fault is an internal error with the fixed `store_error` detail.
+
+namespace {
+
+/// Drop one table of the per-test management-group schema so the next write to it fails.
+void mcp_drop_mgmt_table(const std::string& dsn, const char* qualified_table) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult d{
+        PQexec(conn.get(), (std::string("DROP TABLE ") + qualified_table).c_str())};
+    REQUIRE(d.ok());
+}
+
+} // namespace
+
+TEST_CASE("MCP add_management_group_member: a control byte in an id is refused as invalid params "
+          "with a denied row and nothing stored",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Member Validation";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+
+    struct Case {
+        std::string group_id;
+        std::string agent_id;
+        std::string token;
+    };
+    const std::vector<Case> cases = {
+        {gid, std::string("a\0b", 3), "invalid_agent_id"},
+        {gid, "a\tb", "invalid_agent_id"},
+        {gid, "a\x1b"
+              "b",
+         "invalid_agent_id"},
+        {gid, "a\x7f"
+              "b",
+         "invalid_agent_id"},
+        {gid + std::string("\0x", 2), "agent-1", "invalid_group_id"},
+        {gid + "\t", "agent-1", "invalid_group_id"},
+    };
+    for (const auto& c : cases) {
+        INFO("token " << c.token << ", agent id length " << c.agent_id.size());
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("add_management_group_member",
+                                             {{"group_id", c.group_id}, {"agent_id", c.agent_id}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(store.get_members(gid).empty());
+
+        const auto denied = wf_rows_since(ts, before, "management_group.add_member|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == c.token);
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|success").empty());
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|failure").empty());
+        for (const auto& detail : ts.audit_details)
+            CHECK(detail.find('\0') == std::string::npos);
+    }
+
+    // Clean controls (including a space and a multi-byte character) still add the member.
+    for (const std::string& agent : {std::string("agent-1"), std::string("agent \xc3\xa9 2")}) {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("add_management_group_member",
+                                             {{"group_id", gid}, {"agent_id", agent}}));
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|success").size() == 1);
+    }
+    CHECK(store.get_members(gid).size() == 2);
+}
+
+TEST_CASE("MCP assign_management_group_role: a control byte in a field is refused as invalid "
+          "params with a denied row and nothing stored",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Role Validation";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+    // The rbac store is required to be non-null by the tool's gate and is never read here.
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start();
+
+    struct Case {
+        std::string group_id;
+        std::string principal_type;
+        std::string principal_id;
+        std::string role_name;
+        std::string token;
+    };
+    const std::vector<Case> cases = {
+        {gid, "user", "alice", std::string("Oper\0ator", 9), "invalid_role_name"},
+        {gid, "user", "alice", "Oper\tator", "invalid_role_name"},
+        {gid, "user", "alice", "Oper\x1b"
+                               "ator",
+         "invalid_role_name"},
+        {gid, "user", "alice", "Viewer\x7f", "invalid_role_name"},
+        {gid, "user", std::string("al\0ice", 6), "Operator", "invalid_principal_id"},
+        {gid, "user", "al\tice", "Operator", "invalid_principal_id"},
+        {gid, std::string("us\0er", 5), "alice", "Operator", "invalid_principal_type"},
+        {gid, "us\ter", "alice", "Operator", "invalid_principal_type"},
+        {gid + "\t", "user", "alice", "Operator", "invalid_group_id"},
+    };
+    for (const auto& c : cases) {
+        INFO("token " << c.token);
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", c.group_id},
+                                              {"principal_type", c.principal_type},
+                                              {"principal_id", c.principal_id},
+                                              {"role_name", c.role_name}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(store.get_group_roles(gid).empty());
+
+        const auto denied = wf_rows_since(ts, before, "management_group.assign_role|denied");
+        REQUIRE(denied.size() == 1);
+        CHECK(denied.front() == c.token);
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").empty());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|failure").empty());
+        for (const auto& detail : ts.audit_details)
+            CHECK(detail.find('\0') == std::string::npos);
+    }
+
+    // The clean control still assigns.
+    const auto before = ts.audit_log.size();
+    auto ok = ts.call(rs_tool_call_body("assign_management_group_role",
+                                        {{"group_id", gid},
+                                         {"principal_id", "alice"},
+                                         {"role_name", "Operator"}}));
+    REQUIRE(ok);
+    CHECK_FALSE(nlohmann::json::parse(ok->body).contains("error"));
+    CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").size() == 1);
+    CHECK(store.get_group_roles(gid).size() == 1);
+}
+
+TEST_CASE("MCP assign_management_group_role: a caller value that contains the word failed is "
+          "invalid params, not a retryable store fault",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Classifier";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start();
+
+    // RbacStore::validate_assignment echoes the caller's principal_type in its message, so a
+    // value holding "failed" must not be read as a store fault.
+    for (const char* type : {"failed", "unfailed", "login failed"}) {
+        INFO("principal_type " << type);
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", gid},
+                                              {"principal_type", type},
+                                              {"principal_id", "alice"},
+                                              {"role_name", "Operator"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        REQUIRE(body["error"].contains("data"));
+        REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(store.get_group_roles(gid).empty());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").empty());
+        // The refusal is recorded as the store's validation message, never as a store fault.
+        const auto failures = wf_rows_since(ts, before, "management_group.assign_role|failure");
+        REQUIRE(failures.size() == 1);
+        CHECK(failures.front() != "store_error");
+        CHECK(failures.front().rfind("unrecognized principal_type", 0) == 0);
+    }
+}
+
+TEST_CASE("MCP management-group member and role tools: a group id naming no group is the "
+          "not-found answer with no failure row and no retry hint",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start();
+    const std::string missing = "deadbeef0000";
+
+    SECTION("add_management_group_member") {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("add_management_group_member",
+                                             {{"group_id", missing}, {"agent_id", "agent-1"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "group not found");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(store.get_members(missing).empty());
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|failure").empty());
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|success").empty());
+    }
+
+    SECTION("assign_management_group_role") {
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", missing},
+                                              {"principal_id", "alice"},
+                                              {"role_name", "Operator"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "group not found");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(store.get_group_roles(missing).empty());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|failure").empty());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").empty());
+    }
+}
+
+TEST_CASE("MCP management-group member and role tools: a store fault on an existing group is a "
+          "retryable internal error with the fixed store_error detail and no store text",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Fault Target";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start();
+
+    SECTION("add_management_group_member") {
+        mcp_drop_mgmt_table(db.dsn(), "management_group_store.management_group_members");
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("add_management_group_member",
+                                             {{"group_id", gid}, {"agent_id", "agent-1"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().find("failed") == std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_number());
+        CHECK(wf_rows_since(ts, before, "management_group.add_member|success").empty());
+        const auto failure = wf_rows_since(ts, before, "management_group.add_member|failure");
+        REQUIRE(failure.size() == 1);
+        CHECK(failure.front() == "store_error");
+        const auto mcp_failure = wf_rows_since(ts, before, "mcp.add_management_group_member|failure");
+        REQUIRE(mcp_failure.size() == 1);
+        CHECK(mcp_failure.front() == "store_error");
+    }
+
+    SECTION("assign_management_group_role") {
+        mcp_drop_mgmt_table(db.dsn(), "management_group_store.management_group_roles");
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", gid},
+                                              {"principal_id", "alice"},
+                                              {"role_name", "Operator"}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().find("failed") == std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_number());
+        CHECK(wf_rows_since(ts, before, "management_group.assign_role|success").empty());
+        const auto failure = wf_rows_since(ts, before, "management_group.assign_role|failure");
+        REQUIRE(failure.size() == 1);
+        CHECK(failure.front() == "store_error");
+        const auto mcp_failure = wf_rows_since(ts, before, "mcp.assign_management_group_role|failure");
+        REQUIRE(mcp_failure.size() == 1);
+        CHECK(mcp_failure.front() == "store_error");
+    }
+}
+
+// Dave's review of #7376, item 1, MCP twin: the tool wrote its role-name rows before it asked
+// whether the caller may write at all. A caller with no rights now gets the permission answer
+// and no management_group.assign_role row, whatever the role argument holds.
+TEST_CASE("MCP assign_management_group_role: a caller without ManagementGroup:Write is refused "
+          "before any role-name row is written",
+          "[mcp][pg][management_group][validation][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Gate Before Audit";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    const std::string gid = *created;
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+
+    // A control byte, a name outside the closed list, and a clean allowed name.
+    for (const std::string& role : {std::string("Oper\0ator", 9), std::string("Oper\tator"),
+                                    std::string("ITServiceOwner"), std::string("Operator")}) {
+        INFO("role length " << role.size());
+        const auto before = ts.audit_log.size();
+        auto res = ts.call(rs_tool_call_body("assign_management_group_role",
+                                             {{"group_id", gid},
+                                              {"principal_id", "alice"},
+                                              {"role_name", role}}));
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"] == "forbidden");
+        CHECK(store.get_group_roles(gid).empty());
+
+        // No row for the value; the tool's own denial row carries the fixed gate detail.
+        for (const char* result : {"denied", "failure", "success"})
+            CHECK(wf_rows_since(ts, before,
+                                std::string("management_group.assign_role|") + result)
+                      .empty());
+        const auto tool_denied = wf_rows_since(ts, before, "mcp.assign_management_group_role|denied");
+        REQUIRE(tool_denied.size() == 1);
+        CHECK(tool_denied.front() == "forbidden");
+    }
+}
+
+// Dave's review of #7376, item 2, MCP twin: a duplicate group name is the caller's conflict, not
+// a store fault, so it is invalid params with no retry hint.
+TEST_CASE("MCP create and update management group: a duplicate name is invalid params, not a "
+          "retryable store fault",
+          "[mcp][pg][management_group][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Taken Name";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    REQUIRE(store.create_group(g).has_value());
+    g.name = "Other Name";
+    auto other = store.create_group(g);
+    REQUIRE(other.has_value());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+
+    auto check_conflict = [&](const nlohmann::json& body) {
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "a group with that name already exists");
+        REQUIRE(body["error"].contains("data"));
+        REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    };
+
+    SECTION("create_management_group") {
+        const auto groups_before = store.list_groups().size();
+        auto res = ts.call(rs_tool_call_body("create_management_group", {{"name", "Taken Name"}}));
+        REQUIRE(res);
+        check_conflict(nlohmann::json::parse(res->body));
+        CHECK(store.list_groups().size() == groups_before);
+    }
+
+    SECTION("update_management_group renaming onto an existing name") {
+        auto res = ts.call(rs_tool_call_body("update_management_group",
+                                             {{"group_id", *other}, {"name", "Taken Name"}}));
+        REQUIRE(res);
+        check_conflict(nlohmann::json::parse(res->body));
+        auto still = store.get_group(*other);
+        REQUIRE(still.has_value());
+        CHECK(still->name == "Other Name");
+    }
+}
+
+TEST_CASE("MCP create_result_set: a pending parent is refused with RESULT_SET_NOT_READY",
+          "[pg][mcp][integration][result-sets][parent_seed]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user";
+    parent_cr.name = "pending-parent";
+    parent_cr.source_kind = std::string(source_kind::kEchoQuery);
+    parent_cr.source_payload = R"({"sql":"SELECT 1"})";
+    auto parent = rs_bundle.get()->create_pending(parent_cr, "exec-pending-parent");
+    REQUIRE(parent.has_value());
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start("supervised"); // create_result_set is Infrastructure:Write, above the operator tier
+    const auto create_child = [&ts](const std::string& parent_id) {
+        return ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set","arguments":{"name":"child","device_ids":[],"parent_id":")" +
+            parent_id + R"("}}})");
+    };
+
+    SECTION("a pending parent is refused and the message says to wait") {
+        auto res = create_child(parent->id);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        const auto msg = body["error"]["message"].get<std::string>();
+        CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
+        CHECK(msg.find("wait until it is materialized") != std::string::npos);
+        REQUIRE(body["error"].contains("data"));
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000); // pending: transient
+        CHECK(body["error"]["data"].value("remediation", "") ==
+              "wait until the set is materialized");
+    }
+    SECTION("a failed parent is refused and the message says to re-create it") {
+        rs_bundle.get()->mark_failed(parent->id, "bound exceeded");
+        auto res = create_child(parent->id);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        const auto msg = body["error"]["message"].get<std::string>();
+        CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
+        CHECK(msg.find("re-create it") != std::string::npos);
+        // Presence first: operator[] on a missing key would insert a null and pass vacuously.
+        REQUIRE(body["error"].contains("data"));
+        REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // failed: permanent
+        CHECK(body["error"]["data"].value("remediation", "") == "re-create the parent result set");
+    }
+    SECTION("control: a materialized parent is accepted as lineage with no inherited counters") {
+        REQUIRE(rs_bundle.get()->materialize(parent->id, {"a1"}, 2, 3).has_value());
+        auto res = create_child(parent->id);
+        REQUIRE(res);
+        auto payload = operator_surface_payload(res);
+        auto child = rs_bundle.get()->get(payload["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        REQUIRE(child->has_value());
+        CHECK((*child)->parent_id == parent->id);
+        CHECK((*child)->agents_failed == 0);
+        CHECK((*child)->agents_unanswered == 0);
+    }
+}
+
+// The async producers and re-eval refuse a pending parent before dispatching anything.
+TEST_CASE("MCP result-set producers: echo-query and instruction-result and re-eval refuse a "
+          "pending parent before any dispatch",
+          "[pg][mcp][integration][result-sets][parent_seed]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    yuzu::server::InstructionDefinition def;
+    def.name = "Get OS Version";
+    def.version = "1.0";
+    def.plugin = "os_info";
+    def.action = "version";
+    def.type = "question";
+    def.description = "test";
+    def.enabled = true;
+    auto instruction_id = instr.create_definition(def);
+    REQUIRE(instruction_id.has_value());
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "pending-parent";
+    parent_cr.source_kind = std::string(source_kind::kEchoQuery);
+    parent_cr.source_payload = R"({"sql":"SELECT 1"})";
+    auto parent = rs_bundle.get()->create_pending(parent_cr, "exec-pending-parent");
+    REQUIRE(parent.has_value());
+
+    int sends = 0;
+    auto dispatch = [&sends](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&,
+                             const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++sends;
+        return {.sent = 1, .command_id = "cmd-parent-seed"};
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.start_with_dispatch(dispatch, "operator");
+
+    const auto expect_not_ready = [&](const std::string& request) {
+        auto res = ts.call(request);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        CHECK(sends == 0);
+    };
+
+    SECTION("create_result_set_from_echo_query") {
+        expect_not_ready(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT 1","parent_id":")" +
+            parent->id + R"("}}})");
+    }
+    SECTION("control: a materialized parent reaches the dispatch mock") {
+        CreateRequest ready_cr = parent_cr;
+        ready_cr.name = "ready-parent";
+        auto ready = rs_bundle.get()->create_materialized(ready_cr, {"dev-1"});
+        REQUIRE(ready.has_value());
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set_from_echo_query","arguments":{"sql":"SELECT 1","parent_id":")" +
+            ready->id + R"("}}})");
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(sends == 1);
+    }
+    SECTION("create_result_set_from_instruction_result") {
+        expect_not_ready(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":")" +
+            *instruction_id + R"(","parent_id":")" + parent->id + R"("}}})");
+    }
+    SECTION("reevaluate_result_set on an original whose parent is still pending") {
+        CreateRequest original_cr = parent_cr;
+        original_cr.name = "original";
+        original_cr.parent_id = parent->id;
+        original_cr.source_payload =
+            R"({"sql":"SELECT 1","scope_input_id":")" + parent->id + R"("})";
+        auto original = rs_bundle.get()->create_pending(original_cr, "exec-original");
+        REQUIRE(original.has_value());
+        expect_not_ready(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+            original->id + R"("}}})");
+    }
+}
+
+TEST_CASE("MCP create_result_set_from_inventory_query: a pending parent is refused and an "
+          "incomplete parent is inherited",
+          "[pg][mcp][integration][result-sets][inventory][parent_seed]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+    yuzu::server::InventoryStore inventory{rs_bundle.pool()};
+    REQUIRE(inventory.is_open());
+
+    CreateRequest parent_cr;
+    parent_cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    parent_cr.name = "pending-parent";
+    parent_cr.source_kind = std::string(source_kind::kEchoQuery);
+    parent_cr.source_payload = R"({"sql":"SELECT 1"})";
+    auto parent = rs_bundle.get()->create_pending(parent_cr, "exec-pending-parent");
+    REQUIRE(parent.has_value());
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+    const std::string request =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query","arguments":{"name":"child","parent_id":")" +
+        parent->id + R"("}}})";
+
+    SECTION("a pending parent is refused and nothing is created") {
+        auto res = ts.call(request);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        std::string next;
+        CHECK(rs_bundle.get()->list_by_owner("test-user", "", 50, next).size() == 1);
+    }
+    SECTION("a failed parent is refused and the message says to re-create it") {
+        rs_bundle.get()->mark_failed(parent->id, "bound exceeded");
+        auto res = ts.call(request);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        const auto msg = body["error"]["message"].get<std::string>();
+        CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
+        CHECK(msg.find("re-create it") != std::string::npos);
+        std::string next;
+        CHECK(rs_bundle.get()->list_by_owner("test-user", "", 50, next).size() == 1);
+    }
+    SECTION("an incomplete materialized parent passes its counters to the child") {
+        REQUIRE(rs_bundle.get()->materialize(parent->id, {"a1"}, 2, 3).has_value());
+        auto res = ts.call(request);
+        REQUIRE(res);
+        auto payload = operator_surface_payload(res);
+        auto child = rs_bundle.get()->get(payload["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        REQUIRE(child->has_value());
+        CHECK((*child)->agents_failed == 2);
+        CHECK((*child)->agents_unanswered == 3);
+    }
 }

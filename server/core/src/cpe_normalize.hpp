@@ -74,13 +74,17 @@ inline bool is_lane1(std::string_view eco) {
 
 /// Lane 3 — OS-native software (GUI apps, non-distro package managers incl. Snap
 /// and Flatpak, Windows optional features, machine-context MSI products, IBM MQ
-/// installations, .NET and Java runtimes) that v1 identifies but does NOT
-/// assess: `kind` app/feat OR an OS-native ecosystem. `pkg` is routed by its
-/// ecosystem, not as a kind-level trigger. See ADR-0023 §2 (update 2026-10-04).
+/// installations, .NET and Java runtimes, device drivers) that v1 identifies but does
+/// NOT assess: `kind` app/feat/driver OR an OS-native ecosystem. `pkg` is routed by its
+/// ecosystem, not as a kind-level trigger. Drivers (`kind` driver; ecosystem `windows` or
+/// `kernel_module`) get NO CPE treatment: a driver's name is a device or module label, not a
+/// vendor product name, and a kernel module has no distribution package identity. See
+/// ADR-0023 §2 (update 2026-10-04) and ADR-0016 (update 2026-11-09).
 inline bool is_os_native(const SoftwareEntry& e) {
     const std::string kind = yuzu::server::detail::to_lower_ascii(cpe_trim_view(e.kind));
     const std::string eco = yuzu::server::detail::to_lower_ascii(cpe_trim_view(e.ecosystem));
-    return kind == "app" || kind == "feat" || eco == "windows" || eco == "macos" ||
+    return kind == "app" || kind == "feat" || kind == "driver" || eco == "windows" ||
+           eco == "macos" || eco == "kernel_module" ||
            eco == "macos_pkgutil" || eco == "brew" || eco == "optional_feature" ||
            eco == "snap" || eco == "flatpak" || eco == "msi" || eco == "python" || eco == "ibm_mq" ||
            eco == "dotnet" || eco == "jvm" || eco == "chocolatey" || eco == "winget" || eco == "appx";

@@ -22,6 +22,7 @@
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
+#include "plugin_init_failed_labels.hpp" // catalogue-bounded plugin label for yuzu_fleet_plugin_init_failed
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "echo_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -103,38 +104,25 @@ AgentRegistry::register_agent(const pb::AgentInfo& info) {
         }
         session->scopable_tags[k] = v;
     }
-    // Upgrade-window shim, removed with the other legacy-name shims: an agent that has not
-    // upgraded still reports the pre-rename plugin name `tar`. Normalise it so every inventory
-    // consumer (presence gate, help catalogue) sees `echo`, and remember to write `tar` back on
-    // the wire (wire_for). An inventory advertising BOTH names is not a pre-rename agent (an
-    // upgraded agent rejects a stale tar plugin at load; an old agent has no echo): leave `tar`
-    // un-normalised and the session on the new wire name, so the real echo plugin still receives
-    // its commands instead of the retired binary.
-    bool advertises_tar = false;
-    bool advertises_echo = false;
     for (const auto& p : info.plugins()) {
-        advertises_tar = advertises_tar || p.name() == "tar";
-        advertises_echo = advertises_echo || p.name() == "echo";
-    }
-    if (advertises_tar && advertises_echo) {
-        spdlog::warn("AgentRegistry::register_agent({}): inventory advertises both 'tar' and "
-                     "'echo' - not treating the session as a pre-rename agent",
-                     safe_agent_id);
-    }
-    for (const auto& p : info.plugins()) {
-        const bool legacy_name = p.name() == "tar" && !advertises_echo;
-        if (legacy_name)
-            session->legacy_echo_wire_name = true;
-        const std::string name = legacy_name ? std::string{"echo"} : p.name();
-        session->plugin_names.push_back(name);
+        session->plugin_names.push_back(p.name());
         PluginMeta pm;
-        pm.name = name;
+        pm.name = p.name();
         pm.version = p.version();
         pm.description = p.description();
         for (const auto& cap : p.capabilities()) {
             pm.actions.push_back(cap);
         }
         session->plugin_meta.push_back(std::move(pm));
+    }
+    // An agent that reports the retired name `tar` and no `echo` is not an Echo agent: Echo
+    // commands are refused for it and its `yuzu.plugin.tar.*` heartbeat tags (the corruption
+    // signal) are not read. The fleet is meant to be one build, so say so rather than let it pass.
+    if (std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end() &&
+        std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end()) {
+        spdlog::warn("AgentRegistry::register_agent({}): inventory reports the retired plugin name "
+                     "'tar' and no 'echo' - not an Echo agent; upgrade it to the current build",
+                     safe_agent_id);
     }
 
     // Phase 1 (under mu_): snapshot the CURRENT session for this agent_id (not just whether one
@@ -783,13 +771,11 @@ bool AgentRegistry::send_to(const std::string& agent_id, const ClassifiedCommand
         std::optional<std::string> cluster_id =
             session->cluster_id.empty() ? std::nullopt : std::make_optional(session->cluster_id);
         std::lock_guard glock(gw_pending_mu_);
-        gw_pending_.push_back(
-            {agent_id, wire_for(session->legacy_echo_wire_name, cmd), std::move(cluster_id)});
+        gw_pending_.push_back({agent_id, cmd.wire(), std::move(cluster_id)});
         return true;
     }
     if (session->stream)
-        return session->stream->Write(wire_for(session->legacy_echo_wire_name, cmd),
-                                      grpc::WriteOptions());
+        return session->stream->Write(cmd.wire(), grpc::WriteOptions());
     return false;
 }
 
@@ -823,11 +809,9 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
             std::optional<std::string> cluster_id =
                 s->cluster_id.empty() ? std::nullopt : std::make_optional(s->cluster_id);
             std::lock_guard glock(gw_pending_mu_);
-            gw_pending_.push_back(
-                {s->agent_id, wire_for(s->legacy_echo_wire_name, cmd), std::move(cluster_id)});
+            gw_pending_.push_back({s->agent_id, cmd.wire(), std::move(cluster_id)});
             ++count;
-        } else if (s->stream &&
-                   s->stream->Write(wire_for(s->legacy_echo_wire_name, cmd), grpc::WriteOptions())) {
+        } else if (s->stream && s->stream->Write(cmd.wire(), grpc::WriteOptions())) {
             ++count;
         }
     }
@@ -835,14 +819,14 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
 }
 
 bool AgentRegistry::send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
-                                       const std::string& cluster_id, bool legacy_wire) {
+                                       const std::string& cluster_id) {
     // Same defensive belt-and-braces check `send_to`/`send_to_all` apply —
     // this path has no session to have already validated anything, so it is
     // the ONLY check this method makes before queuing.
     if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
         return false;
     std::lock_guard glock(gw_pending_mu_);
-    gw_pending_.push_back({agent_id, wire_for(legacy_wire, cmd), cluster_id});
+    gw_pending_.push_back({agent_id, cmd.wire(), cluster_id});
     return true;
 }
 
@@ -1806,6 +1790,36 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
     yuzu::scope::collect_attribute_suffixes(expr, "from_result_set:", out);
 }
 
+// The from_result_set:<id> references whose result depends on the set being COMPLETE: every
+// use other than a plain membership test (the bare atom, which the parser lowers to EXISTS)
+// outside any NOT. An incomplete set (an agent failed or never answered) is missing members, so a
+// plain positive reference can only under-match, but under a NOT (or LEN, STARTSWITH ...) a
+// missing member evaluates as "matches". Such references must abort on an incomplete set.
+static void collect_completeness_dependent_result_set_ids(const yuzu::scope::Expression& expr,
+                                                          bool negated,
+                                                          std::vector<std::string>& out) {
+    constexpr std::string_view kPrefix = "from_result_set:";
+    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
+        if (!cond->attribute.starts_with(kPrefix)) {
+            // A synthetic form (LEN/STARTSWITH) wraps the real attribute: never a plain test.
+            const auto real = yuzu::scope::classify_synthetic(cond->attribute).real;
+            if (real.starts_with(kPrefix))
+                out.push_back(std::string(real.substr(kPrefix.size())));
+            return;
+        }
+        const bool plain = !negated && cond->op == yuzu::scope::CompOp::Exists;
+        if (!plain)
+            out.push_back(cond->attribute.substr(kPrefix.size()));
+    } else if (const auto* comb = std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
+        if (*comb) {
+            const bool child_negated =
+                (*comb)->op == yuzu::scope::CombOp::Not ? !negated : negated;
+            for (const auto& child : (*comb)->children)
+                collect_completeness_dependent_result_set_ids(child, child_negated, out);
+        }
+    }
+}
+
 // props.<key> and tag:<key> collection use the same shared
 // yuzu::scope::collect_attribute_suffixes (scope_engine.hpp) — added with
 // ADR-0050 for exactly this preload pattern. Folding props onto it (Gate 7,
@@ -1969,10 +1983,25 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
         }
         if (rs_store && !principal.empty()) {
             const std::string owner(principal);
+            std::vector<std::string> needs_complete;
+            collect_completeness_dependent_result_set_ids(expr, false, needs_complete);
             for (const auto& rsid : refs) {
                 if (rs_members.contains(rsid))
                     continue;
                 auto mem = rs_store->member_set_owned(rsid, owner);
+                // An owned set that cannot be used as scope. The caller passed the owner check,
+                // so the id and cause go in the detail (fixed tokens, the id neutralised). A
+                // pending set may fill (transient); a failed set, or an incomplete one where a
+                // missing member would match, will not change by retrying (permanent). An
+                // expected state, so a warning, not an error.
+                const auto unusable = [&rsid, &owner](ScopeEvalError::Kind kind,
+                                                      std::string_view cause) {
+                    spdlog::warn("AgentRegistry::evaluate_scope: result-set {} (owner={}) cannot "
+                                 "be used as scope (cause={}) — aborting scope evaluation",
+                                 ::yuzu::log_id_token(rsid), ::yuzu::log_id_token(owner), cause);
+                    return std::unexpected(ScopeEvalError{
+                        kind, "cause=" + std::string(cause) + " result_set=" + audit_token(rsid)});
+                };
                 if (!mem) {
                     // #4981 PR-1 A1/A3: member_set_owned's rewritten single-
                     // statement query now type-distinguishes a genuine DB
@@ -1990,6 +2019,13 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                     // test: a set deleted between a caller's own pre-dispatch
                     // ownership gate and this preload used to surface here as
                     // a SUCCESSFUL empty membership, not an error).
+                    // A set that is not ready (pending or failed) has no usable membership;
+                    // it is owned (the owner check ran first), so naming it leaks nothing.
+                    if (mem.error() == ResultSetError::NotReady)
+                        return unusable(ScopeEvalError::Kind::ResultSetUnusable, "pending");
+                    if (mem.error() == ResultSetError::Failed)
+                        return unusable(ScopeEvalError::Kind::ResultSetUnusablePermanent,
+                                        "failed");
                     const bool owner_check_failed = mem.error() == ResultSetError::NotFound ||
                                                     mem.error() == ResultSetError::NotOwner;
                     spdlog::error("AgentRegistry::evaluate_scope: member_set_owned {} for "
@@ -2001,6 +2037,10 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                                                           : ScopeEvalError::Kind::StoreDegraded,
                                       rsid});
                 }
+                // Incomplete and referenced where a missing member would match (under NOT, LEN,
+                // STARTSWITH): only re-running the producer changes that.
+                if (!mem->complete && std::ranges::find(needs_complete, rsid) != needs_complete.end())
+                    return unusable(ScopeEvalError::Kind::ResultSetUnusablePermanent, "incomplete");
                 // #4981 PR-1 A4: touch EVERY owned result (empty or not) — an
                 // owned-but-empty set is now a real, distinguishable success
                 // case (A1), not indistinguishable from not-owned, so it
@@ -2332,15 +2372,7 @@ void AgentHealthStore::upsert(const std::string& agent_id,
         snap.agent_id = agent_id;
         snap.status_tags.clear();
         for (const auto& [k, v] : tags) {
-            // Upgrade-window shim, removed with the other legacy-name shims: an agent that has
-            // not upgraded still publishes its Echo heartbeat tags under the pre-rename
-            // `yuzu.plugin.tar.` prefix. Normalise at ingest so the corruption gate and every tag
-            // reader see one spelling.
-            constexpr std::string_view kLegacyPrefix = "yuzu.plugin.tar.";
-            if (std::string_view{k}.starts_with(kLegacyPrefix))
-                snap.status_tags["yuzu.plugin.echo." + k.substr(kLegacyPrefix.size())] = v;
-            else
-                snap.status_tags[k] = v;
+            snap.status_tags[k] = v;
         }
         snap.last_seen = std::chrono::steady_clock::now();
 
@@ -2369,6 +2401,13 @@ void AgentHealthStore::upsert(const std::string& agent_id,
 void AgentHealthStore::set_corruption_sink(CorruptionSink sink) {
     std::lock_guard lock(mu_);
     corruption_sink_ = std::move(sink);
+}
+
+void AgentHealthStore::set_known_plugins(std::vector<std::string> names) {
+    std::lock_guard lock(mu_);
+    known_plugins_.clear();
+    known_plugins_.insert(std::make_move_iterator(names.begin()),
+                          std::make_move_iterator(names.end()));
 }
 
 void AgentHealthStore::remove(const std::string& agent_id) {
@@ -2812,6 +2851,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int ota_signature_refusing = 0;
     int echo_db_corruption_agents = 0;               // #1567
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
+    // Tokens summed under plugin="unknown" (a well-formed name outside the catalogue), and the
+    // AGENTS that sent at least one token the label dropped, per reason (the rejected gauge).
+    int64_t plugin_init_unknown = 0;
+    int plugin_reject_unknown = 0;
+    int plugin_reject_malformed = 0;
+    int plugin_reject_over_cap = 0;
     int sync_skipping = 0; // #5332: agents whose installed_software daily sync is skipping
 
     // #3663: agent command-dedup store telemetry. Counts of AGENTS (not sums of per-process
@@ -2869,22 +2914,42 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             // its repeat count instead of by 1. `seen_this_agent` holds views into
             // `it->second`, which outlives this block.
             std::unordered_set<std::string_view> seen_this_agent;
+            bool agent_unknown = false;
+            bool agent_malformed = false;
             while (!rest.empty() && tokens < 32) {
                 ++tokens; // every split counts toward the cap, valid or not
                 const auto comma = rest.find(',');
                 const auto tok = rest.substr(0, comma);
                 rest = comma == std::string_view::npos ? std::string_view{}
                                                        : rest.substr(comma + 1);
-                if (tok.empty() || tok.size() > 64 ||
+                if (tok.empty())
+                    continue;
+                if (tok.size() > 64 ||
                     !std::all_of(tok.begin(), tok.end(), [](char ch) {
                         return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
                                (ch >= '0' && ch <= '9') || ch == '_';
-                    }))
+                    })) {
+                    agent_malformed = true;
                     continue;
+                }
                 if (!seen_this_agent.insert(tok).second)
                     continue; // already counted for this agent this sweep
+                // The label is server-chosen: a name the catalogue does not know is summed
+                // under "unknown" (not a catalogue name, so it can never collide with one),
+                // never given a series of its own (an unwired store knows no names).
+                if (!known_plugins_.contains(tok)) {
+                    ++plugin_init_unknown;
+                    agent_unknown = true;
+                    continue;
+                }
                 ++plugin_init_failed[std::string{tok}];
             }
+            // Tokens remain after the 32-split cap: not read, not scanned (an unbounded tag
+            // value is never walked past the cap), reported once per agent.
+            const bool agent_over_cap = !rest.empty();
+            plugin_reject_unknown += agent_unknown;
+            plugin_reject_malformed += agent_malformed;
+            plugin_reject_over_cap += agent_over_cap;
         }
 
         // Non-copying accessor. Every tag VALUE is fully agent-controlled and bounded only
@@ -3314,8 +3379,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         .set(static_cast<double>(ota_signature_refusing));
     // #1567: agents reporting a quarantined echo.db (cumulative per agent since
     // install; a RISING value is the signal), and per-plugin init failures
-    // (absent-not-zero). Fleet-wide label cap: the first 64 plugin names in
-    // lexicographic order, the remainder summed under plugin="other".
+    // (absent-not-zero). The plugin label is bounded by the server's catalogue; every
+    // other well-formed name is summed under plugin="unknown" (see the block below).
     metrics.gauge("yuzu_fleet_echo_db_corruption_agents")
         .set(static_cast<double>(echo_db_corruption_agents));
     // #5332: published every sweep, 0 included (a server-owned count over the reporting
@@ -3335,21 +3400,23 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     if (dedup_rows_reported)
         metrics.gauge(kDedupRowsMaxGauge).set(static_cast<double>(dedup_rows_max));
     {
-        constexpr std::size_t kMaxPluginLabels = 64;
-        std::size_t n = 0;
-        int64_t other = 0;
-        for (const auto& [plugin, count] : plugin_init_failed) {
-            if (n < kMaxPluginLabels) {
-                metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
-                    .set(static_cast<double>(count));
-                ++n;
-            } else {
-                other += count;
-            }
-        }
-        if (other > 0)
-            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", "other"}})
-                .set(static_cast<double>(other));
+        // Every label is a name the SERVER knows (the catalogue, about 73 names), so the label
+        // set is bounded without a cap an agent could fill to displace a real plugin. Names the
+        // catalogue does not know are summed under "unknown", never "other", so a real plugin
+        // named "other" is never overwritten.
+        for (const auto& [plugin, count] : plugin_init_failed)
+            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
+                .set(static_cast<double>(count));
+        if (plugin_init_unknown > 0)
+            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", kUnknownPluginLabel}})
+                .set(static_cast<double>(plugin_init_unknown));
+        // Fixed label set, published every sweep including 0 (no clear needed).
+        metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectUnknownPlugin}})
+            .set(static_cast<double>(plugin_reject_unknown));
+        metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectMalformed}})
+            .set(static_cast<double>(plugin_reject_malformed));
+        metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectOverCap}})
+            .set(static_cast<double>(plugin_reject_over_cap));
     }
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
     metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
