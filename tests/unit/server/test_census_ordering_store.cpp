@@ -929,6 +929,18 @@ private:
     std::vector<std::thread> threads_;
 };
 
+// Turns the per-agent order step off for one case and restores the default on scope exit, so a
+// failed REQUIRE cannot leak the setting into a later case.
+struct AgentStepOff {
+    explicit AgentStepOff(GuaranteedStateStore& s) : store(s) {
+        store.set_agent_step_enabled_for_test(false);
+    }
+    AgentStepOff(const AgentStepOff&) = delete;
+    AgentStepOff& operator=(const AgentStepOff&) = delete;
+    ~AgentStepOff() { store.set_agent_step_enabled_for_test(true); }
+    GuaranteedStateStore& store;
+};
+
 // Poll until `n` backends in this database wait on a lock of `wait_event` (any lock when empty).
 // This observes that a writer really parked, which a fixed sleep cannot.
 bool wait_for_lock_waiters(const std::string& dsn, int n, const std::string& wait_event = {}) {
@@ -2111,6 +2123,10 @@ TEST_CASE("census ordering: a lower-sequence arrival with the same key and a dif
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
+    // Under v5 two first deliveries of one agent serialise on the agent's order row, so this
+    // schedule is only reachable at the census SQL level: the step is off here and the case keeps
+    // pinning the v4 census SQL contract under interleaving (defence in depth).
+    AgentStepOff step_off(store);
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
 
     EventInsertResult w1_res;
@@ -2146,6 +2162,10 @@ TEST_CASE("census ordering: recovery needs a later arrival than the applied verd
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
+    // Under v5 two first deliveries of one agent serialise on the agent's order row, so this
+    // schedule is only reachable at the census SQL level: the step is off here and the case keeps
+    // pinning the v4 census SQL contract under interleaving (defence in depth).
+    AgentStepOff step_off(store);
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
     REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kDrifted, kBase + 1000)).outcome ==
             EventInsertOutcome::Inserted);
@@ -2287,6 +2307,10 @@ TEST_CASE(
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
+    // Under v5 two first deliveries of one agent serialise on the agent's order row, so this
+    // schedule is only reachable at the census SQL level: the step is off here and the case keeps
+    // pinning the v4 census SQL contract under interleaving (defence in depth).
+    AgentStepOff step_off(store);
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
 
     REQUIRE(store.insert_event_classified(ev("w1", "r1", "a", kCompliant, kBase + 200)).outcome ==
@@ -2353,6 +2377,10 @@ TEST_CASE(
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
+    // Under v5 two first deliveries of one agent serialise on the agent's order row, so this
+    // schedule is only reachable at the census SQL level: the step is off here and the case keeps
+    // pinning the v4 census SQL contract under interleaving (defence in depth).
+    AgentStepOff step_off(store);
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
     exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
                            ".yuzu_test_hold_x() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
@@ -4029,4 +4057,49 @@ TEST_CASE("census ordering: the batch path runs the agent step and aborts on a s
         CHECK(census(db.dsn(), "p", "r1").empty());
         CHECK(census(db.dsn(), "x", "r1").empty());
     }
+}
+
+TEST_CASE("census ordering: a second first delivery of one agent waits on the first's agent row and "
+          "past the lock timeout is stored pending with nothing lost",
+          "[pg][guaranteed_state_store][db][census][ordering][lockorder][pair]") {
+    // The REAL behaviour with the step enabled (the four v4 interleaving cases run with it off):
+    // writer A is parked inside its transaction holding the agent's order row; writer B, the same
+    // agent and rule, cannot finish, takes the step's F1 path at the lock timeout and is acked with
+    // its event stored pending and the census untouched. A's release and a redelivery of B repair it.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 400}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("e0", "r1", "a", kCompliant, kBase + 100), 5, 10))
+                .outcome == EventInsertOutcome::Inserted);
+    const auto failures_before = store.census_proj_failures_total();
+
+    EventInsertResult res_a;
+    BarrierHold hold;
+    store.set_census_lock_barrier_for_test([&] { hold.hit(); });
+    WriterThreads writers(store, &hold);
+    writers.start([&] {
+        res_a = store.insert_event_classified(
+            with_pair(ev("wa", "r1", "a", kDrifted, kBase + 200), 5, 11));
+    });
+    REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+
+    const auto wb = with_pair(ev("wb", "r1", "a", kErrored, kBase + 300), 5, 12);
+    const auto res_b = store.insert_event_classified(wb); // waits ~400 ms, then F1
+    CHECK(res_b.outcome == EventInsertOutcome::Inserted);
+    CHECK(pending_for(db.dsn(), "a") == "1");
+    CHECK(store.event_count() == 2); // e0 and wb; wa is still uncommitted
+    CHECK(store.census_proj_failures_total() == failures_before + 1);
+    writers.join_all();
+
+    CHECK(res_a.outcome == EventInsertOutcome::Inserted);
+    CHECK(store.event_count() == 3);
+    CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11");
+    CHECK(order_text(db.dsn(), "a") == "5|11|-|0|0|0|0|0|0|0"); // wb's step wrote nothing
+    CHECK(store.insert_event_classified(wb).outcome == EventInsertOutcome::Redelivered);
+    CHECK(pending_for(db.dsn(), "a") == "0");
+    CHECK(census(db.dsn(), "a", "r1").starts_with("errored|")); // the repair applied the later key
 }

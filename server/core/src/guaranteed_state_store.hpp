@@ -309,6 +309,15 @@ public:
         agent_step_gap_hook_ = std::move(fn);
     }
 
+    /// Test seam: `false` skips the per-agent order step for every first delivery and batch row
+    /// (default `true`). Under schema v5 two first deliveries of one agent serialise on the
+    /// agent's order row, so a test that overlaps two same-agent writers inside the census can
+    /// only reach that schedule at the census SQL level, with the step off. Production never
+    /// sets it. Atomic, so a setter never races an ingest on another thread.
+    void set_agent_step_enabled_for_test(bool enabled) noexcept {
+        agent_step_enabled_.store(enabled, std::memory_order_relaxed);
+    }
+
     /// Test seam for `unrepresented_pending_for_agent` (#7217): while `fn` is set, every call that
     /// reaches the database step invokes it first and returns `std::unexpected` when it returns true,
     /// so a test can fail ONLY this read (the earlier reads on the same request keep working). The
@@ -668,6 +677,7 @@ private:
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
     std::function<void()> census_lock_barrier_;     // test seam, empty in production
+    std::atomic<bool> agent_step_enabled_{true};    // test seam, true in production
     std::function<void(AgentStepGap, const std::string&)> agent_step_gap_hook_; // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
     std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production

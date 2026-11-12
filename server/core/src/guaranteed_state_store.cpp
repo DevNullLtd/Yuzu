@@ -2370,7 +2370,9 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
         // step (rolled back to its own savepoint) stores the event pending, exactly as a failed
         // census write does, and the census write is skipped: it has no decided mode to follow.
         const AgentStepOutcome step =
-            agent_order_step(conn, agent_step_gap_hook_, row, wire_pair);
+            agent_step_enabled_.load(std::memory_order_relaxed)
+                ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair)
+                : AgentStepOutcome::Decided;
         if (step == AgentStepOutcome::Abandoned)
             return op_error(std::string("agent order savepoint failed: ") + PQerrorMessage(conn),
                             kReasonQueryError);
@@ -2505,7 +2507,9 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             // to fall back on, so a failed step (a second missing row included) aborts and rolls
             // back the whole batch and the caller re-issues it.
             const AgentStepOutcome step =
-                agent_order_step(conn, agent_step_gap_hook_, row, wire_pair);
+                agent_step_enabled_.load(std::memory_order_relaxed)
+                    ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair)
+                    : AgentStepOutcome::Decided;
             if (step == AgentStepOutcome::Abandoned)
                 return std::unexpected(std::string("agent order savepoint failed: ") +
                                        PQerrorMessage(conn));
