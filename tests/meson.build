@@ -3472,6 +3472,17 @@ test('agent-only release lint',
   timeout: 30,
 )
 
+# Agent-bundle release verification (#7529): build-agent-bundle.sh must verify
+# SHA256SUMS' cosign signature (exact identity per signing era) before use and
+# match each file to its OWN line. Runs `--verify-only` against stub gh/cosign,
+# asserts cosign's argv, and mutation-tests itself on a scratch copy of the script.
+test('agent bundle release verification',
+  _python3_test,
+  args: [files('test_build_agent_bundle_verify.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of

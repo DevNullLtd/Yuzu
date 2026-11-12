@@ -2228,6 +2228,7 @@ jobs:
         run: |
           bash scripts/build-agent-bundle.sh \
             --version "${{ steps.ref.outputs.version }}" \
+            --signer-repo "${{ github.repository }}" \
             --push
 
       - name: Resolve pushed image digest

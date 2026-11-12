@@ -26,7 +26,8 @@ The Windows (MSVC) and macOS (Apple Clang) agents **cannot be cross-built in a
 Linux Docker stage** — they require their native toolchains. So this image is
 not compiled: `scripts/build-agent-bundle.sh` downloads the Windows-signed /
 macOS-unsigned per-platform archives **and** native installers from the matching GitHub
-*release*, verifies them against the release `SHA256SUMS`, lays them out under
+*release*, authenticates the release `SHA256SUMS` (cosign signature, exact
+`release.yml` identity) and matches every download to its own line in it, lays them out under
 `/opt/yuzu-agents`, and bakes that tree into the chiselled image. This is the
 same provenance customers get from the Releases page — just packaged for
 `docker pull`.
@@ -35,7 +36,7 @@ Each triplet ships **both** forms:
 
 ```
 /opt/yuzu-agents/
-  README.txt              VERSION   SHA256SUMS   UPSTREAM-SHA256SUMS
+  README.txt   VERSION   SHA256SUMS   UPSTREAM-SHA256SUMS   UPSTREAM-SHA256SUMS.sigstore
   linux-x64/
     installers/   yuzu-agent_<v>_amd64.deb   yuzu-agent-<v>.x86_64.rpm
     payload/      bin/yuzu-agent  bin/libyuzu_agent_core.so  plugins/*.so
@@ -67,10 +68,22 @@ bash scripts/build-agent-bundle.sh --version 0.11.0 --push
 bash scripts/build-agent-bundle.sh --multiarch --push
 ```
 
-The script verifies all seven artifacts against the release `SHA256SUMS` and
-**refuses to build** on mismatch; when `gh` is present it also best-effort
-verifies the SLSA provenance attestation. Registry owner is derived from
-`origin` (override with `--registry`); image name with `--image-name`.
+The script first runs `cosign verify-blob` on the release's `SHA256SUMS`
+against `SHA256SUMS.sigstore` with the exact identity
+`https://github.com/<signer>/.github/workflows/release.yml@refs/tags/<tag>`
+(issuer `https://token.actions.githubusercontent.com`; never a regexp), and only
+then reads it: each of the seven artifacts must equal the hash on **its own**
+`SHA256SUMS` line (found by exact file name; a hash that appears only on another
+file's line is a failure). It **refuses to build** on any failure, including a
+missing `cosign` (required, no skip flag), a missing `.sigstore`, or a legacy
+release that carries only `SHA256SUMS.bundle`. The signer is a fixed table by
+version, not read from `origin`: `Tr3kkR/Yuzu` up to `v0.13.x`, `DevNullLtd/Yuzu`
+after the 2026-09-28 move (see `docs/user-manual/release-verification.md`);
+override with `--signer-repo owner/repo`. `--verify-only` downloads and verifies,
+then stops, with no docker needed. When `gh` is present the script also
+best-effort verifies the SLSA provenance attestation; that step does not gate the
+build. Registry owner is derived from `origin` (override with `--registry`);
+image name with `--image-name`.
 
 ### Version pinning
 
@@ -252,7 +265,11 @@ Every file is checksummed twice over:
 ```bash
 cd yuzu-agents
 sha256sum -c SHA256SUMS          # checksums of the laid-out tree
-# UPSTREAM-SHA256SUMS is the signed checksum manifest from the GitHub release.
+# UPSTREAM-SHA256SUMS is the checksum manifest from the GitHub release, which the
+# build verified before use; UPSTREAM-SHA256SUMS.sigstore is its cosign bundle:
+cosign verify-blob --bundle UPSTREAM-SHA256SUMS.sigstore \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v<version>" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com UPSTREAM-SHA256SUMS
 ```
 
 The Windows binaries are Authenticode-signed; that signature is embedded and

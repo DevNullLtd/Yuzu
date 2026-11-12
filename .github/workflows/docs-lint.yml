@@ -281,6 +281,13 @@ jobs:
       - name: Agent-only release lint
         run: python3 -I tests/test_release_agent_only.py
 
+      # Agent-bundle release verification (#7529): build-agent-bundle.sh
+      # verifies SHA256SUMS' cosign signature (exact identity per signing era)
+      # before use and matches each file to its own line. Offline: stub gh and
+      # cosign, asserts cosign's argv; mutation-tests itself. Stdlib only.
+      - name: Agent bundle release verification
+        run: python3 -I tests/test_build_agent_bundle_verify.py
+
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,
       # ratcheted against a by-name baseline that only

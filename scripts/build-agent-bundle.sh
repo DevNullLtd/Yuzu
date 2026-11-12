@@ -9,13 +9,24 @@
 # The Windows (MSVC) and macOS (Apple Clang) agents cannot be cross-built in a
 # Linux Docker stage, so this does NOT compile anything. It downloads the
 # signed/notarized per-platform archives + native installers from the matching
-# GitHub *release*, verifies them against the release SHA256SUMS, lays them out
-# under /opt/yuzu-agents, and bakes them into the chiselled image.
+# GitHub *release*, verifies the release SHA256SUMS' cosign signature (keyless,
+# exact workflow identity) and then each artifact against ITS OWN line in that
+# manifest, lays them out under /opt/yuzu-agents, and bakes them into the
+# chiselled image.
 #
 # Usage:
 #   bash scripts/build-agent-bundle.sh [--version X.Y.Z[-rcN]] [--push] [--multiarch]
 #                                      [--registry ghcr.io/owner] [--image-name NAME]
 #                                      [--no-test] [--keep-staging]
+#                                      [--signer-repo owner/repo] [--verify-only]
+#
+# --signer-repo   repo whose release.yml signed SHA256SUMS. Default is a fixed
+#                 table by version: <= 0.13.x Tr3kkR/Yuzu, later DevNullLtd/Yuzu
+#                 (the identity is baked into the Fulcio cert and not rewritten
+#                 by the repo move). Never derived from the checkout's origin.
+# --verify-only   download, verify the signature and every hash, then stop
+#                 (no docker, no build). Needs gh + cosign only.
+# cosign is REQUIRED; there is no skip flag (fail closed).
 #
 # Examples:
 #   bash scripts/build-agent-bundle.sh                       # build the default version locally
@@ -40,7 +51,8 @@ BUNDLE_ROOT="$STAGING/yuzu-agents"            # becomes /opt/yuzu-agents
 # ── Defaults / config ─────────────────────────────────────────────────────
 VERSION="${YUZU_VERSION:-0.15.0}"
 IMAGE_NAME="yuzu-agent-bundle-chisel"
-PUSH=0; MULTIARCH=0; RUN_TEST=1; KEEP_STAGING=0
+PUSH=0; MULTIARCH=0; RUN_TEST=1; KEEP_STAGING=0; VERIFY_ONLY=0; SIGNER_REPO=""
+STAGING_OWNED=0
 
 # REPO_SLUG drives THREE things: the registry namespace (below), `gh release
 # download` (:116) and `gh attestation verify` (:148). A wrong value silently
@@ -90,7 +102,10 @@ while [ $# -gt 0 ]; do
     --multiarch)   MULTIARCH=1; PUSH=1 ;;   # multi-platform images must be pushed
     --no-test)     RUN_TEST=0 ;;
     --keep-staging) KEEP_STAGING=1 ;;
-    -h|--help)     sed -n '2,33p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    --verify-only) VERIFY_ONLY=1 ;;
+    --signer-repo) [ $# -ge 2 ] || die "--signer-repo needs owner/repo"; SIGNER_REPO="$2"; shift ;;
+    --signer-repo=*) SIGNER_REPO="${1#*=}" ;;
+    -h|--help)     sed -n '2,37p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) die "unknown arg: $1" ;;
   esac
   shift
@@ -100,19 +115,54 @@ VERSION="${VERSION#v}"                 # normalise: store without leading v
 TAG="v${VERSION}"                      # release tag carries the v
 IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
 
+# ── Signer identity (hard-coded era table; NEVER derived from REPO_SLUG) ───
+# The Fulcio certificate SAN of a release's SHA256SUMS signature names the repo
+# that ran release.yml. That is fixed at build time: <= 0.13.x were signed as
+# Tr3kkR/Yuzu, the first release after the 2026-09-28 move (0.14.0-rc2) as
+# DevNullLtd/Yuzu (docs/user-manual/release-verification.md). A checkout's
+# origin (REPO_SLUG) can be a fork or the other era's name, so it must not
+# decide who we trust. Parsing is strict and bounded: X.Y.Z[-(alpha|beta|rc)N],
+# 1-4 digits per field, anything else is refused.
+parse_signer_repo() {
+  local v="$1" major minor
+  [[ "$v" =~ ^([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})(-(alpha|beta|rc)[0-9]{1,4})?$ ]] \
+    || return 1
+  major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]}))
+  if [ "$major" -eq 0 ] && [ "$minor" -le 13 ]; then
+    printf '%s' 'Tr3kkR/Yuzu'
+  else
+    printf '%s' 'DevNullLtd/Yuzu'
+  fi
+}
+[[ "$VERSION" =~ ^([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})(-(alpha|beta|rc)[0-9]{1,4})?$ ]] \
+  || die "malformed --version '$VERSION' (want X.Y.Z or X.Y.Z-{alpha,beta,rc}N, 1-4 digits per field)"
+if [ -z "$SIGNER_REPO" ]; then
+  SIGNER_REPO="$(parse_signer_repo "$VERSION")" || die "cannot derive the signer repo for version '$VERSION'; pass --signer-repo owner/repo"
+fi
+[[ "$SIGNER_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+  || die "malformed --signer-repo '$SIGNER_REPO' (want owner/repo)"
+SIGNER_IDENTITY="https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
+SIGNER_ISSUER="https://token.actions.githubusercontent.com"
+
 # ── Tooling ────────────────────────────────────────────────────────────────
 if command -v sha256sum >/dev/null 2>&1; then SHACHK="sha256sum"
 elif command -v shasum  >/dev/null 2>&1; then SHACHK="shasum -a 256"
 else die "need sha256sum or shasum on PATH"; fi
-command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
-command -v unzip  >/dev/null 2>&1 || die "need unzip on PATH (the windows archive is a .zip)"
+if [ "$VERIFY_ONLY" = 0 ]; then
+  command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+  command -v unzip  >/dev/null 2>&1 || die "need unzip on PATH (the windows archive is a .zip)"
+fi
+# cosign is mandatory: SHA256SUMS is only trustworthy once its signature is
+# verified, so a missing cosign is a hard stop, never a skipped check.
+command -v cosign >/dev/null 2>&1 || die "need cosign on PATH to verify SHA256SUMS' signature (no skip flag, by design) — https://docs.sigstore.dev/cosign/system_config/installation/ , 'brew install cosign', or 'winget install Sigstore.Cosign'"
 command -v gh >/dev/null 2>&1 || die "need the GitHub CLI (gh), authenticated, to download release assets — 'brew install gh && gh auth login'"
 
 DL=""; SMOKE_TMP=""
 cleanup() {
   [ -n "$DL" ] && rm -rf "$DL" 2>/dev/null || true
   [ -n "$SMOKE_TMP" ] && rm -rf "$SMOKE_TMP" 2>/dev/null || true
-  [ "${KEEP_STAGING:-0}" = 1 ] || rm -rf "$STAGING" 2>/dev/null || true
+  # Only the staging dir THIS run created (a --verify-only run never does).
+  if [ "${STAGING_OWNED:-0}" = 1 ] && [ "${KEEP_STAGING:-0}" != 1 ]; then rm -rf "$STAGING" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 
@@ -120,15 +170,18 @@ echo ""
 echo "╔══════════════════════════════════════════════════╗"
 echo "║  Yuzu agent-bundle (chiselled delivery image)     ║"
 echo "╚══════════════════════════════════════════════════╝"
-info "version=$VERSION  tag=$TAG  repo=$REPO_SLUG"
+info "version=$VERSION  tag=$TAG  repo=$REPO_SLUG  signer=$SIGNER_REPO"
 info "image=$IMAGE_REF  push=$PUSH  multiarch=$MULTIARCH"
 
 # ── 1. Download + verify release assets ────────────────────────────────────
 # Download by glob so we match GitHub's *canonical* asset names: GitHub
 # sanitises some characters on upload (e.g. the Debian '~' in 0.12.0~rc0 is
 # served as '.', so for releases before 0.14.0-rc3 the name in SHA256SUMS !=
-# the downloadable name; #5141 fixed that). We therefore verify by HASH
-# presence in the signed manifest, never by filename.
+# the downloadable name; #5141 fixed that). Trust is established in two steps:
+# (1) cosign verifies SHA256SUMS against SHA256SUMS.sigstore with the exact
+# release.yml identity, BEFORE the manifest is read for anything; (2) each
+# artifact's hash must equal the hash on ITS OWN line of that manifest, found by
+# exact name (with a unique, explicit `~`->`.` fallback for pre-0.14.0-rc3).
 DL="$(mktemp -d "${TMPDIR:-/tmp}/yuzu-agent-bundle.XXXXXX")"
 
 # The Windows and macOS archives are agent-only and named for it since
@@ -144,11 +197,34 @@ gh release download "$TAG" --repo "$REPO_SLUG" -D "$DL" --clobber \
   -p 'yuzu-windows-x64.zip' -p 'yuzu-macos-arm64.tar.gz' \
   -p 'yuzu-agent_*_amd64.deb' -p 'yuzu-agent-*.x86_64.rpm' \
   -p 'YuzuAgent-*-macos-arm64.pkg' -p 'YuzuAgentSetup-*.exe' \
-  -p 'SHA256SUMS' \
+  -p 'SHA256SUMS' -p 'SHA256SUMS.sigstore' -p 'SHA256SUMS.bundle' \
   || die "gh release download failed for $TAG (is gh authenticated? does $TAG exist?)"
 
+# ── Authenticate SHA256SUMS before ANY use of it ───────────────────────────
+if [ ! -s "$DL/SHA256SUMS.sigstore" ]; then
+  if [ -s "$DL/SHA256SUMS.bundle" ]; then
+    die "$TAG carries only the legacy SHA256SUMS.bundle (no SHA256SUMS.sigstore); this script verifies the .sigstore form only and will not trust an unverified SHA256SUMS — verify that release by hand per docs/user-manual/release-verification.md"
+  fi
+  die "no SHA256SUMS.sigstore on $TAG; refusing to trust SHA256SUMS without its signature"
+fi
+[ -s "$DL/SHA256SUMS" ] || die "no SHA256SUMS on $TAG"
+info "Verifying SHA256SUMS signature (cosign, identity $SIGNER_IDENTITY)..."
+if ! cosign verify-blob \
+      --bundle "$DL/SHA256SUMS.sigstore" \
+      --certificate-identity "$SIGNER_IDENTITY" \
+      --certificate-oidc-issuer "$SIGNER_ISSUER" \
+      "$DL/SHA256SUMS" 2>"$DL/cosign.err" >"$DL/cosign.out"; then
+  fail "cosign verify-blob FAILED for $TAG (expected signer $SIGNER_REPO):"
+  sed 's/^/     cosign: /' "$DL/cosign.err" >&2
+  die "SHA256SUMS signature did not verify; refusing to use it (wrong --signer-repo for this era, or a tampered release)"
+fi
+ok "SHA256SUMS signature verified (signer $SIGNER_REPO, $TAG)"
+
 # Resolve the installer filenames as actually downloaded (post-sanitisation).
-pick() { ( cd "$DL" && ls $1 2>/dev/null | head -1 ); }
+# `|| true`: with pipefail a pattern that matches nothing (the old archive names
+# on a new release, or the reverse) would otherwise kill the script silently
+# at the assignment instead of reaching the fallback / the named die below.
+pick() { ( cd "$DL" && ls $1 2>/dev/null | head -1 ) || true; }
 DEB="$(pick 'yuzu-agent_*_amd64.deb')"
 RPM="$(pick 'yuzu-agent-*.x86_64.rpm')"
 PKG="$(pick 'YuzuAgent-*-macos-arm64.pkg')"
@@ -157,24 +233,53 @@ EXE="$(pick 'YuzuAgentSetup-*.exe')"
 [ -n "$RPM" ] || die "no .rpm installer asset on $TAG"
 [ -n "$PKG" ] || die "no .pkg installer asset on $TAG"
 [ -n "$EXE" ] || die "no Windows installer asset on $TAG"
-[ -s "$DL/SHA256SUMS" ] || die "no SHA256SUMS on $TAG"
 WIN_ZIP="$(pick 'yuzu-agent-windows-x64.zip')"; [ -n "$WIN_ZIP" ] || WIN_ZIP="$(pick 'yuzu-windows-x64.zip')"
 MAC_TGZ="$(pick 'yuzu-agent-macos-arm64.tar.gz')"; [ -n "$MAC_TGZ" ] || MAC_TGZ="$(pick 'yuzu-macos-arm64.tar.gz')"
 [ -n "$WIN_ZIP" ] || die "no Windows archive on $TAG"
 [ -n "$MAC_TGZ" ] || die "no macOS archive on $TAG"
 ARCHIVES="yuzu-linux-x64.tar.gz $WIN_ZIP $MAC_TGZ"
 
-# Verify every artifact by checking its sha256 appears in the signed manifest.
+# sums_hashes <name> [sanitised]: print the hash of every SHA256SUMS line whose
+# name field equals <name> exactly (fixed-string compare, no regex, no globbing;
+# the name comes in via ENVIRON so awk -v escape processing never touches it).
+# A line is `<64 hex>` + two spaces (text) or space + `*` (binary marker) +
+# name. With `sanitised`, the line's `~` is read as `.` (GitHub served `~` as
+# `.` before 0.14.0-rc3, #5141), so the downloaded name can be compared.
+sums_hashes() {
+  WANT="$1" MODE="${2:-exact}" awk '
+    BEGIN { want = ENVIRON["WANT"]; san = (ENVIRON["MODE"] == "sanitised") }
+    length($0) > 66 && substr($0, 65, 1) == " " && (substr($0, 66, 1) == " " || substr($0, 66, 1) == "*") {
+      name = substr($0, 67)
+      if (san) gsub(/~/, ".", name)
+      if (name == want) print substr($0, 1, 64)
+    }' "$DL/SHA256SUMS"
+}
+
+# Verify one artifact against ITS OWN line of the (already authenticated)
+# manifest: exactly one name match, a 64 lower-case-hex hash, equal to ours.
 verify_hash() {
-  local f="$1" h
+  local f="$1" h want matches n
   [ -s "$DL/$f" ] || die "download missing or empty: $f"
   h="$($SHACHK "$DL/$f" | awk '{print $1}')"
-  grep -qi "^${h}  " "$DL/SHA256SUMS" \
-    || die "NOT in signed SHA256SUMS (corrupt or tampered): $f"
+  matches="$(sums_hashes "$f" exact)"
+  if [ -z "$matches" ]; then
+    matches="$(sums_hashes "$f" sanitised)"
+    [ -n "$matches" ] || die "no line for $f in SHA256SUMS (a hash on another file's line does not count)"
+  fi
+  n="$(printf '%s\n' "$matches" | wc -l | tr -d ' ')"
+  [ "$n" = 1 ] || die "ambiguous: $n SHA256SUMS lines match the name $f"
+  want="$matches"
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "malformed hash on the SHA256SUMS line for $f"
+  [ "$h" = "$want" ] || die "hash MISMATCH against its own SHA256SUMS line (corrupt or tampered): $f"
 }
-info "Verifying downloads against the signed release SHA256SUMS (by hash)..."
+info "Verifying each download against its own line of the authenticated SHA256SUMS..."
 for a in $ARCHIVES "$DEB" "$RPM" "$PKG" "$EXE"; do verify_hash "$a"; done
-ok "All 7 artifacts verified against the signed release SHA256SUMS"
+ok "All 7 artifacts match their own SHA256SUMS line (manifest signature verified)"
+
+if [ "$VERIFY_ONLY" = 1 ]; then
+  ok "--verify-only: $TAG verified (signer $SIGNER_REPO); stopping before any build"
+  exit 0
+fi
 
 # Best-effort provenance attestation (does not gate the build).
 if gh attestation verify "$DL/yuzu-linux-x64.tar.gz" --repo "$REPO_SLUG" >/dev/null 2>&1; then
@@ -186,6 +291,7 @@ fi
 # ── 2. Lay out the /opt/yuzu-agents tree ───────────────────────────────────
 info "Laying out the bundle tree..."
 [ "$KEEP_STAGING" = 1 ] || rm -rf "$STAGING"
+STAGING_OWNED=1
 mkdir -p "$BUNDLE_ROOT"
 
 # extract_payload <platform> <archive> <unpacker> : strips yuzu-server, keeps
@@ -226,6 +332,7 @@ cp "$DL/$RPM" "$BUNDLE_ROOT/linux-x64/installers/"
 cp "$DL/$PKG" "$BUNDLE_ROOT/macos-arm64/installers/"
 cp "$DL/$EXE" "$BUNDLE_ROOT/windows-x64/installers/"
 cp "$DL/SHA256SUMS" "$BUNDLE_ROOT/UPSTREAM-SHA256SUMS"
+cp "$DL/SHA256SUMS.sigstore" "$BUNDLE_ROOT/UPSTREAM-SHA256SUMS.sigstore"
 printf '%s\n' "$VERSION" > "$BUNDLE_ROOT/VERSION"
 
 # ── 3. READMEs (per-OS install + how to point at the gateway) ───────────────
@@ -263,7 +370,13 @@ your gateway. For a no-TLS demo stack the raw payload (which lets you pass
 Integrity
 ----------------------------------------------------------------------------
   SHA256SUMS           checksums of every file in THIS tree
-  UPSTREAM-SHA256SUMS  the signed checksums from the ${TAG} GitHub release
+  UPSTREAM-SHA256SUMS  the checksums from the ${TAG} GitHub release; this
+                       script verified them before use (cosign, signer
+                       ${SIGNER_REPO}, release.yml @ ${TAG})
+  UPSTREAM-SHA256SUMS.sigstore  the cosign bundle for that file. Re-verify:
+    cosign verify-blob --bundle UPSTREAM-SHA256SUMS.sigstore \\
+      --certificate-identity ${SIGNER_IDENTITY} \\
+      --certificate-oidc-issuer ${SIGNER_ISSUER} UPSTREAM-SHA256SUMS
   Verify:  cd yuzu-agents && sha256sum -c SHA256SUMS
 EOF
 
