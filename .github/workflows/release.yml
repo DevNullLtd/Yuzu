@@ -731,11 +731,13 @@ jobs:
         shell: pwsh
         run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
 
-      # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
-      # persist on the self-hosted Windows runner between jobs. The
-      # original cache/restore@v5 calls were already restore-only —
-      # local persistence delivers the same restore semantics without
-      # any GHA round-trip. Issue #569.
+      # ccache (~\AppData\Local\ccache) persists on the self-hosted
+      # Windows runner between jobs (the original cache/restore@v5 calls
+      # were already restore-only — local persistence delivers the same
+      # restore semantics without any GHA round-trip, issue #569).
+      # vcpkg_installed/ does NOT persist for this job: the default
+      # clean: true checkout runs git clean -ffdx, so every release run
+      # installs its own agent-only tree.
       - name: Reset ccache stats
         run: ccache -z
 
@@ -905,8 +907,9 @@ jobs:
           # vcpkg profile regressed. The patterns cover the nine DLLs that a full x64-windows vcpkg
           # tree has and an agent-only one lacks (measured on a real tree): drogon, jsoncpp,
           # libecpg, libecpg_compat, libpgtypes, libpq, libxmlsec1, libxmlsec1-openssl, trantor.
-          # UNVERIFIED on a release: this check has not yet run on a real release tag (a Windows
-          # rehearsal exercises it); until then it is lexically pinned, not operationally proven.
+          # UNVERIFIED on a release: this check ran in the ADR-0035 step-3 Windows rehearsal (not a
+          # release) and has not yet run on a real release tag; until then it is lexically pinned and
+          # rehearsed, not operationally proven.
           $serverDlls = @(Get-ChildItem -Path $top.FullName -Recurse -File -Include "libpq*.dll", "libecpg*.dll", "libpgtypes*.dll", "drogon*.dll", "trantor*.dll", "jsoncpp*.dll", "*xmlsec*.dll" | ForEach-Object { $_.Name })
           if ($serverDlls.Count -gt 0) { Write-Error "server-only DLLs in the agent archive: $($serverDlls -join ', ')"; exit 1 }
           $built = @(Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse).Count
@@ -1713,19 +1716,20 @@ jobs:
   # Postgres 16 + pgvector + app role/db init (ADR-0006/0007/0008, #1318).
   # Mirrors docker-publish (login / metadata / SBOM / attestation / cosign)
   # with three differences:
-  #   1. No needs on build-linux/build-gateway — the image contains no Yuzu
-  #      build artifacts (it's postgres + pgvector + init SQL), so a core
-  #      build failure is irrelevant to it. It does wait for build-windows
-  #      and build-macos, purely as ordering: no :X.Y.Z image is pushed for a
-  #      release whose agent packaging fails (ADR-0035 step 3, UP-12). It IS in the release job's
-  #      needs: the composes release-pin ghcr.io/.../yuzu-postgres:X.Y.Z,
-  #      so a release must not publish if this image failed to.
+  #   1. The image contains no Yuzu build artifacts (it's postgres + pgvector
+  #      + init SQL), so no build is an INPUT to it. It still waits for all
+  #      four builds (build-linux, build-gateway, build-windows, build-macos),
+  #      purely as a success gate: no :X.Y.Z image is pushed for a release
+  #      whose server or agent packaging fails (ADR-0035 step 3, UP-12; owner
+  #      decision 2026-11-12). It IS in the release job's needs: the composes
+  #      release-pin ghcr.io/.../yuzu-postgres:X.Y.Z, so a release must not
+  #      publish if this image failed to.
   #   2. amd64-only today: the QEMU arm64 leg was dropped (see the buildx
   #      step); the demo/viz rigs would need it back.
   #   3. Distinct local buildcache path (postgres suffix).
   docker-publish-postgres:
     name: "Publish postgres image"
-    needs: [release-guard, build-windows, build-macos]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 60
     permissions:

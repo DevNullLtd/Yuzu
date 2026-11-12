@@ -145,8 +145,9 @@ with `-ExecutionPolicy Bypass`, but not command text.
 ## Server tests are Linux-only
 
 The server is not built on Windows (ADR-0035), so there is no server test
-suite here: `meson test -C build-windows --suite server` reports "No suitable
-tests defined" and exits 0, which is a no-op, not a pass. Run the agent tests
+suite here: `meson test -C build-windows --suite server` runs only the five
+Node-script tests that also carry the `server` label (they need no server
+binary and skip without node), which is not server coverage. Run the agent tests
 with `meson test -C build-windows --suite agent --print-errorlogs`, and the
 server tests on Linux. The old libpq.dll-on-PATH setup is no longer needed.
 
@@ -155,5 +156,6 @@ ladder step 2) bundles every DLL in `vcpkg_installed/x64-windows/bin`. Since
 ladder step 3 the release install is agent-only, so the server ports' DLLs
 (`libpq`, `libecpg`, `libecpg_compat`, `libpgtypes`, `drogon`, `trantor`,
 `jsoncpp`, `libxmlsec1`, `libxmlsec1-openssl`) are not installed and not
-shipped, and the release job's archive check fails if any of them appears in
-the archive. That check has not yet run on a real release.
+shipped, and `release.yml`'s `build-windows` step "Verify the agent runs from
+the packaged archive" fails if any of them appears in the archive. That step
+has not yet run on a real release tag.

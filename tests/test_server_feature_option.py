@@ -15,9 +15,9 @@ Lexical (always runs, stdlib only):
   it ("Unknown options"), even with --wipe, so its removal is a planned
   wipe-or-rename event (ADR-0035 step 4), never a quiet cleanup.
 - meson.build derives `build_server` from the feature with
-  `disable_auto_if(host_machine.system() != 'linux')`, errors on
+  `disable_auto_if(_server_host != 'linux')`, errors on
   `-Dserver=enabled` for a non-Linux target and on `enabled` contradicting a
-  stored `build_server=false`, still ANDs in the deprecated boolean, and does
+  passed or stored `build_server=false`, still ANDs in the deprecated boolean, and does
   all of that before the first dependency lookup (so a non-Linux
   misconfiguration fails with the ADR message, not a missing-package error).
   No other meson.build reads either option.
@@ -47,10 +47,11 @@ BUILD = ROOT / "meson.build"
 SETUP = ROOT / "scripts" / "setup.sh"
 GATING = ROOT / "tests" / "shell" / "test_build_examples_gating.sh"
 
-DERIVE = "_server_opt = get_option('server').disable_auto_if(host_machine.system() != 'linux')"
+HOST_LOWER = "_server_host = host_machine.system().to_lower()"
+DERIVE = "_server_opt = get_option('server').disable_auto_if(_server_host != 'linux')"
 ASSIGN = "build_server   = _server_opt.allowed() and get_option('build_server')"
 NON_LINUX_ERROR = re.compile(
-    r"^if _server_opt\.enabled\(\) and host_machine\.system\(\) != 'linux'\n"
+    r"^if _server_opt\.enabled\(\) and _server_host != 'linux'\n"
     r"  error\('-Dserver=enabled: the Yuzu server is Linux-only[^\n]*\)\n"
     r"endif$", re.M)
 CONTRADICTION_ERROR = re.compile(
@@ -79,7 +80,7 @@ def problems(options: str, build: str, other_builds: dict) -> list:
     legacy = option_line(options, "build_server")
     if not legacy:
         found.append("meson.options: `build_server` is gone; deleting it breaks every build dir "
-                     "that stored it (ADR-0035 step 4 plans that, with the dirs wiped or renamed)")
+                     "that stored it (ADR-0035 step 4 plans that, with the dirs deleted or renamed)")
     else:
         if not re.search(r"type: 'boolean'", legacy) or not re.search(r"value: true\b", legacy):
             found.append("meson.options: `build_server` must stay a boolean defaulting to true")
@@ -87,15 +88,22 @@ def problems(options: str, build: str, other_builds: dict) -> list:
             found.append("meson.options: `build_server` must stay deprecated: true")
 
     code = "\n".join(l for l in build.splitlines() if not l.lstrip().startswith("#"))
+    # Meson keeps a cross file's `system = 'Linux'` verbatim: the comparison must be on a lowercased copy.
+    if code.count(HOST_LOWER) != 1:
+        found.append("meson.build: _server_host must be host_machine.system().to_lower(), assigned once")
+    # No raw (case-preserving) host_machine.system() use between that line and the feature summary's end.
+    i, j = code.find(HOST_LOWER), code.find("build_examples = get_option('build_examples')")
+    if i != -1 and j > i and "host_machine.system()" in code[i + len(HOST_LOWER):j]:
+        found.append("meson.build: the server guard must use _server_host, not a raw host_machine.system()")
     if code.count(DERIVE) != 1:
         found.append("meson.build: the server feature must be derived exactly once with "
-                     "disable_auto_if(host_machine.system() != 'linux')")
+                     "disable_auto_if(_server_host != 'linux')")
     if code.count(ASSIGN) != 1:
         found.append("meson.build: build_server must be `_server_opt.allowed() and get_option('build_server')`")
     if len(NON_LINUX_ERROR.findall(code)) != 1:
         found.append("meson.build: -Dserver=enabled on a non-Linux target must be a configure error")
     if len(CONTRADICTION_ERROR.findall(code)) != 1:
-        found.append("meson.build: -Dserver=enabled with a stored build_server=false must be a configure error")
+        found.append("meson.build: -Dserver=enabled with a passed or stored build_server=false must be a configure error")
     # Any indentation: an assignment inside an `if` after the guard re-decides the value.
     if len(re.findall(r"^\s*build_server\s*=(?!=)", code, re.M)) != 1:
         found.append("meson.build: build_server must be assigned exactly once")
@@ -142,9 +150,11 @@ class ServerFeatureOptionLexical(unittest.TestCase):
             "build_server deleted": ("options", "option('build_server',", "option('build_server_x',"),
             "build_server not deprecated": ("options", "value: true,  deprecated: true,", "value: true,"),
             "build_server default false": ("options", "type: 'boolean', value: true,  deprecated: true", "type: 'boolean', value: false, deprecated: true"),
-            "auto not disabled off-Linux": ("build", ".disable_auto_if(host_machine.system() != 'linux')", ""),
-            "auto disabled on Linux": ("build", "disable_auto_if(host_machine.system() != 'linux')", "disable_auto_if(host_machine.system() == 'linux')"),
-            "non-Linux enabled error dropped": ("build", "if _server_opt.enabled() and host_machine.system() != 'linux'\n  error(", "if _server_opt.enabled() and host_machine.system() != 'linux'\n  warning("),
+            "cross-file case kept verbatim": ("build", HOST_LOWER, "_server_host = host_machine.system()"),
+            "guard reads the raw system": ("build", "if not build_server and _server_host != 'linux'", "if not build_server and host_machine.system() != 'linux'"),
+            "auto not disabled off-Linux": ("build", ".disable_auto_if(_server_host != 'linux')", ""),
+            "auto disabled on Linux": ("build", "disable_auto_if(_server_host != 'linux')", "disable_auto_if(_server_host == 'linux')"),
+            "non-Linux enabled error dropped": ("build", "if _server_opt.enabled() and _server_host != 'linux'\n  error(", "if _server_opt.enabled() and _server_host != 'linux'\n  warning("),
             "contradiction error dropped": ("build", "if _server_opt.enabled() and not get_option('build_server')\n  error(", "if _server_opt.enabled() and not get_option('build_server')\n  message("),
             "deprecated boolean ignored": ("build", ASSIGN, "build_server   = _server_opt.allowed()"),
             "boolean alone decides": ("build", ASSIGN, "build_server   = get_option('build_server')"),
@@ -198,7 +208,8 @@ def setup_problems(setup: str, gating: str) -> list:
     if len(resets) != 1 or not resets[0].startswith("VCPKG_INSTALL_ARGS=("):
         found.append("setup.sh: VCPKG_INSTALL_ARGS must be declared once and only appended to (+=) afterwards")
     if len(uses) != 4:
-        found.append(f"setup.sh: VCPKG_INSTALL_ARGS has {len(uses)} uses, expected 4 (declare, --triplet, agent-only, invoke)")
+        found.append(f"setup.sh: VCPKG_INSTALL_ARGS has {len(uses)} uses, expected 4 (declare, --triplet, agent-only, invoke); "
+                     "a deliberate new use is a reviewed edit of this count and of setup_problems()'s other pins, not a bypass")
     if re.search(r"\bif\b[^\n]*\$TESTS", block):
         found.append("setup.sh: --x-feature=tests must not be conditional on --tests off Linux")
     if '"yuzu-server" in names' not in gating or 'uname_s != "Linux"' not in gating:
@@ -291,6 +302,16 @@ class ServerFeatureOptionBehaviour(unittest.TestCase):
         # An explicit -Dserver=disabled is the supported spelling: no deprecation nag.
         out = self.configure("linux", "-Dserver=disabled", "-Dbuild_server=false")
         self.assertNotIn("deprecated -Dbuild_server=false is set", out)
+
+    def test_cross_file_system_case_is_ignored(self):
+        # Meson keeps a cross file's `system = 'Linux'` verbatim (no warning):
+        # the server must still be ON, and a capitalised non-Linux still off.
+        out = self.configure("Linux")
+        self.assertRegex(out, r"dependency|Dependency", out[-2000:])
+        self.assertNotIn("Server: off", out)
+        self.assertNotIn("Linux-only and cannot be built", out)
+        out = self.configure("Windows", "-Dserver=enabled")
+        self.assertIn("cannot be built for a windows target", out)
 
     def test_linux_auto_does_not_turn_the_server_off(self):
         out = self.configure("linux")

@@ -287,7 +287,7 @@ def problems(release: str, check: str, bundle: str) -> list:
             continue
         m = re.search(r"^    needs:\s*\[([^\]]*)\]", dp, re.M)
         dp_needs = {n.strip() for n in m.group(1).split(",")} if m else set()
-        for dep in ("build-windows", "build-macos"):
+        for dep in ("build-linux", "build-gateway", "build-windows", "build-macos"):
             if dep not in dp_needs:
                 found.append(f"{pub} does not need {dep} (needs: {sorted(dp_needs)})")
         if re.search(r"^    if:", dp, re.M):
@@ -331,7 +331,9 @@ class ReleaseAgentOnly(unittest.TestCase):
             "docker-publish stops waiting for windows": ("release", "needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]", "needs: [release-guard, build-linux, build-gateway, build-macos]"),
             "docker-publish stops waiting for macos": ("release", "needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]", "needs: [release-guard, build-linux, build-gateway, build-windows]"),
             "chisel stops waiting for windows": ("release", "needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]\n    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]\n    # Job-level", "needs: [release-guard, build-linux, build-gateway, build-macos]\n    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]\n    # Job-level"),
-            "postgres stops waiting for windows": ("release", "needs: [release-guard, build-windows, build-macos]", "needs: [release-guard, build-macos]"),
+            "postgres stops waiting for windows": ("release", 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]', 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-gateway, build-macos]'),
+            "postgres stops waiting for linux": ("release", 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]', 'name: "Publish postgres image"\n    needs: [release-guard, build-gateway, build-windows, build-macos]'),
+            "postgres stops waiting for gateway": ("release", 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]', 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-windows, build-macos]'),
             "windows server flag dropped": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false"),
             "macos server flag dropped": ("release", "            -Dserver=disabled \\\n            -Db_lto=true", "            -Db_lto=true"),
             "windows server flag doubled": ("release", "-Dserver=disabled\n", "-Dserver=disabled `\n            -Dserver=disabled\n"),
@@ -464,8 +466,13 @@ def find_pwsh():
     return exe if r.returncode == 0 and "ok" in r.stdout else None
 
 
-# Lowercase names only: on Linux pwsh `-Include` matches case-sensitively, on
-# Windows it does not, so a mixed-case fixture would test the host, not the step.
+# Probed ONCE: the skip decorator, the prerequisite check and setUp all read this
+# value, so a pwsh that fails its first call cannot skip the class while the
+# required-mode check separately finds it working (G8-UP-1).
+_PWSH = find_pwsh()
+
+# Lowercase names are enough: pwsh `-Include` is case-INSENSITIVE on every OS
+# (verified on Linux pwsh), so mixed case would not test the step any harder.
 REFUSAL_CASES = (
     ("clean", ("bin/yuzu-agent.exe", "bin/zlib1.dll", "plugins/x/x.dll"), []),
     ("top-level libpq", ("bin/yuzu-agent.exe", "bin/libpq.dll"), ["libpq.dll"]),
@@ -473,6 +480,8 @@ REFUSAL_CASES = (
      ["libxmlsec1-openssl.dll"]),
     ("ecpg and pgtypes", ("bin/libecpg.dll", "bin/libpgtypes.dll"),
      ["libecpg.dll", "libpgtypes.dll"]),
+    ("drogon, trantor and jsoncpp", ("bin/yuzu-agent.exe", "bin/drogon.dll", "plugins/x/trantor.dll", "bin/jsoncpp.dll"),
+     ["drogon.dll", "trantor.dll", "jsoncpp.dll"]),
 )
 
 
@@ -487,16 +496,16 @@ class _PrereqCheck(unittest.TestCase):
         if not _REQUIRE_PWSH:
             self.skipTest("YUZU_REQUIRE_PWSH_TEST is not set")
         self.assertIsNotNone(yaml, "YUZU_REQUIRE_PWSH_TEST=1 but PyYAML is not importable")
-        self.assertTrue(find_pwsh(), "YUZU_REQUIRE_PWSH_TEST=1 but no working pwsh on PATH")
+        self.assertTrue(_PWSH, "YUZU_REQUIRE_PWSH_TEST=1 but no working pwsh on PATH")
 
 
 @unittest.skipUnless(yaml is not None, "PyYAML not installed")
-@unittest.skipUnless(find_pwsh(), "no working pwsh on PATH")
+@unittest.skipUnless(_PWSH, "no working pwsh on PATH")
 class ServerDllRefusalBehaviour(unittest.TestCase):
     """Runs the real refusal from release.yml (ADR-0035 step 3, QE-2)."""
 
     def setUp(self):
-        self.pwsh = find_pwsh()
+        self.pwsh = _PWSH
         self.release = RELEASE.read_text(encoding="utf-8")
 
     def check_cases(self, release_text):

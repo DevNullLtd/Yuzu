@@ -443,12 +443,12 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
 
    *Status: done — #TBD.* As implemented, with these deviations and additions:
    - **Option name: `server`** (feature, default `auto`). `auto` builds the server on a Linux
-     target (judged by `host_machine.system()`, so a Linux-target cross build from any host stays
-     legal) and is off for any other target; `-Dserver=enabled` on a non-Linux target is a
+     target (judged by `host_machine.system()` lowercased, because Meson keeps a cross file's
+     `system = 'Linux'` verbatim; so a Linux-target cross build from any host stays legal) and is off for any other target; `-Dserver=enabled` on a non-Linux target is a
      configure error carrying the ADR message; `disabled` never builds it.
    - **`build_server` is KEPT, deprecated** (`deprecated: true`, default `true`), still honoured
-     as an extra off-switch, and `-Dserver=enabled` together with a stored `build_server=false`
-     is an error. Deleting it would break every build dir and branch that stored or passes it;
+     as an extra off-switch, and `-Dserver=enabled` together with a passed or stored
+     `build_server=false` is an error. Deleting it would break every build dir and branch that stored or passes it;
      its removal is owned by step 4, with the build-dir wipe (step 4's text now says so). On
      Linux, a server turned off only by the deprecated boolean says so at configure.
    - **vcpkg choice.** The manifest default is unchanged (`server` and `tests` stay default
@@ -461,8 +461,9 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      The agent Dockerfiles use `-Dserver=disabled`. Each Wee Tam runner keeps its own persistent
      `vcpkg_installed/x64-windows` tree; the CI, nightly and CodeQL Windows jobs share the
      `+tests` agent-only profile on it, and `release.yml` (a clean checkout, no `tests`) installs
-     its own. The reverse reconcile (a full tree down to agent-only) is expected but unexercised
-     on Windows.
+     its own. The reverse reconcile (a full tree down to agent-only) was exercised on Windows in
+     the rehearsal below (one non-healing case: a kill while removing libpq); it has not been
+     exercised on macOS.
    - **No server switch in CI.** The Windows and macOS `ci.yml` legs, nightly Windows ASan and
      CodeQL Windows pass no `-Dserver` at all (`auto` is already off there), because a stored
      non-default option in a persistent build dir breaks an older branch's reconfigure.
@@ -481,10 +482,23 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    - **Not yet verified.** The release-time DLL refusal has never run on a real release (it
      ran in the Windows rehearsal below, which is not a release), nothing was run on macOS
      (no box), and the added publish wait below is untimed. If the refusal fails on
-     a release tag, nothing is pushed: `docker-publish`, `docker-publish-chisel` and
-     `docker-publish-postgres` now all need `build-windows` and `build-macos` (UP-12, pinned in `tests/test_release_agent_only.py`), so a failed agent
-     packaging step pushes no versioned image (the postgres image no longer publishes in parallel with the builds). An RC tag still has to confirm the
-     added wait (the images now start after the slowest agent build, ~40 min).
+     a release tag, no image is pushed (the build jobs' attestations and workflow artifacts are
+     still recorded): `docker-publish`, `docker-publish-chisel` and
+     `docker-publish-postgres` all need `build-windows` and `build-macos` (UP-12, pinned in
+     `tests/test_release_agent_only.py`), so a failed agent packaging step pushes no versioned
+     image. The first release tag after this change (an RC by plan) has to confirm the added wait
+     (the images now start after the slowest agent build, ~40 min).
+   - **Release publish coupling (owner decision, 2026-11-12; wording pending the owner's
+     confirmation).** The three image-publish jobs (`docker-publish`, `docker-publish-chisel`,
+     `docker-publish-postgres`) need `build-windows` and `build-macos`, and
+     `docker-publish-postgres` also needs `build-linux` and `build-gateway` (it needs no build
+     as an input; the jobs are success gates). Why: no `:X.Y.Z` image may exist for a release whose
+     agent packaging refused (UP-12). Costs: the images start only after the slowest agent build
+     (~40 min, untimed until an RC), and a failed or cancelled Windows or macOS build blocks every
+     image and the GitHub Release. Recovery: fix the cause and re-tag, or "Re-run failed jobs" on
+     the newest run for the tag (a server-DLL refusal is deterministic, so re-running without
+     fixing the Wee Tam vcpkg tree fails the same way). There is no sanctioned images-only publish
+     path today (tracked separately).
    - **Interim gap until step 5: no native server stack on macOS.** `scripts/start-UAT.sh`
      and the native-stack phases of `/test` need a server binary, which macOS no longer
      builds; run the Linux stack (containers) instead.
@@ -493,7 +507,8 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      `tests/test_release_agent_only.py` and `scripts/ci/test_runner_health_check.py` move to the
      new switch and the install opt-out.
    - Proof: static pins plus a Windows rehearsal on a build box (not a CI run, not a release;
-     the first stable tag after this change is the first real run of the changed release jobs).
+     the first release tag after this change, an RC by plan, is the first real run of the changed
+     release jobs).
      Rehearsal (2026-11-12, Windows 11 build box, MSVC 19.44, Meson 1.11.1, pwsh 7.6, scratch
      clones and a scratch vcpkg copy and binary cache; workflow step bodies extracted from the
      YAML, never retyped):
@@ -514,7 +529,9 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
        kill while vcpkg is REMOVING libpq (full to agent-only) leaves libpq `purge ok
        half-installed` with part of its files on disk, and re-running the agent-only install
        does not finish the purge (3 of 3). `libpq.dll` was already gone each time, a
-       pre-step-3 configure still fails loudly, and the archive refusal catches any surviving
+       pre-step-3 build still fails loudly (a debug build at configure, measured; a release
+       build likely at compile, since `lib/libpq.lib` survives and `include/libpq-fe.h` does
+       not), and the archive refusal catches any surviving
        DLL; the remedy is to delete `vcpkg_installed` (or run a full install) and re-run
        `setup.sh` (`docs/windows-build.md`).
      - Persistent build dirs alternated between this change and its parent (`ci.yml`'s

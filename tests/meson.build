@@ -4649,7 +4649,7 @@ endif
 # only when build_server is on, which since ADR-0035 ladder step 3 means a Linux target only (the
 # `server` feature option is off for any other target), so it runs on the Linux legs only; its `.exe`
 # probe, MSYS2_ARG_CONV_EXCL and cygpath handling serve no supported build now and can go when the
-# server's Windows code is removed (ADR-0035 step 5). Suite 'platform', not a bare 'server':
+# server's Windows code is removed (ADR-0035 step 4). Suite 'platform', not a bare 'server':
 # scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate labelled
 # only 'server' would fail that check on any leg that registers it.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server

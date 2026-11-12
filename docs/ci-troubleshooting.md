@@ -682,7 +682,8 @@ rollback also needs them re-provisioned.
 `--suite ['server-nonpg'] matched ZERO entries` is a branch whose workflow
 selects server suites against an agent-only build dir. That cannot happen
 with the renamed dirs; if it does, a build dir was copied or a
-`-Dbuild_server` or `-Dserver` value was set by hand — wipe that dir.
+`-Dbuild_server` or `-Dserver` value was set by hand — delete that build dir
+(`rm -rf`; `--wipe` replays the stored options and does not clear it) and configure again.
 
 ---
 

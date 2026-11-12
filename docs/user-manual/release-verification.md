@@ -174,7 +174,8 @@ A finding in a component the archive does not contain does not apply to it.
 Since ADR-0035 step 3 the Windows and macOS builds install only the agent's
 dependencies, so the server's dependencies (`libpq`, `drogon`, `xmlsec`) are no
 longer installed on those build machines and the Windows agent archive carries
-none of their DLLs (the release job refuses an archive that does). What a
+none of their DLLs (the Windows release build's "Verify the agent runs from the packaged archive" step
+refuses an archive that does; it has not yet run on a real release tag). What a
 given release's SBOM lists beyond the archive is not asserted here: inspect the
 SBOM of the release you verify.
 
