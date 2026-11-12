@@ -142,10 +142,11 @@ message GuaranteedStateEvent {
   // by a wrong clock, can make a later boot claim a lower or equal epoch, and two processes
   // can hold the same one. `emit_seq` is the 1-based ordinal drawn where the agent decides
   // queue order, strictly increasing within one `boot_epoch` of one process. The server
-  // compares (boot_epoch, emit_seq) lexicographically only between two events that both carry
-  // a pair, treats a lower pair as a regression candidate rather than proof of order, and
-  // holds an unpaired event against a paired verdict (docs/spark-flip-gate.md, UP-14). Both
-  // are ordinals, NOT timestamps, and NEITHER is compared by stored_event_matches.
+  // stores the pair on the event and census rows and counts unpaired events per agent; a
+  // comparator that uses it only between two events that both carry a pair, and treats a
+  // lower pair as a regression candidate rather than proof of order, is a later server
+  // change (docs/spark-flip-gate.md, UP-14). Both are ordinals, NOT timestamps, and
+  // NEITHER is compared by stored_event_matches.
   uint64 boot_epoch = 24;
   uint64 emit_seq = 25;
 }
