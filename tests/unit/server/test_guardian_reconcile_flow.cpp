@@ -101,7 +101,8 @@ enum class ScopeOutcome {
     // them today; the flow must still treat each as an untrusted read and abort.
     PrincipalUnresolved,
     OwnerCheckFailed,
-    PresenceDegraded
+    PresenceDegraded,
+    ResultSetUnusable
 };
 
 struct SentPush {
@@ -261,6 +262,9 @@ public:
                 case ScopeOutcome::PresenceDegraded:
                     return std::unexpected(
                         ScopeEvalError{ScopeEvalError::Kind::PresenceDegraded, "presence down"});
+                case ScopeOutcome::ResultSetUnusable:
+                    return std::unexpected(
+                        ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusable, "rs-1"});
                 }
                 return false;
             },
@@ -1016,6 +1020,7 @@ TEST_CASE("GuardianReconcileFlow: any scope error kind except Unresolvable abort
         {"presence_degraded", ScopeOutcome::PresenceDegraded, "presence_degraded"},
         {"principal_unresolved", ScopeOutcome::PrincipalUnresolved, "principal_unresolved"},
         {"owner_check_failed", ScopeOutcome::OwnerCheckFailed, "owner_check_failed"},
+        {"result_set_unusable", ScopeOutcome::ResultSetUnusable, "result_set_unusable"},
     };
     for (const auto& k : kinds) {
         DYNAMIC_SECTION(k.name) {
