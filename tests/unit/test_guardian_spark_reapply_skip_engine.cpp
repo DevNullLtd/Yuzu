@@ -3167,6 +3167,8 @@ TEST_CASE("#5719 engine: the full_sync rebuild line reports first_attach, then r
 // Mutations: drop forced_rebuilds_ (the rule shows key_busy or first_attach: red); consult
 // forced_rebuilds_ only for a first_attach (the io-class key_busy shows: red); record the forced
 // reason for one sibling of a shared key only (the shared case lists one id: red).
+// Third section: drop the key match when the forced cause is applied (the retargeted rule shows
+// faulted_key instead of first_attach: red).
 TEST_CASE("#5719 engine: a kept rule on a faulted key is reported faulted_key with its id, never "
           "key_busy or first_attach",
           "[spark][guardian][reconcile][4415prA][5719]") {
@@ -3226,6 +3228,29 @@ TEST_CASE("#5719 engine: a kept rule on a faulted key is reported faulted_key wi
         CHECK(line.find("first_attach=0") != std::string::npos);
         CHECK(r.engine->last_full_sync_preserved_line_for_test() == preserved_line("1", "s"));
         check_untouched(*r.fm, "s (healthy sibling)", ko);
+    }
+    SECTION("a rule retargeted off its faulted key in the same push is a first attach of the new key") {
+        Rig r;
+        r.open();
+        const auto p0 = r.make_file("s0"), p1 = r.make_file("s1"), p3 = r.make_file("s3");
+        const std::string k0 = file_key(p0), k1 = file_key(p1);
+        REQUIRE(file_key(p3) != k1);
+        r.dispatch(push_bytes({file_rule("s0", p0), file_rule("s1", p1)}, kGen));
+        REQUIRE(r.wait_armed(2));
+        REQUIRE(r.wait_compliant({"s0", "s1"}));
+        REQUIRE(r.wait_generation(kGen));
+        REQUIRE(r.settle());
+
+        r.fm->fire_fault(k1, true, "handle went deaf");
+        REQUIRE(yuzu::test::spin_until([&] { return r.health_events("s1", /*healthy=*/false) >= 1; }, 15s));
+        // The same full push keeps s1 but moves it to p3: its old key is faulted, its new key is not.
+        r.dispatch(push_bytes({file_rule("s0", p0), file_rule("s1", p3)}, kGen));
+        CHECK(r.settle());
+        const auto line = r.engine->last_full_sync_rebuild_line_for_test();
+        CHECK(line == expected_rebuild_line({{"s1", GuardianRebuildReason::FirstAttach}}));
+        CHECK(line.find("first_attach=1 ") != std::string::npos);
+        CHECK(line.find("faulted_key=0") != std::string::npos);
+        check_untouched(*r.fm, "s0", k0);
     }
 }
 

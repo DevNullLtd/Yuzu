@@ -891,8 +891,10 @@ public:
     /// (set_post_attach_hook_for_test). It exists to reach the engine's decision to consult that
     /// record only when attach_rule reported a reason, which no runtime state a Rig can build
     /// pairs with a forced entry. No production caller.
-    void force_rebuild_reason_unlocked_for_test(const std::string& rule_id, GuardianRebuildReason why) {
-        forced_rebuilds_[rule_id] = why;
+    /// `key` is the spark key the forced entry was recorded against (empty matches nothing).
+    void force_rebuild_reason_unlocked_for_test(const std::string& rule_id, GuardianRebuildReason why,
+                                                std::string key = {}) {
+        forced_rebuilds_[rule_id] = ForcedRebuildEntry{std::move(key), why};
     }
 
     /// TEST-ONLY (#4783 Gate 8 re-review): arms legacy_sink_persist_race_hook_for_test_ -
@@ -1492,9 +1494,15 @@ private:
     /// #5719: why each rule the current apply_rules rebuilt was rebuilt (mtx_-guarded; reset at the
     /// start of each apply_rules' rule loop).
     GuardianRebuildTally rebuild_tally_;
-    /// #5719: rule_id -> the cause a full_sync's scoped detach forced (mtx_-guarded; cleared at the
-    /// top of every apply_rules; installed from detach_rules_except's return on a full_sync).
-    std::unordered_map<std::string, GuardianRebuildReason> forced_rebuilds_;
+    /// #5719: rule_id -> the cause a full_sync's scoped detach forced, with the spark key whose
+    /// fault it records (mtx_-guarded; cleared at the top of every apply_rules; installed from
+    /// detach_rules_except's return on a full_sync). The cause is applied only when the rule's
+    /// attach targets that same key: a rule retargeted to another key is a first attach there.
+    struct ForcedRebuildEntry {
+        std::string key;
+        GuardianRebuildReason why{GuardianRebuildReason::None};
+    };
+    std::unordered_map<std::string, ForcedRebuildEntry> forced_rebuilds_;
     /// TEST-ONLY (see last_full_sync_rebuild_line_for_test); empty = none emitted yet.
     std::string last_full_sync_rebuild_line_for_test_;
     /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals

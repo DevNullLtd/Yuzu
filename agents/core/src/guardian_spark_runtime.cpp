@@ -3798,7 +3798,8 @@ GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<
         rule_ids.reserve(rules_.size());
         // #5719: at most one entry per kept rule. Deliberately not reserved, so a push that
         // tears down no kept rule allocates nothing for it. The consequence: `forced` grows by
-        // push_back under registry_mu_ and that can throw std::bad_alloc part-way through this
+        // push_back under registry_mu_ (and each entry copies its key) and that can throw
+        // std::bad_alloc part-way through this
         // loop, before the withdrawals below have run. Nothing catches it here; it propagates to
         // apply_rules' teardown firewall, which counts a reconcile failure and holds the
         // generation so the server retries the push.
@@ -3820,9 +3821,10 @@ GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<
             // them, but a refcount of 2 stops its detach from dropping the watcher).
             bool rebuild_key = false;
             GuardianRebuildReason why = GuardianRebuildReason::None;
+            std::optional<std::string> old_key; // the key the teardown inspected (#5719)
             if (keep.contains(rid)) {
-                const auto key = index_->key_for_rule(rid);
-                const auto kit = key ? keys_.find(*key) : keys_.end();
+                old_key = index_->key_for_rule(rid);
+                const auto kit = old_key ? keys_.find(*old_key) : keys_.end();
                 rebuild_key = kit != keys_.end() && kit->second->faulted;
                 if (rebuild_key)
                     why = kit->second->unhealthy_why != GuardianRebuildReason::None
@@ -3832,7 +3834,7 @@ GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<
             if (!keep.contains(rid) || rebuild_key)
                 rule_ids.push_back(rid);
             if (rebuild_key)
-                forced.push_back(ForcedRebuild{rid, why}); // a kept rule torn down with its key
+                forced.push_back(ForcedRebuild{rid, why, *old_key}); // a kept rule torn down with its key
         }
         works.reserve(rule_ids.size()); // Astra opine review Blocker 4: "detach_all()
                                         // currently accumulates returned claims in a

@@ -2583,10 +2583,10 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                 // the rebuild line, to key_busy or first_attach instead of their faulted/dead
                 // cause. No arm, skip or generation decision depends on the map.
                 try {
-                    std::unordered_map<std::string, GuardianRebuildReason> forced_map;
+                    std::unordered_map<std::string, ForcedRebuildEntry> forced_map;
                     forced_map.reserve(forced.size());
                     for (const auto& f : forced)
-                        forced_map.emplace(f.rule_id, f.why);
+                        forced_map.emplace(f.rule_id, ForcedRebuildEntry{f.key, f.why});
                     forced_rebuilds_ = std::move(forced_map); // noexcept: only after a full build
                 } catch (...) {
                 }
@@ -3776,6 +3776,17 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
             // (#4221 up-2) - re-observing an already-Wedged head via an identical retry,
             // whose receipt is in that case already terminal) before ever throwing a
             // synchronous error.
+            // #5719: the key this attach targets, taken BEFORE `spec` is moved, and only for a
+            // rule the scoped detach recorded a forced cause for. Diagnostic only: a failure to
+            // build it leaves it empty, which matches no forced entry, so the rule is reported
+            // under its own attach's reason.
+            std::string forced_target_key;
+            if (const auto fit = forced_rebuilds_.find(rule.rule_id()); fit != forced_rebuilds_.end()) {
+                try {
+                    forced_target_key = spark_key(*spec);
+                } catch (...) {
+                }
+            }
             auto res = spark_runtime_->attach_rule(GuardianSparkRuntime::NonWaiting{},
                                                    rule.rule_id(), std::move(*spec),
                                                    std::move(*assertion),
@@ -3834,10 +3845,15 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
                 // re-observation carries None and must appear in neither line, even for a kept
                 // rule whose key the scoped detach recorded as faulted.
                 if (res->rebuild_reason != GuardianRebuildReason::None) {
+                    // Only when this attach targets the key the cause was recorded against: a
+                    // rule kept on a faulted key and retargeted in the same push is a first
+                    // attach of its new key.
                     const auto forced = forced_rebuilds_.find(rule.rule_id());
-                    rebuild_tally_.note(rule.rule_id(), forced != forced_rebuilds_.end()
-                                                            ? forced->second
-                                                            : res->rebuild_reason);
+                    const bool forced_applies = forced != forced_rebuilds_.end() &&
+                                                !forced_target_key.empty() &&
+                                                forced->second.key == forced_target_key;
+                    rebuild_tally_.note(rule.rule_id(),
+                                        forced_applies ? forced->second.why : res->rebuild_reason);
                 }
             }
             if (res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed)

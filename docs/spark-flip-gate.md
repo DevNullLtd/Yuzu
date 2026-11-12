@@ -1667,7 +1667,7 @@ flip, with a red-first test each:
     cases (63 pass, 1 skipped on a host with no system bus), `[guardian]`, `[spark]` and the
     10-shard agent suite all green at `a34d19103`; its first run found one more host-dependent
     test (CH-5), fixed.
-    **Flip preconditions beside AC-18** (none of (a), (d) and (e) is closed; (b) is implemented, see it, and not yet observed on a flipped fleet; (c) is measured, with its residuals stated in it): (a) enable the `yuzu-fleet-spark`
+    **Flip preconditions beside AC-18** (none of (a), (d) and (e) is closed; (b) is implemented and was observed only on rig-flipped agents, with the limits stated in it; (c) is measured, with its residuals stated in it): (a) enable the `yuzu-fleet-spark`
     `armed_faulted > 0` alert (its group in `docs/prometheus/yuzu-alerts.yml` is commented out);
     (b) a bounded rebuild-reason INFO log (the unhappy-path SRE-1 finding: with the skip, an
     operator cannot tell from the agent log why a given rule was or was not rebuilt), as
@@ -1717,8 +1717,22 @@ flip, with a red-first test each:
     after it re-inspects its claim (the case in which the claim settled before attach_rule
     re-inspected it) carries a rebuild reason, and the io-class forced-resume SECTION of the R2
     case in `test_guardian_spark_reapply_skip_runtime.cpp` forces it through a test-only resume hook
-    (`set_attach_resume_hook_for_test`) and asserts `Armed` and the reason. The line has not been
-    observed on a flipped fleet; (c) MEASURED, release build (base `45f727420` against branch tip
+    (`set_attach_resume_hook_for_test`) and asserts `Armed` and the reason. Rig observation (a local, never-committed change set `prefer_spark` true in an agent built for the run;
+    the logs were local and are not kept in the repository; one Linux box and one Windows box, so not a
+    fleet): on Linux, three flipped agents beside one unflipped control, 356 full pushes each with a
+    retarget every sixth, logged `other=0` and 60 `first_attach` tokens per agent (the occupied-key
+    retarget label fixed in this PR), and the same box produced `faulted_key`, `key_busy` and
+    `unknown_episode` (a stalled and a dropped system bus); on Windows, `baseline_empty` and
+    `baseline_differs` (a missing watched file, and a rule re-authored with another `expected_hash`).
+    `dead_key`, `health_unknown` and `subscription_replaced` were never produced on either OS: they need
+    a broken engine invariant, a backend that throws, or a race, so they are covered by unit tests
+    only. The three failure counters read zero on every rebuild line of every run (they count a backend
+    throw or an allocation failure, which no rig input produced). Soaks: Linux 30 minutes, resident
+    memory flat at about 123 MB for the last 13 minutes, file descriptors 27 to 29 and flat (the two
+    extra are the Echo plugin's database files, also present in the unflipped control); Windows 20
+    minutes, handles rose by about 40 in the first 8 minutes then stayed flat, working set 123 to
+    136 MB, so a slow growth of a few megabytes is not ruled out. This is evidence for the line, not
+    a flip-safety proof. (c) MEASURED, release build (base `45f727420` against branch tip
     `3f8dd8d0d`, uncommitted throwaway harness; counts are exact, wall times are not): Linux
     (shared box; the cells that waited for a 1-minute load of 8 or less recorded it, the box
     never went below about 4) S0, S5 and S3s at R up to 5000 and S1d up to R=1000 with fake
@@ -1747,7 +1761,7 @@ flip, with a red-first test each:
     limit); (d) an explicit census resync mechanism for
     server-state loss (loss (1); #5718); (e) a per-mechanism deaf-watch test (watched directory
     deleted and recreated, stale handle) proving each shipped mechanism calls `fault()` (loss (6);
-    #5719); (e) is tracked in #5719; (b) is implemented by #5719 PR-A (inactive in production; not yet observed on a flipped fleet).
+    #5719); (e) is tracked in #5719; (b) is implemented by #5719 PR-A (inactive in production; observed only on rig-flipped agents, see precondition (b)).
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then

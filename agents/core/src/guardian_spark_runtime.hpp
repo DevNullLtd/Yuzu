@@ -447,9 +447,15 @@ public:
     /// queued) OR FirstAttach (an inline type, or a disarm that already completed), never the
     /// key's cause: the return value is the only place the cause survives. A caller on the engine
     /// apply thread should prefer it over the reason attach_rule reports for these rules.
+    /// `key` is the spark key the rule was mapped to when the teardown inspected it (the key
+    /// whose fault `why` records). A caller applying `why` to the rule's NEXT attach must do so
+    /// only when that attach targets the same key: a rule kept on a faulted key and retargeted
+    /// to another key in the same push is a first attach of the new key, not a rebuild for the
+    /// old key's cause.
     struct ForcedRebuild {
         std::string rule_id;
         GuardianRebuildReason why{GuardianRebuildReason::None};
+        std::string key;
     };
     [[nodiscard]] std::vector<ForcedRebuild> detach_rules_except(const std::set<std::string, std::less<>>& keep);
 
