@@ -150,6 +150,34 @@ struct GuardianStatusRollup {
     std::int64_t uncertain_rules{0}; // rules with an order-uncertain or pending represented pair
 };
 
+/// One row of `guardian_agent_order` (schema v5): the per-agent pair clock and its counters, as the
+/// store holds them. Nullable columns are optionals; NULL epoch means no paired event was ever
+/// accepted for the agent. Times are the database clock in nanoseconds (`epoch_recv_ns` moves with
+/// the pair clock, `unpaired_recv_ns` with the latest accepted unpaired census-bearing event).
+struct GuardianAgentOrder {
+    std::string agent_id;
+    std::optional<std::int64_t> epoch;
+    std::optional<std::int64_t> emit_seq_hwm;
+    std::optional<std::int64_t> epoch_recv_ns;
+    std::optional<std::int64_t> retired_epoch;
+    std::optional<std::int64_t> unpaired_recv_ns;
+    std::int64_t unpaired_events{0};
+    std::int64_t unpaired_held{0};
+    std::int64_t pair_regressions{0};
+    std::int64_t pair_stragglers{0};
+    std::int64_t pair_recoveries{0};
+    std::int64_t pair_duplicates{0};
+    std::int64_t retired_events{0};
+};
+
+/// Agents "currently unordered" (`unpaired_recv_ns` set and later than `COALESCE(epoch_recv_ns, 0)`)
+/// inside the caller's scope: the exact `count`, and the first `kUnorderedAgentIdCap` agent ids in
+/// byte order. `count > ids.size()` means the list is truncated.
+struct UnorderedAgentsSummary {
+    std::int64_t count{0};
+    std::vector<std::string> ids;
+};
+
 /// Per-agent Guaranteed State status rollup — shared by
 /// `GET /api/v1/guaranteed-state/status/{agent_id}` and MCP
 /// `get_guardian_agent_status`. A DIFFERENT algorithm from

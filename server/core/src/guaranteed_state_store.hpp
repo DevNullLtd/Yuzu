@@ -227,6 +227,10 @@ enum class PolicyGenerationRaiseError { kOutOfRange, kStoreUnavailable };
 /// count is exact and never capped; only the id list is.
 inline constexpr std::size_t kUnrepresentedPendingIdCap = 50;
 
+/// Cap on the agent ids `GuaranteedStateStore::unordered_agents` returns. The count is exact and
+/// never capped; only the id list is.
+inline constexpr std::size_t kUnorderedAgentIdCap = 50;
+
 /// Result of `GuaranteedStateStore::unrepresented_pending_for_agent`: how many (agent, rule) pairs of
 /// one device have a retained `projection_pending` event and NO census row, and the first
 /// `kUnrepresentedPendingIdCap` of their rule ids in `rule_id` order. `count > rule_ids.size()`
@@ -551,6 +555,21 @@ public:
     /// on at least one in-scope represented pair; same scope contract as errored_rule_count.
     std::expected<std::size_t, std::string>
     uncertain_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
+
+    /// The `guardian_agent_order` row of ONE device: `nullopt` = no row (the agent never had a
+    /// census-bearing event accepted, or was decommissioned), which is an answer, not a failure.
+    /// AUTHORITATIVE: `std::unexpected`, never a silent `nullopt`, on any store/query failure.
+    std::expected<std::optional<GuardianAgentOrder>, std::string>
+    agent_order_for_agent(std::string_view agent_id) const;
+
+    /// Agents currently unordered (`unpaired_recv_ns IS NOT NULL AND unpaired_recv_ns >
+    /// COALESCE(epoch_recv_ns, 0)`): the exact count and the first `kUnorderedAgentIdCap` ids in
+    /// `agent_id COLLATE "C"` order. Same scope contract as `uncertain_rule_count`: `nullopt` = the
+    /// whole fleet; engaged-empty = `{0, {}}` WITHOUT a query; a non-empty scope is applied IN SQL,
+    /// so the count never includes a hidden agent. `std::unexpected`, never a silent zero, on any
+    /// store/query failure.
+    std::expected<UnorderedAgentsSummary, std::string>
+    unordered_agents(const std::optional<std::vector<std::string>>& agent_scope) const;
 
     /// Pairs of ONE device (`agent_id`) that have a retained `projection_pending` event and NO census
     /// row (#7217): evidence the represented-pair reads cannot show. `rule_filter`: `nullopt` = every

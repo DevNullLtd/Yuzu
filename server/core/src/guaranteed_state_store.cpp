@@ -4014,6 +4014,16 @@ std::expected<std::size_t, std::string> GuaranteedStateStore::uncertain_rule_cou
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
+std::expected<std::optional<GuardianAgentOrder>, std::string>
+GuaranteedStateStore::agent_order_for_agent(std::string_view) const {
+    return std::unexpected("not implemented");
+}
+
+std::expected<UnorderedAgentsSummary, std::string> GuaranteedStateStore::unordered_agents(
+    const std::optional<std::vector<std::string>>&) const {
+    return std::unexpected("not implemented");
+}
+
 std::size_t GuaranteedStateStore::rule_count() const {
     if (!open_)
         return 0;

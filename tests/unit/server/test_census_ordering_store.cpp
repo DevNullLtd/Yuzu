@@ -4407,3 +4407,259 @@ TEST_CASE("census ordering: the real delete_agent in the Ensure-to-DECIDE gap le
         CHECK(paired_rows_without_order(db.dsn()) == "0");
     }
 }
+
+// ---- A4c-2 (#5690, UP-14 server PR A): the two store reads behind the ordering exposure.
+// `agent_order_for_agent` returns one `guardian_agent_order` row; `unordered_agents` counts the
+// agents whose latest accepted unpaired event is later than their pair clock, under the same scope
+// contract as `uncertain_rule_count`.
+
+TEST_CASE("census ordering: agent_order_for_agent returns the agent's order row and nothing for an "
+          "agent with none",
+          "[pg][guaranteed_state_store][db][census][ordering][order-read][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+
+    SECTION("no row is an answer, not a failure") {
+        const auto none = store.agent_order_for_agent("nobody");
+        REQUIRE(none.has_value());
+        CHECK_FALSE(none->has_value());
+    }
+    SECTION("a paired first delivery sets the clock and counts nothing") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e1", "r1", "a", kCompliant, kBase + 100), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        const auto got = store.agent_order_for_agent("a");
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        const GuardianAgentOrder& o = **got;
+        CHECK(o.agent_id == "a");
+        CHECK(o.epoch == std::optional<std::int64_t>{5});
+        CHECK(o.emit_seq_hwm == std::optional<std::int64_t>{10});
+        REQUIRE(o.epoch_recv_ns.has_value());
+        CHECK(std::to_string(*o.epoch_recv_ns) == order_recv_ns(db.dsn(), "a"));
+        CHECK_FALSE(o.retired_epoch.has_value());
+        CHECK_FALSE(o.unpaired_recv_ns.has_value());
+        CHECK(o.unpaired_events == 0);
+        CHECK(o.unpaired_held == 0);
+        CHECK(o.pair_regressions == 0);
+        CHECK(o.pair_stragglers == 0);
+        CHECK(o.pair_recoveries == 0);
+        CHECK(o.pair_duplicates == 0);
+        CHECK(o.retired_events == 0);
+    }
+    SECTION("an unpaired first delivery is counted and stamps unpaired_recv_ns, with no pair clock") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "u", kCompliant, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        const auto got = store.agent_order_for_agent("u");
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        const GuardianAgentOrder& o = **got;
+        CHECK(o.agent_id == "u");
+        CHECK_FALSE(o.epoch.has_value());
+        CHECK_FALSE(o.emit_seq_hwm.has_value());
+        CHECK_FALSE(o.epoch_recv_ns.has_value());
+        CHECK_FALSE(o.retired_epoch.has_value());
+        CHECK(o.unpaired_recv_ns.has_value());
+        CHECK(o.unpaired_events == 1);
+        CHECK(o.unpaired_held == 0);
+    }
+    SECTION("every column maps to its own field") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e1", "r1", "m", kCompliant, kBase + 100), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        // Distinct values, so a swapped column index cannot pass.
+        exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                               ".guardian_agent_order SET epoch = 11, emit_seq_hwm = 12, "
+                               "epoch_recv_ns = 13, retired_epoch = 14, unpaired_recv_ns = 15, "
+                               "unpaired_events = 21, unpaired_held = 22, pair_regressions = 23, "
+                               "pair_stragglers = 24, pair_recoveries = 25, pair_duplicates = 26, "
+                               "retired_events = 27 WHERE agent_id = 'm'");
+        // A bystander row must not be returned for 'm'.
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e2", "r1", "other", kCompliant, kBase + 100), 1, 1))
+                    .outcome == EventInsertOutcome::Inserted);
+        const auto got = store.agent_order_for_agent("m");
+        REQUIRE(got.has_value());
+        REQUIRE(got->has_value());
+        const GuardianAgentOrder& o = **got;
+        CHECK(o.agent_id == "m");
+        CHECK(o.epoch == std::optional<std::int64_t>{11});
+        CHECK(o.emit_seq_hwm == std::optional<std::int64_t>{12});
+        CHECK(o.epoch_recv_ns == std::optional<std::int64_t>{13});
+        CHECK(o.retired_epoch == std::optional<std::int64_t>{14});
+        CHECK(o.unpaired_recv_ns == std::optional<std::int64_t>{15});
+        CHECK(o.unpaired_events == 21);
+        CHECK(o.unpaired_held == 22);
+        CHECK(o.pair_regressions == 23);
+        CHECK(o.pair_stragglers == 24);
+        CHECK(o.pair_recoveries == 25);
+        CHECK(o.pair_duplicates == 26);
+        CHECK(o.retired_events == 27);
+    }
+    SECTION("an id with SQL metacharacters is a plain value") {
+        const auto got = store.agent_order_for_agent("x' OR '1'='1");
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->has_value());
+    }
+    SECTION("a store that cannot answer is an error, never an absent row") {
+        PgPool dead{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        GuaranteedStateStore closed(dead);
+        CHECK_FALSE(closed.agent_order_for_agent("a").has_value());
+    }
+}
+
+TEST_CASE("census ordering: unordered_agents lists the agents whose latest unpaired event is later "
+          "than their pair clock",
+          "[pg][guaranteed_state_store][db][census][ordering][order-read][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    using Scope = std::optional<std::vector<std::string>>;
+    int n = 0;
+    const auto send_unpaired = [&](const std::string& agent) {
+        ++n;
+        REQUIRE(store
+                    .insert_event_classified(
+                        ev("e" + std::to_string(n), "r1", agent, kDrifted, kBase + 100 * n))
+                    .outcome == EventInsertOutcome::Inserted);
+    };
+    const auto send_paired = [&](const std::string& agent, std::int64_t epoch, std::int64_t seq) {
+        ++n;
+        REQUIRE(store
+                    .insert_event_classified(with_pair(
+                        ev("e" + std::to_string(n), "r1", agent, kDrifted, kBase + 100 * n), epoch,
+                        seq))
+                    .outcome == EventInsertOutcome::Inserted);
+    };
+    const auto ids = [](const std::expected<UnorderedAgentsSummary, std::string>& r) {
+        REQUIRE(r.has_value());
+        return r->ids;
+    };
+
+    // Empty store: a successful zero.
+    {
+        const auto r = store.unordered_agents(Scope{});
+        REQUIRE(r.has_value());
+        CHECK(r->count == 0);
+        CHECK(r->ids.empty());
+    }
+
+    send_unpaired("U");        // (a) never paired, last accepted event unpaired: listed
+    send_paired("P", 5, 10);   // (b) paired only: not listed
+    send_paired("M", 5, 10);   // (c) paired, then an unpaired event after the clock: listed
+    send_unpaired("M");
+    send_unpaired("R");        // unpaired, then paired afterwards: the clock is later, not listed
+    send_paired("R", 5, 10);
+
+    SECTION("count and ids follow the definition") {
+        const auto r = store.unordered_agents(Scope{});
+        REQUIRE(r.has_value());
+        CHECK(r->count == 2);
+        CHECK(r->ids == std::vector<std::string>{"M", "U"});
+    }
+    SECTION("a decommissioned agent leaves the list") {
+        REQUIRE(store.delete_agent("U"));
+        const auto r = store.unordered_agents(Scope{});
+        REQUIRE(r.has_value());
+        CHECK(r->count == 1);
+        CHECK(r->ids == std::vector<std::string>{"M"});
+        REQUIRE(store.delete_agent("M"));
+        const auto none = store.unordered_agents(Scope{});
+        REQUIRE(none.has_value());
+        CHECK(none->count == 0);
+        CHECK(none->ids.empty());
+    }
+    SECTION("a later paired event puts the agent back in order") {
+        send_paired("U", 6, 1);
+        const auto r = store.unordered_agents(Scope{});
+        REQUIRE(r.has_value());
+        CHECK(r->count == 1);
+        CHECK(r->ids == std::vector<std::string>{"M"});
+    }
+    SECTION("the scope is honoured, in SQL, for the count and the ids") {
+        CHECK(ids(store.unordered_agents(Scope{{"U"}})) == std::vector<std::string>{"U"});
+        CHECK(store.unordered_agents(Scope{{"U"}})->count == 1); // M is hidden, so not counted
+        CHECK(store.unordered_agents(Scope{{"P", "R"}})->count == 0); // in scope, not unordered
+        CHECK(store.unordered_agents(Scope{{"nobody"}})->count == 0);
+        CHECK(store.unordered_agents(Scope{{"U", "M", "P"}})->count == 2);
+        CHECK(store.unordered_agents(Scope{std::vector<std::string>{}})->count == 0);
+        CHECK(store.unordered_agents(Scope{std::vector<std::string>{}})->ids.empty());
+    }
+    SECTION("an engaged-empty scope is answered without a query; a down store is an error") {
+        PgPool dead{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        GuaranteedStateStore closed(dead);
+        const auto empty = closed.unordered_agents(Scope{std::vector<std::string>{}});
+        REQUIRE(empty.has_value());
+        CHECK(empty->count == 0);
+        CHECK(empty->ids.empty());
+        CHECK_FALSE(closed.unordered_agents(Scope{}).has_value());
+        CHECK_FALSE(closed.unordered_agents(Scope{{"U"}}).has_value());
+    }
+}
+
+TEST_CASE("census ordering: unordered_agents counts a never-paired agent whose pair clock is NULL "
+          "and orders ids by bytes",
+          "[pg][guaranteed_state_store][db][census][ordering][order-read][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    // Byte order puts 'B' (0x42) before '_' (0x5f) before 'a' (0x61); a locale collation does not.
+    int n = 0;
+    for (const char* agent : {"a-low", "_x", "B-up"}) {
+        ++n;
+        REQUIRE(store
+                    .insert_event_classified(
+                        ev("e" + std::to_string(n), "r1", agent, kDrifted, kBase + 100 * n))
+                    .outcome == EventInsertOutcome::Inserted);
+    }
+    // Every one of them has a NULL epoch_recv_ns: only COALESCE keeps the comparison from being NULL.
+    REQUIRE(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
+                                       ".guardian_agent_order WHERE epoch_recv_ns IS NULL") == "3");
+    const auto r = store.unordered_agents(std::nullopt);
+    REQUIRE(r.has_value());
+    CHECK(r->count == 3);
+    CHECK(r->ids == std::vector<std::string>{"B-up", "_x", "a-low"});
+}
+
+TEST_CASE("census ordering: unordered_agents caps the id list at 50 and never the count",
+          "[pg][guaranteed_state_store][db][census][ordering][order-read][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    constexpr int kAgents = 55;
+    const auto name = [](int i) { return std::format("ag{:03}", i); };
+    // Inserted in reverse so the order cannot be insertion order.
+    for (int i = kAgents - 1; i >= 0; --i)
+        REQUIRE(store
+                    .insert_event_classified(
+                        ev("e" + std::to_string(i), "r1", name(i), kDrifted, kBase + 100 * (i + 1)))
+                    .outcome == EventInsertOutcome::Inserted);
+
+    const auto r = store.unordered_agents(std::nullopt);
+    REQUIRE(r.has_value());
+    CHECK(r->count == kAgents);
+    REQUIRE(r->ids.size() == kUnorderedAgentIdCap);
+    for (std::size_t i = 0; i < r->ids.size(); ++i)
+        CHECK(r->ids[i] == name(static_cast<int>(i)));
+
+    // A confined scope is capped the same way, and its count is its own.
+    std::vector<std::string> scope;
+    for (int i = 0; i < kAgents; i += 2)
+        scope.push_back(name(i));
+    const auto c = store.unordered_agents(std::optional<std::vector<std::string>>{scope});
+    REQUIRE(c.has_value());
+    CHECK(c->count == static_cast<std::int64_t>(scope.size())); // 28
+    CHECK(c->ids.size() == scope.size());
+}
