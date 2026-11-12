@@ -29,6 +29,7 @@ namespace yuzu::server {
 class GuaranteedStateStore;
 class BlastRadiusDetector;
 class DexAlertRouter;
+struct GuaranteedStateEventRow;
 }
 
 namespace spdlog {
@@ -81,6 +82,37 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
 /// not stored). Warm-created at startup (server.cpp) so the series reads 0, not absent.
 inline constexpr char kGuardianEventsRejectedMetric[] =
     "yuzu_server_guardian_events_rejected_total";
+
+/// Why a wire emit-order pair was not taken as a pair (D5). `None` covers both a valid pair and
+/// the legitimate unpaired 0/0 of an older sender; neither is counted.
+enum class PairReject { None, HalfSet, OutOfRange };
+
+/// The wire `(boot_epoch, emit_seq)` pair as validated at the ingest boundary: `paired` is true
+/// only when BOTH are set and each is in [1, 2^62) (2^62 - 1 is accepted), so the values fit a
+/// signed BIGINT with the sign bit unreachable. Both zero is unpaired and not a rejection.
+/// Exactly one zero is `HalfSet` (checked first, so a lone value >= 2^62 beside a zero is still
+/// half-set); either value >= 2^62 beside a set partner is `OutOfRange`. Either rejection is
+/// unpaired too: the event is still stored, only the pair is withheld.
+struct WirePair {
+    bool paired{false};
+    std::int64_t boot_epoch{0};
+    std::int64_t emit_seq{0};
+    PairReject reject{PairReject::None};
+};
+[[nodiscard]] WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq) noexcept;
+
+/// Counter of wire emit-order pairs the ingest boundary withheld, by `reason` (`half_set`,
+/// `out_of_range`). Not a refusal: the event is stored and its census is unaffected, so this is
+/// separate from `kGuardianEventsRejectedMetric`. Pre-seeded (server.cpp) from
+/// `kGuardianPairRejectReasons` so each series reads 0, not absent. Never labelled by agent.
+inline constexpr char kGuardianPairRejectedMetric[] = "yuzu_server_guardian_pair_rejected_total";
+inline constexpr const char* kGuardianPairRejectReasons[] = {"half_set", "out_of_range"};
+
+/// Validate the wire pair and, when it is a pair, set `row.boot_epoch`/`row.emit_seq`; otherwise
+/// leave both unset. A rejection is warned (agent and event ids sanitised) and counted on
+/// `kGuardianPairRejectedMetric` (best-effort; `metrics` may be nullptr). Never refuses the event.
+void apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch, std::uint64_t emit_seq,
+                     yuzu::MetricsRegistry* metrics);
 
 /// Prometheus metric name for the store-operation latency histogram: server-side latency of
 /// `insert_event_classified` (the classify+store SQLite txn) for one Guardian event, split by

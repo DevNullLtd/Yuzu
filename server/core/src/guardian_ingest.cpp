@@ -252,6 +252,44 @@ std::optional<std::int64_t> agent_stamp_ns(bool has_timestamp, std::int64_t seco
     return seconds * kNsPerSec + nanos;
 }
 
+WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq) noexcept {
+    // Exclusive upper bound: below 2^62 the BIGINT sign bit is unreachable.
+    constexpr std::uint64_t kPairLimit = std::uint64_t{1} << 62;
+    if (boot_epoch == 0 && emit_seq == 0)
+        return {};
+    if (boot_epoch == 0 || emit_seq == 0)
+        return {.reject = PairReject::HalfSet};
+    if (boot_epoch >= kPairLimit || emit_seq >= kPairLimit)
+        return {.reject = PairReject::OutOfRange};
+    return {.paired = true,
+            .boot_epoch = static_cast<std::int64_t>(boot_epoch),
+            .emit_seq = static_cast<std::int64_t>(emit_seq)};
+}
+
+void apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch, std::uint64_t emit_seq,
+                     yuzu::MetricsRegistry* metrics) {
+    row.boot_epoch.reset();
+    row.emit_seq.reset();
+    const WirePair wire = pair_from_wire(boot_epoch, emit_seq);
+    if (wire.paired) {
+        row.boot_epoch = wire.boot_epoch;
+        row.emit_seq = wire.emit_seq;
+        return;
+    }
+    if (wire.reject == PairReject::None)
+        return; // 0/0: an unpaired sender, not a rejection
+    const char* reason = wire.reject == PairReject::HalfSet ? "half_set" : "out_of_range";
+    spdlog::warn("Guardian: withholding the emit-order pair ({}) from agent {} event {}; the "
+                 "event is still stored unpaired",
+                 reason, log_id_token(row.agent_id), log_id_token(row.event_id));
+    if (metrics) {
+        try { // best-effort metric; never propagate onto the ingest thread
+            metrics->counter(kGuardianPairRejectedMetric, {{"reason", reason}}).increment();
+        } catch (...) {
+        }
+    }
+}
+
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
                               const pb::CommandResponse& resp, BlastRadiusDetector* blast_radius,
                               DexAlertRouter* alert_router, yuzu::MetricsRegistry* metrics) {
@@ -323,6 +361,7 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             ev.has_timestamp(), ev.timestamp().seconds(), ev.timestamp().nanos());
         ev_row.agent_ns = stamp.value_or(0);
         ev_row.received_ns = recv_wall_ns;
+        apply_wire_pair(ev_row, ev.boot_epoch(), ev.emit_seq(), metrics);
         // Enrich severity from the rule store (contract decision 4) — the agent
         // isn't pushed severity. Fall back to the event's own value, then
         // "unknown" for an already-deleted rule.

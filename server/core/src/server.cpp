@@ -4409,6 +4409,15 @@ public:
                 metrics_.counter("yuzu_server_guardian_census_projection_total",
                                  {{"source", source}, {"outcome", outcome}});
         metrics_.counter(detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}});
+        metrics_.describe(detail::kGuardianPairRejectedMetric,
+                          "Guardian events whose emit-order pair (boot_epoch, emit_seq) was "
+                          "withheld at ingest, by reason. half_set: exactly one of the two was "
+                          "set. out_of_range: a set pair had a value of 2^62 or more. The event "
+                          "is still stored, unpaired, and its census is unaffected; this is not "
+                          "a refusal. Resets on server restart.",
+                          "counter");
+        for (const char* reason : detail::kGuardianPairRejectReasons)
+            metrics_.counter(detail::kGuardianPairRejectedMetric, {{"reason", reason}});
         metrics_.describe("yuzu_server_guardian_census_pending_events",
                           "Guardian events stored with pending census evidence: their census "
                           "write failed and no redelivery has repaired it. Not updated while "

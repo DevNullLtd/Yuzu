@@ -32,11 +32,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <spdlog/sinks/ostream_sink.h>
 #include <spdlog/sinks/sink.h>
@@ -188,10 +190,13 @@ apb::CommandResponse make_error_event(const std::string& event_id) {
 // block, which is gated on rule_id != kObservationRuleId.
 apb::CommandResponse make_rule_event(const std::string& event_id, const std::string& rule_id,
                                      std::int64_t ts_seconds = 1718000000,
-                                     std::int32_t ts_nanos = 0, bool with_timestamp = true) {
+                                     std::int32_t ts_nanos = 0, bool with_timestamp = true,
+                                     std::uint64_t boot_epoch = 0, std::uint64_t emit_seq = 0) {
     gpb::GuaranteedStateEvent ev;
     ev.set_event_id(event_id);
     ev.set_rule_id(rule_id);
+    ev.set_boot_epoch(boot_epoch);
+    ev.set_emit_seq(emit_seq);
     ev.set_event_type("service.stopped");
     ev.set_severity("high");
     ev.set_detected_value("stopped");
@@ -797,4 +802,154 @@ TEST_CASE("guardian ingest: the agent stamp and the receipt reach the stored ord
     const std::string future = key_of("k-future");
     CHECK(future.ends_with("|true"));
     CHECK(std::stoll(future) < 9'000'000'000LL * 1'000'000'000LL);
+}
+
+namespace {
+constexpr std::uint64_t k2p62 = std::uint64_t{1} << 62;
+
+std::int64_t pair_rejected_count(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter(yuzu::server::detail::kGuardianPairRejectedMetric, {{"reason", reason}})
+        .value();
+}
+} // namespace
+
+TEST_CASE("guardian ingest: pair_from_wire validates the emit-order pair (UP-14 D5)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::detail::pair_from_wire;
+    using yuzu::server::detail::PairReject;
+    // Both set and in [1, 2^62): a pair, in the order (boot_epoch, emit_seq).
+    const auto ok = pair_from_wire(7, 11);
+    CHECK(ok.paired);
+    CHECK(ok.boot_epoch == 7);
+    CHECK(ok.emit_seq == 11);
+    CHECK(ok.reject == PairReject::None);
+    // 2^62 - 1 is the largest accepted value on either side; both extremes at once.
+    const auto top = pair_from_wire(k2p62 - 1, k2p62 - 1);
+    CHECK(top.paired);
+    CHECK(top.boot_epoch == static_cast<std::int64_t>(k2p62 - 1));
+    CHECK(top.emit_seq == static_cast<std::int64_t>(k2p62 - 1));
+    CHECK(top.reject == PairReject::None);
+    CHECK(pair_from_wire(1, 1).paired); // the 1-based floor
+    // 0/0 is an unpaired sender, not a rejection.
+    const auto none = pair_from_wire(0, 0);
+    CHECK_FALSE(none.paired);
+    CHECK(none.reject == PairReject::None);
+    // Exactly one set, in either direction, is half_set.
+    CHECK_FALSE(pair_from_wire(5, 0).paired);
+    CHECK(pair_from_wire(5, 0).reject == PairReject::HalfSet);
+    CHECK_FALSE(pair_from_wire(0, 5).paired);
+    CHECK(pair_from_wire(0, 5).reject == PairReject::HalfSet);
+    // half_set is decided before the range check: a lone out-of-range value beside a zero is
+    // still half_set.
+    CHECK(pair_from_wire(k2p62, 0).reject == PairReject::HalfSet);
+    CHECK(pair_from_wire(0, k2p62).reject == PairReject::HalfSet);
+    // Either value at or above 2^62 beside a set partner is out_of_range, including values with
+    // the sign bit set (a wire uint64 cannot be negative; it would read as one as an int64).
+    for (const std::uint64_t big : {k2p62, k2p62 + 1, std::uint64_t{1} << 63,
+                                    std::numeric_limits<std::uint64_t>::max()}) {
+        CHECK_FALSE(pair_from_wire(big, 3).paired);
+        CHECK(pair_from_wire(big, 3).reject == PairReject::OutOfRange);
+        CHECK_FALSE(pair_from_wire(3, big).paired);
+        CHECK(pair_from_wire(3, big).reject == PairReject::OutOfRange);
+    }
+}
+
+TEST_CASE("guardian ingest: apply_wire_pair fills the row and counts only rejections (UP-14 D5)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::GuaranteedStateEventRow;
+    using yuzu::server::detail::apply_wire_pair;
+    const auto row_with = [](std::uint64_t boot, std::uint64_t seq, yuzu::MetricsRegistry* m) {
+        GuaranteedStateEventRow row;
+        row.event_id = "evt-pair";
+        row.agent_id = "agent-A";
+        apply_wire_pair(row, boot, seq, m);
+        return row;
+    };
+    yuzu::MetricsRegistry metrics;
+    // The pre-seed contract (server.cpp warms one series per entry): the closed reason set is
+    // exactly the two labels this code counts on.
+    CHECK(std::vector<std::string>(std::begin(yuzu::server::detail::kGuardianPairRejectReasons),
+                                   std::end(yuzu::server::detail::kGuardianPairRejectReasons)) ==
+          std::vector<std::string>{"half_set", "out_of_range"});
+
+    // Both set: the pair lands on the row, not swapped, and nothing is counted.
+    auto row = row_with(7, 11, &metrics);
+    REQUIRE(row.boot_epoch.has_value());
+    REQUIRE(row.emit_seq.has_value());
+    CHECK(*row.boot_epoch == 7);
+    CHECK(*row.emit_seq == 11);
+    // The largest accepted values.
+    row = row_with(k2p62 - 1, k2p62 - 1, &metrics);
+    CHECK(row.boot_epoch == static_cast<std::int64_t>(k2p62 - 1));
+    CHECK(row.emit_seq == static_cast<std::int64_t>(k2p62 - 1));
+    // Both zero: unset, no counter.
+    row = row_with(0, 0, &metrics);
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+    CHECK(pair_rejected_count(metrics, "half_set") == 0);
+    CHECK(pair_rejected_count(metrics, "out_of_range") == 0);
+
+    // Half set, each direction: unset and counted as half_set only.
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    row = row_with(5, 0, &metrics);
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+    CHECK(pair_rejected_count(metrics, "half_set") == 1);
+    row = row_with(0, 5, &metrics);
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+    CHECK(pair_rejected_count(metrics, "half_set") == 2);
+    CHECK(pair_rejected_count(metrics, "out_of_range") == 0);
+
+    // 2^62 on either side: unset and counted as out_of_range only.
+    row = row_with(k2p62, 5, &metrics);
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+    row = row_with(5, std::numeric_limits<std::uint64_t>::max(), &metrics);
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+    CHECK(pair_rejected_count(metrics, "out_of_range") == 2);
+    CHECK(pair_rejected_count(metrics, "half_set") == 2);
+    cap.stop();
+    CHECK(cap.text().find("withholding the emit-order pair") != std::string::npos);
+
+    // A rejection never throws or crashes without a metrics registry.
+    CHECK_NOTHROW(row_with(5, 0, nullptr));
+}
+
+TEST_CASE("guardian ingest: a rejected pair does not refuse the event (UP-14 D5)",
+          "[pg][guardian][ingest][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    // The refusal counter summed over the pair reasons too, so a pair rejection counted on the
+    // wrong family cannot hide behind the one real refusal label.
+    const auto rejected = [&] {
+        std::int64_t total = 0;
+        for (const char* reason : {"empty_rule_id", "half_set", "out_of_range"})
+            total += metrics
+                         .counter(yuzu::server::detail::kGuardianEventsRejectedMetric,
+                                  {{"reason", reason}})
+                         .value();
+        return total;
+    };
+    const auto ingest = [&](const std::string& id, std::uint64_t boot, std::uint64_t seq) {
+        ingest_guardian_response(
+            store, "agent-A", make_rule_event(id, "rule-1", 1718000000, 0, true, boot, seq),
+            nullptr, nullptr, &metrics);
+    };
+    ingest("p-ok", 3, 4);
+    ingest("p-none", 0, 0);
+    CHECK(pair_rejected_count(metrics, "half_set") == 0);
+    CHECK(pair_rejected_count(metrics, "out_of_range") == 0);
+    ingest("p-half", 3, 0);
+    ingest("p-big", k2p62, 4);
+    CHECK(pair_rejected_count(metrics, "half_set") == 1);
+    CHECK(pair_rejected_count(metrics, "out_of_range") == 1);
+    // Every event, rejected pair or not, is stored; the refusal counter never moved.
+    CHECK(store.event_count() == 4);
+    CHECK(rejected() == 0);
 }
