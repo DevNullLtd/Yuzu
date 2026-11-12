@@ -1505,6 +1505,7 @@ TEST_CASE("#5719 reason R2b: a retarget onto a key another rule holds reports fi
     const auto spec_a = file_spec("/a");
     const auto spec_b = file_spec("/b");
     REQUIRE(rig.rt->attach_rule("r2", spec_b, file_exists_rule("r2"), true).has_value());
+    const auto sub_b = last_sub(rig);
     REQUIRE(rig.rt->attach_rule("r1", spec_a, file_exists_rule("r1"), true).has_value());
 
     SECTION("onto an occupied key") {
@@ -1516,6 +1517,23 @@ TEST_CASE("#5719 reason R2b: a retarget onto a key another rule holds reports fi
         const auto again = attach_nw(rig, "r1", spec_b, file_exists_rule("r1"));
         CHECK(again.skipped);
         CHECK(why_tok(again.rebuild_reason) == "none");
+    }
+    // The retarget check is decided ahead of the health and content terms (it is the same
+    // first_attach a free key gets whatever the content). Mutation: move the check below the
+    // health block and the faulted SECTION reports faulted_key; below the content block and the
+    // changed SECTION reports content_changed.
+    SECTION("onto an occupied key that is faulted: still first_attach") {
+        deliver_faulted(rig, spec_b, sub_b);
+        const auto out = attach_nw(rig, "r1", spec_b, file_exists_rule("r1"));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "first_attach");
+        settle(rig, spec_b);
+    }
+    SECTION("onto an occupied key with changed content: still first_attach") {
+        const auto out = attach_nw(rig, "r1", spec_b, file_exists_rule("r1", false));
+        CHECK_FALSE(out.skipped);
+        CHECK(why_tok(out.rebuild_reason) == "first_attach");
+        settle(rig, spec_b);
     }
     SECTION("onto a free key") {
         const auto spec_c = file_spec("/c");

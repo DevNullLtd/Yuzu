@@ -61,8 +61,11 @@
  *       not the enum order; the two differ in the health block (the code tests the recorded bit,
  *       then an absent probe, then subscription_replaced, then Dead, then any other non-Healthy
  *       state).
- *   (c) first_attach means no committed rule, or no entry for the key the rule now targets (a
- *       retarget: the rule is committed on its old key), and no scoped-detach record. That
+ *   (c) first_attach means no committed rule, no entry for the key the rule now targets, or a
+ *       live arm mapped to a different key (a retarget: the rule is committed on its old key,
+ *       whether or not another rule already holds the new one; decided before the health and
+ *       content terms, so such a rule's new key is not reported on until the next push), and no
+ *       scoped-detach record. That
  *       INCLUDES a rule on_subscription_lost detached between pushes (a Lost event, or the
  *       convergence scheduler's dead-key poll check), which looks the same to the attach path
  *       as a rule never armed.

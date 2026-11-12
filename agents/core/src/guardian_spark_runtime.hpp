@@ -2144,15 +2144,18 @@ private:
     ///      Reobserved success; this rule's own live arm with other content, spec or ownership is
     ///      ContentChanged; any other claim (another rule's arm, a disarm, a parked or retained
     ///      head) is KeyBusy;
-    ///   2. no committed rules_ entry for the rule or keys_ entry for the key: FirstAttach;
+    ///   2. no committed rules_ entry for the rule or keys_ entry for the key, or a committed
+    ///      rule whose live arm is mapped to a different key (a retarget onto a key another rule
+    ///      holds; decided before the health and content terms): FirstAttach;
     ///   3. committed path, health before content: the recorded faulted bit (PerKey::unhealthy_why, KeyFaulted
     ///      when none was recorded), an absent probe (HealthUnknown), a probe of another
     ///      subscription (SubscriptionReplaced), a Dead probe (KeyDead), any other non-Healthy
     ///      probe (KeyFaulted), an Unknown evaluation episode (UnknownEpisode);
     ///   4. content: a changed content id (ContentChanged), then FileHashEquals' empty
     ///      (BaselineEmpty) or differing (BaselineDiffers) pushed hash;
-    ///   5. defensive invariants (inactive generation, spec mismatch, index ownership): Other,
-    ///      unreachable through the public API.
+    ///   5. defensive invariants (inactive generation, spec mismatch, an index that does not own
+    ///      the generation although it maps the rule to this key, or has no mapping for it):
+    ///      Other, unreachable through the public API.
     /// Health outranks content only on the committed path (steps 3 and 4); step 1 comes first, so
     /// a changed-content rule that still has its own arm in flight is ContentChanged even when
     /// the key is unhealthy. The reason only labels conditions that already rebuilt; it never

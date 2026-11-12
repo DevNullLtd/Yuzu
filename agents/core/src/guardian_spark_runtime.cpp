@@ -3016,9 +3016,16 @@ GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::s
         return std::unexpected(GuardianRebuildReason::FirstAttach);
     // A retarget onto a key another rule already holds: keys_ has the key, but this rule's live
     // arm is mapped to a different key. From this key's side it is a first attach, exactly as
-    // when the key is new (the check above). Without this the index-ownership invariant at
-    // step 5 reports it as `other`, a label documented as a defect (found on the flipped rig,
-    // #5719). Non-allocating, so the noexcept contract holds.
+    // when the key is new (the check above, which also precedes every health and content term).
+    // It is decided here, ahead of those terms, so for such a rule they are not consulted: a
+    // retarget onto a faulted or dead key, or one that also changed content, is labelled
+    // first_attach, and the next full push reports the key's own cause. For a healthy,
+    // unchanged rule the invariant at step 5 would report `other`, a label documented as a
+    // defect (found on the flipped rig, #5719). The index is the only record of a committed
+    // rule's key, so index corruption of this shape is indistinguishable from a retarget and
+    // reads first_attach too. The skip decision is unchanged: owns() at step 5 needs the rule
+    // mapped to this key, so no state that reaches here could have skipped. Non-allocating, so
+    // the noexcept contract holds.
     if (index_->mapped_to_other_key(key, rule_id))
         return std::unexpected(GuardianRebuildReason::FirstAttach);
     const RuleGeneration& live = *rit->second;
