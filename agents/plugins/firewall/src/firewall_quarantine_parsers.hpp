@@ -2419,8 +2419,19 @@ struct IptablesListing {
     /// present but not first does not govern: dockerd re-inserts its own FORWARD jump
     /// at position 1 on restart, ahead of our DROP.
     std::array<std::string, 3> first_target{};
+    /// Our generation chains that hold a terminal `-A <chain> -j DROP` rule. A jump to a
+    /// chain that is referenced but EMPTY (the jump delete failed under xtables lock
+    /// contention while the flush succeeded) blocks nothing, so a jump alone is not
+    /// enforcement.
+    std::vector<std::string> dropping;
     [[nodiscard]] bool first_is_ours(std::size_t builtin) const {
         return builtin < first_target.size() && ipt_chain_gen(first_target[builtin]).has_value();
+    }
+    /// The first rule of the built-in chain jumps to one of our chains AND that chain
+    /// still holds the terminal DROP: the only state that denies anything.
+    [[nodiscard]] bool first_is_ours_and_denies(std::size_t builtin) const {
+        return first_is_ours(builtin) &&
+               std::find(dropping.begin(), dropping.end(), first_target[builtin]) != dropping.end();
     }
 };
 
@@ -2441,6 +2452,11 @@ struct IptablesListing {
             if (ipt_chain_gen(f[3]))
                 out.jumps.emplace_back(std::string{f[1]}, std::string{f[3]});
         }
+        // The terminal DROP of one of OUR generation chains (`-A yuzu-fwq-N -j DROP`;
+        // the allow rules in front of it carry more fields).
+        if (f.size() == 4 && f[0] == "-A" && f[2] == "-j" && f[3] == "DROP" &&
+            ipt_chain_gen(f[1]))
+            out.dropping.emplace_back(std::string{f[1]});
         // The first rule of each built-in chain, whatever it is: `-S` lists a chain's
         // rules in order, so the first `-A <builtin>` line is the one that governs.
         if (f.size() >= 2 && f[0] == "-A") {
@@ -3324,8 +3340,11 @@ public:
             // Our jump must be the FIRST rule of each built-in chain: a jump that merely
             // exists behind another (dockerd re-inserts its own at position 1) does not
             // govern, and a retried quarantine repairs it by inserting a new generation
-            // at position 1.
-            all = all && l.first_is_ours(0) && l.first_is_ours(1) && l.first_is_ours(2);
+            // at position 1. It must also point at a chain that still holds the terminal
+            // DROP: a referenced but empty chain blocks nothing and must read as not
+            // enforcing, so the self-check re-applies.
+            all = all && l.first_is_ours_and_denies(0) && l.first_is_ours_and_denies(1) &&
+                  l.first_is_ours_and_denies(2);
         }
         st.state = all ? OsState::enforcing : OsState::not_enforcing;
         if (!all)

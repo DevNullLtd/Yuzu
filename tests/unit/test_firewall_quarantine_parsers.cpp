@@ -257,6 +257,13 @@ struct IptWorld {
                 out += "-N yuzu-quarantine\n";
             for (const auto& c : f.chains)
                 out += "-N " + c + "\n";
+            // Like the real `iptables -S`, the listing carries each user chain's own rules
+            // (`-A <chain> <rule>`), which is how the leg tells a chain that still denies
+            // from one that is referenced but flushed.
+            for (const auto& c : f.chains)
+                if (const auto rit = f.rules.find(c); rit != f.rules.end())
+                    for (const auto& r : rit->second)
+                        out += "-A " + c + " " + r + "\n";
             for (const auto& [b, targets] : f.builtin)
                 for (const auto& t : targets)
                     out += "-A " + b + " -j " + t + "\n";
@@ -5333,6 +5340,46 @@ TEST_CASE("iptables: our jump must be FIRST in every built-in chain; a Docker re
     CHECK(fixed.status == "active");
     CHECK(contains(fixed.notes, "repaired=1"));
     CHECK(rig.jumps(kIptablesPath, "FORWARD").front() == "yuzu-fwq-2-f");
+    CHECK(report_status(rig.env, dl).status == "active");
+}
+
+TEST_CASE("iptables: a jump to a chain with no terminal DROP is not enforcing (empty-chain regression)",
+          "[agent][firewall_quarantine]") {
+    // Parser level: the same jumps, with and without the DROP in the chain.
+    const std::string jumps = "-P INPUT ACCEPT\n-N yuzu-fwq-1\n-N yuzu-fwq-1-f\n"
+                              "-A INPUT -j yuzu-fwq-1\n-A OUTPUT -j yuzu-fwq-1\n"
+                              "-A FORWARD -j yuzu-fwq-1-f\n";
+    const auto empty = parse_iptables_listing(jumps);
+    for (std::size_t b = 0; b < 3; ++b) {
+        CHECK(empty.first_is_ours(b));
+        CHECK_FALSE(empty.first_is_ours_and_denies(b));
+    }
+    const auto full = parse_iptables_listing(jumps + "-A yuzu-fwq-1 -i lo -j ACCEPT\n"
+                                                     "-A yuzu-fwq-1 -j DROP\n"
+                                                     "-A yuzu-fwq-1-f -j DROP\n");
+    for (std::size_t b = 0; b < 3; ++b)
+        CHECK(full.first_is_ours_and_denies(b));
+    // One of the three chains missing its DROP is enough to refuse enforcing.
+    const auto no_fwd = parse_iptables_listing(jumps + "-A yuzu-fwq-1 -j DROP\n");
+    CHECK(no_fwd.first_is_ours_and_denies(0));
+    CHECK(no_fwd.first_is_ours_and_denies(1));
+    CHECK_FALSE(no_fwd.first_is_ours_and_denies(2));
+    // A DROP in someone else's chain, or an ACCEPT-only chain of ours, does not count.
+    CHECK_FALSE(parse_iptables_listing(jumps + "-A OTHER -j DROP\n-A yuzu-fwq-1 -j ACCEPT\n")
+                    .first_is_ours_and_denies(0));
+
+    // Leg level: the jump delete fails under xtables contention while the flush succeeds.
+    IptRig rig;
+    auto dl = rig.dl();
+    REQUIRE(apply_and_verify(rig.env, rig.request(), dl).status == "active");
+    for (auto& [name, rules] : rig.world.fam[std::string{kIptablesPath}].rules)
+        rules.clear(); // flushed chains, jumps still in place
+    const auto st = report_status(rig.env, dl);
+    CHECK(st.status == "degraded");
+    CHECK(st.reason == "policy_not_blocking");
+    // ... and a retried quarantine re-applies instead of skipping.
+    const auto fixed = apply_and_verify(rig.env, rig.request(), dl);
+    CHECK(fixed.status == "active");
     CHECK(report_status(rig.env, dl).status == "active");
 }
 
