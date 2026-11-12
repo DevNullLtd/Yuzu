@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Build Yuzu Windows installers (agent, server, or both).
+# Build the Yuzu Windows agent installer (YuzuAgentSetup).
 #
 # Usage:
-#   bash deploy/packaging/windows/build-installer.sh [--builddir DIR] [--version VER] [--target agent|server|all]
+#   bash deploy/packaging/windows/build-installer.sh [--builddir DIR] [--version VER] [--target agent]
 #
 # Defaults:
 #   --builddir  builddir       (relative to repo root)
 #   --version   extracted from meson.build
-#   --target    all
+#   --target    agent
+#
+# There is no server installer: the server runs on Linux only (ADR-0035) and
+# YuzuServerSetup was discontinued, so --target server and --target all are
+# refused rather than silently building the agent alone.
 #
 # Requires: InnoSetup 6 (ISCC.exe on PATH, or installed via Chocolatey)
 
@@ -19,7 +23,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # Defaults
 BUILD_DIR="$REPO_ROOT/builddir"
 VERSION=""
-TARGET="all"
+TARGET="agent"
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -28,12 +32,20 @@ while [[ $# -gt 0 ]]; do
         --version)  VERSION="$2"; shift 2 ;;
         --target)   TARGET="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--builddir DIR] [--version VER] [--target agent|server|all]"
+            echo "Usage: $0 [--builddir DIR] [--version VER] [--target agent]"
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+case "$TARGET" in
+    agent) ;;
+    server|all)
+        echo "ERROR: --target $TARGET: there is no Windows server installer; the server runs on Linux only (ADR-0035). Use --target agent." >&2
+        exit 1 ;;
+    *) echo "ERROR: unknown --target '$TARGET' (only 'agent' is supported)" >&2; exit 1 ;;
+esac
 
 # Extract version from meson.build if not provided
 if [[ -z "$VERSION" ]]; then
@@ -74,7 +86,7 @@ mkdir -p "$SCRIPT_DIR/output"
 WIN_BUILD_DIR=$(cygpath -w "$BUILD_DIR" 2>/dev/null || echo "$BUILD_DIR")
 
 # ── Build agent installer ──
-if [[ "$TARGET" == "agent" || "$TARGET" == "all" ]]; then
+if [[ "$TARGET" == "agent" ]]; then
     echo ""
     echo "=== Building Agent Installer ==="
 
@@ -96,29 +108,6 @@ if [[ "$TARGET" == "agent" || "$TARGET" == "all" ]]; then
         "$WIN_ISS"
 
     echo "Built: $SCRIPT_DIR/output/YuzuAgentSetup-$VERSION.exe"
-fi
-
-# ── Build server installer ──
-if [[ "$TARGET" == "server" || "$TARGET" == "all" ]]; then
-    echo ""
-    echo "=== Building Server Installer ==="
-
-    if [[ ! -f "$BUILD_DIR/server/core/yuzu-server.exe" ]]; then
-        echo "ERROR: yuzu-server.exe not found in $BUILD_DIR/server/core/" >&2
-        echo "Run 'meson compile -C builddir' first." >&2
-        exit 1
-    fi
-
-    echo "Server exe:   found"
-
-    WIN_ISS=$(cygpath -w "$SCRIPT_DIR/yuzu-server.iss" 2>/dev/null || echo "$SCRIPT_DIR/yuzu-server.iss")
-
-    MSYS_NO_PATHCONV=1 "$ISCC" \
-        "/DAppVersion=$VERSION" \
-        "/DBuildDir=$WIN_BUILD_DIR" \
-        "$WIN_ISS"
-
-    echo "Built: $SCRIPT_DIR/output/YuzuServerSetup-$VERSION.exe"
 fi
 
 echo ""

@@ -292,7 +292,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     if (result.rc != 0) {
         CHECK(result.rc == 1);
         // The whole point of the degraded path: nothing is published, so the
-        // daily sync skips the cycle rather than committing a partial set.
+        // daily sync sends a status-only section rather than committing a partial set.
         CHECK(result.captured.empty());
         // SKIP, not return. This is the ONLY test of the enrichment + receipt
         // integration, so a degraded run leaves that integration UNVERIFIED --
@@ -311,6 +311,8 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     std::size_t bad_prefix = 0, bad_field_count = 0, bad_sig_value = 0;
     std::size_t pkg_bad_ecosystem = 0, pkg_non_numeric_date = 0;
     std::size_t publisher_without_signature = 0;
+    std::size_t apps_with_location = 0;
+    std::size_t relative_locations = 0;
 
     std::istringstream iss(result.captured);
     std::string line;
@@ -321,7 +323,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
             ++bad_prefix;
             continue;
         }
-        // ADR-0016 blob v2: "inv" + exactly 12 fields. Splitting manually
+        // ADR-0016 blob: "inv" + the 12 blob fields + install_location. Splitting manually
         // (not on a parser helper) keeps this a genuine wire-shape check.
         std::vector<std::string> f;
         std::size_t start = 0;
@@ -334,7 +336,7 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
             f.push_back(line.substr(start, bar - start));
             start = bar + 1;
         }
-        if (f.size() != 13) { // "inv" + 12 fields
+        if (f.size() != 14) { // "inv" + 12 fields + install_location
             ++bad_field_count;
             continue;
         }
@@ -349,6 +351,13 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
 
         if (kind == "app") {
             ++app_rows;
+            // A macOS app row carries its .app path as install_location when system_profiler
+            // reported a Location (a pkgutil receipt has none).
+            if (!f[13].empty()) {
+                ++apps_with_location;
+                if (f[13].front() != '/')
+                    ++relative_locations;
+            }
             if (signature == "signed")
                 ++signed_apps;
             else if (signature == "unsigned")
@@ -375,6 +384,17 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     CHECK(bad_field_count == 0);
     CHECK(bad_sig_value == 0);
     CHECK(publisher_without_signature == 0);
+    // How many rows carry a location depends on the host (the sync writer later keeps it only
+    // under a machine root); the shape every one must have is the contract.
+    INFO("apps with an install_location: " << apps_with_location);
+    // The parser's Location capture (test_installed_apps_parsers.cpp) and the 14th-token layout
+    // (test_installed_apps_inventory.cpp, format_inv_row) are fixture-pinned. The one line between
+    // them, the plugin's copy of the parsed path into the record (row 1.4), is only reachable
+    // through a real dispatch, so it is asserted here: a healthy system_profiler run (anything
+    // else SKIPped above) lists at least one bundle with a Location. Unconditional on purpose:
+    // `app_rows == 0` is already red at the CHECK below, so a gate here would only hide this one.
+    CHECK(apps_with_location >= 1);
+    CHECK(relative_locations == 0);
 
     // The #2273 enrichment actually ran and populated the previously
     // always-empty fields.

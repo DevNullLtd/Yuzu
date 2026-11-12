@@ -1,7 +1,7 @@
 ## Virtualization Definitions
 ## Reports whether the device is a virtual machine, which hypervisor, and whether the agent
 ## itself runs in a container, as facts only: nothing is enforced, changed or fetched.
-## Plugin: virtualization | Actions: host, wsl
+## Plugin: virtualization | Actions: host, wsl, runtime_posture
 ##
 ## Sources by platform (no subprocess on any):
 ##   Linux:   CPUID (x86), /sys/class/dmi/id/{sys_vendor,product_name}, /sys/hypervisor/type,
@@ -237,6 +237,131 @@ spec:
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [virtualization]
+
+status:
+  phase: active
+---
+## linux.virtualization.runtime_posture: read-only container-runtime posture (Linux only).
+##
+## Without an endpoint (the default) the agent never opens a socket: it stats the docker, podman
+## and containerd default sockets, config files and data roots, and reads docker's daemon.json
+## through a key allow-list. When the operator sets --container-runtime-endpoint / YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT
+## to ONE read-only unix socket (an operator-supplied proxy in front of the runtime), the agent also
+## sends four fixed GET requests over it (/version, /info, /containers/json?all=1 and
+## /containers/{id}/json) under a 20 s deadline. The agent refuses the runtimes' default sockets as
+## an endpoint. Design, bounds and the endpoint contract: docs/virtualization-runtime-posture-design.md.
+##
+## Roles: executeRoles is advisory (docs/yaml-dsl-spec.md); the enforced control is the server's
+## catalogue row (Security:Read, ExecuteGate::None).
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: linux.virtualization.runtime_posture
+  displayName: Container Runtime Posture
+  version: 1.0.0
+  description: >
+    Reports which container runtimes (docker, podman, containerd) are present on this device, how
+    they are configured from a security point of view, and, only when the operator has provided a
+    read-only runtime endpoint, which containers exist and which risky settings they carry (name,
+    image, state, privileged, network mode and whether a host runtime socket is mounted). Never
+    creates, starts, stops or execs into anything; never emits environment, command line, labels,
+    ports or other mounts. A leading status row states whether the read was complete: constrained
+    means a read failed, a cap was hit or the deadline ran out. The endpoint row says why no
+    container data was read (unset, endpoint_refused, permission_denied, unreachable, not_http).
+    A runtime reads not_detected when none of its standard-path artefacts exists, which is not
+    proof of absence: a stopped, rootless or custom-root runtime can read not_detected.
+  tags: [posture, virtualization, container, docker, podman, containerd]
+
+spec:
+  type: question
+  platforms: [linux]
+
+  execution:
+    plugin: virtualization
+    action: runtime_posture
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Rows are discriminated by field 0 (row_kind); "-" is an absent value. A status row always
+    # comes first.
+    #
+    #   status|runtime_posture|<supported|constrained|unsupported>|<reason or ->
+    #   endpoint|<unset|endpoint_refused|permission_denied|unreachable|not_http|ok>|<reason or ->|<dialect or ->
+    #   runtime|<docker|podman|containerd>|<not_detected|detected|served>|<socket, absent or unreadable>|<config present|absent|unreadable>|<version or ->|<api_version or ->
+    #   config|<runtime or ->|<key>|<value>
+    #   container|<runtime or ->|<id12>|<name>|<image>|<state>|<privileged>|<network_mode>|<socket_mounted>
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, endpoint, runtime, config, container]
+        description: 'Row shape discriminator (field 0). Values: status, endpoint, runtime, config, container.'
+        example: container
+        platforms: [linux]
+      - name: field_1
+        type: string
+        description: 'status: the literal "runtime_posture". endpoint: the endpoint outcome, unset, endpoint_refused, permission_denied, unreachable, not_http or ok. runtime: the runtime, docker, podman or containerd. config: docker for a daemon.json setting, otherwise the runtime that /version identified. container: the runtime that /version identified. For config and container the runtime is docker or podman, or "-" when /version did not identify one.'
+        example: docker
+        platforms: [linux]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained or unsupported (a leg that threw). endpoint: the refusal reason for endpoint_refused (relative, dotdot, too_long, default_socket, same_inode, not_socket, symlink, owner, group, mode, insecure_ancestor, stat_error), otherwise "-". runtime: not_detected, detected or served. config: the setting name, or daemon_json on the one pseudo-row config|docker|daemon_json|malformed that says daemon.json was not usable JSON or held an allow-listed key of the wrong type. container: the first 12 characters of the container id.'
+        example: detected
+        platforms: [linux]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; every token is linux:virtualization:runtime_posture:<source>:<cause>, where <source> is endpoint, version, info, list, inspect, mountinfo, daemon_json or a runtime name; the source segment is omitted for the action-wide tokens busy, rows_capped, inspect_capped and deadline_exhausted, and inspect:failed:<n> carries a count in place of a cause; tokens look like linux:virtualization:runtime_posture:endpoint:default_socket, linux:virtualization:runtime_posture:version:timeout, linux:virtualization:runtime_posture:info:malformed, linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, "-" when it did not answer or its /version named no runtime. runtime: the default socket, present:<mode>:<uid>:<gid>, absent or unreadable (its stat failed). config: the setting value (malformed on the daemon_json pseudo-row). container: the container name.'
+        example: present:0660:0:998
+        platforms: [linux]
+      - name: field_4
+        type: string
+        description: 'runtime: whether a config file was found, present, absent or unreadable (its read failed). container: the image reference. Not used by the other kinds.'
+        example: present
+        platforms: [linux]
+      - name: field_5
+        type: string
+        description: 'runtime: the runtime version, filled only on the served row, otherwise "-". container: the state, created, running, paused, restarting, removing, exited, dead or invalid. Not used by the other kinds.'
+        example: running
+        platforms: [linux]
+      - name: field_6
+        type: string
+        description: 'runtime: the API version, filled only on the served row, otherwise "-". container: privileged, yes, no or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds.'
+        example: 'no'
+        platforms: [linux]
+      - name: field_7
+        type: string
+        description: 'container: the network mode, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds.'
+        example: bridge
+        platforms: [linux]
+      - name: field_8
+        type: string
+        description: 'container: host_runtime_socket_mounted, yes (a mount source is a default runtime socket path or a parent directory of one), no, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). The check covers the default socket paths only. Not used by the other kinds.'
+        example: 'no'
+        platforms: [linux]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "Report container runtime posture"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
     authorRoles: [content-author]
 
   compatibility:

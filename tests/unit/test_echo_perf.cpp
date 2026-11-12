@@ -430,18 +430,16 @@ TEST_CASE("perf: a failed counter read maps to a token by registry support (#184
 // ── Schema registry pins ─────────────────────────────────────────────────────
 
 TEST_CASE("perf: registry tables translate and are operator-queryable", "[echo][perf]") {
-    auto live = translate_dollar_name("$Perf_Live");
-    REQUIRE(live);
-    CHECK(*live == "perf_live");
+    CHECK_FALSE(translate_dollar_name("$Perf_Live").has_value()); // retired raw name
     auto hourly = translate_dollar_name("$Perf_Hourly");
     REQUIRE(hourly);
     CHECK(*hourly == "perf_hourly");
-    CHECK(is_queryable_table("perf_live"));
+    CHECK_FALSE(is_queryable_table("perf_live"));
     CHECK(is_queryable_table("perf_hourly"));
 
-    auto cols = columns_for_table("perf_live");
-    CHECK(std::find(cols.begin(), cols.end(), "cpu_pct") != cols.end());
-    CHECK(std::find(cols.begin(), cols.end(), "net_tx_bps") != cols.end());
+    auto cols = columns_for_table("perf_hourly");
+    CHECK(std::find(cols.begin(), cols.end(), "cpu_avg") != cols.end());
+    CHECK(std::find(cols.begin(), cols.end(), "tx_bps_max") != cols.end());
 }
 
 TEST_CASE("perf: the hourly tier is derived from the roll-up declaration", "[echo][perf]") {

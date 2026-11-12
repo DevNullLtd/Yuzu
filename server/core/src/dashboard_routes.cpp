@@ -3746,7 +3746,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 // queries the response store for that command_id, **filters responses to
 // the operator's visible agents**, parses each agent's
 // `config|<source>_enabled|false` lines plus the matching paused_at /
-// live_rows / oldest_ts companions, and returns an HTML table fragment.
+// rows / oldest_ts companions, and returns an HTML table fragment.
 //
 // Per-username state + visibility filter together close the Gate 2
 // governance HIGH finding (cross-operator data leak via shared scan slot).
@@ -3827,9 +3827,7 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
     // Each response is from one agent. Parse each line for
     //   config|<source>_enabled|<value>
     //   config|<source>_paused_at|<ts>
-    //   config|<source>_rows|<count>        (the hourly count; an agent from before the roll-up-
-    //   config|<source>_live_rows|<count>   only release sends only this raw-row figure, which is
-    //                                       read to flag the agent, never shown as the count)
+    //   config|<source>_rows|<count>        (the hourly count)
     //   config|<source>_oldest_ts|<ts>
     // and emit one row for every (agent, source) pair where `<source>_enabled` ==
     // "false". Sources with `enabled=true` are dropped — callers want the *paused*
@@ -3925,13 +3923,9 @@ DashboardRoutes::gather_echo_retention_paused(const std::string& username,
                 p != kv.end()) {
                 try { row.paused_at = std::stoll(p->second); } catch (...) {}
             }
-            // Row count: `<src>_rows` is the hourly count. An agent that sends only the
-            // one-release alias `<src>_live_rows` has not moved to the roll-up store: flagged,
-            // and its raw-row figure is not presented as the hourly count.
+            // Row count: `<src>_rows` is the hourly count.
             if (auto lr = kv.find(std::string{source} + "_rows"); lr != kv.end()) {
-                try { row.live_rows = std::stoll(lr->second); } catch (...) {}
-            } else if (kv.contains(std::string{source} + "_live_rows")) {
-                row.pre_rollup_agent = true;
+                try { row.hourly_rows = std::stoll(lr->second); } catch (...) {}
             }
             if (auto ot = kv.find(std::string{source} + "_oldest_ts");
                 ot != kv.end()) {
@@ -4141,13 +4135,10 @@ std::string DashboardRoutes::render_echo_retention_paused(
             html += "<td>" + format_age(r.paused_at, now) + "</td>";
         }
         html += "<td class=\"r\">";
-        if (r.pre_rollup_agent) {
-            html += "<span class=\"echo-tree-mute\" title=\"This device runs an agent without "
-                    "the roll-up tables; upgrade the agent\">—</span>";
-        } else if (r.live_rows < 0) {
+        if (r.hourly_rows < 0) {
             html += "<span class=\"echo-tree-mute\">—</span>";
         } else {
-            html += std::format("{}", r.live_rows);
+            html += std::format("{}", r.hourly_rows);
         }
         html += "</td>";
         html += "<td>" + format_age(r.oldest_ts, now) + "</td>";
