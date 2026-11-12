@@ -2568,9 +2568,9 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                 // push moves to another key is a first attach of that key). The override exists
                 // because, after the detach, the kept rule's own attach sees KeyBusy (an io-class
                 // mechanism whose disarm claim is still queued) or FirstAttach (an inline type, or
-                // a disarm that already completed) depending on timing, not the key's cause. The local map is
-                // built first and installed with a move-assign (noexcept), in its own firewall
-                // below. The record is diagnostic only: no arm, skip or generation decision reads
+                // a disarm that already completed) depending on timing, not the key's cause. The
+                // local map is built first and installed with a move-assign (noexcept), in its
+                // own firewall below. The record is diagnostic only: no arm, skip or generation decision reads
                 // it, and it is cleared at the top of the next apply_rules.
                 const auto forced = spark_runtime_->detach_rules_except(push_ids);
                 // The map is diagnostic only, so it is built in its OWN firewall: an allocation

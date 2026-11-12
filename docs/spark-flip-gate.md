@@ -1713,9 +1713,11 @@ flip, with a red-first test each:
     Windows runs. The new cases have run on Linux debug, and `[5719]` and `[4415prA]` have also run
     clean under TSan and under ASan/UBSan, including the retarget label change in
     `reuse_existing_locked`, `SparkKeyRuleIndex::mapped_to_other_key` and the key-qualified
-    forced-reason override in `GuardianEngine` (Linux debug, on the branch after dev was merged: TSan
-    once, ASan/UBSan three times for `[5719]` and once for `[4415prA]`, no sanitizer report; an earlier
-    ASan run of the new retarget SECTION failed on a race in the test's own premise assertion, now a
+    forced-reason override in `GuardianEngine` (Linux debug, on the branch after dev was merged, with the
+    code and tests of `057a272ed5`: TSan once, ASan/UBSan three times for `[5719]` and once for
+    `[4415prA]`, no sanitizer report; the run record was not retained, so this is the author's own
+    report; an earlier ASan run of the new retarget SECTION failed, which we attribute to a race in the
+    test's own premise assertion (the file arm completes on a mechanism thread after `settle()`), now a
     bounded wait).
     Windows (MSVC) and macOS (Apple Clang) runs of them are outstanding. The Armed return that attach_rule makes
     after it re-inspects its claim (the case in which the claim settled before attach_rule

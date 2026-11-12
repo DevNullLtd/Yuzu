@@ -3799,8 +3799,8 @@ GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<
         // #5719: at most one entry per kept rule. Deliberately not reserved, so a push that
         // tears down no kept rule allocates nothing for it. The consequence: `forced` grows by
         // push_back under registry_mu_ and that can throw std::bad_alloc part-way through this
-        // loop (the entry copies the rule id and moves its key string, which
-        // key_for_rule allocated just above), before the withdrawals below have run. Nothing catches it
+        // loop (the entry copies the rule id and moves its key string, which key_for_rule
+        // allocated just above), before the withdrawals below have run. Nothing catches it
         // here; it propagates to apply_rules' teardown firewall, which counts a reconcile
         // failure and holds the generation so the server retries the push.
         // State when such a throw leaves this block: detach_epoch_ has been bumped, the wedge
