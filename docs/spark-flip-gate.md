@@ -1711,9 +1711,12 @@ flip, with a red-first test each:
     captured-log test that the line is logged exactly once. That captured-log test SKIPs where
     its in-band probe line is not captured, so that protection is Linux-only until the macOS and
     Windows runs. The new cases have run on Linux debug, and `[5719]` and `[4415prA]` have also run
-    clean under TSan and under ASan/UBSan (at the commit that added the resume hook; the later
-    retarget label change in `reuse_existing_locked`, the new `SparkKeyRuleIndex::mapped_to_other_key`
-    and the key-qualified forced-reason override in `GuardianEngine` were not re-run under sanitizers).
+    clean under TSan and under ASan/UBSan, including the retarget label change in
+    `reuse_existing_locked`, `SparkKeyRuleIndex::mapped_to_other_key` and the key-qualified
+    forced-reason override in `GuardianEngine` (Linux debug, on the branch after dev was merged: TSan
+    once, ASan/UBSan three times for `[5719]` and once for `[4415prA]`, no sanitizer report; an earlier
+    ASan run of the new retarget SECTION failed on a race in the test's own premise assertion, now a
+    bounded wait).
     Windows (MSVC) and macOS (Apple Clang) runs of them are outstanding. The Armed return that attach_rule makes
     after it re-inspects its claim (the case in which the claim settled before attach_rule
     re-inspected it) carries a rebuild reason, and the io-class forced-resume SECTION of the R2

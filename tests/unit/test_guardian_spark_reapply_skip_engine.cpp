@@ -3253,8 +3253,9 @@ TEST_CASE("#5719 engine: a kept rule on a faulted key is reported faulted_key wi
         CHECK(line.find("faulted_key=0") != std::string::npos);
         // Premises: the scoped detach tore the faulted key down once, and s1 armed on its new key
         // once; without them the line above could read first_attach with or without the key match.
-        CHECK(r.fm->unwatch_calls(k1) == 1);
-        CHECK(r.fm->watch_calls(file_key(p3)) == 1);
+        // The arm and disarm complete on mechanism threads, after settle(): wait, never sleep.
+        CHECK(yuzu::test::spin_until([&] { return r.fm->unwatch_calls(k1) == 1; }, 15s));
+        CHECK(yuzu::test::spin_until([&] { return r.fm->watch_calls(file_key(p3)) == 1; }, 15s));
         check_untouched(*r.fm, "s0", k0);
     }
     SECTION("two rules share a faulted key, one is retargeted: each is reported by its key") {
@@ -3284,7 +3285,7 @@ TEST_CASE("#5719 engine: a kept rule on a faulted key is reported faulted_key wi
                                              {"b", GuardianRebuildReason::KeyFaulted}}));
         CHECK(line.find("first_attach=1 ") != std::string::npos);
         CHECK(line.find("faulted_key=1 ids=[b]") != std::string::npos);
-        CHECK(r.fm->watch_calls(file_key(moved)) == 1);
+        CHECK(yuzu::test::spin_until([&] { return r.fm->watch_calls(file_key(moved)) == 1; }, 15s));
         check_untouched(*r.fm, "s (healthy sibling)", ko);
     }
 }
