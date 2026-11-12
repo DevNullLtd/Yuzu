@@ -2505,7 +2505,9 @@ jobs:
         run: |
           $scope = $env:YUZU_TEST_REGISTRY_SCOPE
           $script = './scripts/ci/check-registry-test-leftovers.ps1'
-          # one probe under EACH root the script scans, so dropping a root from it turns this step red
+          # one probe under EACH root the script scans, so dropping a root from it turns this step red. Only LOCAL SYSTEM
+          # may create a key under the two bam roots: a runner account that is refused there is held to a weaker proof
+          # for those two (the script must still LIST the root); the three other roots always need a live probe.
           $probes = [ordered]@{
             'HKCU:\Software' = "YuzuTest-selftest-$scope-probe-hkcu"
             'HKLM:\SOFTWARE' = "YuzuTest-selftest-$scope-probe-hklm"
@@ -2513,6 +2515,8 @@ jobs:
             'HKLM:\SYSTEM\CurrentControlSet\Services\bam' = "YuzuTest-selftest-$scope-probe-bamroot"
             'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings' = "YuzuTest-selftest-$scope-probe-bamstate"
           }
+          $bamRoots = @('HKLM:\SYSTEM\CurrentControlSet\Services\bam', 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings')
+          $planted = [ordered]@{}
           function Arm($s, $want, $kind, $name) {
             $out = & pwsh -NoProfile -NonInteractive -File $script -Scope $s 2>&1 | Out-String
             $rc = $LASTEXITCODE
@@ -2520,7 +2524,7 @@ jobs:
             if ($rc -ne $want) {
               throw "registry leftover check self-test, $name arm: expected exit $want, got exit $rc"
             }
-            foreach ($p in $probes.Values) {
+            foreach ($p in $planted.Values) {
               if ($out -notmatch ($kind + '.*' + [regex]::Escape($p))) {
                 throw "registry leftover check self-test, $name arm: expected exit $want naming $p, got exit $rc"
               }
@@ -2529,10 +2533,20 @@ jobs:
           # no -Force: a probe that already exists fails the step and, not in $made, is never removed by it
           $made = @()
           try {
-            foreach ($root in $probes.Keys) { $p = Join-Path $root $probes[$root]; New-Item -Path $p | Out-Null; $made += $p }
+            foreach ($root in $probes.Keys) {
+              $p = Join-Path $root $probes[$root]
+              try { New-Item -Path $p -ErrorAction Stop | Out-Null; $made += $p; $planted[$root] = $probes[$root] }
+              catch {
+                if ($bamRoots -notcontains $root) { throw }
+                Write-Host "::warning::registry leftover check self-test: cannot plant a probe under $root ($($_.Exception.Message)); proving only that the script lists it"
+                if (-not (Select-String -LiteralPath $script -SimpleMatch -Quiet -Pattern "'$root'")) {
+                  throw "registry leftover check self-test: $script does not list $root"
+                }
+              }
+            }
             Arm "selftest-$scope" 1 '::error::leftover registry key ' 'own-scope'
             Arm $scope 0 '::warning::' 'other-scope'
-            foreach ($root in $probes.Keys) {
+            foreach ($root in $planted.Keys) {
               if (-not (Test-Path -LiteralPath (Join-Path $root $probes[$root]))) {
                 throw "registry leftover check self-test: the check removed its probe under $root"
               }

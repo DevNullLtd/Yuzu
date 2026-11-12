@@ -59,8 +59,9 @@ bool is_elevated() {
 }
 
 // Same rule as skip_or_fail in test_registry_write_local_dispatcher.cpp (which WARNs where this SKIPs): CI's non-pg step sets
-// YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS (non-empty, not "0") and runs elevated, so an environment
-// SKIP there would be a silent green; it FAILs instead. Both macros throw, so callers need no return.
+// YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS (non-empty, not "0"), so an environment SKIP there would be a silent green; it
+// FAILs instead. The one exception is a refused create under the bam service key (see the create loop below).
+// Both macros throw, so callers need no return.
 void skip_or_fail(const std::string& why) {
     const char* req = std::getenv("YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS");
     if (req != nullptr && req[0] != '\0' && std::string_view{req} != "0")
@@ -128,11 +129,17 @@ TEST_CASE("registry live: bam\\State is never read -- a scratch value under bam 
     ScratchKey control(bam + "\\" + leaf);                          // positive control: inside the watched root
     ScratchKey excluded(bam + "\\State\\UserSettings\\" + leaf);    // below the excluded subtree
     // Both owners are constructed above, before any create() can throw, so a failure here still unwinds both
-    // (a never-created key closes and deletes nothing). An elevated non-SYSTEM token may be refused; CI (LOCAL SYSTEM,
-    // the require flag set) FAILs.
+    // (a never-created key closes and deletes nothing). Only LOCAL SYSTEM may create a key under the bam service
+    // key: an elevated non-SYSTEM token, which a CI runner account can be, is refused with ACCESS_DENIED. That is
+    // a limit of the account, not a defect, so it SKIPs even with the require flag set (the case then runs only where
+    // the account may write, e.g. a LOCAL SYSTEM host); any other error still FAILs under the flag.
     for (ScratchKey* k : {&control, &excluded}) {
-        if (const LONG rc = k->create(); rc != ERROR_SUCCESS)
-            skip_or_fail("cannot create a scratch key under the bam service key (error " + std::to_string(rc) + ")");
+        if (const LONG rc = k->create(); rc != ERROR_SUCCESS) {
+            const std::string why = "cannot create a scratch key under the bam service key (error " + std::to_string(rc) + ")";
+            if (rc == ERROR_ACCESS_DENIED)
+                SKIP(why + "; only LOCAL SYSTEM may write there");
+            skip_or_fail(why);
+        }
     }
     // Deny read to everyone: if the reader ever opens this key it is reported in `skipped`, which
     // is what makes the exclusion observable (the diff engine drops excluded keys on its own, so
