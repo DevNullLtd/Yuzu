@@ -1715,7 +1715,9 @@ jobs:
   # with three differences:
   #   1. No needs on build-linux/build-gateway — the image contains no Yuzu
   #      build artifacts (it's postgres + pgvector + init SQL), so a core
-  #      build failure is irrelevant to it. It IS in the release job's
+  #      build failure is irrelevant to it. It does wait for build-windows
+  #      and build-macos, purely as ordering: no :X.Y.Z image is pushed for a
+  #      release whose agent packaging fails (ADR-0035 step 3, UP-12). It IS in the release job's
   #      needs: the composes release-pin ghcr.io/.../yuzu-postgres:X.Y.Z,
   #      so a release must not publish if this image failed to.
   #   2. amd64-only today: the QEMU arm64 leg was dropped (see the buildx
@@ -1723,7 +1725,7 @@ jobs:
   #   3. Distinct local buildcache path (postgres suffix).
   docker-publish-postgres:
     name: "Publish postgres image"
-    needs: [release-guard]
+    needs: [release-guard, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 60
     permissions:
@@ -1898,7 +1900,9 @@ jobs:
   #      collides with docker-publish's cache.
   docker-publish-chisel:
     name: "Publish ${{ matrix.image }}-chisel image"
-    # Mirror docker-publish's needs (core builds must pass). The release job
+    # Mirror docker-publish's needs (core builds AND the Windows/macOS agent
+    # builds must pass, so no :X.Y.Z image is pushed for a release whose agent
+    # packaging fails; ADR-0035 step 3, UP-12). The release job
     # NEEDS this job (#5242): the three chisel images' SBOMs are release assets
     # and belong inside the signed SHA256SUMS, and while this job stayed out of
     # the release's needs they were attached only when it happened to finish
@@ -1909,7 +1913,7 @@ jobs:
     # Recovery: "Re-run failed jobs" on the NEWEST run for the tag (digests of
     # the succeeded legs are kept; each push re-checks the tag), never on an
     # older run (#5242); a fresh run is the fallback. See the release skill.
-    needs: [release-guard, build-linux, build-gateway]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
     # in-flight build instead of wedging the single self-hosted Linux runner

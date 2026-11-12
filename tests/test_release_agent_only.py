@@ -279,17 +279,19 @@ def problems(release: str, check: str, bundle: str) -> list:
 
     # 4b. docker-publish waits for the agent builds, so a failed Windows/macOS
     # packaging step cannot leave pushed images with no GitHub Release (UP-12).
-    try:
-        dp = job_block(release, "docker-publish")
+    for pub in ("docker-publish", "docker-publish-chisel", "docker-publish-postgres"):
+        try:
+            dp = job_block(release, pub)
+        except AssertionError as e:
+            found.append(str(e))
+            continue
         m = re.search(r"^    needs:\s*\[([^\]]*)\]", dp, re.M)
         dp_needs = {n.strip() for n in m.group(1).split(",")} if m else set()
         for dep in ("build-windows", "build-macos"):
             if dep not in dp_needs:
-                found.append(f"docker-publish does not need {dep} (needs: {sorted(dp_needs)})")
+                found.append(f"{pub} does not need {dep} (needs: {sorted(dp_needs)})")
         if re.search(r"^    if:", dp, re.M):
-            found.append("docker-publish has a job-level if: (a skipped needed job would skip it silently)")
-    except AssertionError as e:
-        found.append(str(e))
+            found.append(f"{pub} has a job-level if: (a skipped needed job would skip it silently)")
 
     # 5. The bundle script requests and prefers the current names.
     requested = literal(re.findall(rf"-p '({ARCHIVE_RE})'", bundle))
@@ -328,6 +330,8 @@ class ReleaseAgentOnly(unittest.TestCase):
         mutations = {
             "docker-publish stops waiting for windows": ("release", "needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]", "needs: [release-guard, build-linux, build-gateway, build-macos]"),
             "docker-publish stops waiting for macos": ("release", "needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]", "needs: [release-guard, build-linux, build-gateway, build-windows]"),
+            "chisel stops waiting for windows": ("release", "needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]\n    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]\n    # Job-level", "needs: [release-guard, build-linux, build-gateway, build-macos]\n    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]\n    # Job-level"),
+            "postgres stops waiting for windows": ("release", "needs: [release-guard, build-windows, build-macos]", "needs: [release-guard, build-macos]"),
             "windows server flag dropped": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false"),
             "macos server flag dropped": ("release", "            -Dserver=disabled \\\n            -Db_lto=true", "            -Db_lto=true"),
             "windows server flag doubled": ("release", "-Dserver=disabled\n", "-Dserver=disabled `\n            -Dserver=disabled\n"),

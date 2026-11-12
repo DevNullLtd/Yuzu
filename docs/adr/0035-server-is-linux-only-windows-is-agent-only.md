@@ -481,9 +481,9 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    - **Not yet verified.** The release-time DLL refusal has never run on a real release
      (lexical pins only; the Windows rehearsal exercises it), the reverse vcpkg reconcile on
      Windows and macOS is unexercised, and nothing was run on macOS. If the refusal fails on
-     a release tag, nothing is pushed: `docker-publish` now needs `build-windows` and
-     `build-macos` (UP-12, pinned in `tests/test_release_agent_only.py`), so a failed agent
-     packaging step stops the images before the push. The rehearsal still has to confirm the
+     a release tag, nothing is pushed: `docker-publish`, `docker-publish-chisel` and
+     `docker-publish-postgres` now all need `build-windows` and `build-macos` (UP-12, pinned in `tests/test_release_agent_only.py`), so a failed agent
+     packaging step pushes no versioned image (the postgres image no longer publishes in parallel with the builds). The rehearsal still has to confirm the
      added wait (the images now start after the slowest agent build, ~40 min).
    - **Interim gap until step 5: no native server stack on macOS.** `scripts/start-UAT.sh`
      and the native-stack phases of `/test` need a server binary, which macOS no longer
