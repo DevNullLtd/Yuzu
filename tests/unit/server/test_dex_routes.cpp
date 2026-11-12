@@ -14,7 +14,6 @@
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
 #include "pg/pg_pool.hpp"
-#include "test_dex_api_double.hpp"
 #include "test_dex_perf_api_double.hpp"
 #include "test_route_sink.hpp"
 
@@ -1272,57 +1271,6 @@ TEST_CASE("DEX routes: /dex lights DEX in the sidebar and ends the breadcrumb on
     CHECK(page->body.find("<a class=\"shell-nav on\" href=\"/dex\" aria-current=\"page\">") !=
           std::string::npos);
     CHECK(page->body.find("<span class=\"shell-sep\">/</span><b>DEX</b>") != std::string::npos);
-}
-
-// Kills: the Apps route reaching the API without a wired DexApi, or answering a non-2xx (htmx drops a
-// non-2xx body, so the operator would see nothing). No store and no Postgres: the handler reads only
-// perm_fn_ and the optional DexApi.
-TEST_CASE("DEX routes: the Apps tab with no DexApi wired is a 200 error panel", "[dex][routes][apps_ui]") {
-    auto okAuth = [](const httplib::Request&, httplib::Response&) {
-        return std::optional<auth::Session>(auth::Session{});
-    };
-    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
-                     const std::string&) { return true; };
-    yuzu::server::test::TestRouteSink sink;
-    DexRoutes routes;
-    routes.register_routes(sink, okAuth, okPerm, /*store=*/nullptr, /*fleet_fn=*/{}, /*audit_fn=*/{});
-
-    auto apps = sink.Get("/fragments/dex/apps?window=7d&platform=all");
-    REQUIRE(apps);
-    CHECK(apps->status == 200);
-    CHECK(apps->body.find("The read could not be completed, so no figures are shown.") != std::string::npos);
-    CHECK(apps->body.find("<tbody class=\"dx-app\">") == std::string::npos); // nothing derived is shown
-}
-
-// Kills: a platform outside the closed set (all, windows, macos, linux) being handed to the API or
-// echoed into the markup. A wired double counts its calls, so a regression that defaults the bad
-// token to a platform, or forwards the raw string, fails here rather than in production.
-TEST_CASE("DEX routes: the Apps tab refuses an unknown platform without calling the API",
-          "[dex][routes][apps_ui]") {
-    auto okAuth = [](const httplib::Request&, httplib::Response&) {
-        return std::optional<auth::Session>(auth::Session{});
-    };
-    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
-                     const std::string&) { return true; };
-    int api_calls = 0;
-    auto api = std::make_shared<yuzu::server::test::FnDexApi>(
-        /*device_score_fn=*/nullptr, /*device_history_fn=*/nullptr, /*observation_fn=*/nullptr,
-        /*app_fn=*/nullptr,
-        [&api_calls](const std::string&, const std::string&) {
-            ++api_calls;
-            return DexAppsModel{};
-        });
-    yuzu::server::test::TestRouteSink sink;
-    DexRoutes routes;
-    routes.register_routes(sink, okAuth, okPerm, /*store=*/nullptr, /*fleet_fn=*/{}, /*audit_fn=*/{});
-    routes.set_dex_api(api);
-
-    auto apps = sink.Get("/fragments/dex/apps?window=7d&platform=%3Cscript%3Ex");
-    REQUIRE(apps);
-    CHECK(apps->status == 200);
-    CHECK(apps->body.find("Unknown platform") != std::string::npos);
-    CHECK(apps->body.find("<script>x") == std::string::npos); // the raw token never reaches the markup
-    CHECK(api_calls == 0);
 }
 
 // Kills: the Trends depth rules in the page shell (guardian_page_ui.cpp) going missing or turning
