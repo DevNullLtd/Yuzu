@@ -1894,7 +1894,9 @@ TEST_CASE("DEX apps UI: agent-reported and customer-authored strings are escaped
     model.apps[1].version_count = 0;
     const auto words = render_dex_apps_fragment(model, 7, "all");
     CHECK(contains(cell(words, "wide.exe", "", kColLastSeen), "unknown"));
-    CHECK(contains(cell(words, "app1.exe", "", kColApp), "version not collected"));
+    // the note sits after a space, never fused to the application link ("app1.exeversion not collected")
+    CHECK(contains(cell(words, "app1.exe", "", kColApp),
+                   "</a> <span class=\"gp-mute\">version not collected</span>"));
 }
 
 TEST_CASE("DEX apps UI: the pre-rendered page stays under its size ceiling", "[dex][apps_ui]") {
