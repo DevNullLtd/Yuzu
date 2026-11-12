@@ -189,6 +189,13 @@ inline constexpr int kDefaultEventRetentionDays = 30;
 // + alert observers ONLY on `Inserted`; Redelivered / Conflict / Error all
 // return before the observers.
 enum class EventInsertOutcome { Inserted, Redelivered, Conflict, Error };
+
+/// The three points of the per-agent order step at which the test seam
+/// `set_agent_step_gap_hook_for_test` runs, in the order a step reaches them. `EnsureToDecide` is
+/// between the first Ensure and the first DECIDE; `BeforeRetryEnsure` is after a first DECIDE that
+/// returned no row and before the retry's Ensure; `RetryEnsureToDecide` is between the retry's
+/// Ensure and the retry's DECIDE. Never reached outside a test that sets the hook.
+enum class AgentStepGap { EnsureToDecide, BeforeRetryEnsure, RetryEnsureToDecide };
 struct EventInsertResult {
     EventInsertOutcome outcome{EventInsertOutcome::Error};
     std::string error; // set for Conflict (mismatch detail) + Error (db message); empty otherwise
@@ -289,6 +296,17 @@ public:
     /// the store is used concurrently and clear it with an empty function.
     void set_census_lock_barrier_for_test(std::function<void()> fn) {
         census_lock_barrier_ = std::move(fn);
+    }
+
+    /// Test seam for the per-agent order step (schema v5): `fn(gap, agent_id)` runs on the ingest
+    /// thread, inside the open transaction, at each `AgentStepGap` of a census-bearing first
+    /// delivery or batch row, so a test can commit or hold a competing write to the agent's order
+    /// row in the gap between Ensure and DECIDE. It may block (a parked writer is observed through
+    /// `pg_stat_activity`). A Repair runs no agent step, so it never reaches it. Production leaves
+    /// it empty (a no-op). Set it before the store is used concurrently and clear it with an empty
+    /// function.
+    void set_agent_step_gap_hook_for_test(std::function<void(AgentStepGap, const std::string&)> fn) {
+        agent_step_gap_hook_ = std::move(fn);
     }
 
     /// Test seam for `unrepresented_pending_for_agent` (#7217): while `fn` is set, every call that
@@ -650,6 +668,7 @@ private:
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
     std::function<void()> census_lock_barrier_;     // test seam, empty in production
+    std::function<void(AgentStepGap, const std::string&)> agent_step_gap_hook_; // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
     std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production
     std::function<void(void*)> pre_commit_hook_;    // test seam, empty in production
