@@ -371,6 +371,11 @@ async function checkExpanderAccessibility(page) {
     () => !document.querySelector('details.dx-vx').open, { timeout: WAIT_MS }));
 }
 
+// htmx 2.0.4 binds a freshly swapped control a moment AFTER the swap settles (it stores its internal data
+// on the element), and a key press before that is a no-op. Wait for the binding before pressing Enter.
+const htmxBound = (page, selector) => page.waitForFunction(
+  (sel) => [...document.querySelectorAll(sel)].every((c) => !!c['htmx-internal-data']), { timeout: WAIT_MS }, selector);
+
 async function scenarioDexApps(page) {
   const w = watch(page);
 
@@ -381,6 +386,7 @@ async function scenarioDexApps(page) {
   const liveText = await page.$eval('#dex-apps', (e) => e.textContent);
   check('dex-apps live: the Apps tab shows the model, not the "Application stability is unavailable" panel',
     !liveText.includes('Application stability is unavailable'), liveText.slice(0, 200));
+  await htmxBound(page, '#dex-apps button.gp-chip');
   await page.evaluate(() => {
     [...document.querySelectorAll('#dex-apps button.gp-chip')].find((c) => c.textContent.trim() === 'Windows').focus();
   });
@@ -497,7 +503,10 @@ async function scenarioDexPaneSync(page) {
     JSON.stringify(after));
   check('dex-pane-sync: the Apps stub saw exactly one request', apps.calls.length === 1,
     'calls: ' + apps.calls.length);
-  check('dex-pane-sync: no page error and no CSP violation', w.errors().length === 0, JSON.stringify(w.errors()));
+  // htmx itself logs these two events through console.error when hx-sync cancels the superseded request,
+  // which is exactly what this scenario provokes; any other page error or CSP violation still fails.
+  const pageErrs = w.errors().filter((e) => e !== 'htmx:afterRequest' && e !== 'htmx:sendAbort');
+  check('dex-pane-sync: no page error and no CSP violation', pageErrs.length === 0, JSON.stringify(pageErrs));
   clearStubs(page);
 }
 
@@ -522,6 +531,7 @@ async function scenarioDexKeyboard(page) {
   await at('Apps fragment (#dex-apps)', page.waitForSelector('#dex-apps', { timeout: WAIT_MS }));
   await at('htmx settled', settled(page));
 
+  await htmxBound(page, '#dex-apps button.gp-chip');
   check('dex-keyboard: a window chip takes focus', await focusIn('#dex-apps button.gp-chip', '30d'));
   await page.keyboard.press('Enter');
   await at('30d chip lit', page.waitForFunction(() => {
@@ -535,10 +545,12 @@ async function scenarioDexKeyboard(page) {
   await stub(page, { path: '/fragments/dex/apps', status: 200, contentType: 'text/html', body });
   const drill = await stub(page, { path: '/fragments/dex/app', status: 200, contentType: 'text/html',
     body: '<div id="dex-app-stub">drill</div>' });
+  await htmxBound(page, '#guardian-detail .gp-subnav button');
   check('dex-keyboard: the Apps tab takes focus again', await focusIn('#guardian-detail .gp-subnav button', 'Apps'));
   await page.keyboard.press('Enter');
   await at('golden Apps fragment', page.waitForSelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk', { timeout: WAIT_MS }));
   await at('htmx settled', settled(page));
+  await htmxBound(page, 'tbody.dx-app .dx-lk');
   const focused = await page.evaluate(() => {
     const el = document.querySelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk');
     el.focus();
