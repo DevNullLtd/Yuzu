@@ -44,7 +44,7 @@ A role assignment on "London Office" applies to both "London Desktops" and "Lond
 When RBAC is enabled, the agent list shown in the dashboard and returned by the agent API is filtered based on management group role assignments:
 
 - **Global administrators** (users with the `Infrastructure:Read` permission) see all agents.
-- **Non-admin users** only see agents that belong to management groups where they have at least one role assignment (Operator, Viewer, or ITServiceOwner).
+- **Non-admin users** only see agents that belong to management groups where they have at least one role assignment (Operator or Viewer; an `ITServiceOwner` row stored before the management-group store began refusing the role also counts, and no new one can be assigned).
 - This applies to the dashboard view, the `/api/agents` endpoint, and any UI page that lists devices.
 
 For example, if `jane.ops` holds the Operator role on the "London Office" group, she sees only agents that are members of "London Office" or its child groups ("London Desktops", "London Servers").
