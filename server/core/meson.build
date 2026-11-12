@@ -820,6 +820,7 @@ yuzu_server_core_lib = static_library(
     'src/mcp_tools_hardware.cpp',
     'src/mcp_tools_containment.cpp',
     'src/mcp_tools_crypto.cpp',
+    'src/mcp_tools_dex.cpp',
     'src/mcp_transport.cpp',
     'src/compliance_model.cpp',
     'src/compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
@@ -842,17 +843,21 @@ yuzu_server_core_lib = static_library(
     'src/group_agent_count_preview.cpp',
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
+    'src/hardware_section_integrity.cpp', # #7159: section-integrity counter + sampled WARN (the pure model stays metrics-free)
     'src/device_containment_render.cpp',
     'src/device_estate_render.cpp',
     'src/software_catalog_rollup.cpp',
     'src/software_normalization_job.cpp',
     'src/software_title_dimension.cpp',
     'src/software_catalogue_model.cpp',
+    'src/software_list_model.cpp',
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
     'src/crypto_widget_catalogue.cpp', # /crypto widgets: pure catalogue + D13 windows + JSON shapers
     'src/crypto_dashboard_layout_store.cpp', # /crypto widgets: per-operator layout (born-on-PG)
+    'src/revocation_source_store.cpp',   # R1 (slice 2b-1a): registered CRL sources (born-on-PG)
+    'src/revocation_source_service.cpp', # R1: shared REST+MCP validation, egress check, JSON views
     'src/preflight_eval.cpp',
     'src/preflight_run_store.cpp',
     'src/preflight_runner.cpp',
@@ -1033,6 +1038,7 @@ yuzu_server_routes_lib = static_library(
     'src/sle_routes.cpp',
     'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
     'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
+    'src/revocation_source_routes.cpp',  # R1: /api/v1/crypto/revocation-sources REST twins
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/verify_routes.cpp',

@@ -48,7 +48,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     // Count tripwire — forces a conscious table update when a pass is added or
     // removed (a silent count change is exactly what WS-10 exists to prevent).
     // Update this number ONLY alongside a real classification change.
-    CHECK(kBackgroundJobs.size() == 50);
+    CHECK(kBackgroundJobs.size() == 52);
 
     // The load-bearing per-pass calls — a regression here is the WS-10 hazard.
     SECTION("MUST-run-per-replica passes are ReplicaSafe, never leader-gated") {
@@ -82,6 +82,12 @@ TEST_CASE("background-job table classifies every audited pass correctly",
             CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
         }
     }
+    SECTION("SAM-14: the software change-ledger prune is ReplicaSafe on preflight_runner_thread_") {
+        auto* j = find("software_inventory_store.run_retention_prune_changes");
+        REQUIRE(j != nullptr);
+        CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
+        CHECK(j->owning_thread == "preflight_runner_thread_");
+    }
     SECTION("#5678: the endpoint_state prune is ReplicaSafe on preflight_runner_thread_, never the health tick") {
         auto* j = find("offline_endpoint_store.run_retention_prune");
         REQUIRE(j != nullptr);
@@ -103,6 +109,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     SECTION("the sweep-added MUST-run-per-replica / idempotent passes are ReplicaSafe") {
         for (std::string_view p : {"cert_reloader.run_loop",
                                    "software_catalog_rollup.refresh_catalog_rollup",
+                                   "software_catalog_rollup.refresh_component_rollup",
                                    "auth_db.cleanup_provisional_mfa",
                                    "ota_transfer_watchdog.sweep_once",
                                    "mcp_stream_bridge.run_projector",

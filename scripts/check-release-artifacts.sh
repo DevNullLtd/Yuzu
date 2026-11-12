@@ -21,21 +21,22 @@
 #   Archives / installers (one each):
 #     yuzu-linux-x64.tar.gz
 #     yuzu-gateway-linux-x64.tar.gz
-#     yuzu-windows-x64.zip
-#     yuzu-macos-arm64.tar.gz
+#     yuzu-agent-windows-x64.zip
+#     yuzu-agent-macos-arm64.tar.gz
+#
+#   Retired assets (refused if present): YuzuServerSetup-*, yuzu-windows-x64.*, yuzu-macos-arm64.*
 #
 #   Glob archives (at least one match each):
 #     *.deb                     (linux server+agent+gateway)
 #     *.rpm                     (linux server+agent+gateway)
 #     YuzuAgentSetup-*.exe      (Windows agent installer)
-#     YuzuServerSetup-*.exe     (Windows server installer)
 #     YuzuAgent-*.pkg           (macOS agent installer)
 #
 #   Per-platform SBOMs (matching the 4 archives above):
 #     yuzu-linux-x64.cdx.json        + .spdx.json
 #     yuzu-gateway-linux-x64.cdx.json + .spdx.json
-#     yuzu-windows-x64.cdx.json       + .spdx.json
-#     yuzu-macos-arm64.cdx.json       + .spdx.json
+#     yuzu-agent-windows-x64.cdx.json + .spdx.json
+#     yuzu-agent-macos-arm64.cdx.json + .spdx.json
 #
 #   Image SBOMs:
 #     yuzu-server-image.cdx.json   + .spdx.json
@@ -75,8 +76,8 @@ fail=0
 REQUIRED_ARCHIVES=(
   "yuzu-linux-x64.tar.gz"
   "yuzu-gateway-linux-x64.tar.gz"
-  "yuzu-windows-x64.zip"
-  "yuzu-macos-arm64.tar.gz"
+  "yuzu-agent-windows-x64.zip"
+  "yuzu-agent-macos-arm64.tar.gz"
 )
 
 for f in "${REQUIRED_ARCHIVES[@]}"; do
@@ -91,7 +92,6 @@ REQUIRED_GLOBS=(
   "*.deb"
   "*.rpm"
   "YuzuAgentSetup-*.exe"
-  "YuzuServerSetup-*.exe"
   "YuzuAgent-*.pkg"
 )
 
@@ -104,14 +104,34 @@ for pat in "${REQUIRED_GLOBS[@]}"; do
   fi
 done
 
+# ── Assets no release may carry any more (ADR-0035 step 2) ──────────
+# The Windows/macOS server and its installer are no longer built, and the
+# Windows/macOS archives were renamed. A stray file of one of these names
+# (a leftover artifact, a re-run mixing runs) would otherwise be hashed into
+# SHA256SUMS while never being attached, so it is refused here.
+FORBIDDEN_GLOBS=(
+  "YuzuServerSetup-*"
+  "yuzu-windows-x64.*"
+  "yuzu-macos-arm64.*"
+)
+
+for pat in "${FORBIDDEN_GLOBS[@]}"; do
+  # shellcheck disable=SC2206 # intentional globbing
+  matches=( "$ART_DIR"/$pat )
+  if [[ -e "${matches[0]}" ]]; then
+    echo "::error::release must not carry ${matches[0]##*/} (no Windows/macOS server since ADR-0035; the archives are yuzu-agent-*)" >&2
+    fail=1
+  fi
+done
+
 # ── SBOMs (CycloneDX + SPDX) for every archive base ─────────────────
 # Base names map 1:1 to the per-platform SBOMs emitted by the build
 # jobs. Image SBOMs use a different naming convention (see below).
 SBOM_BASES=(
   "yuzu-linux-x64"
   "yuzu-gateway-linux-x64"
-  "yuzu-windows-x64"
-  "yuzu-macos-arm64"
+  "yuzu-agent-windows-x64"
+  "yuzu-agent-macos-arm64"
   "yuzu-server-image"
   "yuzu-gateway-image"
   # yuzu-postgres joined the release images in #1318; docker-publish-postgres

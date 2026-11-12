@@ -1,0 +1,1 @@
+- **CI now builds and tests the server on Linux only.** The Windows and macOS CI legs build and test the agent only, matching ADR-0035 (accepted in #7465), under which the server is supported on Linux only.

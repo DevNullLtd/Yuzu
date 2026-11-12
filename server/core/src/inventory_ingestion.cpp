@@ -35,8 +35,8 @@ std::string facet_label(std::string_view facet) {
 // Input caps — the report is untrusted (security-guardian). A blob over the cap
 // is rejected (dropped + nacked); entries/fields beyond the cap are
 // dropped/truncated.
-// kMaxBlobBytes MUST equal the agent source's kMaxBlobBytes
-// (agents/core/src/sync_source_installed_software.cpp) — comment-coordinated, a
+// kMaxBlobBytes MUST equal the agent writer's kV3MaxBlobBytes
+// (agents/core/src/installed_software_v3.hpp) — comment-coordinated, a
 // one-sided bump reintroduces the agent-sends/server-drops tight loop (UP-7).
 // Set below the gRPC 4 MiB receive ceiling for the wire-framing reason
 // documented agent-side (UP-6).
@@ -72,7 +72,7 @@ static_assert(kMaxBlobBytes == kV3MaxBlobBytes && kMaxEntries == kV3MaxRows &&
 // (the documented mixed-version behaviour — an old agent's rows store with empty
 // trailing columns). Tokens beyond the 16th are dropped. The server hash covers
 // the tail only when package_id or source is non-empty (SoftwareInventoryStore::canonical_hash);
-// the agent-side builder (installed_software_canonical_blob) must mirror that. A
+// the agent-side writer (installed_software_v3.cpp, record_of) must mirror that. A
 // fully populated row is up to 4 x kMaxFieldLen bytes longer, so kMaxBlobBytes may
 // bind before kMaxEntries; the caps are deliberately unchanged here. nullopt only
 // when the blob exceeds the cap; an empty list is a legitimate "nothing here".
@@ -114,7 +114,7 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
                 std::string_view raw = rec.substr(p, f_end - p);
                 // Scrub to valid UTF-8 FIRST (governance UP-IN1), then truncate on a
                 // codepoint boundary. Both steps MUST match the agent's clamp_field
-                // (sync_source_installed_software.cpp) byte-for-byte — scrub before
+                // (sync_canonical.cpp, used by installed_software_v3.cpp) byte-for-byte — scrub before
                 // clamp, U+FFFD for any invalid byte — or the server-recomputed hash
                 // diverges from the agent's (governance UP-10 for the clamp half).
                 std::string f = sanitize_utf8_strict(raw);
@@ -144,7 +144,9 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
 // section's outcome into the per-section nack (`installed_software:<facet>`; the whole-source
 // `installed_software` nack is kept for a blob that cannot be attributed to sections at all)
 // and the section counter. Returns the source-level `yuzu_inventory_ingest_total` outcome.
-// A refused section never stops the others: the store applies every section that parsed.
+// A refused section never stops the others: the store applies every section that parsed, and a
+// delta or component section that does not verify is rolled back alone (`mismatch`) and nacked
+// like a refused one, so the agent resends that facet in full.
 const char* ingest_v3_blob(SoftwareInventoryStore& store, const std::string& agent_id,
                            const std::string& blob, pb::InventoryAck& ack,
                            ::yuzu::MetricsRegistry* metrics) {
@@ -223,7 +225,7 @@ void seed_section_ingest_series(::yuzu::MetricsRegistry& metrics) {
     metrics.describe("yuzu_inventory_section_ingest_total",
                      "Blob-v3 installed-software section outcomes by facet and outcome "
                      "(facet = a collector source, component_inventory, or unknown; "
-                     "outcome = stored/status_only/need_full/delta_unsupported/rejected/"
+                     "outcome = stored/status_only/need_full/mismatch/rejected/"
                      "error; moves only once a v3 agent reports)",
                      "counter");
     const auto seed = [&](const std::string& facet) {
@@ -235,6 +237,15 @@ void seed_section_ingest_series(::yuzu::MetricsRegistry& metrics) {
         seed(std::string(src.value));
     seed(std::string(kComponentInventoryFacet));
     seed("unknown");
+
+    metrics.describe("yuzu_software_changes_total",
+                     "Install-history ledger rows written by applied installed-software "
+                     "sections, by kind (install/remove/upgrade); a baseline section writes "
+                     "none",
+                     "counter");
+    for (const auto kind : kSoftwareChangeKinds)
+        metrics.counter("yuzu_software_changes_total",
+                        {{"kind", std::string(software_change_kind_name(kind))}});
 }
 
 bool validate_inventory_report_source_count(const std::string& agent_id,
@@ -266,8 +277,11 @@ void ingest_inventory_report(SoftwareInventoryStore& store, const std::string& a
     if (!validate_inventory_report_source_count(agent_id, report, metrics)) {
         // Whole-report reject (malformed/abusive). Deliberately NO need_full nack — we do
         // not amplify resends to a misbehaving agent; the empty ack means the agent records
-        // the cycle done until the weekly floor. Safety rests on the legit source count
-        // (1 today) staying far below kMaxSources, so a legit report is never dropped here.
+        // the cycle done (and commits the sections it sent as acknowledged). For
+        // installed_software that divergence heals on the next delta, which the server refuses
+        // with a per-facet need_full; the weekly floor applies only to the other sources.
+        // Safety rests on the legit source count (1 today) staying far below kMaxSources, so a
+        // legit report is never dropped here.
         // Emit a DISTINCT `rejected` outcome (NOT `dropped` — that label's alert/runbook is
         // oversized-blob-specific: nacked + never-self-heals; this reject is neither) so a
         // flooding agent is observable without misdirecting the dropped-blob runbook (gov

@@ -434,8 +434,8 @@ TEST_CASE("capability catalogue: shares.list pins its exact classification",
 TEST_CASE("capability catalogue: virtualization.host pins its exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_virtualization();
-    REQUIRE(rows.size() == 1);
-    const auto& row = rows.front();
+    REQUIRE(rows.size() == 3);
+    const auto& row = rows[0];
     CHECK(row.plugin == "virtualization");
     CHECK(row.action == "host");
     CHECK(row.dispatch_class == DispatchClass::ReadOnly);
@@ -450,6 +450,59 @@ TEST_CASE("capability catalogue: virtualization.host pins its exact classificati
     const auto classified = registry.classify("virtualization", "host");
     REQUIRE(classified.has_value());
     CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `virtualization.wsl`. A per-user, read-only list of WSL distributions (the
+/// offline arm mounts a logged-off profile's hive through the shared helper), classified exactly
+/// like `installed_apps.list_per_user`: `Inventory`:Read behind `AdminOrApproval`, checked on the
+/// fragment AND as the composed registry classifies it.
+TEST_CASE("capability catalogue: virtualization.wsl pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 3);
+    const auto& row = rows[1];
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "wsl");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::AdminOrApproval);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "wsl");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::AdminOrApproval);
+}
+
+/// Exact-row pin for `virtualization.runtime_posture`. Linux-only container-runtime posture read
+/// (an opt-in, operator-provided read-only socket; four fixed GET requests) under `Security`:Read
+/// like `system_hardening`, no execute gate (owner decision 2026-11-08), checked on the fragment
+/// AND as the composed registry classifies it so neither a fragment edit nor a composition change
+/// can move it to a broader reader set or behind a gate silently.
+TEST_CASE("capability catalogue: virtualization.runtime_posture pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 3);
+    const auto& row = rows[2];
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "runtime_posture");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "runtime_posture");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Security");
     CHECK(classified->execute_gate == ExecuteGate::None);
 }
 

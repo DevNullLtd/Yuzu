@@ -184,6 +184,10 @@ the paged shape and the export mode is recorded here rather than as a separate r
 `version`, `limit` and `cursor` only (an unknown argument name is ignored, as on the other read tools; only approval-gated tools validate argument names at dispatch). The row
 stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by `#5699` (revisit by 2026-11-07), with the same ADR-1005 exception entry.
 
+**Known asymmetry on the lookup fields (SAM-17).** The eight lookup fields of `GET /api/v1/inventory/software` rows (`hostname`, `last_seen`, `status`, `last_confirmed_at`, `install_type`, `install_scope`, `install_location`, `instance_key`), its `match`, `version_min`, `version_max` and `status` filters and its `totals` block are REST-only: `query_installed_software` keeps the 14 package fields until its twin is widened (SAM-21). The row stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by issue #7396 (revisit by 2026-12-31); the exception is recorded as the 2026-11-09 entry of the exception ledger in `docs/adr/1005-headless-platform-use-case-engines.md`, which also absorbs the `#5699` filter asymmetry above.
+
+**New REST route with its MCP twin pending (SAM-17).** `GET /api/v1/inventory/software/components` (components found inside applications: instances, devices, last poll, status) is a REST v1 capability whose MCP twin is built by SAM-21. The ledger keys no row on it: only legacy and fragment routes carry rows, and a REST v1 route is tracked by the OpenAPI check (it is in `paths`). The pending twin is recorded here so it is not silent, and in the same 2026-11-09 ADR-1005 exception entry (revisit by 2026-12-31).
+
 **Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
 
 **Known asymmetry on the dashboard API-token pair.** `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` apply the same permission, MFA step-up, store-availability, tier/TTL and ownership rules as `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`. They differ in being narrower or in shape: the form has no `scope_service` (no service-scoped minting) and takes `ttl_hours` where the REST route takes `expires_at`; its audit rows are written through `AuditStore::log` and carry no user-agent, principal-class or session-id stamp; and MCP `create_api_token` has no step-up, by design (an MCP-tier token is required, with approval at the supervised tier). The rows stay `twinned`. The Settings page cannot yet prompt for the step-up code, so an MFA-enrolled operator whose proof has expired is refused, sees only the error toast "MFA step-up required" (no prompt) and must re-authenticate.
@@ -207,7 +211,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 |---|---:|---:|---:|
 | devices | 24 | 14 | 10 |
 | inventory | 4 | 4 | 0 |
-| dex | 27 | 18 | 9 |
+| dex | 31 | 22 | 9 |
 | guardian | 18 | 10 | 8 |
 | echo | 12 | 3 | 9 |
 | auto-preflight | 4 | 1 | 3 |
@@ -229,9 +233,9 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 31 | 51 |
-| **Total** | **347** | **143** | **204** |
+| **Total** | **351** | **147** | **204** |
 
-Registered `/api/vN/*` routes: 280. OpenAPI `paths` entries: 279. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 211.
+Registered `/api/vN/*` routes: 287. OpenAPI `paths` entries: 286. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 220.
 
 Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 204. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 78.
 

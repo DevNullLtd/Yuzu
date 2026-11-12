@@ -90,7 +90,7 @@ classifies a capability; it never grants one.
 
 ### Seed catalogue
 
-`kSeedCatalogue` is eight representative rows, not a full mirror of `RbacStore`'s 38 securables × 8
+`kSeedCatalogue` is eight representative rows, not a full mirror of `RbacStore`'s 39 securables × 8
 operations — it exists so PR1.9 has real rows to migrate and so this header's own tests exercise
 `is_valid`, not to be the registry itself. It includes an ordinary CRUD read (`Response:Read`), a
 `Tag:Write` (mirrors `mcp_policy.hpp`'s existing Tag special-case), `Execution:Execute` (the
@@ -449,3 +449,15 @@ insertion-order invariance and per-component sensitivity, and `encode_dispatch_t
 malformed tag). `tests/unit/server/test_rbac_store.cpp` adds the PLAN-001 fresh-seed coverage:
 securable-type presence, and the Administrator/PlatformEngineer/Operator grant tables above,
 including the explicit "Operator holds nothing on `PluginSecret`" negative assertion.
+
+## Per-device dispatch visibility invariants (full statement)
+
+The canonical full statement of these catastrophic-if-violated invariants. The always-loaded routed-concern table carries only a compressed trigger for them.
+
+Per-device dispatch visibility (#1788) + the registry-independent authz model (ADR-0033 §2). CATASTROPHIC: (1) **one intersection, not per-caller** - `dispatch_confined_arms` (`server/core/src/dispatch_confined_arms.hpp`) decides WHO IS REACHED for every operator dispatch surface; `ServerImpl::dispatch_confined` and `command_routes.cpp`'s handler both route through it; a second copy is the drift it removes. Callers own only target RESOLUTION and error shaping. Hardware sync (REST+MCP) sends via `dispatch_system_reserved_ids`. (2) **`nullopt` and present-EMPTY are not interchangeable** - `nullopt` = unfiltered, present-empty = deny-all (ADR-0033 §1); an unwired `ExecVisibleFn` MUST NEVER resolve to `nullopt`, or a missing derivation reads as "no filter". What it resolves to INSTEAD is by route class (`docs/authz-model.md`, "by route class"): behind a per-target `scoped_perm_fn` gate (REST bundles, Echo retention purge, DEX live query) it MUST substitute present-empty; where it is the route's ONLY per-device authorization (the three async result-set producers) it MUST refuse with an AUDITED 500 and substitute nothing, because a silent deny-all reads as an empty fleet and hides the broken gate. The wrong choice in either direction violates this clause. A caller wanting genuinely unfiltered dispatch wires a callback that RETURNS `nullopt`; leaving the callback empty is never a synonym for it. (3) A management group / scope expression / `__all__` is a TARGETING mechanism, never an authz exemption. (4) Service-scoped-token confinement takes precedence over the minter's own global grant. (5) Confinement tests MUST assert the exact send set - route mocks that only observe the `VisibleSet` being handed over stay green while the intersection is deleted (the false-green closure evidence that shipped once already); `tests/unit/server/test_dispatch_confined_arms.cpp` is the binding layer.
+
+## Routed-concern invariants
+
+Moved verbatim from the `app-usage server read surface` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+app-usage server read surface — `GET /api/v1/forensics/agents/{id}/app-usage` + MCP `get_agent_app_usage`: `Forensics:Read` SCOPED to the device and floored to Administrator under RBAC-off (`authz_topology_floor.hpp`), per-open `app_usage.agent.view` audit that FAILS CLOSED (503 + `Sec-Audit-Failed`), 503-on-degrade never empty-200, raw-byte hash-skip ingest with need_full nack on failure, decommission-cascade member; `app_usage` is a typed daily-sync source excluded from generic-store WRITES (gateway skip-list, `typed_inventory_sources.hpp`) with boot-time purge cleanup of cross-version stray rows — every generic READ (`InventoryStore` `list_tables`/`get`/`query`/`count`) excludes each `kTypedInventorySources` member in SQL, so a stray row is never readable via `Infrastructure:Read`/`Inventory:Read` (ADR-0070 D12; closed PER SERVER: an older or rolled-back replica still serves them); skip, purge and filter iterate that ONE array; Echo `usage_*` tables denied to generic `echo.sql` (#4260); the MCP twin's dual-audit posture is DELIBERATELY fail-closed (withholds data on either audit write failing) — stricter than the set-and-proceed convention `query_software_licenses`/the DEX MCP twins use, so do not copy THIS row's gate as the default template for the next behavioural-PII MCP tool without deciding fail-closed-vs-set-and-proceed explicitly.

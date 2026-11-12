@@ -561,9 +561,9 @@ also clears the account's lockout, recording `auth.lockout.cleared`
 (`detail=password_reset`) only when there was a lockout to clear. There
 is no MCP tool for either (#5357 tracks a temporary-password reset tool).
 
-**Re-running the Windows server installer is not a reset.** On an upgrade it
-refuses `/ADMIN_PASS=` (and the removed `/OPERATOR_PASS=`) with exit code 11
-(the config file it would write only seeds an empty database).
+**Re-running an installer is not a reset.** The config file seeds an empty
+database only. (The Windows server installer, discontinued by ADR-0035,
+refused `/ADMIN_PASS=` on an upgrade with exit code 11 for that reason.)
 
 **Fallback — direct SQL**, when no administrator can sign in at all (the only
 admin forgot their password). This writes no audit row and revokes no
@@ -1593,7 +1593,7 @@ one of the two paths above.
 
 ## Step-up returns 503 while the authentication store is unavailable
 
-The 37 routes that need a fresh MFA step-up (token, session, engine-principal,
+The 41 routes that need a fresh MFA step-up (token, session, engine-principal,
 RBAC and Guardian writes, password reset and the others listed in the
 [REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
 check the caller's MFA state before the route runs. Other mutating routes and all
@@ -1812,7 +1812,7 @@ authentication store or reset the affected account. Know its limits:
   elevation still asks for a fresh proof and still fails if the store cannot be
   read.
 - **SAML sessions pass too.** The window check precedes the SAML denial, so while
-  the window is `0` or less a SAML session reaches the 37 central routes instead of
+  the window is `0` or less a SAML session reaches the 41 central routes instead of
   getting its `403`, except approve and reject (`POST /api/approvals/{id}/approve` and
   `/reject`), which keep their own gate whatever this value is (next bullet).
 - **Approval approve and reject keep a gate of their own.** The approver gate

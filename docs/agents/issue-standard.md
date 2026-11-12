@@ -93,7 +93,7 @@ Three mandatory axes; the full taxonomy with meanings is [`triage-labels.md`](tr
 - **Facet labels** (`security`, `performance`, `reliability`, `ci`, `auth`, `plugin`, …) —
   optional, any number that genuinely applies.
 - **Automation-owned labels** (`fixed-on-dev`, `automation-broken`, `triage-sweep`,
-  `do-not-close`, `nightly-broken`, `runner-inventory-drift`) are applied by automation or by the
+  `do-not-close`, `nightly-broken`, `release-legs-broken`, `runner-inventory-drift`) are applied by automation or by the
   maintainer — never set them on a new filing. (Exception: a maintainer may add `do-not-close` to
   any issue at any time; that is the label's purpose.)
 

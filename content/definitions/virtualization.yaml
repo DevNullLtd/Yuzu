@@ -1,7 +1,7 @@
 ## Virtualization Definitions
 ## Reports whether the device is a virtual machine, which hypervisor, and whether the agent
 ## itself runs in a container, as facts only: nothing is enforced, changed or fetched.
-## Plugin: virtualization | Actions: host
+## Plugin: virtualization | Actions: host, wsl, runtime_posture
 ##
 ## Sources by platform (no subprocess on any):
 ##   Linux:   CPUID (x86), /sys/class/dmi/id/{sys_vendor,product_name}, /sys/hypervisor/type,
@@ -9,6 +9,9 @@
 ##            /proc/self/cgroup.
 ##   macOS:   sysctl kern.hv_vmm_present and hw.model.
 ##   Windows: CPUID (x86) and the SMBIOS System Information table (GetSystemFirmwareTable RSMB).
+##   Windows (`wsl`): the HKLM ProfileList and Lxss\MSI keys, and each local profile's Lxss key
+##            through the shared with_user_hive ladder (loaded hive first, else a guarded offline
+##            NTUSER.DAT mount); see the second document below.
 ##
 ## A Windows machine running Hyper-V, VBS or WSL2 sets the CPUID hypervisor bit but is the HOST:
 ## the Hyper-V root-partition bit separates it from a guest (kind host_with_hypervisor,
@@ -112,6 +115,253 @@ spec:
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [virtualization]
+
+status:
+  phase: active
+
+---
+## windows.virtualization.wsl: the WSL distributions of every local profile (Windows only).
+##
+## For each real local profile the agent reads Software\Microsoft\Windows\CurrentVersion\Lxss
+## through the shared with_user_hive ladder: the loaded HKU hive first, else a guarded offline
+## NTUSER.DAT mount under SeBackupPrivilege and SeRestorePrivilege (already held by the agent
+## account, enabled only inside the offline arm, under the process-wide offline-hive lock and the
+## default-on hive-file guard). No subprocess. The work per dispatch is bounded in rows, bytes and
+## registry calls; the mount calls have no wall-clock deadline (bounded work, not bounded time).
+## A hive that could not be reached is reported on its own profile row and counted, never read as
+## having no distributions. gather.ttlSeconds is the response window of the definition, not a
+## schedule. A registry link planted at an Lxss or distribution key is detected and reported
+## (windows:virtualization:wsl:lxss_link), never followed.
+##
+## Roles: executeRoles follows the `host` document and is advisory (docs/yaml-dsl-spec.md); the
+## enforced control is the server's ExecuteGate, AdminOrApproval, which mirrors
+## installed_apps.list_per_user (approval.mode role-gated).
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.virtualization.wsl
+  displayName: WSL Distributions
+  version: 1.0.0
+  description: >
+    Lists the Windows Subsystem for Linux distributions installed for each local user profile:
+    the account (the profile folder name), the distribution name, its WSL version (1 or 2), its
+    install state, whether it is that user's default and its flavor. A profile that is not logged
+    on is read through the same guarded offline hive mount the per-user software inventory uses
+    (SeBackupPrivilege and SeRestorePrivilege, already held by the agent; the mount changes that
+    hive's sequence number and hash, #4977). This is per-user data (account and distribution names), so
+    it requires an administrator or an approval. A summary row counts the distributions, how many are WSL 2 (not a VM count: every WSL 2
+    distribution shares one utility VM whose running state is not read), the profiles read, the
+    profiles whose hive could not be reached and the WSL package version. A profile whose hive
+    was not reached, or whose mount could not be released, is reported on its own profile row;
+    the status row is constrained whenever anything was not read in full, and a registry link
+    planted at the Lxss key or at a distribution key is reported rather than followed. Install paths, disk image
+    paths, SIDs, user ids and mount names are never reported.
+  tags: [inventory, virtualization, wsl, per-user]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: virtualization
+    action: wsl
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Rows are discriminated by field 0 (row_kind); "-" is an absent value. A status row always
+    # comes first, then one summary row.
+    #
+    #   status|wsl|<supported|constrained|unsupported>|<reason or ->
+    #   summary|<distributions>|<wsl2>|<profiles_read>|<profiles_not_loaded>|<package_version or ->
+    #   profile|<account or ->|<outcome>|<detail or ->
+    #   distribution|<account or ->|<name>|<1|2|unknown>|<state>|<yes|no>|<flavor or ->
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, summary, profile, distribution]
+        description: 'Row shape discriminator (field 0). Values: status, summary, profile, distribution.'
+        example: distribution
+        platforms: [windows]
+      - name: field_1
+        type: string
+        description: 'status: the literal "wsl". summary: the number of distributions listed. profile and distribution: the account, the profile folder name ("-" when it cannot be resolved), never the SID.'
+        example: alice
+        platforms: [windows]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained or unsupported (a leg that threw). summary: the number of WSL 2 distributions (not a VM count). profile: the outcome, not_found, privilege_missing, mount_failed, access_denied, file_refused, unload_failed, backup_skipped or sid_invalid. distribution: the distribution name as WSL records it (an e-mail-shaped name is replaced by [redacted-email]).'
+        example: Ubuntu-26.04
+        platforms: [windows]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; tokens look like windows:virtualization:wsl:hive_mount_failed, windows:virtualization:wsl:lxss_link, windows:virtualization:wsl:row_cap, windows:leg:exception. summary: the number of profiles whose Lxss key was read or found absent (it need not add up with field 4 to the profile count: a reached hive whose Lxss key could not be opened, or is a registry link, appears only as a status token). profile: a detail, the hive-file guard refusal for file_refused (hive_path_unc and similar), otherwise "-". distribution: the WSL version, 1, 2 or unknown.'
+        example: '2'
+        platforms: [windows]
+      - name: field_4
+        type: string
+        description: 'summary: the number of profiles whose hive was reached by neither the loaded hive nor the offline mount (a .bak entry or an invalid SID counts, and so does a profile never reached because a dispatch-wide limit stopped the walk). distribution: the install state, installed, installing, uninstalling, converting, exporting, compacting, state_<n> for an unrecognised value or unknown.'
+        example: installed
+        platforms: [windows]
+      - name: field_5
+        type: string
+        description: 'summary: the WSL package version, "-" when unavailable. distribution: whether this is the account''s default distribution, yes or no.'
+        example: 'yes'
+        platforms: [windows]
+      - name: field_6
+        type: string
+        description: 'distribution: the flavor WSL records (for example ubuntu), "-" when absent; an e-mail-shaped value is replaced by [redacted-email]. Not used by the other kinds.'
+        example: ubuntu
+        platforms: [windows]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "List WSL distributions per user profile"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [virtualization]
+
+status:
+  phase: active
+---
+## linux.virtualization.runtime_posture: read-only container-runtime posture (Linux only).
+##
+## Without an endpoint (the default) the agent never opens a socket: it stats the docker, podman
+## and containerd default sockets, config files and data roots, and reads docker's daemon.json
+## through a key allow-list. When the operator sets --container-runtime-endpoint / YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT
+## to ONE read-only unix socket (an operator-supplied proxy in front of the runtime), the agent also
+## sends four fixed GET requests over it (/version, /info, /containers/json?all=1 and
+## /containers/{id}/json) under a 20 s deadline. The agent refuses the runtimes' default sockets as
+## an endpoint. Design, bounds and the endpoint contract: docs/virtualization-runtime-posture-design.md.
+##
+## Roles: executeRoles is advisory (docs/yaml-dsl-spec.md); the enforced control is the server's
+## catalogue row (Security:Read, ExecuteGate::None).
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: linux.virtualization.runtime_posture
+  displayName: Container Runtime Posture
+  version: 1.0.0
+  description: >
+    Reports which container runtimes (docker, podman, containerd) are present on this device, how
+    they are configured from a security point of view, and, only when the operator has provided a
+    read-only runtime endpoint, which containers exist and which risky settings they carry (name,
+    image, state, privileged, network mode and whether a host runtime socket is mounted). Never
+    creates, starts, stops or execs into anything; never emits environment, command line, labels,
+    ports or other mounts. A leading status row states whether the read was complete: constrained
+    means a read failed, a cap was hit or the deadline ran out. The endpoint row says why no
+    container data was read (unset, endpoint_refused, permission_denied, unreachable, not_http).
+    A runtime reads not_detected when none of its standard-path artefacts exists, which is not
+    proof of absence: a stopped, rootless or custom-root runtime can read not_detected.
+  tags: [posture, virtualization, container, docker, podman, containerd]
+
+spec:
+  type: question
+  platforms: [linux]
+
+  execution:
+    plugin: virtualization
+    action: runtime_posture
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # Rows are discriminated by field 0 (row_kind); "-" is an absent value. A status row always
+    # comes first.
+    #
+    #   status|runtime_posture|<supported|constrained|unsupported>|<reason or ->
+    #   endpoint|<unset|endpoint_refused|permission_denied|unreachable|not_http|ok>|<reason or ->|<dialect or ->
+    #   runtime|<docker|podman|containerd>|<not_detected|detected|served>|<socket, absent or unreadable>|<config present|absent|unreadable>|<version or ->|<api_version or ->
+    #   config|<runtime or ->|<key>|<value>
+    #   container|<runtime or ->|<id12>|<name>|<image>|<state>|<privileged>|<network_mode>|<socket_mounted>
+    columns:
+      - name: row_kind
+        type: string
+        values: [status, endpoint, runtime, config, container]
+        description: 'Row shape discriminator (field 0). Values: status, endpoint, runtime, config, container.'
+        example: container
+        platforms: [linux]
+      - name: field_1
+        type: string
+        description: 'status: the literal "runtime_posture". endpoint: the endpoint outcome, unset, endpoint_refused, permission_denied, unreachable, not_http or ok. runtime: the runtime, docker, podman or containerd. config: docker for a daemon.json setting, otherwise the runtime that /version identified. container: the runtime that /version identified. For config and container the runtime is docker or podman, or "-" when /version did not identify one.'
+        example: docker
+        platforms: [linux]
+      - name: field_2
+        type: string
+        description: 'status: supported, constrained or unsupported (a leg that threw). endpoint: the refusal reason for endpoint_refused (relative, dotdot, too_long, default_socket, same_inode, not_socket, symlink, owner, group, mode, insecure_ancestor, stat_error), otherwise "-". runtime: not_detected, detected or served. config: the setting name, or daemon_json on the one pseudo-row config|docker|daemon_json|malformed that says daemon.json was not usable JSON or held an allow-listed key of the wrong type. container: the first 12 characters of the container id.'
+        example: detected
+        platforms: [linux]
+      - name: field_3
+        type: string
+        description: 'status: reason token(s) for a non-supported read, "-" when complete; every token is linux:virtualization:runtime_posture:<source>:<cause>, where <source> is endpoint, version, info, list, inspect, mountinfo, daemon_json or a runtime name; the source segment is omitted for the action-wide tokens busy, rows_capped, inspect_capped and deadline_exhausted, and inspect:failed:<n> carries a count in place of a cause; tokens look like linux:virtualization:runtime_posture:endpoint:default_socket, linux:virtualization:runtime_posture:version:timeout, linux:virtualization:runtime_posture:info:malformed, linux:virtualization:runtime_posture:docker:overprivileged, linux:virtualization:runtime_posture:deadline_exhausted, linux:leg:exception. endpoint: the runtime dialect the endpoint answered as, docker or podman, "-" when it did not answer or its /version named no runtime. runtime: the default socket, present:<mode>:<uid>:<gid>, absent or unreadable (its stat failed). config: the setting value (malformed on the daemon_json pseudo-row). container: the container name.'
+        example: present:0660:0:998
+        platforms: [linux]
+      - name: field_4
+        type: string
+        description: 'runtime: whether a config file was found, present, absent or unreadable (its read failed). container: the image reference. Not used by the other kinds.'
+        example: present
+        platforms: [linux]
+      - name: field_5
+        type: string
+        description: 'runtime: the runtime version, filled only on the served row, otherwise "-". container: the state, created, running, paused, restarting, removing, exited, dead or invalid. Not used by the other kinds.'
+        example: running
+        platforms: [linux]
+      - name: field_6
+        type: string
+        description: 'runtime: the API version, filled only on the served row, otherwise "-". container: privileged, yes, no or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds.'
+        example: 'no'
+        platforms: [linux]
+      - name: field_7
+        type: string
+        description: 'container: the network mode, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). Not used by the other kinds.'
+        example: bridge
+        platforms: [linux]
+      - name: field_8
+        type: string
+        description: 'container: host_runtime_socket_mounted, yes (a mount source is a default runtime socket path or a parent directory of one), no, or unknown (inspection skipped or failed, the container removed before its inspection, or the reply left the key out or null). The check covers the default socket paths only. Not used by the other kinds.'
+        example: 'no'
+        platforms: [linux]
+    aggregation:
+      groupBy:
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "Report container runtime posture"
+
+  gather:
+    ttlSeconds: 3600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
     authorRoles: [content-author]
 
   compatibility:

@@ -117,6 +117,8 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("create_offload_target",                "POST",   R"(/api/v1/offload-targets)"),
     step_up_mcp_detail::exempt ("create_result_set",                    step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets)"),
     step_up_mcp_detail::exempt ("set_crypto_dashboard_layout",          step_up_detail::kOperationalData,   "PUT",    R"(/api/v1/crypto/dashboard/layout)"),
+    step_up_mcp_detail::exempt ("reset_dex_score_policy",               step_up_detail::kOperationalData,   "DELETE", R"(/api/v1/dex/score-policy)"),
+    step_up_mcp_detail::exempt ("set_dex_score_policy",                 step_up_detail::kOperationalData,   "PUT",    R"(/api/v1/dex/score-policy)"),
     // On kMcpPendingBecauseRestTwinRequired: the twin is kRequired (an administrator can write the plugin-signing and audit-retention keys through it).
     step_up_mcp_detail::pending("set_runtime_config",                   "PUT",    R"(/api/v1/config/([a-z_]+))"),
     step_up_mcp_detail::pending("delete_offload_target",                "DELETE", R"(/api/v1/offload-targets/(\d+))"),
@@ -151,6 +153,11 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("mint_engine_credential",               "POST",   R"(/api/v1/engine-principals/([^/]+)/credentials)"),
     // On kMcpPendingBecauseRestTwinRequired: added after the baseline was frozen; the twin is kRequired.
     step_up_mcp_detail::pending("raise_guardian_policy_generation",     "POST",   R"(/api/v1/guaranteed-state/policy-generation/raise)"),
+    // ADR-0070 R1 (slice 2b-1a), likewise added after the baseline was frozen; each twin is kRequired.
+    step_up_mcp_detail::pending("register_revocation_source",           "POST",   R"(/api/v1/crypto/revocation-sources)"),
+    step_up_mcp_detail::pending("remove_revocation_source",             "DELETE", R"(/api/v1/crypto/revocation-sources/([0-9]+))"),
+    step_up_mcp_detail::pending("reset_revocation_source_high_water",   "POST",   R"(/api/v1/crypto/revocation-sources/([0-9]+)/reset-high-water)"),
+    step_up_mcp_detail::pending("update_revocation_source",             "PUT",    R"(/api/v1/crypto/revocation-sources/([0-9]+))"),
     step_up_mcp_detail::pending("revoke_engine_principal",              "DELETE", R"(/api/v1/engine-principals/([^/]+))"),
     step_up_mcp_detail::pending("rewrap_secrets",                       "POST",   R"(/api/v1/secrets/kek/rewrap)"),
     step_up_mcp_detail::pending("rotate_engine_credential",             "POST",   R"(/api/v1/engine-principals/([^/]+)/credentials/rotate)"),
@@ -187,9 +194,13 @@ inline constexpr std::size_t kMcpPendingBaselineMax = 44;
 /// kRequired cannot be listed here and must be kExempt. Many baseline tools also have a kRequired
 /// twin; this list is not the only such group. The class of these entries needs a maintainer
 /// ruling once an MCP step-up consumer exists. Sorted, unique.
-inline constexpr std::array<std::string_view, 2> kMcpPendingBecauseRestTwinRequired = {
+inline constexpr std::array<std::string_view, 6> kMcpPendingBecauseRestTwinRequired = {
     "raise_guardian_policy_generation",
+    "register_revocation_source",
+    "remove_revocation_source",
+    "reset_revocation_source_high_water",
     "set_runtime_config",
+    "update_revocation_source",
 };
 
 /// True when `tool` is on `kMcpPendingBecauseRestTwinRequired`.

@@ -60,7 +60,17 @@ struct SoftwareFleetRow {
     std::string agent_id;
     SoftwareEntry entry;
     std::int64_t install_id{0}; ///< row id (BIGSERIAL); keyset tiebreak, churns on full replace
+    /// The row's facet state (`software_facet_state` for the row's own `source`), filled by
+    /// `query_software` only. facet_status is the raw status ('' = no state row); facet_enabled
+    /// is TRUE when there is no state row. The wire `status` is derived from the pair by ONE
+    /// rule, kRowStatusCaseSql (SQL) and its C++ twin software_list_model.hpp derive_status.
+    std::string facet_status;
+    bool facet_enabled{true};
+    std::int64_t last_confirmed_at{0}; ///< facet last_confirmed_at; 0 = never confirmed / no row
 };
+
+/// How `SoftwareFleetQuery::name` / `SoftwareComponentQuery::name` is matched.
+enum class NameMatch { kExact, kPrefix, kContains };
 
 /// Keyset position for `SoftwareFleetQuery::after`: the last row of the previous page.
 struct SoftwareCursor {
@@ -208,6 +218,18 @@ struct SoftwareFleetQuery {
     /// Exact version filter: nullopt = any version; present (including "") = that exact
     /// version, so "" selects only the empty-version rows.
     std::optional<std::string> version;
+    /// How `name` is matched (default exact). kPrefix is a LIKE-escaped `name LIKE term%`, which
+    /// installed_software_name_idx serves only under the C collation (under a locale collation it
+    /// is a sequential scan the row LIMIT does not bound); kContains is a literal ILIKE. Both run
+    /// under the 5 s bound, like `q`; only kExact is index-driven everywhere.
+    NameMatch match{NameMatch::kExact};
+    /// Exact version SET (`version = ANY(...)`), the resolved form of a version range. nullopt =
+    /// any; present-empty selects nothing (empty value, no SQL). ANDed with `version` if both set.
+    std::optional<std::vector<std::string>> versions;
+    /// Row status filter over the derived status ("current" | "unconfirmed" | "disabled");
+    /// "" = no filter. The same CASE the response `status` is derived from (kRowStatusCaseSql);
+    /// no index serves it, so a non-empty status runs the read under the 5 s bound, like `q`.
+    std::string status;
     /// Scope push-down (ADR-0033): nullopt = unfiltered; PRESENT-EMPTY = deny-all -> empty
     /// value with no SQL; non-empty -> `agent_id = ANY(...)` in SQL, so the last returned row
     /// is the cursor and a scoped caller never gets a short page.
@@ -224,6 +246,72 @@ struct SoftwareFleetQuery {
     /// make the next page skip or repeat a row (same class as the install_id churn above).
     std::int64_t skip{0};
 };
+
+/// One component row (`software_components`, SAM-14) with its facet state
+/// (`component_inventory`). No agent emits component rows until SAM-40; the server apply path is
+/// live, so the read surface is too.
+struct SoftwareComponentRow {
+    std::string agent_id;
+    std::string kind;
+    std::string path_hash; ///< keyset tiebreak (SHA-256 of the exact path bytes)
+    std::string name;
+    std::string version;
+    std::string version_source;
+    std::string path;
+    std::string anchor_app;
+    std::int64_t first_seen{0};
+    std::string facet_status; ///< as SoftwareFleetRow::facet_status, for `component_inventory`
+    bool facet_enabled{true};
+    std::int64_t last_confirmed_at{0};
+};
+
+/// Keyset position for `SoftwareComponentQuery::after`.
+struct SoftwareComponentCursor {
+    std::string name;
+    std::string agent_id;
+    std::string kind;
+    std::string path_hash;
+};
+
+/// Fleet component query. Empty filters match all. Ordered (name, agent_id, kind, path_hash).
+/// `q` is a literal case-insensitive substring over name | path | anchor_app (clamped to 128
+/// bytes, 5 s bound). `limit` is clamped to kFleetQueryRowCap's ceiling inside the store.
+struct SoftwareComponentQuery {
+    std::string kind;
+    std::string name;
+    NameMatch match{NameMatch::kExact};
+    std::optional<std::vector<std::string>> versions; ///< as SoftwareFleetQuery::versions
+    std::string agent_id;
+    std::string q;
+    std::string status; ///< as SoftwareFleetQuery::status
+    std::optional<std::vector<std::string>> agent_ids; ///< scope push-down, as SoftwareFleetQuery
+    int limit{1000};
+    std::optional<SoftwareComponentCursor> after;
+    std::int64_t skip{0};
+};
+
+/// Exact fleet totals for one title or component. `installs` counts INSTALL ROWS (a device with
+/// two architectures counts twice) and `devices` DISTINCT devices, the same two definitions for a
+/// rollup-served and a live-computed figure. `devices_unconfirmed` (components only, else 0) is
+/// the distinct devices whose row status is not `current`.
+struct SoftwareTotals {
+    /// Install rows; on the components route, component instances (serialised as `instances`).
+    std::int64_t installs{0};
+    std::int64_t devices{0};
+    std::int64_t devices_unconfirmed{0};
+};
+
+/// Freshness stamp of the components rollup (refreshed_at == 0: never computed, "building").
+struct ComponentRollupMeta {
+    std::int64_t refreshed_at{0};
+};
+
+/// The row-status rule, ONE SQL fragment shared by every read and the rollup. Needs the facet
+/// state joined as `fs` (LEFT JOIN: a missing row is unconfirmed). Its C++ twin is
+/// software_list_model.hpp derive_status; a [pg] case materialises every (status, enabled) pair.
+inline constexpr std::string_view kRowStatusCaseSql =
+    "CASE WHEN fs.enabled IS FALSE OR fs.status = 'disabled' THEN 'disabled' "
+    "WHEN fs.status IN ('full', 'delta') THEN 'current' ELSE 'unconfirmed' END";
 
 /// The cadence of the background catalogue refresh (server.cpp constructs SoftwareCatalogRollup
 /// with it).
@@ -329,19 +417,21 @@ struct NamePatternDevicesPage {
 /// What one blob-v3 section became (`apply_installed_software_v3`). The ingest seam maps it to
 /// the `yuzu_inventory_section_ingest_total{facet,outcome}` label and to the per-section nack.
 enum class V3SectionOutcome {
-    kStored,           ///< full section: the facet's rows were replaced
-    kStatusOnly,       ///< status-only section: facet state recorded, rows untouched
-    kNeedFull,         ///< not applied (delta on a base we do not hold, or a facet we cannot store)
-    kDeltaUnsupported, ///< a delta whose base matches: no delta apply yet, a full is asked for
-    kRejected,         ///< the section broke the grammar and was refused
-    kError,            ///< the transaction failed; nothing of this call was applied
+    kStored,     ///< full section replaced the facet's rows, or a delta section was applied
+    kStatusOnly, ///< status-only section: facet state recorded, rows untouched
+    kNeedFull,   ///< not applied: a delta on a base the server does not hold
+    kMismatch,   ///< a section that did not verify (a `-` naming a row not held, a key or path
+                 ///< collision, a facet left over the per-call record cap, or a post-apply hash !=
+                 ///< the agent's `expect`): rolled back, the facet is nacked
+    kRejected,   ///< the section broke the grammar and was refused
+    kError,      ///< the transaction failed; nothing of this call was applied
 };
 
 /// Every outcome, in the enum's order: the closed `outcome` label set the section counter is
 /// pre-seeded from.
 inline constexpr std::array<V3SectionOutcome, 6> kV3SectionOutcomes = {
     V3SectionOutcome::kStored,   V3SectionOutcome::kStatusOnly,
-    V3SectionOutcome::kNeedFull, V3SectionOutcome::kDeltaUnsupported,
+    V3SectionOutcome::kNeedFull, V3SectionOutcome::kMismatch,
     V3SectionOutcome::kRejected, V3SectionOutcome::kError};
 
 [[nodiscard]] constexpr std::string_view v3_section_outcome_name(V3SectionOutcome o) noexcept {
@@ -352,8 +442,8 @@ inline constexpr std::array<V3SectionOutcome, 6> kV3SectionOutcomes = {
         return "status_only";
     case V3SectionOutcome::kNeedFull:
         return "need_full";
-    case V3SectionOutcome::kDeltaUnsupported:
-        return "delta_unsupported";
+    case V3SectionOutcome::kMismatch:
+        return "mismatch";
     case V3SectionOutcome::kRejected:
         return "rejected";
     case V3SectionOutcome::kError:
@@ -366,6 +456,40 @@ inline constexpr std::array<V3SectionOutcome, 6> kV3SectionOutcomes = {
 [[nodiscard]] constexpr bool v3_section_needs_full(V3SectionOutcome o) noexcept {
     return o != V3SectionOutcome::kStored && o != V3SectionOutcome::kStatusOnly;
 }
+
+/// What one applied section did to the device's install history (`software_changes`).
+enum class SoftwareChangeKind { kInstall, kRemove, kUpgrade };
+
+[[nodiscard]] constexpr std::string_view software_change_kind_name(SoftwareChangeKind k) noexcept {
+    switch (k) {
+    case SoftwareChangeKind::kInstall:
+        return "install";
+    case SoftwareChangeKind::kRemove:
+        return "remove";
+    case SoftwareChangeKind::kUpgrade:
+        return "upgrade";
+    }
+    return "install";
+}
+
+/// Every kind, the closed `kind` label set `yuzu_software_changes_total` is pre-seeded from.
+inline constexpr std::array<SoftwareChangeKind, 3> kSoftwareChangeKinds = {
+    SoftwareChangeKind::kInstall, SoftwareChangeKind::kRemove, SoftwareChangeKind::kUpgrade};
+
+/// One ledger row (see `SoftwareInventoryStore::diff_changes`). `instance_key` is the NEW row's
+/// for install/upgrade and the removed row's for remove. A version is compared as written, so a row
+/// whose version could not be read ('') moves to or from a real version as an `upgrade` with an
+/// empty `from_version` or `to_version` (when the row has no epoch or release either); a reader
+/// that wants only real version steps skips the upgrades that have an empty side.
+struct SoftwareChange {
+    SoftwareChangeKind kind{SoftwareChangeKind::kInstall};
+    std::string name;
+    std::string publisher;
+    std::string identity_key;
+    std::string instance_key;
+    std::string from_version; ///< remove/upgrade: `[epoch:]version[-release]`
+    std::string to_version;   ///< install/upgrade: `[epoch:]version[-release]`
+};
 
 struct V3SectionResult {
     std::string facet;
@@ -447,13 +571,31 @@ public:
     ///    {status, token, recomputed section_hash, last_confirmed_at, duration, bytes}.
     ///  - status-only (constrained|timeout|oversize|not_collected|disabled): record the status
     ///    only; rows, section_hash and last_confirmed_at are left alone.
-    ///  - `delta`: NOT applied here (delta apply and `-` deletions belong to the next change).
-    ///    Always answered need-full: kNeedFull when its base is not the stored section hash,
-    ///    kDeltaUnsupported when it is (a WARN names the gap). Nothing is lost: the agent falls
-    ///    back to a full section.
-    ///  - `component_inventory`: grammar-validated, its facet state recorded with an EMPTY
-    ///    section_hash (this store holds no component rows). A `full` or `delta` one is answered
-    ///    kNeedFull; a status-only one is a complete report (kStatusOnly).
+    ///  - `delta`: applied as row-hash `-` / `+` changes against the rows the server already holds,
+    ///    inside a SAVEPOINT per section. The facet must be held with status full|delta and a
+    ///    section hash equal to the delta's `base`, else kNeedFull (nothing written). The `-` set
+    ///    is ONE DELETE ... instance_key = ANY(...) RETURNING; the rows it returns must equal the
+    ///    unique `-` count. The facet's rows are then re-read and their section hash must equal the
+    ///    agent's `expect`. A stale `-`, an instance_key collision on a `+`, a facet left over
+    ///    the per-call record cap, or a hash that differs rolls that section back to its
+    ///    savepoint and answers kMismatch (the other sections of the call still apply and the
+    ///    facet is nacked); on success the facet state carries status 'delta' and `expect` as
+    ///    its section hash.
+    ///  - LEDGER: every applied section writes `software_changes` rows (install | remove |
+    ///    upgrade) in the same transaction, from `diff_changes` over the rows that went out and
+    ///    came in. A full section is a BASELINE (no ledger rows) when its facet holds no section
+    ///    hash (first contact, which includes the first v3 call that applies a section; a facet
+    ///    only ever reported status-only; a hash cleared by a status-only section over a
+    ///    'disabled' facet), has 'disabled' as its last status, or holds rows that do not hash to
+    ///    its held section hash (an out-of-band change to the table); otherwise it is diffed
+    ///    against the held rows, so a status-only section followed by a full one, or an
+    ///    honest-empty full followed by a populated one, yields the right rows. There are
+    ///    NO tombstones on `installed_software`: a removal is a hard delete plus a `remove` row.
+    ///  - `component_inventory`: full replaces the agent's `software_components` rows, delta
+    ///    applies `-` row_hash / `comp` changes (same verification), in THIS store's schema and
+    ///    transaction so the section hash joins the report hash atomically. An honest-empty full
+    ///    deletes the rows. A primary-key collision inside one section is a producer defect:
+    ///    kMismatch, as is a component set left over the per-call cap.
     ///  - a refused section (V3Section::refusal) is kRejected; the others still apply.
     /// A SQL failure rolls the whole call back and answers kError for every section in it that
     /// was not refused (a refused section stays kRejected).
@@ -461,6 +603,35 @@ public:
     /// always recomputed from the applied rows, never taken from the wire.
     [[nodiscard]] std::vector<V3SectionResult>
     apply_installed_software_v3(std::string_view agent_id, V3Report report);
+
+    /// Ledger rows for a set of rows that left (`old_rows`) and a set that arrived (`new_rows`),
+    /// both with derived keys. removed = old-not-new, added = new-not-old, keyed by instance_key.
+    /// A row's version is the (epoch, version, release) tuple, so a release-only or epoch-only
+    /// change is an update. Within one identity stem (identity_key with its version segment
+    /// blanked), both sides sorted by (tuple, instance_key): a removed and an added row with an
+    /// EQUAL tuple pair first and write NO row (install_date, signature, or a location spelling
+    /// that normalises equal); the rest pair k-th to k-th as `upgrade(from, to)`; leftovers are
+    /// `remove` / `install`. from/to are `[epoch:]version[-release]`, non-empty parts only. Pure.
+    [[nodiscard]] static std::vector<SoftwareChange>
+    diff_changes(const std::vector<SoftwareEntry>& old_rows,
+                 const std::vector<SoftwareEntry>& new_rows);
+
+    /// Canonical form of one component (`kind US name US version US version_source US path US size
+    /// US mtime US anchor_app RS`), its row hash (SHA-256 hex; the value a delta `-` names) and the
+    /// hash of a whole component section (records sorted by those fields, size and mtime
+    /// numerically, de-duplicated by whole record, SHA-256 hex over the concatenated records).
+    /// Pure; the agent writer mirrors it byte for byte.
+    [[nodiscard]] static std::string component_row_hash(const V3Component& c);
+    [[nodiscard]] static std::string canonical_component_section_hash(std::vector<V3Component> rows);
+
+    /// Clock-guarded, capped prune of `software_changes` older than kChangesRetentionSeconds
+    /// (docs/clock-guarded-retention.md, all seven parts through `pg::run_clock_guarded_prune`).
+    /// Returns rows deleted, 0 on a decline or a lost lock race, -1 when the store is not open
+    /// or the pass failed. A pass that hit the cap may have more: the caller re-arms.
+    int run_retention_prune_changes();
+
+    static constexpr std::int64_t kChangesRetentionSeconds = 400LL * 24 * 60 * 60;
+    static constexpr int kChangesPruneCapPerPass = 50'000;
 
     /// Hash of one section's rows: SHA-256 hex over the sorted, de-duplicated rows, each written
     /// as ALL 16 wire slots (slot 14 empty; no conditional tail), 0x1F-joined and
@@ -535,6 +706,54 @@ public:
     /// (degraded — NEVER a silent empty; ADR-0016 §7). An empty value = no matches.
     [[nodiscard]] std::optional<std::vector<SoftwareFleetRow>>
     query_software(const SoftwareFleetQuery& q);
+
+    /// Fleet component query (see SoftwareComponentQuery). Same AUTHORITATIVE contract and scope
+    /// push-down as query_software: nullopt on any degrade, never a silent empty; a present-empty
+    /// `agent_ids` or `versions` is an empty value with no SQL.
+    [[nodiscard]] std::optional<std::vector<SoftwareComponentRow>>
+    query_components(const SoftwareComponentQuery& q);
+
+    /// Distinct non-empty versions of one installed title, LIVE from `installed_software` (served
+    /// by installed_software_name_idx), ordered, at most kCatalogRowCap rows: a read that returns
+    /// that many may have been cut (the caller must treat it as unresolvable). Live, not the hourly
+    /// version_rollup, so a version first reported since the last refresh is never missing from a
+    /// range resolved against it. `agent_ids` is the caller's scope pushed into the WHERE (the
+    /// SoftwareFleetQuery::agent_ids rule: nullopt = the whole fleet; present-empty = an empty
+    /// value with no SQL), so the cap and the set a confined caller's range resolves against are
+    /// about its own rows only. 5 s bound; nullopt on degrade. Empty name -> empty value.
+    [[nodiscard]] std::optional<std::vector<std::string>>
+    installed_software_distinct_versions(std::string_view name,
+                                         const std::optional<std::vector<std::string>>& agent_ids);
+
+    /// Distinct non-empty versions of one component (kind may be empty = any kind), LIVE from
+    /// `software_components` (served by software_components_name_idx), ordered, at most
+    /// kCatalogRowCap rows (the same cut-read and `agent_ids` scope rules as
+    /// installed_software_distinct_versions). 5 s bound; nullopt on degrade. Empty name -> empty
+    /// value.
+    [[nodiscard]] std::optional<std::vector<std::string>>
+    component_versions(std::string_view kind, std::string_view name,
+                       const std::optional<std::vector<std::string>>& agent_ids);
+
+    /// Exact application totals for one title (name-only grain of the catalogue rollup):
+    /// installs = install rows, devices = distinct devices. nullopt on degrade; a title absent
+    /// from the rollup is a genuine zero (pair with catalog_rollup_meta() for "building").
+    [[nodiscard]] std::optional<SoftwareTotals> catalog_title_totals(std::string_view name);
+
+    /// Live exact totals for one title restricted to a version set: COUNT(*) rows and COUNT(DISTINCT
+    /// agent_id) in ONE statement (never a sum of per-version distinct counts: a device on two
+    /// selected versions counts once). 5 s bound; nullopt on degrade; empty set -> zeros.
+    [[nodiscard]] std::optional<SoftwareTotals>
+    installed_software_version_set_totals(std::string_view name,
+                                          const std::vector<std::string>& versions);
+
+    /// Exact component totals. A non-empty `kind` with no `versions` is served by the (kind, name)
+    /// rollup row (a missing row is a genuine zero; pair with component_rollup_meta() for
+    /// "building"); every other shape (a version set, or no kind: distinct devices are not
+    /// additive across kinds) is ONE live aggregate over software_components (5 s bound,
+    /// name-index driven).
+    [[nodiscard]] std::optional<SoftwareTotals>
+    component_totals(std::string_view kind, std::string_view name,
+                     const std::optional<std::vector<std::string>>& versions);
 
     /// Name-pattern rollup over `installed_software` (see `NamePatternQuery`): per-(label,
     /// version, ecosystem) distinct-device counts, per-label and grand-total distinct-device
@@ -638,6 +857,18 @@ public:
     /// degrade. The singleton meta row is seeded at migration with `refreshed_at = 0`
     /// (the "building" sentinel), so a successful read always returns a value.
     [[nodiscard]] std::optional<CatalogRollupMeta> catalog_rollup_meta();
+
+    /// Recompute the components rollup (`component_rollup`, `component_rollup_meta`) from
+    /// software_components with the same shape and guarantees as refresh_catalog_rollup: ONE
+    /// REPEATABLE READ transaction, a non-blocking cluster-wide advisory lock (a peer holding it
+    /// is a skip, success), KEEP-LAST-GOOD on failure/cancel/budget. One row per (kind, name);
+    /// instances = rows, devices = distinct devices, devices_unconfirmed = distinct devices whose
+    /// row status is not `current`.
+    bool refresh_component_rollup(const std::function<bool()>& cancelled = {});
+
+    /// The components rollup freshness stamp; refreshed_at == 0 = never computed. AUTHORITATIVE:
+    /// nullopt on degrade.
+    [[nodiscard]] std::optional<ComponentRollupMeta> component_rollup_meta();
 
     /// Drop an agent's software inventory (e.g. on agent removal). Returns true
     /// iff the transaction committed both deletes; false on a closed store, a
