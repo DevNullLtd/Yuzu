@@ -1545,6 +1545,16 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // no production caller) takes census rows in batch order across pairs and carries no such
 // guarantee: two concurrent batches can deadlock, which surfaces per statement as Failed (and
 // then rolls the batch back).
+//
+// Schema v5 puts the agent's order row in front of all of that. Every census-bearing first
+// delivery and batch row takes it `FOR UPDATE` in the agent step (above `kAgentOrderEnsure`)
+// BEFORE the pair's pending rows, the census row and the rule row, and holds it to the end of the
+// transaction, so every rule of one agent serialises on it: the order is agent row, pending rows,
+// census row, rule row. No counter on it is written outside the DECIDE statement. A Repair takes
+// no agent-row lock and writes nothing to the order table. A transaction that locks the order
+// rows of SEVERAL agents must take them in ascending agent_id order; the batch path does not sort
+// its rows, so two concurrent batches over the same agents can deadlock there as they can on the
+// census rows (same Failed outcome, same rolled-back batch, no production caller).
 
 constexpr std::int64_t kReceiptSkewCapNs = 300'000'000'000LL; // receipt + 300 s bounds the key
 
@@ -1846,6 +1856,74 @@ constexpr const char* kCensusMarkPending =
     "UPDATE guaranteed_state_store.guaranteed_state_events SET projection_pending = true "
     "WHERE event_id = $1";
 
+// ── The per-agent order step (schema v5, UP-14 server PR A) ──────────────────────────────────
+//
+// Two statements per census-bearing first delivery, in the OUTER transaction after the event
+// INSERT and before `SAVEPOINT census_upsert`, under their own `SAVEPOINT agent_step`. Ensure
+// creates the agent's row when it is absent (`DO NOTHING` takes no lock on an existing committed
+// row). DECIDE locks that row `FOR UPDATE`, derives the pair-clock mode from the OLD row in one
+// CASE, and writes the clock and the per-agent counters in the same statement; it is the ONLY
+// writer of those columns (a counter written anywhere else could double-count a retry). $1 agent,
+// $2 boot_epoch (0 = unpaired), $3 emit_seq. It RETURNS the mode and the epoch the agent's most
+// recent lower-epoch recovery retired; PR A stores and counts, so the census does not read them yet.
+//
+// A fresh clock is one that a CURRENT event refreshed less than `YUZU_CENSUS_STALE_NS_` ago and
+// not more than `YUZU_CENSUS_FUTURE_SLACK_NS_` in the database's future. Only an accepted
+// `current` event (a higher epoch, or a higher sequence in the epoch) or a recovery refreshes it:
+// a straggler, a refused lower-epoch or retired-epoch event and an unpaired event never do, so a
+// lost row's hold expires instead of being renewed by the events it refuses.
+//
+// DECIDE must return EXACTLY ONE row. A concurrent `DELETE` of the agent's row between the two
+// statements (committed, or uncommitted while DECIDE waits on it) leaves it zero without an error:
+// the caller re-runs Ensure and DECIDE once, and a second zero is a failure of the step (the event
+// is stored pending, or the batch aborts), never a census write with no agent row behind it.
+#define YUZU_AGENT_ORDER_FRESH_                                                                    \
+    "(o.epoch_recv_ns IS NOT NULL AND NOT (" YUZU_CENSUS_DB_NOW_NS_ " - o.epoch_recv_ns > "        \
+    YUZU_CENSUS_STALE_NS_ " OR o.epoch_recv_ns > " YUZU_CENSUS_DB_NOW_NS_ " + "                    \
+    YUZU_CENSUS_FUTURE_SLACK_NS_ "))"
+
+#define YUZU_AGENT_ORDER_MODE_                                                                     \
+    "CASE WHEN $2::bigint = 0 THEN (CASE WHEN o.epoch IS NOT NULL AND " YUZU_AGENT_ORDER_FRESH_    \
+    " THEN 'unpaired_held' ELSE 'unpaired' END) "                                                  \
+    "WHEN o.retired_epoch = $2::bigint THEN 'refused_retired' "                                    \
+    "WHEN o.epoch IS NULL OR $2::bigint > o.epoch THEN 'current' "                                 \
+    "WHEN $2::bigint = o.epoch AND $3::bigint > o.emit_seq_hwm THEN 'current' "                    \
+    "WHEN $2::bigint = o.epoch THEN (CASE WHEN " YUZU_AGENT_ORDER_FRESH_                           \
+    " THEN 'current_straggler' ELSE 'current_rebase' END) "                                        \
+    "ELSE (CASE WHEN " YUZU_AGENT_ORDER_FRESH_ " THEN 'refused_regression' "                       \
+    "ELSE 'current_rebase' END) END"
+
+constexpr const char* kAgentOrderEnsure =
+    "INSERT INTO guaranteed_state_store.guardian_agent_order (agent_id) VALUES ($1::text) "
+    "ON CONFLICT (agent_id) DO NOTHING";
+
+constexpr const char* kAgentOrderDecide =
+    "UPDATE guaranteed_state_store.guardian_agent_order g SET "
+    "epoch = CASE WHEN old.mode IN ('current', 'current_rebase') THEN $2::bigint "
+    "             ELSE g.epoch END, "
+    "emit_seq_hwm = CASE WHEN old.mode IN ('current', 'current_rebase') THEN $3::bigint "
+    "                    ELSE g.emit_seq_hwm END, "
+    "epoch_recv_ns = CASE WHEN old.mode IN ('current', 'current_rebase') "
+    "                     THEN " YUZU_CENSUS_DB_NOW_NS_ " ELSE g.epoch_recv_ns END, "
+    "retired_epoch = CASE WHEN old.mode = 'current_rebase' AND $2::bigint < old.epoch "
+    "                     THEN old.epoch ELSE g.retired_epoch END, "
+    "unpaired_recv_ns = CASE WHEN $2::bigint = 0 THEN " YUZU_CENSUS_DB_NOW_NS_
+    " ELSE g.unpaired_recv_ns END, "
+    "unpaired_events = g.unpaired_events + ($2::bigint = 0)::int, "
+    "unpaired_held = g.unpaired_held + (old.mode = 'unpaired_held')::int, "
+    "pair_regressions = g.pair_regressions + (old.mode = 'refused_regression')::int, "
+    "pair_stragglers = g.pair_stragglers + (old.mode = 'current_straggler')::int, "
+    "pair_recoveries = g.pair_recoveries + (old.mode = 'current_rebase')::int, "
+    "retired_events = g.retired_events + (old.mode = 'refused_retired')::int "
+    "FROM (SELECT o.*, " YUZU_AGENT_ORDER_MODE_ " AS mode "
+    "      FROM guaranteed_state_store.guardian_agent_order o WHERE o.agent_id = $1::text "
+    "      FOR UPDATE) old "
+    "WHERE g.agent_id = old.agent_id "
+    "RETURNING old.mode, g.retired_epoch";
+
+#undef YUZU_AGENT_ORDER_MODE_
+#undef YUZU_AGENT_ORDER_FRESH_
+
 #undef YUZU_CENSUS_SEEN_DISAGREES_
 #undef YUZU_CENSUS_SEEN_MAX_SEQ_
 #undef YUZU_CENSUS_APPLY_
@@ -2035,6 +2113,90 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
     return control("RELEASE SAVEPOINT census_upsert") ? out : CensusOutcome::Abandoned;
 }
 
+enum class AgentStepOutcome {
+    Decided,   // DECIDE returned exactly one row; the savepoint is released
+    Failed,    // rolled back to the savepoint and released: the transaction is still usable and
+               // the step's writes (including a row Ensure made) are undone
+    Abandoned, // a savepoint control statement failed: the caller must return an error without
+               // committing
+};
+
+// The per-agent order step of ONE census-bearing first delivery or batch row (statements and the
+// zero-row rule above `kAgentOrderEnsure`), in the caller's open transaction under its own
+// SAVEPOINT agent_step, so a failure inside it (a lock wait that times out, a cancelled
+// statement, a second missing row) costs the step and never the transaction that holds the
+// event. Never called for a Repair: a Repair runs no step and leaves the order table untouched.
+//
+// Timeouts: the step sets none of its own. It runs under the connection's pool options, the
+// `lock_timeout` (10 s) and `statement_timeout` (30 s) every census statement runs under (nothing
+// on the ingest path issues a SET LOCAL), so at those defaults a held agent row costs a writer at
+// most 10 s before SQLSTATE 55P03; a pool whose statement timeout is the lower of the two gets
+// 57014 instead. Both take the same path as any other error here.
+//
+// `pair` is the validated wire pair (0/0 = unpaired). The decided mode is not read: stored and
+// counted, not compared.
+[[nodiscard]] AgentStepOutcome
+agent_order_step(PGconn* conn,
+                 const std::function<void(AgentStepGap, const std::string&)>& gap_hook,
+                 const GuaranteedStateEventRow& row, const CensusPair& pair) {
+    const auto control = [conn](const char* sql) {
+        return pg::exec_params(conn, sql, std::vector<std::string>{}).status() ==
+               PGRES_COMMAND_OK;
+    };
+    if (!control("SAVEPOINT agent_step"))
+        return AgentStepOutcome::Abandoned;
+
+    const std::vector<std::string> ensure_params{row.agent_id};
+    const std::vector<std::string> decide_params{row.agent_id, std::to_string(pair.boot_epoch),
+                                                 std::to_string(pair.emit_seq)};
+    std::string why; // empty until something went wrong
+    // Ensure, the test hook, DECIDE. Returns the DECIDE row count, or -1 with `why` set.
+    const auto run = [&](AgentStepGap gap) -> int {
+        pg::PgResult ensure = pg::exec_params(conn, kAgentOrderEnsure, ensure_params);
+        if (ensure.status() != PGRES_COMMAND_OK) {
+            why = std::string("ensure failed: ") + PQresultErrorMessage(ensure.get());
+            return -1;
+        }
+        if (gap_hook)
+            gap_hook(gap, row.agent_id);
+        pg::PgResult decide = pg::exec_params(conn, kAgentOrderDecide, decide_params);
+        if (decide.status() != PGRES_TUPLES_OK) {
+            why = std::string("decide failed: ") + PQresultErrorMessage(decide.get());
+            return -1;
+        }
+        return PQntuples(decide.get());
+    };
+
+    int rows = run(AgentStepGap::EnsureToDecide);
+    if (rows == 0) {
+        // A DELETE of the agent's row landed between Ensure and DECIDE: run both once more.
+        if (gap_hook)
+            gap_hook(AgentStepGap::BeforeRetryEnsure, row.agent_id);
+        rows = run(AgentStepGap::RetryEnsureToDecide);
+    }
+    if (rows == 1)
+        return control("RELEASE SAVEPOINT agent_step") ? AgentStepOutcome::Decided
+                                                       : AgentStepOutcome::Abandoned;
+    if (rows >= 0)
+        why = rows == 0 ? "no agent order row to decide after one retry"
+                        : "decide returned " + std::to_string(rows) + " rows";
+    // ROLLBACK TO keeps the savepoint defined, so release it too.
+    if (!control("ROLLBACK TO SAVEPOINT agent_step") || !control("RELEASE SAVEPOINT agent_step")) {
+        spdlog::error("GuaranteedStateStore: agent order step abandoned, it failed and its "
+                      "savepoint could not be rolled back and released, the transaction is "
+                      "abandoned event_id={} agent_id={}: {}",
+                      log_id_token(row.event_id), log_id_token(row.agent_id),
+                      ::yuzu::log_key_token(why));
+        return AgentStepOutcome::Abandoned;
+    }
+    spdlog::error("GuaranteedStateStore: agent order step failed (a first delivery keeps the "
+                  "event stored with pending census evidence and writes no census row, a batch "
+                  "is rolled back) event_id={} agent_id={}: {}",
+                  log_id_token(row.event_id), log_id_token(row.agent_id),
+                  ::yuzu::log_key_token(why));
+    return AgentStepOutcome::Failed;
+}
+
 } // namespace
 
 EventInsertResult
@@ -2203,14 +2365,40 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
     // together; a refused or failed census write is rolled back to its own savepoint and
     // never takes the event with it (see project_rule_status).
     if (bearing) {
-        const CensusOutcome projected = project_rule_status(
-            conn, census_proj_failures_, census_lock_barrier_, row,
-            event_state_from_type(row.event_type), ProjectionSource::FirstDelivery, ordering.key,
-            ingest_seq, ordering.capped);
-        count_projection(metrics_, ProjectionSource::FirstDelivery, projected);
-        if (projected == CensusOutcome::Abandoned)
-            return op_error(std::string("census savepoint failed: ") + PQerrorMessage(conn),
+        // The agent step first, in this transaction and before the census savepoint, so a
+        // failed census write still leaves the agent's pair clock having seen the event. A failed
+        // step (rolled back to its own savepoint) stores the event pending, exactly as a failed
+        // census write does, and the census write is skipped: it has no decided mode to follow.
+        const AgentStepOutcome step =
+            agent_order_step(conn, agent_step_gap_hook_, row, wire_pair);
+        if (step == AgentStepOutcome::Abandoned)
+            return op_error(std::string("agent order savepoint failed: ") + PQerrorMessage(conn),
                             kReasonQueryError);
+        if (step == AgentStepOutcome::Failed) {
+            pg::PgResult mark =
+                pg::exec_params(conn, kCensusMarkPending, std::vector<std::string>{row.event_id});
+            if (mark.status() != PGRES_COMMAND_OK) {
+                spdlog::error("GuaranteedStateStore: could not record the pending evidence of an "
+                              "event whose agent order step failed, the event is not stored "
+                              "event_id={} agent_id={} rule_id={}: {}",
+                              log_id_token(row.event_id), log_id_token(row.agent_id),
+                              log_id_token(row.rule_id),
+                              ::yuzu::log_key_token(PQresultErrorMessage(mark.get())));
+                return op_error(std::string("agent order step failed: ") + PQerrorMessage(conn),
+                                kReasonQueryError);
+            }
+            census_proj_failures_.fetch_add(1, std::memory_order_relaxed);
+            count_projection(metrics_, ProjectionSource::FirstDelivery, CensusOutcome::Failed);
+        } else {
+            const CensusOutcome projected = project_rule_status(
+                conn, census_proj_failures_, census_lock_barrier_, row,
+                event_state_from_type(row.event_type), ProjectionSource::FirstDelivery,
+                ordering.key, ingest_seq, ordering.capped);
+            count_projection(metrics_, ProjectionSource::FirstDelivery, projected);
+            if (projected == CensusOutcome::Abandoned)
+                return op_error(std::string("census savepoint failed: ") + PQerrorMessage(conn),
+                                kReasonQueryError);
+        }
     }
 
     // Checked for EVERY event, not only census-bearing ones: the DEX savepoint block above discards
@@ -2313,6 +2501,20 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
         // failure; a refused or failed census write is isolated by its own savepoint, as in
         // insert_event_classified (a failed one then aborts the batch, below).
         if (census_bearing(row)) {
+            // The agent step, as in insert_event_classified. The batch has no pending evidence
+            // to fall back on, so a failed step (a second missing row included) aborts and rolls
+            // back the whole batch and the caller re-issues it.
+            const AgentStepOutcome step =
+                agent_order_step(conn, agent_step_gap_hook_, row, wire_pair);
+            if (step == AgentStepOutcome::Abandoned)
+                return std::unexpected(std::string("agent order savepoint failed: ") +
+                                       PQerrorMessage(conn));
+            if (step == AgentStepOutcome::Failed) {
+                census_proj_failures_.fetch_add(1, std::memory_order_relaxed);
+                count_projection(metrics_, ProjectionSource::Batch, CensusOutcome::Failed);
+                return std::unexpected("agent order step failed for event_id '" + row.event_id +
+                                       "'; batch rolled back");
+            }
             const CensusOutcome projected =
                 project_rule_status(conn, census_proj_failures_, census_lock_barrier_, row,
                                     event_state_from_type(row.event_type), ProjectionSource::Batch,
