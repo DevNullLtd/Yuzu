@@ -4,7 +4,9 @@
 Reads the run file the gateway scale suite writes at the end of a run
 (yuzu_gw_scale-<run>.json: every scenario's result) or one scenario's file
 (yuzu_gw_scale-<run>-<n>-<scenario>.json) and prints the headline numbers and
-the invariants that did not hold. See docs/testing/gateway-scale-tests.md.
+the invariants that did not hold; or the idle_memory case's file
+(yuzu_gw_idle_mem-<run>.json) and prints the memory per connection at each
+point of the sweep. See docs/testing/gateway-scale-tests.md.
 
 Usage: python3 scripts/test/gateway-scale-report.py <file.json> [...]
 """
@@ -83,10 +85,36 @@ def scenario(r):
     return "\n".join(lines)
 
 
+def kib(v):
+    return "-" if not isinstance(v, (int, float)) else "%.1f" % (v / 1024)
+
+
+def idle_memory(data):
+    """The idle_memory case: per transport, per N, the marginal bytes per
+    connection, (M(N) - M(0)) / N, in KiB."""
+    host = data.get("host", {})
+    lines = ["== idle_memory %s on %s %s, OTP %s" % (data.get("run"), host.get("kernel"),
+                                                       host.get("arch"), host.get("otp_version"))]
+    keys = [("BEAM", "beam_total"), ("procs", "beam_processes"), ("binary", "beam_binary"),
+            ("ets", "beam_ets"), ("anon", "os_anon"), ("rss", "os_rss")]
+    for run in data.get("runs", []):
+        lines.append("  %s: KiB per connection (%s)" % (run["transport"], ", ".join(k for k, _ in keys)))
+        for p in run.get("points", []):
+            pc = p.get("per_conn", {})
+            lines.append("    N=%-6s %s" % (p["n"], "  ".join("%s %s" % (k, kib(pc.get(m))) for k, m in keys)))
+    for c in data.get("ceiling", {}).get("checks", []):
+        lines.append("  ceiling %s %s: %s B measured, ceiling %s: %s"
+                     % (c["transport"], c["metric"], c["measured"], c["ceiling"], "ok" if c["ok"] else "OVER"))
+    return "\n".join(lines)
+
+
 def main(paths):
     for p in paths:
         with open(p, encoding="utf-8") as f:
             data = json.load(f)
+        if data.get("kind") == "idle_memory":
+            print(idle_memory(data))
+            continue
         for r in data.get("scenarios", [data]):
             print(scenario(r))
     return 0
