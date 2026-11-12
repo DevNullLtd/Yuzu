@@ -2138,6 +2138,11 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
     return control("RELEASE SAVEPOINT census_upsert") ? out : CensusOutcome::Abandoned;
 }
 
+// The step's own lock wait bound (milliseconds). Deliberately shorter than the pool's `lock_timeout`
+// (10 s): see the Timeouts paragraph on `agent_order_step`. Ensure and DECIDE both wait on the
+// agent's row, so both are bounded by it.
+constexpr int kAgentStepLockTimeoutMs = 1000;
+
 enum class AgentStepOutcome {
     Decided,   // DECIDE returned exactly one row; the savepoint is released
     Failed,    // rolled back to the savepoint and released: the transaction is still usable and
@@ -2152,11 +2157,19 @@ enum class AgentStepOutcome {
 // statement, a second missing row) costs the step and never the transaction that holds the
 // event. Never called for a Repair: a Repair runs no step and leaves the order table untouched.
 //
-// Timeouts: the step sets none of its own. It runs under the connection's pool options, the
-// `lock_timeout` (10 s) and `statement_timeout` (30 s) every census statement runs under (nothing
-// on the ingest path issues a SET LOCAL), so at those defaults a held agent row costs a writer at
-// most 10 s before SQLSTATE 55P03; a pool whose statement timeout is the lower of the two gets
-// 57014 instead. Both take the same path as any other error here.
+// Timeouts: the step bounds its own lock waits (`kAgentStepLockTimeoutMs`) and leaves the
+// statement timeout to the connection's pool option (30 s). The agent row is the one lock every
+// first delivery of an agent queues on, and a waiter holds a pool lease for the whole wait, so a
+// row held for the pool's 10 s `lock_timeout` (a long fold, a stalled commit, an operator session
+// idle in a transaction) would pin one lease per waiting delivery and starve every other store
+// that shares the pool. A waiter that gives up after the step's bound takes the F1 path below
+// (SQLSTATE 55P03, event stored pending), which is the same cost at a fraction of the lease time.
+// The bound is set under the step's savepoint and restored before the success RELEASE: ROLLBACK TO
+// reverts a SET LOCAL, RELEASE does not, so without the restore the census upsert and the fold
+// that follow in the same transaction would run under the step's bound instead of the pool's.
+// `TO DEFAULT` returns the pool's startup-option value, not the server default. A pool whose
+// statement timeout is the lower of the two gets 57014 instead. All take the same path as any
+// other error here.
 //
 // `pair` is the validated wire pair (0/0 = unpaired). The decided mode is not read: stored and
 // counted, not compared.
@@ -2169,6 +2182,9 @@ agent_order_step(PGconn* conn,
                PGRES_COMMAND_OK;
     };
     if (!control("SAVEPOINT agent_step"))
+        return AgentStepOutcome::Abandoned;
+    // A failed SET LOCAL is a failed savepoint control statement: the transaction is abandoned.
+    if (!control(("SET LOCAL lock_timeout = " + std::to_string(kAgentStepLockTimeoutMs)).c_str()))
         return AgentStepOutcome::Abandoned;
 
     const std::vector<std::string> ensure_params{row.agent_id};
@@ -2199,9 +2215,13 @@ agent_order_step(PGconn* conn,
             gap_hook(AgentStepGap::BeforeRetryEnsure, row.agent_id);
         rows = run(AgentStepGap::RetryEnsureToDecide);
     }
-    if (rows == 1)
+    if (rows == 1) {
+        // RELEASE keeps a SET LOCAL, so give the pool's lock_timeout back first.
+        if (!control("SET LOCAL lock_timeout TO DEFAULT"))
+            return AgentStepOutcome::Abandoned;
         return control("RELEASE SAVEPOINT agent_step") ? AgentStepOutcome::Decided
                                                        : AgentStepOutcome::Abandoned;
+    }
     if (rows >= 0)
         why = rows == 0 ? "no agent order row to decide after one retry"
                         : "decide returned " + std::to_string(rows) + " rows";

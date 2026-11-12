@@ -3922,8 +3922,10 @@ TEST_CASE("census ordering: a delete uncommitted before Ensure makes Ensure wait
 TEST_CASE("census ordering: a held or cancelled agent step costs the step and never the event",
           "[pg][guaranteed_state_store][db][census][ordering][lockorder][pair]") {
     // F1-A and the 57014 case. A second session holds the agent's order row; the step's DECIDE
-    // waits until the lock timeout (55P03) or the statement timeout (57014) fires. Without the
-    // agent_step savepoint the whole ingest aborts and the event is stored nowhere; with it the
+    // waits until the step's own 1 s lock bound (55P03) or the statement timeout (57014, the 400 ms
+    // variant) fires. The pool keeps its 10 s lock_timeout in both variants: the step's SET LOCAL
+    // overrides a pool value, so a shorter pool value would no longer be the one under test. Without
+    // the agent_step savepoint the whole ingest aborts and the event is stored nowhere; with it the
     // event is stored pending and acked, and a redelivery repairs it.
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     const bool statement_cancel = GENERATE(false, true);
@@ -3931,7 +3933,7 @@ TEST_CASE("census ordering: a held or cancelled agent step costs the step and ne
     PgPool pool{{.conninfo = db.dsn(),
                  .size = 4,
                  .statement_timeout_ms = statement_cancel ? 400 : 30000,
-                 .lock_timeout_ms = statement_cancel ? 10000 : 400}};
+                 .lock_timeout_ms = 10000}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
@@ -3967,6 +3969,106 @@ TEST_CASE("census ordering: a held or cancelled agent step costs the step and ne
                     with_pair(ev("e3", "r1", "a", kCompliant, kBase + 300), 5, 12))
                 .outcome == EventInsertOutcome::Inserted);
     CHECK(order_text(db.dsn(), "a") == "5|12|-|0|0|0|0|0|0|0");
+}
+
+TEST_CASE("census ordering: the agent step bounds its own lock wait at one second and the pool's "
+          "lock timeout is back for the census write",
+          "[pg][guaranteed_state_store][db][census][ordering][lockorder][pair]") {
+    // The pool keeps its 10 s lock_timeout. The step sets a 1 s bound under its savepoint, so a
+    // delivery queued behind a held agent row fails fast into the F1 path instead of pinning a pool
+    // lease for 10 s, and the bound must not leak to the census upsert that follows in the same
+    // transaction.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 10000}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("e1", "r1", "a", kCompliant, kBase + 100), 5, 10))
+                .outcome == EventInsertOutcome::Inserted);
+    const auto failures_before = store.census_proj_failures_total();
+    const std::string verdict_before = census(db.dsn(), "a", "r1");
+
+    SECTION("a held agent row ends the step at about one second, not ten") {
+        HeldSession holder(db.dsn());
+        REQUIRE(holder.run("BEGIN"));
+        REQUIRE(holder.run(std::string("SELECT 1 FROM ") + kSchema +
+                           ".guardian_agent_order WHERE agent_id = 'a' FOR UPDATE"));
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto r = store.insert_event_classified(
+            with_pair(ev("e2", "r1", "a", kDrifted, kBase + 200), 5, 11));
+        const auto waited = std::chrono::steady_clock::now() - t0;
+        CHECK(r.outcome == EventInsertOutcome::Inserted); // acked, event stored pending (F1)
+        CHECK(waited >= std::chrono::milliseconds(900));  // it did wait for the bound
+        CHECK(waited < std::chrono::seconds(6));          // and not for the pool's 10 s
+        CHECK(pending_for(db.dsn(), "a") == "1");
+        CHECK(census(db.dsn(), "a", "r1") == verdict_before);
+        CHECK(store.census_proj_failures_total() == failures_before + 1);
+        CHECK(pool.in_use() == 0);
+    }
+
+    SECTION("a census row held past one second is waited for under the pool's lock timeout") {
+        // The step succeeds at once (the agent row is free) and must give the pool's lock_timeout
+        // back before RELEASE. The census upsert then waits behind the held census row for 2 s,
+        // which a leaked 1 s bound would turn into a 55P03, a pending event and a counted failure.
+        EventInsertResult res;
+        std::chrono::steady_clock::duration waited{};
+        WriterThreads writers(store, nullptr);
+        HeldSession holder(db.dsn());
+        REQUIRE(holder.run("BEGIN"));
+        REQUIRE(holder.run(std::string("SELECT 1 FROM ") + kSchema +
+                           ".guardian_agent_rule_status WHERE agent_id = 'a' AND rule_id = 'r1' "
+                           "FOR UPDATE"));
+        writers.start([&] {
+            const auto t0 = std::chrono::steady_clock::now();
+            res = store.insert_event_classified(
+                with_pair(ev("e2", "r1", "a", kDrifted, kBase + 200), 5, 11));
+            waited = std::chrono::steady_clock::now() - t0;
+        });
+        REQUIRE(wait_for_lock_waiters(db.dsn(), 1)); // the census upsert is parked on the row
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+        REQUIRE(holder.run("COMMIT"));
+        writers.join_all();
+
+        CHECK(res.outcome == EventInsertOutcome::Inserted);
+        CHECK(waited >= std::chrono::milliseconds(1900));
+        CHECK(pending_for(db.dsn(), "a") == "0");           // the census write was not abandoned
+        CHECK(store.census_proj_failures_total() == failures_before);
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11");
+        CHECK(order_text(db.dsn(), "a") == "5|11|-|0|0|0|0|0|0|0");
+        CHECK(pool.in_use() == 0);
+    }
+
+    SECTION("the lock timeout in force is the step's inside it and the pool's at the census write") {
+        // A trigger on each table records current_setting('lock_timeout') as its statement runs.
+        const std::string log = std::string(kSchema) + ".yuzu_test_lt_log";
+        exec_sql(db.dsn(), "CREATE TABLE " + log + " (stage text, val text)");
+        exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                               ".yuzu_test_lt_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                               "INSERT INTO " +
+                               log +
+                               " VALUES (TG_TABLE_NAME, current_setting('lock_timeout')); "
+                               "RETURN NEW; END $$");
+        for (const char* table : {"guardian_agent_order", "guardian_agent_rule_status"})
+            exec_sql(db.dsn(), std::string("CREATE TRIGGER yuzu_test_lt_note BEFORE INSERT OR "
+                                           "UPDATE ON ") +
+                                   kSchema + "." + table + " FOR EACH ROW EXECUTE FUNCTION " +
+                                   kSchema + ".yuzu_test_lt_note()");
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e2", "r1", "a", kDrifted, kBase + 200), 5, 11))
+                    .outcome == EventInsertOutcome::Inserted);
+        CHECK(pending_for(db.dsn(), "a") == "0");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11"); // the census write ran
+        // Both order statements (Ensure and DECIDE) ran under 1 s; the census upsert under 10 s.
+        CHECK(query_scalar(db.dsn(), "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT "
+                                     "stage || '=' || val AS x FROM " +
+                                         log + ") t") ==
+              "guardian_agent_order=1s,guardian_agent_rule_status=10s");
+        // The connection goes back to the pool with its own setting, not the step's.
+        CHECK(pool.in_use() == 0);
+    }
 }
 
 TEST_CASE("census ordering: two writers of one agent on two rules take the agent row first and "
@@ -4072,10 +4174,10 @@ TEST_CASE("census ordering: a second first delivery of one agent waits on the fi
           "[pg][guaranteed_state_store][db][census][ordering][lockorder][pair]") {
     // The REAL behaviour with the step enabled (the four v4 interleaving cases run with it off):
     // writer A is parked inside its transaction holding the agent's order row; writer B, the same
-    // agent and rule, cannot finish, takes the step's F1 path at the lock timeout and is acked with
+    // agent and rule, cannot finish, takes the step's F1 path at its 1 s lock bound and is acked with
     // its event stored pending and the census untouched. A's release and a redelivery of B repair it.
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 400}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 10000}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
@@ -4096,7 +4198,7 @@ TEST_CASE("census ordering: a second first delivery of one agent waits on the fi
     REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
 
     const auto wb = with_pair(ev("wb", "r1", "a", kErrored, kBase + 300), 5, 12);
-    const auto res_b = store.insert_event_classified(wb); // waits ~400 ms, then F1
+    const auto res_b = store.insert_event_classified(wb); // waits the step's 1 s bound, then F1
     CHECK(res_b.outcome == EventInsertOutcome::Inserted);
     CHECK(pending_for(db.dsn(), "a") == "1");
     CHECK(store.event_count() == 2); // e0 and wb; wa is still uncommitted
