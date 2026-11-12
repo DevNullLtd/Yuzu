@@ -2732,9 +2732,11 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
         // AuditUnavailable). 411, 413 and 415 come from the pre-routing cap (kBodyCapTable,
         // dex_score_policy: 320 KiB, requires_measurable, any method): 411 for a request that
         // cannot be sized in advance, 413 over the cap, 415 for a Content-Encoding other than
-        // identity (evaluate_body_cap answers it first, on every class). 429 comes from the
-        // pre-routing per-principal quota gate (apply_engine_quota_gate in server.cpp's
-        // pre-routing handler, no per-path exemption) for an engine principal.
+        // identity (evaluate_body_cap answers it first, on every class). 429 comes from two
+        // pre-routing gates with no per-path exemption, so it is server-wide: the per-source-IP
+        // rate limiter (api_rate_limiter_, write_rate_limited_response) and, for an engine
+        // principal, the per-principal quota gate (apply_engine_quota_gate in server.cpp's
+        // pre-routing handler).
         {"/dex/score-policy",
          "put",
          {"200", "400", "401", "403", "409", "411", "413", "415", "428", "429", "503"}},
