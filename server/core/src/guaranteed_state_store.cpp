@@ -485,6 +485,8 @@ ALTER TABLE guaranteed_state_events
 ALTER TABLE guardian_agent_rule_status
     ADD COLUMN IF NOT EXISTS boot_epoch BIGINT,
     ADD COLUMN IF NOT EXISTS emit_seq BIGINT;
+-- fillfactor 70: every census-bearing first delivery rewrites the agent's row, so the free
+-- space lets those updates stay on the page (HOT) instead of growing the table and the key.
 CREATE TABLE IF NOT EXISTS guardian_agent_order (
     agent_id          TEXT NOT NULL,
     epoch             BIGINT,
@@ -500,12 +502,14 @@ CREATE TABLE IF NOT EXISTS guardian_agent_order (
     pair_duplicates   BIGINT NOT NULL DEFAULT 0,
     retired_events    BIGINT NOT NULL DEFAULT 0,
     CONSTRAINT guardian_agent_order_pkey PRIMARY KEY (agent_id)
-);
--- The v4 tripwire, extended: a verdict change that leaves a NON-NULL pair unchanged is also
--- flagged. This version's upsert moves the pair with the verdict, so only an earlier build
--- (which never writes the pair) can do that to a paired row. A v4 INSERT, or a v4 write to a
--- row whose pair is NULL, is as clean here as under v4. The trigger itself is v4's; only the
--- function body is replaced.
+) WITH (fillfactor = 70);
+-- The v4 tripwire, extended: a verdict or timestamp change that leaves a NON-NULL pair
+-- unchanged is also flagged. Two writers do that to a paired row: an earlier build, which never
+-- writes the pair, and this build itself, when an applied event repeats the stored pair (an
+-- equal pair) or changes only state or updated_at while the pair stays as it was. The flag
+-- is therefore a signal to look at the row, not proof that an earlier build wrote it. A v4
+-- INSERT, or a v4 write to a row whose pair is NULL, is as clean here as under v4. The trigger
+-- itself is v4's; only the function body is replaced.
 CREATE OR REPLACE FUNCTION guardian_agent_rule_status_flag_legacy_write() RETURNS trigger
 LANGUAGE plpgsql AS $fn$
 BEGIN

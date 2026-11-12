@@ -490,6 +490,12 @@ TEST_CASE("census ordering: a fresh database migrates to v5 with every v5 object
                                            "AND conrelid = '") +
                                    kSchema + ".guardian_agent_order'::regclass") ==
         "guardian_agent_order_pkey:p:{1}");
+    // Every census-bearing first delivery rewrites the agent's row: the table keeps free space
+    // for HOT updates (perf P3).
+    CHECK(query_scalar(db.dsn(), std::string("SELECT coalesce(array_to_string(reloptions, ','), "
+                                             "'') FROM pg_class WHERE oid = '") +
+                                     kSchema + ".guardian_agent_order'::regclass") ==
+          "fillfactor=70");
     // The tripwire function carries the pair test (the shape check pins the same three fragments).
     const std::string def =
         query_scalar(db.dsn(), std::string("SELECT pg_get_functiondef('") + kSchema +
