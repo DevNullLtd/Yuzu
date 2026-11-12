@@ -12,6 +12,12 @@
 /// pane holds child loaders that fire on load into their own targets, which would then abort each
 /// other. Header-only, no store or httplib include. htmx core attributes only (the CSP blocks
 /// `hx-on`).
+///
+/// The one exception to "one definition" is the Scope and Model selects on the per-application
+/// trend page (`dex_app_perf_ui.cpp`): they spell the same three attributes inline, in the order
+/// target, swap, trigger, sync. This constant ends with `hx-sync`, so using it there would move
+/// `hx-sync` ahead of `hx-trigger` in markup that shipped in the other order; those two strings are
+/// kept as they are, and an edit to the attributes here must be made in both places by hand.
 
 #include <string>
 #include <string_view>

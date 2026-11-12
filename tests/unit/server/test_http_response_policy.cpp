@@ -35,9 +35,11 @@ std::string synthetic_page(size_t bytes) {
     std::string page;
     page.reserve(bytes + 128);
     size_t i = 0;
-    while (page.size() < bytes)
-        page += "<tr><td>app" + std::to_string(i++ % 977) + ".exe</td><td class=\"gp-num\">" +
+    while (page.size() < bytes) {
+        const size_t app = i++; // its own statement: the two operands below must not race on `i`
+        page += "<tr><td>app" + std::to_string(app % 977) + ".exe</td><td class=\"gp-num\">" +
                 std::to_string(i * 31 % 1000) + "</td></tr>\n";
+    }
     return page;
 }
 
@@ -63,20 +65,52 @@ struct Counted {
 
 } // namespace
 
-TEST_CASE("brotli_compress: round trip for an empty body, a short body, a 2.5 MB page and arbitrary bytes",
+TEST_CASE("brotli_compress: round trip for an empty body, a short body, a page and arbitrary bytes",
           "[http_response_policy][brotli]") {
     std::mt19937 rng(7);
     std::string noise(4096, '\0');
     for (auto& c : noise)
         c = static_cast<char>(rng() & 0xFF);
-    const std::string page = synthetic_page(2'500'000);
+    // Quality 11 costs about a millisecond per kilobyte, so its leg runs on bodies of at most 150 KB;
+    // the 2.5 MB body is encoded at the configured quality only (a few milliseconds).
+    const std::string page = synthetic_page(150'000);
     for (const std::string& in : {std::string{}, std::string("hello"), page, noise}) {
         for (const int q : {kDynamicBrotliQuality, 11}) {
+            INFO("quality " << q << ", " << in.size() << " bytes");
             std::string out;
             REQUIRE(brotli_compress(in, q, out));
             CHECK(decode(out, in.size()) == in);
         }
     }
+    const std::string big = synthetic_page(2'500'000);
+    std::string out;
+    REQUIRE(brotli_compress(big, kDynamicBrotliQuality, out));
+    CHECK(decode(out, big.size()) == big);
+}
+
+TEST_CASE("dynamic compression uses the configured quality", "[http_response_policy][brotli]") {
+    // The literal 5 is the measured choice documented beside kDynamicBrotliQuality: this case fails
+    // if the constant moves (for instance back to the 11 that httplib would use) without that
+    // table being redone. The two independent encodes must differ, or the comparison below could not
+    // tell the qualities apart.
+    constexpr int kMeasuredQuality = 5;
+    constexpr int kHttplibQuality = 11;
+    const std::string page = synthetic_page(150'000);
+    std::string at_measured, at_httplib;
+    REQUIRE(brotli_compress(page, kMeasuredQuality, at_measured));
+    REQUIRE(brotli_compress(page, kHttplibQuality, at_httplib));
+    // Double parentheses: the operands are binary, so a failure must not print them.
+    REQUIRE((at_measured != at_httplib));
+
+    Counted c;
+    const auto h = with_response_policy(c.handler(page, "text/html; charset=utf-8"));
+    httplib::Response res;
+    h(req_for("GET", "/fragments/dex/apps", "br"), res);
+    REQUIRE(res.get_header_value("Content-Encoding") == "br");
+    INFO("encoded " << res.body.size() << " bytes; quality " << kMeasuredQuality << " gives "
+                    << at_measured.size() << " and quality " << kHttplibQuality << " gives "
+                    << at_httplib.size());
+    CHECK((res.body == at_measured));
 }
 
 TEST_CASE("head_runs_handler: probes, static assets, sign-in pages and the public CA files",

@@ -19,6 +19,7 @@
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -3230,6 +3231,13 @@ struct AppsRouteHarness {
         routes.register_routes(sink, okAuth, okPerm, nullptr, []() { return DexFleet{}; }, /*audit_fn=*/{});
     }
 };
+
+std::size_t count_substr(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
+        ++n;
+    return n;
+}
 } // namespace
 
 TEST_CASE("DEX apps route: a DexApi whose apps() throws still answers 200 with a panel",
@@ -3240,8 +3248,9 @@ TEST_CASE("DEX apps route: a DexApi whose apps() throws still answers 200 with a
         nullptr, nullptr, nullptr, nullptr,
         [&calls](const std::string&, const std::string&) -> DexAppsModel {
             ++calls;
-            throw std::runtime_error("boom");
+            throw std::runtime_error("boom\nforged");
         }));
+    yuzu::test::LogCapture log;
     for (const char* target : {"/fragments/dex/apps", "/fragments/dex/apps?platform=linux&window=30d"}) {
         auto r = h.sink.Get(target);
         REQUIRE(r);
@@ -3252,20 +3261,38 @@ TEST_CASE("DEX apps route: a DexApi whose apps() throws still answers 200 with a
         CHECK(r->body.find("<tr") == std::string::npos);             // never a figure
     }
     CHECK(calls == 2);
+    // The cause is logged: once for the two failing requests (one throttle key per reason), naming the
+    // route, the reason token and the exception text, with the line break folded so the text cannot
+    // forge a second line.
+    log.stop();
+    const std::string logged = log.text();
+    CHECK(count_substr(logged, "[error]") == 1);
+    CHECK(logged.find("GET /fragments/dex/apps: boom_forged (internal_error)") != std::string::npos);
+    CHECK(logged.find("boom\nforged") == std::string::npos);
 }
 
 TEST_CASE("DEX apps route: no DexApi set answers 200 with the not_wired panel",
           "[dex][routes][apps_model]") {
     AppsRouteHarness h;
+    yuzu::test::LogCapture log;
     auto r = h.sink.Get("/fragments/dex/apps");
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK(r->body.find("not_wired") != std::string::npos);
     CHECK(r->body.find("<tr") == std::string::npos);
+    // The same request again: still the panel, and the throttle keeps it to one log line.
+    auto again = h.sink.Get("/fragments/dex/apps?window=30d");
+    REQUIRE(again);
+    CHECK(again->body.find("not_wired") != std::string::npos);
     // An invalid platform is still its own panel, even with nothing wired.
     auto bad = h.sink.Get("/fragments/dex/apps?platform=plan9");
     REQUIRE(bad);
     CHECK(bad->body.find("Unknown platform") != std::string::npos);
+    log.stop();
+    const std::string logged = log.text();
+    CHECK(count_substr(logged, "[error]") == 1);
+    CHECK(logged.find("GET /fragments/dex/apps: no DexApi is wired for the Apps page (not_wired)") !=
+          std::string::npos);
 }
 
 TEST_CASE("DEX apps route: a degraded model with reason statement_timeout reaches the page as the "

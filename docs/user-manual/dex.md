@@ -376,6 +376,8 @@ platform coverage, and the privacy model are on the
 **Window selector.** `24h / 7d / 30d / All` rescopes every signal view.
 Drill-downs opened from a panel inherit the window you were viewing, so the
 numbers match.
+The Scoring and Alerts tabs open on the window you chose. The Network tab has no window of
+its own, so leaving it, and the Scoring **Reload** button, still return to 7d.
 
 ## Drill-downs
 

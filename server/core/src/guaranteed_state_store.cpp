@@ -287,24 +287,6 @@ void bump_policy_generation_on(PGconn* conn) {
                      PQerrorMessage(conn));
 }
 
-// Shared body for every DEX/analytics read (ADR-0038 "deferred widening",
-// follow-up #2659): acquire a bounded lease, run `body(conn)` (which executes
-// the query and returns the parsed result, or nullopt on a query-level
-// failure), and count+sampled-log a degrade on store-not-open / pool-timeout
-// / query-error via yuzu_server_guardian_read_degrade_total{reason}. A successful
-// EMPTY container is NOT a degrade — only body() returning nullopt is.
-//
-// `dex_read_checked` is the TYPE-DISTINGUISHABLE twin (#4855): it returns
-// `std::nullopt` on a degrade instead of collapsing it into an empty
-// container, so a caller that NEEDS to tell "degraded" apart from "genuinely
-// no data" (the DEX device-score read — a degrade must never render as a
-// perfectly healthy score) can. It still bumps
-// `yuzu_server_guardian_read_degrade_total{reason}` via the same
-// `note_read_degrade` on every degrade path. `dex_read` itself is now a thin
-// `.value_or(Result{})` wrapper over it, so the ~26 other DEX/analytics call
-// sites (#2659's still-deferred widening) stay behaviour-identical
-// (empty-on-degrade) — this widens ONLY the device-score read, not the
-// whole family.
 // `dex_read_faulted` is the fault-carrying core: the same open check, bounded lease and
 // count-plus-sampled-log as `dex_read_checked`, but a degrade comes back as the `DexReadFault`
 // that caused it so the caller can tell the causes apart. `body` returns the same
@@ -337,6 +319,24 @@ dex_read_faulted(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics, co
     return result;
 }
 
+// Shared body for every DEX/analytics read (ADR-0038 "deferred widening",
+// follow-up #2659): acquire a bounded lease, run `body(conn)` (which executes
+// the query and returns the parsed result, or nullopt on a query-level
+// failure), and count+sampled-log a degrade on store-not-open / pool-timeout
+// / query-error via yuzu_server_guardian_read_degrade_total{reason}. A successful
+// EMPTY container is NOT a degrade — only body() returning nullopt is.
+//
+// `dex_read_checked` is the TYPE-DISTINGUISHABLE twin (#4855): it returns
+// `std::nullopt` on a degrade instead of collapsing it into an empty
+// container, so a caller that NEEDS to tell "degraded" apart from "genuinely
+// no data" (the DEX device-score read — a degrade must never render as a
+// perfectly healthy score) can. It still bumps
+// `yuzu_server_guardian_read_degrade_total{reason}` via the same
+// `note_read_degrade` on every degrade path. `dex_read` itself is now a thin
+// `.value_or(Result{})` wrapper over it, so the ~26 other DEX/analytics call
+// sites (#2659's still-deferred widening) stay behaviour-identical
+// (empty-on-degrade) — this widens ONLY the device-score read, not the
+// whole family.
 template <typename Result, typename Body>
 std::optional<Result> dex_read_checked(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics,
                                        const char* method, DegradeSampler& sampler, Body&& body) {
