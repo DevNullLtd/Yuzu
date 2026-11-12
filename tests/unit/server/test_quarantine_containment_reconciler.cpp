@@ -2494,6 +2494,69 @@ TEST_CASE("reconciler (firewall): each busy answer to an owed release escalates 
                                                   "firewall.quarantine_status"}));
 }
 
+// The reconciler reads steady_clock::now() itself (no clock seam), so this case spends real time,
+// but every assertion is in the direction a slow machine cannot break. Phase 1 only asserts that at
+// least a SUM OF WAITS elapsed between sends (a stall makes that longer). Phase 2 sleeps past
+// max_backoff before every tick (a stall is again harmless), so a tick is rate limited only if some
+// wait was longer than max_backoff.
+TEST_CASE("reconciler (firewall): repeated busy answers to an owed release grow the backoff only "
+          "up to max_backoff and the release is still retried: no park and no failure row",
+          "[pg][quarantine][reconciler][prq2][owed][busy]") {
+    using Clock = std::chrono::steady_clock;
+    using Ms = std::chrono::milliseconds;
+    constexpr Ms kMin{3};
+    constexpr Ms kMax{24}; // 8 x kMin: the clamp first bites at the second busy answer
+    RECON_RIG(rig);
+    rig.min_interval = kMin;
+    rig.max_backoff = kMax;
+    rig.build();
+    const auto rec = rig.quarantine();
+    REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
+    rig.reply("", "status|active", "status|busy");
+
+    // Phase 1: tick as fast as the state machine allows until the third release has gone out,
+    // keeping when each tick that sent a release started and ended. Backoff: status read 2 x kMin,
+    // first busy 4 x, status read 8 x, second busy 16 x clamped to kMax.
+    std::vector<std::pair<Clock::time_point, Clock::time_point>> release_ticks;
+    const auto give_up = Clock::now() + std::chrono::seconds(10);
+    while (release_ticks.size() < 3 && Clock::now() < give_up) {
+        const auto before = rig.count_sent("firewall.release");
+        const auto started = Clock::now();
+        rig.rec->tick();
+        if (rig.count_sent("firewall.release") > before)
+            release_ticks.emplace_back(started, Clock::now());
+        std::this_thread::sleep_for(Ms(1));
+    }
+    REQUIRE(release_ticks.size() == 3);
+    const auto gap_ms = [&](std::size_t i) {
+        return std::chrono::duration_cast<Ms>(release_ticks[i].second - release_ticks[i - 1].first)
+            .count();
+    };
+    // Between two release sends: the busy answer's wait, the status send's, the status read's and
+    // the release send's. First pair 2 + 4 + 4 + 8 x kMin, then all four are kMax: the delay grew.
+    CHECK(gap_ms(1) >= (2 + 4 + 4 + 8) * kMin.count());
+    CHECK(gap_ms(2) >= 4 * kMax.count());
+
+    // Phase 2: past the plateau. Eight ticks, each after more than kMax, are two more whole cycles
+    // (read busy, send status, read it, send release, and again): never rate limited, so no wait
+    // outgrew max_backoff, and the owed release keeps being retried, never parked.
+    const auto limited = rig.counter("rate_limited");
+    for (int i = 0; i < 8; ++i) {
+        std::this_thread::sleep_for(kMax + Ms(4));
+        rig.rec->tick();
+    }
+    CHECK(rig.counter("rate_limited") == limited);
+    CHECK(rig.counter("busy") == 4); // the answers to releases 1 to 4
+    std::vector<std::string> expected;
+    for (int i = 0; i < 5; ++i) // five cycles of status then release, nothing else
+        expected.insert(expected.end(), {"firewall.quarantine_status", "firewall.release"});
+    CHECK(rig.sent() == expected);
+    CHECK(rig.rows_with("quarantine.disable",
+                        "forced_release_sent record_id=" + std::to_string(rec.id)) == 5);
+    CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 0);
+    CHECK(rig.owed().size() == 1); // still owed, not parked
+}
+
 TEST_CASE("reconciler (firewall): an owed record, device offline: nothing sent, counted in "
           "forced_release_owed{offline}",
           "[pg][quarantine][reconciler][prq2][owed]") {
