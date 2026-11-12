@@ -649,7 +649,7 @@ jobs:
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           # Agent-only vcpkg profile (ADR-0035 step 3), the same as ci.yml's
-          # Windows leg: the two share one vcpkg_installed tree on Wee Tam.
+          # Windows leg: both reuse a runner's persistent vcpkg_installed tree.
           "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
             --triplet x64-windows \
             --x-manifest-root="$GITHUB_WORKSPACE" \

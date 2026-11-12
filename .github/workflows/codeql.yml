@@ -268,8 +268,8 @@ jobs:
             runner: [self-hosted, Windows, X64, yuzu-weetam-windows]
             triplet: x64-windows
             vcpkg_bin: vcpkg.exe
-            # Agent-only profile (ADR-0035 step 3), the same as every other
-            # Windows workflow on Wee Tam, which share one vcpkg_installed tree.
+            # Agent-only profile (ADR-0035 step 3), the same as ci.yml's and
+            # nightly.yml's Windows legs (each runner keeps its own tree).
             vcpkg_features: "--x-no-default-features --x-feature=tests"
             build_dir: build-windows-codeql
             category: "/language:c-cpp-windows"

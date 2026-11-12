@@ -130,7 +130,7 @@ if _server_opt.enabled() and host_machine.system() != 'linux'
   error('-Dserver=enabled: the Yuzu server is Linux-only and cannot be built for a ' + host_machine.system() + ' target (ADR-0035). Build the agent here, and the server on Linux.')
 endif
 if _server_opt.enabled() and not get_option('build_server')
-  error('-Dserver=enabled contradicts the deprecated -Dbuild_server=false stored in this build dir (ADR-0035 step 3). Pass -Dbuild_server=true as well, or wipe the build dir.')
+  error('-Dserver=enabled contradicts the deprecated -Dbuild_server=false passed or stored for this build dir (ADR-0035 step 3). Pass -Dbuild_server=true as well, or delete the build dir and configure again (--wipe replays stored options).')
 endif
 build_server   = _server_opt.allowed() and get_option('build_server')
 if not build_server and host_machine.system() != 'linux'

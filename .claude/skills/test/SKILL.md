@@ -51,7 +51,7 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 - Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
 - Phase 6 sanitizers → still dispatches to the `yuzu-bigtam-linux` self-hosted pool, unaffected by local Docker availability
 
-Everything else (Phase 0 preflight, Phase 0b tooling, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer/browser-smoke, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
+Everything else (Phase 0 preflight, Phase 0b tooling, Phase 1 C++ + Erlang build, Phase 4 native stack (no server is built on macOS since ADR-0035 step 3, so this phase has no native server to run there until step 5), Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer/browser-smoke, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
 
 ## Workflow summary
 

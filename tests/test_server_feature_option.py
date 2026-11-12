@@ -96,7 +96,8 @@ def problems(options: str, build: str, other_builds: dict) -> list:
         found.append("meson.build: -Dserver=enabled on a non-Linux target must be a configure error")
     if len(CONTRADICTION_ERROR.findall(code)) != 1:
         found.append("meson.build: -Dserver=enabled with a stored build_server=false must be a configure error")
-    if len(re.findall(r"^build_server\s*=", code, re.M)) != 1:
+    # Any indentation: an assignment inside an `if` after the guard re-decides the value.
+    if len(re.findall(r"^\s*build_server\s*=(?!=)", code, re.M)) != 1:
         found.append("meson.build: build_server must be assigned exactly once")
     if code.count("get_option('server')") != 1 or code.count("get_option('build_server')") != 2:
         found.append("meson.build: the option is read somewhere other than the guard")
@@ -108,6 +109,9 @@ def problems(options: str, build: str, other_builds: dict) -> list:
         found.append("meson.build: the server guard must come before the first dependency lookup")
 
     for path, text in other_builds.items():
+        # subdir() shares meson.build's variable scope, so a reassignment there reaches the guard's value.
+        if re.search(r"^\s*build_server\s*=(?!=)", text, re.M):
+            found.append(f"{path}: assigns build_server; meson.build's guard is the only assignment")
         if re.search(r"get_option\('(?:build_)?server'\)", text):
             found.append(f"{path}: reads the server option; meson.build's `build_server` variable is the only reader")
     return found
@@ -145,6 +149,7 @@ class ServerFeatureOptionLexical(unittest.TestCase):
             "deprecated boolean ignored": ("build", ASSIGN, "build_server   = _server_opt.allowed()"),
             "boolean alone decides": ("build", ASSIGN, "build_server   = get_option('build_server')"),
             "second assignment": ("build", "build_examples = get_option('build_examples')", "build_server = true\nbuild_examples = get_option('build_examples')"),
+            "indented reassignment": ("build", "build_examples = get_option('build_examples')", "if true\n  build_server = true\nendif\nbuild_examples = get_option('build_examples')"),
             "guard after a dependency": ("build", "# ── Feature summary", "_early = dependency('zlib')\n# ── Feature summary"),
         }
         for name, (which, old, new) in mutations.items():
@@ -154,6 +159,10 @@ class ServerFeatureOptionLexical(unittest.TestCase):
                 srcs[which] = srcs[which].replace(old, new, 1)
                 self.assertNotEqual(problems(srcs["options"], srcs["build"], self.others), [],
                                     f"{name!r} was not caught")
+        with self.subTest(mutation="subdir reassigns build_server"):
+            others = dict(self.others)
+            others["tests/meson.build"] = "  build_server = true\n"
+            self.assertNotEqual(problems(self.options, self.build, others), [])
         with self.subTest(mutation="subdir reads the option"):
             others = dict(self.others)
             others["server/meson.build"] = "if get_option('build_server')\nendif\n"
@@ -176,6 +185,20 @@ def setup_problems(setup: str, gating: str) -> list:
     if SETUP_ARGS not in block + "\n":
         found.append("setup.sh: off Linux the install must pass `--x-no-default-features --x-feature=tests` "
                      "unconditionally (a plain run after `--tests` must not drop Catch2)")
+    # The block is exactly the one install-args line and an echo: nothing else may alter the array here.
+    body = [l.strip() for l in block.splitlines()[1:] if l.strip() and not l.strip().startswith("#")]
+    if [l for l in body if not l.startswith("echo ") and l != SETUP_ARGS.strip()]:
+        found.append("setup.sh: the agent-only block must hold only the install-args line and an echo")
+    # Everywhere else in the file the array is only ever appended to once the declaration has run:
+    # a later reset (`=(`, `=`, `unset`) would silently drop --x-feature=tests (the A-R1 defect).
+    uses = [l.strip() for l in setup.splitlines()
+            if "VCPKG_INSTALL_ARGS" in l and not l.strip().startswith("#")]
+    resets = [l for l in uses if re.search(r"VCPKG_INSTALL_ARGS=|unset\s+VCPKG_INSTALL_ARGS|VCPKG_INSTALL_ARGS\[", l)
+              and "[@]" not in l]
+    if len(resets) != 1 or not resets[0].startswith("VCPKG_INSTALL_ARGS=("):
+        found.append("setup.sh: VCPKG_INSTALL_ARGS must be declared once and only appended to (+=) afterwards")
+    if len(uses) != 4:
+        found.append(f"setup.sh: VCPKG_INSTALL_ARGS has {len(uses)} uses, expected 4 (declare, --triplet, agent-only, invoke)")
     if re.search(r"\bif\b[^\n]*\$TESTS", block):
         found.append("setup.sh: --x-feature=tests must not be conditional on --tests off Linux")
     if '"yuzu-server" in names' not in gating or 'uname_s != "Linux"' not in gating:
@@ -197,6 +220,10 @@ class SetupAndGatingLexical(unittest.TestCase):
                 "  VCPKG_INSTALL_ARGS+=(--x-no-default-features)\n  if $TESTS; then\n    VCPKG_INSTALL_ARGS+=(--x-feature=tests)\n  fi\n"),
             "tests feature dropped": ("setup", SETUP_ARGS, "  VCPKG_INSTALL_ARGS+=(--x-no-default-features)\n"),
             "opt-out dropped": ("setup", SETUP_ARGS, "  VCPKG_INSTALL_ARGS+=(--x-feature=tests)\n"),
+            "later reset drops tests": ("setup", '"$VCPKG_EXE" "${VCPKG_INSTALL_ARGS[@]}"', 'VCPKG_INSTALL_ARGS=(install --x-manifest-root="$PROJECT_ROOT" --x-no-default-features)\n"$VCPKG_EXE" "${VCPKG_INSTALL_ARGS[@]}"'),
+            "later conditional reset": ("setup", '"$VCPKG_EXE" "${VCPKG_INSTALL_ARGS[@]}"', '[[ "$BUILDTYPE" == release ]] && VCPKG_INSTALL_ARGS=(--x-no-default-features)\n"$VCPKG_EXE" "${VCPKG_INSTALL_ARGS[@]}"'),
+            "later unset": ("setup", '"$VCPKG_EXE" "${VCPKG_INSTALL_ARGS[@]}"', 'unset VCPKG_INSTALL_ARGS\n"$VCPKG_EXE" "${VCPKG_INSTALL_ARGS[@]}"'),
+            "reset inside the block": ("setup", SETUP_ARGS, SETUP_ARGS + "  VCPKG_INSTALL_ARGS=(--x-no-default-features)\n"),
             "block removed": ("setup", SETUP_GUARD, 'if [[ "$HOST_OS" == "none" ]]; then\n'),
             "gating server-target assertion dropped": ("gating", '"yuzu-server" in names', "False"),
             "gating off-Linux condition dropped": ("gating", 'uname_s != "Linux"', "False"),

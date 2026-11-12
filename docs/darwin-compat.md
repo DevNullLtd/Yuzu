@@ -71,6 +71,8 @@ The Yuzu source tree is built from multiple hosts (WSL2 Linux + native Windows o
 
 ## macOS `/test` prerequisites
 
+> Since ADR-0035 ladder step 3 macOS builds the agent only: there is no native `yuzu-server`, so the native server stack (`scripts/start-UAT.sh`, the `/test` native-stack phase) is unavailable on macOS until step 5. Use the Linux stack in containers.
+
 Before invoking `/test` (the pre-commit/pre-push gate skill) on a fresh macOS dev box, install:
 
 | Tool | Install | Why |

@@ -458,8 +458,11 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      `--x-no-default-features` (no tests); `scripts/setup.sh` on a Windows or macOS host without
      a cross file always passes `--x-no-default-features --x-feature=tests` (a plain run after
      `--tests` must not drop Catch2 from a build dir that stored `build_tests=true`; pinned).
-     The agent Dockerfiles use `-Dserver=disabled`. Every Windows workflow therefore shares one
-     profile on Wee Tam's shared `vcpkg_installed/x64-windows` tree.
+     The agent Dockerfiles use `-Dserver=disabled`. Each Wee Tam runner keeps its own persistent
+     `vcpkg_installed/x64-windows` tree; the CI, nightly and CodeQL Windows jobs share the
+     `+tests` agent-only profile on it, and `release.yml` (a clean checkout, no `tests`) installs
+     its own. The reverse reconcile (a full tree down to agent-only) is expected but unexercised
+     on Windows.
    - **No server switch in CI.** The Windows and macOS `ci.yml` legs, nightly Windows ASan and
      CodeQL Windows pass no `-Dserver` at all (`auto` is already off there), because a stored
      non-default option in a persistent build dir breaks an older branch's reconfigure.
@@ -469,10 +472,20 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      agent-only off Linux on its own, so adding a flag would test less. Instead, off Linux it now
      asserts from the introspected targets that no `yuzu-server` target exists.
    - **Added: `release.yml` refuses server-port DLLs.** The "Verify the agent runs from the
-     packaged archive" step fails if the archive holds a `libpq*`, `drogon*`, `trantor*`,
-     `jsoncpp*` or `*xmlsec*` DLL, so the "verify afterwards" instruction above is a permanent
+     packaged archive" step fails if the archive holds a `libpq*`, `libecpg*`, `libpgtypes*`, `drogon*`,
+     `trantor*`, `jsoncpp*` or `*xmlsec*` DLL (the nine DLLs a full x64-windows vcpkg tree has
+     and an agent-only one lacks, measured: drogon, jsoncpp, libecpg, libecpg_compat,
+     libpgtypes, libpq, libxmlsec1, libxmlsec1-openssl, trantor), so the "verify afterwards" instruction above is a permanent
      gate, pinned (with mutants) in `tests/test_release_agent_only.py`. This supersedes step 2's
      note that the DLL sweep was left unchanged.
+   - **Not yet verified.** The release-time DLL refusal has never run on a real release
+     (lexical pins only; the Windows rehearsal exercises it), the reverse vcpkg reconcile on
+     Windows and macOS is unexercised, and nothing was run on macOS. If the refusal fails on
+     a release tag, `docker-publish` has already pushed the `:X.Y.Z` images (it does not wait
+     for `build-windows`) and no GitHub Release exists: fix and re-tag.
+   - **Interim gap until step 5: no native server stack on macOS.** `scripts/start-UAT.sh`
+     and the native-stack phases of `/test` need a server binary, which macOS no longer
+     builds; run the Linux stack (containers) instead.
    - Pins: `tests/test_server_feature_option.py` (new: lexical pins with mutants, a real
      configure for Windows, macOS and Linux targets, and the `setup.sh` / gating pins),
      `tests/test_release_agent_only.py` and `scripts/ci/test_runner_health_check.py` move to the
@@ -495,8 +508,11 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    (`meson.options`, its two reads in `meson.build`, and the pins in
    `tests/test_server_feature_option.py`). Deleting it makes Meson refuse to reconfigure any
    build dir that stored it ("Unknown options", even with `--wipe`), so this is a build-dir
-   wipe-or-rename event on every persistent dir (Wee Tam's, the macOS and Linux runners', and
-   developers' `build-*`), done together with the Wee Tam deprovisioning.
+   delete-or-rename event (`rm -rf <dir>`; `--wipe` replays the stored options and does not
+   help) on every persistent dir (Wee Tam's, the macOS and Linux runners', and
+   developers' `build-*`), done together with the Wee Tam deprovisioning. `main`'s nightly still passes
+   `-Dbuild_server=false` until `main` carries step 3, so delete a persistent dir only once
+   the branch that removes the option is the one its jobs build.
 5. **Docs + dev workflow** — retire the server sections of `docs/windows-build.md`; scope
    `docs/darwin-compat.md` to the agent and **document the replacement macOS server dev workflow**
    (Linux builder container / VM / Docker image) and the `/test` platform-asymmetry

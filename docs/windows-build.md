@@ -24,7 +24,7 @@ vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features
 vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features --x-feature=tests  # + -Dbuild_tests=true
 ```
 
-Neither form touches `triplets/x64-windows.cmake` or the hand-wired grpc/protobuf/abseil branch (#375). `zlib` is declared in the base manifest because the `_libzlib` find_library in the root `meson.build` requires it. vcpkg reconciles `vcpkg_installed/x64-windows` on every install in both directions (see `docs/build-guide.md` "Dependency features"), which is why every Windows workflow now uses the one agent-only profile. `ci.yml`, `nightly.yml` and `codeql.yml` pass `--x-no-default-features --x-feature=tests`, `release.yml` passes `--x-no-default-features`, and `scripts/setup.sh` on a Windows host passes the former.
+Neither form touches `triplets/x64-windows.cmake` or the hand-wired grpc/protobuf/abseil branch (#375). `zlib` is declared in the base manifest because the `_libzlib` find_library in the root `meson.build` requires it. vcpkg reconciles `vcpkg_installed/x64-windows` on every install in both directions (see `docs/build-guide.md` "Dependency features"), which is why the Windows workflows install an agent-only profile. `ci.yml`, `nightly.yml` and `codeql.yml` pass `--x-no-default-features --x-feature=tests`, `release.yml` passes `--x-no-default-features` (no tests), and `scripts/setup.sh` on a Windows host passes the former. The reverse direction (a tree that held the full set, reconciled down to agent-only) is expected to work but has not been exercised on Windows.
 
 **Windows builds the agent only (ADR-0035 ladder steps 1 to 3).** The server is a Linux-only component. Meson's `server` option is `auto`, which is off for a non-Linux target, so a Windows configure builds no server and needs no flag (`-Dserver=enabled` there is a configure error; `release.yml` passes `-Dserver=disabled` explicitly, `ci.yml`, `nightly.yml` and `codeql.yml` pass nothing so a stored option never breaks an older branch's reconfigure of Wee Tam's persistent build dirs). No server code is built or tested on Wee Tam, and every Windows workflow installs the agent-only vcpkg profile above.
 
@@ -142,24 +142,18 @@ The installer runs these commands with `-Command`, never `-File`: a
 Group-Policy `AllSigned` execution policy blocks unsigned script *files* even
 with `-ExecutionPolicy Bypass`, but not command text.
 
-## Running server tests locally (libpq.dll on PATH)
+## Server tests are Linux-only
 
-Since #1320 PR 1 the server library links libpq, which is a **DLL** on
-Windows (the static triplet override covers the grpc stack only — see the
-`libpq_dep` block in the root `meson.build` and the ADR-0008 Correction).
-CI's test step prepends `vcpkg_installed/x64-windows/debug/bin` (debug) or
-`/bin` (release) to PATH before `meson test`; a developer shell must do
-the same or `yuzu_server_tests.exe` / `yuzu-server.exe` aborts at load
-with a libpq.dll-not-found error:
-
-```bash
-export PATH="$PWD/vcpkg_installed/x64-windows/debug/bin:$PATH"   # MSYS2 bash
-meson test -C build-windows --suite server --print-errorlogs
-```
+The server is not built on Windows (ADR-0035), so there is no server test
+suite here: `meson test -C build-windows --suite server` reports "No suitable
+tests defined" and exits 0, which is a no-op, not a pass. Run the agent tests
+with `meson test -C build-windows --suite agent --print-errorlogs`, and the
+server tests on Linux. The old libpq.dll-on-PATH setup is no longer needed.
 
 The release zip (`yuzu-agent-windows-x64.zip`, agent only since ADR-0035
 ladder step 2) bundles every DLL in `vcpkg_installed/x64-windows/bin`. Since
-ladder step 3 the release install is agent-only, so `libpq.dll` and the other
-server-port DLLs are not installed and not shipped, and the release job's
-archive check fails if `libpq`, `drogon`, `trantor`, `jsoncpp` or `xmlsec`
-DLLs appear in the archive.
+ladder step 3 the release install is agent-only, so the server ports' DLLs
+(`libpq`, `libecpg`, `libecpg_compat`, `libpgtypes`, `drogon`, `trantor`,
+`jsoncpp`, `libxmlsec1`, `libxmlsec1-openssl`) are not installed and not
+shipped, and the release job's archive check fails if any of them appears in
+the archive. That check has not yet run on a real release.

@@ -25,7 +25,8 @@ What they pin:
   packaged archive" step (no continue-on-error, a step timeout), after
   Package archive and before the installers, attestation and upload, and it
   keeps each of its checks (VERIFY_MUST), including the refusal of the server
-  ports' DLLs (libpq, drogon, trantor, jsoncpp, xmlsec) in the archive. build-macos signs and notarizes
+  ports' DLLs (libpq, libecpg, libpgtypes, drogon, trantor, jsoncpp, xmlsec: the nine DLLs
+  an agent-only tree lacks) in the archive. build-macos signs and notarizes
   `build-macos/agents/core/yuzu-agent` and checks the notarization verdict.
 - The release job's `gh release create` list attaches no `YuzuServerSetup`;
   scripts/check-release-artifacts.sh requires none and its FORBIDDEN_GLOBS
@@ -78,7 +79,7 @@ VERIFY_MUST = (
     'if (-not $p.WaitForExit(60000)) { $p.Kill(); Write-Error',
     'if ($p.ExitCode -ne 0) { Write-Error',
     # ADR-0035 step 3: the archive must hold none of the server ports' DLLs.
-    '-Include "libpq*.dll", "drogon*.dll", "trantor*.dll", "jsoncpp*.dll", "*xmlsec*.dll"',
+    '$serverDlls = @(Get-ChildItem -Path $top.FullName -Recurse -File -Include "libpq*.dll", "libecpg*.dll", "libpgtypes*.dll", "drogon*.dll", "trantor*.dll", "jsoncpp*.dll", "*xmlsec*.dll"',
     'if ($serverDlls.Count -gt 0) { Write-Error',
 )
 OLD_NAME_RE = re.compile(r"(?<![a-z0-9-])(?:" + "|".join(map(re.escape, OLD_ARCHIVES)) + r")\b")
@@ -344,7 +345,12 @@ class ReleaseAgentOnly(unittest.TestCase):
             "verify agent-present check dropped": ("release", '          if (-not (Test-Path $agent)) { Write-Error "yuzu-agent.exe missing from the archive"; exit 1 }\n', ""),
             "verify server check inverted": ("release", 'if (Test-Path (Join-Path $bin "yuzu-server.exe")) { Write-Error', 'if (-not (Test-Path (Join-Path $bin "yuzu-server.exe"))) { Write-Error'),
             "verify server-DLL refusal dropped": ("release", "          if ($serverDlls.Count -gt 0) { Write-Error", "          if ($false) { Write-Error"),
-            "verify server-DLL list loses libpq": ("release", '"libpq*.dll", "drogon*.dll"', '"drogon*.dll"'),
+            "verify server-DLL list loses libpq": ("release", '"libpq*.dll", ', ""),
+            "verify server-DLL scan drops -Recurse": ("release", "Get-ChildItem -Path $top.FullName -Recurse -File -Include", "Get-ChildItem -Path $top.FullName -File -Include"),
+            "verify server-DLL list loses libecpg": ("release", '"libecpg*.dll", ', ""),
+            "verify server-DLL list loses libpgtypes": ("release", '"libpgtypes*.dll", ', ""),
+            "verify server-DLL list loses trantor": ("release", '"trantor*.dll", ', ""),
+            "verify server-DLL list loses jsoncpp": ("release", '"jsoncpp*.dll", ', ""),
             "verify server-DLL list loses xmlsec": ("release", ', "*xmlsec*.dll"', ""),
             "verify plugin count dropped": ("release", "          if ($built -lt 1 -or $packed -ne $built) { Write-Error", "          if ($false) { Write-Error"),
             "verify made non-gating": ("release", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n        continue-on-error: true\n"),

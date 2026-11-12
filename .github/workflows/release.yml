@@ -867,8 +867,9 @@ jobs:
 
           # Runtime DLLs from vcpkg that plugins/binaries need. This copies
           # every DLL vcpkg installed; since ADR-0035 step 3 the install above
-          # is agent-only, so the server-only DLLs (libpq, drogon, trantor,
-          # jsoncpp, xmlsec) are no longer installed or shipped.
+          # is agent-only, so the server-only DLLs (libpq and its libecpg/
+          # libpgtypes siblings, drogon, trantor, jsoncpp, xmlsec) are not
+          # installed; the verify step below refuses the archive if one is.
           $vcpkgBin = "${{ github.workspace }}/vcpkg_installed/x64-windows/bin"
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter "*.dll" | Copy-Item -Destination "${staging}/bin/"
@@ -901,8 +902,12 @@ jobs:
           if (-not (Test-Path $agent)) { Write-Error "yuzu-agent.exe missing from the archive"; exit 1 }
           if (Test-Path (Join-Path $bin "yuzu-server.exe")) { Write-Error "yuzu-server.exe found in the agent archive"; exit 1 }
           # ADR-0035 step 3: the install is agent-only, so a server-only DLL in the archive means the
-          # vcpkg profile regressed. Names are the server ports' DLLs (libpq, drogon, trantor, jsoncpp, xmlsec).
-          $serverDlls = @(Get-ChildItem -Path $top.FullName -Recurse -File -Include "libpq*.dll", "drogon*.dll", "trantor*.dll", "jsoncpp*.dll", "*xmlsec*.dll" | ForEach-Object { $_.Name })
+          # vcpkg profile regressed. The patterns cover the nine DLLs that a full x64-windows vcpkg
+          # tree has and an agent-only one lacks (measured on a real tree): drogon, jsoncpp,
+          # libecpg, libecpg_compat, libpgtypes, libpq, libxmlsec1, libxmlsec1-openssl, trantor.
+          # UNVERIFIED on a release: this check has not yet run on a real release tag (a Windows
+          # rehearsal exercises it); until then it is lexically pinned, not operationally proven.
+          $serverDlls = @(Get-ChildItem -Path $top.FullName -Recurse -File -Include "libpq*.dll", "libecpg*.dll", "libpgtypes*.dll", "drogon*.dll", "trantor*.dll", "jsoncpp*.dll", "*xmlsec*.dll" | ForEach-Object { $_.Name })
           if ($serverDlls.Count -gt 0) { Write-Error "server-only DLLs in the agent archive: $($serverDlls -join ', ')"; exit 1 }
           $built = @(Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse).Count
           $packed = @(Get-ChildItem -Path (Join-Path $top.FullName "plugins") -Filter "*.dll").Count
@@ -1003,10 +1008,12 @@ jobs:
       # binaries). Syft supports PowerShell/Windows runners via the
       # composite action, which downloads a Windows syft binary.
       # Known limitation: `path: .` scans the whole workspace (the vcpkg
-      # ports tree and build trees too), so this SBOM lists components the
-      # agent archive does not ship or load (thousands of entries, the
-      # server's dependencies such as libpq among them). The release notes
-      # and release-verification.md say so.
+      # ports tree and build trees too), so this SBOM can list components the
+      # agent archive does not ship or load. Since ADR-0035 step 3 the vcpkg
+      # install on this runner is agent-only, so the server's dependencies
+      # (libpq, drogon, xmlsec) are no longer installed here; whether Syft
+      # still reports them from the ports tree is unverified until a release
+      # SBOM is inspected. The release notes and release-verification.md say so.
       - name: Generate Windows SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -1398,8 +1405,9 @@ jobs:
       # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
       # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
       # Same known limitation as the Windows SBOM: `path: .` covers the
-      # whole workspace, so it lists components the agent archive does not
-      # ship, the server's dependencies such as libpq among them.
+      # whole workspace, so it can list components the agent archive does not
+      # ship. The vcpkg install is agent-only (ADR-0035 step 3), so the
+      # server's dependencies are not installed on this runner either.
       - name: Generate macOS SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -2586,9 +2594,8 @@ jobs:
           held the server; update any script that downloads them by name.
 
           Known limitation: the Windows and macOS SBOMs are generated from the whole build
-          workspace, so they list thousands of components the archive does
-          not ship or load, the server's dependencies among them; a finding
-          in one of those does not apply to the agent.
+          workspace, so they can list components the archive does not ship
+          or load; a finding in one of those does not apply to the agent.
 
           ## Compose Wizard
 
