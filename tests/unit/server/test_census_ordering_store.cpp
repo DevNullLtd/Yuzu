@@ -4071,6 +4071,106 @@ TEST_CASE("census ordering: the agent step bounds its own lock wait at one secon
     }
 }
 
+TEST_CASE("census ordering: an abandoned agent step is an ingest error, is counted as abandoned "
+          "and stores nothing",
+          "[pg][guaranteed_state_store][db][census][ordering][pair]") {
+    // A savepoint control statement that cannot run (the backend ended under the step) abandons
+    // the transaction. The census write's own Abandoned outcome is counted and returned as an
+    // error; the step must do the same (C3), on the single and the batch path alike.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("e1", "r1", "a", kCompliant, kBase + 100), 5, 10))
+                .outcome == EventInsertOutcome::Inserted);
+    const auto projected = [&](const char* source, const char* outcome) {
+        return metrics
+            .counter("yuzu_server_guardian_census_projection_total",
+                     {{"source", source}, {"outcome", outcome}})
+            .value();
+    };
+    const auto e2 = with_pair(ev("e2", "r1", "a", kDrifted, kBase + 200), 5, 11);
+    const std::string order_before = order_text(db.dsn(), "a");
+    const std::string order_table = std::string(kSchema) + ".guardian_agent_order";
+    const std::string events_table = std::string(kSchema) + ".guaranteed_state_events";
+
+    // DECIDE (an UPDATE of the order row) ends its own backend, so the ROLLBACK TO that follows
+    // cannot run.
+    const auto kill_on_decide = [&] {
+        exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                               ".yuzu_test_step_kill() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                               "BEGIN PERFORM pg_terminate_backend(pg_backend_pid()); "
+                               "PERFORM pg_sleep(5); RETURN NEW; END $$");
+        exec_sql(db.dsn(), "CREATE TRIGGER yuzu_test_step_kill BEFORE UPDATE ON " + order_table +
+                               " FOR EACH ROW EXECUTE FUNCTION " + kSchema +
+                               ".yuzu_test_step_kill()");
+    };
+
+    SECTION("a first delivery") {
+        kill_on_decide();
+        yuzu::test::LogCapture cap(spdlog::level::err);
+        const auto r = store.insert_event_classified(e2);
+        cap.stop();
+        CHECK(r.outcome == EventInsertOutcome::Error);
+        CHECK(r.error.find("agent order savepoint failed") != std::string::npos);
+        CHECK(cap.text().find("agent order step abandoned") != std::string::npos);
+        CHECK(store.events_ingest_errors_total() == 1);
+        CHECK(projected("first_delivery", "abandoned") == 1);
+        CHECK(projected("first_delivery", "failed") == 0);
+        CHECK(store.event_count() == 1); // the event went down with the transaction
+        CHECK(order_text(db.dsn(), "a") == order_before);
+        // The store still serves once the cause is gone.
+        exec_sql(db.dsn(), "DROP TRIGGER yuzu_test_step_kill ON " + order_table);
+        CHECK(store.insert_event_classified(e2).outcome == EventInsertOutcome::Inserted);
+        CHECK(pool.in_use() == 0);
+    }
+    SECTION("a batch row") {
+        kill_on_decide();
+        const auto n = store.insert_events({e2});
+        REQUIRE_FALSE(n.has_value());
+        CHECK(n.error().find("agent order savepoint failed") != std::string::npos);
+        CHECK(projected("batch", "abandoned") == 1);
+        CHECK(projected("batch", "failed") == 0);
+        CHECK(store.event_count() == 1);
+        CHECK(order_text(db.dsn(), "a") == order_before);
+    }
+    SECTION("a failed step whose pending evidence cannot be recorded") {
+        // DECIDE fails cleanly (the step is rolled back and released), then marking the event
+        // pending ends the backend: nothing can be stored, which is Abandoned and not Failed.
+        exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                               ".yuzu_test_step_fail() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                               "BEGIN RAISE EXCEPTION 'forced step failure' USING ERRCODE = "
+                               "'XX000'; END $$");
+        exec_sql(db.dsn(), "CREATE TRIGGER yuzu_test_step_fail BEFORE UPDATE ON " + order_table +
+                               " FOR EACH ROW EXECUTE FUNCTION " + kSchema +
+                               ".yuzu_test_step_fail()");
+        exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                               ".yuzu_test_mark_kill() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                               "BEGIN IF NEW.projection_pending THEN "
+                               "PERFORM pg_terminate_backend(pg_backend_pid()); "
+                               "PERFORM pg_sleep(5); END IF; RETURN NEW; END $$");
+        exec_sql(db.dsn(), "CREATE TRIGGER yuzu_test_mark_kill BEFORE UPDATE ON " + events_table +
+                               " FOR EACH ROW EXECUTE FUNCTION " + kSchema +
+                               ".yuzu_test_mark_kill()");
+        const auto failures_before = store.census_proj_failures_total();
+        yuzu::test::LogCapture cap(spdlog::level::err);
+        const auto r = store.insert_event_classified(e2);
+        cap.stop();
+        CHECK(r.outcome == EventInsertOutcome::Error);
+        CHECK(r.error.find("agent order step failed") != std::string::npos);
+        CHECK(cap.text().find("could not record the pending evidence") != std::string::npos);
+        CHECK(projected("first_delivery", "abandoned") == 1);
+        CHECK(projected("first_delivery", "failed") == 0);
+        CHECK(store.census_proj_failures_total() == failures_before);
+        CHECK(store.event_count() == 1);
+    }
+}
+
 TEST_CASE("census ordering: two writers of one agent on two rules take the agent row first and "
           "never deadlock",
           "[pg][guaranteed_state_store][db][census][ordering][lockorder][pair]") {

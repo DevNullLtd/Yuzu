@@ -2418,13 +2418,19 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
             agent_step_enabled_.load(std::memory_order_relaxed)
                 ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair)
                 : AgentStepOutcome::Decided;
-        if (step == AgentStepOutcome::Abandoned)
+        // An abandoned step is counted as the census write's own Abandoned outcome is: it aborts
+        // the transaction and is also an ingest error.
+        if (step == AgentStepOutcome::Abandoned) {
+            count_projection(metrics_, ProjectionSource::FirstDelivery, CensusOutcome::Abandoned);
             return op_error(std::string("agent order savepoint failed: ") + PQerrorMessage(conn),
                             kReasonQueryError);
+        }
         if (step == AgentStepOutcome::Failed) {
             pg::PgResult mark =
                 pg::exec_params(conn, kCensusMarkPending, std::vector<std::string>{row.event_id});
             if (mark.status() != PGRES_COMMAND_OK) {
+                count_projection(metrics_, ProjectionSource::FirstDelivery,
+                                 CensusOutcome::Abandoned);
                 spdlog::error("GuaranteedStateStore: could not record the pending evidence of an "
                               "event whose agent order step failed, the event is not stored "
                               "event_id={} agent_id={} rule_id={}: {}",
@@ -2555,9 +2561,11 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
                 agent_step_enabled_.load(std::memory_order_relaxed)
                     ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair)
                     : AgentStepOutcome::Decided;
-            if (step == AgentStepOutcome::Abandoned)
+            if (step == AgentStepOutcome::Abandoned) {
+                count_projection(metrics_, ProjectionSource::Batch, CensusOutcome::Abandoned);
                 return std::unexpected(std::string("agent order savepoint failed: ") +
                                        PQerrorMessage(conn));
+            }
             if (step == AgentStepOutcome::Failed) {
                 census_proj_failures_.fetch_add(1, std::memory_order_relaxed);
                 count_projection(metrics_, ProjectionSource::Batch, CensusOutcome::Failed);
