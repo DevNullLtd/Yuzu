@@ -1,5 +1,7 @@
 # Resource Ledger: 6898-echo-test-ci-stability (range origin/dev..fix/echo-test-ci-stability)
 
+Run: `governance.d/6898-echo-test-ci-stability.ArY3uO.jsonl`
+
 Every owning boundary the diff adds or changes in C++ (tests/unit/test_echo_registry_bam_live.cpp, tests/unit/test_echo_registry_source.cpp; tests/unit/test_echo_local_dispatcher.cpp changes four WARN+return branches to SKIP and owns nothing new). All of it is Windows-only test code (`#ifdef _WIN32`); the two translation units are empty elsewhere. No production code changes.
 
 | ID | Resource / construct | Owner type | Acquired | Released | Transfer | Failure cleanup |
