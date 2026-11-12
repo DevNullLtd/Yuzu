@@ -77,11 +77,13 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
 class QuarantineStore;
 struct QuarantineRecord;
+struct StoredResponse; // response_store.hpp (the .cpp includes it)
 
 // ── Layer A: pure ────────────────────────────────────────────────────────
 
@@ -154,6 +156,12 @@ struct ContainmentReply {
 /// treated as `active`. The first `note|ttl_expires=<digits>` row sets `ttl_expires`
 /// (anything else reads as 0); any `note|probe_target=` row sets `probe_configured`.
 [[nodiscard]] ContainmentReply parse_containment_reply(std::string_view payload);
+
+/// A command's stored response rows (the store returns them newest first) joined oldest
+/// first with '\n', so a multi-frame reply reads as the one payload `parse_containment_reply`
+/// expects. The reconciler's poll and the DELETE route's confirm wait both read replies this
+/// way.
+[[nodiscard]] std::string combined_output(const std::vector<StoredResponse>& rows);
 
 /// Whether the reply confirms containment. Exhaustive switch, no `default:`, so a
 /// future enumerator fails to compile here instead of silently falling through (the

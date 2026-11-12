@@ -2,6 +2,7 @@
 
 #include "cidr_match.hpp"
 #include "quarantine_store.hpp"
+#include "response_store.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -101,7 +102,6 @@ build_quarantine_reapply_params(std::string_view stored_whitelist) {
 
 ContainmentReply parse_containment_reply(std::string_view payload) {
     ContainmentReply reply;
-    bool status_seen = false;
     bool ttl_seen = false;
     std::size_t line_start = 0;
     while (line_start <= payload.size()) {
@@ -114,9 +114,8 @@ ContainmentReply parse_containment_reply(std::string_view payload) {
         if (!line.empty() && line.back() == '\r')
             line.remove_suffix(1);
 
-        if (!status_seen && line.starts_with("status|")) {
-            status_seen = true; // the FIRST status line decides; the plugin renders it first
-            reply.status_seen = true;
+        if (!reply.status_seen && line.starts_with("status|")) {
+            reply.status_seen = true; // the FIRST status line decides; the plugin renders it first
             const auto rest = line.substr(7);
             const auto pipe = rest.find('|');
             const auto token = pipe == std::string_view::npos ? rest : rest.substr(0, pipe);
@@ -146,6 +145,16 @@ ContainmentReply parse_containment_reply(std::string_view payload) {
         line_start = nl + 1;
     }
     return reply;
+}
+
+std::string combined_output(const std::vector<StoredResponse>& rows) {
+    std::string out;
+    for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
+        if (!out.empty())
+            out += '\n';
+        out += it->output;
+    }
+    return out;
 }
 
 std::expected<ContainmentReapplyResult, ContainmentReapplyError>

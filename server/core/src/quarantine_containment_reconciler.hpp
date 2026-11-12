@@ -140,6 +140,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -336,24 +337,6 @@ private:
         std::chrono::milliseconds backoff{0};
     };
 
-    // What reconcile_one read about an entry when it claimed it (nothing is read under
-    // a lock again after the claim except to write the outcome).
-    struct Claim {
-        Kind kind{Kind::active};
-        std::int64_t record_id{0};
-        bool confirmed{false};
-        bool verify_first{false};
-        Pending pending{Pending::none};
-        std::string pending_command_id;
-        std::int64_t pending_record_id{0};
-        std::int64_t pending_ttl_expires{0};
-        std::string pending_session_id;
-        std::chrono::steady_clock::time_point pending_since{};
-        std::string owed_tried_session_id;
-        bool owed_release_sent{false};
-        bool owed_parked{false};
-    };
-
     // Steady-clock-facing constants, expressed in milliseconds so a test
     // override (Deps, also milliseconds) composes without a lossy
     // seconds-truncation step. Production values are unchanged (60s/900s/
@@ -373,17 +356,21 @@ private:
     // leading cohort of skip-only agents can starve later ones from ever
     // reaching the periodic backstop.
     bool reconcile_one(const std::string& agent_id, std::string_view trigger);
-    // The pieces of reconcile_one (each returns the same "a dispatch was attempted" signal).
-    void handle_apply_reply(const std::string& agent_id, const ContainmentReply& reply,
-                            std::chrono::steady_clock::time_point steady_now);
-    void handle_release_reply(const std::string& agent_id, const ContainmentReply& reply,
-                              std::chrono::steady_clock::time_point steady_now);
-    void handle_status_reply(const std::string& agent_id, const Claim& c,
+    // The pieces of reconcile_one. `c` is the copy of the entry taken under `mu_` when the entry
+    // was claimed (nothing is read under a lock again after the claim except to write the
+    // outcome). The send_* pieces return the same "a dispatch was attempted" signal.
+    void handle_mutation_reply(const std::string& agent_id, const ContainmentReply& reply,
+                               std::chrono::steady_clock::time_point steady_now);
+    void handle_status_reply(const std::string& agent_id, const AgentState& c,
                              const ContainmentReply& reply,
                              std::chrono::steady_clock::time_point steady_now);
-    bool send_status(const std::string& agent_id, const Claim& c);
-    bool send_release(const std::string& agent_id, const Claim& c);
-    bool send_apply(const std::string& agent_id, const Claim& c, std::string_view trigger);
+    bool send_status(const std::string& agent_id, const AgentState& c);
+    bool send_release(const std::string& agent_id, const AgentState& c);
+    bool send_apply(const std::string& agent_id, std::string_view trigger);
+    // Dispatches one parameterless firewall containment action to one agent. Returns the command
+    // id when an agent was reached; counts `dispatch_error` when the dispatch threw and
+    // `not_reached` when it reached nobody (both "a dispatch was attempted").
+    std::optional<std::string> dispatch_bare(const std::string& agent_id, std::string_view action);
     // Escalates the entry's backoff and holds its next claim until it elapses.
     void back_off(const std::string& agent_id, std::chrono::steady_clock::time_point steady_now);
     void count(const char* result) const;

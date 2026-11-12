@@ -8262,30 +8262,35 @@ void RestApiV1::register_routes(
                                                                 ResponseQuery{.agent_id = agent_id});
                         if (!rows || rows->empty())
                             continue; // degraded or nothing yet: the bounded loop retries
-                        std::string combined; // oldest first (the store returns newest first)
-                        for (auto it = rows->rbegin(); it != rows->rend(); ++it) {
-                            if (!combined.empty())
-                                combined += '\n';
-                            combined += it->output;
-                        }
-                        auto parsed = parse_containment_reply(combined);
+                        auto parsed = parse_containment_reply(combined_output(*rows));
                         if (parsed.status_seen)
                             reply = parsed; // the first reply with a status line ends the wait
                     }
                 }
             }
             const std::string cmd = command_id.empty() ? std::string{} : " command_id=" + command_id;
-            const auto respond_released = [&](bool forced, bool confirmed, bool with_command) {
+            // `forced` answers the operator's own end (the device did not confirm); otherwise the
+            // device did.
+            const auto respond_released = [&](bool forced) {
                 JObj o;
                 o.add("released", true).add("state", "released").add("forced", forced).add(
-                    "device_confirmed", confirmed);
-                if (forced)
+                    "device_confirmed", !forced);
+                if (forced) {
                     o.add("message", "Record ended without the device's confirmation. The device may "
                                      "still be contained.");
-                if (with_command && !command_id.empty())
-                    o.add("command_id", command_id);
+                    if (!command_id.empty())
+                        o.add("command_id", command_id);
+                }
                 res.status = 200;
                 res.set_content(ok_json(o.str()), "application/json");
+            };
+            // The record was already ended by the reconciler when this request tried to end it.
+            const auto ended_by_reconciler = [&] {
+                (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable",
+                                                    "success", "Security", agent_id,
+                                                    "state=released " + rec +
+                                                        " ended_by=reconciler");
+                respond_released(false);
             };
 
             // The device answered `inactive`: the record ends on ITS word. "device is not
@@ -8297,15 +8302,11 @@ void RestApiV1::register_routes(
                     (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable",
                                                         "success", "Security", agent_id,
                                                         "state=released " + rec + cmd);
-                    respond_released(false, true, false);
+                    respond_released(false);
                     return;
                 }
                 if (marked.error() == "device is not quarantined") {
-                    (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable",
-                                                        "success", "Security", agent_id,
-                                                        "state=released " + rec +
-                                                            " ended_by=reconciler");
-                    respond_released(false, true, false);
+                    ended_by_reconciler();
                     return;
                 }
                 // a store failure in the mark: handled below like any other unconfirmed outcome
@@ -8331,11 +8332,7 @@ void RestApiV1::register_routes(
             auto forced = quarantine_store->mark_released(agent_id, record_id, ReleaseEnd::forced);
             if (!forced) {
                 if (forced.error() == "device is not quarantined") {
-                    (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable",
-                                                        "success", "Security", agent_id,
-                                                        "state=released " + rec +
-                                                            " ended_by=reconciler");
-                    respond_released(false, true, false);
+                    ended_by_reconciler();
                     return;
                 }
                 const bool db_error = is_quarantine_db_error(forced.error());
@@ -8353,7 +8350,7 @@ void RestApiV1::register_routes(
                 detail_text += std::string(" last_status=") + endpoint_state_name(reply->state);
             (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable", "success",
                                                 "Security", agent_id, detail_text);
-            respond_released(true, false, true);
+            respond_released(true);
         });
 
     // ── RBAC (/api/v1/rbac) ──────────────────────────────────────────────
