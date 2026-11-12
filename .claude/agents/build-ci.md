@@ -41,7 +41,7 @@ You ensure the Meson build system, vcpkg dependency management, GitHub Actions C
 2. **Source file tracking** — Every `.cpp` file must be listed in a `meson.build` `sources` array. Every `.h`/`.hpp` must be in an `include_directories()`.
 3. **Dependency declaration** — All external dependencies come through vcpkg and are found via Meson's `dependency()` or `cmake.subproject()`.
 4. **Platform conditionals** — Use Meson's `host_machine.system()` for platform-specific source files and compiler flags.
-5. **Build options** — Project options (`-Dbuild_agent`, `-Dbuild_server`, `-Dbuild_tests`) must gate their respective targets.
+5. **Build options** — Project options (`-Dbuild_agent`, `-Dserver` (feature; the deprecated `-Dbuild_server` boolean still honoured until ADR-0035 step 4), `-Dbuild_tests`) must gate their respective targets.
 
 ## CI Pipeline Health
 

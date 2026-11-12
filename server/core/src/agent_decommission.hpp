@@ -3,7 +3,8 @@
 /// @file agent_decommission.hpp
 /// The agent-decommission cascade (ADR-0024 Decision 11 / roadmap D-3): a single
 /// entry point that fans `delete_agent(agent_id)` across EVERY per-agent store,
-/// so that an operator decommission CAN durably erase a machine's stored rows.
+/// so that an operator decommission CAN durably erase a machine's stored rows (see
+/// "WHAT `Deleted` MEANS IS PER STORE" below for what that means per store).
 /// This is the GDPR-erasure MECHANISM half; the per-store `delete_agent` methods
 /// exist on each store but had ZERO production callers before this seam (they
 /// were invoked only from unit tests). The PRODUCTION TRIGGER is now LIVE:
@@ -14,16 +15,28 @@
 /// fail-closed. It calls `ServerImpl::decommission_agent`, which builds this
 /// cascade. §27 builds the fan-out AND wires its first production caller.
 ///
+/// WHAT `Deleted` MEANS IS PER STORE. For most stores it means every row the store holds for the
+/// device was erased. It does not for `guaranteed_state` (#5675): that store deletes the compliance
+/// census rows and retires the pending census evidence, and the Guardian event log and the DEX
+/// observations are retained until retention expiry (never, when the retention setting is 0 or
+/// below). The Art.17 reading of a result must therefore go through each store's own contract, not
+/// through the word `Deleted` alone.
+///
 /// STANDING RULE — the gate is the single `Decommission:Delete` securable, so
 /// adding a store no longer changes WHO can decommission — but it DOES widen WHAT
 /// the securable destroys, so when you add a store to `AgentDecommissionStores`
 /// you MUST: (a) append the store here, (b) register it in
 /// `agent_decommission.cpp`'s registration list, (c) bump `kCascadeStoreCount` in
-/// `test_agent_decommission.cpp`, (d) add the store to the blast-radius lists in
-/// `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete block, ADR-0024 Decisions
-/// 9/11, and `rest-api.md`. The drift guard in `test_agent_decommission.cpp` fails
-/// until (c) is done, so the store list and the documented radius cannot silently
-/// diverge.
+/// `test_agent_decommission.cpp` (the drift guard, the null-store case's two counts, the
+/// unconfigured-store case's skipped count and the real-store fan-out's counts: four pins), (d) add
+/// the store to the blast-radius lists in `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete
+/// block, ADR-0024 Decisions 9/11, and `rest-api.md`, (e) hand the live pointer over in
+/// `ServerImpl::decommission_agent` (`server.cpp`). The drift guard in
+/// `test_agent_decommission.cpp` fails until (c) is done, so the store list and the documented
+/// radius cannot silently diverge; `tests/test_decommission_wiring_lexical.py` fails until (e) is
+/// done, because nothing else notices a registered store that is never wired (it would be
+/// `Skipped` for every operator decommission). Also update the operator-facing "N stores" text in
+/// `device_estate_render.cpp` and `static/yuzu-estate.js`: no test pins it.
 ///
 /// ACCOUNTABLE, aggregated. Each per-store `delete_agent` now RETURNS a bool
 /// status: true iff the delete actually committed, false on a transient failure
@@ -62,12 +75,14 @@ class SoftwareLicensingStore;
 class AppUsageStore;
 class CertificateInventoryStore;
 class OfflineEndpointStore;
+class GuaranteedStateStore;
 
 /// Per-store outcome of one decommission fan-out.
 enum class DecommissionOutcome {
     Deleted, ///< delete_agent was invoked and reported success (returned true):
-             ///< the delete committed. This is confirmed erasure, not merely
-             ///< "invoked".
+             ///< the delete committed. This is confirmed erasure of the rows that
+             ///< store deletes (see "WHAT `Deleted` MEANS IS PER STORE" above), not
+             ///< merely "invoked".
     Skipped, ///< the store was not configured on this deployment (null pointer).
     Failed,  ///< delete_agent reported failure (returned false — e.g. a transient
              ///< PG outage rolled the DELETE back) OR threw. Either way the delete
@@ -97,8 +112,8 @@ struct DecommissionResult {
     /// reports its commit status, a configured store whose delete did not commit
     /// (a transient PG failure that rolls the DELETE back, or a throw) counts as
     /// `failed` and flips `ok()` to false — so for a decommission that did real
-    /// work (`deleted > 0`), `ok()` means "erasure confirmed across every
-    /// configured store", not merely "no exception".
+    /// work (`deleted > 0`), `ok()` means "erasure confirmed, store by store, of what
+    /// each configured store deletes", not merely "no exception".
     ///
     /// CAVEAT — `ok()` is NOT by itself proof that anything was erased. An
     /// all-`Skipped` result is also `ok()`: an empty `agent_id` short-circuits
@@ -124,6 +139,8 @@ struct AgentDecommissionStores {
     AppUsageStore* app_usage{nullptr};                    ///< PG per-agent last-used app usage
     OfflineEndpointStore* offline_endpoint{nullptr}; ///< PG endpoint_state presence row (#5682)
     CertificateInventoryStore* certificate_inventory{nullptr}; ///< PG certificate_inventory_store (erase only)
+    /// PG guardian_agent_rule_status census rows + pending-evidence retire (#5675)
+    GuaranteedStateStore* guaranteed_state{nullptr};
 };
 
 /// A single decommission entry point that fans `delete_agent` across a fixed set

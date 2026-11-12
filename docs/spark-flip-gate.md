@@ -2434,8 +2434,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   lifecycle and compliance lanes is shown as uncertain and no longer silently leaves a false compliant
   (#5690; the agent now stamps milliseconds, and an agent that predates that stamps whole seconds; live today
   for guard.unhealthy; the agent-side hold, PR #5776, delays each overtake by up to
-  H = 1 s and then permits up to N = 64, which does not change the tie rule); (d) the census is absent from the decommission cascade, so
-  REST/MCP errored_rules and the dashboard can disagree after a decommission (#5675).
+  H = 1 s and then permits up to N = 64, which does not change the tie rule); (d) closed by #5675: a decommission now removes the device's census rows
+  and retires its pending census evidence (the event log and DEX observations stay until retention expires), so
+  REST/MCP errored_rules and the dashboard no longer disagree after a decommission; a still-running agent re-creates its
+  census at its next census-bearing event, so stop the agent first.
 - **Journal-quarantine finding (enterprise-readiness Gate 6) - FOUND AND FIXED IN PR-2d
   ITSELF, not deferred.** `guardian_lifecycle_journal.cpp`'s replay-validation allowlist
   only recognized `"armed"`/`"disarmed"` - the exact same class of gap as C-1 above (C-1's census mapping is resolved by #5667, residuals open), but

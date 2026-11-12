@@ -83,6 +83,9 @@ enum class ScopeAbortReason {
     PrincipalUnresolved,
     Unresolvable,
     PresenceDegraded,
+    ResultSetUnusable,          ///< a referenced set is still pending (transient)
+    ResultSetUnusablePermanent, ///< failed, or incomplete where a missing member would match
+                                ///< (for example NOT, LEN or STARTSWITH); permanent; same wire reason
 };
 
 /// Audit-log string vocabulary for `ScopeAbortReason` — MUST agree pairwise
@@ -104,6 +107,9 @@ inline const char* to_string(ScopeAbortReason r) {
         return "unresolvable";
     case ScopeAbortReason::PresenceDegraded:
         return "presence_degraded";
+    case ScopeAbortReason::ResultSetUnusable:
+    case ScopeAbortReason::ResultSetUnusablePermanent:
+        return "result_set_unusable";
     }
     return "unknown";
 }
@@ -125,6 +131,10 @@ inline ScopeAbortReason to_abort_reason(ScopeEvalError::Kind k) {
         return ScopeAbortReason::OwnerCheckFailed;
     case ScopeEvalError::Kind::PresenceDegraded:
         return ScopeAbortReason::PresenceDegraded;
+    case ScopeEvalError::Kind::ResultSetUnusable:
+        return ScopeAbortReason::ResultSetUnusable;
+    case ScopeEvalError::Kind::ResultSetUnusablePermanent:
+        return ScopeAbortReason::ResultSetUnusablePermanent;
     }
     return ScopeAbortReason::DbDegraded;
 }
@@ -143,6 +153,10 @@ struct ScopeLadderResult {
     std::optional<std::vector<std::string>> matched;
     std::optional<std::string> parse_error;
     std::optional<ScopeAbortReason> abort_reason;
+    /// For a `result_set_unusable` abort only: `cause=<pending|failed|incomplete> result_set=<id>`
+    /// (fixed tokens, the id neutralised). The set passed the caller's owner check, so naming it
+    /// answers the caller about its own set. Empty for every other reason.
+    std::string abort_detail;
 };
 
 /// The ladder itself: alias resolution -> owner-check gate -> parse ->
@@ -210,8 +224,16 @@ inline ScopeLadderResult resolve_scope_targets(
         !matched.error().detail.empty() && audit.resolution_failed)
         audit.resolution_failed(matched.error().detail);
     result.abort_reason = to_abort_reason(matched.error().kind);
-    spdlog::error("scope dispatch: evaluate_scope degraded (reason={})",
-                  to_string(*result.abort_reason));
+    if (matched.error().kind == ScopeEvalError::Kind::ResultSetUnusable ||
+        matched.error().kind == ScopeEvalError::Kind::ResultSetUnusablePermanent) {
+        // An expected state of the caller's own set, not a degrade (the registry logged it).
+        result.abort_detail = matched.error().detail;
+        spdlog::warn("scope dispatch: evaluate_scope aborted (reason={})",
+                     to_string(*result.abort_reason));
+    } else {
+        spdlog::error("scope dispatch: evaluate_scope degraded (reason={})",
+                      to_string(*result.abort_reason));
+    }
     if (audit.evaluation_aborted)
         audit.evaluation_aborted(to_string(*result.abort_reason));
     return result;

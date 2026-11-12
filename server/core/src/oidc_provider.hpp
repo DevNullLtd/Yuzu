@@ -30,6 +30,13 @@
 
 #include "oidc_egress_policy.hpp"
 
+// Declared only: the full definitions are in bounded_resolver.hpp, which pulls in the socket
+// headers and stays out of this one.
+namespace yuzu::server::net {
+struct ResolverPool;
+struct ResolveResult;
+} // namespace yuzu::server::net
+
 namespace yuzu::server::oidc {
 
 struct OidcConfig {
@@ -330,12 +337,10 @@ public:
     /// this instance's binding SHA-256 fail exactly as a broken crypto provider would;
     /// `add_test_pending_flow` plants a pending flow with a chosen binding hash (hex), bypassing
     /// `start_auth_flow`, so the stored-hash validation can be driven with a value no honest
-    /// flow stores. TEST-ONLY: none of the test seams in this block (these two,
-    /// `set_http_timeouts_for_test`, `set_discovery_negative_cache_for_test`,
-    /// `set_resolver_for_test`,
-    /// `clear_nat64_discovery_cache_for_test` and `pending_flow_count_for_test`) has
-    /// a production caller, and tests/unit/server/ test_oidc_provider.cpp pins (source scan) that
-    /// no other file in server/core/src references them.
+    /// flow stores. TEST-ONLY: no `*_for_test` member of this block (the two above and every
+    /// seam declared after them) has a production caller, and
+    /// tests/unit/server/test_oidc_provider.cpp pins (source scan) that no other file in
+    /// server/core/src references them.
     void set_binding_digest_failure_for_test(bool fail);
     void add_test_pending_flow(const std::string& state, std::string binding_hash);
     /// Test-only seam: replaces the 5 s per-operation connect/read/write timeouts of every IdP
@@ -351,6 +356,14 @@ public:
     /// Process-wide: a test must restore it. Same source-scan pin.
     using ResolverForTest = std::function<std::vector<std::string>(const std::string& host)>;
     static void set_resolver_for_test(ResolverForTest resolver);
+    /// Test-only seam: replaces the lookup function and the pool the POSIX name-resolution
+    /// adapter passes to `net::bounded_resolve` (bounded_resolver.hpp), BELOW
+    /// `set_resolver_for_test`, so a test can block a lookup behind a latch, fill a small pool or
+    /// fail a lookup without DNS. An empty `lookup` and a null `pool` restore the system lookup and
+    /// the OIDC pool. Process-wide: a test must restore it. Same source-scan pin.
+    using BoundedLookupForTest = std::function<net::ResolveResult(const std::string& host)>;
+    static void set_bounded_lookup_for_test(BoundedLookupForTest lookup,
+                                            std::shared_ptr<net::ResolverPool> pool);
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);
@@ -454,10 +467,10 @@ public:
     /// fixed `kEgressRefused` text and names no address. Plain http (an `http://` URL) to a PUBLIC
     /// address is refused outright, with the distinct fixed `kEgressCleartextPublicRefused` text,
     /// whatever `allow_private_networks` says; plain http to a loopback/private address still
-    /// needs that flag. Name resolution is inside the total bound except on a glibc build, where
-    /// a lookup against an unresponsive resolver can run to about 30 s (httplib waits for the
-    /// resolver after it cancels the lookup). Up to four permitted addresses
-    /// are tried in order while the connect fails (any other outcome is final).
+    /// needs that flag. Name resolution is inside the total bound: on POSIX the lookup runs on a
+    /// detached worker through `net::bounded_resolve` and the caller stops waiting at the bound.
+    /// Up to four permitted addresses are tried in order while the connect fails (any other
+    /// outcome is final).
     ///
     /// NAT64. An IPv6 address the policy would otherwise permit is also decoded under
     /// `nat64_prefixes` (the operator's `--oidc-nat64-prefix`) and under the prefixes the server
@@ -551,5 +564,11 @@ private:
 
     static constexpr auto kChallengeTtl = std::chrono::minutes(10);
 };
+
+/// Name lookups currently outstanding in the pool the OIDC egress path owns (cap
+/// `net::kMaxInFlightLookups`). A lookup that has timed out for its caller still holds its slot
+/// until the resolver returns. Feeds `yuzu_server_oidc_resolver_in_flight`. Fed only on POSIX
+/// builds (the pool is not used elsewhere), so it always reads 0 on other builds.
+[[nodiscard]] int oidc_resolver_in_flight();
 
 } // namespace yuzu::server::oidc

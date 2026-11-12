@@ -2,6 +2,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -135,5 +136,35 @@ inline constexpr std::string_view kStaleSourceMessage =
 /// trailer when present; otherwise counts data lines. An `error|...` output
 /// (the echo failure shape) returns 0. Exposed for direct testing.
 int echo_row_count(std::string_view output);
+
+/// Targeted agents recorded as unanswered when a pending set is filled. Terminal (every targeted
+/// agent responded, and none of those answers was lost) is 0. Otherwise the count is
+/// `targeted - responded` plus `dropped` (agents the tracker counted as responded whose terminal
+/// response the response store did not persist: their answer is not in the stored rows), floored
+/// at 1: with no tracker data, or none targeted, completeness cannot be proven, so the set reads
+/// "not known complete" rather than complete. Never 0 while `dropped > 0`.
+[[nodiscard]] inline int64_t unanswered_agent_count(int64_t targeted, int64_t responded,
+                                                    bool tracker_present, int64_t dropped = 0) {
+    const int64_t lost = dropped > 0 ? dropped : 0;
+    if (tracker_present && targeted > 0 && responded >= targeted && lost == 0)
+        return 0;
+    const int64_t gap = tracker_present && targeted > responded ? targeted - responded : 0;
+    const int64_t total = gap + lost;
+    return total > 1 ? total : 1;
+}
+
+/// The dropped-answer count the fill uses for a set that is due (terminal or timed out), from the
+/// tracker's count (`nullopt` when it could not be read) and the set's age in seconds. A readable
+/// count is used as is. An unreadable one skips the set for this tick (`nullopt`) until the set is
+/// older than `give_up_after_s`; past that the set is filled with a count of 1, so it reads
+/// incomplete rather than staying pending until its expiry.
+[[nodiscard]] constexpr std::optional<int64_t>
+fill_count_decision(std::optional<int64_t> count, int64_t age_s, int64_t give_up_after_s) noexcept {
+    if (count)
+        return *count;
+    if (age_s > give_up_after_s)
+        return int64_t{1};
+    return std::nullopt;
+}
 
 } // namespace yuzu::server::rs_matcher

@@ -1879,6 +1879,7 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_mgmt_group_owner_gate.cpp', # owner-arm predicate: surface, token class, engine, grant rows (pure, no PG)
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_engine_aware_visibility.cpp', # #6204: the engine rule in the username-keyed visibility/dispatch resolvers, against real stores
@@ -3473,6 +3474,18 @@ test('agent-only release lint',
   timeout: 30,
 )
 
+# The `server` feature option (ADR-0035 ladder step 3): auto turns the server
+# off on a non-Linux target, enabled there is an error, the deprecated
+# `build_server` boolean stays declared and honoured. Lexical pins with a
+# mutation self-test, plus a real configure of this tree for Windows, macOS
+# and Linux targets (skipped without meson and a compiler).
+test('server feature option lint',
+  _python3_test,
+  args: [files('test_server_feature_option.py')],
+  suite: 'docs',
+  timeout: 300,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -4338,6 +4351,19 @@ test('DEX Apps wiring lexical gate (#7520, #7519)',
   timeout: 60,
 )
 
+# Agent-decommission cascade wiring (#5675): every field of AgentDecommissionStores must be handed a
+# live store pointer in ServerImpl::decommission_agent (server.cpp). A store registered in the
+# cascade but never wired there is Skipped for every operator decommission, and no unit test sees
+# it (the route test injects its own decommission_fn; the drift guard pins only the COUNT).
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' for the same
+# reason as the gate above.
+test('agent decommission cascade wiring lexical gate (#5675)',
+  _python3_test,
+  args: [files('test_decommission_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Echo rename upgrade window: static lexical gate pinning that agent.cpp still CALLS the tested
 # tar.db adoption helper and the KV re-key after KvStore::open( and before the first plugin
 # init (no Agent::run() seam exists to test that, #1492). Carries its own in-memory mutation
@@ -4540,6 +4566,18 @@ test('OpenAPI literal segment size lexical gate',
   timeout: 30,
 )
 
+# Lexical gate: the OpenAPI authoring mistakes test_openapi_spec_completeness.cpp reports one kind
+# per full build (no operationId, an ill-formed or duplicate one, the operationId checksum pin, a
+# success response left untyped and not in kUntyped) are all reported together, before any build.
+# Reads the same literal chain as the segment gate above and the constants out of the C++ test.
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' as above.
+test('OpenAPI operation authoring lexical gate',
+  _python3_test,
+  args: [files('test_openapi_operation_authoring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Lexical gate: the OpenAPI x-yuzu-unavailable markers agree with the stores server.cpp passes to
 # register_routes (a store passed as nullptr <=> its group is marked). Carries its own in-memory
 # mutation self-test. No build required.
@@ -4633,9 +4671,10 @@ endif
 # Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
 # runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
 # platform: OS-contract test (docs is OS-independent and Linux-only since 2026-10-21). It is registered
-# only when build_server is on, so since ADR-0035 ladder step 1 (Windows and macOS CI configure with
-# -Dbuild_server=false) it runs on the Linux legs only; its `.exe` probe, MSYS2_ARG_CONV_EXCL and cygpath
-# handling now serve local Windows builds alone. Suite 'platform', not a bare 'server':
+# only when build_server is on, which since ADR-0035 ladder step 3 means a Linux target only (the
+# `server` feature option is off for any other target), so it runs on the Linux legs only; its `.exe`
+# probe, MSYS2_ARG_CONV_EXCL and cygpath handling serve no supported build now and can go when the
+# server's Windows code is removed (ADR-0035 step 4). Suite 'platform', not a bare 'server':
 # scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate labelled
 # only 'server' would fail that check on any leg that registers it.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server
@@ -4831,6 +4870,23 @@ test('software lookup wiring lexical',
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# yuzu_fleet_plugin_init_failed label catalogue: the one production set_known_plugins(...) line must
+# exist exactly once and precede the health recompute thread (no unit test builds ServerImpl; an
+# unwired store labels every real plugin "unknown"), and both metrics_.describe rows must exist.
+# The selftest deletes each required statement in memory and requires the gate to name it.
+test('plugin init failed wiring lexical',
+  _python3_test,
+  args: [files('test_plugin_init_failed_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('plugin init failed wiring lexical selftest',
+  _python3_test,
+  args: [files('test_plugin_init_failed_wiring_lexical_selftest.py')],
   suite: 'docs',
   timeout: 30,
 )

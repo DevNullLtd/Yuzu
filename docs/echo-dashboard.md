@@ -526,3 +526,9 @@ Audit actions: `echo.status.scan` (Scan fleet — PR-A.A), `echo.source.reenable
 - Should the retention-paused list also surface `<source>_enabled=true` devices that have *zero* recent rows (silent collector failure)? Useful for SRE but visually noisy in IR; defer to PR-G.
 - The "Purge data" action should ideally be replaced by an "Export then purge" flow that puts the rows into a signed evidence bundle before deletion — a SOC 2 CC7.2 evidence requirement. Defer to a follow-up issue once the retention-paused list ships.
 - Multi-device re-enable (select-many in the table, single click "Re-enable selected") is an obvious affordance once the table has rows; ship in PR-A only if the single-row path is solid.
+
+## Routed-concern invariants
+
+Moved verbatim from the `Echo dashboard` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Echo dashboard — frames, URLs, permissions. New source: CORE pattern (`docs/echo-implementer.md` §8), NOT the self-contained tier pattern; ARP/DNS + Capture-sources frame: ADR-0015 (Windows-first; DNS is usage-class PII). Untrusted `echo.sql` runs only via read-only `EchoDatabase::execute_user_query` (authorizer allowlist), not trusted `execute_query` (#760/#631). Per-source enable/disable fails CLOSED via `canonical_source_enabled`'s tri-state (#560). `EchoDatabase::open` integrity-checks + quarantines a corrupt `echo.db` aside or fails closed — never re-open-and-trust (#559). New streaming sources implement `ProcStreamCollector`, no parallel path (`docs/echo-module-loads.md`).

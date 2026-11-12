@@ -193,7 +193,8 @@ struct AsyncHarness {
 
     explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true,
                           InventoryStore* inv = nullptr, bool with_exec_visible = true,
-                          bool with_fleet_read_fn = true, bool with_all_agent_ids_fn = true)
+                          bool with_fleet_read_fn = true, bool with_all_agent_ids_fn = true,
+                          bool with_forensics_set = false)
         : inventory(inv), wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible),
           wire_fleet_read_fn(with_fleet_read_fn), wire_all_agent_ids_fn(with_all_agent_ids_fn) {
         permit_exec = true; // each harness starts permissive
@@ -288,6 +289,11 @@ struct AsyncHarness {
                 [this]() -> std::vector<std::string> { return all_agent_ids_override; });
         }
 
+        // The real catalogue-derived Forensics set, as the server wires it before the routes. Off by
+        // default: only the Forensics-source refusal cases need it.
+        if (with_forensics_set)
+            api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr, /*response_store=*/nullptr, instr.get(),
@@ -364,11 +370,11 @@ std::string make_cert_instruction(InstructionStore& s) {
     REQUIRE(id.has_value());
     return *id;
 }
-std::string make_instruction(InstructionStore& s) {
+std::string make_instruction(InstructionStore& s, const char* plugin = "filehash") {
     InstructionDefinition def;
     def.name = "Chrome hash check";
     def.version = "1.0";
-    def.plugin = "filehash";
+    def.plugin = plugin;
     def.action = "check";
     def.type = "action";
     def.description = "hash check";
@@ -1083,6 +1089,34 @@ TEST_CASE("from-instruction-result: 202 pending with operator matcher persisted"
     auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
     REQUIRE(row->matcher.find("sha256") != std::string::npos);
     REQUIRE(row->matcher.find("value_set") != std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a Forensics-tier plugin is refused before any execution "
+          "row or dispatch and an ordinary plugin proceeds",
+          "[pg][result_set][async][instruction][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool, true, nullptr, true, true, true, /*with_forensics_set=*/true);
+    const auto forensics_id = make_instruction(*h.instr, yuzu::server::test::kForensicsPlugin);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result",
+                    R"({"instruction_id":")" + forensics_id + R"("})", status);
+    REQUIRE(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find(
+              std::string(yuzu::server::kSourceNotSupportedMessage)) != std::string::npos);
+    CHECK(h.calls.empty());                         // nothing was sent
+    CHECK(h.tracker->query_executions({}).empty()); // and no execution row was created
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back().result == "denied");
+    CHECK(h.audits.back().detail.find("reason=forensics_source") != std::string::npos);
+
+    // The control: an ordinary plugin on the same harness is dispatched.
+    const auto ordinary_id = make_instruction(*h.instr, yuzu::server::test::kOrdinaryPlugin);
+    j = h.post("/api/v1/result-sets/from-instruction-result",
+               R"({"instruction_id":")" + ordinary_id + R"("})", status);
+    REQUIRE(status == 202);
+    CHECK(h.calls.size() == 1);
 }
 
 TEST_CASE("from-instruction-result: a column matcher is bound to the declared columns; "
@@ -4482,6 +4516,24 @@ std::string seed_instruction_result(AsyncHarness& h, const std::string& instruct
 
 } // namespace
 
+TEST_CASE("re-eval: a stored set whose definition names a Forensics-tier plugin is refused "
+          "and never re-dispatched",
+          "[pg][result_set][async][reeval][forensics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool, true, nullptr, true, true, true, /*with_forensics_set=*/true);
+    const auto forensics_id = make_instruction(*h.instr, yuzu::server::test::kForensicsPlugin);
+    const auto id = seed_instruction_result(h, forensics_id, nlohmann::json::object());
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find(
+              std::string(yuzu::server::kSourceNotSupportedMessage)) != std::string::npos);
+    CHECK(h.calls.empty());
+    CHECK(h.tracker->query_executions({}).empty());
+}
+
 TEST_CASE("re-eval: a set stored over a raw capture table is refused with RESULT_SET_REEVAL_STALE_SOURCE",
           "[pg][result_set][async][reeval][echo][stale_source]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
@@ -4866,18 +4918,101 @@ TEST_CASE("materialise: a success answer whose schema lacks the matcher column i
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
 
-TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",
-          "[result_set][async][agents_failed]") {
-    // The tick has no seam a test can drive (it is a lambda on the server's maintenance thread),
-    // so this pins the two lines lexically: the materialize call carries agents_failed, and a
-    // truncated read is marked failed instead of materialized.
-    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/server.cpp", std::ios::binary);
+namespace {
+// The text of a server source with `//` comments removed and every whitespace run collapsed to one
+// space (none after `(` or before `)`), so a pin matches a statement however it is wrapped, and a
+// comment between two pinned statements cannot satisfy or break the pin.
+std::string normalised_source(const std::string& file) {
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/" + file, std::ios::binary);
     REQUIRE(in.good());
     std::ostringstream ss;
     ss << in.rdbuf();
-    const auto src = ss.str();
-    CHECK(src.find("result_set_store_->materialize(p.id, members, agents_failed)") !=
-          std::string::npos);
+    const std::string src = ss.str();
+    std::string out;
+    out.reserve(src.size());
+    bool space = false;
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        const char c = src[i];
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i + 1 < src.size() && src[i + 1] != '\n')
+                ++i;
+            space = true;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            space = true;
+            continue;
+        }
+        if (space && !out.empty() && out.back() != '(' && c != ')')
+            out += ' ';
+        space = false;
+        out += c;
+    }
+    return out;
+}
+
+std::size_t count_in(const std::string& text, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",
+          "[result_set][async][agents_failed]") {
+    // The tick has no seam a test can drive (it is a lambda on the server's maintenance thread),
+    // so this pins its statements over whitespace-normalised source: the cheap skip runs first,
+    // the dropped-answer count only after it (an unreadable count retries next tick and never
+    // reads as zero, until fill_count_decision fills the set as incomplete), the members read
+    // after both, and the whole materialize call carries both counters.
+    const auto src = normalised_source("server.cpp");
+    const std::string skip_then_count =
+        "const bool timed_out = now - p.created_at > kPendingTimeoutSeconds; "
+        "if (!terminal && !timed_out) continue; "
+        "if (execution_tracker_) { const auto lost = "
+        "execution_tracker_->count_response_dropped(p.source_execution_id); "
+        "const auto use = rs_matcher::fill_count_decision(lost, now - p.created_at, "
+        "kPendingTimeoutSeconds * 3); "
+        "if (!lost) { static RefusalLogThrottle unreadable_log(std::chrono::seconds(30)); "
+        "if (unreadable_log.should_warn(p.id)) spdlog::warn(";
+    const auto skip_at = src.find(skip_then_count);
+    REQUIRE(skip_at != std::string::npos);
+    CHECK(count_in(src, skip_then_count) == 1);
+    const auto retry_at = src.find("if (!use) continue; count_unreadable = !lost; "
+                                   "dropped = *use; } "
+                                   "const int64_t agents_unanswered = "
+                                   "rs_matcher::unanswered_agent_count(targeted, responded, "
+                                   "execution_tracker_ != nullptr, dropped);",
+                                   skip_at);
+    REQUIRE(retry_at != std::string::npos);
+    CHECK(retry_at - skip_at < 900); // the throttled warn's arguments, nothing else, in between
+    const auto unanswered_at = src.find("const int64_t agents_unanswered", retry_at);
+    const auto members_at = src.find("result_set_members(*response_store_, forensics_plugins(), p)",
+                                     unanswered_at);
+    REQUIRE(members_at != std::string::npos);
+    CHECK(members_at - unanswered_at < 2000);
+    // get_summary no longer carries the count: the tick reads it only for a set about to fill.
+    CHECK(src.find("agents_response_dropped") == std::string::npos);
+    const std::string materialize_call =
+        "if (result_set_store_->materialize(p.id, members, agents_failed, agents_unanswered)) {";
+    CHECK(count_in(src, materialize_call) == 1);
+    CHECK(src.find(materialize_call, members_at) != std::string::npos);
+    // count_unreadable is counted once, only inside the successful fill, never at the decision.
+    const std::string forced_fill_count =
+        "if (count_unreadable) metrics_ .counter(\"yuzu_result_sets_total\", "
+        "{{\"source_kind\", p.source_kind}, {\"result\", \"count_unreadable\"}}) .increment();";
+    CHECK(count_in(src, "{\"result\", \"count_unreadable\"}") == 1);
+    const auto materialized_at = src.find(materialize_call, members_at);
+    const auto forced_at = src.find(forced_fill_count, materialized_at);
+    REQUIRE(forced_at != std::string::npos);
+    CHECK(forced_at - materialized_at < 400); // after the materialized counter, before the else
+    const auto else_at = src.find("} else {", materialized_at);
+    REQUIRE(else_at != std::string::npos);
+    CHECK(else_at > forced_at); // inside the successful fill, not the materialize_failed branch
+    // The parent's completeness is snapshotted onto the pending row at create time
+    // (inherit_completeness); the tick never reads the parent.
+    CHECK(src.find("fold_parent_completeness") == std::string::npos);
     CHECK(src.find("agents_failed = found->agents_failed;") != std::string::npos);
     // The truncated branch: between its `if` and the line that adopts the membership, the set
     // is marked failed and the branch ends in `continue;` with nothing but the closing brace
@@ -4892,9 +5027,84 @@ TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a tr
     const auto cont = branch.rfind("continue;");
     REQUIRE(cont != std::string::npos);
     CHECK(cont > marked);
-    CHECK(branch.substr(cont + std::string("continue;").size()).find_first_not_of(" \t\r\n}") ==
+    CHECK(branch.substr(cont + std::string("continue;").size()).find_first_not_of(" }") ==
           std::string::npos);
-    CHECK(marked < 1200);
+    CHECK(marked < 800);
+}
+
+TEST_CASE("ingest: every response-store site records a lost frame beside the agent's status",
+          "[result_set][async][response_dropped]") {
+    // The four ingest sites (Subscribe and gateway, RUNNING and terminal) have no seam a test
+    // can drive; pin them over whitespace-normalised source. Each stores the frame, turns the
+    // outcome into the dropped flag, and hands the flag to the tracker so it lands in the same
+    // upsert as the status; both terminal sites also mark a failed finalize as dropped and report
+    // an earlier unverified streaming frame of the same agent.
+    const auto src = normalised_source("agent_service_impl.cpp");
+    CHECK(count_in(src, "response_dropped = !store_outcome_durable(response_store_->store(sr));") ==
+          4);
+    CHECK(count_in(src, "} else if (finalize_result == FR::Error) { response_dropped = true; }") ==
+          2);
+    CHECK(count_in(src, "else if (finalize_result == FR::Error) {") == 2);
+    CHECK(count_in(src, "resp, prov, response_dropped);") == 4);
+    CHECK(count_in(src, "resp, prov, /*response_dropped=*/false);") == 2);
+}
+
+TEST_CASE("ingest: a failed provenance lookup is carried to the terminal answer in order",
+          "[result_set][async][response_dropped][unverified_frames]") {
+    // The record is written only for a failed lookup, right after the keepalive branch (never for
+    // a keepalive), on both paths; each terminal site checks it before the tracker call, and the
+    // record is forgotten only inside notify_exec_tracker, after a tracker write that carried
+    // the flag.
+    const auto src = normalised_source("agent_service_impl.cpp");
+    const std::string note =
+        "if (prov.outcome == ProvenanceOutcome::kLookupDegraded) "
+        "note_unverified_frame(resp.command_id(), agent_id);";
+    CHECK(count_in(src, note) == 2);
+    CHECK(count_in(src, "note_unverified_frame(resp.command_id(), agent_id);") == 2);
+    CHECK(count_in(src, "/*response_dropped=*/false); continue; } " + note) == 1);
+    CHECK(count_in(src, "/*response_dropped=*/false); return; } " + note) == 1);
+
+    const std::string peek =
+        "if (unverified_frame_seen(resp.command_id(), agent_id)) response_dropped = true;";
+    const std::string notify =
+        "notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);";
+    CHECK(count_in(src, peek) == 2);
+    std::size_t sites = 0;
+    const std::string store = "response_dropped = !store_outcome_durable(";
+    for (auto at = src.find(peek); at != std::string::npos; at = src.find(peek, at + 1)) {
+        // The peek runs AFTER the store outcome is assigned (it would otherwise be overwritten):
+        // the nearest preceding assignment is this site's own, a few statements earlier.
+        const auto store_at = src.rfind(store, at);
+        REQUIRE(store_at != std::string::npos);
+        CHECK(at - store_at < 300);
+        const auto notify_at = src.find(notify, at);
+        REQUIRE(notify_at != std::string::npos);
+        CHECK(notify_at - at < 300); // the registry audit hook, nothing else, in between
+        ++sites;
+    }
+    CHECK(sites == 2);
+    // A lost answer whose tracker row could not be written is noted instead, unconditionally (a
+    // marker, remembered command or latch covering the pair may expire before a fresh entry), so a
+    // later terminal or replayed frame still reports it.
+    CHECK(count_in(src, "const bool recorded = tracker->update_agent_status(execution_id, s); "
+                        "if (response_dropped) { if (recorded) "
+                        "unverified_frames_.forget(command_id, agent_id); "
+                        "else note_unverified_frame(command_id, agent_id); }") == 1);
+    CHECK(count_in(src, "unverified_frame_seen(command_id, agent_id)") == 0);
+    CHECK(count_in(src, "unverified_frames_.forget(") == 1);
+    CHECK(count_in(src, "update_agent_status(") == 1);
+    // Three note sites (two failed lookups, one failed tracker write) plus the definition.
+    CHECK(count_in(src, "note_unverified_frame(") == 4);
+    CHECK(count_in(src, "note_unverified_frame(command_id, agent_id);") == 1);
+}
+
+TEST_CASE("create: every async producer snapshots its parent's completeness",
+          "[result_set][async][agents_failed]") {
+    // REST and MCP each have an echo-query and an inventory producer that copy the parent's
+    // counters onto the child at create time.
+    CHECK(count_in(normalised_source("rest_api_v1.cpp"), "inherit_completeness(") +
+              count_in(normalised_source("mcp_server.cpp"), "inherit_completeness(") ==
+          4);
 }
 
 TEST_CASE("materialise: a success-status error| answer under the default matcher is a member "
@@ -4918,6 +5128,191 @@ TEST_CASE("materialise: a success-status error| answer under the default matcher
     CHECK(std::vector<std::string>(found->begin(), found->end()) ==
           std::vector<std::string>{"agent-a"});
     CHECK(found->agents_failed == 1);
+}
+
+// A parent that is not materialized has no membership to seed a child from: every producer that
+// accepts a parent_id refuses it (409) before any dispatch or read, and a materialized parent that
+// is incomplete passes its completeness on to the child.
+TEST_CASE("result-set producers refuse a pending parent and inherit an incomplete parent",
+          "[pg][result_set][async][parent_seed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    CreateRequest pending_req;
+    pending_req.owner_principal = "operator-1";
+    pending_req.name = "pending-parent";
+    pending_req.source_kind = std::string(source_kind::kEchoQuery);
+    pending_req.source_payload = R"({"sql":"SELECT 1"})";
+    auto pending = h.store->create_pending(pending_req, "exec-pending-parent");
+    REQUIRE(pending.has_value());
+
+    const std::string inv_body =
+        R"({"name":"child","conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}],"parent_id":")" +
+        pending->id + R"("})";
+
+    SECTION("from-inventory-query refuses a pending parent and creates nothing") {
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", inv_body, status);
+        CHECK(status == 409);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        CHECK(j["error"]["message"].get<std::string>().find("wait until it is materialized") !=
+              std::string::npos);
+        CHECK(j["error"]["retry_after_ms"] == 5000); // pending: transient
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 1); // the parent only
+    }
+    SECTION("from-echo-query refuses a pending parent and dispatches nothing") {
+        int status = 0;
+        h.post("/api/v1/result-sets/from-echo-query",
+               R"({"sql":"SELECT 1","parent_id":")" + pending->id + R"("})", status);
+        CHECK(status == 409);
+        CHECK(h.calls.empty());
+    }
+    SECTION("from-inventory-query refuses a failed parent and says to re-create it") {
+        h.store->mark_failed(pending->id, "bound exceeded");
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", inv_body, status);
+        CHECK(status == 409);
+        const auto msg = j["error"]["message"].get<std::string>();
+        CHECK(msg.find("RESULT_SET_NOT_READY") != std::string::npos);
+        CHECK(msg.find("re-create it") != std::string::npos);
+        CHECK(msg.find("wait until") == std::string::npos);
+        REQUIRE(j["error"].contains("retry_after_ms"));
+        CHECK(j["error"]["retry_after_ms"].is_null()); // failed: permanent
+    }
+    SECTION("from-inventory-query inherits a partial parent's counters") {
+        REQUIRE(h.store->materialize(pending->id, {}, 2, 3).has_value());
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", inv_body, status);
+        REQUIRE(status == 201);
+        auto child = get_ok(*h.store, j["data"]["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        CHECK(child->agents_failed == 2);
+        CHECK(child->agents_unanswered == 3);
+    }
+    SECTION("from-echo-query snapshots a partial parent's counters onto the pending row") {
+        REQUIRE(h.store->materialize(pending->id, {"dev-1"}, 2, 3).has_value());
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-echo-query",
+                        R"({"sql":"SELECT 1","parent_id":")" + pending->id + R"("})", status);
+        REQUIRE(status == 202);
+        auto child = get_ok(*h.store, j["data"]["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        CHECK(child->status == ResultSetStatus::Pending);
+        CHECK(child->agents_failed == 2);
+        CHECK(child->agents_unanswered == 3);
+    }
+}
+
+// The remaining parent-accepting routes obey the same rule as the inventory and echo producers
+// above: a pending parent is refused (409) before anything is dispatched or created, and a
+// materialized parent is the control that proves the refusal is the parent state, not a body
+// the route would reject anyway.
+TEST_CASE("result-set routes: instruction-result and generic create and re-eval refuse a pending "
+          "parent",
+          "[pg][result_set][async][parent_seed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    CreateRequest pending_req;
+    pending_req.owner_principal = "operator-1";
+    pending_req.name = "pending-parent";
+    pending_req.source_kind = std::string(source_kind::kEchoQuery);
+    pending_req.source_payload = R"({"sql":"SELECT 1"})";
+    auto pending = h.store->create_pending(pending_req, "exec-pending-parent");
+    REQUIRE(pending.has_value());
+    const auto only_pending_parent_exists = [&h] {
+        std::string next;
+        return h.store->list_by_owner("operator-1", "", 50, next).size() == 1;
+    };
+
+    SECTION("from-instruction-result refuses a pending parent and dispatches nothing") {
+        nlohmann::json body;
+        body["instruction_id"] = make_instruction(*h.instr);
+        body["parent_id"] = pending->id;
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        CHECK(status == 409);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        CHECK(h.calls.empty());
+        CHECK(only_pending_parent_exists());
+    }
+    SECTION("control: from-instruction-result with a materialized parent dispatches") {
+        nlohmann::json body;
+        body["instruction_id"] = make_instruction(*h.instr);
+        body["parent_id"] = h.seed_materialized("ready-parent", {"dev-1"});
+        int status = 0;
+        h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        CHECK(status == 202);
+        CHECK(h.calls.size() == 1);
+    }
+    SECTION("generic create refuses a pending parent and creates nothing") {
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets",
+                        R"({"name":"child","parent_id":")" + pending->id + R"("})", status);
+        CHECK(status == 409);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        CHECK(only_pending_parent_exists());
+    }
+    SECTION("generic create refuses a failed parent") {
+        h.store->mark_failed(pending->id, "bound exceeded");
+        int status = 0;
+        h.post("/api/v1/result-sets", R"({"name":"child","parent_id":")" + pending->id + R"("})",
+               status);
+        CHECK(status == 409);
+        CHECK(only_pending_parent_exists());
+    }
+    SECTION("control: generic create with a materialized parent is lineage only") {
+        // Direct creation does not inherit completeness: its members are the supplied device_ids.
+        CreateRequest cr;
+        cr.owner_principal = "operator-1";
+        cr.name = "partial-parent";
+        cr.source_kind = std::string(source_kind::kManualCurate);
+        cr.source_payload = "{}";
+        cr.agents_failed = 2;
+        cr.agents_unanswered = 3;
+        auto parent = h.store->create_materialized(cr, {"dev-1"});
+        REQUIRE(parent.has_value());
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets",
+                        R"({"name":"child","device_ids":["dev-1"],"parent_id":")" + parent->id +
+                            R"("})",
+                        status);
+        REQUIRE(status == 201);
+        auto child = get_ok(*h.store, j["data"]["id"].get<std::string>());
+        REQUIRE(child.has_value());
+        CHECK(child->parent_id == parent->id);
+        CHECK(child->agents_failed == 0);
+        CHECK(child->agents_unanswered == 0);
+    }
+    SECTION("re-eval refuses an original whose parent is still pending") {
+        CreateRequest original_req;
+        original_req.owner_principal = "operator-1";
+        original_req.name = "original";
+        original_req.source_kind = std::string(source_kind::kEchoQuery);
+        original_req.source_payload =
+            R"({"sql":"SELECT 1","scope_input_id":")" + pending->id + R"("})";
+        original_req.parent_id = pending->id;
+        auto original = h.store->create_pending(original_req, "exec-original");
+        REQUIRE(original.has_value());
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/" + original->id + "/re-eval", "", status);
+        CHECK(status == 409);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_NOT_READY") !=
+              std::string::npos);
+        CHECK(h.calls.empty());
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 2); // parent + original
+    }
 }
 
 // A name carrying an embedded NUL cannot be stored faithfully, so it is refused BEFORE dispatch:

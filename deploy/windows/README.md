@@ -198,7 +198,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
   next `dev`→`main` promotion carries step 1, and so does each open PR until it
   is rebased past step 1.
   The server is Linux-only: `ci.yml`'s Windows leg builds the agent only
-  (`-Dbuild_server=false`, into `build-windows-agent-{debug,release}`; the job
+  (no server switch: the `server` option is `auto`, off on Windows; into `build-windows-agent-{debug,release}`; the job
   deletes the older `build-windows-{debug,release}` dirs on every run) and no
   longer runs `Ensure Postgres` or any server suite. The clusters stay
   provisioned until ladder step 4 removes them together with the `postgres`

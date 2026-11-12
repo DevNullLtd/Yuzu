@@ -67,7 +67,7 @@ else
   done
 fi
 if [ -z "$BIN" ]; then
-  echo "SKIP: no built yuzu-server binary found (build with -Dbuild_server=true first)" >&2
+  echo "SKIP: no built yuzu-server binary found (build on Linux with the server on: -Dserver=auto or enabled)" >&2
   exit 0
 fi
 
