@@ -110,6 +110,7 @@
 #include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -165,11 +166,27 @@ struct ResultSet {
     std::string source_execution_id;      // set for async producers; else empty
     std::string matcher;                  // JSON matcher for instruction-result; else empty
     int64_t device_count{0};
-    /// Async producers: how many agents never satisfied the matcher AND answered at least once
-    /// with a failure (status not success, or output starting `error|`). The set is partial when
-    /// this is non-zero: those agents are absent from the membership because their query failed,
-    /// not because they do not match. 0 for sync producers.
+    /// Agents absent from the membership because their query failed (they answered at least once
+    /// with a failure: status not success, or output starting `error|`), not because they do not
+    /// match. Async producers add the count from their own execution at fill time. A child created
+    /// from a parent's members also carries the parent's count from creation (`inherit_completeness`),
+    /// so along a lineage the value is a SUM over the chain, not "failed in this execution": only
+    /// the zero/non-zero distinction (`partial`) is reliable. 0 for a set created from explicit
+    /// device ids and for a failed set.
     int64_t agents_failed{0};
+    /// Targeted agents absent from the membership because they never answered before the set was
+    /// filled (at the pending timeout at the latest), or because their answer was not fully
+    /// stored. The fill pass stores at least 1 when it cannot prove every agent answered (no
+    /// tracker data, or none targeted), so 1 can mean "not known complete" rather than an exact
+    /// count. Inherited and summed along a lineage exactly like `agents_failed`.
+    int64_t agents_unanswered{0};
+};
+
+/// The membership `member_set_owned` returns for a `materialized` set: the member ids, plus
+/// whether the set is complete (no agent failed and none went unanswered). An incomplete set
+/// can only under-match, so it is safe to include and unsafe to exclude.
+struct OwnedMembers : std::unordered_set<std::string> {
+    bool complete{true};
 };
 
 /// One step in a lineage chain (design §6 `/lineage`).
@@ -194,7 +211,21 @@ struct PendingSet {
 /// Typed failure surface; the REST layer maps these to the error taxonomy
 /// (RESULT_SET_NOT_FOUND, RESULT_SET_NOT_OWNER, RESULT_SET_QUOTA, PIN_LIMIT,
 /// RESULT_SET_EXPIRED) and the corresponding HTTP status.
-enum class ResultSetError { NotFound, NotOwner, QuotaExceeded, PinLimit, Pinned, TooManyMembers, DbError };
+enum class ResultSetError {
+    NotFound,
+    NotOwner,
+    QuotaExceeded,
+    PinLimit,
+    Pinned,
+    TooManyMembers,
+    DbError,
+    /// The set exists and is owned, but is still `pending`: it has no membership yet, and may
+    /// fill. Returned by `member_set_owned` only.
+    NotReady,
+    /// The set exists and is owned, but its fill `failed`: it never will have a membership.
+    /// Returned by `member_set_owned` only.
+    Failed
+};
 
 const char* to_string(ResultSetError e);
 
@@ -207,7 +238,54 @@ struct CreateRequest {
     std::string source_kind;
     std::string source_payload; // JSON
     std::string matcher;        // JSON; only meaningful for async instruction-result
+    /// Completeness a child inherits from its parent (`inherit_completeness`). Both create
+    /// methods persist them; for a pending row `materialize` later ADDS the fill's own counts.
+    int64_t agents_failed{0};
+    int64_t agents_unanswered{0};
 };
+
+/// A parent set may seed a child only once its membership means something: status
+/// `materialized`. A `pending` set has no members yet and a `failed` one never will, so
+/// seeding from either would read as an empty (complete) membership. Every producer that
+/// accepts a `parent_id` applies this right after its owner check and before it reads the
+/// parent's members; a refusal is `parent_not_ready_message(parent)` (REST 409, MCP -32602).
+[[nodiscard]] inline bool parent_may_seed(const ResultSet& parent) noexcept {
+    return parent.status == ResultSetStatus::Materialized;
+}
+
+/// The refusal for a parent `parent_may_seed` rejects, by the parent's status: a pending parent
+/// may still fill (wait), a failed one never will (re-create it).
+inline constexpr std::string_view kParentPendingMessage =
+    "RESULT_SET_NOT_READY: the parent result set is still pending; wait until it is "
+    "materialized";
+inline constexpr std::string_view kParentFailedMessage =
+    "RESULT_SET_NOT_READY: the parent result set failed and will never be materialized; "
+    "re-create it";
+[[nodiscard]] inline std::string_view parent_not_ready_message(const ResultSet& parent) noexcept {
+    return parent.status == ResultSetStatus::Failed ? kParentFailedMessage : kParentPendingMessage;
+}
+/// The A4 hint for that refusal: a pending parent is transient (retry after the hint, once it is
+/// materialized); a failed one is permanent (no retry hint).
+struct ParentNotReadyAdvice {
+    std::string_view remediation;
+    std::optional<std::int64_t> retry_after_ms; ///< nullopt: no retry hint (null on the wire)
+};
+[[nodiscard]] inline ParentNotReadyAdvice parent_not_ready_advice(const ResultSet& parent) noexcept {
+    if (parent.status == ResultSetStatus::Failed)
+        return {"re-create the parent result set", std::nullopt};
+    return {"wait until the set is materialized", std::int64_t{5000}};
+}
+
+/// Carry a parent's completeness onto a child created from its members: a child is never
+/// more complete than the parent it was narrowed from. Every producer whose members come from
+/// the parent's calls this at create time: the inventory producers and the three async ones
+/// (whose pending row then carries the parent's counters from birth). A materialized parent's
+/// counters never change afterwards, so the snapshot is exact and a later delete of the parent
+/// changes nothing.
+inline void inherit_completeness(CreateRequest& child, const ResultSet& parent) noexcept {
+    child.agents_failed = parent.agents_failed;
+    child.agents_unanswered = parent.agents_unanswered;
+}
 
 class ResultSetStore {
 public:
@@ -351,7 +429,12 @@ public:
     /// inverts to "every device matches" — the fleet-wide fail-open this
     /// contract exists to prevent. Callers MUST abort (not dispatch) on ANY
     /// `std::unexpected` from this method.
-    std::expected<std::unordered_set<std::string>, ResultSetError>
+    ///
+    /// A set that is not `materialized` returns `std::unexpected(ResultSetError::NotReady)` while
+    /// pending and `std::unexpected(ResultSetError::Failed)` once its fill failed: its membership
+    /// says nothing about the fleet. A `materialized` set returns its members with `complete` false when any agent
+    /// failed or went unanswered; the caller decides whether an incomplete set is usable.
+    std::expected<OwnedMembers, ResultSetError>
     member_set_owned(const std::string& id, const std::string& owner);
     /// Resolve an owner-scoped alias to a canonical id; `nullopt` if not
     /// found. `std::unexpected(DbError)` on a runtime error — see the
@@ -395,10 +478,13 @@ public:
 
     // ── Async materialisation (server maintenance thread) ────────────────────
     std::vector<PendingSet> list_pending();
-    /// Populate members, flip status → materialized, set device_count and agents_failed.
+    /// Populate members, flip status → materialized, set device_count, and ADD `agents_failed` /
+    /// `agents_unanswered` to the counters the pending row already carries (inherited from its
+    /// parent at create time), in the same status-guarded statement.
     std::expected<void, ResultSetError> materialize(const std::string& id,
                                                     const std::vector<std::string>& members,
-                                                    int64_t agents_failed = 0);
+                                                    int64_t agents_failed = 0,
+                                                    int64_t agents_unanswered = 0);
     void mark_failed(const std::string& id, const std::string& reason);
 
     /// #4493 heal path for a row `mark_failed` cannot reach: `mark_failed`'s
@@ -408,7 +494,7 @@ public:
     /// method is status-agnostic on purpose: unlike `mark_failed`, whose job
     /// IS the pending -> failed transition, this NEVER writes `status`, since
     /// a `materialized` row's members are real and still scope-walkable
-    /// (`member_set_owned` never filters on status), so forcing it to
+    /// (`member_set_owned` reads it), so forcing it to
     /// `failed` would misrepresent a working set as having produced nothing
     /// to every status-reading consumer (REST/MCP response body, the
     /// dashboard badge). Re-checks the raw text itself (never trusts a

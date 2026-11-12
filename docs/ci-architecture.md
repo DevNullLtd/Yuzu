@@ -337,8 +337,9 @@ dashboard: it crawls every route the shell nav links to (200, the `Content-Secur
 header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
 discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
 directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
-and runs four scenarios (stubbed where they write: those requests are answered in the browser,
-so nothing reaches the server). The gate first runs
+and runs six scenarios (five that each force their own precondition, with writes answered by a
+request stub in the browser so nothing reaches the server, and the DEX Apps tab: a live keyboard
+half plus a committed golden page served through a GET stub). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
 layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
 older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,
