@@ -1298,7 +1298,8 @@ Before the suite, `Self-test the registry leftover check` plants a probe key und
 `scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
 other scope: exit 0 with a `::warning`). A probe under one of the two `bam` roots that the runner account is refused
 (only LOCAL SYSTEM may create a key there) is replaced by a check that the script still lists that root, with a
-`::warning`; the three other roots always need a live probe. After it, `Assert this job left no YuzuTest-* registry keys behind` runs
+`::warning`; the three other roots always need a live probe. After it,
+`Assert this job left no YuzuTest-* registry keys behind` runs
 the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). The
 could-not-list arm has no self-test of its own (accepted residual): a persistent listing failure is caught pre-suite,
 because the self-test's probes go unnamed. It reports and never deletes (a leftover can be a registry link, and a

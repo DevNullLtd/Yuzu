@@ -22,8 +22,9 @@
   own rule), so removal is left to a human.
 
   Run by .github/workflows/ci.yml three times per Windows job: twice before the suite in a self-test that plants a probe
-  key under each scanned root (a bam root the runner account is refused under is proven by checking that this script lists it) and proves both decisions (exit 1 naming the keys, exit 0 with a warning), then once
-  after the suite step with the job's own scope.
+  key under each scanned root and proves both decisions (exit 1 naming the keys, exit 0 with a warning), then once
+  after the suite step with the job's own scope. A bam root the runner account is refused under is proven only by
+  checking that this script lists it.
   Keep this file ASCII only (Windows PowerShell 5.1 misreads BOM-less UTF-8).
 
 .PARAMETER Scope
