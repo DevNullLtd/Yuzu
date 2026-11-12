@@ -508,7 +508,7 @@ TEST_CASE("ManagementGroupStore: get_visible_agents honors RBAC-disabled posture
         a.group_id = *gid_a;
         a.principal_type = "user";
         a.principal_id = "admin";
-        a.role_name = "ITServiceOwner";
+        a.role_name = "Operator";
         REQUIRE(store.assign_role(a).has_value());
         auto visible = store.get_visible_agents("admin");
         REQUIRE(visible.has_value());
