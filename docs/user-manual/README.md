@@ -80,8 +80,8 @@ The following features are documented within the files listed above:
 |----------|-------------|--------|-------|---------|
 | Linux | x64 (amd64) | Yes | Yes | Yes |
 | Linux | ARM64 (aarch64) | Cross-compiled | Cross-compiled | Yes |
-| Windows | x64 | Yes | Yes | -- |
-| macOS | ARM64 (Apple Silicon) | Yes | Yes | -- |
+| Windows | x64 | No (Linux only, ADR-0035) | Yes | -- |
+| macOS | ARM64 (Apple Silicon) | No (Linux only, ADR-0035) | Yes | -- |
 | macOS | x64 (Intel) | Not supported | Not supported | -- |
 
 > **Note:** macOS Intel (x64) builds are not currently produced or tested. Only Apple Silicon (ARM64) Macs running macOS 14+ are supported. If you require macOS Intel support, please open an issue.

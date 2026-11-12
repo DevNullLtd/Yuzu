@@ -283,7 +283,7 @@ Each card has its own audit verb so a usage-class read (what a person is running
 | **Listening ports** | `network_diag/listening` | `device.live.listening` | all |
 | **Active connections** | `network_diag/connections` | `device.live.connections` | all |
 | **Logged-in users** | `users/logged_on` | `device.live.users` | all |
-| **Capture sources** — read-only view of which Echo warehouse sources are capturing locally (toggle state, the `$<Source>_Hourly` table and its row count; a dash with "This device runs an agent without the roll-up tables; upgrade the agent" for an agent that has not moved to the roll-up store); configure on the Echo page | `echo/status` | `device.live.capture_sources` | all |
+| **Capture sources** — read-only view of which Echo warehouse sources are capturing locally (toggle state, the `$<Source>_Hourly` table and its row count; a dash when the device reports no row count); configure on the Echo page | `echo/status` | `device.live.capture_sources` | all |
 | **Disk space** — free/used for the root volume with a colour-coded usage bar (>=90% used or <5 GiB free = red) | `disk_space/free` | `device.live.disk` | all |
 
 Every card requires **`Execution:Execute`** in addition to `GuaranteedState:Read`, each scoped to the device's management group; without Execute the card shows an explanatory note rather than failing silently, and a device outside your scope cannot be live-queried at all. The process tree, connections, logged-in-user, and **DNS-cache** reads are **usage-class behavioral telemetry** (a person's running software, active connections, sessions, and resolved names) and are individually audit-logged; the remaining kinds (uptime, services, adapters/IP, listening ports, ARP, capture sources, disk space) are machine-health reads.
@@ -383,8 +383,23 @@ The full set of agent command-line flags:
 | `--log-max-files` | Number of rotated log files kept. Applies whenever the agent writes a log file, otherwise ignored (env `YUZU_LOG_MAX_FILES`) | `5` |
 | `--debug` | Sets the agent's `debug_mode` configuration value to `true`. In this release it enables no extra behaviour: the only effect is that the `status` plugin's `connection` output reports `debug_mode` as `true`. It does not change the log level; use `--log-level debug` or `--verbose` for more logging. No environment variable | off |
 | `--update-check-interval` | Seconds between OTA update checks. Values are clamped to between 1 second and 8,760 hours (one year); the startup log line `OTA update checker started (interval=…s)` shows the effective value. Ignored with `--no-auto-update` (env `YUZU_UPDATE_CHECK_INTERVAL`) | `21600` (6 hours) |
+| `--container-runtime-endpoint` | Linux only. Absolute path of ONE read-only unix socket the operator provides in front of the container runtime, used by the `virtualization` plugin's `runtime_posture` action to read container state. Unset, the plugin never opens a socket. The endpoint must admit only the four read-only requests the plugin sends (see [Container runtime posture endpoint](#container-runtime-posture-endpoint-linux-opt-in)). The runtime's own default sockets are refused even when named here. The packaged service unit never sets it; contract and recipes: `docs/virtualization-runtime-posture-design.md` (env `YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT`) | (none) |
 
 Agent logging is asynchronous (#4666 PR-2): a producer thread enqueues a formatted line onto a fixed-size 8192-slot queue and returns; one dedicated worker thread does the actual sink I/O, so a stalled log destination no longer blocks the agent. Under sustained overload the queue silently drops the oldest still-queued lines (`overrun_oldest`) rather than growing or blocking. There is no `--log-sync` flag to opt back into synchronous logging. A shutdown that cannot tear this logger down within an internal 2-second grace, or that fails outright while doing so, self-exits with a new code, 5 (distinct from the existing 1/3/4); see "Stopping a wedged agent" in [Server Administration](server-admin.md) for the full exit-code reference and the async-logging behavior details, and "If log volume matters" in the same page for the level-gating consequence for the SIGINT/SIGTERM shutdown log line (it goes silent at `--log-level warn` or above).
+
+### Container runtime posture endpoint (Linux, opt-in)
+
+The `virtualization` plugin's `runtime_posture` action (instruction `Container Runtime Posture`) reports which container runtimes a Linux host has and how they are set up. It lists the containers, and their risky settings (privileged, network mode, a runtime socket mounted into the container), only when you give the agent an endpoint. Without one it reads file and socket metadata only and never opens a socket. The agent is never added to the `docker` group and never connects to a runtime's own socket: `/run/docker.sock`, `/var/run/docker.sock`, `/run/podman/podman.sock` and `/run/containerd/containerd.sock` are refused as an endpoint.
+
+To set it up:
+
+1. Run a request-filtering proxy in front of the runtime, as root, under its own systemd unit that owns the socket directory (`RuntimeDirectory=yuzu-agent`). It listens on `/run/yuzu-agent/runtime.sock` and forwards to the runtime's socket.
+2. Make that socket owned by root, group the agent's group (`yuzu-agent` on the packaged unit), mode `0660`, and keep every parent directory root-owned and not writable by group or other. A socket under `/tmp` or a home directory, or a symbolic link, is refused.
+3. Configure the proxy to admit only these four requests, matched byte for byte on every request of a connection (not only the first), and to refuse everything else: `GET /version`, `GET /info`, `GET /containers/json?all=1` and `GET /containers/{id}/json`, where `{id}` is 12 to 64 lowercase hexadecimal digits. The proxy filters requests, not responses: whatever it admits comes back unchanged, and a permissive proxy lets a compromised agent reach whatever the proxy permits.
+4. Set `YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT=/run/yuzu-agent/runtime.sock` in `/etc/yuzu-agent/yuzu-agent.env` and restart the agent. The startup log then says `container runtime endpoint: configured` (the path itself is never logged).
+5. Run the `Container Runtime Posture` instruction on the host and check that the `endpoint` row reads `ok`. Any other state names the reason on that row (`endpoint_refused` carries the refusal reason, `permission_denied` means the agent could not connect, `unreachable` means nothing answered) and the result is `CONSTRAINED`.
+
+The contract, the bounds and the security review are in the [design note](../virtualization-runtime-posture-design.md); the rows and tokens are in the plugin README (`agents/plugins/virtualization/README.md`).
 
 ### Per-agent mTLS auto-provisioning (PKI)
 
@@ -725,3 +740,9 @@ curl -s http://localhost:8080/api/deployment-jobs/{job_id} \
 curl -s -X DELETE http://localhost:8080/api/deployment-jobs/{job_id} \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+## Routed-concern invariants
+
+Moved verbatim from the `Device pages` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Device pages (`/devices` + `/device?id=`) — SHARED device surface: Device info / DEX / Guardian lens tabs + "Get live info" dispatch-and-poll snapshot; every kind has its own `device.live.<kind>` audit verb — usage-class reads stay separately countable (works-council). CRITICAL: (1) ALL behavioural-PII access-audit funnels through `server/core/src/rest_audit.hpp` (`emit_behavioral_audit`, #1647) — REST fail-closed 503 + `Sec-Audit-Failed`, dashboard HTML + MCP set-and-proceed; NEVER reintroduce an inline bool-capture on a new PII route (last un-migrated: `device.live.*` REST; #1703). (2) Result polls scoped at the store seam — `ResponsesFn` threads `agent_id` into `ResponseQuery{.agent_id}` (#1634); post-filter is defense-in-depth only.

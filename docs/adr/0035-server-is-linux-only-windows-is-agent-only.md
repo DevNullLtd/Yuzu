@@ -339,7 +339,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    artifact-name change reaches it). Keep the (non-blocking) gateway canary. Prune now-unused Windows
    server cache scopes (`cache-prune.yml`).
 
-   *Status: in progress — the step-1 CI change, #7499.* As
+   *Status: done — #7499 (merged 2026-11-11).* As
    implemented: the Windows and macOS legs of `ci.yml` pass `-Dbuild_server=false` (the boolean;
    the feature option is step 3) and drop every item listed above for them, and the Windows leg
    moves to `build-windows-agent-{debug,release}` and deletes the old dirs, so a branch cut
@@ -351,9 +351,10 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    workflow at once. `cache-prune.yml` has no Windows-server-only scope to prune: its Windows
    `sweep-test-databases.sh` step goes with Wee Tam's Postgres in step 4, and until then
    `Assert-Toolchain.ps1` still health-checks those clusters in the Windows job.
-   `pre-release.yml`: no change until step 2's artefact rename.
+   `pre-release.yml` needs no change at all: it never referenced the Windows or macOS
+   archives (it checks only the Linux and gateway tarballs).
 
-   **Release ordering (owner decision, 2026-11-10):** step 2 MUST merge before the next release
+   **Release ordering (owner decision, 2026-11-10; satisfied by step 2):** step 2 MUST merge before the next release
    tag, or that release MUST explicitly accept shipping a Windows/macOS server that CI never
    built or tested before tagging, recorded as a `changelog.d` caveat fragment merged through a
    reviewed PR (whose description names the approver and the date) and promoted before tagging,
@@ -371,7 +372,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    tarball), so the `/release` preflight grep goes empty; delete the
    `YuzuServerSetup` / `deploy/packaging/windows/yuzu-server.iss` path; rename the Windows/macOS
    archives to their agent-only names and update **every** consumer: `scripts/check-release-artifacts.sh`
-   (the `FILES` array **and** the `.cdx.json`/`.spdx.json` SBOM name expectations), the SBOM artifact
+   (its `REQUIRED_ARCHIVES` list **and** the `.cdx.json`/`.spdx.json` SBOM name expectations, `SBOM_BASES`), the SBOM artifact
    names + provenance-attestation subjects in `release.yml`, `.claude/skills/release/SKILL.md`,
    `.codex/skills/release/SKILL.md`, `docs/user-manual/release-verification.md`, and
    `scripts/build-agent-bundle.sh`. Update the release-notes platform matrix (server row → Linux-only)
@@ -379,6 +380,53 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    removal notice ("`YuzuServerSetup-*.exe` is discontinued; use the container image or the Linux
    packages"), remove the Windows server runbook from `docs/user-manual/server-admin.md`, and close
    #5325 and #1835 as resolved by removal.
+
+   *Status: done — #7523.* As implemented, with these deviations and
+   additions:
+   - **The Windows DLL sweep is unchanged.** `release.yml` copies every DLL in
+     `vcpkg_installed/x64-windows/bin`, and that tree keeps the server ports until step 3, so the
+     agent archive still carries `libpq.dll` and the other server-port DLLs until step 3.
+     Pruning by a hand-written list, proven on no runner, was judged riskier than one more
+     release with unused DLLs (plan review, 2026-11-11). Instead a new, gating step extracts the
+     archive, checks it holds every plugin DLL the build produced and no `yuzu-server.exe`, and
+     runs `yuzu-agent.exe --help` with `PATH` cut to the Windows directories, so a DLL the agent
+     or its core library imports at load time and the archive lacks fails the job before the
+     installers are built or anything is attested or published. It does not cover DLLs only a
+     plugin imports, or the MSVC runtime, which the runner supplies from System32.
+   - **The platform SBOMs over-list, and step 3 does not fully fix that.** Both the Windows and
+     macOS SBOMs are generated with `path: .`, the whole workspace (vcpkg's ports tree and build
+     trees included), so they list PostgreSQL client libraries and other components the agent
+     archive does not ship or load (verified against the v0.15.0 SBOMs). That is pre-existing; the
+     release notes, `docs/user-manual/release-verification.md` and `upgrading.md` disclose it.
+   - **The macOS "Notarize binaries" step** now reads the notarization status and fails unless it is
+     `Accepted`. Like the rest of macOS signing it is dormant until a signing secret is set.
+   - **The macOS codesign and notarization steps** pointed at `build-macos/yuzu-server` and
+     `build-macos/yuzu-agent`, paths that never existed (they never ran: no signing secret is
+     set). The server line is gone and the agent path is now `build-macos/agents/core/yuzu-agent`.
+   - **The in-archive top-level directory** is renamed with the archive
+     (`yuzu-agent-<version>-{windows-x64,macos-arm64}`).
+   - **`scripts/build-agent-bundle.sh`** accepts either archive name, so a hand-run against a tag
+     cut before this change still works.
+   - **`build-installer.sh`** builds the agent installer only; `--target server|all` is refused.
+   - **The `/release` preflight's hand check** is replaced by `tests/test_release_agent_only.py`
+     (Docs Lint and `meson test`), which fails if a Windows or macOS server build, `YuzuServerSetup`
+     or an old archive name comes back, and if the archive names in `release.yml`,
+     `scripts/check-release-artifacts.sh` and `scripts/build-agent-bundle.sh` disagree.
+   - **Also done here, ahead of step 5:** the release notes' "Windows (server + agent)" and "macOS
+     (server + agent)" archive rows, and the user manual's "Supported Platforms" table (Server is
+     now "No" on Windows and macOS). The retirement guidance for an existing Windows or macOS
+     server ("Moving a Windows or macOS server to Linux" in `docs/user-manual/server-admin.md`)
+     and an `upgrading.md` breaking-change section land here too. That guidance is a fresh Linux
+     deployment with agents enrolled as new installations, not a data migration: the CA store records the CA key's
+     absolute path (`ca_store.ca_root.key_ref`), and a Linux server refuses a key outside its own
+     CA directory, so a Windows server's restored database could not sign agent certificates or
+     publish CRLs. Carrying data over would need a server change; none is planned. Re-pointing an
+     already-enrolled agent or gateway at a different server has no supported procedure either,
+     so the guidance treats them as new installations (follow-ups #7524, and #7525 for a Windows agent's non-default CA).
+   - **#5325 and #1835** are closed as resolved by removal when this change merges.
+   - Proof without an RC (owner decision, 2026-11-11): the static pins, plus a Windows rehearsal of
+     the agent-only build, packaging and installer on a build box. The first stable tag after this
+     change is the first real run of the changed jobs.
 3. **Build guard** — implement Decision 4: convert `build_server` to a feature option, key the guard
    on `host_machine.system()`, make the non-Linux `vcpkg install` paths skip the `server` feature,
    and update `scripts/setup.sh`, the CLAUDE.md quickstarts, and any docs passing
@@ -387,7 +435,11 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    1)** for why. Also update `tests/shell/test_build_examples_gating.sh` (suite `platform`, runs on
    the Windows and macOS legs): it configures against the vcpkg tree with the default server
    switch, so once the server ports leave the Windows/macOS install it must pass
-   `-Dbuild_server=false` (or the new option's `disabled`) off Linux.
+   `-Dbuild_server=false` (or the new option's `disabled`) off Linux. The rename also reaches the
+   two pins that assert the switch: `scripts/ci/test_runner_health_check.py` (`ci.yml`, step 1)
+   and `tests/test_release_agent_only.py` (`release.yml`, step 2). This includes `release.yml`'s
+   `build-windows` and `build-macos` jobs: verify afterwards that the Windows agent archive no
+   longer carries `libpq.dll` or the other server-port DLLs.
 4. **Code + build/CI plumbing** — remove server-side `_WIN32` / `__APPLE__`-specific branches under
    `server/core/` (retain POSIX/Linux; do not disturb `agents/shared/` or `sdk/`, which stay
    cross-platform); and remove the plumbing that exists only for the non-Linux server: the
@@ -402,9 +454,8 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    (Linux builder container / VM / Docker image) and the `/test` platform-asymmetry
    (`.claude/skills/test/SKILL.md`); make `docs/uat-environment.md`'s native rig Linux-only; update
    `docs/os-capability-matrix.md`, `docs/ci-architecture.md`, `docs/capability-map.md`, and the
-   CLAUDE.md build sections; fix the user manual's "Supported Platforms" table
-   (`docs/user-manual/README.md`, which still lists Server = Yes on Windows x64 and macOS ARM64), the
-   "Windows (server + agent)" and "macOS (server + agent)" release-notes lines in `release.yml`, and the Windows-server behaviour
+   CLAUDE.md build sections; (the user manual's "Supported Platforms" table and the
+   "(server + agent)" release-notes lines in `release.yml` were done in step 2); fix the Windows-server behaviour
    notes in `docs/user-manual/authentication.md` and `tls.md`; add a `changelog.d/` fragment; add release-note guidance pointing any
    former Windows/macOS-server curiosity at the Docker image / Linux binary.
 

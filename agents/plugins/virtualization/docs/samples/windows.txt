@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-08 · LocalSystem (elevated; account names replaced with jsmith) · leg-hash 2a955b994291
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-11 · interactive user (elevated; account names replaced with jsmith) · leg-hash aec6e0e7930c
 == action=host
 status|host|supported|-
 host|no|host_with_hypervisor|hyperv|EliteMini Series|cpuid|high
@@ -7,7 +7,11 @@ container|unknown|windows:virtualization:container:not_read
 
 == action=wsl
 status|wsl|supported|-
-summary|1|1|6|0|3.0.3.0
+summary|1|1|6|0|3.0.5.0
 distribution|jsmith|Ubuntu-26.04|2|installed|yes|ubuntu
 [result_status] OK / FULL / 
+
+== action=runtime_posture
+status|runtime_posture|unsupported|windows:virtualization:runtime_posture:unsupported
+[result_status] UNAVAILABLE / UNKNOWN / windows:virtualization:runtime_posture:unsupported
 

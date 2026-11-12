@@ -1154,10 +1154,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      the instruction ids `crossplatform.tar.*`, the result-set matcher kind
      `tar_rows_ge` and the agent plugin name `tar`. Replacement names substitute
      `echo` for `tar` (`/api/v1/echo/...`, `*_echo_*`, `yuzu_echo_*`, `echo.*`,
-     `crossplatform.echo.*`, `echo_rows_ge`, plugin `echo`). The only retained
-     compatibility is the upgrade-window plugin-name shim (the server accepts an
-     agent that still reports `tar` and writes that name on the wire to it),
-     removed with the other legacy-name shims. Rationale: the feature is renamed
+     `crossplatform.echo.*`, `echo_rows_ge`, plugin `echo`). The only
+     compatibility retained at the time was an upgrade-window plugin-name shim
+     (the server accepted an agent that still reported `tar` and wrote that name
+     on the wire to it); it has since been removed. Rationale: the feature is renamed
      outright, so a retained alias would keep the old name alive in every
      surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
      old and new names. The ledger records the retirement because the policy

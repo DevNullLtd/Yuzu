@@ -8,9 +8,8 @@
  * columns are derived from fold_sources() (echo_fold_schema.hpp), never typed twice.
  *
  * ROLL-UP IS THE ONLY STORAGE MODEL: raw capture rows are not kept, and no setting, flag or
- * environment variable selects between the two. `$Process_Live` and the other 15 retired raw
- * names still translate, to empty shim views with the legacy columns, so a stored query reads
- * zero rows instead of failing.
+ * environment variable selects between the two. The retired raw names (`$Process_Live` and the
+ * other 15) do not translate: a query that names one fails as an unknown table.
  *
  * The $-name convention ($Process_Hourly, $TCP_Daily, etc.) maps to snake_case SQLite
  * view names (process_hourly, tcp_daily) via a whitelist translation.
@@ -230,7 +229,7 @@ std::string generate_warehouse_ddl();
 
 /**
  * Translate a $-prefixed table name to its real SQLite table name.
- * e.g. "$Process_Live" -> "process_live", "$TCP_Hourly" -> "tcp_hourly".
+ * e.g. "$Process_Hourly" -> "process_hourly", "$TCP_Hourly" -> "tcp_hourly".
  * Returns nullopt if the name is not in the whitelist.
  */
 std::optional<std::string> translate_dollar_name(std::string_view dollar_name);
