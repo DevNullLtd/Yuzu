@@ -10,8 +10,12 @@
 /// deviation from RFC 9110 section 9.1 (a general-purpose server MUST support HEAD), which that RFC
 /// allows only for a resource that does not answer GET; and section 15.5.6 says an `Allow` header
 /// lists every method the resource supports, while this one names GET only (listing the others would
-/// mean reading the route table from inside the step-up chokepoint for a rarely hit answer). Probes,
-/// static assets, sign-in pages and the public CA files keep answering HEAD.
+/// mean reading the route table from inside the step-up chokepoint for a rarely hit answer). The exempt
+/// set is `head_runs_handler`: the probes, static assets, sign-in pages and the public CA files, and
+/// also the SCIM GET surface (`/scim/v2/*`) and the sign-in start and callback GET routes
+/// (`/auth/oidc/start`, `/auth/callback`, `/auth/saml/start`), because all of them ride the
+/// login-exempt set; they keep answering HEAD. A route that only accepts POST (`/saml/acs`, the
+/// `/login` form posts) has no HEAD handler, and being in that set does not give it one.
 ///
 /// Compression. httplib encodes a dynamic body with brotli at quality 11, which costs seconds of one
 /// worker's CPU for a multi-megabyte page. A body httplib would brotli-encode is encoded here first,
@@ -37,8 +41,10 @@ namespace yuzu::server {
 /// by under 6 percent, and 9 costs twice as much). The output is about 25 percent larger than quality 11's.
 inline constexpr int kDynamicBrotliQuality = 5;
 
-/// True for the paths that keep answering HEAD: the unauthenticated probes, static assets, sign-in
-/// pages and the public CA files (`health::is_probe_path` or `is_login_exempt_path`).
+/// True for the paths that keep answering HEAD: the unauthenticated probes (`health::is_probe_path`)
+/// and everything `is_login_exempt_path` names (static assets, sign-in pages, the sign-in start and
+/// callback routes, the public CA files and the `/scim/v2/` prefix). It is a path test, not a route
+/// table: only a route registered for GET answers HEAD at all.
 [[nodiscard]] bool head_runs_handler(std::string_view path);
 
 /// Brotli-encodes `in` at `quality` (window 22, generic mode) into `out`. False leaves `out`

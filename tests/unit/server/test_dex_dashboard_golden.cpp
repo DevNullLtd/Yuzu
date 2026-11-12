@@ -1883,14 +1883,17 @@ TEST_CASE("DEX apps UI: the coverage caption counts the live observers and keeps
                                  std::to_string(o["disarmed"].get<int64_t>()) + " not armed, " +
                                  std::to_string(o["none_reported"].get<int64_t>()) + " not reporting"));
     }
-    CHECK(contains(page, "A device that is not armed or not reporting sends no crash or hang signal, so a "
-                         "quiet list does not cover it."));
+    CHECK(contains(page, "A device that is not armed or not reporting may not be sending all of its crash "
+                         "and hang signals (collection can be incomplete or unavailable), so a quiet list "
+                         "does not cover it."));
+    // The caption never claims silence: a disarmed collector can still deliver some signals.
+    CHECK_FALSE(contains(page, "sends no crash or hang signal"));
     // Every device armed: the warning sentence goes, the counts stay.
     auto healthy = populated_model();
     healthy.observer_state = std::vector<DexObserverSplit>{{"windows", 12, 0, 0}};
     const auto healthy_page = render_dex_apps_fragment(healthy, 7, "windows");
     CHECK(contains(healthy_page, "Observers now: Windows 12 armed, 0 not armed, 0 not reporting."));
-    CHECK_FALSE(contains(healthy_page, "sends no crash or hang signal"));
+    CHECK_FALSE(contains(healthy_page, "may not be sending all of its crash and hang signals"));
     // Per scope: a platform scope names its one row only.
     auto linux_only = model_of(populated_rows(), 50, "linux");
     linux_only.observer_state = std::vector<DexObserverSplit>{{"linux", 1, 2, 3}};

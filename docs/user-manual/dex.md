@@ -98,7 +98,8 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   sends no observer state: the agent runs with `--dex-disable` (`YUZU_AGENT_DEX_DISABLE`), it is on a
   build with no observer, or the server has no recent heartbeat for it (older than 90 seconds); these
   cases cannot be told apart. When any device is not armed or not reporting, the caption adds that
-  such a device sends no crash or hang signal, so a quiet list does not cover it. The counts come
+  such a device may not be sending all of its crash and hang signals (collection can be incomplete
+  or unavailable), so a quiet list does not cover it. The counts come
   from the same snapshot the population is counted from, so the rows add up to the population
   (under All: Windows, Linux, macOS and Other platforms, the last for any operating system the server
   does not recognise). When no observer source is wired the caption has no `Observers now` sentence

@@ -1414,6 +1414,9 @@ struct TableLock {
         PgResult r{PQexec(conn.get(), "ROLLBACK")};
         REQUIRE(r.ok());
     }
+    // Closing the connection ends its transaction and drops the lock. Idempotent and non-throwing,
+    // so a ScopeExit can call it mid-unwind (release() holds a REQUIRE and cannot).
+    void close() noexcept { conn.reset(); }
 };
 
 std::string apps_page(const yuzu::server::DexAppsModel& m) {
@@ -1443,9 +1446,21 @@ TEST_CASE("DexApi: budget saturation refuses the fifth read while four are parke
     lock.hold_observations();
     constexpr int kBudget = GuaranteedStateStore::kDexAppsConcurrentReads;
     std::latch entered(kBudget);
-    store.set_apps_read_barrier_for_test([&] { entered.count_down(); });
     std::atomic<int> served{0};
     std::vector<std::thread> readers;
+    // Runs on every exit, including a failed REQUIRE or a reader that could not be started: closes
+    // the lock connection (which unparks the readers), joins every reader that did start, then clears
+    // the barrier. A joinable std::thread destroyed during unwinding would terminate the whole test
+    // binary and every later [pg] case with it. Installed before the first reader starts; it must not
+    // throw, so it holds no REQUIRE. Declared after everything it touches, so it destructs first.
+    yuzu::test::ScopeExit cleanup{[&] {
+        lock.close();
+        for (auto& t : readers)
+            if (t.joinable())
+                t.join();
+        store.set_apps_read_barrier_for_test({});
+    }};
+    store.set_apps_read_barrier_for_test([&] { entered.count_down(); });
     for (int i = 0; i < kBudget; ++i)
         readers.emplace_back([&] {
             const auto r = store.dex_app_stability_checked("", "windows", 10, 20, 5, {});
@@ -1465,8 +1480,7 @@ TEST_CASE("DexApi: budget saturation refuses the fifth read while four are parke
     lock.release();
     for (auto& t : readers)
         t.join();
-    store.set_apps_read_barrier_for_test({}); // clear only after the threads joined
-    CHECK(served.load() == kBudget);
+    CHECK(served.load() == kBudget); // the guard clears the barrier after this, once the threads joined
 }
 
 // A 1 s statement timeout stands in for the issue's 31 s hold (the production pool's is 30 s).

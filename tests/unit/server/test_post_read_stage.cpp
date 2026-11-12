@@ -367,6 +367,16 @@ TEST_CASE("post-read stage: HEAD on a dynamic route is refused and brotli is app
     const int port = svr.bind_to_any_port("127.0.0.1");
     REQUIRE(port > 0);
     std::thread th([&] { svr.listen_after_bind(); });
+    // Stops and joins on every exit, including a failed REQUIRE below: a joinable std::thread
+    // destroyed during unwinding would terminate the whole test binary. The wait sits inside the
+    // joinable() test because stop() is a no-op until the accept loop is running.
+    yuzu::test::ScopeExit joiner{[&] {
+        if (th.joinable()) {
+            svr.wait_until_ready();
+            svr.stop();
+            th.join();
+        }
+    }};
     svr.wait_until_ready();
     REQUIRE(svr.is_running());
 
@@ -412,9 +422,6 @@ TEST_CASE("post-read stage: HEAD on a dynamic route is refused and brotli is app
         REQUIRE(r);
         CHECK(r->body == page);
     }
-
-    svr.stop();
-    th.join();
 }
 
 TEST_CASE("post-read stage: an exempt server with no stage installed serves its handlers "

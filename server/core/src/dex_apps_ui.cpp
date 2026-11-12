@@ -220,8 +220,9 @@ Coverage coverage(const std::string& scope,
         c.line += ". Complete and partial describe what the agent collects on each platform by design. " +
                   observer_text(*observers, any_quiet);
         if (any_quiet)
-            c.line += " A device that is not armed or not reporting sends no crash or hang signal, so a "
-                      "quiet list does not cover it.";
+            c.line += " A device that is not armed or not reporting may not be sending all of its crash "
+                      "and hang signals (collection can be incomplete or unavailable), so a quiet list "
+                      "does not cover it.";
     } else {
         c.line += ". This is what the agent collects on each platform, not a live check of each device.";
     }
