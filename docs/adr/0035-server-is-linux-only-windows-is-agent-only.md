@@ -442,7 +442,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    `build-windows` and `build-macos` jobs: verify afterwards that the Windows agent archive no
    longer carries `libpq.dll` or the other server-port DLLs.
 
-   *Status: done — #TBD.* As implemented, with these deviations and additions:
+   *Status: done — #7632.* As implemented, with these deviations and additions:
    - **Option name: `server`** (feature, default `auto`). `auto` builds the server on a Linux
      target (judged by `host_machine.system()` lowercased, because Meson keeps a cross file's
      `system = 'Linux'` verbatim; so a Linux-target cross build from any host stays legal) and is off for any other target; `-Dserver=enabled` on a non-Linux target is a
