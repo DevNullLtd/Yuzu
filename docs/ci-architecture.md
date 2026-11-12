@@ -3545,7 +3545,7 @@ a stale build instead of queueing behind it, and a 120-min timeout. Since
 failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
-release's own signed agent archives) on a GitHub-hosted runner — no
+release's own agent archives, after verifying the release `SHA256SUMS` cosign signature) on a GitHub-hosted runner — no
 compilation, so no self-hosted dependency — and cosign-signs + SBOMs +
 attests the pushed `yuzu-agent-bundle-chisel` image like the other publish
 jobs.

@@ -46,7 +46,7 @@ certificate at build time and cannot be restamped.
 | Platform archives | `yuzu-linux-x64.tar.gz`, `yuzu-gateway-linux-x64.tar.gz`, `yuzu-agent-windows-x64.zip`, `yuzu-agent-macos-arm64.tar.gz` (the Windows and macOS archives hold the agent only, and were named `yuzu-windows-x64.zip` / `yuzu-macos-arm64.tar.gz` in earlier releases) | `sha256sum -c SHA256SUMS` |
 | Native installers | `*.deb`, `*.rpm`, `YuzuAgentSetup-*.exe`, `YuzuAgent-*.pkg` (`YuzuServerSetup-*.exe` was discontinued: the server runs on Linux only, ADR-0035) | `sha256sum -c SHA256SUMS` |
 | Checksum manifest | `SHA256SUMS` | `cosign verify-blob` against `SHA256SUMS.sigstore` |
-| Cosign bundle | `SHA256SUMS.sigstore` (legacy: `SHA256SUMS.bundle` for releases ≤ v0.11.0) | Sigstore OIDC identity |
+| Cosign bundle | `SHA256SUMS.sigstore` (legacy filename `SHA256SUMS.bundle`: the only name on v0.7.x; v0.11.0-rc1 to v0.11.0 carry both) | Sigstore OIDC identity |
 | CycloneDX SBOMs | `yuzu-*.cdx.json`, including the images: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
 | SPDX SBOMs | `yuzu-*.spdx.json`, including the same image set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
@@ -91,7 +91,8 @@ prove authenticity — use the cosign step below for that.
 was signed by the GitHub Actions workflow that produced this release.
 
 ```bash
-TAG=v0.11.0   # the exact tag of the release you downloaded
+# TAG is the exact tag of the release you downloaded
+TAG=v0.11.0
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore \
   --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
@@ -110,15 +111,16 @@ listed asset is exactly what the workflow produced.
 ## 3. Verify Docker image signatures (cosign)
 
 ```bash
+# same TAG as step 2
 cosign verify \
-  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v0.11.0" \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/${OWNER}/yuzu-server:0.11.0
+  ghcr.io/${OWNER}/yuzu-server:${TAG#v}
 
 cosign verify \
-  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v0.11.0" \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/${OWNER}/yuzu-gateway:0.11.0
+  ghcr.io/${OWNER}/yuzu-gateway:${TAG#v}
 ```
 
 Output includes the signing certificate's SAN
@@ -266,14 +268,17 @@ echo "✓ all checks passed for v${VERSION}"
 
 **`cosign verify-blob: no matching signatures` / `certificate identity
 mismatch`** — do NOT widen the identity to a wildcard; that accepts a
-signature from any workflow. Check, in order: the release predates signing
-(v0.8.0 to v0.10.0 carry no signature file at all); `TAG` is not exactly the
+signature from any workflow. Check, in order: the release carries no signature
+file (v0.8.0-rc0 to v0.10.0 have neither a `.sigstore` nor a `.bundle`); `TAG` is not exactly the
 tag you downloaded; or `SIGNER_REPO` is wrong for the era (`Tr3kkR/Yuzu` up to
 0.13.x, `DevNullLtd/Yuzu` after). The only legitimate signers are those two
 repositories: if the default for the release's era fails, treat the download
 as suspect (wrong source or tampered), and never set `SIGNER_REPO` to the
-subject cosign prints. A network error reaching Sigstore's TUF root is
-transient: wait and re-run.
+subject cosign prints. A network error reaching Sigstore's TUF root usually
+clears on a re-run (cosign needs network access to the TUF root, or a local
+`--trusted-root`; there is no offline mode in `scripts/build-agent-bundle.sh`); if
+it persists for about an hour, or cosign reports an expired or unverifiable
+trusted root, update cosign (v3.x) instead of waiting.
 
 **`SHA256SUMS.sigstore: no such file`** — the v0.7.x releases ship the
 bundle only under the legacy filename `SHA256SUMS.bundle`; v0.8.0-rc0 to

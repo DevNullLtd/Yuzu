@@ -85,15 +85,33 @@ def sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def artifacts(version: str) -> dict:
+def installers(version: str, deb_sep: str = ".") -> dict:
+    """Installer file names as published (real spellings, checked against the
+    DevNullLtd/Yuzu releases): stable 0.15.0 -> _0.15.0_ / -0.15.0-1. / -0.15.0-macos /
+    -0.15.0.exe; prerelease 0.13.0-rc6 -> deb _0.13.0.rc6_ (or -rc6 from 0.14.0-rc3 on;
+    deb_sep picks '.', '-' or '~'), rpm -0.13.0-0.1.rc6., pkg/exe 0.13.0_rc6."""
+    base, _, pre = version.partition("-")
+    if pre:
+        return {
+            f"yuzu-agent_{base}{deb_sep}{pre}_amd64.deb": b"deb",
+            f"yuzu-agent-{base}-0.1.{pre}.x86_64.rpm": b"rpm",
+            f"YuzuAgent-{base}_{pre}-macos-arm64.pkg": b"pkg",
+            f"YuzuAgentSetup-{base}_{pre}.exe": b"exe",
+        }
     return {
-        "yuzu-linux-x64.tar.gz": b"linux",
-        "yuzu-agent-windows-x64.zip": b"win",
-        "yuzu-agent-macos-arm64.tar.gz": b"mac",
         f"yuzu-agent_{version}_amd64.deb": b"deb",
         f"yuzu-agent-{version}-1.x86_64.rpm": b"rpm",
         f"YuzuAgent-{version}-macos-arm64.pkg": b"pkg",
         f"YuzuAgentSetup-{version}.exe": b"exe",
+    }
+
+
+def artifacts(version: str, deb_sep: str = ".") -> dict:
+    return {
+        "yuzu-linux-x64.tar.gz": b"linux",
+        "yuzu-agent-windows-x64.zip": b"win",
+        "yuzu-agent-macos-arm64.tar.gz": b"mac",
+        **installers(version, deb_sep),
     }
 
 
@@ -290,7 +308,8 @@ class VerifyTests(unittest.TestCase):
         r = self.run_script("--version", "0.15.0", cosign_rc=1,
                             cosign_stderr="Error: expected SAN github.com/Attacker/Yuzu")
         self.assertFailed(r, "Tr3kkR/Yuzu", "DevNullLtd/Yuzu", "tampered release or the wrong download source",
-                          "NEVER set --signer-repo", "transient: wait and re-run")
+                          "NEVER set --signer-repo", "cosign older than v3.x",
+                          "There is no offline mode", "treat it as permanent")
         self.assertNotIn("wrong --signer-repo", r.stdout + r.stderr)
 
     def test_bad_signature_wins_over_a_tampered_file(self):
@@ -315,24 +334,29 @@ class VerifyTests(unittest.TestCase):
     def test_missing_sigstore_fails_closed(self):
         self.release("0.15.0", sigstore=False)
         r = self.run_script("--version", "0.15.0")
-        self.assertFailed(r, "no SHA256SUMS.sigstore")
+        # needle is the NON-legacy text: the legacy branch says "(no SHA256SUMS.sigstore)"
+        self.assertFailed(r, "no SHA256SUMS.sigstore on v0.15.0")
+        self.assertNotIn("legacy", r.stdout + r.stderr)
+        self.assertIn("v0.8.0-rc0 to v0.10.0 carry neither", r.stdout + r.stderr)   # C8-1: cause on THIS branch
         self.assertFalse((self.logs / "cosign.argv").exists())
 
     def test_legacy_bundle_only_release_fails_closed_naming_it(self):
-        self.release("0.11.0", sigstore=False, legacy_bundle=True)
-        r = self.run_script("--version", "0.11.0")
+        self.release("0.7.1-rc1", sigstore=False, legacy_bundle=True)   # the only .bundle-only era (v0.7.x)
+        r = self.run_script("--version", "0.7.1-rc1")
         self.assertFailed(r, "legacy SHA256SUMS.bundle")
         # UP-2: the by-hand command is inline, exact and tag-bound (no doc pointer, no regexp).
         self.assertIn("cosign verify-blob --bundle SHA256SUMS.bundle --certificate-identity "
-                      f"https://github.com/{OLD}/.github/workflows/release.yml@refs/tags/v0.11.0 "
+                      f"https://github.com/{OLD}/.github/workflows/release.yml@refs/tags/v0.7.1-rc1 "
                       f"--certificate-oidc-issuer {ISSUER} SHA256SUMS", r.stdout + r.stderr)
         self.assertNotIn("regexp", r.stdout + r.stderr)
+        self.assertNotIn("v0.8.0-rc0", r.stdout + r.stderr)
         self.assertFalse((self.logs / "cosign.argv").exists())
 
     def test_cosign_absent_fails_closed(self):
         self.release("0.15.0")
         r = self.run_script("--version", "0.15.0", cosign=False)
-        self.assertFailed(r, "need cosign on PATH")
+        self.assertFailed(r, "need cosign on PATH", "install cosign v3", "cosign version")
+        self.assertNotIn("have no cosign package", r.stdout + r.stderr)
         self.assertFalse((self.logs / "gh.argv").exists(), "must stop before downloading")
 
     # ---- per-file hash lookup -------------------------------------------------------
@@ -380,22 +404,22 @@ class VerifyTests(unittest.TestCase):
         self.assertFailed(r, "ambiguous", "yuzu-linux-x64.tar.gz")
 
     def test_ambiguous_sanitised_name_fails(self):
-        ver = "0.12.0.rc0"                       # as GitHub serves 0.12.0~rc0
+        ver = "0.13.0-rc6"                       # GitHub serves the manifest's 0.13.0~rc6 as 0.13.0.rc6
         art = artifacts(ver)
-        tilde = f"yuzu-agent_0.12.0~rc0_amd64.deb"
+        tilde = "yuzu-agent_0.13.0~rc6_amd64.deb"
         lines = [f"{sha(b)}  {n}" for n, b in art.items() if not n.endswith(".deb")]
         lines += [f"{sha(b'deb')}  {tilde}", f"{sha(b'deb')}  {tilde}"]
         self.release(ver, sums_lines=lines)
-        r = self.run_script("--version", "0.13.0")
+        r = self.run_script("--version", ver)
         self.assertFailed(r, "ambiguous")
 
     def test_tilde_sanitised_name_matches_when_unique(self):
-        ver = "0.12.0.rc0"
+        ver = "0.13.0-rc6"
         art = artifacts(ver)
         lines = [f"{sha(b)}  {n}" for n, b in art.items() if not n.endswith(".deb")]
-        lines.append(f"{sha(b'deb')}  yuzu-agent_0.12.0~rc0_amd64.deb")
+        lines.append(f"{sha(b'deb')}  yuzu-agent_0.13.0~rc6_amd64.deb")
         self.release(ver, sums_lines=lines)
-        r = self.run_script("--version", "0.13.0")
+        r = self.run_script("--version", ver)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_exact_name_wins_over_tilde_fallback(self):
@@ -440,6 +464,61 @@ class VerifyTests(unittest.TestCase):
         r = self.run_script("--version", ver)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    # ---- installer selection is by the REQUESTED version (C8-2) -------------------------
+    def _release_with_extra(self, ver, extra, sums_extra=True):
+        files = self.release(ver)
+        for n, b in extra.items():
+            (self.fixture / n).write_bytes(b)
+        if sums_extra:
+            with (self.fixture / "SHA256SUMS").open("a") as f:
+                for n, b in extra.items():
+                    f.write(f"{sha(b)}  {n}\n")
+        return files
+
+    def test_installers_of_an_older_prerelease_on_the_same_release_are_not_picked(self):
+        # v0.13.0-rc6 really carries the rc4 AND rc6 .deb/.rpm; `ls | head -1` bundled rc4.
+        stale = {n: b"stale-" + b for n, b in installers("0.13.0-rc4").items()}
+        self._release_with_extra("0.13.0-rc6", stale)
+        r = self.run_script("--version", "0.13.0-rc6")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        sel = [l for l in r.stdout.splitlines() if "Installers selected" in l]
+        self.assertEqual(len(sel), 1, r.stdout)
+        for n in installers("0.13.0-rc6"):
+            self.assertIn(n, sel[0])
+        self.assertNotIn("rc4", sel[0])
+
+    def test_every_published_spelling_is_selected(self):
+        for ver, sep in [("0.13.0-rc6", "."), ("0.14.0-rc2", "."), ("0.14.0-rc3", "-"),
+                         ("0.14.0-rc7", "~"), ("0.15.0", "."), ("0.8.1-alpha1", "."), ("0.9.0-beta2", "-")]:
+            with self.subTest(version=ver, deb_sep=sep):
+                for p in self.fixture.glob("*"):
+                    p.unlink()
+                art = artifacts(ver, sep)
+                for n, b in art.items():
+                    (self.fixture / n).write_bytes(b)
+                (self.fixture / "SHA256SUMS").write_text("".join(f"{sha(b)}  {n}\n" for n, b in art.items()))
+                (self.fixture / "SHA256SUMS.sigstore").write_text("{}")
+                r = self.run_script("--version", ver)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                for n in installers(ver, sep):
+                    self.assertIn(n, r.stdout)
+
+    def test_two_installers_for_the_same_version_are_ambiguous(self):
+        both = {"yuzu-agent_0.13.0-rc6_amd64.deb": b"deb2"}      # '.' and '-' spellings together
+        self._release_with_extra("0.13.0-rc6", both)
+        r = self.run_script("--version", "0.13.0-rc6")
+        self.assertFailed(r, "ambiguous: 2 .deb installer assets", "yuzu-agent_0.13.0.rc6_amd64.deb",
+                          "yuzu-agent_0.13.0-rc6_amd64.deb")
+
+    def test_installers_only_for_another_version_are_refused_naming_them(self):
+        ver = "0.13.0-rc6"
+        wrong = installers("0.13.0-rc4")
+        self.release(ver, drop=tuple(installers(ver)))
+        for n, b in wrong.items():
+            (self.fixture / n).write_bytes(b)
+        r = self.run_script("--version", ver)
+        self.assertFailed(r, "no .deb installer asset for 0.13.0-rc6", "yuzu-agent_0.13.0.rc4_amd64.deb")
+
     def test_missing_installer_names_the_asset(self):
         self.release("0.15.0", drop=("YuzuAgentSetup-0.15.0.exe",))
         r = self.run_script("--version", "0.15.0")
@@ -457,6 +536,34 @@ class VerifyTests(unittest.TestCase):
         self.assertNotIn("Laying out", r.stdout)
         self.assertTrue(marker.exists(), "a run deleted a staging tree it did not create")
         self.assertEqual(self.staging_dirs(), [".agent-bundle-build"])
+
+    def test_verify_only_refuses_push_and_multiarch(self):
+        # HP-1: --verify-only builds and pushes nothing, so the combination is an error, not a silent exit 0.
+        self.release("0.15.0")
+        for flag in ("--push", "--multiarch"):
+            with self.subTest(flag=flag):
+                (self.logs / "gh.argv").unlink(missing_ok=True)
+                r = self.run_script("--version", "0.15.0", flag)
+                self.assertFailed(r, "--verify-only downloads and verifies only")
+                self.assertFalse((self.logs / "gh.argv").exists())
+
+    def test_help_prints_the_whole_header_block(self):
+        # DOC8-1: the range is derived from the header, not hard-coded.
+        out = subprocess.run([BASH, str(self.repo / "scripts" / "build-agent-bundle.sh"), "-h"],
+                             cwd=self.repo, capture_output=True, text=True,
+                             env={"PATH": f"{self.toolbin}", "HOME": str(self.tmp), "YUZU_REPO_SLUG": FORK}).stdout
+        lines = out.splitlines()
+        self.assertEqual(lines[-1], "Windows/macOS agent artifacts). Override with --version for another release.")
+        self.assertIn("--verify-only", out)
+        self.assertFalse([l for l in lines if l.startswith("#")], out)   # the comment marker is stripped
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads a 000 file")
+    def test_unreadable_manifest_after_cosign_dies_with_a_message(self):
+        # UP-9: used to exit 2 with no [xx] line (a bare set -e abort).
+        self.release("0.15.0")
+        body = COSIGN_STUB.replace('exit "${STUB_COSIGN_RC:-0}"', 'chmod 000 "${@: -1}"; exit 0')
+        r = self.run_script("--version", "0.15.0", cosign_body=body)
+        self.assertFailed(r, "cannot read SHA256SUMS while looking up")
 
     def test_sha256sum_absent_falls_back_to_shasum(self):
         # XP-1: the macOS toolchain has shasum (perl) but no sha256sum.
@@ -525,6 +632,31 @@ class VerifyTests(unittest.TestCase):
             self.assertRegex(d, r"^\.agent-bundle-build\.[A-Za-z0-9]{6}$")
             self.assertIn(f"staging kept at deploy/docker/{d}", r1.stdout + r2.stdout)
 
+    def test_readmes_do_not_overclaim_signing_and_name_the_image_verification(self):
+        # SEC8-2 / REL8-3: neither the Windows nor the macOS binaries are code-signed, and
+        # the sha256 files cannot authenticate payload/ -- only the image signature does.
+        self._build_release()
+        r = self._build("--keep-staging")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        (root,) = self.staging_dirs()
+        tree = self.repo / "deploy" / "docker" / root / "yuzu-agents"
+        top = (tree / "README.txt").read_text()
+        win = (tree / "windows-x64" / "README.txt").read_text()
+        mac = (tree / "macos-arm64" / "README.txt").read_text()
+        ident = f"https://github.com/{NEW}/.github/workflows/release.yml@refs/tags/v0.15.0"
+        image = "ghcr.io/example/yuzu-agent-bundle-chisel:0.15.0"
+        for name, text in (("top", top), ("mac", mac)):
+            with self.subTest(readme=name):
+                self.assertIn(f"cosign verify {image}", text)
+                self.assertIn(f"--certificate-identity {ident}", text)
+                self.assertIn(f"--certificate-oidc-issuer {ISSUER}", text)
+        self.assertLess(mac.index("cosign verify"), mac.index("xattr -dr com.apple.quarantine"))
+        self.assertIn("NOT Authenticode-signed today, #239", win)
+        self.assertIn("NOT Authenticode-signed today, #239", top)
+        for text in (top, win, mac):
+            self.assertNotRegex(text, r"(?<!NOT )(?<!not )Authenticode-signed")
+            self.assertNotIn("via signed installer", text)
+
     def test_failed_build_cleans_its_staging_dir_and_keep_staging_preserves_it(self):
         self._build_release()
         (self.fixture / "yuzu-agent-windows-x64.zip").write_bytes(b"not a zip")
@@ -539,6 +671,32 @@ class VerifyTests(unittest.TestCase):
         r = self._build("--keep-staging")
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(len(self.staging_dirs()), 1)
+
+
+class WorkflowArgvTests(unittest.TestCase):
+    """release.yml's signing-time verify must use the same cosign flag set as the
+    script (SEC8-5): a signature the script would reject must fail the signing job."""
+
+    @staticmethod
+    def _statement(text, anchor):
+        """The shell statement starting at anchor, continuation lines joined."""
+        i = text.index(anchor)
+        out = []
+        for line in text[i:].splitlines():
+            out.append(line.rstrip("\\").strip())
+            if not line.rstrip().endswith("\\"):
+                break
+        return " ".join(out)
+
+    def test_signing_time_verify_matches_the_scripts_flag_set(self):
+        wf = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+        sig = self._statement(wf, "cosign verify-blob --bundle SHA256SUMS.sigstore")
+        scr = self._statement(REAL_SCRIPT.read_text(), "if ! cosign verify-blob")
+        flags = lambda st: sorted(t for t in st.split() if t.startswith("--"))
+        self.assertEqual(flags(sig), flags(scr), (sig, scr))
+        self.assertEqual(flags(sig), ["--bundle", "--certificate-identity", "--certificate-oidc-issuer"])
+        self.assertIn("release.yml@${SIGN_REF}", sig)
+        self.assertNotIn("regexp", wf)
 
 
 @unittest.skipIf(os.name == "nt" or shutil.which("bash") is None or IN_MUTATION_RUN,
@@ -609,7 +767,7 @@ class MutationSelfTest(unittest.TestCase):
          ["test_binary_marker_tolerated"]),
         ("pick-dies-silently-on-no-match",
          '2>/dev/null | head -1 ) || true; }', '2>/dev/null | head -1 ); }',
-         ["test_old_archive_names_are_used_when_new_ones_are_absent", "test_missing_installer_names_the_asset"]),
+         ["test_old_archive_names_are_used_when_new_ones_are_absent"]),
         ("verify-only-continues",
          'ok "--verify-only: $TAG verified (signer $SIGNER_REPO); stopping before any build"\n  exit 0',
          'ok "--verify-only: $TAG verified (signer $SIGNER_REPO); stopping before any build"',
@@ -636,9 +794,66 @@ class MutationSelfTest(unittest.TestCase):
          'info "staging kept at $STAGING"', 'true',
          ["test_keep_staging_prints_the_path_and_runs_get_distinct_dirs"]),
         ("staging-never-cleaned",
-         'case "$STAGING" in "$STAGING_PREFIX".??????) rm -rf "$STAGING" 2>/dev/null || true ;; esac', 'true',
+         'case "$STAGING" in "$STAGING_PREFIX".??????) rm -rf "$STAGING" 2>/dev/null || warn "could not remove the staging dir $STAGING" ;; esac', 'true',
          ["test_failed_build_cleans_its_staging_dir_and_keep_staging_preserves_it"]),
+        ("installer-first-match",
+         'for c in "$@"; do [ -e "$DL/$c" ] && hits+=("$c"); done',
+         'hits=($(cd "$DL" && ls $glob 2>/dev/null | head -1))',
+         ["test_installers_of_an_older_prerelease_on_the_same_release_are_not_picked",
+          "test_installers_only_for_another_version_are_refused_naming_them"]),
+        ("installer-ambiguity-tolerated",
+         '*) die "ambiguous: ${#hits[@]} $label',
+         '*) printf -v "$var" \'%s\' "${hits[0]}" ;;\n    99) die "ambiguous: ${#hits[@]} $label',
+         ["test_two_installers_for_the_same_version_are_ambiguous"]),
+        ("installer-absence-tolerated",
+         '0) present="$(',
+         '0) printf -v "$var" \'%s\' "" ;;\n    99) present="$(',
+         ["test_installers_only_for_another_version_are_refused_naming_them", "test_missing_installer_names_the_asset"]),
+        ("verify-only-push-tolerated",
+         '[ "$VERIFY_ONLY" = 0 ] || [ "$PUSH" = 0 ]', 'true',
+         ["test_verify_only_refuses_push_and_multiarch"]),
+        ("help-range-hardcoded",
+         "awk 'NR == 1 { next } /^#/ { sub(/^# ?/, \"\"); print; next } { exit }' \"$0\"",
+         "sed -n '2,39p' \"$0\" | sed 's/^# \\?//'",
+         ["test_help_prints_the_whole_header_block"]),
+        ("manifest-read-failure-silent",
+         'matches="$(sums_hashes "$f" sanitised)" || die "cannot read SHA256SUMS while looking up $f"',
+         'matches="$(sums_hashes "$f" sanitised)" || true',
+         ["test_unreadable_manifest_after_cosign_dies_with_a_message"]),
+        ("mac-readme-image-verify-removed",
+         "  #   cosign verify ${IMAGE_REF} \\\\", "  #   true ${IMAGE_REF} \\\\",
+         ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
+        ("windows-readme-claims-authenticode",
+         "Yuzu Agent — windows-x64 — ${VERSION}  (NOT Authenticode-signed today, #239)",
+         "Yuzu Agent — windows-x64 — ${VERSION}  (Authenticode-signed)",
+         ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
+        ("legacy-branch-always",
+         'if [ -s "$DL/SHA256SUMS.bundle" ]; then', 'if true; then',
+         ["test_missing_sigstore_fails_closed"]),
     ]
+
+    # A mutant's only catching case SKIPS on a host lacking the tool it drives; the
+    # matching mutant must then skip too, else the suite goes red on that host
+    # (BCI8-1 / XP8-1). Names map to the host requirements of the cases above.
+    NEEDS = {
+        "shasum-wrong-algorithm": ("shasum", "perl"),
+        "fixed-staging-dir": ("unzip",),
+        "keep-staging-silent": ("unzip",),
+        "mac-readme-image-verify-removed": ("unzip",),
+        "windows-readme-claims-authenticode": ("unzip",),
+        "staging-never-cleaned": ("unzip",),
+        "manifest-read-failure-silent": ("!root",),
+    }
+
+    @classmethod
+    def _skip_reason(cls, name):
+        for need in cls.NEEDS.get(name, ()):
+            if need == "!root":
+                if hasattr(os, "geteuid") and os.geteuid() == 0:
+                    return "running as root (a 000 file stays readable)"
+            elif shutil.which(need) is None:
+                return f"needs {need}"
+        return None
 
     def test_every_guard_has_a_case_that_catches_its_mutant(self):
         text = REAL_SCRIPT.read_text()
@@ -647,6 +862,9 @@ class MutationSelfTest(unittest.TestCase):
             self.assertEqual(clean.returncode, 0, "unmutated script must pass:\n" + clean.stderr)
             for name, old, new, tests in self.MUTANTS:
                 with self.subTest(mutant=name):
+                    why = self._skip_reason(name)
+                    if why:
+                        self.skipTest(f"mutant {name}: its case skips here ({why})")
                     self.assertEqual(text.count(old), 1, f"mutant {name}: anchor not unique in script")
                     mutant = Path(d) / f"{name}.sh"
                     mutant.write_text(text.replace(old, new))

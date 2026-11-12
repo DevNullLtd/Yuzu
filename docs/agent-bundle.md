@@ -6,7 +6,7 @@ agent for three target triplets at one pinned version:
 | Triplet | OS / arch | Toolchain | Signing |
 |---|---|---|---|
 | `linux-x64` | Linux x86_64 (glibc) | GCC | — |
-| `windows-x64` | Windows x86_64 | MSVC | Authenticode |
+| `windows-x64` | Windows x86_64 | MSVC | not signed today (Authenticode signing is skipped in the release workflow, [#239](https://github.com/DevNullLtd/Yuzu/issues/239)) |
 | `macos-arm64` | macOS Apple Silicon | Apple Clang | not signed / not notarized |
 
 It exists so a design partner who can only **`docker pull`** can still get the
@@ -24,8 +24,8 @@ Image: `ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version>`
 
 The Windows (MSVC) and macOS (Apple Clang) agents **cannot be cross-built in a
 Linux Docker stage** — they require their native toolchains. So this image is
-not compiled: `scripts/build-agent-bundle.sh` downloads the Windows-signed /
-macOS-unsigned per-platform archives **and** native installers from the matching GitHub
+not compiled: `scripts/build-agent-bundle.sh` downloads the (unsigned: neither
+Windows nor macOS is code-signed today) per-platform archives **and** native installers from the matching GitHub
 *release*, authenticates the release `SHA256SUMS` (cosign signature, exact
 `release.yml` identity) and matches every download to its own line in it, lays them out under
 `/opt/yuzu-agents`, and bakes that tree into the chiselled image. This is the
@@ -73,17 +73,33 @@ against `SHA256SUMS.sigstore` with the exact identity
 `https://github.com/<signer>/.github/workflows/release.yml@refs/tags/<tag>`
 (issuer `https://token.actions.githubusercontent.com`; never a regexp), and only
 then reads it: each of the seven artifacts must equal the hash on **its own**
-`SHA256SUMS` line (found by exact file name; a hash that appears only on another
-file's line is a failure). It **refuses to build** on any failure, including a
-missing `cosign` (required, no skip flag), a missing `.sigstore`, or a legacy
-release that carries only `SHA256SUMS.bundle`. The signer is a fixed table by
-version, not read from `origin`: `Tr3kkR/Yuzu` up to `v0.13.x`, `DevNullLtd/Yuzu`
-after the 2026-09-28 move (see `docs/user-manual/release-verification.md`);
-override with `--signer-repo owner/repo`, which prints a `[!!]` warning when it differs from the table. The only legitimate signers are those two repositories: never set `--signer-repo` to the subject cosign reports in a failure, because a mismatch on the default means a tampered release or the wrong download source. `--verify-only` downloads and verifies,
-then stops, with no docker needed. When `gh` is present the script also
-best-effort verifies the SLSA provenance attestation; that step does not gate the
-build. Registry owner is derived from `origin` (override with `--registry`);
-image name with `--image-name`.
+`SHA256SUMS` line (found by exact file name, with a unique `~` to `.` fallback
+for releases before 0.14.0-rc3, where GitHub served the Debian `~` as `.`; a hash
+that appears only on another file's line is a failure). Each installer is
+chosen by the **requested version**: a pre-release can carry the installers of
+earlier pre-releases beside its own (v0.13.0-rc6 also holds the rc4 `.deb` and
+`.rpm`), so the script derives the exact file names for that version and
+refuses to build if none, or more than one, exists. It **refuses to build** on
+any failure, including a missing `cosign` (required, v3.x, no skip flag), a
+missing `.sigstore`, or a legacy release that carries only `SHA256SUMS.bundle`.
+The signer is a fixed table by version, not read from `origin`: `Tr3kkR/Yuzu`
+up to `v0.13.x`, `DevNullLtd/Yuzu` after the 2026-09-28 move (see
+`docs/user-manual/release-verification.md`); override with
+`--signer-repo owner/repo`, which prints a `[!!]` warning when it differs from
+the table. The only legitimate signers are those two repositories: never set
+`--signer-repo` to the subject cosign reports in a failure, because a mismatch
+on the default means a tampered release or the wrong download source (rule out
+an old cosign, a wrong clock and a Sigstore network failure first).
+
+Requirements: `gh` (authenticated), `cosign` v3.x with network access to
+Sigstore's TUF root (there is no offline mode; `--trusted-root` is not wired
+in), `sha256sum` or `shasum`, `git`, and a Yuzu checkout. A full build also
+needs `docker` and `unzip`. The script is bash; run it on Linux or macOS, or
+under WSL2 / Git Bash on Windows. `--verify-only` downloads and verifies, then
+stops, with no docker needed (and `--push`/`--multiarch` with it is an error).
+The script also best-effort verifies the SLSA provenance attestation; that step
+does not gate the build. Registry owner is derived from `origin` (override with
+`--registry`); image name with `--image-name`.
 
 ### Version pinning
 
@@ -260,23 +276,39 @@ upgrade first.
 
 ## Verify integrity
 
-Every file is checksummed twice over:
+Three checks, and they cover different things:
 
 ```bash
 cd yuzu-agents
-sha256sum -c SHA256SUMS          # checksums of the laid-out tree
+sha256sum -c SHA256SUMS          # the laid-out tree is intact (NOT proof it is genuine:
+                                 # anyone who edits the tree can regenerate this file)
 # UPSTREAM-SHA256SUMS is the checksum manifest from the GitHub release, which the
-# build verified before use; UPSTREAM-SHA256SUMS.sigstore is its cosign bundle:
+# build verified before use; UPSTREAM-SHA256SUMS.sigstore is its cosign bundle.
+# It authenticates the release archives and installers, not payload/ as laid out.
+# SIGNER_REPO is Tr3kkR/Yuzu for releases up to v0.13.x, DevNullLtd/Yuzu after.
+# Needs cosign v3.x and network access to Sigstore's TUF root:
+SIGNER_REPO=DevNullLtd/Yuzu
+TAG=v<version>
 cosign verify-blob --bundle UPSTREAM-SHA256SUMS.sigstore \
-  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v<version>" \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com UPSTREAM-SHA256SUMS
 ```
 
-The Windows binaries are Authenticode-signed; that signature is embedded and
-survives the copy in/out of the image. **macOS binaries are not yet signed or
-notarized** (deferred — see Phase B / `docs/macos-code-signing` when it lands),
-so a copied macOS file is unsigned and Gatekeeper will quarantine it; clear it
-with `xattr -dr com.apple.quarantine <dir>`.
+`UPSTREAM-SHA256SUMS.sigstore` is absent from bundles built before this check
+existed, and the first release that carries a `SHA256SUMS.sigstore` to rebuild
+from is v0.11.0-rc1. The check that covers what you extracted is the
+signature on the **image** (below): verify it on the image you pulled before
+you trust or run anything in it.
+
+**Nothing in the bundle is code-signed today.** The release workflow's
+Authenticode steps for the Windows binaries and installer are skipped (no
+signing certificate is provisioned, [#239](https://github.com/DevNullLtd/Yuzu/issues/239)),
+so do not expect a valid Authenticode signature (`Get-AuthenticodeSignature`
+reports `NotSigned`) and SmartScreen may warn. **macOS binaries are not signed
+or notarized either** (deferred, see Phase B / `docs/macos-code-signing` when it
+lands), so a copied macOS file is unsigned and Gatekeeper will quarantine it. Clear
+that with `xattr -dr com.apple.quarantine <dir>` only after the image signature
+below verified, because the cosign signatures are the only authenticity check.
 
 The **image itself** (when built by the `docker-publish-agent-bundle` release
 job) is cosign-keyless-signed with SLSA provenance and a CycloneDX/SPDX SBOM, so
@@ -289,7 +321,7 @@ cosign verify ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> \
 gh attestation verify oci://ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> --repo <owner>/Yuzu
 ```
 
-`<signer>` is `Tr3kkR/Yuzu` for releases up to `v0.13.x` and `DevNullLtd/Yuzu` after; the identity is an exact, tag-bound match.
+`<signer>` is the repository that ran `release.yml` for that tag (`DevNullLtd/Yuzu` since the 2026-09-28 move, `Tr3kkR/Yuzu` before it); the identity is an exact, tag-bound match, and `<owner>` is the registry owner.
 
 (Manual off-cycle builds via `scripts/build-agent-bundle.sh` are *not* image-signed
 — only the CI job signs. Prefer the released, CI-published image for partners.)
