@@ -703,7 +703,8 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21,
     // Destructive row in any fragment must land with the aggregate tripwire
     // still passing, which is exactly the drift this test's own title
     // forbids. (19 + registry.delete_user_value and registry.apply, registry 2.1.0,
-    // + firewall.quarantine, firewall 1.0.0; minus the legacy quarantine.quarantine row, removed by PRQ.2.)
+    // + firewall.quarantine, firewall 1.0.0; minus the removed containment plugin's
+    // Destructive row (PRQ.2).)
     CHECK(destructive_count == 21);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's

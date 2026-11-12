@@ -405,7 +405,7 @@ private:
                          const std::string& command_id) const;
     // #3425 governance Gate 2 (security-guardian): the observable agent-facing
     // action named by `what` already happened (dispatch accepted / status read
-    // confirmed state|active) even though the durable stamp write failed — this
+    // confirmed status|active) even though the durable stamp write failed — this
     // records that fact with result="failure" so a transient store outage never
     // produces a silent audit gap. See the two call sites for the full rationale.
     void audit_unstamped(const std::string& agent_id, std::int64_t record_id,

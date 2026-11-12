@@ -148,7 +148,7 @@ void QuarantineContainmentReconciler::audit_unstamped(const std::string& agent_i
     // #3425 governance Gate 2 (security-guardian): the observable, agent-
     // facing action described by `what` already happened by the time this
     // is called (a dispatch was accepted, or a status read confirmed
-    // state|active) — that is a real containment-affecting system fact and
+    // status|active) — that is a real containment-affecting system fact and
     // must leave an audit trail even though the durable stamp write failed,
     // or a transient store outage creates a silent gap in exactly the
     // evidence this verb exists to provide. `result="failure"` (not

@@ -342,9 +342,9 @@ says so.
 
 The earlier containment plugin's pf path replaced the main ruleset with its own (a
 block-all plus its whitelist, loaded by `pfctl -f`). **This build neither removes nor
-detects what an earlier build left on a host**, so a host quarantined by that plugin
-and then upgraded keeps its block-all main ruleset until an operator reloads
-`/etc/pf.conf` (or reboots, since pf rules are not persisted):
+detects what an earlier build left on a host**, so a host that still carries that
+plugin's ruleset when it is brought under this build keeps its block-all main ruleset
+until an operator reloads `/etc/pf.conf` (or reboots, since pf rules are not persisted):
 
 - the main ruleset on such a host does not reference `com.apple/*`, so a `firewall`
   apply fails `anchor_not_referenced` before the anchor is loaded (nothing is loaded),
@@ -352,10 +352,8 @@ and then upgraded keeps its block-all main ruleset until an operator reloads
 - once `/etc/pf.conf` is reloaded the reference is live again and the next apply or
   status sees a healthy anchor.
 
-The server's record for such a device is the record it already held, and the
-reconciler drives it through the firewall actions like any other. The upgrade note
-in `docs/user-manual/upgrading.md` tells operators to release or reload before
-upgrading a contained macOS host.
+The upgrading note in `docs/user-manual/upgrading.md` ("Not covered") tells operators
+to clear those rules before bringing the device under this build.
 
 ## 4. Persistence across reboot, and the gap before it
 

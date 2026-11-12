@@ -1315,8 +1315,18 @@ TEST_CASE("REST DELETE /api/v1/quarantine: a privilege refusal, a partial releas
     const std::string reply = GENERATE(std::string{"status|refused|privilege_unavailable"},
                                        std::string{"status|partial|release_failed"},
                                        std::string{"status|active"}, std::string{""});
-    CAPTURE(reply);
+    // The record has either never been confirmed or was confirmed once before the release began:
+    // a failed release leaves both kinds releasing.
+    const bool once_confirmed = GENERATE(false, true);
+    CAPTURE(reply, once_confirmed);
     RELEASE_RIG(h, reply);
+    if (once_confirmed) {
+        const auto seeded = active_record(h.quarantine_store, "agent-B");
+        REQUIRE(seeded.has_value());
+        REQUIRE(h.quarantine_store
+                    .mark_endpoint_confirmed("agent-B", seeded->id, /*at=*/1000, /*ttl_expires=*/0)
+                    .has_value());
+    }
     auto res = h.del("agent-B");
     REQUIRE(res);
     CHECK(res->status == 202);

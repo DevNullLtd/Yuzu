@@ -363,7 +363,7 @@ TEST_CASE("QuarantineContainmentReconciler: a busy mutation-gate response does n
 // on timing precision.
 
 TEST_CASE("QuarantineContainmentReconciler: confirmation requires a follow-up status read "
-          "reporting state|active — dispatch acceptance alone is not enough",
+          "reporting status|active — dispatch acceptance alone is not enough",
           "[pg][quarantine][reconciler]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
     PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
@@ -429,7 +429,7 @@ TEST_CASE("QuarantineContainmentReconciler: confirmation requires a follow-up st
     CHECK((*after_status_dispatch)->last_confirmed_at == 0);
 }
 
-TEST_CASE("QuarantineContainmentReconciler: a follow-up status read of state|active marks "
+TEST_CASE("QuarantineContainmentReconciler: a follow-up status read of status|active marks "
           "the record confirmed",
           "[pg][quarantine][reconciler]") {
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
@@ -1163,7 +1163,7 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_confi
 
     // NOW release the device — racing the eventual mark_endpoint_confirmed
     // call that fires once this status response is polled and parses as
-    // state|active.
+    // status|active.
     store_status_response(rstore, "cmd-2", "agent-1", "status|active");
     end_record(qstore, "agent-1");
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -1683,7 +1683,7 @@ TEST_CASE("QuarantineContainmentReconciler: a session swapped during the status 
     registry.map_session("session-A", "agent-1");
 
     MockDispatch dispatch;
-    auto_respond(dispatch, rstore); // stores the usual response, incl. `state|active` for status
+    auto_respond(dispatch, rstore); // stores the usual response, incl. `status|active` for status
     bool swapped = false;
     dispatch.on_dispatch = [&, respond = dispatch.on_dispatch] {
         respond();

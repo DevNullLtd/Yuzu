@@ -7,10 +7,10 @@
 #include "../command_capability.hpp"
 
 /// @file plugin_action_catalogue_c.hpp
-/// PR1.9 data C: the command-capability catalogue fragment for the 13
+/// PR1.9 data C: the command-capability catalogue fragment for the 12
 /// network/security agent plugins (PR1.10 group C) — network_config,
 /// netprobe, netstat, network_diag, network_actions, discovery,
-/// wifi, wol, http_client, certificates, firewall, quarantine, rdp_control.
+/// wifi, wol, http_client, certificates, firewall, rdp_control.
 /// (sockwho retired into netstat's `attribution` action, #3403 -- was its
 /// own plugin group member here, now a second netstat row below.)
 /// One row per action, grouped by plugin below (each group cites the
