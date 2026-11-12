@@ -1880,8 +1880,10 @@ constexpr const char* kCensusMarkPending =
 //
 // Two statements per census-bearing first delivery, in the OUTER transaction after the event
 // INSERT and before `SAVEPOINT census_upsert`, under their own `SAVEPOINT agent_step`. Ensure
-// creates the agent's row when it is absent (`DO NOTHING` takes no lock on an existing committed
-// row). DECIDE locks that row `FOR UPDATE`, derives the pair-clock mode from the OLD row in one
+// creates the agent's row when it is absent (`DO NOTHING` takes no lock of its own on an existing
+// row, but it waits for another transaction's uncommitted UPDATE of that row, so a delivery queued
+// behind a holder of the agent row can reach `lock_timeout` in Ensure rather than in DECIDE).
+// DECIDE locks that row `FOR UPDATE`, derives the pair-clock mode from the OLD row in one
 // CASE, and writes the clock and the per-agent counters in the same statement; it is the ONLY
 // writer of those columns (a counter written anywhere else could double-count a retry). $1 agent,
 // $2 boot_epoch (0 = unpaired), $3 emit_seq. It RETURNS the mode and the epoch the agent's most
