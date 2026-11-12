@@ -1284,10 +1284,12 @@ label still fails loud.
 
 `Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
 `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
-cannot write `HKLM`) fails instead. The one exception is the Echo bam live case (#6898): only LOCAL SYSTEM may create a
-key under `HKLM\SYSTEM\CurrentControlSet\Services\bam`, so on a runner account that is refused there (error 5) it SKIPs even
-with the flag set, and the exclusion is proven live only where the account may write (a LOCAL SYSTEM host). Any other
-failure of that case still fails the job. The job-level
+cannot write `HKLM`) fails instead. The one exception is the Echo bam live case (#6898): a runner account can be refused
+(error 5) creating its scratch keys under `HKLM\SYSTEM\CurrentControlSet\Services\bam` (measured as an elevated non-SYSTEM
+user: a key directly under `bam` was allowed, `bam\State\UserSettings` was refused; LOCAL SYSTEM may write both), and then
+the case SKIPs even with the flag set. The exclusion is proven live only where the account may write (a LOCAL SYSTEM
+host), so while the Windows runner's account stays refused CI does not run it (#7637; the missing test of the skip
+decision is #7638). Any other failure of that case still fails the job. The job-level
 `YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
 `YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys. The script
 scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node`, `HKCU\Software` and (for the
@@ -1296,13 +1298,13 @@ local dispatcher's `Software\YuzuTest\RegistryPr17Ld_<salt>` keys (`test_registr
 outside the scan.
 Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans and proves both decisions of
 `scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
-other scope: exit 0 with a `::warning`). A probe under one of the two `bam` roots that the runner account is refused
-(only LOCAL SYSTEM may create a key there) is replaced by a check that the script still lists that root, with a
-`::warning`; the three other roots always need a live probe. After it,
+other scope: exit 0 with a `::warning`). A probe under one of the two `bam` roots where the runner account is refused
+is replaced by a check that the script still lists that root, with a `::warning` that also names the runner's identity
+and says the bam live case is expected to skip; the three other roots always need a live probe. After the self-test,
 `Assert this job left no YuzuTest-* registry keys behind` runs
 the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). The
 could-not-list arm has no self-test of its own (accepted residual): a persistent listing failure is caught pre-suite,
-because the self-test's probes go unnamed. It reports and never deletes (a leftover can be a registry link, and a
+because the other-scope self-test arm expects exit 0 and a failed listing makes it exit 1. It reports and never deletes (a leftover can be a registry link, and a
 tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
 removes it.
 
