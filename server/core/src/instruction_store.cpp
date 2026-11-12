@@ -194,7 +194,43 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
 
 // ── Echo rename (upgrade window) ─────────────────────────────────────────────
 
-// The token chain the rename script applies to the builtin Echo definitions' prose, as
+// The archive-tool guards of the retired rename script (its PROTECT list's captured-data
+// and "archive tool: files, commands, package lists, prose" groups), ported as
+// zero-width constraints placed before the bare-word rule. The script masks a protected span and
+// rewrites the rest; the equivalent here is a `tar` that is protected when its left context L
+// AND its right context R both hold, so it is rewritten only when (NOT L) OR (NOT R):
+// `(?:(?<!L)|(?!tar R))` per guard, which Postgres ARE (lookbehind since 9.6) accepts. The word
+// boundary `\b` of the script is `\y` in ARE. Ported (script lines 94, 97-100, 102, 103 and 107):
+// captured data (`tar|123`), archive file names (`.tar.gz`, `x.tar`, `tar.exe`, `modern-tar`),
+// the archive command shapes (`tar -x`, `tar xzf`, `tar --strip..`), a `tar` piped to another
+// tool, and `tar` beside another package in a package list (`tar unzip git`). NOT widened to
+// `\s*\|`: the shipped `tar|snapshot` response line must still become `echo|snapshot`. NOT
+// ported, so an operator edit of a builtin-shaped row using one of these exact shapes IS
+// rewritten: `<tar@debian.org>`, `unzip tar`, `zip tar`, `curl tar`, `--entrypoint tar`,
+// `tar/zstd`, `tar archive`, `tar stream`, `tar) tar`,
+// `.tar.gz tar` at a line end, and the prose sentences of repository files (`sh, cp, tar, ls`,
+// `sh ls cp tar cat`, "Never tar the postgres", "tar preserves", "tar takes SIGPIPE",
+// "tar unpacks", "filesystem-level `tar`", "by `tar`-ing", "and tar takes"). The shipped builtin
+// definitions contain none of them (they pass the chain byte-identical to the seeded text);
+// the carried-forward database that could is the unsupported upgrade path. Quotes are doubled
+// because the chain sits inside single-quoted SQL.
+constexpr const char* kEchoRenameBareTarGuards =
+    "(?!tar\\|\\d)"                                      // captured data
+    "(?!tar\\.(?:gz|xz|zst|bz2|lz|lzma|Z)(?![A-Za-z]))"    // .tar.gz and kin
+    "(?:(?<![\\w}\\)\"'']\\.)|(?!tar(?:[\"''\\s`)\\]]|$)))" // name.tar
+    "(?<!modern-)"
+    "(?!tar\\.exe)"
+    "(?:(?<=[\\w.-])|(?!tar(?:"                           // archive command / pipe-to-tool
+    "\\s+(?:-[A-Za-z]|--(?:strip|exclude|create|extract|list|directory|file|gzip|xz|zstd|"
+    "warning|no-|owner|group|sort|mtime|numeric|use-|transform|wildcards|totals|verbose|"
+    "one-file|format|posix|preserve|same|keep|overwrite|to-stdout|files-from|null|absolute|"
+    "dereference|hard|remove|index|label|checkpoint|blocking|record|sparse|ignore|anchored|"
+    "auto-|bzip2|lzma|lzop|compress|show|backup|suffix|atime|touch|version|help)|"
+    "[xctzvjJ]+f?\\y)|"
+    "\\s*\\|\\s*(?:grep|head|wc|sed|awk|tee|gzip|zstd|xz|sha\\w*)\\y|"
+    "\\s+(?:zip|unzip|git|python3-pip|ca-certificates|gzip)\\y)))";
+
+// The token chain applied to the builtin Echo definitions' prose, as
 // regexp_replace calls over one column expression. Word boundaries are Postgres ARE `\m` / `\M`.
 std::string echo_rename_text_chain(const std::string& col) {
     std::string e = col;
@@ -203,8 +239,10 @@ std::string echo_rename_text_chain(const std::string& col) {
     };
     wrap("Timeline Activity Record \\(TAR\\)", "Echo");
     wrap("\\mTAR\\M", "Echo");
-    wrap("\\mtar_", "echo_");
-    wrap("\\mtar\\M", "echo");
+    // Legacy on-disk `tar_events` objects stay (the script's "legacy on-disk SQLite objects"
+    // guard).
+    wrap("\\mtar_(?!events)", "echo_");
+    wrap(std::string(kEchoRenameBareTarGuards) + "\\mtar\\M", "echo");
     return e;
 }
 
@@ -261,6 +299,29 @@ std::string echo_rename_definitions_sql() {
         "WHERE id LIKE 'crossplatform.tar.%' AND NOT EXISTS ("
         "  SELECT 1 FROM deleted_seed_content t2 WHERE t2.kind = deleted_seed_content.kind "
         "  AND t2.id = replace(deleted_seed_content.id, 'crossplatform.tar.', 'crossplatform.echo.'));";
+    // Fail closed on a collision, after BOTH id updates. The NOT EXISTS guards above leave a legacy
+    //    id in place when an Echo-named definition already exists, while the dependent stores
+    //    (schedules, approvals, policies, workflows) rewrite their references to
+    //    the Echo id unconditionally and would silently re-point at the other definition. The raise
+    //    aborts this migration's transaction, the store does not open, and server startup refuses
+    //    (server.cpp: a store that is not open sets startup_failed_, which the construction of
+    //    every store built after the InstructionStore - ExecutionTracker, ScheduleEngine,
+    //    CommandOutboxStore, ApprovalManager, ResultSetStore, PolicyStore, WorkflowEngine - is
+    //    gated on). Two stores are built BEFORE it and have already committed their own rename
+    //    rewrites when this raises: PluginConfigStore (kill switches, enablement rules) and
+    //    ResponseStore; the runbook in docs/user-manual/upgrading.md ("Definition id collision")
+    //    says so, which is why it forbids returning to the older build. It is part of this one
+    //    migration only: no standing guard on the `crossplatform.tar.` namespace, which is
+    //    unreserved and may legitimately hold an operator-authored id once this has run.
+    sql +=
+        "DO $echo_collision$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM instruction_definitions WHERE id LIKE 'crossplatform.tar.%') "
+        "THEN "
+        "RAISE EXCEPTION 'Echo rename: legacy definition ids remain (collision with an existing "
+        "Echo definition): %', (SELECT string_agg(id, ', ' ORDER BY id) FROM ("
+        "SELECT id FROM instruction_definitions WHERE id LIKE 'crossplatform.tar.%' "
+        "ORDER BY id LIMIT 10) c); "
+        "END IF; END $echo_collision$;";
     return sql;
 }
 

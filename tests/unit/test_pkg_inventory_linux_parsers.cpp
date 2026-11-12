@@ -411,8 +411,9 @@ TEST_CASE("pkg_inventory linux: an absent root is supported with zero rows for b
 
 TEST_CASE("pkg_inventory linux [degraded, SUPPORTED]: a per-item anomaly degrades the row, never the status",
           "[pkg_inventory][linux][degraded]") {
-    // MUTATION: any token on these paths makes a persistent per-item anomaly stall the host's
-    // installed_software cycle via the action table's ConstrainedPolicy::fail.
+    // MUTATION: any token on these paths makes a persistent per-item anomaly constrain the whole
+    // action, so the installed_software collector sends only a status-only section for that
+    // source and never refreshes its rows.
     auto one_row = [](const Walk& w) {
         REQUIRE_FALSE(w.token.has_value());
         REQUIRE(w.rows.size() == 1);

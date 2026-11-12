@@ -255,14 +255,15 @@ TEST_CASE("remote_access_audit execute_list contains a leg that throws under sus
 
 TEST_CASE("virtualization execute_action contains a leg that throws under sustained OOM",
           "[plugin][abi][oom][virtualization]") {
-    for (const char* action : {"host", "wsl"}) {
+    for (const char* action : {"host", "wsl", "runtime_posture"}) {
         yuzu::CommandContext ctx{nullptr};
         reset_stubs();
         bool escaped = false;
         int rc = -1;
         try {
             rc = yuzu::virtualization::execute_action(
-                ctx, action, yuzu::virtualization::Legs{&oom_leg, &oom_leg}, "linux:leg:exception");
+                ctx, action, yuzu::virtualization::Legs{&oom_leg, &oom_leg, &oom_leg},
+                "linux:leg:exception");
         } catch (...) {
             escaped = true;
         }

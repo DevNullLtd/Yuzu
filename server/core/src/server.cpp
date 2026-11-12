@@ -1714,8 +1714,9 @@ public:
                           "server_shutdown, credential_revoked, credential_indeterminate (the "
                           "caller's credential was checked before a step), late_denied or "
                           "definition_changed (a step was refused at send time), a zero-reach cause "
-                          "(containment_unreadable, route_unreadable, os_gate_unreadable, "
-                          "no_agents_reached, quarantined, plugin_not_found, kill_switched_os), "
+                          "(dispatch_denied, containment_unreadable, route_unreadable, "
+                          "os_gate_unreadable, no_agents_reached, quarantined, plugin_not_found, "
+                          "kill_switched_os), "
                           "run_failed (the engine ended the run before any dispatch), "
                           "dispatch_exception (the run threw after its requested audit row; steps "
                           "may have been sent), or none. A run killed with the process never "
@@ -2655,6 +2656,22 @@ public:
                           "Epoch seconds of the last successful catalogue rollup refresh; alert when "
                           "now - this exceeds the rollup cadence (a stuck/failing thread leaves the "
                           "/inventory catalogue silently stale)",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_component_rollup_total",
+                          "Software components rollup (component_rollup, the totals of "
+                          "GET /api/v1/inventory/software/components) refresh outcomes, by outcome "
+                          "(success/error). Keep-last-good on error; both series are seeded at 0.",
+                          "counter");
+        metrics_.describe("yuzu_inventory_component_rollup_duration_seconds",
+                          "Wall-clock of the last components rollup refresh (one GROUP BY over "
+                          "software_components, off the request path, on the catalogue rollup "
+                          "thread)",
+                          "gauge");
+        metrics_.describe("yuzu_inventory_component_rollup_last_success_timestamp",
+                          "Epoch seconds of the last successful components rollup refresh (0 until "
+                          "the first); alert when now - this exceeds twice the rollup cadence (7200 s), "
+                          "guarded by > 0 (a failing refresh leaves the components totals aging or "
+                          "building)",
                           "gauge");
         metrics_.describe("yuzu_software_normalization_pass_total",
                           "Software-title normalisation ticks by outcome (success/error); hourly, "
@@ -6400,9 +6417,9 @@ public:
                         return;
                     if (!gate->should_log(agent_id, quarantine))
                         return;
-                    // Reservation completes the slot even if AuditEvent construction
+                    // Reservation completes that agent's slot even if AuditEvent construction
                     // or audit_store_->log() throws (log() is not noexcept).
-                    detail::EchoCorruptionAuditGate::Reservation res(*gate);
+                    detail::EchoCorruptionAuditGate::Reservation res(*gate, agent_id);
                     AuditEvent ev;
                     ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
@@ -6415,7 +6432,7 @@ public:
                     ev.detail = detail::encode_echo_corruption_detail(total, quarantine);
                     ev.result = "success";
                     if (audit_store_->log(ev))
-                        res.logged(agent_id, quarantine);
+                        res.logged(quarantine);
                     else
                         res.failed();
                 });
@@ -10926,17 +10943,17 @@ public:
     }
 
     /// Decommission an agent for good: fan `delete_agent(agent_id)` across every
-    /// per-agent store this server owns, durably erasing the machine's stored
-    /// rows (ADR-0024 Decision 11 — the GDPR-erasure path; the per-store
-    /// `delete_agent` methods had no production caller before this). Best-effort
-    /// in execution, ACCOUNTABLE in result, and null-tolerant: a store that is
-    /// not configured (e.g. no Postgres reachable, so every per-agent store —
-    /// all born-on-PG — is absent) is skipped, and one store's failure never
-    /// aborts the others — but
-    /// each `delete_agent` now reports its commit status, so a delete that did
-    /// NOT commit is recorded `Failed` (not `Deleted`) and
-    /// `DecommissionResult::ok()` confirms erasure across every configured store.
-    /// A caller relying on this as Art.17 erasure evidence MUST check `ok()`.
+    /// per-agent store this server owns, durably erasing the rows each store deletes
+    /// for the machine (ADR-0024 Decision 11, the GDPR-erasure path; the per-store
+    /// `delete_agent` methods had no production caller before this). The Guardian store keeps
+    /// its event log and DEX observations until retention expiry (see agent_decommission.hpp).
+    /// Best-effort in execution, ACCOUNTABLE in result, and null-tolerant: a store that is not
+    /// configured (e.g. no Postgres reachable, so every per-agent store — all born-on-PG — is
+    /// absent) is skipped, and one store's failure never aborts the others — but each
+    /// `delete_agent` now reports its commit status, so a delete that did NOT commit is recorded
+    /// `Failed` (not `Deleted`) and `DecommissionResult::ok()` confirms erasure, store by store, of
+    /// what each configured store deletes. A caller relying on this as Art.17 erasure evidence MUST
+    /// check `ok()`.
     ///
     /// The cascade is built HERE from the LIVE store pointers on each call
     /// (never a long-lived borrow), so it is inherently safe against the store
@@ -10949,8 +10966,10 @@ public:
     /// PR7.2) — a device-level erasure grant covering the cascade's whole blast
     /// radius — plus audit-before-erase fail-closed (Decision 11). ADDING A STORE
     /// BELOW? Add it to `AgentDecommissionStores`, `agent_decommission.cpp`'s
-    /// registration list, and `kCascadeStoreCount` — the securable no longer
-    /// changes.
+    /// registration list, `kCascadeStoreCount` and this initializer (nothing but
+    /// tests/test_decommission_wiring_lexical.py notices a store registered but never
+    /// wired here: it would be Skipped for every operator decommission); the securable
+    /// no longer changes.
     /// Today's OTHER agent-removal paths (registry session teardown, enrollment
     /// deny/remove, cert revocation) are non-durable-data by design and deliberately
     /// do NOT auto-erase (a revoked-for-compromise agent's forensic rows must
@@ -10965,6 +10984,7 @@ public:
             .app_usage = app_usage_store_.get(),
             .offline_endpoint = offline_endpoint_store_.get(),
             .certificate_inventory = certificate_inventory_store_.get(),
+            .guaranteed_state = guaranteed_state_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
@@ -13913,8 +13933,7 @@ private:
         return yuzu::server::ConfinedDispatchSink{
             [this, &cmd, route_fallback](const std::string& aid) {
                 if (auto cluster = route_fallback->cluster_for(aid))
-                    return registry_.send_via_directory(aid, cmd, *cluster,
-                                                    route_fallback->legacy_wire_for(aid));
+                    return registry_.send_via_directory(aid, cmd, *cluster);
                 return registry_.send_to(aid, cmd);
             },
             [this, &cmd] { return registry_.send_to_all(cmd); },
@@ -14206,7 +14225,8 @@ private:
                                      /*payload=*/{}, /*stagger_seconds=*/0, /*delay_seconds=*/0,
                                      std::string(dispatch_arm_label(arm)), execution_id);
         if (!classified)
-            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id};
+            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id,
+                                                         .denied = classified.error()};
 
         agent_service_.record_send_time(command_id);
         // PR 2 / UP2-4: command_id -> (plugin, execution_id) was recorded BEFORE any RPC, inside
@@ -22536,6 +22556,9 @@ private:
         // local-vs-presence mismatch one route over. MUST run BEFORE
         // register_routes(), same timing contract as the setters above.
         rest_api_v1_->set_all_agent_ids_fn([this] { return registry_.all_ids(); });
+        // The device-table roster (the SAME 30-day read the Software devices tables use) behind
+        // the `hostname` field of the software lookup routes; must precede register_routes.
+        rest_api_v1_->set_hostnames_fn(hw_hostnames_fn);
         // #5342 — POST /api/v1/users/me/password + /api/v1/users/{name}/password.
         // The current-password proof is AuthRoutes' lockout-accounted check
         // (the SAME section POST /login runs — never a second copy); it and the
@@ -22587,9 +22610,13 @@ private:
         // listener thread(s) before it resets the store, so no handler is running when the
         // reference dies (the same ordering the provider's reader relies on). Without an open
         // store the three routes answer 503. MUST run BEFORE register_routes().
+        // #6087: the MCP twins (mcp_tools_dex.cpp) take a copy of the SAME deps through ToolDeps
+        // below, so the two surfaces share one reader, one pair of conditional writes and one
+        // provider; only the audit hook differs per surface and per request.
+        std::optional<DexScorePolicyWriteDeps> dex_score_policy_deps;
         if (dex_score_policy_provider_) {
             auto policy_writes = dex_score_policy_store_writer(*runtime_config_store_);
-            DexScorePolicyWriteDeps policy_deps{
+            dex_score_policy_deps = DexScorePolicyWriteDeps{
                 .read_stored = dex_score_policy_store_reader(*runtime_config_store_),
                 .compare_and_set = std::move(policy_writes.compare_and_set),
                 .compare_and_remove = std::move(policy_writes.compare_and_remove),
@@ -22597,8 +22624,8 @@ private:
                 .audit = {}};
             // AP-3.12: the Scoring tab shares these deps; its setters read per request, so only
             // the REST setter below must precede register_routes.
-            settings_routes_->set_dex_score_policy_writer(policy_deps);
-            rest_api_v1_->set_dex_score_policy_writer(std::move(policy_deps));
+            settings_routes_->set_dex_score_policy_writer(*dex_score_policy_deps);
+            rest_api_v1_->set_dex_score_policy_writer(*dex_score_policy_deps);
             // The suggestions and the pre-save tier-change preview score the Apps model through
             // the production scorer with a substituted policy. Deliberately absent where the
             // signals store is (a runtime-config store without one is a shipped configuration):
@@ -23388,6 +23415,29 @@ private:
                     };
             }
             tool_deps.crypto_access_fn = crypto_access_cb;
+            // #6087: get/set/reset_dex_score_policy. The read closure is the REST GET's
+            // reader; the apply closure is a pure forward of apply_dex_score_policy, the one
+            // audit-first write path REST PUT/DELETE also call, with the per-request audit
+            // hook swapped in. Lifetime is the REST route's: the store reference inside the
+            // deps is released only after the listener threads join (see stop()). Empty when
+            // the deployment has no runtime-config store; the tools then answer an internal
+            // error.
+            if (dex_score_policy_deps) {
+                // The write tools resolve the caller's session once and stamp every domain row
+                // from it, as the REST PUT/DELETE do (audit_as_session_fn, #6065 PR-Q).
+                tool_deps.session_fn = [this](const httplib::Request& req)
+                    -> std::optional<auth::Session> { return auth_routes_->resolve_session(req); };
+                tool_deps.audit_as_session_fn = auth_routes_->audit_as_session_fn();
+                tool_deps.dex_score_policy_read_fn = dex_score_policy_deps->read_stored;
+                tool_deps.dex_score_policy_apply_fn =
+                    [deps = *dex_score_policy_deps](
+                        const DexScorePolicyWriteRequest& rq,
+                        mcp::ToolDeps::DexScorePolicyAuditFn audit) {
+                        auto d = deps;
+                        d.audit = std::move(audit);
+                        return apply_dex_score_policy(rq, d);
+                    };
+            }
             // The registry path carries no session, and the two dashboard-layout tools key the
             // caller's OWN layout on the session username: re-resolve it from the request, the
             // way crypto_access does for the gate (a request that just authenticated resolves;
@@ -24054,8 +24104,7 @@ private:
         const yuzu::server::ConfinedDispatchSink sink{
             [&](const std::string& aid) {
                 if (auto cluster = legacy_route_fallback->cluster_for(aid))
-                    return registry_.send_via_directory(
-                        aid, *classified, *cluster, legacy_route_fallback->legacy_wire_for(aid));
+                    return registry_.send_via_directory(aid, *classified, *cluster);
                 return registry_.send_to(aid, *classified);
             },
             [&] { return registry_.send_to_all(*classified); },

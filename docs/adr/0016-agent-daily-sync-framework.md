@@ -449,7 +449,11 @@ else the `PACKAGER` tag.
 > `uninstall_string`, stay reserved and empty (#5186). A `constrained`
 > enumeration, or a product-property read that fails for any reason other than
 > the product not having the property, fails the action and skips the whole
-> cycle, like `pkg_inventory.packages`. The same product also appears as an
+> cycle, like `pkg_inventory.packages`. (**Superseded 2026-11-09:** a constrained or
+> failed `msi_packages.list_inventory` read is now a status-only section for that
+> source and no longer skips the cycle: the server keeps the stored `msi` rows, shown
+> as unconfirmed, and every other source is still sent; see the Update of 2026-11-09
+> below.) The same product also appears as an
 > `installed_apps` `app`/`windows` row; the two are not de-duplicated.
 
 > **Update (2026-10-29):** `middleware.ibm_mq` is collected as ecosystem `ibm_mq`,
@@ -464,7 +468,10 @@ else the `PACKAGER` tag.
 > it answers again, and the server sees no signal (`skip_reason` stays empty; the
 > agent logs one warn line). The policy exists for a steady-state constraint that
 > is a permission fact, where skipping the cycle would freeze every other source
-> for ever.
+> for ever. (**Superseded 2026-11-09:** `ConstrainedPolicy` and `drop_source` are
+> retired. A constrained `middleware.ibm_mq` answer is a status-only section: the
+> server keeps the source's stored rows, shown as unconfirmed, instead of removing
+> them, and no other source is affected; see the Update of 2026-11-09 below.)
 
 > **Update (2026-11-04):** the `pkg_inventory` Windows legs are collected as three
 > ecosystems, all machine scope: `appx` (kind `app`; the packages registered for
@@ -481,7 +488,12 @@ else the `PACKAGER` tag.
 > per-item shortfall (an unreadable nuspec, an unparsable package name) degrades its
 > own row to an empty version instead of constraining the action. The three values
 > are appended at the tail of the published ecosystem enumeration. The tail
-> `install_location` slot stays reserved and empty.
+> `install_location` slot stays reserved and empty. (**Superseded 2026-11-09:**
+> `ConstrainedPolicy` is retired, so a constrained `packages` or `store_packages`
+> answer no longer skips the cycle: it is a status-only section for that source, the
+> server keeps the source's stored rows, shown as unconfirmed, and no other source is
+> affected; the per-item shortfall rule above is unchanged. See the Update of
+> 2026-11-09 below.)
 
 Mechanics:
 
@@ -941,7 +953,8 @@ v2 canonical hash is unchanged. Slot 14 (`uninstall_string`) stays reserved on b
 operator-tier: machine-scope roots only (ADR-0028), but a root can still name an account's home
 directory, so it is classified like the `list` column above. It is erased on decommission
 (`delete_agent` deletes the rows), and nothing in this change reads it back (no route, tool, page
-or log line carries it). The server stores it as sent after the field step, without minimisation,
+or log line carries it; the first read-back is the 2026-11-09 lookup surface below, which
+re-opens §8 again). The server stores it as sent after the field step, without minimisation,
 so **the agent writer must not send per-user paths**: that precondition is owned by the change
 that starts sending slot 13, which must also test that no profile path is emitted.
 The change ledger (the 2026-11-04 Update, schema v11) keeps a copy for its retention window:
@@ -965,8 +978,9 @@ packages) is `package_manager`, so the same package reads the same with or witho
 ecosystem: `msi` → `msi`, `optional_feature` → `optional_feature`, `python` → `runtime`,
 `ibm_mq` → `middleware`, `snap` and
 `flatpak` → `store`, `brew`, `rpm`, `deb`, `apk`, `pacman` → `package_manager`, `windows`, `macos`,
-`macos_pkgutil` → `installer`, anything else `''`. `component` and `driver` are reserved for the
-component and drivers facets; no source maps to them yet. The table has a compile-time
+`macos_pkgutil` → `installer`, anything else `''`. `driver` is the install type of
+`hardware.drivers_inventory` (the 2026-11-09 Update); `component` is reserved for the component
+facet, and no source maps to it yet. The table has a compile-time
 totality check over `kSoftwareSources`, so a new collector cannot ship without an install type.
 The `pkg_inventory.managers` presence row is stored in `installed_software` today, so it is typed
 `package_manager` like the packages it manages; it is not exempted by name. `install_scope` is
@@ -1110,8 +1124,11 @@ map, and the wire, the KV keys and the heartbeat tags are unchanged.
   within four hours rather than across twenty-four: about 70 `ReportInventory` calls a second per
   million agents at the peak, against about 12 for the uniform spread (six times), and zones
   overlap less than a uniform spread would. Hash-skip is unchanged, so most of those calls carry
-  a hash only; the blob goes out for a changed source, at the 7 to 8 day floor and for an
-  operator-forced sync. The handler takes a per-agent lock and no fleet-wide one, and nothing
+  a hash only; the blob goes out for a changed source, at the 7 to 8 day floor (except
+  `installed_software`, which has no floor: the server's per-section checks heal it) and for an
+  operator-forced sync. A device's first contact sends its installed-software report in full (every
+  section, up to 20,000 rows or 3 MiB per call, further calls 30 s apart), which the mass-enrollment
+  figure below, a hash-only count, does not include. The handler takes a per-agent lock and no fleet-wide one, and nothing
   rate-limits it; these figures are arithmetic from the window length, not measurements, and
   pool sizing against them has not been measured.
 - **Catch-up.** A persisted `next_fire` more than `kMaxTickSeconds` (15 minutes) in the past,
@@ -1274,8 +1291,8 @@ any read surface for the ledger or the components.
 `GET /api/v1/hardware/{id}` and the MCP tool
 `get_hardware_ci` serve the expanded record behind the fail-closed `inventory.device.ci` audit.
 The chassis, board and DIMM serials and the machine-id hash (with its algorithm and source) are
-served. Section rows are served only for the `ok` and `constrained` levels; a section at any other
-level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
+served. Section rows are served only for the `ok` and `constrained` levels, except a section withheld
+for an integrity mismatch (below); a section at any other level shows its reason and no rows. The record and its sections are read in one REPEATABLE READ
 snapshot (`get_device_ci_with_sections`), so the scalars and the rows are the same replace
 generation. A failed read of the sections is a `503` on REST and a retryable error on MCP
 (`retry_after_ms` 5000), with the record withheld and the audit detail `state=sections
@@ -1286,8 +1303,8 @@ nullable): the number of child rows the full replace actually inserted for it, t
 the same transaction and never from the agent. The read side compares it with the rows it reads in the
 same snapshot; if they differ (child rows lost outside the product, for example a partial single-table
 restore or a manual `DELETE`) an `ok` section is served `constrained` and `complete: false` with reason
-`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and the
-rows that were read are still served.
+`server:row_count_mismatch` (appended after any existing reason, so `server_cap:<n>` is kept), and its
+rows are withheld (`rows: []`; #7165, owner ruling 2026-11-09).
 
 The status row also records `content_digest` (the same migration v3, additive and nullable): the
 SHA-256 of a canonical, length-prefixed serialization of the section's rows (section kind, column
@@ -1306,7 +1323,7 @@ alarm on every stored row. (A column change also needs its own ALTER migration; 
 read side recomputes it from the rows it reads in the same snapshot; a difference with an unchanged
 row count (rows edited, or swapped for another sync's, out of band) serves the section `constrained`
 and `complete: false` with reason `server:content_digest_mismatch`, appended after any existing
-reason. The rows that were read are still served, but they are not the values the agent reported. A
+reason. Its rows are withheld (`rows: []`; #7165), because they are not the values the agent reported. A
 lost row is reported by the count token alone, since it changes the digest too. This is an integrity
 check against accident and non-malicious drift, not tamper resistance: anyone able to write the child
 tables can also rewrite the digest column, and the digest covers the rows only, not the section's
@@ -1328,7 +1345,7 @@ holds after migrations 2 and 3: an older server that runs against the migrated d
 there, so the sections it writes are unverified until a v3 server next does a full replace for that
 device.
 
-> **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the `keep_rows_if_present_seen` constrained policy (a constrained answer that lists at least one install keeps its rows; one that lists none skips the device's whole installed-software report for the cycle, retried daily on backoff, and the stored rows stay), not the `drop_source` policy of `runtimes.python`. `hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.
+> **Update (2026-11-03):** `runtimes.dotnet` and `runtimes.jvm` are collected as ecosystems `dotnet` and `jvm` (kind `app`; name `.NET Runtime`/`.NET SDK`/`.NET Framework` or `Java JDK`/`Java JRE`; version from the plugin row; publisher Microsoft or the JVM vendor), on Windows, macOS and Linux, under the `keep_rows_if_present_seen` constrained policy (a constrained answer that lists at least one install keeps its rows; one that lists none skips the device's whole installed-software report for the cycle, retried daily on backoff, and the stored rows stay), not the `drop_source` policy of `runtimes.python`. (**Superseded 2026-11-09:** the constrained policies are retired and a constrained answer is a status-only section that keeps the stored rows, and `hardware.drivers_inventory` **is** now a daily-sync section, kind `driver`; both are set out in the Update of 2026-11-09 below. This sentence once read: "`hardware.drivers_inventory` is an on-demand action and is not a daily-sync source.")
 
 ### 2026-11-04 — `installed_software`: a publisher on every row, and the `via:` origin label
 
@@ -1443,3 +1460,316 @@ build sends no settings to agents.
   a window only at a whole-day interval of 24 hours or more in whole days, apply the IANA zone, honour
   the per-collector switch, and reject any setting it cannot honour, then report the effective version
   it applied. Until the push lands the settings have no effect on any agent.
+
+### 2026-11-09 — the lookup read surface: v3 columns, components, and totals (SAM-17, schema v12)
+
+**Decision.** The first read surface that returns the v3 columns. `GET /api/v1/inventory/software`
+rows gain `hostname`, `last_seen`, `status`, `last_confirmed_at`, `install_type`, `install_scope`,
+`install_location` and `instance_key`, and a new `GET /api/v1/inventory/software/components`
+reads the component store (`software_components`, schema v11) the same way. One call answers
+the lookup question for an application or a component: how many installs, on which devices,
+polled when, in what state.
+
+- **Row status.** `status` is derived from the row's own collection facet (`software_facet_state`
+  for the row's `source`; `component_inventory` for a component) by ONE rule: `disabled` when the
+  facet is switched off, `current` when it last reported a `full` or `delta` section, `unconfirmed`
+  otherwise, including a device with no facet record. The rule is one SQL fragment
+  (`kRowStatusCaseSql`) used by the reads, the status filter, the rollup and the live totals, and
+  its C++ twin is pinned equal to it by a test over every (status, enabled) pair. An unconfirmed
+  row may be stale or missing and is never proof of absence; it is returned by default.
+- **Totals.** `totals` is `{installs, devices, as_of}` (components: `{instances, devices,
+  devices_unconfirmed, as_of}`). `installs` and `instances` count install ROWS everywhere (a
+  device with two architectures counts twice), `devices` distinct devices, so a rollup-served and a
+  live figure agree on one definition. Application totals come from the hourly catalogue rollup
+  (the name-only grain, which gains a `row_count` column) unless a version filter is present, in
+  which case they are ONE live aggregate over the version set (never a sum of per-version distinct
+  counts). Component totals come from a new hourly `component_rollup` (one row per kind and name,
+  refreshed by the existing rollup thread with its own advisory lock and keep-last-good), or are
+  live for a version filter or no kind. Totals are served only to an unfiltered caller for an
+  exact name; ADR-0017 records why a confined caller gets rows and `totals_omitted: "scope"`.
+- **Version range.** `version_min` / `version_max` resolve against the title's distinct versions
+  within the caller's scope (the gate's `VisibleSet` pushed into the read; an unfiltered caller
+  reads the fleet) under the catalogue comparator into a version set, for every caller; a title
+  at the 2000-version read cap in that scope is refused. The set is a predicate only. The distinct
+  versions are read LIVE (`installed_software` for a title, `software_components` for a component,
+  5 s bounded, the name indexes), never from the hourly rollups: a rollup lacks a version first
+  reported since its last refresh, which would drop that version from the set and serve a live,
+  exact-looking zero for software that is installed. The scope is pushed into this read for the
+  same reason the totals are withheld (ADR-0017): a fleet-wide cut would make the refusal a fact
+  about devices the caller cannot see, so a confined caller is answered for a title with 2000
+  versions outside its scope exactly as for an unknown title.
+- **Schema v12.** `catalog_rollup.row_count` (constant default, metadata-only; the migration also
+  sets the catalogue stamp back to `building` so no reader sees a zero row count beside a non-zero
+  device count), the two component rollup tables, and `software_components_name_idx`. The index is a plain `CREATE INDEX` in the ladder transaction:
+  `software_components` is empty in every deployment until an agent emits component rows (the
+  server apply path is live, the producer ships later), so the build holds its lock for no
+  measurable time.
+- **Component rollup ceiling (recorded, not fixed here).** `refresh_component_rollup` is one
+  `GROUP BY kind, name` with a `count(DISTINCT agent_id)` over `software_components`: measured at
+  44-47 s for 8.8M component rows (en_US collation, 4 MB and 64 MB `work_mem` alike), so it meets
+  the flat 60 s statement limit near 11M rows (about 1M devices with 10 components each); past
+  that the first refresh never completes and the kind-and-name totals stay `building`
+  (keep-last-good; rows and live totals are unaffected). Latent today: the table is empty until
+  the component producer ships (SAM-40). A per-(kind, name, agent) pre-aggregate ran the same
+  refresh in 8.2 s and is the recorded upgrade path.
+- **Recorded limits of the lookup surface (recorded, not fixed here).** (1) The live
+  version-set totals and the version-range reads (`installed_software_version_set_totals`,
+  `installed_software_distinct_versions`, `component_versions`) run under the 5 s statement
+  bound with no in-flight bound of their own (`/crypto` has one): about 3 requests per second
+  of 5-second reads can pin a 16-connection pool, which audit and revocation share; the figure
+  is 5 s divided by 16 leases, not measured. On a title above about 5M rows the live read times
+  out every time, so that `503` is deterministic and retrying does not clear it (the rows are
+  still served by paging or export). (2) The range read pushes the caller's whole scope as one
+  array with no `kScopePushdownMaxIds` cut (a cut distinct set cannot be post-filtered without
+  re-leaking the fleet property), so a confined caller with 100k or more devices sends a
+  multi-MB parameter per range request and the same 5 s bound caps it; cost at 100k and 500k
+  ids is unmeasured. (3) Rollup alerting shares the catalogue rollup's pattern: a peer holding
+  the advisory lock makes a replica's refresh a skip that counts as success and stamps the
+  liveness gauge, so replicas whose tick offsets alternate the lock winner, each timing out,
+  keep both `YuzuInventoryComponentRollup*` rules quiet while the totals age; a worker that
+  never started exports no series at all, and a throw in the catalogue leg (none expected, the
+  store returns bool) skips the components leg with no `error` increment. (4) The wide-scope
+  cursor's `skip` reaches `OFFSET` on the unbounded installs page read and a forged value can
+  hold a pool lease to the 30 s statement timeout; this is the pre-existing `read_devices_page`
+  behaviour moved verbatim into `read_scoped_page` (base `software_catalogue_model.cpp:865` and
+  `software_inventory_store.cpp:2268`), not introduced here. (5) A maximum-width CSV export
+  (1024-byte fields in 22 columns, 10,000 rows) can reach about 200 MB per request by cap
+  arithmetic; the measured exports used typical rows. Each is a candidate issue; none changes a
+  served figure.
+- **§8 re-opened for the first read-back of slot 13 and the component path.** `install_location`
+  (and a component's `path` and `anchor_app`) is served by both routes and their CSV exports to
+  every caller the gate admits with `Inventory:Read`; a confined caller sees only the paths of its
+  own rows, and a service-scoped token only those of its service's devices. Classification is
+  unchanged (operator-tier, a machine-scope path that can still name an account's directory, the
+  `list` column's class); retention is unchanged (erased with the device by `delete_agent`, kept
+  lower-cased in `software_changes.identity_key` for 400 days). The server cannot minimise the
+  value at read or store time without breaking the v3 hash agreement, so the control for
+  `install_location` is the agent writer's allowlist: the agent-side blob-v3 writer
+  (`installed_software_v3.cpp`) keeps a location only under a machine root (`kMachineRoots`) and blanks every
+  other path, fail closed, and tests that no profile path is emitted. A component's `path` and
+  `anchor_app` carry NO allowlist yet: the component writer only clamps them
+  (`component_normal_form`), and the SAM-40 producer must apply the same machine-root allowlist
+  with a no-profile-path test before it populates them. This read surface therefore depends on
+  the SAM-15 writer shipping alongside it; until it does, no agent sends slot 13 or component
+  rows and both fields are empty. An agent that does not apply the allowlist (older, forked or
+  hostile) can place a per-user path here; the row is still served as sent, which the manual
+  states beside the field.
+- **Not changed.** The MCP `query_installed_software` rows keep their 14 fields; the twin is a
+  later change (recorded in `docs/api-parity-ledger.md` and as the 2026-11-09 entry of the
+  ADR-1005 exception ledger, revisit by 2026-12-31).
+
+### 2026-11-09 — the agent's blob-v3 writer, and drivers as a daily-sync section (SAM-15)
+
+The agent now writes the sectioned report the server has accepted since the 2026-11-04 Updates, and the
+v2 writer (`installed_software_canonical_blob`, `ConstrainedPolicy`, `accept_partial` and the
+`withheld` adapter status) is deleted. It is a hard cutover: this build's agent and server move
+together, the agent has no v2 path to fall back to, and the server's v2 parser stays only for blobs
+from older agents (it is untouched). The writer is
+`agents/core/src/installed_software_v3.{hpp,cpp}` (pure: records, hashes, planning, serialising) and the
+collector in `sync_source_installed_software.cpp`.
+
+**One section per source.** The facet of a section is the source's `plugin.action`, which is also
+the `source` of every row in it. A source that answered in full is `full` the first time and after
+any `need_full`, then a `delta` against the last acknowledged set, and no section at all while its set
+is unchanged; any other answer is a status-only section (`constrained`, `timeout`, `oversize`,
+`not_collected`) that costs only that source. A status-only section is sent when its status and token
+differ from the ones the server last acknowledged for that source, and not again while they stay the same
+(memory only: a restart, or a reconnect, which rebuilds the collector, costs one resend, which the server's upsert makes harmless), so a host with
+sources its OS cannot collect still sends the report hash alone on a quiet day. The sources run one at a
+time, in the collector's table order, and the daily sync never starts a second detached worker inside a
+plugin (an operator dispatch of the same plugin is not held by this flag): the single-flight slot is per
+plugin, so the three `pkg_inventory` sources (and the three `runtimes` ones) share one (see Bounded
+workers).
+
+**Rows.** A `+` record is the 16 wire slots of the stored form: every field through `clamp_field` (scrub to
+UTF-8, clamp to 1,024 bytes on a codepoint boundary, then strip 0x1F, 0x1E and NUL, the one preparation
+step), a canonical epoch (`0` and rpm's `(none)` are written empty) and release (`(none)` is empty), a
+`install_location` kept only under a machine root, the facet as `source`, and a publisher that is never empty (the
+declared vendor, else `via:<ecosystem>`, applied by the planner to every row it plans and clamped like
+every other field). The planner normalises ONCE and the writer transmits exactly the bytes the planner
+hashed; the stored form is a fixed point of its own normalisation (`machine_install_location` iterates
+its passes to stability), so a row normalised again on either side is the same bytes. Rows are
+sorted and de-duplicated in the server's comparator order (the 15 stored fields in wire order, location
+before `package_id` and `source`). The section hash, the row hash (the server's `instance_key`), the
+`v3:` report hash and the component record, row hash and section hash reproduce the server's recipes
+byte for byte; the golden vectors of `tests/unit/server/test_software_inventory_store.cpp` are pinned in
+`tests/unit/test_installed_software_v3.cpp`. No plugin produces component rows yet (the evidence
+collector is a later change), so the component functions are shipped and pinned, not called.
+
+**The delta rule.** A `delta` is `+` for current rows whose hash is not in the acknowledged set and `-` for
+acknowledged hashes that are no longer current, with `base` the acknowledged section hash and `expect`
+the hash of the current set (emitted on every `delta` `S` record; the server refuses a delta without
+it). A delta that would carry more than 20,000 `+` or `-` records, or more bytes than a section may
+occupy, is sent as a `full` section instead. An acknowledged pair that is not self-consistent (the same
+row hashes under a different section hash) is not trusted: the facet is resent in full.
+
+**State and commit-on-ack.** The acknowledged set of a facet is one KV value,
+`sync.installed_software.<facet>.acked` = `<section hash>\n<concatenated sorted 64-hex row hashes>`,
+written by one `kv_set` (one SQLite statement, so the hash and the set commit together), plus
+`sync.installed_software.<facet>.need_full` (a torn write there costs one extra full section; the
+server's base and `expect` checks are the backstop). A value that is not exactly that shape reads as no
+acknowledged set, so the facet is sent in full. Nothing is written when a collection is made: the
+scheduler's `on_ack` hook commits what the last blob carried, after the server answered, and discards it
+when the RPC failed. A `full` or `delta` section that was acknowledged replaces the facet's set. A status-only
+section that was acknowledged **erases** the facet's set, because the server refuses a delta over any
+facet whose stored status is not `full` or `delta` (it clears a section hash only over `disabled`), so the
+first row-bearing section after any status-only section is always `full`. The held set the agent claims
+in its report hash is the facets it holds a set for, less those it sent status-only in this call, plus
+those it sent `full` or `delta`.
+
+**Acknowledgement and forced sends.** The scheduler matches a nack token that equals the source name or
+starts with `<name>:`. The whole-source token marks every facet `need_full` and makes the next send
+full (`SyncSource::on_force_full`, called before `collect()` in both tick passes whenever the
+scheduler is about to send full: `request_now`, a whole-source nack or the weekly floor (not for this
+source), so a forced blob always carries a full section per facet, and every status-only section again,
+and never a header-only blob, which the server's parser refuses). A never-acknowledged report hash sends
+the blob but does not call it: a facet with no acknowledged set is full by the collector's own rule, so first
+contact is full without it. A per-section token (`installed_software:<facet>`) marks only that
+facet `need_full`; the scheduler does not force the other facets, and it consumes a force that was owed
+(the forced blob was delivered and attributed per section) while leaving the report hash unacknowledged, so
+the retry is the collector's persisted `need_full` for the nacked facets alone: facets already acknowledged
+are not re-sent, and a section deferred by the call caps is sent on the next tick. `SyncSource::wants_blob` is OR-ed into
+the full decision after the hash comparison and is true whenever a collection wrote any section, so a
+status or token change reaches the server although the held-facet hash did not move; on a quiet pass it
+is false and the report is the hash alone.
+
+**No weekly full resend (`SyncSource::no_full_floor`).** The source is exempt from the scheduler's 7-day
+full floor (roadmap R3: no weekly forced full for v3); a force and a whole-source nack still send the
+blob, full for EVERY facet, and a never-acknowledged hash sends it full for every facet the agent holds
+no acknowledged set for. Divergence heals without a floor: the server recomputes each
+section's hash after every apply and refuses a delta over a base that no longer matches, answering
+`installed_software:<facet>`, which the agent resends in full, and a facet with no acknowledged hash is
+always sent in full. The report hash covers only the facets the agent holds, so a facet the server lost is
+named by the next mismatch. A per-source pause knob to restore the weekly full temporarily is not built:
+nothing measures the `need_full` rate yet, and the exemption is one flag on the source.
+
+**First contact larger than a call.** A call carries at most 20,000 `+`, 20,000 `-`, 20,000 `comp` and 3 MiB.
+Status-only sections are written first, then row-bearing sections in table order; one that would cross
+a cap (it fits alone) is **deferred**: not written, not claimed held. `SyncSource::has_more` is then
+true and a clean acknowledgement re-fires the source after `kMinTickSeconds` (30 s) instead of at its next
+slot; the collected rows are reused for `kPassCooldown` (10 minutes), so the follow-up calls do not dispatch
+the plugins again. A source whose rows exceed 20,000, or whose full section exceeds the section budget
+(3 MiB less the header and a status record for each possible section), is `oversize` with token
+`rows=<n>` or `bytes=<n>`: it is intrinsically unshippable and is neither deferred nor split.
+
+**Bounded workers.** Each source runs on a detached worker bounded by its time limit (`installed_apps`,
+`windows_optional_features` and `hardware.drivers_inventory` 120 s, the rest 60 s). The single-flight flag
+and the outstanding-worker count live in one object owned by the agent, not by the source (the source is
+rebuilt on every reconnect while a worker abandoned at its limit may still be inside a plugin). The flag is
+per **plugin**, not per action: a plugin is one object with shared state, so a worker of any of its actions
+that is still inside it means a second thread must not enter it through a sibling action either, and the
+outstanding count is the number of plugins with a worker in flight. Dispatch is strictly sequential, so only
+abandoned workers accumulate, one per plugin: until the two-at-once pairing of the binary-evidence plugin lands
+(see "Not in this change"), the number of workers inside plugins at once is bounded by the distinct plugins in
+the action table (and by the process-wide ceiling of `bounded_wait.hpp`), not by two. The flag is released by a
+guard inside the worker when it physically returns. Every source of a plugin whose worker is still running
+is `timeout` with token `busy` (each facet still reports for itself). That is a status-only section, and a status-only
+acknowledgement erases a facet's acknowledged set, so a healthy sibling of a hung action is sent in full once the
+plugin answers again (an accepted cost). A bounded call that could not start (the outstanding-call ceiling or thread creation)
+is `timeout` with token `rejected`; the ticket inside the never-invoked closure ends the flag (below). **Teardown:** after the worker threads
+are joined and before any plugin `shutdown()` or unload, on both teardown paths of the agent, the agent
+waits `kOrphanDrainGrace` (3 s) for the count to reach zero and otherwise logs and exits with code 3
+(`hard_exit.hpp`), the F3 precedent for a detached worker: a plugin is never shut down under a
+worker still executing it. A plugin that never returns therefore makes the restart a hard exit. The
+sync thread is joined on every reconnect and on shutdown, so it can wait out a source's time limit; the
+shutdown watchdog (20 s) is shorter than 120 s, so a stop that lands inside such a wait ends in that
+watchdog (exit code 4), exactly as an unbounded in-process collection did before this change. A
+reconnect joins the sync thread, and the pass runs its sources in sequence with no stop check between
+them, so a reconnect waits for the SUM of the limits of the plugins that newly stall in that pass (up to
+about 600 s when every one does: three at 120 s and four at 60 s; a plugin already `busy` costs nothing),
+with the agent disconnected meanwhile (no Subscribe stream, no commands). That wait is a recorded limit,
+not fixed here: it needs a plugin hang AND a disconnect inside the same pass, it is bounded by the sum
+above, and a stop check between facets would be a new `SyncSource` hook, so the seam is left as it is.
+On Windows the hard exit precedes the service's stopped report, so
+the Service Control Manager's recovery action restarts the agent after 60 s even on an operator stop
+(three restarts a day at most; systemd and launchd honour an operator stop). The single-flight flag is
+RAII: `CollectorWorkers::admit` returns a ticket that rides in the worker closure and is moved into a
+local at the worker's entry, so the flag ends when the worker returns or throws, and a closure never
+invoked (a Rejected bounded call, or an allocation failing before it) ends it when the closure is
+destroyed; no path clears it by hand.
+
+**Retired policies.** `ConstrainedPolicy`, `accept_partial` and the `withheld` status are removed.
+Every degraded answer is a status-only section: a non-zero return, a truncated capture, a
+`constrained` status row, a typed PARTIAL completeness (the provenance is the token), an answer that
+declared no completeness at all (UNKNOWN is never read as FULL: token `unknown`, counted in the
+heartbeat tag `yuzu.sync.installed_software.completeness_unknown_total`, a per-device heartbeat tag which no server page, API or fleet gauge returns yet; every plugin of the table
+declares `OK`/`FULL` on a clean pass, so this fires only for a plugin that stopped declaring) and an
+`installed_apps` listing with no rows (`no_rows`; never a deleting `full`). The server keeps the facet's rows
+and reads them as unconfirmed (R23) until a `full` section confirms them again. This changes what a
+constrained `runtimes.python` or `middleware.ibm_mq` read does (the rows were removed under v2) and what a
+constrained `runtimes.dotnet`, `runtimes.jvm` or `pkg_inventory.managers` read does (the rows it had seen were
+kept and the rest removed): none of them replace or remove rows now. To retire a facet's rows the writer
+sends `full` with no rows, which only a clean `supported` answer with zero rows produces.
+
+**Row 1.4 (completeness).** `installed_apps.list_inventory` and `windows_optional_features.list` declare
+`OK`/`FULL` on a clean pass (on every OS leg of the first, through the one `emit_inventory` chokepoint) as
+they already declared `CONSTRAINED`/`PARTIAL` on a degraded one. The `inv|` row gains a 14th token,
+`install_location` (the Windows `InstallLocation`, the macOS `.app` path, empty on Linux; a `|` in it is
+written as U+FFFD), which the collector reads as wire slot 13. On Windows a failed read of the agent
+identity's own `HKCU` Uninstall key never degrades the machine-scope collection, and the `WOW6432Node` view is absent
+only on a 32-bit OS.
+
+**No per-user paths (ADR-0016 section 8): slot 13 is an allowlist.** The writer
+(`machine_install_location`, `installed_software_v3.cpp`) canonicalises the collector's value first (quotes and
+padding trimmed; the Win32 `\\?\` and `\\.\` prefixes dropped; `\` and `/` both separators under a drive
+letter, `/` alone on a POSIX path (where `\` is a filename byte, so `x\..` never climbs, and a path that
+leads with `\` and has no drive letter has no recognised shape and is blanked), runs collapsed;
+`.` dropped and `..` resolved, an escape past the root refused; trailing dots and spaces stripped per
+Windows segment; the macOS `/System/Volumes/Data` firmlink folded; compared without regard to case; the
+pass is repeated to a fixed point, at most `kV3MaxCanonicalPasses` (8) times, and a value still moving at
+the cap is blanked) and
+then KEEPS it, in one spelling (the segments' own case is kept), only when it sits under a root of the one table `kMachineRoots`: Windows
+`Program Files`, `Program Files (x86)`, `ProgramData` and `Windows` under any drive letter; macOS
+`/Applications`, `/Library`, `/System/Applications`, `/Developer`; `/opt` and `/usr` (macOS and Linux);
+Linux `/snap`, `/var/lib/flatpak`, `/nix`, `/app`. Everything else is blanked, fail closed: a home under
+any root or volume (`C:\Users`, `/home`, `E:\Profiles\alice`, `/Volumes/<label>/Users`, `/var/home`), a
+UNC path (a home share cannot be told from an application share), a drive-relative `C:Users`, an
+unexpanded `%ProgramFiles%`, an 8.3 name (`PROGRA~1`), an NT object spelling (`\??\`, `\\?\Volume{...}`,
+`GLOBALROOT`), a bare name, a control byte. A location outside the roots (`D:\Apps\Foo`, `/Volumes/Data/Apps`)
+is therefore not reported; the row's name, version, publisher and hash are, and two same-version installs
+of one product in non-allowlisted folders collapse to one row. The decision (2026-11-09) replaced a blacklist
+of home roots, which a probe showed leaking through quoting, padding, doubled separators, dot segments, 8.3
+names, NT prefixes, relocated profile roots and `/Volumes`; a blacklist on installer-authored text is
+fail-open, an allowlist is not. The blanking is part of the stored form, so it also keeps one app installed
+under two accounts one row, and a kept location is written in one spelling, so quoting or separator variants
+of one folder are one row too. The rule is lexical: a kept path is not checked below its root, nor for links or
+junctions, and a path under a machine root is accepted as machine-scope whatever it names (`/opt/users/alice/app`
+is kept; so is a POSIX-shaped value that carries a literal `\` after a machine root, such as `/opt/x\..\..\Users\a`: it is the installer's own text, `\` is a filename byte on that shape and does not climb, and only a Windows host would read it as a rooted path). The mount-point redaction above (`mount_entry_is_personal`) stays a personal-roots
+rule (it redacts, it does not select); a shared canonical form for both is a follow-up. Customer-configurable
+extra roots are a follow-up. `tests/unit/test_installed_software_v3.cpp` pins every probed spelling and the
+kept machine paths through both `v3_record` and `plan_section`.
+
+**Drivers are a daily-sync section.** This reverses the 2026-11-03 statement that
+`hardware.drivers_inventory` is not a daily-sync source. It is the eleventh and last row of the collector's
+table: kind `driver`; ecosystem `windows` on the WMI leg (publisher the driver provider, else the signer;
+version, date and signature state from the row; class, INF and hardware id are not carried) and
+`kernel_module` on the Linux leg. The Linux provider is the fixed literal `kernel`, a label for the
+source rather than a vendor, so it is not carried and a module is `via:kernel_module`; macOS answers
+`unsupported` and is `not_collected`. The server adds `driver` to the kind vocabulary (the catalogue
+table, the REST and MCP filters), `kernel_module` to the ecosystem table (family `linux`), and the source to the
+source and install-type tables (`driver`). Drivers get no CPE treatment: `is_os_native` routes the kind and the ecosystem to
+the lane that identifies but does not assess.
+
+**State size.** An acknowledged value is at most 64 + 20,000 x 64 hex characters (about 1.3 MB) per facet and
+about 14 MB for eleven facets in the worst case; typical hosts hold 100 to 300 KB. A more compact form is a
+later change if a measurement asks for it.
+
+**Not in this change.** The component facet (no plugin produces it; its writer clamps `path` and `anchor_app` but
+applies no machine-root allowlist to them, so SAM-40 must canonicalise each component once, apply the allowlist
+there and pin planner-vs-wire equality for component sections as the installed-software tests do), the settings
+push of the 2026-11-05 Update, the binary-evidence plugin and its two-at-once pairing, the
+`software_evidence.list_inventory` source (no such plugin exists; it is deferred with the component
+facet), the `disabled` status (nothing in the agent turns a facet off yet), and a per-source off switch: drivers
+can be stopped only by the `hardware` plugin's kill switch, and the collection-settings document
+(`collection_settings_resolve.hpp`, six plugin keys, a missing key is a 400) does not carry a `hardware` key,
+because adding one changes the PUT contract for every existing client and belongs with the settings push.
+Two recorded limits of the writer: component records are still normalised inside `serialise_section`
+(idempotent, and unreachable until a producer exists; the component change plans them pre-normalised and
+drops that call), and the agent tests' server oracle is a test-local copy of the server recipe (the agent
+tests cannot link the store), so the server's golden vectors stay the cross-pin and both change together.
+
+## Routed-concern invariants
+
+Moved verbatim from the `Agent daily-sync framework` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Agent daily-sync framework + installed-software inventory (ADR-0016) — agent pushes per-source state daily over `ReportInventory` (hash-skip); sources: #1 `installed_software` (blob v3, a section per source: `installed_apps.list_inventory` — `list` rows are never hashed; `pkg_inventory.*`, `windows_optional_features.list`, `msi_packages.list_inventory`, `runtimes.*`, `middleware.ibm_mq`, `hardware.drivers_inventory`), #2 `app_perf`, #3 `device_ci` (serial/UUID/MAC = GDPR personal data → behavioural-PII tier). CRITICAL: (1) `inventory_state.last_seen`/`first_seen` = SERVER receipt time, never agent `collected_at` (#1685); (2) a new sync source is a new `plugin_data` map KEY, NOT a proto field (no `agent_pb`/`gateway_pb` regen); (3) Windows registry STRING reads use `Reg*W` via `win_str.hpp`, never `Reg*A` (#1662/#1682); (4) the v3 section hash is hashed byte-for-byte on agent (`agents/core/src/installed_software_v3.cpp`, the only writer) + server (`software_inventory_store.cpp`): 16 slots, slot 14 (uninstall_string) RESERVED (#5186), slot 13 (install_location) an agent-side allowlist (§8: kept under a machine root, else blanked), source = facet, publisher never empty — a one-sided change breaks hash agreement for good; the writer follows the `v3:` held-facet rule and commits on ack (a status-only ack ERASES the facet's acked set); a degraded answer is a status-only section, never rows; collector workers drain before plugin shutdown.

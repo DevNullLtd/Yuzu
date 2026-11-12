@@ -19,9 +19,11 @@
  * scope expansion that PR 3 wires into /push.
  */
 
+#include "agent_decommission.hpp"
 #include "auth_routes.hpp"
 #include "baseline_store.hpp"
 #include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
+#include "dispatch_denial.hpp"    // #7114: the chokepoint refusal the live stub can return
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
@@ -149,6 +151,10 @@ struct RestGsHarness {
     // response row. live_sent toggles the offline path.
     std::unique_ptr<ResponseStore> resp_store;
     int live_sent{1};
+    /// #7114: when set, the dispatch stub answers as the chokepoint does for a refused pair (sent 0,
+    /// the denial on the outcome); `live_dispatches` counts the dispatches the route made.
+    std::optional<yuzu::server::detail::DispatchDenial> live_denied;
+    int live_dispatches{0};
     std::string last_live_plugin, last_live_action;
     /// #1788: the confinement set the /live handler derived and threaded into
     /// dispatch. The per-device scoped_perm_fn gate remains this route's
@@ -247,6 +253,11 @@ struct RestGsHarness {
     // the shared #1647 helper catches it (the throw arm was previously silent) and
     // still fails closed with Sec-Audit-Failed rather than letting it escape.
     bool audit_throws{false};
+
+    // Runs inside every audit write with its result: the window in which production lets a
+    // grant, an elevation or a session move between the route's first decision and its dispatch
+    // (#7110).
+    std::function<void(const std::string& result)> on_audit;
 
     // When false, the live deps (response_store + command_dispatch_fn) are left
     // unwired so a test can prove /live → 503 when the substrate is unavailable.
@@ -456,9 +467,12 @@ struct RestGsHarness {
                    const std::unordered_map<std::string, std::string>&, const std::string&,
                    const yuzu::server::DispatchCaller& caller)
             -> yuzu::server::ConfinedDispatchOutcome {
+            ++live_dispatches;
             last_live_plugin = plugin;
             last_live_action = action;
             last_live_exec_visible = caller.exec_visible;
+            if (live_denied)
+                return {.command_id = plugin + "-live", .denied = live_denied};
             // Model what the production seam does to the Ids arm rather than
             // ignoring the set the route just derived — otherwise this fake
             // reports a successful dispatch whatever confinement decided, which
@@ -579,6 +593,8 @@ struct RestGsHarness {
             if (audit_throws)
                 throw std::runtime_error("audit store unavailable (test)");
             audit_log.push_back({action, result, target_type, target_id, detail});
+            if (on_audit)
+                on_audit(result);
             return audit_succeeds;
         };
 
@@ -3669,6 +3685,14 @@ TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.last_live_plugin.empty()); // never dispatched
+    // The metric label is the closed set: an unresolved kind is counted as `unknown`, never as
+    // the caller's own text (one series per distinct string a caller sends).
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "unknown"}, {"outcome", "400"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "bogus"}, {"outcome", "400"}})
+              .value() == 0.0);
 }
 
 TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch",
@@ -4504,6 +4528,114 @@ TEST_CASE("REST dex/devices/{id}/live: Execute denied but Read allowed → 403, 
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(h.last_live_plugin.empty()); // the Execute gate denied before any dispatch
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a scoped gate or the caller withdrawn inside the requested-row "
+          "write dispatches nothing; 403 / failure row (#7110)",
+          "[pg][rest][dex][device][live][scope][7110]") {
+    struct Withdrawal {
+        const char* name;
+        std::function<void(RestGsHarness&)> mutate; // runs INSIDE the `requested` audit write
+        std::optional<int> status; // nullopt: this harness's auth_fn writes none (production's 401)
+        const char* detail;
+    };
+    const std::vector<Withdrawal> withdrawals = {
+        {"Execution:Execute withdrawn", [](RestGsHarness& h) { h.deny_scoped_op = "Execute"; }, 403,
+         "permission_revoked"},
+        {"GuaranteedState:Read withdrawn (every scoped gate refuses)",
+         [](RestGsHarness& h) { h.grant_perms = false; }, 403, "permission_revoked"},
+        {"the session no longer resolves", [](RestGsHarness& h) { h.session_user.clear(); },
+         std::nullopt, "caller_unresolved"},
+    };
+    for (const auto& w : withdrawals) {
+        DYNAMIC_SECTION(w.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            RestGsHarness h(true, true, true, true, &pool);
+            h.on_audit = [&](const std::string& result) {
+                if (result == "requested")
+                    w.mutate(h);
+            };
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            if (w.status)
+                CHECK(res->status == *w.status);
+            CHECK(h.last_live_plugin.empty()); // nothing dispatched
+            REQUIRE(h.audit_log.size() == 2);
+            CHECK(h.audit_log[0].result == "requested");
+            CHECK(h.audit_log[1].action == "device.live.uptime");
+            CHECK(h.audit_log[1].result == "failure");
+            CHECK(h.audit_log[1].target_id == "WS-1");
+            CHECK(h.audit_log[1].detail.find(w.detail) == 0);
+        }
+    }
+}
+
+// Kills: reverting the recheck's `fail` lambda to a bare audit_fn call. The failure row is the
+// only evidence the probe was NOT sent (the success path writes no outcome row), so its loss
+// must be on the answer.
+TEST_CASE("REST dex/devices/{id}/live: a lost failure row after a recheck refusal is flagged "
+          "Sec-Audit-Failed; the 403 and the no-dispatch hold (#7110)",
+          "[pg][rest][dex][device][live][scope][7110]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.deny_scoped_op = "Execute"; // withdrawn INSIDE the row write
+        if (result == "failure")
+            h.audit_succeeds = false; // the outcome row alone is lost
+    };
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_live_plugin.empty());
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].result == "failure");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a chokepoint refusal is a dispatch_denied answer, never a "
+          "retryable 'device offline' (#7114)",
+          "[pg][rest][dex][device][live][7114]") {
+    struct Case {
+        const char* name;
+        yuzu::server::detail::DispatchDenialReason reason;
+        int status;
+        const char* token;
+    };
+    using R = yuzu::server::detail::DispatchDenialReason;
+    // The pair comes from the server's own kind table: a permission-class refusal is the caller's
+    // 403, an Unclassified one is a server catalogue fault (500), unlike the 400 a caller-named
+    // pair would get.
+    const Case cases[] = {
+        {"approval_required is a 403", R::ApprovalRequired, 403, "approval_required"},
+        {"forbidden is a 403", R::Forbidden, 403, "forbidden"},
+        {"unclassified is a 500 (server-named pair)", R::Unclassified, 500, "unclassified"},
+    };
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            RestGsHarness h(true, true, true, true, &pool);
+            h.live_denied = yuzu::server::detail::DispatchDenial{c.reason, "Inventory",
+                                                                 yuzu::server::authz::Operation::Read};
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            CHECK(res->status == c.status);
+            const auto j = nlohmann::json::parse(res->body);
+            CHECK(j["error"]["message"].get<std::string>() ==
+                  std::string("dispatch denied: reason=") + c.token);
+            CHECK(res->body.find("offline") == std::string::npos);
+            CHECK(h.live_dispatches == 1); // refused once, never retried or re-sent
+            REQUIRE(h.audit_log.size() == 2);
+            CHECK(h.audit_log[0].result == "requested");
+            CHECK(h.audit_log[1].action == "device.live.uptime");
+            CHECK(h.audit_log[1].result == "failure");
+            CHECK(h.audit_log[1].target_id == "WS-1");
+            CHECK(h.audit_log[1].detail.find(std::string("dispatch_denied reason=") + c.token) == 0);
+        }
+    }
 }
 
 TEST_CASE("REST dex/devices/{id}/live: live substrate unavailable → 503",
@@ -6777,4 +6909,115 @@ TEST_CASE("REST gs.rules: a store fault on delete answers 404 but is audited as 
     CHECK(del->status == 404); // documented: any delete failure answers 404
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].result == "failure");
+}
+
+// -- #5675: a decommission erases the census, and every census read agrees afterwards --
+//
+// The census is read by the fleet rollup, the per-device rollup, the per-device guard list and (for
+// an agent that registers again under the same id) the next projection. Each of those is RE-READ
+// after the cascade ran: asserting only the cascade outcome would pass with an empty-bodied
+// `delete_agent`.
+TEST_CASE("REST gs.status: a decommission erases the device's census and pending evidence, and "
+          "a re-registered device starts clean (#5675)",
+          "[pg][rest][guaranteed_state][decommission]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    h.seed_rule("r2", "rule-2");
+    h.seed_rule("r3", "rule-3");
+    install_fail_marked_trigger(h);
+
+    // WS-1: errored on r1 and r2; a later r1 verdict the trigger refuses (pending evidence on a
+    // represented pair); a first r3 verdict the trigger refuses (pending evidence, no census row).
+    // WS-2: errored on r1 only, and it stays untouched.
+    h.seed_status("a1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:01:00Z");
+    h.seed_status("a2", "WS-1", "r2", "guard.unhealthy", "2026-06-20T10:01:00Z");
+    h.seed_status("a3", "WS-2", "r1", "guard.unhealthy", "2026-06-20T10:01:00Z");
+    h.seed_status("p1", "WS-1", "r1", "guard.unhealthy", kFailMarkedTs);
+    h.seed_status("p2", "WS-1", "r3", "guard.compliant", kFailMarkedTs);
+
+    const auto get = [&](const std::string& path, bool with_headers) {
+        auto res = with_headers ? h.sink.Get(path, h.status_route_headers()) : h.sink.Get(path);
+        REQUIRE(res);
+        INFO(res->body);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    };
+    const auto fleet = [&] {
+        return get("/api/v1/guaranteed-state/status", true);
+    };
+    const auto device = [&](const char* id) {
+        return get(std::string("/api/v1/guaranteed-state/status/") + id, false);
+    };
+    const auto device_guards = [&](const char* id) {
+        return get(std::string("/api/v1/guaranteed-state/agents/") + id + "/rules", false);
+    };
+
+    // Before: the state the cascade has to remove.
+    {
+        const auto f = fleet();
+        CHECK(f["errored_rules"].get<int>() == 2);   // r1 and r2
+        CHECK(f["uncertain_rules"].get<int>() == 1); // r1, through WS-1's pending evidence
+        const auto d = device("WS-1");
+        CHECK(d["total_rules"].get<int>() == 2);
+        CHECK(d["errored_rules"].get<int>() == 2);
+        CHECK(d["uncertain_rules"].get<int>() == 1);
+        const auto g = device_guards("WS-1");
+        CHECK(g["unrepresented_pending_guards"].get<int>() == 1);
+        CHECK(string_array(g["unrepresented_pending_rule_ids"]) == std::vector<std::string>{"r3"});
+        REQUIRE(h.store->pending_projection_count_checked().has_value());
+        CHECK(*h.store->pending_projection_count_checked() == 2);
+    }
+
+    // Decommission through the real cascade, so the registration path (store name, deleter) runs.
+    AgentDecommission cascade{AgentDecommissionStores{.guaranteed_state = h.store.get()}};
+    const DecommissionResult result = cascade.decommission("WS-1");
+    CHECK(result.ok());
+    CHECK(result.deleted == 1);
+    const auto line = std::find_if(result.stores.begin(), result.stores.end(),
+                                   [](const auto& s) { return s.store == "guaranteed_state"; });
+    REQUIRE(line != result.stores.end());
+    CHECK(line->outcome == DecommissionOutcome::Deleted);
+
+    // After: every read agrees that WS-1 is gone and WS-2 is untouched.
+    {
+        const auto f = fleet();
+        CHECK(f["errored_rules"].get<int>() == 1); // WS-2's r1 only
+        CHECK(f["uncertain_rules"].get<int>() == 0);
+        const auto d = device("WS-1");
+        CHECK(d["total_rules"].get<int>() == 0);
+        CHECK(d["errored_rules"].get<int>() == 0);
+        CHECK(d["uncertain_rules"].get<int>() == 0);
+        const auto g = device_guards("WS-1");
+        CHECK(g["guards"].empty());
+        CHECK(g["unrepresented_pending_guards"].get<int>() == 0);
+        CHECK(g["unrepresented_pending_rule_ids"].empty());
+        CHECK(device("WS-2")["errored_rules"].get<int>() == 1);
+        const auto rows = h.store->agent_rule_statuses_for_agent("WS-1");
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+        const auto other = h.store->agent_rule_statuses_for_agent("WS-2");
+        REQUIRE(other.has_value());
+        CHECK(other->size() == 1);
+        REQUIRE(h.store->pending_projection_count_checked().has_value());
+        CHECK(*h.store->pending_projection_count_checked() == 0);
+    }
+
+    // Re-registration under the same id: a verdict that is older than the retired evidence's
+    // ordering key creates a clean row, not one folded together with the erased evidence.
+    h.seed_status("n1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:30Z");
+    {
+        const auto f = fleet();
+        CHECK(f["errored_rules"].get<int>() == 1); // still only WS-2's r1
+        CHECK(f["uncertain_rules"].get<int>() == 0);
+        const auto d = device("WS-1");
+        CHECK(d["total_rules"].get<int>() == 1);
+        CHECK(d["errored_rules"].get<int>() == 0);
+        CHECK(d["uncertain_rules"].get<int>() == 0);
+        const auto g = device_guards("WS-1");
+        REQUIRE(g["guards"].size() == 1);
+        CHECK(g["guards"][0]["state"].get<std::string>() == "compliant");
+        CHECK_FALSE(g["guards"][0]["order_uncertain"].get<bool>());
+        CHECK_FALSE(g["guards"][0]["projection_pending"].get<bool>());
+        CHECK(g["unrepresented_pending_guards"].get<int>() == 0);
+    }
 }

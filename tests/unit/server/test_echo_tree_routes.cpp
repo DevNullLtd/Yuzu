@@ -14,6 +14,7 @@
 #include "authz_model.hpp"
 #include "secure_random.hpp"
 #include "echo_tree_routes.hpp"
+#include "openapi_spec_access.hpp"
 #include "source_scan.hpp"
 #include "test_route_sink.hpp"
 
@@ -1513,7 +1514,7 @@ TEST_CASE("echo routes: frames that together pass a payload cap take the over-ca
     }
 }
 
-TEST_CASE("echo routes: capture-source cards never relabel the old live count",
+TEST_CASE("echo routes: capture-source cards read the row count from <src>_rows only",
           "[echo][routes][capture-sources]") {
     SECTION("<src>_rows alone") {
         EchoHarness h;
@@ -1524,14 +1525,13 @@ TEST_CASE("echo routes: capture-source cards never relabel the old live count",
         CHECK(res->body.find("$Process_Hourly") != std::string::npos);
         CHECK(res->body.find("upgrade the agent") == std::string::npos);
     }
-    SECTION("<src>_live_rows alone is a dash and one upgrade note") {
+    SECTION("<src>_live_rows alone is not read: a dash") {
         EchoHarness h;
         h.status_output = "config|process_enabled|true\nconfig|process_live_rows|5678\n";
         auto res = h.run_capture_sources();
         REQUIRE(res);
         CHECK(res->body.find("5678") == std::string::npos);
-        CHECK(res->body.find("This device runs an agent without the roll-up tables; upgrade the agent") !=
-              std::string::npos);
+        CHECK(res->body.find("without the roll-up tables") == std::string::npos);
         CHECK(res->body.find("&mdash;") != std::string::npos);
     }
     SECTION("neither key: a dash, not zero") {
@@ -1833,6 +1833,49 @@ TEST_CASE("echo_retention_paused_json: sorts value-error first, then oldest-paus
     CHECK(rows[0]["value_error"] == true);
     CHECK(rows[1]["agent_id"] == "dev-old"); // then oldest paused_at first
     CHECK(rows[2]["agent_id"] == "dev-new");
+}
+
+// The REST and MCP twins both serialise through this builder: the row count is the hourly
+// roll-up count under `hourly_rows`, and no `live_rows` key is emitted.
+TEST_CASE("echo_retention_paused_json: rows carry hourly_rows and no live_rows",
+          "[echo][tree][model]") {
+    EchoRetentionPausedScan scan;
+    EchoPausedSourceRow known;
+    known.agent_id = "dev-a";
+    known.agent_display = "dev-a";
+    known.source = "process";
+    known.hourly_rows = 42;
+    EchoPausedSourceRow unknown;
+    unknown.agent_id = "dev-b";
+    unknown.agent_display = "dev-b";
+    unknown.source = "tcp";
+    scan.rows = {known, unknown};
+
+    auto parsed = nlohmann::json::parse(echo_retention_paused_json(scan), nullptr, false);
+    REQUIRE_FALSE(parsed.is_discarded());
+    const auto& rows = parsed["rows"];
+    REQUIRE(rows.size() == 2);
+    for (const auto& r : rows) {
+        CHECK(r.contains("hourly_rows"));
+        CHECK_FALSE(r.contains("live_rows"));
+    }
+    // Both rows share paused_at 0 and no value error, so the order falls to agent_display.
+    CHECK(rows[0]["agent_id"] == "dev-a");
+    CHECK(rows[0]["hourly_rows"] == 42);
+    CHECK(rows[1]["hourly_rows"] == -1);
+}
+
+// The OpenAPI row schema is the machine-readable twin of the builder above.
+TEST_CASE("OpenAPI EchoRetentionPausedRow names hourly_rows and not live_rows",
+          "[echo][tree][openapi]") {
+    const auto spec = nlohmann::json::parse(openapi_spec_json(), nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& row = spec.at("components").at("schemas").at("EchoRetentionPausedRow");
+    CHECK(row.at("properties").contains("hourly_rows"));
+    CHECK_FALSE(row.at("properties").contains("live_rows"));
+    const auto required = row.at("required").dump();
+    CHECK(required.find("\"hourly_rows\"") != std::string::npos);
+    CHECK(required.find("live_rows") == std::string::npos);
 }
 
 // #4644: `node` is ONE non-negative base-10 integer. `stoul` accepted "-1" (wrapping to

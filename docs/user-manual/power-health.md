@@ -193,3 +193,9 @@ anywhere in this plugin's docs, changelog, or capability declaration, and must
 not be until a capture lands: the Windows run found a state no fixture had
 thought to cover, so the macOS leg's fixtures are not evidence that its
 classification is complete either.
+
+## Routed-concern invariants
+
+Moved verbatim from the `power_health set_power_plan` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+**power_health `set_power_plan`** — the plugin surface's only destructive power action (`PowerManagement` securable, admin-or-approval). Two things a reader must not mistake for gaps: `ScheduleRunner` deliberately retains approval-gated scope/broadcast fan-out (access-control table, D3), so an APPROVED fleet-wide scheduled switch IS permitted by design and the gate must never move into `dispatch_confined`; and the row is Destructive **and Reversible** — it captures and emits `previous_guid` so the change can be undone — which is the first such row in the catalogue and is allowlisted by name in `test_capability_catalogue.cpp`, so a NEW Destructive+Reversible row still fails loudly and has to be justified there.
