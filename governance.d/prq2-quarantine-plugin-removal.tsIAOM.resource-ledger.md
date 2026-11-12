@@ -28,15 +28,15 @@ RAII owner, and one RAII in-flight guard. Each is listed below.
 
 | Resource | Type | Owner | Notes |
 |---|---|---|---|
-| `QuarantineRecord` (+ `release_requested_at`, `endpoint_ttl_expires`, `device_release_owed_at`) | struct of `std::string`/`int64_t` | caller stack frames | Read through one column list (`kRecordCols`) so the `releasing` status is derived in one place. |
-| `ContainmentReply`, `ContainmentReapplyResult`, `ContainmentReapplyError` | structs / `std::expected` | `redispatch_stored_containment` and the reconciler | Parsed once per reply; `ttl_expires` and `probe_configured` are plain fields. |
-| Reconciler `AgentState` map (`agent_id` -> state: kind, pending, session, record id, owed-release flags, timestamps) | `std::unordered_map` | the reconciler, tick-thread only | Entries are erased when an agent has no record and nothing owed; the heartbeat fast path reads only `unconfirmed_cache_`, under the existing `mu_`. `reconcile_one` works on a plain copy of its entry taken under `mu_` when it claims the entry, so a reply is honoured only for the record and session it was sent under and a re-quarantined or reconnected device is never confirmed from an older reply. |
+| `QuarantineRecord` (+ `release_requested_at`, `device_release_owed_at`) | struct of `std::string`/`int64_t` | caller stack frames | Read through one column list (`kRecordCols`) so the `releasing` status is derived in one place. |
+| `ContainmentReply`, `ContainmentReapplyResult`, `ContainmentReapplyError` | structs / `std::expected` | `redispatch_stored_containment` and the reconciler | Parsed once per reply; `probe_configured` and `allow_set_unchanged` are plain fields. |
+| Reconciler `AgentState` map (`agent_id` -> state: kind, pending, session, record id, owed-release flags, the allow-set report flag, timestamps) | `std::unordered_map` | the reconciler; read and written by the tick thread and by heartbeat callbacks, every access under `mu_` | Entries are erased when an agent has no record and nothing owed; the heartbeat fast path reads only `unconfirmed_cache_`, under the existing `mu_`. `reconcile_one` works on a plain copy of its entry taken under `mu_` when it claims the entry, so a reply is honoured only for the record and session it was sent under and a re-quarantined or reconnected device is never confirmed from an older reply. |
 | Gauges `yuzu_server_quarantine_release_pending{reachability}`, `yuzu_server_quarantine_forced_release_owed{reachability}` | `yuzu::Gauge` entries in the existing metrics registry | `server.cpp` (seeded at boot), the reconciler (set each tick) | Two fixed label values each, pre-seeded to 0. |
 
 ## Table 3 — threads and callbacks
 
 No thread is created or destroyed. The `std::function` callbacks the reconciler is handed (`Deps`:
 dispatch, record reads and writes, audit, metrics, the millisecond overrides used by tests) are
-stack- or server-lifetime-scoped and are invoked only from the reconciler's tick thread; the REST
+stack- or server-lifetime-scoped and are invoked from the reconciler's tick thread and from heartbeat callbacks (`notify_agent_heartbeat`); the REST
 `DELETE` handler runs on the httplib pool and calls the same dispatch function synchronously inside
 its bounded poll. Nothing is stored beyond the call that received it.

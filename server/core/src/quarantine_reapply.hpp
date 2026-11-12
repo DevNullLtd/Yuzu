@@ -64,10 +64,15 @@
 ///
 /// WHAT "CONFIRMED" MEANS: the device reports its rules in force and
 /// enforcing (`status|active`, or `status|active_unproven` when no probe
-/// target is stored). It is NOT a reachability proof, and the device's
-/// allow-list is not compared with the stored whitelist: a
+/// target is stored). It is NOT a reachability proof, and the server does not
+/// compare the device's allow-list with the stored whitelist: a
 /// `firewall.quarantine_allow` sent outside the quarantine routes changes the
-/// device and not the record.
+/// device and not the record. The one difference the device itself reports is
+/// `kAllowSetUnchangedNote` on a `firewall.quarantine` reply: the device was
+/// already contained under other operator exceptions and kept them. The reconciler
+/// does not confirm a record that has never been confirmed on that note (it is left
+/// unconfirmed, audited and alerted); it cannot make the device take the new
+/// whitelist, which needs a release and a new quarantine.
 
 #include <cstddef>
 #include <cstdint>
@@ -117,17 +122,24 @@ inline constexpr std::size_t kQuarantineWhitelistMaxLen = 512;
 [[nodiscard]] std::optional<std::unordered_map<std::string, std::string>>
 build_quarantine_reapply_params(std::string_view stored_whitelist);
 
+/// The one row (whole line, exact) the device adds to a `firewall.quarantine` reply when the
+/// device was already contained and the request's operator exceptions differ, as a set, from the
+/// ones in force: the device kept its stored allow set. The device makes the comparison; the
+/// server never parses the allow rows.
+inline constexpr std::string_view kAllowSetUnchangedNote{
+    "note|allow_set_unchanged_use_quarantine_allow=1"};
+
 /// What a `firewall.quarantine_status` reply (or a `firewall.release` reply) says about
 /// the device's containment. `active_unproven` is the plugin's "rules in force and
 /// enforcing, but no completed reachability proof".
 enum class QuarantineEndpointState { active, active_unproven, inactive, busy, unconfirmed };
 
-/// A parsed reply: the state, the device time limit it carried (epoch seconds, 0 when
-/// none), and whether a probe target is configured on the device's record.
+/// A parsed reply: the state, whether a probe target is configured on the device's record,
+/// and whether the device said it kept an earlier allow set (see `kAllowSetUnchangedNote`).
 struct ContainmentReply {
     QuarantineEndpointState state{QuarantineEndpointState::unconfirmed};
-    std::int64_t ttl_expires{0};
     bool probe_configured{false};
+    bool allow_set_unchanged{false}; ///< the exact `kAllowSetUnchangedNote` row was present
     bool status_seen{false}; ///< a `status|` line was present (even a refusal): the device answered
 };
 
@@ -154,8 +166,8 @@ struct ContainmentReply {
 /// active_unproven / inactive / busy; any other token, every refusal
 /// (`status|refused|...`, the privilege refusal included), a partial or degraded
 /// status, and a reply with no status line at all is `unconfirmed` — never silently
-/// treated as `active`. The first `note|ttl_expires=<digits>` row sets `ttl_expires`
-/// (anything else reads as 0); any `note|probe_target=` row sets `probe_configured`.
+/// treated as `active`. Any `note|probe_target=` row sets `probe_configured`; the exact line
+/// `kAllowSetUnchangedNote` sets `allow_set_unchanged`.
 [[nodiscard]] ContainmentReply parse_containment_reply(std::string_view payload);
 
 /// A command's stored response rows (the store returns them newest first) joined oldest
@@ -184,20 +196,6 @@ struct ContainmentReply {
         return false;
     }
     return false; // fail closed; unreachable while the switch above stays exhaustive
-}
-
-/// The device judges its own time limit on ITS clock, and a contained device blocks NTP
-/// (see the `ttl_expired` handling in firewall_quarantine_parsers.hpp), so its clock can
-/// run ahead of the server's by a few seconds or more. This allowance is the one knob: an `inactive`
-/// answer within it of the stored limit is read as the limit running out; further ahead
-/// than that reads as drift and is re-applied.
-inline constexpr std::int64_t kDeviceLimitLapseTolerance{300};
-
-/// True when a device time limit is stored (non-zero) and `now_epoch` is at or past it
-/// less `kDeviceLimitLapseTolerance`. A stored 0 (no limit) is never lapsed.
-[[nodiscard]] constexpr bool device_limit_lapsed(std::int64_t stored_ttl_expires,
-                                                 std::int64_t now_epoch) {
-    return stored_ttl_expires != 0 && now_epoch >= stored_ttl_expires - kDeviceLimitLapseTolerance;
 }
 
 // ── Layer B: I/O-bearing, implemented in quarantine_reapply.cpp ───────────

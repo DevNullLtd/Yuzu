@@ -4225,6 +4225,49 @@ TEST_CASE("nft: an active record the table no longer backs is re-applied from th
     CHECK(rig.store.state()->generation == 2);
 }
 
+TEST_CASE("quarantine on an active record names the allow-set note only when the operator exceptions "
+          "differ as a set",
+          "[agent][firewall_quarantine]") {
+    NftRig rig;
+    auto dl = rig.dl();
+    auto first = rig.request();
+    first.allow = make_set({"203.0.113.53"}, {ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out")});
+    REQUIRE(apply_and_verify(rig.env, first, dl).status == "active");
+
+    SECTION("only the control peer and the resolvers differ: no note") {
+        auto retry = rig.request();
+        auto moved = build_allow_set("198.51.100.8", "198.51.100.8:50051", {"203.0.113.99"},
+                                     {ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out")});
+        REQUIRE(moved.has_value());
+        retry.allow = *moved;
+        const auto o = apply_and_verify(rig.env, retry, dl);
+        CHECK(o.status == "active");
+        CHECK(contains(o.notes, "already_active=1"));
+        CHECK_FALSE(contains(o.notes, "allow_set_unchanged_use_quarantine_allow=1"));
+    }
+    SECTION("the same exceptions in another order: no note") {
+        auto retry = rig.request();
+        retry.allow = make_set({"203.0.113.53"}, {ex("10.0.0.6:443/tcp/out"), ex("10.0.0.5:22/tcp/in")});
+        const auto o = apply_and_verify(rig.env, retry, dl);
+        CHECK(o.status == "active");
+        CHECK_FALSE(contains(o.notes, "allow_set_unchanged_use_quarantine_allow=1"));
+    }
+    SECTION("a different exception, fewer, or none: the note") {
+        const std::vector<std::vector<Endpoint>> requests{
+            {ex("10.0.0.5:22/tcp/in"), ex("10.9.9.9:22/tcp/in")}, {ex("10.0.0.5:22/tcp/in")}, {}};
+        for (const auto& requested : requests) {
+            INFO("exceptions requested: " << requested.size());
+            auto retry = rig.request();
+            retry.allow = make_set({"203.0.113.53"}, requested);
+            const auto o = apply_and_verify(rig.env, retry, dl);
+            CHECK(o.status == "active");
+            CHECK(contains(o.notes, "already_active=1"));
+            CHECK(contains(o.notes, "allow_set_unchanged_use_quarantine_allow=1"));
+            CHECK(rig.store.state()->allow.exceptions.size() == 2); // the stored set was kept
+        }
+    }
+}
+
 TEST_CASE("quarantine on an active record says when a new ttl_seconds was ignored",
           "[agent][firewall_quarantine]") {
     NftRig rig;

@@ -49,13 +49,10 @@ struct QuarantineRecord {
     std::int64_t last_confirmed_at{0};
     // Schema v4 (PRQ.2), same 0 = never sentinel. `release_requested_at`: a release was
     // asked for (the record reads "releasing" until the device confirms it).
-    // `endpoint_ttl_expires`: the device time limit (epoch seconds) the latest confirming
-    // status reply carried, 0 when it had none; it decides whether an `inactive` answer
-    // ends the record. `device_release_owed_at`: the record was ended by an operator's
-    // forced DELETE before the device confirmed, and the device still owes a release
-    // (set back to 0 when it confirms).
+    // `device_release_owed_at`: the record was ended by an operator's forced DELETE before
+    // the device confirmed, and the device still owes a release (set back to 0 when it
+    // confirms).
     std::int64_t release_requested_at{0};
-    std::int64_t endpoint_ttl_expires{0};
     std::int64_t device_release_owed_at{0};
 };
 

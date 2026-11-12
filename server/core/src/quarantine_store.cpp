@@ -107,7 +107,6 @@ QuarantineRecord read_record(PGresult* res, int row) {
     r.last_applied_at = to_i64(PQgetvalue(res, row, c++));
     r.last_confirmed_at = to_i64(PQgetvalue(res, row, c++));
     r.release_requested_at = to_i64(PQgetvalue(res, row, c++));
-    r.endpoint_ttl_expires = to_i64(PQgetvalue(res, row, c++));
     r.device_release_owed_at = to_i64(PQgetvalue(res, row, c++));
     return r;
 }
@@ -118,8 +117,7 @@ QuarantineRecord read_record(PGresult* res, int row) {
 constexpr const char* kRecordCols =
     "id, agent_id, CASE WHEN status = 'active' AND release_requested_at <> 0 THEN 'releasing' ELSE "
     "status END, quarantined_by, quarantined_at, released_at, whitelist, reason, "
-    "last_applied_at, last_confirmed_at, release_requested_at, endpoint_ttl_expires, "
-    "device_release_owed_at";
+    "last_applied_at, last_confirmed_at, release_requested_at, device_release_owed_at";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
@@ -176,15 +174,16 @@ const std::vector<pg::PgMigration>& migrations() {
         // PRQ.2: the release is a real, confirmed step. `release_requested_at` marks a record whose
         // release was asked for (read as status `releasing`; the stored status stays active|released so
         // the CHECK, the partial unique index and every active-row query are untouched).
-        // `endpoint_ttl_expires` is the device time limit the latest confirming status reply carried
-        // (it decides whether an `inactive` answer ends the record, so it is a column, not memory).
         // `device_release_owed_at` marks a record an operator ended by force before the device
-        // confirmed a release. All three: 0 = never, this table's existing sentinel.
+        // confirmed a release. Both: 0 = never, this table's existing sentinel. The partial index
+        // serves the owed list the reconciler reads every tick: it holds only force-ended records the
+        // device has not confirmed, so it stays tiny.
         {4,
          "ALTER TABLE quarantine_records ADD COLUMN release_requested_at BIGINT NOT NULL DEFAULT 0;"
-         "ALTER TABLE quarantine_records ADD COLUMN endpoint_ttl_expires BIGINT NOT NULL DEFAULT 0;"
          "ALTER TABLE quarantine_records ADD COLUMN device_release_owed_at BIGINT NOT NULL DEFAULT "
-         "0;"},
+         "0;"
+         "CREATE INDEX idx_quarantine_release_owed ON quarantine_records(agent_id, id) "
+         "WHERE status = 'released' AND device_release_owed_at <> 0;"},
     };
     return kMigrations;
 }
@@ -341,11 +340,9 @@ QuarantineStore::mark_endpoint_applied(const std::string& agent_id, std::int64_t
 
 std::expected<void, std::string>
 QuarantineStore::mark_endpoint_confirmed(const std::string& agent_id, std::int64_t record_id,
-                                         std::int64_t at, std::int64_t ttl_expires) {
-    return guarded_record_update(pool_, open_, "last_confirmed_at",
-                                 "last_confirmed_at = $3::bigint, endpoint_ttl_expires = $4::bigint",
-                                 "active", agent_id, record_id,
-                                 {std::to_string(at), std::to_string(ttl_expires)});
+                                         std::int64_t at) {
+    return guarded_record_update(pool_, open_, "last_confirmed_at", "last_confirmed_at = $3::bigint",
+                                 "active", agent_id, record_id, {std::to_string(at)});
 }
 
 std::expected<std::optional<QuarantineRecord>, std::string>

@@ -1739,8 +1739,9 @@ TEST_CASE("QuarantineContainmentReconciler: a session swapped during the status 
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// PRQ.2: the firewall cut-over. Re-verify and drift, the device time limit, the release (a
-// releasing record), and the owed release of a force-ended record. Every case asserts the EXACT
+// PRQ.2: the firewall cut-over. Re-verify and drift, a device's own state never ending a record, a
+// new record on an already-contained device, the release (a releasing record), and the owed release
+// of a force-ended record. Every case asserts the EXACT
 // send set (plugin.action, in order), and the store and audit outcome.
 //
 // One rig: real QuarantineStore, ResponseStore and AuditStore, a real AgentRegistry, a mock
@@ -1765,6 +1766,10 @@ struct ReconRig {
     // What the "device" answers each dispatch ("" = no answer). Called with the call just made.
     std::function<std::string(const DispatchCall&)> script;
     std::int64_t clock{1'800'000'000};
+    // Timing of the reconciler build() makes; a test that needs a visible backoff sets these
+    // and calls build() again.
+    std::chrono::milliseconds min_interval{1};
+    std::chrono::milliseconds max_backoff{6};
     std::unique_ptr<QuarantineContainmentReconciler> rec;
 
     ReconRig(const std::string& qdsn, const std::string& rdsn, const std::string& adsn,
@@ -1801,11 +1806,11 @@ struct ReconRig {
             .audit_store = &astore,
             .dispatch_fn = dispatch.fn(),
             .now_fn = [this] { return clock; },
-            .min_reapply_interval_override = std::chrono::milliseconds(1),
+            .min_reapply_interval_override = min_interval,
             .response_wait_override = std::chrono::milliseconds(60'000),
             .verify_grace_override = std::chrono::milliseconds(1),
             .reverify_interval_override = reverify,
-            .max_backoff_override = std::chrono::milliseconds(6),
+            .max_backoff_override = max_backoff,
         });
     }
 
@@ -2057,115 +2062,125 @@ TEST_CASE("reconciler (firewall): an ACTIVE record whose apply is refused privil
     CHECK(rig.gauge("yuzu_server_quarantine_endpoint_unconfirmed", "connected") == 1);
 }
 
-// ── The device time limit ───────────────────────────────────────────────────
+// ── A device's own state never ends a record ───────────────────────────────
 
-TEST_CASE("reconciler (firewall): a confirm stores the device time limit; inactive at or after it ends the "
-          "record as system ttl_expired, erases state and re-applies nothing",
-          "[pg][quarantine][reconciler][prq2][ttl]") {
-    const auto offset = GENERATE(std::int64_t{100}, std::int64_t{0}, std::int64_t{-50}, std::int64_t{290});
+TEST_CASE("reconciler (firewall): a confirm whose reply carried a time limit changes nothing; a later "
+          "inactive is drift: the record stays active and listed, one drift row, no quarantine.disable "
+          "row, containment re-applied",
+          "[pg][quarantine][reconciler][prq2][drift]") {
+    const auto offset = GENERATE(std::int64_t{-5000}, std::int64_t{0}, std::int64_t{5000});
     CAPTURE(offset);
     RECON_RIG(rig, std::chrono::milliseconds(30));
-    const auto rec = rig.quarantine();
-    const std::int64_t limit = rig.clock + offset; // 290 s ahead is within the 300 s allowance
-    rig.confirm("status|active\nnote|ttl_expires=" + std::to_string(limit));
-    CHECK(rig.active()->endpoint_ttl_expires == limit); // stored by the confirming reply
+    const auto rec = rig.quarantine("10.0.0.1");
+    rig.confirm("status|active\nnote|ttl_expires=" + std::to_string(rig.clock + offset));
+    CHECK(rig.has_row("quarantine.reapply", "success", "CONFIRMED record_id=" + std::to_string(rec.id)));
 
     rig.reply("status|active_unproven", "status|inactive");
-    const auto sent_before = rig.sent().size();
     rig.reverify_once();
-    CHECK_FALSE(rig.active().has_value()); // ended
+    const auto row = rig.active();
+    REQUIRE(row.has_value());
+    CHECK(row->status == "active"); // still listed, still refusing dispatch
+    CHECK(rig.rows_with("quarantine.reapply",
+                        "drift status=inactive record_id=" + std::to_string(rec.id)) == 1);
+    CHECK(rig.audit("quarantine.disable").empty());
+    CHECK(rig.counter("released") == 0);
+    CHECK(rig.owed().empty());
     auto history = rig.qstore.get_history("agent-1");
     REQUIRE(history.has_value());
     REQUIRE(history->size() == 1);
-    CHECK((*history)[0].status == "released");
-    CHECK((*history)[0].device_release_owed_at == 0);
-    const auto rows = rig.audit("quarantine.disable");
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0].result == "success");
-    CHECK(rows[0].principal == "system");
-    CHECK(rows[0].detail.starts_with("ttl_expired ttl_expires=" + std::to_string(limit) +
-                                     " record_id=" + std::to_string(rec.id)));
-    CHECK(rig.counter("released") == 1);
-    // exactly one more send (the verifying status) and never a firewall.quarantine afterwards
-    CHECK(rig.sent().size() == sent_before + 1);
-    rig.run(4);
-    CHECK(rig.count_sent("firewall.quarantine") == 1);
-    CHECK(rig.sent().size() == sent_before + 1);
+    CHECK((*history)[0].status == "active");
+    // the next cycle re-applies through the chokepoint with the stored whitelist
+    rig.step();
+    CHECK(rig.sent().back() == "firewall.quarantine");
+    REQUIRE(rig.dispatch.calls.back().parameters.size() == 1);
+    CHECK(rig.dispatch.calls.back().parameters.at("exceptions") == "10.0.0.1/out,10.0.0.1/in");
+    CHECK(rig.active().has_value());
 }
 
-TEST_CASE("reconciler (firewall): inactive more than 300 s before the stored limit, or with none stored, is "
-          "drift: re-applied, never ended",
-          "[pg][quarantine][reconciler][prq2][ttl]") {
-    SECTION("301 s before the limit") {
-        RECON_RIG(rig, std::chrono::milliseconds(30));
-        rig.quarantine();
-        rig.confirm("status|active\nnote|ttl_expires=" + std::to_string(rig.clock + 301));
-        rig.reply("status|active_unproven", "status|inactive");
-        rig.reverify_once();
-        CHECK(rig.has_row("quarantine.reapply", "failure", "drift status=inactive"));
-        CHECK(rig.audit("quarantine.disable").empty());
-        CHECK(rig.active().has_value());
-        rig.step();
-        CHECK(rig.sent().back() == "firewall.quarantine");
-    }
-    SECTION("no limit stored") {
-        RECON_RIG(rig, std::chrono::milliseconds(30));
-        rig.quarantine();
-        rig.confirm("status|active");
-        rig.reply("status|active_unproven", "status|inactive");
-        rig.reverify_once();
-        CHECK(rig.has_row("quarantine.reapply", "failure", "drift status=inactive"));
-        CHECK(rig.audit("quarantine.disable").empty());
-        rig.step();
-        CHECK(rig.sent().back() == "firewall.quarantine");
-    }
+TEST_CASE("reconciler (firewall): inactive on an active record that was never confirmed is re-applied, "
+          "never an end, with no drift row",
+          "[pg][quarantine][reconciler][prq2][drift]") {
+    RECON_RIG(rig);
+    rig.quarantine();
+    rig.reply("status|active_unproven", "status|inactive");
+    rig.run(6);
+    CHECK(rig.active().has_value());
+    CHECK(rig.active()->last_confirmed_at == 0);
+    CHECK(rig.count_sent("firewall.quarantine") >= 2); // applied again after the inactive read
+    CHECK(rig.audit("quarantine.disable").empty());
+    CHECK(rig.rows_with("quarantine.reapply", "drift") == 0); // never confirmed, so never drift
 }
 
-TEST_CASE("reconciler (firewall): a restart over a record whose stored limit has run out reads status first, "
-          "never applies first",
-          "[pg][quarantine][reconciler][prq2][ttl]") {
+TEST_CASE("reconciler (firewall): a restarted server applies first over a record confirmed earlier, and an "
+          "inactive answer is then re-applied, never an end",
+          "[pg][quarantine][reconciler][prq2][drift]") {
     RECON_RIG(rig);
     const auto rec = rig.quarantine();
-    const std::int64_t limit = rig.clock - 10; // already passed
-    REQUIRE(rig.qstore.mark_endpoint_confirmed("agent-1", rec.id, rig.clock - 400, limit).has_value());
-
-    SECTION("inactive ends it as ttl_expired") {
-        rig.reply("status|active_unproven", "status|inactive");
-        rig.run(2);
-        CHECK(rig.sent() == std::vector<std::string>{"firewall.quarantine_status"}); // never an apply
-        CHECK_FALSE(rig.active().has_value());
-        CHECK(rig.has_row("quarantine.disable", "success", "ttl_expired ttl_expires=" + std::to_string(limit)));
-        rig.run(3);
-        CHECK(rig.count_sent("firewall.quarantine") == 0);
-    }
-    SECTION("an answer that neither confirms nor reads inactive falls back to one apply, with no status loop") {
-        rig.reply("status|active_unproven", "status|degraded|policy_not_blocking");
-        rig.run(2);
-        CHECK(rig.sent() == std::vector<std::string>{"firewall.quarantine_status"});
-        rig.step();
-        CHECK(rig.sent() == (std::vector<std::string>{"firewall.quarantine_status", "firewall.quarantine"}));
-        CHECK(rig.active().has_value());
-        CHECK(rig.audit("quarantine.disable").empty());
-    }
+    REQUIRE(rig.qstore.mark_endpoint_confirmed("agent-1", rec.id, rig.clock - 400).has_value());
+    rig.reply("status|active_unproven", "status|inactive");
+    rig.run(2);
+    CHECK(rig.sent() == std::vector<std::string>{"firewall.quarantine"}); // apply first, never a status read
+    rig.run(2);
+    CHECK(rig.sent() == kApplyThenVerify); // the verify read answered inactive
+    CHECK(rig.active().has_value());
+    CHECK(rig.audit("quarantine.disable").empty());
+    rig.step();
+    CHECK(rig.sent().back() == "firewall.quarantine");
 }
 
-TEST_CASE("reconciler (firewall): a later confirm with no ttl_expires row clears the stored limit, and a "
-          "following inactive is drift",
-          "[pg][quarantine][reconciler][prq2][ttl]") {
-    RECON_RIG(rig, std::chrono::milliseconds(30));
-    rig.quarantine();
-    rig.confirm("status|active\nnote|ttl_expires=" + std::to_string(rig.clock + 5000));
-    CHECK(rig.active()->endpoint_ttl_expires > 0);
+// ── A new record on a device that is already contained ──────────────────────
 
-    rig.reply("status|active_unproven", "status|active"); // the limit is gone from the device
-    rig.reverify_once();
-    CHECK(rig.active()->endpoint_ttl_expires == 0); // the latest confirm wins
-
-    rig.reply("status|active_unproven", "status|inactive");
-    rig.reverify_once();
-    CHECK(rig.has_row("quarantine.reapply", "failure", "drift status=inactive"));
-    CHECK(rig.audit("quarantine.disable").empty());
-    CHECK(rig.active().has_value());
+TEST_CASE("reconciler (firewall): a new record on a device already contained under other exceptions is "
+          "never confirmed: one failure row, no status read after the declined apply",
+          "[pg][quarantine][reconciler][prq2][allowset]") {
+    const std::string kKept =
+        "status|active\nnote|already_active=1\nnote|allow_set_unchanged_use_quarantine_allow=1";
+    SECTION("the note on a record that was never confirmed") {
+        RECON_RIG(rig);
+        const auto rec = rig.quarantine("10.0.0.2");
+        rig.reply(kKept, "status|active");
+        rig.run(8);
+        CHECK(rig.count_sent("firewall.quarantine") >= 2); // the entry keeps applying on its backoff
+        CHECK(rig.count_sent("firewall.quarantine_status") == 0); // but never reads status after a declined apply
+        const auto row = rig.active();
+        REQUIRE(row.has_value());
+        CHECK(row->last_confirmed_at == 0);
+        CHECK(row->status == "active");
+        CHECK(rig.rows_with("quarantine.reapply", "allow_set_not_applied") == 1); // one per entry
+        CHECK(rig.has_row("quarantine.reapply", "failure",
+                          "allow_set_not_applied record_id=" + std::to_string(rec.id) + " command_id=cmd-1"));
+        CHECK(rig.rows_with("quarantine.reapply", "CONFIRMED") == 0);
+        CHECK(rig.audit("quarantine.disable").empty());
+        CHECK(rig.counter("unconfirmed") >= 1);
+        CHECK(rig.counter("confirmed") == 0);
+        CHECK(rig.gauge("yuzu_server_quarantine_endpoint_unconfirmed", "connected") == 1);
+        // the failure row carries the ids only, never device text
+        for (const auto& r : rig.audit("quarantine.reapply"))
+            CHECK(r.detail.find("already_active") == std::string::npos);
+    }
+    SECTION("the same exceptions: the apply reply carries no such note, and the record is confirmed") {
+        RECON_RIG(rig);
+        rig.quarantine("10.0.0.2");
+        rig.reply("status|active\nnote|already_active=1", "status|active");
+        rig.run(4);
+        CHECK(rig.sent() == kApplyThenVerify);
+        CHECK(rig.active()->last_confirmed_at > 0);
+        CHECK(rig.rows_with("quarantine.reapply", "allow_set_not_applied") == 0);
+    }
+    SECTION("a record that was confirmed once keeps today's behaviour: the status read confirms it") {
+        RECON_RIG(rig);
+        rig.quarantine("10.0.0.2");
+        rig.confirm("status|active");
+        const auto first_stamp = rig.active()->last_confirmed_at;
+        rig.clock += 60;
+        rig.build(); // a restart: the reconciler applies again
+        rig.reply(kKept, "status|active");
+        rig.run(4);
+        CHECK(rig.count_sent("firewall.quarantine") == 2);
+        CHECK(rig.count_sent("firewall.quarantine_status") == 2);
+        CHECK(rig.active()->last_confirmed_at > first_stamp);
+        CHECK(rig.rows_with("quarantine.reapply", "allow_set_not_applied") == 0);
+    }
 }
 
 // ── Release driving: a releasing record ─────────────────────────────────────
@@ -2386,33 +2401,97 @@ TEST_CASE("reconciler (firewall): an owed record that never reads inactive: one 
     CHECK(rig.owed().size() == 1);
 }
 
-TEST_CASE("reconciler (firewall): an owed record whose release is answered busy: one release in the "
-          "session, one forced_release_unconfirmed row, status-only reads after the park, one more release "
-          "on a new session",
-          "[pg][quarantine][reconciler][prq2][owed]") {
+TEST_CASE("reconciler (firewall): an owed release answered busy is not spent: status is read again and "
+          "the release is sent again in the same session, with no failure row and no park",
+          "[pg][quarantine][reconciler][prq2][owed][busy]") {
     RECON_RIG(rig);
     const auto rec = rig.quarantine();
     REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
-    rig.reply("", "status|active", "status|busy");
-    rig.run(8);
-    // busy is counted, but it does not make the session's release a candidate for a re-send
-    CHECK(rig.counter("busy") >= 1);
-    CHECK(rig.count_sent("firewall.release") == 1);
-    CHECK(rig.rows_with("quarantine.disable", "forced_release_sent record_id=" + std::to_string(rec.id)) == 1);
-    CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed status=active record_id=" +
-                                                  std::to_string(rec.id)) == 1);
-    const auto parked_status_reads = rig.count_sent("firewall.quarantine_status");
-    rig.run(8);
-    CHECK(rig.count_sent("firewall.release") == 1);
-    CHECK(rig.count_sent("firewall.quarantine_status") > parked_status_reads); // status-only reads
-    CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 1);
-    CHECK(rig.owed().size() == 1);
 
-    rig.connect("session-B");
-    rig.run(14);
-    CHECK(rig.count_sent("firewall.release") == 2);
-    CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 2);
-    CHECK(rig.owed().size() == 1);
+    SECTION("busy every time") {
+        rig.reply("", "status|active", "status|busy");
+        rig.run(10);
+        CHECK(rig.counter("busy") >= 2);
+        CHECK(rig.count_sent("firewall.release") >= 2); // the same session
+        const auto sent = rig.sent();
+        REQUIRE(sent.size() >= 4);
+        CHECK(std::vector<std::string>(sent.begin(), sent.begin() + 4) ==
+              (std::vector<std::string>{"firewall.quarantine_status", "firewall.release",
+                                        "firewall.quarantine_status", "firewall.release"}));
+        CHECK(rig.rows_with("quarantine.disable", "forced_release_sent record_id=" +
+                                                      std::to_string(rec.id)) >= 2);
+        CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 0);
+        CHECK(rig.owed().size() == 1); // still owed, not parked
+    }
+    SECTION("busy once, then answered and still contained: parked with one row after that release") {
+        int releases = 0;
+        rig.script = [&releases](const DispatchCall& c) -> std::string {
+            if (c.action == "quarantine_status")
+                return "status|active";
+            if (c.action == "release")
+                return ++releases == 1 ? "status|busy" : "status|active";
+            return {};
+        };
+        rig.run(16);
+        CHECK(rig.count_sent("firewall.release") == 2);
+        CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed status=active record_id=" +
+                                                      std::to_string(rec.id)) == 1);
+        CHECK(rig.owed().size() == 1);
+    }
+    SECTION("a release refused privilege_unavailable is answered, so it parks after one cycle") {
+        rig.reply("", "status|active", "status|refused|privilege_unavailable");
+        rig.run(10);
+        CHECK(rig.count_sent("firewall.release") == 1);
+        CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed status=active record_id=" +
+                                                      std::to_string(rec.id)) == 1);
+        CHECK(rig.counter("busy") == 0);
+    }
+    SECTION("busy and then a status read that finds the device released clears the mark") {
+        int statuses = 0;
+        rig.script = [&statuses](const DispatchCall& c) -> std::string {
+            if (c.action == "quarantine_status")
+                return ++statuses < 3 ? "status|active" : "status|inactive";
+            if (c.action == "release")
+                return "status|busy";
+            return {};
+        };
+        rig.run(12);
+        CHECK(rig.owed().empty());
+        CHECK(rig.has_row("quarantine.disable", "success", "forced_release_confirmed record_id=" +
+                                                               std::to_string(rec.id)));
+        CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 0);
+    }
+}
+
+TEST_CASE("reconciler (firewall): each busy answer to an owed release escalates the entry's backoff, so the "
+          "next claim waits longer than before",
+          "[pg][quarantine][reconciler][prq2][owed][busy]") {
+    RECON_RIG(rig);
+    rig.min_interval = std::chrono::milliseconds(60);
+    rig.max_backoff = std::chrono::milliseconds(10'000);
+    rig.build();
+    const auto rec = rig.quarantine();
+    REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
+    rig.reply("", "status|active", "status|busy");
+    const auto pause_then_tick = [&rig](int ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        rig.rec->tick();
+    };
+    // Backoff 60 ms: the status goes out, its answer doubles the wait to 120 ms, the release goes out.
+    rig.rec->tick();
+    pause_then_tick(70); // reads the status answer
+    pause_then_tick(130); // sends the release
+    CHECK(rig.sent() == (std::vector<std::string>{"firewall.quarantine_status", "firewall.release"}));
+    pause_then_tick(130); // reads the busy answer: the wait doubles again, to 240 ms
+    const auto limited = rig.counter("rate_limited");
+    rig.rec->tick();
+    CHECK(rig.counter("rate_limited") == limited + 1);
+    pause_then_tick(150); // past the 120 ms the entry waited before, inside the 240 ms it waits now
+    CHECK(rig.counter("rate_limited") == limited + 2);
+    CHECK(rig.sent().size() == 2);
+    pause_then_tick(120); // past 240 ms in all: status first, again
+    CHECK(rig.sent() == (std::vector<std::string>{"firewall.quarantine_status", "firewall.release",
+                                                  "firewall.quarantine_status"}));
 }
 
 TEST_CASE("reconciler (firewall): an owed record, device offline: nothing sent, counted in "
@@ -2469,9 +2548,13 @@ TEST_CASE("reconciler (firewall): a failed owed read counts degraded, and the ac
     {
         // Fail ONLY the owed read. Its WHERE compares device_release_owed_at with 0, which no
         // longer type-checks once the column is text; the active read selects the column but never
-        // compares it, so it keeps working.
+        // compares it, so it keeps working. The owed-read partial index compares the column too and
+        // would block the type change, so it goes first.
         PgConn conn{PQconnectdb(qdb.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult drop_index{
+            PQexec(conn.get(), "DROP INDEX quarantine_store.idx_quarantine_release_owed")};
+        REQUIRE(drop_index.ok());
         PgResult alter{PQexec(conn.get(),
                               "ALTER TABLE quarantine_store.quarantine_records "
                               "ALTER COLUMN device_release_owed_at DROP DEFAULT, "

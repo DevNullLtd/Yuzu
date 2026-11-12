@@ -624,36 +624,42 @@ verified proof confirms). Confirmed means **the device reports its rules in forc
 - it is the target agent's own self-report (bound to its certificate identity, so another agent cannot
   forge it, but not independently corroborated by any network-side signal);
 - it is **not a reachability proof**;
-- the device's allow-list is **not compared** with the stored whitelist: a `firewall.quarantine_allow`
-  sent outside the quarantine routes changes the device and not the record, and the record still
-  reads confirmed.
+- the server does **not compare** the device's allow-list with the stored whitelist: a
+  `firewall.quarantine_allow` sent outside the quarantine routes changes the device and not the record,
+  and the record still reads confirmed;
+- the one difference the device itself reports is on a **new record for a device that is already
+  contained**. `firewall.quarantine` to a contained device keeps the exceptions already in force, and
+  when the request's exceptions differ from them (as a set, order aside) the reply carries
+  `note|allow_set_unchanged_use_quarantine_allow=1`. For a record that has never been confirmed the
+  server then does **not** confirm it and does not read status: the device is contained, but not under
+  this record's whitelist. The record stays unconfirmed, one `quarantine.reapply` failure row
+  (`allow_set_not_applied record_id=<id> command_id=<id>`) is written, and
+  `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay. **The new whitelist is still not on
+  the device.** To get it there, release the device and quarantine it again (the release ends the record
+  once the device confirms, and the new quarantine then applies the whitelist to a device that holds no
+  earlier exceptions). A record that was confirmed once keeps the behaviour above: later allow-list
+  drift is not detected.
 
 ### Releasing a device
 
 `DELETE /api/v1/quarantine/{agent_id}` asks the device to lift its rules and waits up to 5 seconds:
 `200` when the device answers `status|inactive`, `202` otherwise. **A record ends only on the device's
-word, or by an operator's forced end, or when its device time limit runs out** (below). Until then it
+word, or by an operator's forced end** (below). Until then it
 reads `releasing`, stays listed, and keeps the dispatch refusal, so a device that still holds the
 containment is never treated as free. The reconciler reads the device's status first (`inactive` ends
 the record), otherwise sends `firewall.release` and reads status again, and no answer to the release
 itself ends anything. A record that cannot finish stays listed with commands refused until it is forced,
 and `YuzuQuarantineReleasePending` fires after 15 minutes for a connected device.
 
-**The three ways a record ends, and no other:**
+**The two ways a record ends, and no other:**
 
 1. The device answers `status|inactive` to a release (audit `quarantine.disable`, `confirmed`).
-2. The device answers `status|inactive` on an active record whose **stored device time limit** has run
-   out (audit `quarantine.disable` by `system`, `ttl_expired`).
-3. An operator forces it with `DELETE ...?force=true` (audit names the operator and `reason=forced`).
+2. An operator forces it with `DELETE ...?force=true` (audit names the operator and `reason=forced`).
 
-**Device time limits.** The quarantine routes set no time limit. A limit on a device comes from a
-`firewall.quarantine` dispatch outside them (`ttl_seconds`); each confirming status reply stores the
-`note|ttl_expires=` it carries on the record. When the device then reads `inactive` and the stored
-limit has run out, the server ends the record, and the audit row names `system`. **Accepted
-behaviour, stated plainly: whoever can dispatch `firewall.quarantine` and `firewall.release` can end a
-Security record this way without `DELETE` authority.** The limit is judged on the device's clock, which
-is not synchronised while contained, so the server allows 300 seconds of difference: an `inactive` more
-than 300 seconds before the stored limit is read as drift and re-applied with no limit.
+A device that reads `inactive` while its record is **active** ends nothing: it is read as drift (one
+`quarantine.reapply` failure row, `drift status=inactive`) and containment is re-applied. A time limit
+set on the device by a `firewall.quarantine` dispatch outside the quarantine routes (`ttl_seconds`) does
+not end the record either; the quarantine routes set no time limit.
 
 **Forced end (`?force=true`, REST only).** Use it for a device that will not return, or one that cannot
 finish a release (such as the Linux packaged unit, which refuses mutation). Authority is the release's
@@ -663,6 +669,12 @@ commands to it, the reconciler sends the release it owes once per reconnect and 
 after one unconfirmed cycle (`yuzu_server_quarantine_forced_release_owed` counts them; no alert fires
 on it), and an operator can send `firewall.release` through the generic routes at any time. A device
 whose firewall plugin does not load cannot be released from the server at all (#7444).
+
+Until the device confirms that owed release, **the release lifts whatever containment the device holds,
+including one applied directly with `firewall.quarantine` after the forced end.** A containment sent
+outside the quarantine routes is not recorded, listed, re-applied or protected by the server. To keep
+the device contained, quarantine it again through the quarantine routes: the new record stops the owed
+release.
 
 ### Containment from the Hardware page
 
@@ -773,17 +785,23 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   same chokepoint. A device whose live session changes (a reboot) re-verifies via status first, and a
   record that is replaced (released and re-quarantined while the agent stayed connected) resets to a
   fresh apply. A confirm is checked against the session that was live when the verifying status was
-  sent. A restarted server whose stored device time limit has already run out reads status once before
-  it would re-apply, so it never re-applies to a device whose limit has passed.
+  sent. A restarted server applies first (its in-memory state starts empty), then reads status.
+- **A new record on a contained device.** See "What confirmed means": when the device says it kept
+  other exceptions, a record that was never confirmed is left unconfirmed, audited and alerted, and the
+  remedy is a release followed by a new quarantine.
 - **Release driving.** See "Releasing a device" above.
 - **The owed release.** A record ended by force before the device confirmed stays on a list until the
   device does. Per agent session the reconciler reads status (`inactive` clears it, audited
   `forced_release_confirmed`), otherwise sends `firewall.release` once (and only while a fresh read shows
   no active record for the device: a device quarantined again is governed by its new record), reads
-  status again, and, if the device still does not read `inactive`, writes one `forced_release_unconfirmed`
-  failure row and parks it: a status-only read every 15 minutes and a new release only on a new session.
+  status again, and, if the device still does not read `inactive` after a release it answered, writes one
+  `forced_release_unconfirmed` failure row and parks it: a status-only read every 15 minutes and a new
+  release only on a new session. A `busy` answer (the device's mutation gate was held, so the release
+  did not run) does not spend the session's release: the reconciler waits an escalating backoff, reads
+  status and sends the release again, so a gate that stays busy costs at most one release and one
+  `forced_release_sent` row per 15 minutes.
 - **Audit.** `quarantine.reapply` (`principal: system`): `record_id=<id> command_id=<id>
-  trigger=tick|heartbeat` per apply, `CONFIRMED ...`, `drift ...`. `quarantine.disable`: the release
+  trigger=tick|heartbeat` per apply, `CONFIRMED ...`, `drift ...`, `allow_set_not_applied ...`. `quarantine.disable`: the release
   rows described in the audit log reference. `record_id` is the internal `QuarantineRecord::id`, so a
   release-then-requarantine race stays distinguishable.
 - **Observability.** `yuzu_server_quarantine_endpoint_unconfirmed{reachability}`,
@@ -811,7 +829,9 @@ same device can end with the apply arriving after the release, in one of two way
 
 The release a `DELETE` sends and the owed release both check the record and then dispatch, so each has the
 same narrow window against a new quarantine of the same device (the new record's re-verify corrects it
-within 5 minutes). If you release and immediately re-quarantine the same device with a different
+within 5 minutes). The same outcome follows when a release sent earlier is run by the device after a later
+record's apply, because commands are not ordered on the device: the new record can be confirmed and the
+device then released, uncontained until the re-verify re-applies it. If you release and immediately re-quarantine the same device with a different
 whitelist, a follow-up `firewall.quarantine_status` check is a reasonable sanity step. Tracked for a
 proper fix (a claim or generation token on the active record).
 

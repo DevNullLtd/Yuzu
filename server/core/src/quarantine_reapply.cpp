@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <charconv>
 #include <exception>
 #include <tuple>
 
@@ -102,7 +101,6 @@ build_quarantine_reapply_params(std::string_view stored_whitelist) {
 
 ContainmentReply parse_containment_reply(std::string_view payload) {
     ContainmentReply reply;
-    bool ttl_seen = false;
     std::size_t line_start = 0;
     while (line_start <= payload.size()) {
         const auto nl = payload.find('\n', line_start);
@@ -128,16 +126,10 @@ ContainmentReply parse_containment_reply(std::string_view payload) {
             else if (token == "busy")
                 reply.state = QuarantineEndpointState::busy;
             // any other token (refused, partial, degraded, ...) stays `unconfirmed`
-        } else if (line.starts_with("note|ttl_expires=") && !ttl_seen) {
-            ttl_seen = true;
-            const auto digits = line.substr(17);
-            std::int64_t v = 0;
-            const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), v);
-            // anything but a clean, non-negative integer reads as "no limit"
-            if (ec == std::errc{} && ptr == digits.data() + digits.size() && v > 0)
-                reply.ttl_expires = v;
         } else if (line.starts_with("note|probe_target=")) {
             reply.probe_configured = true;
+        } else if (line == kAllowSetUnchangedNote) {
+            reply.allow_set_unchanged = true;
         }
 
         if (nl == std::string_view::npos)

@@ -498,16 +498,18 @@ after the already-shipped v1-v3 (never edited in place):
   the record reads `releasing` through a `CASE` in the select list, so the partial unique index
   (`quarantine_records(agent_id) WHERE status='active'`) still allows at most one live record per
   agent and a releasing record still holds it.
-- `endpoint_ttl_expires` (`BIGINT NOT NULL DEFAULT 0`): the device time limit the latest
-  confirming status reply carried, used to recognise a record whose device limit has run out.
 - `device_release_owed_at` (`BIGINT NOT NULL DEFAULT 0`): non-zero marks a record an operator
   ended by force before the device confirmed; the reconciler still owes that device a release.
+- `idx_quarantine_release_owed` (`quarantine_records(agent_id, id) WHERE status = 'released' AND
+  device_release_owed_at <> 0`): serves the owed-release read the reconciler makes on every tick.
+  It holds only force-ended records the device has not confirmed, so it stays tiny; adding it
+  after release would cost a further migration.
 - `release_device` is removed. Ending a record is `request_release` (set the marker),
   `mark_released` with a closed reason (`device_confirmed` or `forced`) and `clear_release_owed`,
   each a single guarded statement that updates only the row it was read for.
 
-A record ends in exactly three ways: the device answers `inactive` after a release; the device
-answers `inactive` on a record whose stored device time limit has run out (audited as system
-`ttl_expired`); an operator forces it with `DELETE ...?force=true`. A forced end does not release
-the device, which may still be contained. Fresh-database deployment contract applies: v4 is
+A record ends in exactly two ways: the device answers `inactive` after a release; an operator
+forces it with `DELETE ...?force=true`. A device's own state never ends a record: `inactive` on an
+active record is drift and is re-applied. A forced end does not release the device, which may
+still be contained. Fresh-database deployment contract applies: v4 is
 applied to a new database, with no data carried from earlier builds.

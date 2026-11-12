@@ -1,8 +1,8 @@
 /**
  * test_quarantine_reapply.cpp — Layer A (pure) of quarantine_reapply.hpp:
  * the whitelist-to-exceptions mapper, the params builder, the firewall
- * status-reply parser, the confirms-containment predicate and the device
- * time-limit test. No I/O, no store, no dispatch — see quarantine_reapply.hpp
+ * status-reply parser and the confirms-containment predicate. No I/O, no
+ * store, no dispatch — see quarantine_reapply.hpp
  * for why the shared re-dispatch recipe is split this way (mirrors
  * quarantine_dispatch_decision.hpp).
  */
@@ -13,14 +13,14 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 using yuzu::server::build_quarantine_reapply_params;
 using yuzu::server::ContainmentReply;
-using yuzu::server::device_limit_lapsed;
 using yuzu::server::endpoint_state_name;
 using yuzu::server::kContainmentExceptionsParam;
 using yuzu::server::kContainmentMaxAddresses;
-using yuzu::server::kDeviceLimitLapseTolerance;
+using yuzu::server::kAllowSetUnchangedNote;
 using yuzu::server::kQuarantineWhitelistMaxLen;
 using yuzu::server::map_whitelist_to_exceptions;
 using yuzu::server::parse_containment_reply;
@@ -159,23 +159,57 @@ TEST_CASE("parse_containment_reply: CRLF is tolerated and the first status line 
           QuarantineEndpointState::unconfirmed);
 }
 
-TEST_CASE("parse_containment_reply: the time limit and the probe target rows", "[server][quarantine][reapply]") {
-    auto r = parse_containment_reply("status|active\nnote|ttl_expires=1767225600\n");
-    CHECK(r.ttl_expires == 1767225600);
-    CHECK_FALSE(r.probe_configured);
-    // anything but a clean positive integer reads as no limit
-    CHECK(parse_containment_reply("status|active\nnote|ttl_expires=abc").ttl_expires == 0);
-    CHECK(parse_containment_reply("status|active\nnote|ttl_expires=12abc").ttl_expires == 0);
-    CHECK(parse_containment_reply("status|active\nnote|ttl_expires=-5").ttl_expires == 0);
-    CHECK(parse_containment_reply("status|active\nnote|ttl_expires=").ttl_expires == 0);
-    CHECK(parse_containment_reply("status|active\nnote|ttl_expires=99999999999999999999").ttl_expires == 0);
-    // the first ttl row sets it, later ones are ignored
-    CHECK(parse_containment_reply("status|active\nnote|ttl_expires=100\nnote|ttl_expires=200\n")
-              .ttl_expires == 100);
+TEST_CASE("parse_containment_reply: the probe target row", "[server][quarantine][reapply]") {
     auto p = parse_containment_reply("status|active_unproven\nnote|probe_target=203.0.113.5:443\n");
     CHECK(p.probe_configured);
     CHECK(p.state == QuarantineEndpointState::active_unproven);
     CHECK_FALSE(parse_containment_reply("status|active\n").probe_configured);
+}
+
+TEST_CASE("parse_containment_reply: a time limit row is read as nothing: it changes neither the state nor "
+          "any flag",
+          "[server][quarantine][reapply]") {
+    const auto r = parse_containment_reply("status|active\nnote|ttl_expires=1767225600\n");
+    CHECK(r.state == QuarantineEndpointState::active);
+    CHECK_FALSE(r.probe_configured);
+    CHECK_FALSE(r.allow_set_unchanged);
+    CHECK(reply_confirms_containment(r));
+}
+
+TEST_CASE("parse_containment_reply: the allow-set note is the exact line only",
+          "[server][quarantine][reapply]") {
+    static_assert(kAllowSetUnchangedNote == "note|allow_set_unchanged_use_quarantine_allow=1");
+    const std::string note(kAllowSetUnchangedNote);
+    const std::vector<std::string> carrying{
+        "status|active\n" + note,
+        "status|active\n" + note + "\n",
+        "status|active_unproven\r\nnote|already_active=1\r\n" + note + "\r\n",
+        note + "\nstatus|active",
+    };
+    for (const auto& payload : carrying) {
+        INFO(payload);
+        CHECK(parse_containment_reply(payload).allow_set_unchanged);
+    }
+    // the note says nothing about the state: it rides with whatever the device reported
+    CHECK(parse_containment_reply("status|active\n" + note).state == QuarantineEndpointState::active);
+    CHECK(parse_containment_reply("status|degraded|policy_not_blocking\n" + note).state ==
+          QuarantineEndpointState::unconfirmed);
+    const std::vector<std::string> not_carrying{
+        "status|active",
+        "",
+        "status|active\nnote|already_active=1",
+        "status|active\n" + note + "0",
+        "status|active\n" + note + " ",
+        "status|active\n " + note,
+        "status|active\nnote|allow_set_unchanged_use_quarantine_allow=",
+        "status|active\nnote|allow_set_unchanged_use_quarantine_allow=2",
+        "status|active\nxnote|allow_set_unchanged_use_quarantine_allow=1",
+        "status|active\nnote|detail=" + note,
+    };
+    for (const auto& payload : not_carrying) {
+        INFO(payload);
+        CHECK_FALSE(parse_containment_reply(payload).allow_set_unchanged);
+    }
 }
 
 // ── reply_confirms_containment ─────────────────────────────────────────────
@@ -185,7 +219,7 @@ TEST_CASE("reply_confirms_containment: true only for active, and for active_unpr
     for (const bool probe : {false, true}) {
         INFO("probe_configured=" << probe);
         const auto reply = [probe](QuarantineEndpointState s) {
-            return ContainmentReply{.state = s, .ttl_expires = 0, .probe_configured = probe};
+            return ContainmentReply{.state = s, .probe_configured = probe};
         };
         CHECK(reply_confirms_containment(reply(QuarantineEndpointState::active)));
         CHECK(reply_confirms_containment(reply(QuarantineEndpointState::active_unproven)) == !probe);
@@ -199,7 +233,7 @@ TEST_CASE("reply_confirms_containment: compile-time exhaustiveness", "[server][q
     static_assert(reply_confirms_containment(ContainmentReply{QuarantineEndpointState::active}));
     static_assert(reply_confirms_containment(ContainmentReply{QuarantineEndpointState::active_unproven}));
     static_assert(!reply_confirms_containment(
-        ContainmentReply{QuarantineEndpointState::active_unproven, 0, true}));
+        ContainmentReply{QuarantineEndpointState::active_unproven, true}));
     static_assert(!reply_confirms_containment(ContainmentReply{QuarantineEndpointState::inactive}));
     static_assert(!reply_confirms_containment(ContainmentReply{QuarantineEndpointState::busy}));
 }
@@ -210,20 +244,4 @@ TEST_CASE("endpoint_state_name: the enumerator's name, never device text", "[ser
     CHECK(std::string(endpoint_state_name(QuarantineEndpointState::inactive)) == "inactive");
     CHECK(std::string(endpoint_state_name(QuarantineEndpointState::busy)) == "busy");
     CHECK(std::string(endpoint_state_name(QuarantineEndpointState::unconfirmed)) == "unconfirmed");
-}
-
-// ── device_limit_lapsed ────────────────────────────────────────────────────
-
-TEST_CASE("device_limit_lapsed: a stored 0 is never lapsed; the allowance is the one knob",
-          "[server][quarantine][reapply]") {
-    constexpr std::int64_t limit = 1'000'000;
-    CHECK_FALSE(device_limit_lapsed(0, 0));
-    CHECK_FALSE(device_limit_lapsed(0, 4'000'000'000));
-    // 301 s before the limit: not yet (it would read as drift and be re-applied)
-    CHECK_FALSE(device_limit_lapsed(limit, limit - kDeviceLimitLapseTolerance - 1));
-    // exactly the allowance before, at, and after the limit: lapsed
-    CHECK(device_limit_lapsed(limit, limit - kDeviceLimitLapseTolerance));
-    CHECK(device_limit_lapsed(limit, limit));
-    CHECK(device_limit_lapsed(limit, limit + 1));
-    static_assert(kDeviceLimitLapseTolerance == 300);
 }

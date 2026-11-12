@@ -345,7 +345,7 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed happy path, read bac
     CHECK((*after_apply)->last_applied_at == 1000);
     CHECK((*after_apply)->last_confirmed_at == 0); // apply alone is not confirmation
 
-    REQUIRE(store.mark_endpoint_confirmed("agent-001", (*fresh)->id, 2000, 0).has_value());
+    REQUIRE(store.mark_endpoint_confirmed("agent-001", (*fresh)->id, 2000).has_value());
     auto after_confirm = store.get_status("agent-001");
     REQUIRE(after_confirm.has_value());
     REQUIRE(after_confirm->has_value());
@@ -366,7 +366,7 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed on a non-quarantined
     CHECK(applied.error() == "device is not quarantined");
     CHECK_FALSE(applied.error().starts_with(yuzu::server::kQuarantineDbErrorPrefix));
 
-    auto confirmed = store.mark_endpoint_confirmed("never-quarantined", /*record_id=*/0, 1000, 0);
+    auto confirmed = store.mark_endpoint_confirmed("never-quarantined", /*record_id=*/0, 1000);
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error() == "device is not quarantined");
 }
@@ -427,7 +427,7 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed with the WRONG recor
     auto applied = store.mark_endpoint_applied("agent-003", old_id, 1000);
     REQUIRE_FALSE(applied.has_value());
     CHECK(applied.error() == "device is not quarantined");
-    auto confirmed = store.mark_endpoint_confirmed("agent-003", old_id, 1000, 0);
+    auto confirmed = store.mark_endpoint_confirmed("agent-003", old_id, 1000);
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error() == "device is not quarantined");
 
@@ -460,7 +460,7 @@ TEST_CASE("QuarantineStore: mark_endpoint_applied/confirmed share quarantine_dev
     REQUIRE_FALSE(applied.has_value());
     CHECK(applied.error() == "agent_id is required");
 
-    auto confirmed = store.mark_endpoint_confirmed("", /*record_id=*/0, 1000, 0);
+    auto confirmed = store.mark_endpoint_confirmed("", /*record_id=*/0, 1000);
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error() == "agent_id is required");
 }
@@ -550,7 +550,6 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
     // reads 0 for each (never) and keeps its stored status.
     CHECK((*status)->status == "active");
     CHECK((*status)->release_requested_at == 0);
-    CHECK((*status)->endpoint_ttl_expires == 0);
     CHECK((*status)->device_release_owed_at == 0);
 
     // And mark_endpoint_applied/confirmed round-trip through the now-v2
@@ -585,7 +584,8 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
 
 // ── The release (PRQ.2 schema v4) ───────────────────────────────────────────
 
-TEST_CASE("QuarantineStore: v4 applies; the three release columns default to 0",
+TEST_CASE("QuarantineStore: v4 applies; the two release columns default to 0 and the owed-release "
+          "partial index exists",
           "[pg][quarantine][release]") {
     YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -596,8 +596,26 @@ TEST_CASE("QuarantineStore: v4 applies; the three release columns default to 0",
     REQUIRE(row.has_value());
     CHECK(row->status == "active");
     CHECK(row->release_requested_at == 0);
-    CHECK(row->endpoint_ttl_expires == 0);
     CHECK(row->device_release_owed_at == 0);
+
+    // The partial index the per-tick owed read relies on, and no column for a device-reported limit.
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult idx{PQexec(conn.get(),
+                        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'quarantine_store' AND "
+                        "indexname = 'idx_quarantine_release_owed'")};
+    REQUIRE(idx.ok());
+    REQUIRE(PQntuples(idx.get()) == 1);
+    const std::string def = PQgetvalue(idx.get(), 0, 0);
+    CHECK(def.find("(agent_id, id)") != std::string::npos);
+    CHECK(def.find("device_release_owed_at <> 0") != std::string::npos);
+    CHECK(def.find("'released'") != std::string::npos);
+    PgResult cols{PQexec(conn.get(),
+                         "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = "
+                         "'quarantine_store' AND table_name = 'quarantine_records' AND column_name IN "
+                         "('release_requested_at', 'device_release_owed_at', 'endpoint_ttl_expires')")};
+    REQUIRE(cols.ok());
+    CHECK(std::string(PQgetvalue(cols.get(), 0, 0)) == "2");
 }
 
 TEST_CASE("QuarantineStore: request_release returns the record id and the record reads releasing but stays listed",
@@ -819,7 +837,8 @@ TEST_CASE("QuarantineStore: clear_release_owed removes the mark; a repeat and a 
     REQUIRE_FALSE(none.has_value());
 }
 
-TEST_CASE("QuarantineStore: mark_endpoint_confirmed stores the device time limit it is given; a later confirm with 0 clears it",
+TEST_CASE("QuarantineStore: mark_endpoint_confirmed stamps last_confirmed_at, the latest confirm wins, and "
+          "a stale record id is refused",
           "[pg][quarantine][release]") {
     YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -828,13 +847,13 @@ TEST_CASE("QuarantineStore: mark_endpoint_confirmed stores the device time limit
     REQUIRE(store.quarantine_device("agent-t1", "admin", "reason", "").has_value());
     const auto id = active_row(store, "agent-t1")->id;
 
-    REQUIRE(store.mark_endpoint_confirmed("agent-t1", id, 2000, 1767225600).has_value());
-    auto row = active_row(store, "agent-t1");
-    CHECK(row->last_confirmed_at == 2000);
-    CHECK(row->endpoint_ttl_expires == 1767225600);
+    REQUIRE(store.mark_endpoint_confirmed("agent-t1", id, 2000).has_value());
+    CHECK(active_row(store, "agent-t1")->last_confirmed_at == 2000);
+    REQUIRE(store.mark_endpoint_confirmed("agent-t1", id, 3000).has_value());
+    CHECK(active_row(store, "agent-t1")->last_confirmed_at == 3000);
 
-    REQUIRE(store.mark_endpoint_confirmed("agent-t1", id, 3000, 0).has_value());
-    row = active_row(store, "agent-t1");
-    CHECK(row->last_confirmed_at == 3000);
-    CHECK(row->endpoint_ttl_expires == 0); // the latest confirm wins
+    auto stale = store.mark_endpoint_confirmed("agent-t1", id + 1000, 4000);
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == "device is not quarantined");
+    CHECK(active_row(store, "agent-t1")->last_confirmed_at == 3000);
 }

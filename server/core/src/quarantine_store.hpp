@@ -71,9 +71,8 @@ namespace yuzu::server {
 /// callers key off the shared constant, never a local copy of the literal.
 inline constexpr const char* kQuarantineDbErrorPrefix = "db_error: ";
 
-/// How a record came to end. `device_confirmed`: the device answered `inactive` (to a
-/// release, or on a record whose stored device time limit had run out). `forced`: an
-/// operator ended it without the device's word; the device is then owed a release.
+/// How a record came to end. `device_confirmed`: the device answered `inactive` to a release.
+/// `forced`: an operator ended it without the device's word; the device is then owed a release.
 enum class ReleaseEnd { device_confirmed, forced };
 
 class QuarantineStore {
@@ -185,13 +184,10 @@ public:
 
     /// #3425: record that a FOLLOW-UP `firewall.quarantine_status` read confirmed
     /// the device's firewall rules in force — the only signal this store treats as proof
-    /// of endpoint containment. One statement stamps `last_confirmed_at` and
-    /// `endpoint_ttl_expires` (the device time limit the reply carried; 0 when it had
-    /// none, so the latest confirm wins). Same `record_id` scoping and error contract as
-    /// `mark_endpoint_applied`.
+    /// of endpoint containment. Stamps `last_confirmed_at`. Same `record_id` scoping and
+    /// error contract as `mark_endpoint_applied`.
     [[nodiscard]] std::expected<void, std::string>
-    mark_endpoint_confirmed(const std::string& agent_id, std::int64_t record_id, std::int64_t at,
-                            std::int64_t ttl_expires);
+    mark_endpoint_confirmed(const std::string& agent_id, std::int64_t record_id, std::int64_t at);
 
     /// Full quarantine history (active and released) for `agent_id`, newest
     /// first. AUTHORITATIVE read: `std::nullopt` on a store/pool/query

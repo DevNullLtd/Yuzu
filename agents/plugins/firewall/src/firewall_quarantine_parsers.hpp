@@ -3873,7 +3873,13 @@ struct ApplyRequest {
                 if (o.status != "degraded")
                     o.notes.emplace_back("already_active=1");
             }
-            if (!(cur.allow == req.allow))
+            // Said when the operator EXCEPTIONS differ, as a set (order is not a difference).
+            // Not when only the control peer or the resolvers differ: the live peer leads a
+            // new request's control set and the resolvers are re-read, so those differ on a
+            // healthy retry. The server keys on this note to learn that a new record's
+            // whitelist was not applied (the stored set was kept).
+            if (!std::is_permutation(cur.allow.exceptions.begin(), cur.allow.exceptions.end(),
+                                     req.allow.exceptions.begin(), req.allow.exceptions.end()))
                 o.notes.emplace_back("allow_set_unchanged_use_quarantine_allow=1");
             // Same rule for the TTL: a retry never rewrites a contained host's expiry.
             if (req.ttl_seconds != 0)

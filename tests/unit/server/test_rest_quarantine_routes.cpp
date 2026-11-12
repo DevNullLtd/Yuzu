@@ -1334,8 +1334,7 @@ TEST_CASE("REST DELETE /api/v1/quarantine: a privilege refusal, a partial releas
     if (once_confirmed) {
         const auto seeded = active_record(h.quarantine_store, "agent-B");
         REQUIRE(seeded.has_value());
-        REQUIRE(h.quarantine_store
-                    .mark_endpoint_confirmed("agent-B", seeded->id, /*at=*/1000, /*ttl_expires=*/0)
+        REQUIRE(h.quarantine_store.mark_endpoint_confirmed("agent-B", seeded->id, /*at=*/1000)
                     .has_value());
     }
     auto res = h.del("agent-B");

@@ -43,6 +43,18 @@
 /// quarantine routes changes the device and not the record, and the record still
 /// reads confirmed. Detecting that belongs with the store-updating allow surface.
 ///
+/// A NEW RECORD ON A DEVICE THAT IS ALREADY CONTAINED. `firewall.quarantine` to a contained
+/// device keeps the stored allow set and says so (`kAllowSetUnchangedNote`) when the request's
+/// operator exceptions differ from the ones in force, as a set. For a record that was never
+/// confirmed that note means the device is contained but NOT under this record's whitelist, so
+/// the apply reply is not followed by a status read: the entry backs off, counts `unconfirmed`
+/// and writes one `quarantine.reapply` failure row (`allow_set_not_applied record_id=<id>
+/// command_id=<id>`, no device text). The record stays unconfirmed and
+/// `YuzuQuarantineEndpointUnconfirmed` fires. This component does not make the device take the
+/// whitelist (a release, then a new quarantine, does). A record that was confirmed once keeps the
+/// behaviour above: later allow-list drift stays undetected (its detection is out of scope here),
+/// so a re-apply after a restart or a loss of containment is confirmed by the status read.
+///
 /// RE-VERIFY AND DRIFT. A confirmed record is re-read every `kReverifyInterval`
 /// (5 minutes) while its device is connected; the record stays confirmed meanwhile
 /// (the unconfirmed gauge and its alert do not blink) and the CONFIRMED audit row is
@@ -79,35 +91,35 @@
 /// a release for a row a fresh store read does not show as releasing, and no answer to
 /// `firewall.release` ends anything: only the device's `status|inactive` does.
 ///
-/// THE THREE WAYS A RECORD ENDS, and no other:
+/// THE TWO WAYS A RECORD ENDS, and no other:
 ///   1. The device answers `status|inactive` to a release (audit `confirmed`).
-///   2. The device answers `status|inactive` on an ACTIVE record whose stored device
-///      time limit has run out (audit, principal system, `ttl_expired`). The server
-///      sets no limit; a limit on a device came from a dispatch outside the quarantine
-///      routes, and each confirming reply stores the limit it carries. The test is
-///      `now >= limit - kDeviceLimitLapseTolerance`: the device judges the limit on
-///      its own clock while NTP is blocked. ACCEPTED BEHAVIOUR (Alex, 2026-11-11):
-///      a limit set outside the quarantine routes can end a Security record without
-///      DELETE authority; the row names `system`, and the dispatch that set the limit
-///      is in the command audit.
-///   3. An operator forces it with `DELETE ...?force=true` (REST only; audit names the
+///   2. An operator forces it with `DELETE ...?force=true` (REST only; audit names the
 ///      operator and `reason=forced`). The device is then OWED a release.
+/// A device's `status|inactive` on an ACTIVE record ends nothing: it is drift, and the record is
+/// re-applied. Nothing a device reports (a time limit, a state) ends a record the server applied.
 ///
 /// THE OWED-RELEASE LEG. A record ended by force before the device confirmed stays on
 /// a list (`list_release_owed`) until the device does. Per agent session this component
 /// reads status first (`inactive` clears the mark), then sends `firewall.release` once,
 /// but only while a fresh store read shows no active record for the device (a device
 /// quarantined again is governed by its new record), then reads status again; a device
-/// that still does not read `inactive` is PARKED with one failure row, read status-only
-/// every `kMaxBackoff`, and sent a new release only on a new session.
+/// that still does not read `inactive` after a release it answered (anything but `busy`) is
+/// PARKED with one failure row, read status-only every `kMaxBackoff`, and sent a new release
+/// only on a new session. A `busy` answer means the device did not run the release at all (its
+/// mutation gate was held), so the session's one release is not spent: the entry escalates its
+/// backoff, reads status first again and sends the release again, so a gate that stays busy
+/// costs at most one release and one `forced_release_sent` row per `kMaxBackoff`.
+/// WHAT THIS LEG LIFTS: until the device confirms the owed release, the release lifts whatever
+/// containment the device holds, including one applied directly with `firewall.quarantine` after
+/// the forced end. A containment sent outside the quarantine routes is not recorded, listed,
+/// re-applied or protected by this component; to keep such a device contained, quarantine it
+/// again through the quarantine routes (the new record stops the owed release).
 ///
 /// State: durable across restarts via `QuarantineStore::mark_endpoint_applied`/
 /// `mark_endpoint_confirmed` (schema v2) and the v4 release columns; in-memory (this
 /// class) for per-agent phase/in-flight-command/backoff/confirmed-session bookkeeping —
 /// lost on restart. A restart therefore costs one full apply-then-verify cycle per
-/// previously-confirmed active record (a fresh `AgentState` defaults `confirmed=false`),
-/// except that a record whose stored device time limit has run out reads status once
-/// first, so a restarted server never re-applies to a device whose limit has passed.
+/// previously-confirmed active record (a fresh `AgentState` defaults `confirmed=false`).
 ///
 /// Concurrency: `tick()` and `notify_agent_heartbeat()` both funnel into
 /// `reconcile_one()`, which claims a per-agent rate-limit slot UNDER THE
@@ -140,7 +152,10 @@
 ///       `firewall.release` sent through the generic dispatch routes.
 /// REST DELETE's own release has the same check-then-dispatch window against a
 /// re-quarantine of the device, as does the owed-release leg (the new record's
-/// re-verify corrects either within 5 minutes). The window is narrow (one
+/// re-verify corrects either within 5 minutes). The same outcome follows when a release sent
+/// earlier is run by the device after a later record's apply: commands are not ordered on the
+/// device, so the new record can be confirmed and the device then released, uncontained until the
+/// re-verify re-applies it (up to 5 minutes). The window is narrow (one
 /// synchronous read-then-dispatch pair inside a single `reconcile_one` call, not
 /// spanning any of this component's own waiting); the proper fix (a database-backed
 /// claim or generation on the active row, checked by the release and the reapply path)
@@ -177,7 +192,8 @@ namespace yuzu::server {
 inline constexpr std::array<std::string_view, 13> kQuarantineReapplyResults{
     "reapplied",         // an apply or status dispatch was accepted (agents_reached > 0)
     "confirmed",         // a status read reported the device's rules in force (status|active, or active_unproven with no probe target)
-    "unconfirmed",       // a status read reported anything else (partial, inactive, refused, degraded, ...)
+    "unconfirmed",       // a status read reported anything else (partial, inactive, refused, degraded, ...),
+                         // or an apply reply said the device kept other exceptions (never-confirmed record)
     "busy",              // the plugin's mutation gate answered status|busy
     "offline",           // no live AgentSession — dispatch skipped entirely
     "not_reached",       // dispatched but agents_reached==0, or the response never arrived before kResponseWait
@@ -187,8 +203,8 @@ inline constexpr std::array<std::string_view, 13> kQuarantineReapplyResults{
     "validation_failed", // the stored whitelist failed server-edge validation
     "dispatch_error",    // the dispatch call itself threw
     "release_sent",      // a firewall.release dispatch was accepted (releasing row, or the owed-release leg)
-    "released",          // a record ended: the device answered inactive (to a release, on a lapsed time
-                         // limit) or cleared a forced end's owed release
+    "released",          // a record ended: the device answered inactive to a release, or cleared a
+                         // forced end's owed release
 };
 
 class QuarantineStore;
@@ -303,8 +319,8 @@ private:
         std::chrono::steady_clock::time_point confirmed_at{};
         // Set on session-churn detection (tick()): the next reconcile_one
         // call verifies via `firewall.quarantine_status` before considering a fresh
-        // apply, rather than blindly re-dispatching. Also set by a due re-verify, a
-        // lapsed stored time limit, and a releasing/owed entry's first cycle.
+        // apply, rather than blindly re-dispatching. Also set by a due re-verify and a
+        // releasing/owed entry's first cycle.
         bool verify_first{false};
         Pending pending{Pending::none};
         std::string pending_command_id;
@@ -316,12 +332,13 @@ private:
         // have the confirmation stamp land on the wrong (never-dispatched)
         // record. 0 only before the first-ever claim.
         std::int64_t pending_record_id{0};
-        // The row's stored `endpoint_ttl_expires`, read at the status dispatch: it decides
-        // whether an `inactive` answer is a lapsed device time limit.
-        std::int64_t pending_ttl_expires{0};
-        // The one status-first read for a lapsed stored limit has been done for this entry
-        // (set by any status reply on an active entry).
-        bool lapse_checked{false};
+        // The in-flight apply is for a record that was never confirmed (`last_confirmed_at == 0`
+        // when it was sent): a reply saying the device kept other operator exceptions then
+        // leaves the record unconfirmed instead of being followed by a status read.
+        bool apply_for_unconfirmed{false};
+        // The `allow_set_not_applied` failure row has been written for this entry (one per entry,
+        // not one per re-apply cycle).
+        bool allow_set_reported{false};
         // #3425 governance re-review (unhappy-path, Finding UP-2): the live
         // `AgentSession::session_id` at the moment the verify status
         // dispatch was SENT — compared against the CURRENT session
@@ -370,7 +387,8 @@ private:
     // The pieces of reconcile_one. `c` is the copy of the entry taken under `mu_` when the entry
     // was claimed (nothing is read under a lock again after the claim except to write the
     // outcome). The send_* pieces return the same "a dispatch was attempted" signal.
-    void handle_mutation_reply(const std::string& agent_id, const ContainmentReply& reply,
+    void handle_mutation_reply(const std::string& agent_id, const AgentState& c,
+                               const ContainmentReply& reply,
                                std::chrono::steady_clock::time_point steady_now);
     void handle_status_reply(const std::string& agent_id, const AgentState& c,
                              const ContainmentReply& reply,

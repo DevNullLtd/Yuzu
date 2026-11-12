@@ -279,6 +279,10 @@ Type: files; Name: "{app}\plugins\sockwho.dll"
 ; and register the retired plugin name. (deb/rpm file lists and the macOS package manifest
 ; already remove the old binary.)
 Type: files; Name: "{app}\plugins\tar.dll"
+; Device containment moved into the firewall plugin and its separate containment DLL was removed.
+; The same rule applies: a stale quarantine.dll left in the plugin directory would be loaded by
+; the glob beside firewall.dll and register the retired actions again.
+Type: files; Name: "{app}\plugins\quarantine.dll"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"

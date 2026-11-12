@@ -2076,7 +2076,10 @@ costs neither a per-record permission check nor an audit row.
 > agent's own self-report (cert-bound to its identity, not independently corroborated by any
 > network-side signal), so treat it as strong operational evidence of containment, not proof. See
 > `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
-> boundary.
+> boundary. A device that was already contained under other operator exceptions keeps them: for a
+> record that was never confirmed, `last_confirmed_at` stays `0` (audit `quarantine.reapply`,
+> `allow_set_not_applied`), and the whitelist is not on the device until it is released and quarantined
+> again.
 >
 > **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
 > progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed.
