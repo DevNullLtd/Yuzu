@@ -4542,6 +4542,18 @@ test('OpenAPI literal segment size lexical gate',
   timeout: 30,
 )
 
+# Lexical gate: the OpenAPI authoring mistakes test_openapi_spec_completeness.cpp reports one kind
+# per full build (no operationId, an ill-formed or duplicate one, the operationId checksum pin, a
+# success response left untyped and not in kUntyped) are all reported together, before any build.
+# Reads the same literal chain as the segment gate above and the constants out of the C++ test.
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' as above.
+test('OpenAPI operation authoring lexical gate',
+  _python3_test,
+  args: [files('test_openapi_operation_authoring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Lexical gate: the OpenAPI x-yuzu-unavailable markers agree with the stores server.cpp passes to
 # register_routes (a store passed as nullptr <=> its group is marked). Carries its own in-memory
 # mutation self-test. No build required.

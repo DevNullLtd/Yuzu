@@ -4157,7 +4157,7 @@ static const ToolDef kTools[] = {
      "keys need an administrator account over REST: /mcp/v1/ requires a token that carries an "
      "MCP tier, and even an administrator token with a tier cannot write them over MCP, so use "
      "PUT /api/v1/config/{key} or the Settings pages; dex_score_policy has its own route and "
-     "answers invalid params. Values are sent as "
+     "answers invalid params (write it with set_dex_score_policy). Values are sent as "
      "strings, e.g. \"90\"; key is 1 to 64 characters from a-z and _, value at most 256 bytes "
      "(a longer value, such as a long dex_alert_routing, goes through PUT /api/v1/config/{key}); "
      "extra arguments are refused. "
