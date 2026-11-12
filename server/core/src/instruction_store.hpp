@@ -329,8 +329,9 @@ public:
     /// Bounds (this signature-gated variant only; the trusted seed is exempt): `name` 128,
     /// `version` 64 and `instruction_set_id` 128 bytes, and a non-empty `plugin` / `action` must
     /// meet `check_dispatch_identifier` (the SIGNED yaml's values are checked too, since the
-    /// binding takes them verbatim); `action` is lowercased. `description` is deliberately not
-    /// bounded (bundled definitions carry long ones). The caller stamps `created_by`.
+    /// binding takes them verbatim); `action` is lowercased. `description` is bounded at
+    /// `kMaxDefinitionImportDescriptionLen` (16 KiB, wide enough for the bundled definitions'
+    /// long ones). The caller stamps `created_by`.
     std::expected<std::string, std::string> import_definition_json(const std::string& json);
 
     /// Trusted-content variant — bypasses the signature gate AND routes through the seed-aware

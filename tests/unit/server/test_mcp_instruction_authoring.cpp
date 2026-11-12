@@ -957,9 +957,10 @@ TEST_CASE("mcp ticket_subject: 40000 arguments cost under 10x of 10000 (linear; 
 }
 
 // UP-2: the version token the supervised tier requires. Turns red if missing_version_token stops
-// asking for it (or asks for it on a create / delete / import).
-TEST_CASE("mcp missing_version_token: update_definition and an id-bearing save_definition_yaml "
-          "need the version; create; delete and import do not",
+// asking for it on an update, a delete (M3-3) or an id-bearing YAML save, or asks for it on a
+// create or an import.
+TEST_CASE("mcp missing_version_token: update_definition and delete_definition and an id-bearing "
+          "save_definition_yaml need the version; create and import do not",
           "[mcp][instruction_authoring][security]") {
     const auto missing = [](const char* tool, const json& args) {
         return iauth::missing_version_token(tool, args);
