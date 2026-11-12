@@ -1069,19 +1069,24 @@ bool GuaranteedStateStore::delete_agent(std::string_view agent_id) {
         return false;
     const std::string id{agent_id};
     // One transaction, in the census writers' lock order (see the lock-order comment above the
-    // census statements): the agent's pending events are locked in ingest_seq order first, then the
-    // census rows are touched. A projection that wins the pending-row locks makes this wait; this
-    // then deletes the census row it committed. No rule row is locked (a child DELETE does not lock
-    // its parent), so the event-row waits stay acyclic against delete_rule too. The census-row
-    // deletes of this method and of delete_rule's cascade take row locks in heap order, so two
-    // transactions that overlap on several census rows could in principle deadlock; Postgres
-    // aborts one, this method then returns false and the re-issue is idempotent. A pending event
-    // committed after the list is read is not retired here (delete_rule has the same list-read
-    // gap; the sweep of stranded pending evidence is tracked in #7147). Every statement result is
-    // checked: a false return rolls the whole transaction back, so the decommission cascade records
-    // Failed and the re-issue is idempotent. The failure reason is logged at warn level, because
-    // the pool's last_error() is set only by connect and acquire failures and never by a failed
-    // statement.
+    // census statements): the agent's order row is deleted first (the row a census-bearing first
+    // delivery also takes first), then the agent's pending events are locked in ingest_seq order,
+    // then the census rows are touched. A projection that wins the pending-row locks makes this
+    // wait; this then deletes the census row it committed. No rule row is locked (a child DELETE
+    // does not lock its parent), so the event-row waits stay acyclic against delete_rule too. The
+    // order-row DELETE cannot see a row that an in-flight first delivery inserted and has not yet
+    // committed (a brand-new or just-decommissioned agent's first event): that delivery commits an
+    // order row after this returns, an accepted residual of the same class as the pending-list
+    // race below. No advisory lock, rule hook or generation bump is taken or made here. The
+    // census-row deletes of this method and of delete_rule's cascade take row locks in heap order,
+    // so two transactions that overlap on several census rows could in principle deadlock;
+    // Postgres aborts one, this method then returns false and the re-issue is idempotent. A
+    // pending event committed after the list is read is not retired here (delete_rule has the same
+    // list-read gap; the sweep of stranded pending evidence is tracked in #7147). Every statement
+    // result is checked: a false return rolls the whole transaction back, so the decommission
+    // cascade records Failed and the re-issue is idempotent. The failure reason is logged at warn
+    // level, because the pool's last_error() is set only by connect and acquire failures and never
+    // by a failed statement.
     const auto log_step_failure = [&](const char* step, PGconn* conn, const pg::PgResult& res) {
         // A null result (out of memory, a lost connection) carries no message of its own: the
         // reason is then on the connection.
@@ -1092,6 +1097,15 @@ bool GuaranteedStateStore::delete_agent(std::string_view agent_id) {
                      step, log_id_token(agent_id), ::yuzu::log_key_token(msg ? msg : ""));
     };
     const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // FIRST statement, in this same transaction (never its own): the agent row is the first
+        // lock of every census writer, so taking it first here keeps the order acyclic.
+        pg::PgResult order = pg::exec_params(
+            conn, "DELETE FROM guaranteed_state_store.guardian_agent_order WHERE agent_id = $1",
+            std::vector<std::string>{id});
+        if (order.status() != PGRES_COMMAND_OK) {
+            log_step_failure("order-row delete", conn, order);
+            return false;
+        }
         pg::PgResult locked =
             pg::exec_params(conn,
                             "SELECT event_id FROM guaranteed_state_store.guaranteed_state_events "
@@ -1528,8 +1542,9 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // Postgres row locks serialise a pair. Every pending event row of the pair is locked in
 // `ingest_seq` order in ONE statement, then the census row is touched, and `delete_rule` locks the
 // rule's pending rows the same way before it retires them and deletes the rule. `delete_agent`
-// (the decommission cascade, #5675) is the third writer: it locks the agent's pending rows the same
-// way, then deletes the agent's census rows, and takes no rule-row lock. On the production
+// (the decommission cascade, #5675) is the third writer: it deletes the agent's order row first (see
+// the schema v5 paragraph below), then locks the agent's pending rows the same way, then deletes
+// the agent's census rows, and takes no rule-row lock. On the production
 // paths (single-event ingest, repair, `delete_rule`, `delete_agent`) every event-row lock is taken
 // by one `ORDER BY ingest_seq FOR UPDATE` statement, so event-row waits are acyclic (the census-row
 // deletes of `delete_agent` and of `delete_rule`'s cascade take row locks in heap order and could
@@ -1551,7 +1566,11 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // BEFORE the pair's pending rows, the census row and the rule row, and holds it to the end of the
 // transaction, so every rule of one agent serialises on it: the order is agent row, pending rows,
 // census row, rule row. No counter on it is written outside the DECIDE statement. A Repair takes
-// no agent-row lock and writes nothing to the order table. A transaction that locks the order
+// no agent-row lock and writes nothing to the order table. `delete_agent` is the one other
+// agent-row-first writer: its first statement deletes the agent's order row (waiting on a first
+// delivery that holds it, or making one wait that arrives after), and only then does it lock the
+// agent's pending rows and delete its census rows, in the same transaction. It adds no advisory
+// lock, rule hook or generation bump. A transaction that locks the order
 // rows of SEVERAL agents must take them in ascending agent_id order; the batch path does not sort
 // its rows, so two concurrent batches over the same agents can deadlock there as they can on the
 // census rows (same Failed outcome, same rolled-back batch, no production caller).

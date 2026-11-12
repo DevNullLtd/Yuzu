@@ -28,9 +28,9 @@
 /// from `guaranteed_state_events.rule_id` to `guaranteed_state_rules(rule_id)`.
 /// When a rule is deleted, its historical events remain for forensic review.
 /// Time-based expiry is the single retention mechanism for events. An agent decommission
-/// (`delete_agent`) does not change that: it retires the agent's pending census evidence (clears
-/// the pending flag of its pending events) and deletes its census rows, and no event row is
-/// deleted.
+/// (`delete_agent`) does not change that: it deletes the agent's per-agent order row, retires its
+/// pending census evidence (clears the pending flag of its pending events) and deletes its census
+/// rows, and no event row is deleted.
 ///
 /// ── Posture (ADR-0012 §1 / ADR-0038), split by table family ─────────────────
 ///  - **Rules + meta reads — AUTHORITATIVE, type-distinguishable** (the
@@ -355,16 +355,19 @@ public:
     std::expected<void, std::string> update_rule(const GuaranteedStateRuleRow& row);
     std::expected<void, std::string> delete_rule(const std::string& rule_id);
     /// Decommission erasure (ADR-0024 Decision 11 cascade member, #5675). One transaction in the
-    /// census writers' lock order: the agent's pending events are locked in `ingest_seq` order and
-    /// retired (`projection_pending = false`), then the agent's census rows are deleted. No rule
-    /// row is locked. True iff the transaction committed; zero rows is still true (idempotent).
+    /// census writers' lock order: the agent's `guardian_agent_order` row is deleted first, then
+    /// the agent's pending events are locked in `ingest_seq` order and retired
+    /// (`projection_pending = false`), then the agent's census rows are deleted. No rule row is
+    /// locked. True iff the transaction committed; zero rows is still true (idempotent).
     /// False on an empty id, a store that is not open, a lease timeout, a failed statement or a
     /// failed COMMIT (the whole transaction is rolled back). The event log and the DEX
     /// observations are NOT erased (they expire by retention, which is 30 days by default; rows
     /// written while the retention setting is 0 or below never expire). This is not a rule
-    /// mutation: no policy-generation bump, no `on_rule_mutation_` hook, no push. A still-running
-    /// agent's next census-bearing event (after a state change, an agent restart or a rule push;
-    /// not on a schedule) re-creates its row (stop the agent first).
+    /// mutation: no policy-generation bump, no `on_rule_mutation_` hook, no push, no advisory lock. A
+    /// still-running agent's next census-bearing event (after a state change, an agent restart or a
+    /// rule push; not on a schedule) re-creates its census row and its order row (stop the agent
+    /// first), and an agent's first event can commit an order row just after this returns: the
+    /// order-row DELETE cannot see a row an in-flight first delivery has not committed.
     [[nodiscard]] bool delete_agent(std::string_view agent_id);
     /// Three-state read (ADR-0038 catastrophic-read set): found / genuinely
     /// absent (`std::nullopt`) / degraded (`std::unexpected`). Callers MUST
