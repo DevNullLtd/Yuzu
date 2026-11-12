@@ -4394,10 +4394,13 @@ public:
                           "rule is gone (not a fault); failed is a fault that leaves pending "
                           "evidence, except for source batch, whose failure rolls back the whole batch "
                           "(this count is not rolled back; see "
-                          "..._census_proj_failures_total); a failed per-agent emit-order step on a "
-                          "first delivery is also counted failed (the census write is then "
+                          "..._census_proj_failures_total); a failed per-agent emit-order step is "
+                          "also counted failed (on a first delivery the census write is then "
                           "skipped); abandoned aborted the "
-                          "transaction (counted again as an ingest error). Counted when the "
+                          "transaction (counted again as an ingest error); it includes a failed "
+                          "control statement of the emit-order step's savepoint and, on a first "
+                          "delivery, a failed write of the pending evidence after a failed order "
+                          "step. Counted when the "
                           "projection returns, before the transaction commits. Resets on server "
                           "restart.",
                           "counter");
@@ -4417,22 +4420,26 @@ public:
                           "Guardian events whose emit-order pair (boot_epoch, emit_seq) was "
                           "withheld at ingest, by reason. half_set: exactly one of the two was "
                           "set. out_of_range: a set pair had a value of 2^62 or more. The event "
-                          "is still stored, unpaired, and its census is unaffected; this is not "
-                          "a refusal. Resets on server restart.",
+                          "is still stored, unpaired, and its verdict decision is unaffected (the "
+                          "census row's stored pair becomes NULL); this is not a refusal. "
+                          "Counted once per withheld pair: a redelivery of the same event does "
+                          "not count again. Resets on server restart.",
                           "counter");
         for (const char* reason : detail::kGuardianPairRejectReasons)
             metrics_.counter(detail::kGuardianPairRejectedMetric, {{"reason", reason}});
         metrics_.describe("yuzu_server_guardian_census_pending_events",
                           "Guardian events stored with pending census evidence: their census "
-                          "write failed and no redelivery has repaired it. Not updated while "
+                          "write, or the per-agent emit-order step before it, failed and no "
+                          "redelivery has repaired it. Not updated while "
                           "the store cannot answer. A sustained non-zero value means census "
                           "verdicts are waiting on an agent redelivery that may never come "
                           "(the stranded classes are listed in docs/clock-guarded-retention.md).",
                           "gauge");
         metrics_.describe(detail::kGuardianCensusUnorderedAgentsMetric,
-                          "Agents whose latest accepted census-bearing event carried no emit-order "
-                          "pair and is later than the time their pair clock last advanced (a never-"
-                          "paired agent counts). The pair is stored and counted, not yet compared: "
+                          "Agents whose latest accepted unpaired census-bearing event is later than "
+                          "the time their pair clock last advanced (an agent that never sent a "
+                          "pair counts; accepted means accepted for ordering). The pair is stored "
+                          "and counted, not yet compared: "
                           "no verdict depends on it. Not updated while the store cannot answer, "
                           "and absent until the first answered read. Per-agent detail is the "
                           "ordering field of the per-device all-guards read.",
@@ -4445,15 +4452,18 @@ public:
         // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
         // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
         // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
-        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count, fail-hard: the
+        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count and the
+        // request-path unordered_agents read behind the status rollup, fail-hard: the
         // caller gets a std::expected error and aborts the push/reconcile
         // rather than fan out empty/stale data); "guardian_census" (#5690) is the
-        // census pending-evidence COUNT read only (the gauge keeps its last value);
+        // census GAUGE reads only (the pending-evidence count and the unordered-agents count;
+        // each gauge keeps its last value);
         // "guardian_census_device" (#7217) is the per-device unrepresented-pending
-        // reads behind the device-compliance and all-guards routes (fail-hard: REST
-        // 503 / MCP error), and is the only source with the extra reason
-        // "statement_timeout" (SQLSTATE 57014, most likely a retained-backlog symptom whose
-        // retry usually fails identically). Pre-seeded below (same closed
+        // read and the per-device emit-order read behind the device-compliance and
+        // all-guards routes (fail-hard: REST 503 / MCP error), and is the only source with the
+        // extra reason "statement_timeout" (SQLSTATE 57014, most likely a retained-backlog
+        // symptom whose retry usually fails identically; only the unrepresented-pending read
+        // sets a statement timeout, the order read does not). Pre-seeded below (same closed
         // {reason x source} cross-product pre-seed pattern as
         // yuzu_server_kek_operations_total above) so absent()/rate() alerting
         // is meaningful before the first degrade ever fires.
@@ -4465,11 +4475,14 @@ public:
                           "in-flight budget, plus statement_timeout for a guardian_census_device "
                           "read that exceeded its time budget) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
-                          "served; guardian_rules = authoritative rule/status reads, fail-hard, "
+                          "served; guardian_rules = authoritative rule/status reads, including "
+                          "the request-path unordered-agents read, fail-hard, "
                           "push/reconcile aborts rather than fans out empty; guardian_census = "
-                          "the census pending-evidence count read, whose gauge keeps its last "
+                          "the census gauge reads (the pending-evidence count and the "
+                          "unordered-agents count), whose gauges keep their last "
                           "value; guardian_census_device = the per-device unrepresented-pending "
-                          "reads, fail-hard, the device request is refused and a statement_timeout "
+                          "and emit-order reads, fail-hard, the device request is refused and a "
+                          "statement_timeout "
                           "most likely means a large retained pending backlog, which a retry usually "
                           "does not clear). "
                           "A sampled warn accompanies each new degrade episode.",
