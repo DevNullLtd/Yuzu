@@ -349,8 +349,8 @@ its `:has()` rules are removed; a selftest failure fails the gate.
 
 The selftest half also runs in CI: the path-filtered `ui-smoke-selftest` workflow
 (`.github/workflows/ui-smoke-selftest.yml`) runs `node tests/puppeteer/ui-smoke.mjs --selftest` on a
-hosted `ubuntu-24.04` runner when `server/core/src/*_ui.cpp`, `server/core/static/**`,
-`tests/puppeteer/**`, the Apps goldens or the install script change. It is **not a required check**: it
+hosted `ubuntu-24.04` runner when `server/core/src/*_ui.cpp`, `server/core/src/dex_pane.hpp`,
+`server/core/src/dex_routes.cpp`, `server/core/src/plural.hpp`, `server/core/static/**`, `tests/puppeteer/**`, the Apps goldens or the install script change. It is **not a required check**: it
 is path-filtered, and the `dev` ruleset blocks a merge on a required check that was skipped. The live
 half (the scenarios against a running dashboard) stays in `/test`, because it needs the UAT stack. A failure records FAIL (the
 older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,

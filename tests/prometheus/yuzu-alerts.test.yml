@@ -3498,7 +3498,7 @@ tests:
   # (authoritative rule/status reads, fail-hard), "guardian_census" (the
   # census pending-evidence count read, #5690) and "guardian_census_device"
   # (the two per-device unrepresented-pending reads, #7217, whose reasons add
-  # statement_timeout) - each pages on a sustained non-zero rate, keyed by both
+  # statement_timeout, as does the Apps read on guardian_state) - each pages on a sustained non-zero rate, keyed by both
   # labels (the expr has no source filter; the cases below exercise
   # guardian_state, guardian_rules and guardian_census_device).
 
