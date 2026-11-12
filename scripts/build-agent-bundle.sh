@@ -8,8 +8,9 @@
 #
 # The Windows (MSVC) and macOS (Apple Clang) agents cannot be cross-built in a
 # Linux Docker stage, so this does NOT compile anything. It downloads the
-# signed/notarized per-platform archives + native installers from the matching
-# GitHub *release*, verifies the release SHA256SUMS' cosign signature (keyless,
+# per-platform archives + native installers from the matching
+# GitHub *release* (the Windows installer is Authenticode-signed; the macOS
+# agent is NOT signed or notarized, see docs/agent-bundle.md), verifies the release SHA256SUMS' cosign signature (keyless,
 # exact workflow identity) and then each artifact against ITS OWN line in that
 # manifest, lays them out under /opt/yuzu-agents, and bakes them into the
 # chiselled image.
@@ -24,6 +25,8 @@
 #                 table by version: <= 0.13.x Tr3kkR/Yuzu, later DevNullLtd/Yuzu
 #                 (the identity is baked into the Fulcio cert and not rewritten
 #                 by the repo move). Never derived from the checkout's origin.
+# --keep-staging  keep this run's staging dir (its path is printed) instead of
+#                 removing it on exit. Each run stages in its own mktemp dir.
 # --verify-only   download, verify the signature and every hash, then stop
 #                 (no docker, no build). Needs gh + cosign only.
 # cosign is REQUIRED; there is no skip flag (fail closed).
@@ -45,8 +48,13 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 cd "$REPO_ROOT"
 
 DOCKERFILE="deploy/docker/Dockerfile.agent-bundle.chisel"
-STAGING="deploy/docker/.agent-bundle-build"   # build context (gitignored)
-BUNDLE_ROOT="$STAGING/yuzu-agents"            # becomes /opt/yuzu-agents
+# Build context: a PER-RUN mktemp dir under deploy/docker/ (gitignored via
+# .agent-bundle-build*), created at the layout step and removed only by the run
+# that made it, so two hand builds in one checkout can never share or delete
+# each other's tree. STAGING stays empty until then.
+STAGING_PREFIX="deploy/docker/.agent-bundle-build"
+STAGING=""
+BUNDLE_ROOT=""                                # $STAGING/yuzu-agents -> /opt/yuzu-agents
 
 # ── Defaults / config ─────────────────────────────────────────────────────
 VERSION="${YUZU_VERSION:-0.15.0}"
@@ -105,7 +113,7 @@ while [ $# -gt 0 ]; do
     --verify-only) VERIFY_ONLY=1 ;;
     --signer-repo) [ $# -ge 2 ] || die "--signer-repo needs owner/repo"; SIGNER_REPO="$2"; shift ;;
     --signer-repo=*) SIGNER_REPO="${1#*=}" ;;
-    -h|--help)     sed -n '2,37p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)     sed -n '2,39p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *) die "unknown arg: $1" ;;
   esac
   shift
@@ -136,11 +144,18 @@ parse_signer_repo() {
 }
 [[ "$VERSION" =~ ^([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})(-(alpha|beta|rc)[0-9]{1,4})?$ ]] \
   || die "malformed --version '$VERSION' (want X.Y.Z or X.Y.Z-{alpha,beta,rc}N, 1-4 digits per field)"
+ERA_SIGNER_REPO="$(parse_signer_repo "$VERSION")" || ERA_SIGNER_REPO=""
 if [ -z "$SIGNER_REPO" ]; then
-  SIGNER_REPO="$(parse_signer_repo "$VERSION")" || die "cannot derive the signer repo for version '$VERSION'; pass --signer-repo owner/repo"
+  [ -n "$ERA_SIGNER_REPO" ] || die "cannot derive the signer repo for version '$VERSION'; pass --signer-repo owner/repo"
+  SIGNER_REPO="$ERA_SIGNER_REPO"
 fi
 [[ "$SIGNER_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
   || die "malformed --signer-repo '$SIGNER_REPO' (want owner/repo)"
+if [ "$SIGNER_REPO" != "$ERA_SIGNER_REPO" ]; then
+  warn "--signer-repo $SIGNER_REPO differs from the era table's $ERA_SIGNER_REPO for $VERSION."
+  warn "Only a release you KNOW was built by that repo's release.yml should be verified this way;"
+  warn "never copy a repo name out of a cosign error message."
+fi
 SIGNER_IDENTITY="https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
 SIGNER_ISSUER="https://token.actions.githubusercontent.com"
 
@@ -154,15 +169,22 @@ if [ "$VERIFY_ONLY" = 0 ]; then
 fi
 # cosign is mandatory: SHA256SUMS is only trustworthy once its signature is
 # verified, so a missing cosign is a hard stop, never a skipped check.
-command -v cosign >/dev/null 2>&1 || die "need cosign on PATH to verify SHA256SUMS' signature (no skip flag, by design) — https://docs.sigstore.dev/cosign/system_config/installation/ , 'brew install cosign', or 'winget install Sigstore.Cosign'"
+command -v cosign >/dev/null 2>&1 || die "need cosign on PATH to verify SHA256SUMS' signature (no skip flag, by design) — https://docs.sigstore.dev/cosign/system_config/installation/ , 'brew install cosign', 'winget install Sigstore.Cosign', or download the release binary (apt/dnf have no cosign package)"
 command -v gh >/dev/null 2>&1 || die "need the GitHub CLI (gh), authenticated, to download release assets — 'brew install gh && gh auth login'"
 
 DL=""; SMOKE_TMP=""
 cleanup() {
   [ -n "$DL" ] && rm -rf "$DL" 2>/dev/null || true
   [ -n "$SMOKE_TMP" ] && rm -rf "$SMOKE_TMP" 2>/dev/null || true
-  # Only the staging dir THIS run created (a --verify-only run never does).
-  if [ "${STAGING_OWNED:-0}" = 1 ] && [ "${KEEP_STAGING:-0}" != 1 ]; then rm -rf "$STAGING" 2>/dev/null || true; fi
+  # Only the staging dir THIS run created (a --verify-only run never does); the
+  # case guard confines the rm to our own mktemp'd name.
+  if [ "${STAGING_OWNED:-0}" = 1 ]; then
+    if [ "${KEEP_STAGING:-0}" = 1 ]; then
+      info "staging kept at $STAGING"
+    else
+      case "$STAGING" in "$STAGING_PREFIX".??????) rm -rf "$STAGING" 2>/dev/null || true ;; esac
+    fi
+  fi
 }
 trap cleanup EXIT
 
@@ -203,7 +225,7 @@ gh release download "$TAG" --repo "$REPO_SLUG" -D "$DL" --clobber \
 # ── Authenticate SHA256SUMS before ANY use of it ───────────────────────────
 if [ ! -s "$DL/SHA256SUMS.sigstore" ]; then
   if [ -s "$DL/SHA256SUMS.bundle" ]; then
-    die "$TAG carries only the legacy SHA256SUMS.bundle (no SHA256SUMS.sigstore); this script verifies the .sigstore form only and will not trust an unverified SHA256SUMS — verify that release by hand per docs/user-manual/release-verification.md"
+    die "$TAG carries only the legacy SHA256SUMS.bundle (no SHA256SUMS.sigstore); this script verifies the .sigstore form only and will not trust an unverified SHA256SUMS — verify that release by hand: cosign verify-blob --bundle SHA256SUMS.bundle --certificate-identity https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG} --certificate-oidc-issuer ${SIGNER_ISSUER} SHA256SUMS (releases v0.8.0-rc0 to v0.10.0 carry neither signature file and cannot be verified this way)"
   fi
   die "no SHA256SUMS.sigstore on $TAG; refusing to trust SHA256SUMS without its signature"
 fi
@@ -216,7 +238,11 @@ if ! cosign verify-blob \
       "$DL/SHA256SUMS" 2>"$DL/cosign.err" >"$DL/cosign.out"; then
   fail "cosign verify-blob FAILED for $TAG (expected signer $SIGNER_REPO):"
   sed 's/^/     cosign: /' "$DL/cosign.err" >&2
-  die "SHA256SUMS signature did not verify; refusing to use it (wrong --signer-repo for this era, or a tampered release)"
+  fail "The only legitimate signers are Tr3kkR/Yuzu (<= 0.13.x) and DevNullLtd/Yuzu (after)."
+  fail "A mismatch on the default path means a tampered release or the wrong download source."
+  fail "NEVER set --signer-repo to the subject cosign reports above."
+  fail "If cosign's error is a Sigstore/TUF network failure it is transient: wait and re-run."
+  die "SHA256SUMS signature did not verify; refusing to use it"
 fi
 ok "SHA256SUMS signature verified (signer $SIGNER_REPO, $TAG)"
 
@@ -290,8 +316,10 @@ fi
 
 # ── 2. Lay out the /opt/yuzu-agents tree ───────────────────────────────────
 info "Laying out the bundle tree..."
-[ "$KEEP_STAGING" = 1 ] || rm -rf "$STAGING"
+STAGING="$(mktemp -d "$REPO_ROOT/$STAGING_PREFIX.XXXXXX")" || die "cannot create a staging dir under $REPO_ROOT/deploy/docker"
+STAGING="${STAGING#"$REPO_ROOT"/}"            # relative, so the cleanup case guard matches
 STAGING_OWNED=1
+BUNDLE_ROOT="$STAGING/yuzu-agents"
 mkdir -p "$BUNDLE_ROOT"
 
 # extract_payload <platform> <archive> <unpacker> : strips yuzu-server, keeps
@@ -344,7 +372,7 @@ gateway of the same version):
 
   linux-x64     Linux   x86_64          (glibc)
   windows-x64   Windows x86_64          (MSVC, Authenticode-signed)
-  macos-arm64   macOS   Apple Silicon   (notarized)
+  macos-arm64   macOS   Apple Silicon   (NOT signed or notarized)
 
 This is a DELIVERY image, not a runtime: it ships the agent for three operating
 systems so you can copy the right one onto each endpoint. Nothing here runs the
@@ -377,6 +405,8 @@ Integrity
     cosign verify-blob --bundle UPSTREAM-SHA256SUMS.sigstore \\
       --certificate-identity ${SIGNER_IDENTITY} \\
       --certificate-oidc-issuer ${SIGNER_ISSUER} UPSTREAM-SHA256SUMS
+    (This needs network access to Sigstore's TUF root, or a local --trusted-root;
+    it is absent from bundles built before this check existed.)
   Verify:  cd yuzu-agents && sha256sum -c SHA256SUMS
 EOF
 
@@ -408,7 +438,7 @@ PERSISTENT (systemd service via native package):
 EOF
 
 cat > "$BUNDLE_ROOT/macos-arm64/README.txt" <<EOF
-Yuzu Agent — macos-arm64 — ${VERSION}  (Apple Silicon, notarized)
+Yuzu Agent — macos-arm64 — ${VERSION}  (Apple Silicon, NOT signed or notarized)
 ==============================================================================
 DEMO (no-TLS stack, foreground) — simplest:
   cd payload
@@ -416,10 +446,12 @@ DEMO (no-TLS stack, foreground) — simplest:
     --server <GATEWAY_HOST>:50051 --no-tls \\
     --enrollment-token <TOKEN> \\
     --plugin-dir "\$PWD/plugins" --data-dir ./data --log-level info
-  # The binary is signed + notarized. If macOS quarantines copied files:
+  # The macOS agent is NOT signed or notarized (see docs/agent-bundle.md), so
+  # Gatekeeper will quarantine copied files. Clear that only after you have
+  # verified the bundle (see Integrity in the top-level README.txt):
   #   xattr -dr com.apple.quarantine ./bin ./plugins
 
-PERSISTENT (launchd daemon via signed .pkg):
+PERSISTENT (launchd daemon via the .pkg; the .pkg is not signed or notarized either):
   sudo installer -pkg installers/${PKG} -target /
   Edit /Library/LaunchDaemons/com.yuzu.agent.plist — add to <ProgramArguments>:
     --server <GATEWAY_HOST>:50051   --enrollment-token <TOKEN>
@@ -520,8 +552,6 @@ else
     ok "Pushed $IMAGE_REF"
   fi
 fi
-
-[ "$KEEP_STAGING" = 1 ] || rm -rf "$STAGING"
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"

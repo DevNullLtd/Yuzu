@@ -79,7 +79,7 @@ missing `cosign` (required, no skip flag), a missing `.sigstore`, or a legacy
 release that carries only `SHA256SUMS.bundle`. The signer is a fixed table by
 version, not read from `origin`: `Tr3kkR/Yuzu` up to `v0.13.x`, `DevNullLtd/Yuzu`
 after the 2026-09-28 move (see `docs/user-manual/release-verification.md`);
-override with `--signer-repo owner/repo`. `--verify-only` downloads and verifies,
+override with `--signer-repo owner/repo`, which prints a `[!!]` warning when it differs from the table. The only legitimate signers are those two repositories: never set `--signer-repo` to the subject cosign reports in a failure, because a mismatch on the default means a tampered release or the wrong download source. `--verify-only` downloads and verifies,
 then stops, with no docker needed. When `gh` is present the script also
 best-effort verifies the SLSA provenance attestation; that step does not gate the
 build. Registry owner is derived from `origin` (override with `--registry`);
@@ -285,9 +285,11 @@ a partner's security team can verify it before trusting the pull:
 ```bash
 cosign verify ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp='^https://github.com/<owner>/Yuzu/\.github/workflows/release\.yml@.*'
+  --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>'
 gh attestation verify oci://ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> --repo <owner>/Yuzu
 ```
+
+`<signer>` is `Tr3kkR/Yuzu` for releases up to `v0.13.x` and `DevNullLtd/Yuzu` after; the identity is an exact, tag-bound match.
 
 (Manual off-cycle builds via `scripts/build-agent-bundle.sh` are *not* image-signed
 — only the CI job signs. Prefer the released, CI-published image for partners.)

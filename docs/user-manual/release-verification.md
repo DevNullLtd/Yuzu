@@ -91,33 +91,32 @@ prove authenticity — use the cosign step below for that.
 was signed by the GitHub Actions workflow that produced this release.
 
 ```bash
+TAG=v0.11.0   # the exact tag of the release you downloaded
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore \
-  --certificate-identity-regexp "https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*" \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 ```
 
+The identity is an exact match, bound to the tag: a signature from a
+different tag of the same repository (an older or a downgraded release)
+does not verify. Use the `SIGNER_REPO` for your release's era (the table
+above); never take it from an error message.
+
 On success: `Verified OK`. Combined with step 1, this proves every
 listed asset is exactly what the workflow produced.
-
-**Tighter identity matching.** If you know the exact tag, substitute the
-regex for a literal match:
-
-```bash
-  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v0.11.0"
-```
 
 ## 3. Verify Docker image signatures (cosign)
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp "https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*" \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v0.11.0" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/${OWNER}/yuzu-server:0.11.0
 
 cosign verify \
-  --certificate-identity-regexp "https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*" \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v0.11.0" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   ghcr.io/${OWNER}/yuzu-gateway:0.11.0
 ```
@@ -221,7 +220,7 @@ VERSION="${1:?usage: verify.sh <version, e.g. 0.11.0>}"
 OWNER="${OWNER:-tr3kkr}"                   # devnullltd for releases after 2026-09-28
 SIGNER_REPO="${SIGNER_REPO:-Tr3kkR/Yuzu}"  # DevNullLtd/Yuzu for the same
 
-IDENTITY_RE="https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*"
+IDENTITY="https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v${VERSION#v}"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 echo "→ sha256sum -c SHA256SUMS"
@@ -230,14 +229,14 @@ sha256sum -c SHA256SUMS
 echo "→ cosign verify-blob (SHA256SUMS)"
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore \
-  --certificate-identity-regexp "$IDENTITY_RE" \
+  --certificate-identity "$IDENTITY" \
   --certificate-oidc-issuer "$OIDC_ISSUER" \
   SHA256SUMS
 
 echo "→ cosign verify (Docker images)"
 for img in server gateway; do
   cosign verify \
-    --certificate-identity-regexp "$IDENTITY_RE" \
+    --certificate-identity "$IDENTITY" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
     "ghcr.io/${OWNER}/yuzu-${img}:${VERSION}" >/dev/null
   echo "  ghcr.io/${OWNER}/yuzu-${img}:${VERSION} OK"
@@ -265,17 +264,25 @@ echo "✓ all checks passed for v${VERSION}"
 
 ## Troubleshooting
 
-**`cosign verify-blob: no matching signatures`** — the release you are
-verifying predates signing, or the `--certificate-identity-regexp` is
-too strict for the tag format. Widen to `--certificate-identity-regexp
-'.*'` to diagnose, then tighten once you have confirmed the identity.
+**`cosign verify-blob: no matching signatures` / `certificate identity
+mismatch`** — do NOT widen the identity to a wildcard; that accepts a
+signature from any workflow. Check, in order: the release predates signing
+(v0.8.0 to v0.10.0 carry no signature file at all); `TAG` is not exactly the
+tag you downloaded; or `SIGNER_REPO` is wrong for the era (`Tr3kkR/Yuzu` up to
+0.13.x, `DevNullLtd/Yuzu` after). The only legitimate signers are those two
+repositories: if the default for the release's era fails, treat the download
+as suspect (wrong source or tampered), and never set `SIGNER_REPO` to the
+subject cosign prints. A network error reaching Sigstore's TUF root is
+transient: wait and re-run.
 
-**`SHA256SUMS.sigstore: no such file`** — releases up to and including
-v0.11.0 ship the same bundle under the legacy filename
-`SHA256SUMS.bundle`. Both files contain a byte-identical Sigstore bundle
-and either can be passed to `cosign verify-blob --bundle`. v0.11.0 and
-v0.11.0-rc2 carry both names side-by-side; v0.12.0 onwards ship only
-the canonical `.sigstore` filename.
+**`SHA256SUMS.sigstore: no such file`** — the v0.7.x releases ship the
+bundle only under the legacy filename `SHA256SUMS.bundle`; v0.8.0-rc0 to
+v0.10.0 ship neither file (no signature to verify). v0.11.0-rc1, -rc2 and
+v0.11.0 carry both names side-by-side (byte-identical bundles, either can be
+passed to `cosign verify-blob --bundle`); v0.12.0 onwards ship only the
+canonical `.sigstore` filename. `scripts/build-agent-bundle.sh` performs the
+same exact-identity check on `SHA256SUMS.sigstore` and refuses any release
+without it (see [the agent bundle guide](../agent-bundle.md)).
 
 **`gh attestation verify: no attestations found`** — run `gh auth login`
 first; the GitHub CLI must be able to query

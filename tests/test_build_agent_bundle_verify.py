@@ -21,13 +21,16 @@ Stdlib only; needs a POSIX bash, so it skips on Windows.
 """
 
 import hashlib
+import io
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,7 +47,11 @@ FORK = "Example/Fork"          # the checkout's origin; must never decide the si
 # testable without the host's cosign (or anything else) leaking in.
 TOOLS = ["git", "sed", "awk", "tr", "cut", "mktemp", "sha256sum", "ls", "head", "cat",
          "rm", "wc", "mkdir", "cp", "dirname", "basename", "grep", "sort", "env",
-         "tail", "uname", "find", "xargs", "id", "chmod", "du", "date", "printf"]
+         "tail", "uname", "find", "xargs", "id", "chmod", "du", "date", "printf",
+         # shasum is a perl script: the macOS fallback needs both (and a case hides sha256sum).
+         "shasum", "perl",
+         # only the (docker-stubbed) build cases need these
+         "tar", "gzip", "unzip"]
 
 GH_STUB = r"""#!/bin/bash
 printf '%s\n' "$@" > "$STUB_LOG_DIR/gh.argv"
@@ -101,8 +108,20 @@ class VerifyTests(unittest.TestCase):
         self.toolbin = self.tmp / "toolbin"
         self.stubs = self.tmp / "stubs"
         self.scratch = self.tmp / "scratch"          # the script's TMPDIR
-        for d in (self.fixture, self.logs, self.toolbin, self.stubs, self.scratch):
+        self.repo = self.tmp / "repo"                # the script's REPO_ROOT: NEVER the real checkout
+        for d in (self.fixture, self.logs, self.toolbin, self.stubs, self.scratch, self.repo):
             d.mkdir()
+        # The script `cd`s to `git rev-parse --show-toplevel` and creates/removes a
+        # staging dir under deploy/docker, so it only ever runs from a scratch
+        # `git init` copy (the test_ensure_install_helpers.py pattern), never from
+        # the checkout this test lives in (#7529 governance UP-1).
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True,
+                       env={"PATH": os.environ["PATH"], "HOME": str(self.tmp)})
+        (self.repo / "scripts").mkdir()
+        shutil.copy(SCRIPT, self.repo / "scripts" / "build-agent-bundle.sh")
+        (self.repo / "deploy" / "docker").mkdir(parents=True)
+        for f in ("Dockerfile.agent-bundle.chisel", "agent-bundle-extract.sh"):
+            shutil.copy(ROOT / "deploy" / "docker" / f, self.repo / "deploy" / "docker" / f)
         for t in TOOLS:
             real = shutil.which(t)
             if real:
@@ -133,7 +152,9 @@ class VerifyTests(unittest.TestCase):
         return files
 
     def run_script(self, *args, cosign=True, cosign_rc=0, cosign_stderr="", extra_env=None,
-                   cosign_body=COSIGN_STUB):
+                   cosign_body=COSIGN_STUB, verify_only=True, hide=()):
+        for t in hide:
+            (self.toolbin / t).unlink(missing_ok=True)
         if cosign:
             self._stub("cosign", cosign_body)
         env = {
@@ -149,8 +170,13 @@ class VerifyTests(unittest.TestCase):
         env.update(extra_env or {})
         if not cosign and (self.stubs / "cosign").exists():
             (self.stubs / "cosign").unlink()
-        return subprocess.run([BASH, str(SCRIPT), "--verify-only", *args], cwd=ROOT,
+        script = self.repo / "scripts" / "build-agent-bundle.sh"
+        pre = ["--verify-only"] if verify_only else []
+        return subprocess.run([BASH, str(script), *pre, *args], cwd=self.repo,
                               env=env, capture_output=True, text=True)
+
+    def staging_dirs(self):
+        return sorted(p.name for p in (self.repo / "deploy" / "docker").glob(".agent-bundle-build*"))
 
     def cosign_argv(self):
         return (self.logs / "cosign.argv").read_text().splitlines()
@@ -223,6 +249,17 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn(NEW, " ".join(self.cosign_argv()))
 
+    def test_override_differing_from_the_era_table_warns_loudly(self):
+        self.release("0.15.0")
+        r = self.run_script("--version", "0.15.0", "--signer-repo", OLD)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("[!!] --signer-repo Tr3kkR/Yuzu differs from the era table's DevNullLtd/Yuzu", r.stdout)
+        # the era default and an override equal to it stay silent
+        for extra in ([], ["--signer-repo", NEW]):
+            r = self.run_script("--version", "0.15.0", *extra)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertNotIn("differs from the era table", r.stdout)
+
     def test_malformed_signer_repo_refused(self):
         self.release("0.15.0")
         r = self.run_script("--version", "0.15.0", "--signer-repo", "no-slash")
@@ -247,6 +284,23 @@ class VerifyTests(unittest.TestCase):
         self.assertFailed(r, "cosign verify-blob FAILED", "none of the expected identities matched")
         self.assertCleanedUp()
 
+    def test_failure_text_names_only_the_two_signers_and_forbids_copying_the_subject(self):
+        # SEC-1/SRE-1: the die text must not invite --signer-repo <what cosign reported>.
+        self.release("0.15.0")
+        r = self.run_script("--version", "0.15.0", cosign_rc=1,
+                            cosign_stderr="Error: expected SAN github.com/Attacker/Yuzu")
+        self.assertFailed(r, "Tr3kkR/Yuzu", "DevNullLtd/Yuzu", "tampered release or the wrong download source",
+                          "NEVER set --signer-repo", "transient: wait and re-run")
+        self.assertNotIn("wrong --signer-repo", r.stdout + r.stderr)
+
+    def test_bad_signature_wins_over_a_tampered_file(self):
+        # QE-1 / ordering: with BOTH a bad signature and a tampered file the run
+        # must stop at the signature, never reach (or report) the hash.
+        self.release("0.15.0", overrides={"yuzu-linux-x64.tar.gz": b"evil"})
+        r = self.run_script("--version", "0.15.0", cosign_rc=1, cosign_stderr="Error: bad sig")
+        self.assertFailed(r, "cosign verify-blob FAILED")
+        self.assertNotIn("hash MISMATCH", r.stdout + r.stderr)
+
     def test_wrong_era_signer_fails(self):
         # The stub cannot judge identities, so model the real behaviour: it fails
         # whenever the identity is not the one the fixture was "signed" with.
@@ -268,6 +322,11 @@ class VerifyTests(unittest.TestCase):
         self.release("0.11.0", sigstore=False, legacy_bundle=True)
         r = self.run_script("--version", "0.11.0")
         self.assertFailed(r, "legacy SHA256SUMS.bundle")
+        # UP-2: the by-hand command is inline, exact and tag-bound (no doc pointer, no regexp).
+        self.assertIn("cosign verify-blob --bundle SHA256SUMS.bundle --certificate-identity "
+                      f"https://github.com/{OLD}/.github/workflows/release.yml@refs/tags/v0.11.0 "
+                      f"--certificate-oidc-issuer {ISSUER} SHA256SUMS", r.stdout + r.stderr)
+        self.assertNotIn("regexp", r.stdout + r.stderr)
         self.assertFalse((self.logs / "cosign.argv").exists())
 
     def test_cosign_absent_fails_closed(self):
@@ -387,14 +446,99 @@ class VerifyTests(unittest.TestCase):
         self.assertFailed(r, "no Windows installer asset")
 
     def test_verify_only_stops_and_leaves_no_build_state(self):
+        # A marker in the scratch checkout's staging area must survive (UP-1).
+        marker = self.repo / "deploy" / "docker" / ".agent-bundle-build" / "marker"
+        marker.parent.mkdir()
+        marker.write_text("keep")
         self.release("0.15.0")
-        staging = ROOT / "deploy" / "docker" / ".agent-bundle-build"
-        existed = staging.exists()
         r = self.run_script("--version", "0.15.0")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("--verify-only", r.stdout)
         self.assertNotIn("Laying out", r.stdout)
-        self.assertEqual(staging.exists(), existed)
+        self.assertTrue(marker.exists(), "a run deleted a staging tree it did not create")
+        self.assertEqual(self.staging_dirs(), [".agent-bundle-build"])
+
+    def test_sha256sum_absent_falls_back_to_shasum(self):
+        # XP-1: the macOS toolchain has shasum (perl) but no sha256sum.
+        if shutil.which("shasum") is None or shutil.which("perl") is None:
+            self.skipTest("needs shasum + perl")
+        self.release("0.15.0")
+        r = self.run_script("--version", "0.15.0", hide=("sha256sum",))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("match their own SHA256SUMS line", r.stdout)
+
+    # ---- the build path (docker stubbed): per-run staging dir (UP-12) -----------------
+    def _build_release(self, version="0.15.0"):
+        def tgz(binname):
+            b = io.BytesIO()
+            with tarfile.open(fileobj=b, mode="w:gz") as t:
+                for name, data, mode in (("top/bin/" + binname, b"#!/bin/sh\n", 0o755),
+                                         ("top/plugins/p.so", b"so", 0o644)):
+                    ti = tarfile.TarInfo(name)
+                    ti.size, ti.mode = len(data), mode
+                    t.addfile(ti, io.BytesIO(data))
+            return b.getvalue()
+        zb = io.BytesIO()
+        with zipfile.ZipFile(zb, "w") as z:
+            z.writestr("top/bin/yuzu-agent.exe", b"MZ")
+            z.writestr("top/plugins/p.dll", b"dll")
+        files = artifacts(version)
+        files["yuzu-linux-x64.tar.gz"] = tgz("yuzu-agent")
+        files["yuzu-agent-macos-arm64.tar.gz"] = tgz("yuzu-agent")
+        files["yuzu-agent-windows-x64.zip"] = zb.getvalue()
+        for n, b in files.items():
+            (self.fixture / n).write_bytes(b)
+        (self.fixture / "SHA256SUMS").write_text("".join(f"{sha(b)}  {n}\n" for n, b in files.items()))
+        (self.fixture / "SHA256SUMS.sigstore").write_text("{}")
+        self._stub("docker", '#!/bin/bash\nprintf "%s\\n" "$*" >> "$STUB_LOG_DIR/docker.argv"\n'
+                             '[ "$1" = build ] && ls "${@: -1}" > "$STUB_LOG_DIR/docker.context"\nexit 0\n')
+
+    def _build(self, *extra):
+        if shutil.which("unzip") is None:
+            self.skipTest("needs unzip")
+        return self.run_script("--version", "0.15.0", "--no-test", *extra, verify_only=False)
+
+    def test_build_uses_and_removes_only_its_own_staging_dir(self):
+        self._build_release()
+        old = self.repo / "deploy" / "docker" / ".agent-bundle-build" / "marker"
+        other = self.repo / "deploy" / "docker" / ".agent-bundle-build.ZZZZZZ" / "marker"
+        for m in (old, other):
+            m.parent.mkdir()
+            m.write_text("keep")
+        r = self._build()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(old.exists() and other.exists(), "a build deleted a tree it did not create")
+        self.assertEqual(self.staging_dirs(), [".agent-bundle-build", ".agent-bundle-build.ZZZZZZ"])
+        ctx = (self.logs / "docker.context").read_text()
+        self.assertIn("yuzu-agents", ctx)          # docker built from the run's own tree
+        self.assertIn("extract.sh", ctx)
+
+    def test_keep_staging_prints_the_path_and_runs_get_distinct_dirs(self):
+        self._build_release()
+        r1 = self._build("--keep-staging")
+        r2 = self._build("--keep-staging")
+        for r in (r1, r2):
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        dirs = self.staging_dirs()
+        self.assertEqual(len(dirs), 2, dirs)
+        for d in dirs:
+            self.assertRegex(d, r"^\.agent-bundle-build\.[A-Za-z0-9]{6}$")
+            self.assertIn(f"staging kept at deploy/docker/{d}", r1.stdout + r2.stdout)
+
+    def test_failed_build_cleans_its_staging_dir_and_keep_staging_preserves_it(self):
+        self._build_release()
+        (self.fixture / "yuzu-agent-windows-x64.zip").write_bytes(b"not a zip")
+        # keep the manifest consistent so the failure is in the build, not the hash
+        lines = [l for l in (self.fixture / "SHA256SUMS").read_text().splitlines()
+                 if not l.endswith("yuzu-agent-windows-x64.zip")]
+        lines.append(f"{sha(b'not a zip')}  yuzu-agent-windows-x64.zip")
+        (self.fixture / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+        r = self._build()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.staging_dirs(), [])
+        r = self._build("--keep-staging")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(len(self.staging_dirs()), 1)
 
 
 @unittest.skipIf(os.name == "nt" or shutil.which("bash") is None or IN_MUTATION_RUN,
@@ -407,7 +551,8 @@ class MutationSelfTest(unittest.TestCase):
     MUTANTS = [
         ("skip-cosign",
          "if ! cosign verify-blob", "if ! true",
-         ["test_bad_signature_fails_and_shows_cosign_stderr", "test_good_release_passes_with_exact_identity"]),
+         ["test_bad_signature_fails_and_shows_cosign_stderr", "test_good_release_passes_with_exact_identity",
+          "test_bad_signature_wins_over_a_tampered_file"]),
         ("identity-as-regexp",
          '--certificate-identity "$SIGNER_IDENTITY"', '--certificate-identity-regexp "$SIGNER_IDENTITY"',
          ["test_good_release_passes_with_exact_identity", "test_signer_table_by_era"]),
@@ -469,6 +614,30 @@ class MutationSelfTest(unittest.TestCase):
          'ok "--verify-only: $TAG verified (signer $SIGNER_REPO); stopping before any build"\n  exit 0',
          'ok "--verify-only: $TAG verified (signer $SIGNER_REPO); stopping before any build"',
          ["test_verify_only_stops_and_leaves_no_build_state"]),
+        ("signer-warning-removed",
+         'if [ "$SIGNER_REPO" != "$ERA_SIGNER_REPO" ]; then', 'if false; then',
+         ["test_override_differing_from_the_era_table_warns_loudly"]),
+        ("die-text-invites-override",
+         'fail "NEVER set --signer-repo to the subject cosign reports above."',
+         'fail "wrong --signer-repo for this era? pass the subject above."',
+         ["test_failure_text_names_only_the_two_signers_and_forbids_copying_the_subject"]),
+        ("legacy-bundle-doc-pointer",
+         'verify that release by hand: cosign verify-blob --bundle SHA256SUMS.bundle --certificate-identity https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG} --certificate-oidc-issuer ${SIGNER_ISSUER} SHA256SUMS',
+         'verify that release by hand per release-verification.md',
+         ["test_legacy_bundle_only_release_fails_closed_naming_it"]),
+        ("shasum-wrong-algorithm",
+         'SHACHK="shasum -a 256"', 'SHACHK="shasum -a 1"',
+         ["test_sha256sum_absent_falls_back_to_shasum"]),
+        ("fixed-staging-dir",
+         'STAGING="$(mktemp -d "$REPO_ROOT/$STAGING_PREFIX.XXXXXX")" || die "cannot create a staging dir under $REPO_ROOT/deploy/docker"',
+         'STAGING="$REPO_ROOT/$STAGING_PREFIX"; rm -rf "$STAGING"; mkdir -p "$STAGING"',
+         ["test_build_uses_and_removes_only_its_own_staging_dir"]),
+        ("keep-staging-silent",
+         'info "staging kept at $STAGING"', 'true',
+         ["test_keep_staging_prints_the_path_and_runs_get_distinct_dirs"]),
+        ("staging-never-cleaned",
+         'case "$STAGING" in "$STAGING_PREFIX".??????) rm -rf "$STAGING" 2>/dev/null || true ;; esac', 'true',
+         ["test_failed_build_cleans_its_staging_dir_and_keep_staging_preserves_it"]),
     ]
 
     def test_every_guard_has_a_case_that_catches_its_mutant(self):

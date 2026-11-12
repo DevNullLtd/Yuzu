@@ -241,7 +241,7 @@ Match the failure against this table. **All entries have happened in real Yuzu r
 | `Linking target agents/core/yuzu-agent` (or `yuzu_agent_core.dll`) fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, then "Re-run failed jobs" on the newest run; see Recovery. Long-form: see `.codex/agents/build-ci.md` "Windows MSVC static-link history and #375". |
 | `Verify the agent runs from the packaged archive` fails on `build-windows` | The Windows agent archive lacks a DLL the agent or `yuzu_agent_core.dll` imports (exit `-1073741515`, STATUS_DLL_NOT_FOUND), lacks plugin DLLs, contains `yuzu-server.exe`, or the agent hung (the step kills it after 60 s) | Read the step log. A transient cause (a hang, a runner problem): "Re-run failed jobs" on the newest run, as in Recovery above. A real packaging defect needs a commit, then re-tag as Recovery describes. No GitHub Release exists yet, but the docker-publish jobs do not wait for `build-windows`, so this tag's images may already be pushed |
 | `Notarize binaries` fails with "notarization status is 'Invalid'" on `build-macos` | Apple rejected the agent binary or a dylib (only once `MACOS_SIGNING_CERT` is set; macOS signing is dormant until then) | `xcrun notarytool log <id>` with the id printed in the step log (the step prints the notarization result). Fix the signing with a commit, then re-tag as Recovery describes. No GitHub Release exists yet, but this tag's images may already be pushed |
-| `docker-publish-agent-bundle` fails in `scripts/build-agent-bundle.sh` with `cosign verify-blob FAILED`, `no SHA256SUMS.sigstore`, `legacy SHA256SUMS.bundle`, `hash MISMATCH`, `no line for <file>` or `ambiguous` (#7529) | The script authenticates the release's `SHA256SUMS` with cosign (exact identity `https://github.com/<signer>/.github/workflows/release.yml@refs/tags/<tag>`, issuer `token.actions.githubusercontent.com`) before reading it, then matches each download to ITS OWN `SHA256SUMS` line. In CI the signer is `--signer-repo ${{ github.repository }}`; by hand it comes from a fixed table (<= 0.13.x `Tr3kkR/Yuzu`, later `DevNullLtd/Yuzu`). A mismatch means the signature, the signer repo, or an asset is wrong: `SHA256SUMS.sigstore` missing means the release was assembled by hand (see Known limitations), `hash MISMATCH`/`no line for` means a corrupt or tampered asset | Reproduce offline of docker with `bash scripts/build-agent-bundle.sh --verify-only --version X.Y.Z` (needs `gh` and `cosign`; `--signer-repo owner/repo` overrides the table). **Never skip the check or edit the script to get past it** and there is no skip flag by design; confirm with the operator before publishing a bundle for a release whose manifest does not verify. A transient download failure: "Re-run failed jobs" on the newest run. |
+| `docker-publish-agent-bundle` fails in `scripts/build-agent-bundle.sh` with `cosign verify-blob FAILED`, `no SHA256SUMS.sigstore`, `legacy SHA256SUMS.bundle`, `hash MISMATCH`, `no line for <file>` or `ambiguous` (#7529) | The script authenticates the release's `SHA256SUMS` with cosign (exact identity `https://github.com/<signer>/.github/workflows/release.yml@refs/tags/<tag>`, issuer `token.actions.githubusercontent.com`) before reading it, then matches each download to ITS OWN `SHA256SUMS` line. In CI the signer is `--signer-repo ${{ github.repository }}`; by hand it comes from a fixed table (<= 0.13.x `Tr3kkR/Yuzu`, later `DevNullLtd/Yuzu`). The ONLY legitimate signers are `Tr3kkR/Yuzu` (<= 0.13.x) and `DevNullLtd/Yuzu` (after): a `cosign verify-blob FAILED` on the default path means a tampered release or the wrong download source, NOT a signer to override. A Sigstore/TUF network failure in cosign's output is a transient (wait, then re-run). `SHA256SUMS.sigstore` missing means the release was assembled by hand (see Known limitations); `legacy SHA256SUMS.bundle` means a v0.7.x release (verify by hand with the exact tag-bound `--certificate-identity`); `hash MISMATCH`/`no line for` means a corrupt or tampered asset | Reproduce offline of docker with `bash scripts/build-agent-bundle.sh --verify-only --version X.Y.Z` (needs `gh` and `cosign`; `--signer-repo owner/repo` overrides the table and prints a `[!!]` warning when it differs; **never set it to the subject cosign reports**). **Never skip the check or edit the script to get past it** and there is no skip flag by design; confirm with the operator before publishing a bundle for a release whose manifest does not verify. A transient download failure: "Re-run failed jobs" on the newest run. |
 
 For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed ("Re-run failed jobs" on the newest run; see Recovery — or a fix and re-tag, or abort).
 
@@ -325,16 +325,18 @@ fi
 gh release download "vX.Y.Z" --pattern 'SHA256SUMS*'
 sha256sum -c SHA256SUMS
 
-# cosign: verify the keyless signature on SHA256SUMS + both images
+# cosign: verify the keyless signature on SHA256SUMS + both images, with the EXACT
+# tag-bound identity (never a wildcard). Signer = the repo that ran release.yml.
+SIGNER_REPO=DevNullLtd/Yuzu   # Tr3kkR/Yuzu only for releases <= 0.13.x
 if command -v cosign >/dev/null 2>&1; then
   cosign verify-blob \
     --bundle SHA256SUMS.sigstore \
-    --certificate-identity-regexp '.*' \
+    --certificate-identity "https://github.com/$SIGNER_REPO/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     SHA256SUMS
   for img in yuzu-server yuzu-gateway; do
     cosign verify \
-      --certificate-identity-regexp '.*' \
+      --certificate-identity "https://github.com/$SIGNER_REPO/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
       "ghcr.io/$OWNER/$img:X.Y.Z"
   done
