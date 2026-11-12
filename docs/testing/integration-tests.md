@@ -36,7 +36,7 @@ The primary integration test runs all three components together:
 ./scripts/integration-test.sh --tls --free-ports --gateway-ct
 ```
 
-The script needs Postgres (`YUZU_TEST_POSTGRES_DSN`; it creates a uniquely named database and
+The script needs bash 4+ (an older bash exits 2 before it creates anything) and Postgres (`YUZU_TEST_POSTGRES_DSN`; it creates a uniquely named database and
 drops it on exit), `psql`, `openssl`, `curl`, `python3` (and `ps`, only where there is no `/proc`) and Erlang/OTP with `rebar3` (it
 builds the gateway release). `ss` (iproute2) is optional: under `--free-ports` it confirms that
 every port belongs to the process that should hold it, and without it that check is skipped (the

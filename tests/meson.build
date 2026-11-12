@@ -4124,7 +4124,7 @@ if _bash_test.found()
     # start-up is a retryable lost race; a TLS/key start failure is not), the attempt loop,
     # its process-ownership guard and its monotonic clock. Hermetic: helpers
     # sourced from the script, fake ss, real throwaway sleep children; no stack, Postgres or
-    # root. LINUX ONLY: its assertions read /proc and need GNU `timeout`, so 7-10 of them fail
+    # root. LINUX ONLY: its assertions read /proc and need GNU `timeout`, so several of them fail
     # by construction on macOS; the no-/proc path is covered on Linux through NOPROC_DIR.
     if host_machine.system() == 'linux'
       test('integration-test.sh port-retry classifier (#7538)',

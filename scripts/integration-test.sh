@@ -64,6 +64,7 @@
 #   - Erlang/OTP + rebar3 (the gateway release is built here: rebar3 as prod release)
 #   - Postgres: YUZU_TEST_POSTGRES_DSN (the server fails closed without it); a
 #     uniquely named database is created for the run and dropped on exit
+#   - bash 4+ (an older bash exits 2 at once, before any trap, directory or process exists)
 #   - psql, openssl, curl, python3 (and ps, only where there is no /proc); ss (iproute2)
 #     is optional: without it the --free-ports port-ownership check is skipped (logged)
 #   - grpcurl (optional, for gRPC probing)
@@ -364,11 +365,14 @@ fi
 #      step's shell, not this script: the step ends when that shell exits, about 10 s
 #      after a timeout or cancel, and the orphaned script is SIGKILLed at job end without
 #      cleanup, so the delay cannot extend the step).
-#   5. The gateway release build runs BEFORE the server starts (it ran between them).
+#   5. The gateway release build runs BEFORE the server starts (it ran between them), and
+#      so do the YUZU_GW_MGMT_AUTH_MODE check (exit 2 on a bad value), the gateway node
+#      name, cookie and vm.args, and the sys.config write.
 #   6. Readiness is stricter: the server must answer HTTP on /readyz and the gateway on
 #      /healthz (any status, 30 s each), a wait stops early when its process exits, the
-#      budgets are monotonic time (/proc/uptime on Linux; where there is no /proc, $SECONDS,
-#      which follows the wall clock, as macOS does) and also capped in iterations, and
+#      budgets are monotonic time (/proc/uptime where it is readable at start-up; otherwise
+#      $SECONDS, which follows the wall clock, as on macOS, which has no /proc) and also
+#      capped in iterations, and
 #      verify_stack_bound checks both processes are still alive.
 #   7. A failed start prints the server.log tail (40 lines) and the whole gateway.log, then
 #      "FAIL: stack start-up failed (fixed ports: ...)", exit 1 (before: wait_for_port's
@@ -383,8 +387,14 @@ fi
 #      a second signal cannot cut the teardown (and the DROP DATABASE) short.
 #  11. The script refuses to start on bash older than 4 (exit 2): the BASHPID guard above
 #      would otherwise abort the EXIT trap and leave the stack and its database behind.
-#  12. The two psql calls that create and drop this run's database set PGCONNECT_TIMEOUT=10,
-#      so an unanswering database host cannot stall the teardown for minutes.
+#  12. The two psql calls that create and drop this run's database use the caller's
+#      PGCONNECT_TIMEOUT, or 10 when it is unset or empty (the CI linux job exports 30).
+#      This bounds the CONNECT only: a host that stops answering after the connection is
+#      up can still hold the teardown.
+#  13. The readiness log lines changed ("Server is ready." is now "Server answers HTTP.");
+#      nothing in the repo reads them.
+#  14. start_own_stack runs with errexit suppressed (`start_own_stack || START_RC=$?`), so
+#      its failure paths are explicit.
 # TEST SEAM (never used by CI): YUZU_IT_PORT_HOG_INDEX=<0..7> makes attempt 1 find
 # a stranger listening on that port (index order is the FREE_LIST order below), to
 # prove the retry. It is read only under --free-ports, honoured on attempt 1 only,
@@ -400,7 +410,10 @@ fi
 # GW_METRICS_PORT, ...), YUZU_IT_PORT_HOG_INDEX (read by run_start_attempts) and, through
 # that, compute_port_derived and write_gateway_config. Globals written: BIND_EVIDENCE,
 # SS_ABSENT_LOGGED, START_ATTEMPT, MAX_START_ATTEMPTS, PROC_PPID/PROC_START (_proc_fields),
-# and the SERVER_*/GATEWAY_* PID and STAMP variables (cleared by stop_own_stack). It moves
+# MONO_SRC (mono_clock_choose),
+# and the SERVER_*/GATEWAY_* PID and STAMP variables (cleared by stop_own_stack). The caller
+# must run mono_clock_choose once, before any wait, so that the clock is fixed for the whole
+# run (mono_seconds chooses lazily if it was not, but a choice made inside a subshell does not persist). It moves
 # or removes the per-attempt logs and crash dump in WORK_DIR, and stop_own_stack and
 # run_start_attempts can `exit 1`.
 # --- testable-helpers:begin ---
@@ -469,7 +482,8 @@ _proc_fields() {
 }
 
 # _ps_stamp <pid>: `ps` start time ("" when gone or when ps fails). It follows the wall
-# clock and the time zone, so it is only the fallback where there is no /proc.
+# clock (a clock step moves it; the time zone no longer does, TZ is pinned), so it is only
+# the fallback where there is no /proc.
 _ps_stamp() {
     TZ=UTC0 ps -o lstart= -p "$1" 2> /dev/null | sed 's/^ *//; s/ *$//' || true
 }
@@ -494,7 +508,7 @@ proc_stamp() {
 #      time that differs: the PID was recycled; the CI pool shares one OS identity, #1871)
 #   2  unknown: alive, but this cannot be told: an empty <stamp>, an unreadable /proc
 #      entry or a failing `ps`, or an "s:" (ps) start time that differs from the one
-#      captured, which a clock or time-zone change produces on a process that IS ours
+#      captured, which a wall-clock step produces on a process that IS ours (the time zone does not: TZ is pinned)
 # The check and the signal that follows are two steps; the window between them is not
 # closed (a microsecond, on a PID that was ours a moment ago).
 is_own_child() {
@@ -1061,7 +1075,7 @@ cleanup() {
     fi
     # Drop this run's database (created below, salted per run).
     if [[ -n "$IT_DB" && -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
-        PGCONNECT_TIMEOUT=10 psql "$YUZU_TEST_POSTGRES_DSN" -qtAc "DROP DATABASE IF EXISTS \"$IT_DB\" WITH (FORCE);" \
+        PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}" psql "$YUZU_TEST_POSTGRES_DSN" -qtAc "DROP DATABASE IF EXISTS \"$IT_DB\" WITH (FORCE);" \
             > /dev/null 2>&1 || true
     fi
     # Clean temp dir. It is kept when YUZU_KEEP_WORK_DIR is set (debugging) and
@@ -1198,7 +1212,7 @@ if ! $REUSE_STACK; then
     # the prefix, so the test-database sweepers can reclaim one this run leaked
     # (SIGKILL, runner loss). Same naming as tests/shell/test_gateway_peer_boot_refusal.sh.
     IT_DB="yuzu_test_$(date +%s)_gwint_${RUN_SALT}"
-    if ! PGCONNECT_TIMEOUT=10 psql "$YUZU_TEST_POSTGRES_DSN" -v ON_ERROR_STOP=1 -qtAc "CREATE DATABASE \"$IT_DB\";" \
+    if ! PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}" psql "$YUZU_TEST_POSTGRES_DSN" -v ON_ERROR_STOP=1 -qtAc "CREATE DATABASE \"$IT_DB\";" \
             > /dev/null 2>&1; then
         IT_DB=""
         echo "FAIL: could not CREATE DATABASE on YUZU_TEST_POSTGRES_DSN" >&2
@@ -1268,7 +1282,8 @@ wait_listening() {
         fi
         sleep 0.5
         # The iteration cap is the backstop when the clock cannot be read (each pass
-        # sleeps 0.5 s, so the cap is never reached before the budget on a readable clock).
+        # sleeps 0.5 s, so when `sleep` succeeds the cap is never reached before the budget
+        # on a readable clock).
         if mono_expired "$start" "$timeout" || (( ++iter >= timeout * 2 + 2 )); then
             echo "  ✗ $name did not start on port $port within ${timeout}s"
             return 1
@@ -1306,7 +1321,7 @@ wait_http_answers() {
             return 10
         fi
         sleep 0.5
-        # Backstop for an unreadable clock (a pass takes at least 0.5 s).
+        # Backstop for an unreadable clock (when `sleep` succeeds a pass takes at least 0.5 s).
         if mono_expired "$start" "$timeout" || (( ++iter >= timeout * 2 + 2 )); then
             echo "  ✗ $name not answering HTTP at $url within ${timeout}s"
             return 1
