@@ -4837,6 +4837,23 @@ test('forensics tier wiring lexical selftest',
   timeout: 30,
 )
 
+# yuzu_fleet_plugin_init_failed label catalogue: the one production set_known_plugins(...) line must
+# exist exactly once and precede the health recompute thread (no unit test builds ServerImpl; an
+# unwired store labels every real plugin "unknown"), and both metrics_.describe rows must exist.
+# The selftest deletes each required statement in memory and requires the gate to name it.
+test('plugin init failed wiring lexical',
+  _python3_test,
+  args: [files('test_plugin_init_failed_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('plugin init failed wiring lexical selftest',
+  _python3_test,
+  args: [files('test_plugin_init_failed_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #2146: the workflow-execute zero-reach status list lives in the header, the REST manual and the MCP
 # manual, and an absent command_id is never said to prove a step unsent. Self-checks in memory.
 test('workflow execute docs lexical',

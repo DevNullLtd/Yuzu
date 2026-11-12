@@ -47,6 +47,7 @@
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_matcher.hpp"        // validate_matcher: admission check of a caller matcher (#4644)
+#include "result_set_members.hpp"        // plugin_may_seed_result_set: Forensics-tier source refusal
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
 #include "revocation_source_admin_gate.hpp" // ADR-0070 R1: decide_admin + RevocationSourceService (shared REST+MCP)
@@ -711,8 +712,8 @@ static_assert(kMaxFacetValueBytes == 2048,
 // nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
 // array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
 // #undef'd right after it.
-#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica, and false for a failed set"})j"
-#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. A set created from a parent's members carries the parent's counters, summed along a lineage, so partial is the reliable signal. False for a failed set"})j"
+#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","agents_unanswered","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents",
      "List the connected agents the caller may read, with hostname, OS, architecture, "
@@ -1554,7 +1555,11 @@ static const ToolDef kTools[] = {
      "it still resolves store-only. See docs/asset-tagging-guide.md \"Tag source precedence\". A "
      "from_result_set:<id> atom referencing a result set that is absent, expired, or not owned "
      "by the caller aborts with kInvalidParams (RESULT_SET_NOT_FOUND) rather than silently "
-     "matching nothing or everything. REST v1 twin: POST /api/v1/scope/preview.",
+     "matching nothing or everything. An owned set that is still pending aborts with "
+     "kInternalError result_set_unusable and retry_after_ms 5000; one that has failed, or is "
+     "incomplete (partial) and referenced under NOT, LEN or STARTSWITH, aborts as "
+     "result_set_unusable with retry_after_ms null (re-run the producer that created the set). "
+     "REST v1 twin: POST /api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
@@ -1564,8 +1569,8 @@ static const ToolDef kTools[] = {
     // v1 had a full 12-operation API with zero MCP tools before this batch.
     // Every tool below shares the SAME `ResultSet` row shape (id/name/
     // owner_principal/created_at/ttl_at/last_used_at/pinned/parent_id/
-    // source_kind/status/source_execution_id/device_count/agents_failed/partial) as its REST v1
-    // twin — both surfaces call the SAME result_set_json() builder
+    // source_kind/status/source_execution_id/device_count/agents_failed/agents_unanswered/partial)
+    // as its REST v1 twin — both surfaces call the SAME result_set_json() builder
     // (result_set_model.hpp), so the shape cannot drift.
 
     {"list_result_sets",
@@ -1585,7 +1590,10 @@ static const ToolDef kTools[] = {
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
      "new set onto an owned existing set. A non-empty device_ids is checked against the "
      "fleet — any id that does not exist or is not visible to the caller rejects the whole "
-     "request (RESULT_SET_UNKNOWN_DEVICE_ID). REST v1 twin: POST /api/v1/result-sets. "
+     "request (RESULT_SET_UNKNOWN_DEVICE_ID). A parent_id that is pending or failed is "
+     "refused -32602 RESULT_SET_NOT_READY (wait for a pending parent, re-create a failed one); "
+     "the new set does not inherit the parent's agents_failed or agents_unanswered, since its "
+     "members are the given device_ids. REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
@@ -1604,7 +1612,9 @@ static const ToolDef kTools[] = {
      "or for failing to parse as JSON at all, this call refuses (kInternalError) rather than "
      "materialise a result set narrower than the true match set (#4496, extended by the #4496 "
      "follow-up for the parse-error cause; each cause is its own distinctly-named refusal "
-     "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
+     "reason - query_truncated/poison_excluded/parse_error_excluded). A parent_id that is "
+     "pending or failed is refused -32602 RESULT_SET_NOT_READY; the new set inherits the "
+     "parent's agents_failed and agents_unanswered. REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. JSON integers are exact; every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is -32602: send an integer, or send the decimal as a string under > >= < <= (at most 15 significant digits, a magnitude below 2^53, not subnormal, within the range of a double), where == and != stay a text compare; write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as 1e16 (read exactly). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
@@ -1620,7 +1630,7 @@ static const ToolDef kTools[] = {
      "the server only length-checks (max 100000 bytes). Membership is every agent that "
      "returned >=1 row (include_empty=true widens to every responder); an agent whose "
      "query failed is not a member, and the filled set reports how many in agents_failed "
-     "with partial=true (an execution with more than 100000 stored answers marks the set "
+     "(and the agents that never answered in agents_unanswered) with partial=true (an execution with more than 100000 stored answers marks the set "
      "failed instead, with agents_failed 0 and the reason in the server log). SQL that "
      "reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
@@ -1628,8 +1638,10 @@ static const ToolDef kTools[] = {
      "$Process_Hourly. Dispatches to "
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
-     "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
+     "nothing is refused (400), never silently widened. A parent_id that is pending or failed "
+     "is refused -32602 RESULT_SET_NOT_READY before anything is dispatched; the new set "
+     "carries the parent's agents_failed and agents_unanswered from creation. REST v1 twin: "
+     "POST /api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
      "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
      "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
@@ -1650,15 +1662,17 @@ static const ToolDef kTools[] = {
      "output row satisfies the operator-supplied matcher (column/op/value); omitting matcher "
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
-     "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
+     "create_result_set_from_echo_query, including the RESULT_SET_NOT_READY refusal of a pending "
+     "or failed parent and the inherited agents_failed and agents_unanswered. Find valid "
+     "instruction_id values via list_definitions "
      "or discover_instructions — do not guess. An echo.sql definition whose SQL (params.sql, "
      "else the definition's own default) reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
      "RESULT_SET_REEVAL_STALE_SOURCE and nothing is dispatched, the same as "
-     "create_result_set_from_echo_query. If the definition runs a Forensics-tier "
-     "plugin (an action on the Forensics securable) the set materializes with no members "
-     "for every creator, because the materializer never reads Forensics-tier output; an "
-     "empty set from such a definition says nothing about the fleet. A definition whose "
+     "create_result_set_from_echo_query. A definition that runs a Forensics-tier "
+     "plugin is refused with RESULT_SET_SOURCE_NOT_SUPPORTED (-32602) before anything is "
+     "dispatched, because the stored responses of such a plugin are withheld from "
+     "result-set membership. A definition whose "
      "plugin.action is gated (admin or approval) is refused for a non-admin caller with a "
      "permission-denied error whose error.data.reason is approval_required (permanent, "
      "retry_after_ms null): an approval ticket never lifts that gate for this tool, so a "
@@ -1702,6 +1716,9 @@ static const ToolDef kTools[] = {
      "narrowed to a parent set at creation time and that parent has since been deleted, this "
      "REFUSES (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than silently broadcasting "
      "to every visible device (#4306) — create a new set from the intended parent instead. "
+     "An original whose parent is pending or failed is refused -32602 RESULT_SET_NOT_READY, "
+     "and an instruction_result original whose definition runs a Forensics-tier plugin is "
+     "refused -32602 RESULT_SET_SOURCE_NOT_SUPPORTED, both before anything is dispatched. "
      "An instruction_result source whose definition's plugin.action is gated (admin or "
      "approval) is refused for a non-admin caller (permission denied, "
      "error.data.reason=approval_required, retry_after_ms null): an approval ticket never "
@@ -15330,29 +15347,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     // null) applies, the transient arm passes a concrete hint.
                     mcp_audit("failure", expression);
                     // #4981 fix-round finding: was a raw string comparison against
-                    // outcome.detail, which cannot warn if a future 6th
-                    // ScopeEvalError::Kind value lands unclassified. Routed
-                    // through the shared, exhaustive scope_abort_is_permanent()
-                    // classifier (scope_eval_error.hpp) instead — see that
-                    // function's doc comment for why OwnerCheckFailed never
-                    // actually reaches here (handled above).
-                    const bool permanent = outcome.abort_kind &&
-                                           yuzu::server::scope_abort_is_permanent(*outcome.abort_kind);
-                    if (permanent) {
-                        res.set_content(
-                            a4_error(kInternalError,
-                                     "scope evaluation unavailable: " + outcome.detail,
-                                     "this is a permanent condition and will NOT clear on "
-                                     "retry; escalate to an operator"),
-                            "application/json");
-                    } else {
-                        res.set_content(
-                            a4_error(kInternalError,
-                                     "scope evaluation unavailable: " + outcome.detail,
-                                     "retry once the server reports ready",
-                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                            "application/json");
-                    }
+                    // outcome.detail, which cannot warn if a further ScopeEvalError::Kind
+                    // value lands unclassified. Routed through scope_abort_advice, over the
+                    // shared, exhaustive scope_abort_is_permanent() classifier
+                    // (scope_eval_error.hpp), shared with the REST twin — see that function's
+                    // doc comment for why OwnerCheckFailed never actually reaches here
+                    // (handled above).
+                    // result_set_unusable names the caller's own set and why (REST twin).
+                    const std::string message =
+                        "scope evaluation unavailable: " + outcome.detail +
+                        (outcome.abort_detail.empty() ? "" : " (" + outcome.abort_detail + ")");
+                    // A pending set is transient (wait for it); a failed or incomplete one is not.
+                    const auto advice = yuzu::server::scope_abort_advice(
+                        outcome.abort_kind, mcp::kMcpStoreFaultRetryMs);
+                    const long retry_ms =
+                        static_cast<long>(advice.retry_after_ms.value_or(-1));
+                    res.set_content(
+                        a4_error(kInternalError, message, advice.remediation, retry_ms),
+                        "application/json");
                     return;
                 }
                 case yuzu::server::ScopePreviewOutcome::Kind::kOk:
@@ -15375,8 +15387,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // producers (matching REST exactly: the synchronous creators
             // below use `rs_load_owned` directly on a canonical id, no alias
             // resolution). Resolves a per-operator alias OR a canonical
-            // "rs_"-prefixed id to a canonical id this session owns.
-            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<std::string> {
+            // "rs_"-prefixed id to the materialized row this session owns.
+            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<ResultSet> {
                 std::string rs_id = raw;
                 if (!raw.starts_with("rs_")) {
                     auto canon = result_set_store_->resolve_alias(session->username, raw);
@@ -15396,7 +15408,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return std::nullopt;
-                return rs_id;
+                if (!parent_may_seed(*row)) {
+                    // A pending parent is transient (retry hint), a failed one is not.
+                    const auto advice = parent_not_ready_advice(*row);
+                    const long retry_ms =
+                        static_cast<long>(advice.retry_after_ms.value_or(-1));
+                    res.set_content(
+                        a4_error(kInvalidParams, parent_not_ready_message(*row),
+                                 advice.remediation, retry_ms),
+                        "application/json");
+                    return std::nullopt;
+                }
+                return row; // the caller snapshots its completeness (inherit_completeness)
             };
 
             // A NUL byte in a result-set producer input (name, parameters, parent_id) is
@@ -15458,6 +15481,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (rs_params_have_nul(params)) {
                     rs_refuse_nul("parameters", src_kind);
+                    return;
+                }
+                // A Forensics-tier plugin's stored responses are withheld from result-set
+                // membership, so a set built from one would fill empty while every agent counts
+                // as answered: refused before any execution row or dispatch (REST twin: run_async).
+                if (!plugin_may_seed_result_set(plugin, forensics_plugins_)) {
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   "reason=forensics_source source_kind=" + audit_token(src_kind));
+                    // retry-hint-exempt: caller-input rejection (an unsupported source), not a
+                    // transient fault.
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   std::string(kSourceNotSupportedMessage)),
+                                    "application/json");
                     return;
                 }
                 if (!result_set_store_ || !execution_tracker) {
@@ -15605,14 +15641,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 std::optional<std::string> parent_id;
+                std::optional<ResultSet> parent_row;
                 std::string scope_expr;
                 if (args_for_parent.contains("parent_id") && args_for_parent["parent_id"].is_string() &&
                     !args_for_parent["parent_id"].get<std::string>().empty()) {
-                    auto canon = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
-                    if (!canon)
+                    parent_row = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
+                    if (!parent_row)
                         return; // rs_resolve_owned_parent already wrote the error
-                    parent_id = *canon;
-                    scope_expr = "from_result_set:" + *canon;
+                    parent_id = parent_row->id;
+                    scope_expr = "from_result_set:" + parent_row->id;
                 }
 
                 // Create-before-dispatch (UP2-4): the execution_id must be
@@ -15774,6 +15811,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = name;
                 cr.parent_id = parent_id;
+                // Narrowed to the parent's members: the pending row carries the parent's
+                // completeness from birth (REST twin: run_async).
+                if (parent_row)
+                    inherit_completeness(cr, *parent_row);
                 cr.source_kind = std::string(src_kind);
                 cr.source_payload = source_payload;
                 cr.matcher = matcher;
@@ -16068,6 +16109,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto parent = rs_load_owned(*pid);
                     if (!parent)
                         return; // rs_load_owned already wrote the error
+                    if (!parent_may_seed(*parent)) {
+                        // A pending parent is transient (retry hint), a failed one is not.
+                        const auto advice = parent_not_ready_advice(*parent);
+                        const long retry_ms =
+                            static_cast<long>(advice.retry_after_ms.value_or(-1));
+                        res.set_content(
+                            a4_error(kInvalidParams, parent_not_ready_message(*parent),
+                                     advice.remediation, retry_ms),
+                            "application/json");
+                        return;
+                    }
+                    // Lineage only: a directly created set's members are the caller's explicit
+                    // device_ids, not a narrowing of the parent's members, so it does not call
+                    // inherit_completeness (the inventory and async producers, whose members come
+                    // from the parent's, do).
                     cr.parent_id = *pid;
                     // #4306 follow-up: do NOT add the marker for a parent_id
                     // that failed ownership above -- that request is already
@@ -16396,6 +16452,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto parent = rs_load_owned(pid);
                     if (!parent)
                         return;
+                    if (!parent_may_seed(*parent)) {
+                        // A pending parent is transient (retry hint), a failed one is not.
+                        const auto advice = parent_not_ready_advice(*parent);
+                        const long retry_ms =
+                            static_cast<long>(advice.retry_after_ms.value_or(-1));
+                        res.set_content(
+                            a4_error(kInvalidParams, parent_not_ready_message(*parent),
+                                     advice.remediation, retry_ms),
+                            "application/json");
+                        return;
+                    }
+                    // The child is narrowed from this parent, so it is no more complete than
+                    // it (REST twin: from-inventory-query).
+                    inherit_completeness(cr, *parent);
                     cr.parent_id = pid;
                     args["scope_input_id"] = pid;
                     std::unordered_set<std::string> ms;
