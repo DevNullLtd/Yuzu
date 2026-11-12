@@ -4370,14 +4370,16 @@ public:
                           "counter");
         metrics_.describe(
             "yuzu_server_guardian_census_proj_failures_total",
-            "Compliance-census (guardian_agent_rule_status) writes that failed "
+            "Compliance-census (guardian_agent_rule_status) writes, and the per-agent "
+            "emit-order step that runs before each first-delivery write, that failed "
             "for a reason other than the rule not existing. The failure of a single "
             "event does not discard it: it stays stored with pending census "
             "evidence, and the pair keeps its previous state "
             "until a redelivery of that event repairs it or a later event for the pair arrives. A "
             "repair that fails is counted here again. >0 means the census may be "
             "stale; the server log line 'census upsert failed' names the agent "
-            "and rule. A write refused because the rule is not defined on this "
+            "and rule (the order step logs 'agent order step failed' with the agent and event). "
+            "A write refused because the rule is not defined on this "
             "server (the census foreign key, SQLSTATE 23503) is a normal "
             "outcome and is not counted; a failure to retire the evidence of "
             "such an event is an ingest error.",
@@ -4392,7 +4394,9 @@ public:
                           "rule is gone (not a fault); failed is a fault that leaves pending "
                           "evidence, except for source batch, whose failure rolls back the whole batch "
                           "(this count is not rolled back; see "
-                          "..._census_proj_failures_total); abandoned aborted the "
+                          "..._census_proj_failures_total); a failed per-agent emit-order step on a "
+                          "first delivery is also counted failed (the census write is then "
+                          "skipped); abandoned aborted the "
                           "transaction (counted again as an ingest error). Counted when the "
                           "projection returns, before the transaction commits. Resets on server "
                           "restart.",
@@ -4424,6 +4428,14 @@ public:
                           "the store cannot answer. A sustained non-zero value means census "
                           "verdicts are waiting on an agent redelivery that may never come "
                           "(the stranded classes are listed in docs/clock-guarded-retention.md).",
+                          "gauge");
+        metrics_.describe(detail::kGuardianCensusUnorderedAgentsMetric,
+                          "Agents whose latest accepted census-bearing event carried no emit-order "
+                          "pair and is later than the time their pair clock last advanced (a never-"
+                          "paired agent counts). The pair is stored and counted, not yet compared: "
+                          "no verdict depends on it. Not updated while the store cannot answer, "
+                          "and absent until the first answered read. Per-agent detail is the "
+                          "ordering field of the per-device all-guards read.",
                           "gauge");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
@@ -10468,6 +10480,9 @@ public:
                     if (auto pending = guaranteed_state_store_->pending_projection_count_checked())
                         metrics_.gauge("yuzu_server_guardian_census_pending_events")
                             .set(static_cast<double>(*pending));
+                    // Same posture: the unordered-agents count is published only when read.
+                    detail::publish_guardian_census_unordered_gauge(metrics_,
+                                                                    *guaranteed_state_store_);
                 }
                 if (baseline_store_) {
                     metrics_.gauge("yuzu_server_guardian_baselines_total")

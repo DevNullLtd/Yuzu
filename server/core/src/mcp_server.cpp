@@ -44,6 +44,7 @@
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "outbound_url_policy.hpp"       // url_audit_detail: audit rows never carry a destination URL in full
+#include "guardian_order_json.hpp"       // UP-14: the shared JSON of a device's ordering block (REST twin)
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_matcher.hpp"        // validate_matcher: admission check of a caller matcher (#4644)
@@ -1858,11 +1859,17 @@ static const ToolDef kTools[] = {
      "0 does NOT prove the census is fresh or complete, since an event that never arrived leaves "
      "no trace, and a pending event whose pair has no census row is not counted (the per-device "
      "reads get_guardian_device_guards and get_guardian_device_compliance report those as "
-     "unrepresented_pending_guards). A service-scoped "
+     "unrepresented_pending_guards). unordered_agents counts agents whose latest event without "
+     "an emit-order pair is later than the time their pair clock last advanced (an agent that "
+     "never sent a pair counts), within the same scope; unordered_agent_ids lists the first 50 "
+     "in ascending byte order of agent id (a count above the list length means truncation). The "
+     "pair is stored and counted, not yet compared: no verdict depends on it. 0 does NOT prove "
+     "every agent sends a pair, since an agent with no census-bearing event has no order row. A "
+     "service-scoped "
      "API token is refused outright (this is a fleet rollup with no per-service slice to narrow "
      "to).",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"note":{"type":"string"}},"required":["total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules"]})j"},
+     R"j({"type":"object","properties":{"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"unordered_agents":{"type":"integer","minimum":0},"unordered_agent_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}},"note":{"type":"string"}},"required":["total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules","unordered_agents","unordered_agent_ids"]})j"},
 
     {"list_guardian_rules",
      "List every Guaranteed State rule (Guard) in the catalogue — full rule bodies "
@@ -1916,11 +1923,19 @@ static const ToolDef kTools[] = {
      "non-atomic observations (a pair may appear in both guards[] and the unrepresented list); a "
      "zero count or false flag establishes neither freshness nor "
      "completeness. A pending-evidence read that times out answers a non-retryable error (no "
-     "retry hint): the most likely cause is a large retained pending backlog. Per-device scoped "
-     "(management-group aware) via the same "
+     "retry hint): the most likely cause is a large retained pending backlog. ordering is the "
+     "device's stored emit-order pair state, or null when the device has no order row (no "
+     "census-bearing event was ever accepted, or it was decommissioned): epoch, emit_seq_hwm "
+     "and epoch_recv_ns (server clock, nanoseconds) are the pair clock; unpaired_recv_ns is the "
+     "latest accepted event without a pair; currently_unordered is true when that is later than "
+     "epoch_recv_ns (a never-paired device counts). The counters count accepted events by the "
+     "kind of pair they carried against the clock. They are stored and counted, not yet "
+     "compared: no verdict was held or refused on them, and pair_duplicates stays 0 until the "
+     "comparator ships. The integers are 64-bit and can exceed 2^53, so read them as 64-bit "
+     "integers. Per-device scoped (management-group aware) via the same "
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"},"unrepresented_pending_guards":{"type":"integer","minimum":0},"unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}}},"required":["agent_id","guards","total_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids"]})j"},
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"},"unrepresented_pending_guards":{"type":"integer","minimum":0},"unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}},"ordering":{"type":["object","null"],"properties":{"epoch":{"type":["integer","null"]},"emit_seq_hwm":{"type":["integer","null"]},"epoch_recv_ns":{"type":["integer","null"]},"retired_epoch":{"type":["integer","null"]},"unpaired_recv_ns":{"type":["integer","null"]},"currently_unordered":{"type":"boolean"},"unpaired_events":{"type":"integer","minimum":0},"unpaired_held":{"type":"integer","minimum":0},"pair_regressions":{"type":"integer","minimum":0},"pair_stragglers":{"type":"integer","minimum":0},"pair_recoveries":{"type":"integer","minimum":0},"pair_duplicates":{"type":"integer","minimum":0},"retired_events":{"type":"integer","minimum":0}},"required":["epoch","emit_seq_hwm","epoch_recv_ns","retired_epoch","unpaired_recv_ns","currently_unordered","unpaired_events","unpaired_held","pair_regressions","pair_stragglers","pair_recoveries","pair_duplicates","retired_events"]}},"required":["agent_id","guards","total_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids","ordering"]})j"},
 
     // ── Guardian rule CRUD + push + per-agent read twins (#2146 Batch B1) ──
     // Closes the remaining MCP gap on the Guaranteed State surface: the 6
@@ -17900,6 +17915,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // UP-14: same ids as the REST twin (scoped by the same list-read gate, in SQL).
+                JArr unordered_ids;
+                for (const auto& agent : rollup->unordered_agent_ids)
+                    unordered_ids.add(agent);
                 mcp_audit("success");
                 res.set_content(
                     success_response(
@@ -17909,6 +17928,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                              .add("drifted_rules", rollup->drifted_rules)
                                              .add("errored_rules", rollup->errored_rules)
                                              .add("uncertain_rules", rollup->uncertain_rules)
+                                             .add("unordered_agents", rollup->unordered_agents)
+                                             .raw("unordered_agent_ids", unordered_ids.str())
                                              .str(),
                                         kObjectOutputSchema)),
                     "application/json");
@@ -18267,7 +18288,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     .raw("guards", arr.str())
                     .add("total_guards", static_cast<int64_t>(rows->guards.size()))
                     .add("unrepresented_pending_guards", rows->unrepresented_pending_guards)
-                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str());
+                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str())
+                    // UP-14: one rendering shared with the REST twin; null = no order row.
+                    .raw("ordering", rows->ordering
+                                         ? render_guardian_agent_order_json(*rows->ordering)
+                                         : std::string("null"));
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 res.set_content(

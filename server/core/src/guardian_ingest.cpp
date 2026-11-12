@@ -109,8 +109,13 @@ void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
                           {{"status", std::string(event_insert_status_label(status))}}, buckets);
 }
 
-void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry&, const GuaranteedStateStore&) {
-    // Stub, red until the next commit.
+void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry& metrics,
+                                             const GuaranteedStateStore& store) {
+    // Published only on success: an unanswered read must not read as zero. The fleet-wide scope
+    // (nullopt) also fetches the capped id list; only the exact count is used here.
+    if (const auto unordered = store.unordered_agents(std::nullopt))
+        metrics.gauge(kGuardianCensusUnorderedAgentsMetric)
+            .set(static_cast<double>(unordered->count));
 }
 
 // ── #4666 PR-4: dedicated bounded async logger for the T_server diagnostic line ─────────────
