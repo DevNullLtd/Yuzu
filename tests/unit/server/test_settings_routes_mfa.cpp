@@ -554,6 +554,7 @@ TEST_CASE("POST /api/settings/mfa/verify success stamps a step-up proof on the c
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+    check_mfa_no_store(*res); // #6940: the recovery-code reveal is uncacheable and private
 
     CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=stamped");
     CHECK(has_step_up_proof(h, token));

@@ -2025,6 +2025,8 @@ restart once the store is back.
 
 ## MFA binding enforcement failed
 
+**Triage first.** If the gauge reads `0` and `YuzuMfaBindingNotEnforced` is firing, continue here. If the gauge reads `1`, no alert fires, and an approver or step-up request is refused `503` `mfa_proof_unavailable`, the account reads factor generation `0`: go to "Enrolled accounts at generation 0" under "Post-restore verification" and run `yuzu-server --mfa-reset <user>`.
+
 `YuzuMfaBindingNotEnforced` fires (critical) when `yuzu_auth_mfa_binding_enforcement_ok{store}` reads `0`
 for a minute. A validation on this replica has observed that one of the two database triggers that
 bind an MFA proof to the account's factor is no longer in force:

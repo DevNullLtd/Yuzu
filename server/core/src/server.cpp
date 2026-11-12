@@ -9884,7 +9884,15 @@ public:
                 }
                 // #6079: two atomic flag reads. The flags flip only when a request-driven
                 // validation observes the fault (AuthDB::mfa_status, SessionStore::find).
-                publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
+                // A throw here (an allocation failure in the labelled series) must not end
+                // this thread's loop or terminate the process: the next tick republishes.
+                try {
+                    publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
+                } catch (const std::exception& e) {
+                    spdlog::warn("mfa binding gauge publish failed: {}", e.what());
+                } catch (...) {
+                    spdlog::warn("mfa binding gauge publish failed: unknown exception");
+                }
                 // The CRL source registration resolver pool, published from this 15 s tick (never
                 // from a request path), so the in-flight gauge cannot sit stale after a lookup ends.
                 metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight")
