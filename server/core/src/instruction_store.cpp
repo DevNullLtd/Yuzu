@@ -515,9 +515,10 @@ std::optional<std::string> validate_parameter_schema_write(const std::string& pa
 // ---------------------------------------------------------------------------
 
 namespace {
-// A string holding a NUL can never equal a stored id or filter value (every write path sanitizes
-// or refuses NUL), so a read or delete keyed on one has a definite answer without asking Postgres:
-// nothing matches. pg::exec_params refuses a NUL parameter (SQLSTATE 22021) where libpq used to
+// A string holding a NUL can never equal a stored id or filter value (create, import and update
+// sanitize or refuse a NUL in every column they bind, and an id is closed-charset on create), so
+// a read or delete keyed on one has a definite answer without asking Postgres: nothing
+// matches. pg::exec_params refuses a NUL parameter (SQLSTATE 22021) where libpq used to
 // truncate it, so binding one raw would surface a client error as a "read failed" store fault
 // (REST 503 / MCP internal error) on every caller, including the pre-existing legacy ones.
 bool has_nul(const std::string& s) {
@@ -984,6 +985,11 @@ InstructionStore::update_definition(const InstructionDefinition& def,
     }
     if (def.id.empty())
         return std::unexpected("id is required for update");
+    // A NUL id can never match a stored row (see has_nul), and binding it would surface as a
+    // db-error and bump the write-degrade counter for what is a plain not-found.
+    if (has_nul(def.id))
+        return std::unexpected(std::string(kNotFoundPrefix) +
+                               "instruction definition not found: id contains a NUL byte");
 
     // arch-B1/UP-4: the same scope-block validation the create path enforces — update must not
     // be a bypass for the fromResultSet rules.

@@ -2163,7 +2163,8 @@ TEST_CASE("InstructionStore: a NUL in a read or delete key answers not found and
     SECTION("each query filter answers an empty list") {
         for (int field = 0; field < 4; ++field) {
             InstructionQuery q;
-            const std::string v = "x" + std::string(1, '\0') + "y";
+            // The text before the NUL names the stored row, so a truncating driver would match it.
+            const std::string v = "Nul Read Keeper" + std::string(1, '\0') + "y";
             if (field == 0)
                 q.name_filter = v;
             else if (field == 1)
@@ -2186,6 +2187,12 @@ TEST_CASE("InstructionStore: a NUL in a read or delete key answers not found and
         auto stale = store.delete_definition(nul_id, std::int64_t{1});
         REQUIRE_FALSE(stale.has_value());
         CHECK(stale.error().starts_with("not_found:"));
+        auto upd = kept;
+        upd.id = nul_id;
+        upd.description = "should never land";
+        auto updated = store.update_definition(upd);
+        REQUIRE_FALSE(updated.has_value());
+        CHECK(updated.error().starts_with("not_found:"));
         auto set_del = store.delete_set(nul_set);
         REQUIRE_FALSE(set_del.has_value());
         CHECK(set_del.error().starts_with("not_found:"));
