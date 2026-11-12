@@ -514,6 +514,31 @@ std::optional<std::string> validate_parameter_schema_write(const std::string& pa
 // spec.scope validation (pure logic, shared by create+update; unaffected by storage substrate)
 // ---------------------------------------------------------------------------
 
+namespace {
+// The columns bound to Postgres WITHOUT sanitize_pg_text (structured text and free-form
+// concurrency_mode; id, type and approval_mode are closed-charset or closed-set checked
+// elsewhere). A NUL in any of them is refused at the create/import/update chokepoint as a client
+// error. pg::exec_params refuses a NUL parameter (SQLSTATE 22021) where libpq used to truncate it
+// silently, so an unguarded one surfaces as a 503 "outcome unknown" store fault for what is a
+// permanent 400. yaml_source has its own message in validate_definition_scope.
+std::optional<std::string> reject_nul_in_unsanitised_columns(const InstructionDefinition& def) {
+    const struct {
+        const char* name;
+        const std::string& value;
+    } columns[] = {
+        {"parameter_schema", def.parameter_schema},
+        {"result_schema", def.result_schema},
+        {"concurrency_mode", def.concurrency_mode},
+        {"visualization_spec", def.visualization_spec},
+        {"response_templates_spec", def.response_templates_spec},
+    };
+    for (const auto& c : columns)
+        if (c.value.find('\0') != std::string::npos)
+            return std::string(c.name) + " contains a NUL byte";
+    return std::nullopt;
+}
+} // namespace
+
 // Store-level yaml_source gates shared by create AND update (size cap, scope-walking
 // fromResultSet combos, inline flow-mapping rejection). Only errors when spec.scope.fromResultSet
 // is present with a forbidden combo; scope-less and selector-only definitions (incl. all bundled
@@ -738,6 +763,8 @@ InstructionStore::validate_and_prepare(InstructionDefinition& def) const {
 
     if (auto err = validate_definition_scope(def.yaml_source))
         return std::unexpected(*err);
+    if (auto err = reject_nul_in_unsanitised_columns(def))
+        return std::unexpected(*err);
     // Covers create_definition and both JSON imports (signed and trusted).
     if (auto err = validate_parameter_schema_write(def.parameter_schema))
         return std::unexpected(*err);
@@ -945,6 +972,8 @@ InstructionStore::update_definition(const InstructionDefinition& def,
     // arch-B1/UP-4: the same scope-block validation the create path enforces — update must not
     // be a bypass for the fromResultSet rules.
     if (auto err = validate_definition_scope(def.yaml_source))
+        return std::unexpected(*err);
+    if (auto err = reject_nul_in_unsanitised_columns(def))
         return std::unexpected(*err);
     // An empty schema keeps the stored column (below), so only a supplied one is checked,
     // and only when it differs from the stored text: a legacy row that predates the write

@@ -2669,6 +2669,39 @@ TEST_CASE("DELETE /api/v1/instruction-sets/{id}: a member definition's token mov
     CHECK(w.row(member).instruction_set_id.empty());
 }
 
+TEST_CASE("POST /api/v1/instructions/import: a NUL in a text field is a 400 naming the field and "
+          "not a 503 store fault; audited; and stores nothing",
+          "[pg][server][instruction_authoring]") {
+    // Turns red if reject_nul_in_unsanitised_columns is removed from the store chokepoint:
+    // pg::exec_params refuses the NUL (22021) and the route would answer 503 outcome-unknown.
+    YUZU_REQUIRE_PG_DB_TPL(db, authoring_tpl);
+    PgWired w{db.dsn()};
+    w.store.set_require_signed_definitions(false);
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    const json base{{"id", "authoring.import.nul"},
+                    {"name", "n"},
+                    {"type", "question"},
+                    {"plugin", "os_info"},
+                    {"yaml_source", kYaml}};
+    for (const std::string field : {"concurrency_mode", "result_schema"}) {
+        INFO(field);
+        json doc = base;
+        doc[field] = std::string("x") + '\0' + "y"; // dumped as \u0000
+        h.audits.clear();
+        auto r = h.sink.Post("/api/v1/instructions/import", doc.dump());
+        REQUIRE(r);
+        CHECK(r->status == 400);
+        CHECK(error_message(r->body).find(field) != std::string::npos);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[1].result == "denied");
+        CHECK_FALSE(w.get("authoring.import.nul").has_value());
+    }
+}
+
 TEST_CASE("POST /api/v1/instructions/import: a TTL outside the create/update range is a 400 naming "
           "the field; audited; and stores nothing",
           "[pg][server][instruction_authoring]") {

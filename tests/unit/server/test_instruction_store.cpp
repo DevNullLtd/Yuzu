@@ -314,6 +314,93 @@ TEST_CASE("InstructionStore: NUL in yaml_source is rejected at the store chokepo
     CHECK(result.error() == "yaml_source contains a NUL byte");
 }
 
+TEST_CASE("InstructionStore: NUL in an unsanitised column is a client error and not a store fault",
+          "[instruction_store][pg]") {
+    // result_schema, concurrency_mode, visualization_spec, response_templates_spec and
+    // parameter_schema are bound without sanitize_pg_text. pg::exec_params refuses a NUL
+    // parameter (22021), which the twins would classify as a 503 "outcome unknown" store
+    // fault, so the store refuses it first with a plain validation error (no db-error prefix)
+    // on create, import and update.
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto is_client_error = [](const std::string& err, std::string_view column) {
+        return err == std::string(column) + " contains a NUL byte" &&
+               err.rfind(std::string(kInstructionStoreDbErrorPrefix), 0) != 0;
+    };
+
+    InstructionDefinition base;
+    base.name = "Nul Column Probe";
+    base.type = "question";
+    base.plugin = "test";
+    base.action = "test";
+    base.version = "1.0";
+    const std::string nul = std::string("a") + '\0' + "b";
+
+    SECTION("create refuses each column") {
+        for (const std::string_view column :
+             {"result_schema", "concurrency_mode", "visualization_spec",
+              "response_templates_spec", "parameter_schema"}) {
+            auto def = base;
+            if (column == "result_schema")
+                def.result_schema = nul;
+            else if (column == "concurrency_mode")
+                def.concurrency_mode = nul;
+            else if (column == "visualization_spec")
+                def.visualization_spec = nul;
+            else if (column == "response_templates_spec")
+                def.response_templates_spec = nul;
+            else
+                def.parameter_schema = nul;
+            auto result = store.create_definition(def);
+            INFO(std::string(column));
+            REQUIRE_FALSE(result.has_value());
+            CHECK(is_client_error(result.error(), column));
+        }
+        InstructionQuery q;
+        auto all = store.query_definitions(q);
+        REQUIRE(all.has_value());
+        CHECK(std::none_of(all->begin(), all->end(),
+                           [](const auto& d) { return d.name == "Nul Column Probe"; }));
+    }
+
+    SECTION("import refuses a NUL escape in a string field") {
+        store.set_require_signed_definitions(false);
+        const std::string body =
+            R"({"name":"Nul Column Probe","type":"question","plugin":"system_info",)"
+            R"("action":"query","concurrency_mode":"per-device\u0000x"})";
+        auto result = store.import_definition_json(body);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "concurrency_mode"));
+    }
+
+    SECTION("trusted import refuses a NUL escape in result_schema") {
+        const std::string body =
+            R"({"name":"Nul Column Probe","type":"question","plugin":"system_info",)"
+            R"("action":"query","result_schema":"{}\u0000"})";
+        auto result = store.import_definition_json_trusted(body);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "result_schema"));
+    }
+
+    SECTION("update refuses concurrency_mode and leaves the row untouched") {
+        auto created = store.create_definition(base);
+        REQUIRE(created.has_value());
+        auto def = base;
+        def.id = *created;
+        def.concurrency_mode = nul;
+        auto result = store.update_definition(def);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "concurrency_mode"));
+        auto stored = store.get_definition(*created);
+        REQUIRE(stored.has_value());
+        REQUIRE(stored->has_value());
+        CHECK((*stored)->concurrency_mode == "per-device");
+    }
+}
+
 // ── spec.scope (scope-walking DSL) validation (PR-E) ────────────────────────
 
 namespace {

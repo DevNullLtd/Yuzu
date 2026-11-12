@@ -2555,6 +2555,37 @@ TEST_CASE("mcp definition handlers re-enforce the shared bounds without the sche
 
 // ── Version-token integrity, import TTL range, probe fault, delete pre-image (batch C gov) ──
 
+TEST_CASE("mcp import_definition: a NUL in a text field is a typed refusal naming the field and "
+          "not a store fault; audited attempted then denied; and stores nothing",
+          "[pg][mcp][instruction_authoring]") {
+    // Turns red if reject_nul_in_unsanitised_columns is removed from the store chokepoint:
+    // pg::exec_params refuses the NUL (22021) and the tool would answer store_write_outcome_unknown.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_authoring_tpl);
+    PgWired w{db.dsn()};
+    w.store.set_require_signed_definitions(false);
+    Supervised s{&w.store};
+    Mcp& m = s.m;
+
+    const json base{{"id", "imp.nul"},    {"name", "n"},
+                    {"type", "question"}, {"plugin", "os_info"},
+                    {"yaml_source", kYaml}};
+    for (const std::string field : {"concurrency_mode", "result_schema"}) {
+        INFO(field);
+        json doc = base;
+        doc[field] = std::string("x") + '\0' + "y";
+        m.clear();
+        const json r = m.call_ticketed("import_definition", {{"document", doc}});
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["message"].get<std::string>().find(field) != std::string::npos);
+        const auto keys = m.domain_keys();
+        REQUIRE(keys.size() == 2);
+        CHECK(keys[0] == "instruction.import|attempted");
+        CHECK(keys[1] == "instruction.import|denied");
+        CHECK_FALSE(w.get("imp.nul").has_value());
+    }
+}
+
 TEST_CASE("mcp import_definition: a TTL outside the create/update range is a typed refusal naming "
           "the field; audited attempted then denied; and stores nothing",
           "[pg][mcp][instruction_authoring]") {
