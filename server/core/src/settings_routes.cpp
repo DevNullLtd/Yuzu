@@ -8214,6 +8214,9 @@ void SettingsRoutes::register_routes(
                                 session->username,
                                 std::format("reason=factor_changed expected_gen={}",
                                             admission->factor_gen));
+                      // #6940: every MFA fragment response is no-store; set here, not in the shared
+                      // helper (the disable handler already sets it once, and set_header appends).
+                      set_no_store(res);
                       respond_mfa_factor_changed(res, *session, "recovery_codes");
                       return;
                   }

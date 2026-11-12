@@ -1932,6 +1932,7 @@ TEST_CASE("recovery-codes route: a factor rotated after the gate admitted the re
     CHECK(res->body.find("Store these recovery codes now") == std::string::npos);
     CHECK(res->get_header_value("HX-Redirect").empty());
     CHECK(res->get_header_value("Set-Cookie").empty());
+    check_mfa_no_store(*res); // #6940: the 409 re-render carries the no-store set exactly once
     // F2's ten code rows are the original rows: nothing was deleted or inserted.
     REQUIRE(count_ids(f2_ids) == 10);
     CHECK(code_ids(h) == f2_ids);
@@ -1970,6 +1971,7 @@ TEST_CASE("disable route: a factor rotated after the gate admitted the request a
     CHECK(res->body.find("MFA factor changed while this request was in flight") !=
           std::string::npos);
     CHECK(res->get_header_value("HX-Redirect").empty()); // no sign-out
+    check_mfa_no_store(*res); // #6940
     CHECK(res->get_header_value("Set-Cookie").empty());
     // F2 is intact: still enrolled with its ten codes, and no session of the account ended.
     const auto st = h.auth_db->mfa_status("admin");
@@ -2009,6 +2011,7 @@ TEST_CASE("disable route: cancelling an enrolment that completed after the gate 
     REQUIRE(res);
     CHECK(res->status == 409);
     CHECK(res->get_header_value("HX-Redirect").empty());
+    check_mfa_no_store(*res); // #6940
     const auto st = h.auth_db->mfa_status("admin");
     REQUIRE(st.has_value());
     CHECK(st->enrolled); // the cancel did not strip a factor that did not exist when admitted
