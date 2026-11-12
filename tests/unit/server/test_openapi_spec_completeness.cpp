@@ -2830,6 +2830,17 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
         const json* desc = find_at(spec, {"paths", "/config/{key}", "put", "description"});
         REQUIRE(desc != nullptr);
         CHECK(desc->get<std::string>().find("refused with a 403 on every key") != std::string::npos);
+        // The step-up wording: mfa_step_up_required is false on the SAML and engine 403s, and the
+        // envelope description says every step-up refusal carries a remediation bar two defensive
+        // fault paths.
+        CHECK(desc->get<std::string>().find("adds mfa_step_up_required to meta (false on the 403)") !=
+              std::string::npos);
+        const json* envelope_desc =
+            find_at(spec, {"components", "schemas", "A4ErrorEnvelope", "description"});
+        REQUIRE(envelope_desc != nullptr);
+        CHECK(envelope_desc->get<std::string>().find(
+                  "with a remediation, but never retry_after_ms (two defensive fault paths differ") !=
+              std::string::npos);
 
         // The score-policy PUT and DELETE word the retry rule, the audit refusal (5000), the busy
         // writer (2000) and the replay of an applied write in their own responses; the behaviour
@@ -2848,7 +2859,14 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
                             "revision you sent") != std::string::npos);
             CHECK(response_text(method, "415").find("Content-Encoding other than identity") !=
                   std::string::npos);
+            CHECK(response_text(method, "429").find("Server-wide, not specific to this route") !=
+                  std::string::npos);
             CHECK(response_text(method, "429").find("per-principal quota") != std::string::npos);
+            const json* retry_after = find_at(spec, {"paths", "/dex/score-policy", method,
+                                                     "responses", "429", "headers", "Retry-After",
+                                                     "schema", "type"});
+            REQUIRE(retry_after != nullptr);
+            CHECK(*retry_after == "integer");
             const std::string r503 = response_text(method, "503");
             CHECK(r503.find("another score policy write in this process is still running "
                             "(retry_after_ms 2000)") != std::string::npos);
