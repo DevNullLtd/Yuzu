@@ -2127,3 +2127,75 @@ TEST_CASE("InstructionStore: update keeps the stored parameter_schema when the s
     CHECK(store.update_definition(def).has_value());
     CHECK(stored() == legacy);
 }
+
+TEST_CASE("InstructionStore: a NUL in a read or delete key answers not found and not a store fault",
+          "[instruction_store][pg]") {
+    // pg::exec_params refuses a NUL parameter (22021). A string holding a NUL can never equal a
+    // stored id or filter value, so the store answers "nothing matches" itself instead of
+    // surfacing a client error as a db-error on every caller (the legacy routes and the older MCP
+    // list/get tools pass the raw id and filters straight through).
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto kept = make_question("Nul Read Keeper");
+    auto kept_id = store.create_definition(kept);
+    REQUIRE(kept_id.has_value());
+    InstructionSet iset;
+    iset.name = "Nul Read Set";
+    auto set_id = store.create_set(iset);
+    REQUIRE(set_id.has_value());
+
+    // The row a truncating driver would have matched: the id up to the NUL.
+    const std::string nul_id = *kept_id + '\0' + "tail";
+    const std::string nul_set = *set_id + '\0' + "tail";
+
+    SECTION("get and export answer not found") {
+        auto got = store.get_definition(nul_id);
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->has_value());
+        auto exported = store.export_definition_json(nul_id);
+        REQUIRE(exported.has_value());
+        CHECK(*exported == "{}");
+    }
+
+    SECTION("each query filter answers an empty list") {
+        for (int field = 0; field < 4; ++field) {
+            InstructionQuery q;
+            const std::string v = "x" + std::string(1, '\0') + "y";
+            if (field == 0)
+                q.name_filter = v;
+            else if (field == 1)
+                q.plugin_filter = v;
+            else if (field == 2)
+                q.type_filter = v;
+            else
+                q.set_id_filter = v;
+            INFO("filter " << field);
+            auto res = store.query_definitions(q);
+            REQUIRE(res.has_value());
+            CHECK(res->empty());
+        }
+    }
+
+    SECTION("delete answers not_found and removes nothing") {
+        auto del = store.delete_definition(nul_id);
+        REQUIRE_FALSE(del.has_value());
+        CHECK(del.error().starts_with("not_found:"));
+        auto stale = store.delete_definition(nul_id, std::int64_t{1});
+        REQUIRE_FALSE(stale.has_value());
+        CHECK(stale.error().starts_with("not_found:"));
+        auto set_del = store.delete_set(nul_set);
+        REQUIRE_FALSE(set_del.has_value());
+        CHECK(set_del.error().starts_with("not_found:"));
+
+        auto still = store.get_definition(*kept_id);
+        REQUIRE(still.has_value());
+        CHECK(still->has_value());
+        auto sets = store.list_sets();
+        REQUIRE(sets.has_value());
+        CHECK(std::any_of(sets->begin(), sets->end(),
+                          [&](const auto& s) { return s.id == *set_id; }));
+    }
+}

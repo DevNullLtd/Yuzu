@@ -515,6 +515,15 @@ std::optional<std::string> validate_parameter_schema_write(const std::string& pa
 // ---------------------------------------------------------------------------
 
 namespace {
+// A string holding a NUL can never equal a stored id or filter value (every write path sanitizes
+// or refuses NUL), so a read or delete keyed on one has a definite answer without asking Postgres:
+// nothing matches. pg::exec_params refuses a NUL parameter (SQLSTATE 22021) where libpq used to
+// truncate it, so binding one raw would surface a client error as a "read failed" store fault
+// (REST 503 / MCP internal error) on every caller, including the pre-existing legacy ones.
+bool has_nul(const std::string& s) {
+    return s.find('\0') != std::string::npos;
+}
+
 // The columns bound to Postgres WITHOUT sanitize_pg_text (structured text, free-form
 // concurrency_mode, and type: validate_and_prepare closes type to question/action on create, but
 // update_definition does not and the legacy dashboard PUT stores any string; id and approval_mode
@@ -660,6 +669,9 @@ InstructionStore::query_definitions(const InstructionQuery& q) const {
         note_read_degrade(metrics_, kReasonStoreNotOpen);
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
     }
+    if (has_nul(q.name_filter) || has_nul(q.plugin_filter) || has_nul(q.type_filter) ||
+        has_nul(q.set_id_filter))
+        return std::vector<InstructionDefinition>{};
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         note_read_degrade(metrics_, kReasonPoolTimeout);
@@ -719,6 +731,8 @@ InstructionStore::get_definition(const std::string& id) const {
         note_read_degrade(metrics_, kReasonStoreNotOpen);
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
     }
+    if (has_nul(id))
+        return std::optional<InstructionDefinition>{};
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         note_read_degrade(metrics_, kReasonPoolTimeout);
@@ -1091,6 +1105,9 @@ InstructionStore::delete_definition(const std::string& id,
         note_write_degrade(metrics_, "delete_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
     }
+    if (has_nul(id))
+        return std::unexpected(std::string(kNotFoundPrefix) +
+                               "instruction definition not found: id contains a NUL byte");
 
     std::string failure;
     bool deleted = false;
@@ -1700,6 +1717,9 @@ std::expected<void, std::string> InstructionStore::delete_set(const std::string&
         note_write_degrade(metrics_, "delete_set");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
     }
+    if (has_nul(id))
+        return std::unexpected(std::string(kNotFoundPrefix) +
+                               "instruction set not found: id contains a NUL byte");
 
     std::string failure;
     bool deleted = false;
