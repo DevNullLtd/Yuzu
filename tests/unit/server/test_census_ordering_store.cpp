@@ -102,6 +102,10 @@ yuzu::test::PgTestTemplate ordering_tpl{
 
 constexpr const char* kSchema = "guaranteed_state_store";
 
+// The version the latest migration stamps. The v4 cases below check v4's objects; the stamp they
+// read back is the store's current one.
+constexpr const char* kStampedVersion = "5";
+
 std::string schema_version(const std::string& dsn) {
     return query_scalar(dsn, "SELECT version FROM public.schema_meta "
                              "WHERE store = 'guaranteed_state_store'");
@@ -128,6 +132,32 @@ void downgrade_to_v3(const std::string& dsn) {
                   "WHERE store = 'guaranteed_state_store'");
 }
 
+// The v4 body of the census tripwire function (what a v4 database carries; v5 replaces it).
+constexpr const char* kV4TripwireBody =
+    "BEGIN IF (NEW.state IS DISTINCT FROM OLD.state OR NEW.updated_at IS DISTINCT FROM "
+    "OLD.updated_at) AND NEW.key_ns IS NOT DISTINCT FROM OLD.key_ns AND NEW.ingest_seq IS NOT "
+    "DISTINCT FROM OLD.ingest_seq THEN NEW.order_uncertain := true; END IF; RETURN NEW; END";
+
+void replace_tripwire_body(const std::string& dsn, const std::string& body) {
+    exec_sql(dsn, std::string("CREATE OR REPLACE FUNCTION ") + kSchema +
+                      ".guardian_agent_rule_status_flag_legacy_write() RETURNS trigger "
+                      "LANGUAGE plpgsql AS $fn$ " +
+                      body + " $fn$");
+}
+
+// Put a v5 database back to the v4 shape: drop what v5 added, restore the v4 tripwire body and
+// stamp 4.
+void downgrade_to_v4(const std::string& dsn) {
+    exec_sql(dsn, std::string("DROP TABLE IF EXISTS ") + kSchema + ".guardian_agent_order");
+    exec_sql(dsn, std::string("ALTER TABLE ") + kSchema +
+                      ".guaranteed_state_events DROP COLUMN boot_epoch, DROP COLUMN emit_seq");
+    exec_sql(dsn, std::string("ALTER TABLE ") + kSchema +
+                      ".guardian_agent_rule_status DROP COLUMN boot_epoch, DROP COLUMN emit_seq");
+    replace_tripwire_body(dsn, kV4TripwireBody);
+    exec_sql(dsn, "UPDATE public.schema_meta SET version = 4 "
+                  "WHERE store = 'guaranteed_state_store'");
+}
+
 } // namespace
 
 // ── C1: schema v4 ────────────────────────────────────────────────────────────
@@ -136,7 +166,7 @@ TEST_CASE("census ordering: a fresh database migrates to v4 with every v4 object
           "[pg][guaranteed_state_store][db][census][ordering][schema]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     REQUIRE(opens(db.dsn()));
-    CHECK(schema_version(db.dsn()) == "4");
+    CHECK(schema_version(db.dsn()) == kStampedVersion);
     CHECK(query_scalar(db.dsn(), "SELECT attidentity FROM pg_attribute WHERE attrelid = "
                                  "'guaranteed_state_store.guaranteed_state_events'::regclass "
                                  "AND attname = 'ingest_seq'") == "a");
@@ -162,7 +192,7 @@ TEST_CASE("census ordering: a v4 database missing the two later census columns i
     exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 3 "
                        "WHERE store = 'guaranteed_state_store'");
     CHECK(opens(db.dsn()));
-    CHECK(schema_version(db.dsn()) == "4");
+    CHECK(schema_version(db.dsn()) == kStampedVersion);
     CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM pg_attribute WHERE attrelid = '" + st +
                                      "'::regclass AND attname IN ('seq_hwm', 'hwm_recv_ns') AND "
                                      "NOT attisdropped") == "2");
@@ -189,7 +219,7 @@ TEST_CASE("census ordering: v4 over a v3 database keeps the census and fills ing
                            "VALUES ('a1', 'r1', 'drifted', '2026-04-19T12:00:00Z')");
 
     REQUIRE(opens(db.dsn()));
-    CHECK(schema_version(db.dsn()) == "4");
+    CHECK(schema_version(db.dsn()) == kStampedVersion);
     // Pre-v4 events: one distinct sequence value each, no key, never pending.
     CHECK(query_scalar(db.dsn(), std::string("SELECT count(DISTINCT ingest_seq) FROM ") + kSchema +
                                      ".guaranteed_state_events") == "3");
@@ -228,7 +258,7 @@ TEST_CASE("census ordering: replaying v4 over a used v4 changes nothing and the 
     exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 2 "
                        "WHERE store = 'guaranteed_state_store'");
     REQUIRE(opens(db.dsn()));
-    CHECK(schema_version(db.dsn()) == "4");
+    CHECK(schema_version(db.dsn()) == kStampedVersion);
     CHECK(query_scalar(db.dsn(), objs) == before);
     exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
                            ".guaranteed_state_events (event_id, rule_id, agent_id, event_type, "
@@ -385,6 +415,379 @@ TEST_CASE("census ordering: a hand-broken object makes the v4 migration refuse a
                            ".guaranteed_state_events (rule_id)");
     CHECK_FALSE(opens(db.dsn()));
     CHECK(schema_version(db.dsn()) == "3");
+}
+
+// A2: schema v5 (the event pair and the per-agent order table)
+
+namespace {
+
+// Opens a store on a v5 database that holds a hand-broken object and returns the boot log.
+struct OpenAttempt {
+    bool open = false;
+    std::string log;
+};
+
+OpenAttempt try_open(const std::string& dsn) {
+    yuzu::test::LogCapture cap(spdlog::level::err);
+    PgPool pool{{.conninfo = dsn, .size = 2}};
+    GuaranteedStateStore store(pool);
+    cap.stop();
+    return {store.is_open(), cap.text()};
+}
+
+void insert_rule(const std::string& dsn, const char* rule_id) {
+    exec_sql(dsn, std::string("INSERT INTO ") + kSchema +
+                      ".guaranteed_state_rules (rule_id, name, yaml_source, created_at, "
+                      "updated_at) VALUES ('" +
+                      rule_id + "', 'n', 'y', 't', 't')");
+}
+
+// "name:type:notnull" for every live column of a v5 table, in column order.
+std::string column_shape(const std::string& dsn, const char* table) {
+    return query_scalar(
+        dsn, std::string("SELECT string_agg(a.attname || ':' || format_type(a.atttypid, NULL) "
+                         "|| ':' || a.attnotnull, ',' ORDER BY a.attnum) FROM pg_attribute a "
+                         "WHERE a.attrelid = '") +
+                 kSchema + "." + table + "'::regclass AND a.attnum > 0 AND NOT a.attisdropped");
+}
+
+} // namespace
+
+TEST_CASE("census ordering: a fresh database migrates to v5 with every v5 object",
+          "[pg][guaranteed_state_store][db][census][ordering][schema][pair]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    REQUIRE(opens(db.dsn()));
+    CHECK(schema_version(db.dsn()) == "5");
+    // The four pair columns: bigint, nullable (NULL/NULL is an unpaired event or verdict).
+    for (const char* table : {"guaranteed_state_events", "guardian_agent_rule_status"}) {
+        CHECK(query_scalar(db.dsn(), std::string("SELECT string_agg(a.attname || ':' || "
+                                                 "format_type(a.atttypid, NULL) || ':' || "
+                                                 "a.attnotnull || ':' || (d.oid IS NULL), ',' "
+                                                 "ORDER BY a.attname) FROM pg_attribute a LEFT "
+                                                 "JOIN pg_attrdef d ON d.adrelid = a.attrelid "
+                                                 "AND d.adnum = a.attnum WHERE a.attrelid = '") +
+                                         kSchema + "." + table +
+                                         "'::regclass AND a.attname IN ('boot_epoch', "
+                                         "'emit_seq') AND NOT a.attisdropped") ==
+              "boot_epoch:bigint:false:true,emit_seq:bigint:false:true");
+    }
+    // The order table: exactly the full regime machine's columns, in this order.
+    CHECK(column_shape(db.dsn(), "guardian_agent_order") ==
+          "agent_id:text:true,epoch:bigint:false,emit_seq_hwm:bigint:false,"
+          "epoch_recv_ns:bigint:false,retired_epoch:bigint:false,unpaired_recv_ns:bigint:false,"
+          "unpaired_events:bigint:true,unpaired_held:bigint:true,pair_regressions:bigint:true,"
+          "pair_stragglers:bigint:true,pair_recoveries:bigint:true,pair_duplicates:bigint:true,"
+          "retired_events:bigint:true");
+    CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM pg_attrdef d JOIN "
+                                             "pg_attribute a ON a.attrelid = d.adrelid AND "
+                                             "a.attnum = d.adnum WHERE d.adrelid = '") +
+                                     kSchema +
+                                     ".guardian_agent_order'::regclass AND "
+                                     "pg_get_expr(d.adbin, d.adrelid) = '0'") == "7");
+    CHECK(
+        query_scalar(db.dsn(), std::string("SELECT conname || ':' || contype::text || ':' "
+                                           "|| conkey::text FROM pg_constraint WHERE contype = 'p' "
+                                           "AND conrelid = '") +
+                                   kSchema + ".guardian_agent_order'::regclass") ==
+        "guardian_agent_order_pkey:p:{1}");
+    // The tripwire function carries the pair test (the shape check pins the same three fragments).
+    const std::string def =
+        query_scalar(db.dsn(), std::string("SELECT pg_get_functiondef('") + kSchema +
+                                   ".guardian_agent_rule_status_flag_legacy_write'::regproc)");
+    CHECK(def.find("NEW.boot_epoch IS NOT NULL") != std::string::npos);
+    CHECK(def.find("NEW.boot_epoch IS NOT DISTINCT FROM OLD.boot_epoch") != std::string::npos);
+    CHECK(def.find("NEW.emit_seq IS NOT DISTINCT FROM OLD.emit_seq") != std::string::npos);
+    CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
+                                     ".guardian_agent_order") == "0");
+}
+
+TEST_CASE("census ordering: v5 over a v4 database keeps the census with a NULL pair and the "
+          "sequence continues",
+          "[pg][guaranteed_state_store][db][census][ordering][schema][pair]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    REQUIRE(opens(db.dsn()));
+    downgrade_to_v4(db.dsn());
+    insert_rule(db.dsn(), "r1");
+    for (int i = 1; i <= 3; ++i) {
+        exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                               ".guaranteed_state_events (event_id, rule_id, agent_id, "
+                               "event_type, severity, timestamp) VALUES ('e" +
+                               std::to_string(i) +
+                               "', 'r1', 'a1', 'drift.detected', 'high', "
+                               "'2026-04-19T12:00:00Z')");
+    }
+    exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                           ".guardian_agent_rule_status (agent_id, rule_id, state, updated_at, "
+                           "key_ns, ingest_seq, ts_hwm, seq_hwm, hwm_recv_ns) VALUES ('a1', "
+                           "'r1', 'drifted', '2026-04-19T12:00:00Z', 11, 3, 11, 3, 12)");
+    const std::string max_before =
+        query_scalar(db.dsn(), std::string("SELECT max(ingest_seq) FROM ") + kSchema +
+                                   ".guaranteed_state_events");
+
+    REQUIRE(opens(db.dsn()));
+    CHECK(schema_version(db.dsn()) == "5");
+    // The v4 census row is untouched; its pair is NULL (unordered), as is every event's.
+    CHECK(query_scalar(db.dsn(), std::string("SELECT state || '|' || key_ns || '|' || ingest_seq "
+                                             "|| '|' || (boot_epoch IS NULL) || '|' || "
+                                             "(emit_seq IS NULL) || '|' || order_uncertain FROM ") +
+                                     kSchema + ".guardian_agent_rule_status") ==
+          "drifted|11|3|true|true|false");
+    CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
+                                     ".guaranteed_state_events WHERE boot_epoch IS NOT NULL OR "
+                                     "emit_seq IS NOT NULL") == "0");
+    CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
+                                     ".guaranteed_state_events") == "3");
+    CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
+                                     ".guardian_agent_order") == "0");
+    // The identity sequence was not reset by the v5 apply.
+    exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                           ".guaranteed_state_events (event_id, rule_id, agent_id, event_type, "
+                           "severity, timestamp) VALUES ('e4', 'r1', 'a1', 'drift.detected', "
+                           "'high', 't')");
+    CHECK(std::stoll(query_scalar(db.dsn(), std::string("SELECT max(ingest_seq) FROM ") + kSchema +
+                                                ".guaranteed_state_events")) >
+          std::stoll(max_before));
+}
+
+TEST_CASE("census ordering: replaying v5 over a used v5 changes nothing",
+          "[pg][guaranteed_state_store][db][census][ordering][schema][pair]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    REQUIRE(opens(db.dsn()));
+    insert_rule(db.dsn(), "r1");
+    exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                           ".guaranteed_state_events (event_id, rule_id, agent_id, event_type, "
+                           "severity, timestamp, boot_epoch, emit_seq) VALUES ('e1', 'r1', 'a1', "
+                           "'drift.detected', 'high', 't', 7, 9)");
+    exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                           ".guardian_agent_rule_status (agent_id, rule_id, state, updated_at, "
+                           "key_ns, ingest_seq, boot_epoch, emit_seq) VALUES ('a1', 'r1', "
+                           "'drifted', 't', 5, 1, 7, 9)");
+    exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                           ".guardian_agent_order (agent_id, epoch, emit_seq_hwm, epoch_recv_ns, "
+                           "retired_epoch, unpaired_recv_ns, unpaired_events, unpaired_held, "
+                           "pair_regressions, pair_stragglers, pair_recoveries, pair_duplicates, "
+                           "retired_events) VALUES ('a1', 7, 9, 100, 3, 50, 1, 2, 3, 4, 5, 6, 7)");
+    const std::string objs =
+        "SELECT md5(string_agg(c.oid::text || a.attnum::text || a.attname || a.attnotnull, ',' "
+        "ORDER BY c.oid, a.attnum)) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
+        "AND a.attnum > 0 AND NOT a.attisdropped WHERE c.relnamespace = "
+        "'guaranteed_state_store'::regnamespace AND c.relkind IN ('r', 'i')";
+    const std::string rows =
+        std::string("SELECT (SELECT string_agg(g::text, ';') FROM ") + kSchema +
+        ".guardian_agent_order g) || '#' || (SELECT string_agg(e.boot_epoch || '/' || e.emit_seq, "
+        "';') FROM " +
+        kSchema +
+        ".guaranteed_state_events e) || '#' || (SELECT string_agg(c.boot_epoch || '/' || "
+        "c.emit_seq || '/' || c.order_uncertain, ';') FROM " +
+        kSchema + ".guardian_agent_rule_status c)";
+    const std::string fn = std::string("SELECT md5(pg_get_functiondef('") + kSchema +
+                           ".guardian_agent_rule_status_flag_legacy_write'::regproc))";
+    const std::string objs_before = query_scalar(db.dsn(), objs);
+    const std::string rows_before = query_scalar(db.dsn(), rows);
+    const std::string fn_before = query_scalar(db.dsn(), fn);
+    REQUIRE_FALSE(rows_before.empty());
+
+    // The remedy for a v5-only defect: stamp 4, so the v5 migration text runs again.
+    exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 4 "
+                       "WHERE store = 'guaranteed_state_store'");
+    REQUIRE(opens(db.dsn()));
+    CHECK(schema_version(db.dsn()) == "5");
+    CHECK(query_scalar(db.dsn(), objs) == objs_before);
+    CHECK(query_scalar(db.dsn(), rows) == rows_before);
+    CHECK(query_scalar(db.dsn(), fn) == fn_before);
+}
+
+TEST_CASE("census ordering: the v5 tripwire flags a verdict change that leaves a paired row's "
+          "pair unchanged and nothing else new",
+          "[pg][guaranteed_state_store][db][census][ordering][schema][pair]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    REQUIRE(opens(db.dsn()));
+    insert_rule(db.dsn(), "r1");
+    const std::string st = std::string(kSchema) + ".guardian_agent_rule_status";
+    auto flagged = [&](const char* agent) {
+        return query_scalar(db.dsn(), "SELECT order_uncertain FROM " + st + " WHERE agent_id = '" +
+                                          agent + "'");
+    };
+    exec_sql(db.dsn(), "INSERT INTO " + st +
+                           " (agent_id, rule_id, state, updated_at, key_ns, ingest_seq, "
+                           "boot_epoch, emit_seq) VALUES ('paired_same', 'r1', 'compliant', 't', "
+                           "1, 1, 5, 10), ('paired_moved', 'r1', 'compliant', 't', 1, 1, 5, 10), "
+                           "('paired_unkeyed', 'r1', 'compliant', 't', 1, 1, 5, 10)");
+    exec_sql(db.dsn(), "INSERT INTO " + st +
+                           " (agent_id, rule_id, state, updated_at, key_ns, ingest_seq) VALUES "
+                           "('unpaired_moved', 'r1', 'compliant', 't', 1, 1), "
+                           "('unpaired_same', 'r1', 'compliant', 't', 1, 1)");
+    // The v5 rule: the verdict changed, the ordering tuple moved, the NON-NULL pair did not.
+    exec_sql(db.dsn(), "UPDATE " + st +
+                           " SET state = 'drifted', key_ns = 2, ingest_seq = 2 "
+                           "WHERE agent_id = 'paired_same'");
+    CHECK(flagged("paired_same") == "t");
+    // The pair moved with the verdict: this version's own upsert, clean.
+    exec_sql(db.dsn(), "UPDATE " + st +
+                           " SET state = 'drifted', key_ns = 2, ingest_seq = 2, "
+                           "boot_epoch = 5, emit_seq = 11 WHERE agent_id = 'paired_moved'");
+    CHECK(flagged("paired_moved") == "f");
+    // The v4 rule is kept: the ordering tuple did not move.
+    exec_sql(db.dsn(), "UPDATE " + st +
+                           " SET state = 'drifted', boot_epoch = 5, emit_seq = 11 "
+                           "WHERE agent_id = 'paired_unkeyed'");
+    CHECK(flagged("paired_unkeyed") == "t");
+    // A v4 write to an unpaired row is as clean as under v4.
+    exec_sql(db.dsn(), "UPDATE " + st +
+                           " SET state = 'drifted', key_ns = 2, ingest_seq = 2 "
+                           "WHERE agent_id = 'unpaired_moved'");
+    CHECK(flagged("unpaired_moved") == "f");
+    exec_sql(db.dsn(), "UPDATE " + st + " SET state = 'drifted' WHERE agent_id = 'unpaired_same'");
+    CHECK(flagged("unpaired_same") == "t");
+}
+
+TEST_CASE("census ordering: an adopted v5 object not as this version creates it is refused",
+          "[pg][guaranteed_state_store][db][census][ordering][schema][pair]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    REQUIRE(opens(db.dsn()));
+    const std::string ev = std::string(kSchema) + ".guaranteed_state_events";
+    const std::string st = std::string(kSchema) + ".guardian_agent_rule_status";
+    const std::string ord = std::string(kSchema) + ".guardian_agent_order";
+
+    std::string expect; // the named defect each section must be refused for
+
+    SECTION("events.boot_epoch is INTEGER") {
+        expect = "guaranteed_state_events.boot_epoch";
+        exec_sql(db.dsn(), "ALTER TABLE " + ev + " ALTER COLUMN boot_epoch TYPE integer");
+    }
+    SECTION("events.emit_seq is NOT NULL") {
+        expect = "guaranteed_state_events.emit_seq";
+        exec_sql(db.dsn(), "ALTER TABLE " + ev + " ALTER COLUMN emit_seq SET NOT NULL");
+    }
+    SECTION("the census boot_epoch has a default") {
+        expect = "guardian_agent_rule_status.boot_epoch";
+        exec_sql(db.dsn(), "ALTER TABLE " + st + " ALTER COLUMN boot_epoch SET DEFAULT 0");
+    }
+    SECTION("the census emit_seq column is missing") {
+        expect = "guardian_agent_rule_status.emit_seq";
+        exec_sql(db.dsn(), "ALTER TABLE " + st + " DROP COLUMN emit_seq");
+    }
+    SECTION("the agent table is missing") {
+        expect = "table guardian_agent_order(permanent, ordinary)";
+        exec_sql(db.dsn(), "DROP TABLE " + ord);
+    }
+    SECTION("the agent table is unlogged") {
+        expect = "table guardian_agent_order(permanent, ordinary)";
+        exec_sql(db.dsn(), "ALTER TABLE " + ord + " SET UNLOGGED");
+    }
+    SECTION("an agent table column is of the wrong type") {
+        expect = "guardian_agent_order.emit_seq_hwm";
+        exec_sql(db.dsn(), "ALTER TABLE " + ord + " ALTER COLUMN emit_seq_hwm TYPE integer");
+    }
+    SECTION("an agent table counter lost its default") {
+        expect = "guardian_agent_order.pair_duplicates";
+        exec_sql(db.dsn(), "ALTER TABLE " + ord + " ALTER COLUMN pair_duplicates DROP DEFAULT");
+    }
+    SECTION("an agent table counter is nullable") {
+        expect = "guardian_agent_order.retired_events";
+        exec_sql(db.dsn(), "ALTER TABLE " + ord + " ALTER COLUMN retired_events DROP NOT NULL");
+    }
+    SECTION("an agent table column is missing") {
+        expect = "guardian_agent_order.pair_stragglers";
+        exec_sql(db.dsn(), "ALTER TABLE " + ord + " DROP COLUMN pair_stragglers");
+    }
+    SECTION("the agent table primary key was renamed") {
+        expect = "order table primary key guardian_agent_order_pkey(agent_id)";
+        exec_sql(db.dsn(), "ALTER TABLE " + ord +
+                               " RENAME CONSTRAINT guardian_agent_order_pkey TO adopted_pk");
+    }
+    SECTION("the tripwire function body is v4's, without the pair test") {
+        expect = "guardian_agent_rule_status_flag_legacy_write(pair test)";
+        replace_tripwire_body(db.dsn(), kV4TripwireBody);
+    }
+    SECTION("the tripwire function tests the epoch but not the sequence") {
+        expect = "guardian_agent_rule_status_flag_legacy_write(pair test)";
+        replace_tripwire_body(
+            db.dsn(),
+            "BEGIN IF (NEW.state IS DISTINCT FROM OLD.state) AND ((NEW.key_ns IS NOT DISTINCT "
+            "FROM OLD.key_ns) OR (NEW.boot_epoch IS NOT NULL AND NEW.boot_epoch IS NOT DISTINCT "
+            "FROM OLD.boot_epoch)) THEN NEW.order_uncertain := true; END IF; RETURN NEW; END");
+    }
+    SECTION("the tripwire function tests the sequence but not the epoch") {
+        expect = "guardian_agent_rule_status_flag_legacy_write(pair test)";
+        replace_tripwire_body(
+            db.dsn(),
+            "BEGIN IF (NEW.state IS DISTINCT FROM OLD.state) AND ((NEW.key_ns IS NOT DISTINCT "
+            "FROM OLD.key_ns) OR (NEW.boot_epoch IS NOT NULL AND NEW.emit_seq IS NOT DISTINCT "
+            "FROM OLD.emit_seq)) THEN NEW.order_uncertain := true; END IF; RETURN NEW; END");
+    }
+    SECTION("the tripwire function tests the pair but not that it is non-NULL") {
+        expect = "guardian_agent_rule_status_flag_legacy_write(pair test)";
+        replace_tripwire_body(
+            db.dsn(),
+            "BEGIN IF (NEW.state IS DISTINCT FROM OLD.state) AND ((NEW.key_ns IS NOT DISTINCT "
+            "FROM OLD.key_ns) OR (NEW.boot_epoch IS NOT DISTINCT FROM OLD.boot_epoch AND "
+            "NEW.emit_seq IS NOT DISTINCT FROM OLD.emit_seq)) THEN NEW.order_uncertain := true; "
+            "END IF; RETURN NEW; END");
+    }
+
+    REQUIRE_FALSE(expect.empty()); // a section that forgets its token would pass vacuously
+    const OpenAttempt a = try_open(db.dsn());
+    CHECK_FALSE(a.open);
+    CHECK(a.log.find("unsupported schema, refusing to start") != std::string::npos);
+    CHECK(a.log.find("v5: object not as this version creates it") != std::string::npos);
+    CHECK(a.log.find(expect) != std::string::npos);
+    // The remedy of a defect only v5 has resets to 4, never to 3.
+    CHECK(a.log.find("SET version = 4 WHERE store = 'guaranteed_state_store'") !=
+          std::string::npos);
+    CHECK(a.log.find("SET version = 3") == std::string::npos);
+}
+
+TEST_CASE("census ordering: a defect v4 also has keeps v4's text and its reset to version 3",
+          "[pg][guaranteed_state_store][db][census][ordering][schema][pair]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    REQUIRE(opens(db.dsn()));
+    exec_sql(db.dsn(), std::string("DROP INDEX ") + kSchema + ".idx_gse_pending");
+    SECTION("alone") {}
+    SECTION("beside a v5 defect, v4 is reported first") {
+        exec_sql(db.dsn(), std::string("DROP TABLE ") + kSchema + ".guardian_agent_order");
+    }
+    const OpenAttempt a = try_open(db.dsn());
+    CHECK_FALSE(a.open);
+    CHECK(a.log.find("v4: object not as this version creates it") != std::string::npos);
+    CHECK(a.log.find("idx_gse_pending") != std::string::npos);
+    CHECK(a.log.find("SET version = 3 WHERE store = 'guaranteed_state_store'") !=
+          std::string::npos);
+    CHECK(a.log.find("v5: object not as") == std::string::npos);
+    CHECK(a.log.find("SET version = 4") == std::string::npos);
+}
+
+TEST_CASE("census ordering: a hand-broken object makes the v5 migration refuse and not stamp",
+          "[pg][guaranteed_state_store][db][census][ordering][schema][pair]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    REQUIRE(opens(db.dsn()));
+    downgrade_to_v4(db.dsn());
+    const std::string ev = std::string(kSchema) + ".guaranteed_state_events";
+
+    SECTION("an adopted events.boot_epoch of the wrong type") {
+        exec_sql(db.dsn(), "ALTER TABLE " + ev + " ADD COLUMN boot_epoch integer");
+    }
+    SECTION("an adopted agent table of the wrong shape") {
+        exec_sql(db.dsn(),
+                 std::string("CREATE TABLE ") + kSchema + ".guardian_agent_order (agent_id text)");
+    }
+    SECTION("an adopted agent table with a renamed primary key") {
+        exec_sql(db.dsn(), std::string("CREATE TABLE ") + kSchema +
+                               ".guardian_agent_order (agent_id text CONSTRAINT adopted_pk "
+                               "PRIMARY KEY, epoch bigint, emit_seq_hwm bigint, epoch_recv_ns "
+                               "bigint, retired_epoch bigint, unpaired_recv_ns bigint, "
+                               "unpaired_events bigint NOT NULL DEFAULT 0, unpaired_held bigint "
+                               "NOT NULL DEFAULT 0, pair_regressions bigint NOT NULL DEFAULT 0, "
+                               "pair_stragglers bigint NOT NULL DEFAULT 0, pair_recoveries "
+                               "bigint NOT NULL DEFAULT 0, pair_duplicates bigint NOT NULL "
+                               "DEFAULT 0, retired_events bigint NOT NULL DEFAULT 0)");
+    }
+    CHECK_FALSE(opens(db.dsn()));
+    CHECK(schema_version(db.dsn()) == "4"); // not stamped
+    // The migration rolled back as a whole: the half it had applied is gone too.
+    CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM pg_attribute WHERE attrelid = '" + ev +
+                                     "'::regclass AND attname = 'emit_seq' AND NOT "
+                                     "attisdropped") == "0");
 }
 
 // ── C3: the key, the pending evidence, the fold, the upsert and the clear ───────────────────
