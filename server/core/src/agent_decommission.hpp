@@ -139,7 +139,7 @@ struct AgentDecommissionStores {
     AppUsageStore* app_usage{nullptr};                    ///< PG per-agent last-used app usage
     OfflineEndpointStore* offline_endpoint{nullptr}; ///< PG endpoint_state presence row (#5682)
     CertificateInventoryStore* certificate_inventory{nullptr}; ///< PG certificate_inventory_store (erase only)
-    /// PG guardian_agent_rule_status census rows + pending-evidence retire (#5675)
+    /// PG guardian_agent_order row + guardian_agent_rule_status census rows + pending-evidence retire (#5675)
     GuaranteedStateStore* guaranteed_state{nullptr};
 };
 
