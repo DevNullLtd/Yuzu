@@ -1070,11 +1070,12 @@ pin fails `unpinned_leaf_is_refused`. It cannot skip: the script has no skip pat
 prerequisite exits non-zero, and `YUZU_REAL_UPSTREAM_STRICT=1` turns a check the suite cannot make
 (server unreachable, `/metrics` unreadable) into a failure. The four runner agents share one OS
 identity (#1871), so every named resource is per-run: all 8 ports come from the OS in one
-allocation (`--free-ports`), the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
+allocation (`--free-ports`). A start-up that loses one to another process before binding it is retried, up to 3 attempts, on an unambiguous bind failure only, and a retry is a `::warning::` annotation and a step-summary line (#7538). The Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
 the job's `YUZU_TEST_POSTGRES_DSN` and dropped on exit, the work directory is a `mktemp` name under
 `runner.temp`, and the gateway's Erlang node name and cookie carry a random salt (the release's own
 fixed `yuzu_gw` short name would contest the shared EPMD). A failed run keeps its work directory and
-the step "Upload gateway real-wire logs on failure" uploads its logs (`failure() &&` leads the
+the step "Upload gateway real-wire logs on failure" uploads its logs, including each retried
+attempt's `server.attemptN.log` / `gateway.attemptN.log` (`failure() &&` leads the
 condition) and the Common Test logs, never the run's throwaway CA or agent keys. The burst's own log
 (`mgmt_driver.log`) is among the uploaded `*.log` files.
 

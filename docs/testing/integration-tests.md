@@ -36,9 +36,26 @@ The primary integration test runs all three components together:
 ./scripts/integration-test.sh --tls --free-ports --gateway-ct
 ```
 
-The script needs Postgres (`YUZU_TEST_POSTGRES_DSN`; it creates a uniquely named database and
-drops it on exit), `psql`, `openssl`, `curl`, `python3` and Erlang/OTP with `rebar3` (it builds the
-gateway release). `--free-ports` makes concurrent runs on one host safe.
+The script needs bash 4+ (an older bash exits 2 before it creates anything) and Postgres (`YUZU_TEST_POSTGRES_DSN`; it creates a uniquely named database and
+drops it on exit), `psql`, `openssl`, `curl`, `python3` (and `ps`, only where there is no `/proc`) and Erlang/OTP with `rebar3` (it
+builds the gateway release). `ss` (iproute2) is optional: under `--free-ports` it confirms that
+every port belongs to the process that should hold it, and without it that check is skipped (the
+script logs so once); without `ss` a lost web port is not retried (a stranger that does not answer HTTP fails the start with "no
+bind-failure evidence", and one that answers HTTP is not detected at start-up: the run fails later). `--free-ports` makes concurrent runs on one host safe, with one checkout per
+concurrent run (the gateway release under `gateway/_build` is shared).
+
+If another process takes one of the drawn ports before the stack binds it, `--free-ports` retries
+the start-up (at most 3 attempts, all 8 ports redrawn) and keeps the failed attempt's logs as
+`server.attemptN.log` / `gateway.attemptN.log`. Only an unambiguous bind failure is retried: the
+`eaddrinuse` / `Address already in use` error in a log, the server's web-listener failure line
+together with another process listening on that port, or another process found listening on one
+of the stack's ports. Any other start failure (a crash, a timeout, a TLS or key error) fails at
+once. Under GitHub Actions a retry is also a `::warning::` annotation and a line in the step
+summary. What this does and does not guarantee is stated in the script's "Free ports" comment, and
+the classifier, the post-start ownership check and the attempt loop are locked by
+`tests/shell/test_integration_port_retry.sh`.
+`YUZU_IT_PORT_HOG_INDEX=<0..7>` is a local-only test seam that makes attempt 1 lose that port; it
+is refused when `GITHUB_ACTIONS` is set or `CI=true`.
 
 This test:
 - Starts the C++ server in gateway mode with `--gateway-upstream`. The gateway-upstream service refuses to start without gateway peer authorization or an acknowledgement. The plaintext mode passes `--no-tls --insecure-gateway-peer` (the check is disabled, so that mode does not exercise it). `--tls` passes no acknowledgement: the server runs on its generated default certificates and enforces the automatic pin of its own `default-gateway.pem`, the leaf the gateway presents, so the gateway hop is pinned mutual TLS and the script asserts the server booted enforcing with that leaf's SPKI prefix and denied no call

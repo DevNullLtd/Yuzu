@@ -4132,6 +4132,21 @@ if _bash_test.found()
       suite: 'docs',
       timeout: 60,
     )
+    # #7538: scripts/integration-test.sh's lost-port-race classifier (the bind errno, the
+    # web-listener line with a foreign owner, or a foreign listener on a stack port after
+    # start-up is a retryable lost race; a TLS/key start failure is not), the attempt loop,
+    # its process-ownership guard and its monotonic clock. Hermetic: helpers
+    # sourced from the script, fake ss, real throwaway sleep children; no stack, Postgres or
+    # root. LINUX ONLY: its assertions read /proc and need GNU `timeout`, so several of them fail
+    # by construction on macOS; the no-/proc path is covered on Linux through NOPROC_DIR.
+    if host_machine.system() == 'linux'
+      test('integration-test.sh port-retry classifier (#7538)',
+        _bash_test,
+        args: [files('shell/test_integration_port_retry.sh')],
+        suite: 'docs',
+        timeout: 120,
+      )
+    endif
     # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
     # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
     # replaced by functions; spawns and signals nothing. The decoy command line
