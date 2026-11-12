@@ -10778,7 +10778,7 @@ Returns the full topology as JSON.
 
 | Status | When | Body |
 |---|---|---|
-| `200` | Success | `fleet_topology.v1` JSON envelope (see schema below). If the durable offline-host read failed, the live fleet is still returned and the envelope carries `offline_roster_degraded: true` (absent on success). `offline_roster_truncated: true` is present only when more offline hosts existed than the durable read returns (the newest 100,000 are merged); it is reachable as a `200` only with `machines_max=100000` (a `413` otherwise, #7550) |
+| `200` | Success | `fleet_topology.v1` JSON envelope (see schema below). If the durable offline-host read failed, the live fleet is still returned and the envelope carries `offline_roster_degraded: true` (absent on success). `offline_roster_truncated: true` is present only when more offline hosts existed than the durable read returns (the newest 100,000 are merged); it is reachable as a `200` only with `machines_max=100000` and every live host already inside the roster (a `413` otherwise, #7550) |
 | `400` | `machines_max` non-numeric, out of `[1, 100000]`, or overflows `int` | `{"error":{"code":400,"message":"..."}, "meta":{"api_version":"v1"}}` |
 | `403` | RBAC denied | Standard auth error envelope |
 | `413` | Snapshot exceeds `machines_max` | `{"error":{"code":413,"message":"fleet topology exceeds machines_max..."}, "meta":{"api_version":"v1"}}` |
@@ -10822,7 +10822,7 @@ Returns the full topology as JSON.
 
 `schema_minor` is bumped (not `schema`) on additive evolution; renderers MUST ignore unknown keys.
 
-Optional top-level key `offline_roster_degraded: true` is present only when the durable offline-host read failed; `machines` is then live-only. It is a request-time, envelope-level annotation like the MCP twin's `audit_persisted` (set per request, outside the cached snapshot document), not a `schema_minor` change. `offline_roster_truncated: true` is the same kind of annotation: present only when more offline hosts existed than the durable read returns (the newest 100,000 are merged), and reachable as a `200` only with `machines_max=100000` (a `413` otherwise, #7550).
+Optional top-level key `offline_roster_degraded: true` is present only when the durable offline-host read failed; `machines` is then live-only. It is a request-time, envelope-level annotation like the MCP twin's `audit_persisted` (set per request, outside the cached snapshot document), not a `schema_minor` change. `offline_roster_truncated: true` is the same kind of annotation: present only when more offline hosts existed than the durable read returns (the newest 100,000 are merged), and reachable as a `200` only with `machines_max=100000` and every live host already inside the roster (a `413` otherwise, #7550).
 
 **`schema_minor` history:**
 

@@ -1164,9 +1164,10 @@ offline device outside the newest 100,000 still shows its identity. The Software
 Quarantine pages' hostname column is display-only and reads the same capped roster: a
 device outside it shows its `agent_id` in place of the hostname.
 
-The KPI strip's other figures (CI coverage, the manufacturer breakdown, median memory and
-"Showing a-b of N") are derived from the same capped roster and are lower bounds too; the
-notice says so, though only the four count tiles carry the `≥` mark.
+The KPI strip's other figures are derived from the same capped roster: the CI-coverage count,
+the manufacturer counts and "Showing a-b of N" are lower bounds too, while the median memory
+and the CI-coverage ratio describe only the listed devices. The notice says so, though only the
+four count tiles carry the `≥` mark.
 
 ### Known limits above 100,000 devices
 
