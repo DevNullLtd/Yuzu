@@ -239,7 +239,7 @@ Procedure for any change that introduces a new privileged shell-out:
 3. **Update the privilege matrix above.** Add a row with the platform-specific grants.
 4. **Update `install-agent-user.{sh,ps1}` `generate_sudoers_content` / `RequiredPrivileges`.** Both scripts. If the change is platform-specific, only the platform-specific script needs changing, but document that in the matrix.
 5. **Update the plugin's source to use `sudo -n` (Unix) or run inside the elevated service token (Windows).** Code-review for argument quoting: every argv passed to `sudo -n` must come from a trusted source (a YAML-declared parameter that's been validated against its schema), not from raw operator input.
-6. **Add a regression test under `tests/instructions/` (PR C surface) that exercises the new privilege grant on a UAT stack** with the install script's `--check` as a precondition.
+6. **Add a regression test under `tests/instructions/` (PR C surface) that exercises the new privilege grant on a UAT stack** with the install script's `--check` as a precondition. For the `firewall` plugin's `nft` and `pfctl` grants this is `scripts/test/instructions_firewall_containment.py`: it runs `install-agent-user.sh --check` first, probes `firewall.quarantine_status` on the UAT stack, and with `--apply-containment` (refused over SSH unless `--i-have-console-access`) applies and always releases containment; its guards are covered by `tests/test_firewall_containment_ceremony.py`. The live round trip is run by hand on a local host, never on a remote one.
 7. **File a security-guardian review** referencing this doc. The reviewer's job: confirm the grant is the narrowest that works and the argv-validation in step 5 is sound.
 
 ---

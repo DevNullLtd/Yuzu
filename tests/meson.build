@@ -4235,6 +4235,17 @@ test('Echo mapdrive hive-mount pin wiring lexical gate (#5291)',
   timeout: 30,
 )
 
+# firewall containment regression (privilege model step 6): the guards of
+# scripts/test/instructions_firewall_containment.py -- SSH refusal, the console flag, the
+# install-agent-user.sh --check precondition. No network and no firewall change; the live
+# apply/release needs a UAT stack on a local host.
+test('Firewall containment regression guards (privilege model step 6)',
+  _python3_test,
+  args: [files('test_firewall_containment_ceremony.py')],
+  suite: 'agent',
+  timeout: 60,
+)
+
 # virtualization `wsl`: static lexical gate over the Windows shell's wiring -- the one
 # with_user_hive call (default-on hive-file guard, no check argument), no HKEY_USERS enumeration,
 # REG_OPTION_OPEN_LINK on every registry open, and the SID-bearing mount name only in the agent

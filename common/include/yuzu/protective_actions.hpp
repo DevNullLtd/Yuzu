@@ -107,6 +107,8 @@ namespace detail {
 /// This is NOT the containment-gate exemption: `is_quarantine_control_plugin`
 /// (used by `dispatch_confined_arms.hpp`) stays the legacy plugin's set until
 /// the server's live containment path moves to the firewall plugin (#7437).
+/// The legacy plugin and its set stay in this change: its removal, and re-keying this
+/// predicate to the firewall four alone, is the separate follow-up that lands after PR 7530.
 [[nodiscard]] inline bool is_firewall_control_plugin(std::string_view plugin,
                                                      std::string_view action) {
     using detail::iequals;
