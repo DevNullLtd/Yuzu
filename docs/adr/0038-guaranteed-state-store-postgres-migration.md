@@ -315,6 +315,30 @@ row (tracker #7532), the same class as the pending-list race of #7147. The decom
 has an order row again. That is accepted: the row holds counters and the pair clock only, and a later
 decommission deletes it.
 
+Lock wait and pool bound of the agent step (owner-accepted trade). Every census-bearing first
+delivery of an agent queues on that agent's order row, so one transaction that holds the row
+(for example the census fold of another rule of the same agent, a stalled commit, or an operator
+session left idle in a transaction) makes the agent's other first deliveries wait. A waiter holds a
+connection lease for the whole wait, and the leases come from one shared `PgPool` (default 16
+connections, `--postgres-pool-size`) that serves every store, authentication and audit included,
+with a 500 ms acquire timeout for ingest. The step therefore bounds its own wait: it runs
+`SET LOCAL lock_timeout = 1000` after its savepoint and restores the pool's value before the
+savepoint is released (`kAgentStepLockTimeoutMs`), so a waiter gives up after 1 s instead of the
+pool's 10 s. A waiter that gives up takes the existing failure path: the event is stored with pending census
+evidence, its census write is skipped, and it is counted as a failed census projection. The census
+write and the fold keep the pool's `lock_timeout`. The owner accepted that trade: a waiter fails fast
+into pending instead of holding a pooled connection for 10 s, and the cost is faster pending growth
+for the waiting rules. Different agents do not wait on one another through this row, but they share
+the pool, so one agent holding its row for long can occupy leases until the shared pool saturates. Measured on one
+development host (Postgres 18.4, a pool of 8, default timeouts): the fold of one first delivery took
+about 155 ms with 10,000 pending events on one (agent, rule) pair and about 1.67 s with 100,000,
+and another rule of the same agent waited about 151 ms during the 10,000-pending fold (about 2 ms
+with the step off). The point at which the pool saturates was not measured, and neither was the
+gateway's in-flight occupancy. A redelivery repairs only the census row of such an event: a repair
+runs no order step, so the event is never counted in the agent's order clock or counters, and the
+fleet count of unordered agents can undercount for an agent whose first deliveries all failed the
+step, until its next first delivery. That gap must be closed before the comparison ships.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).
