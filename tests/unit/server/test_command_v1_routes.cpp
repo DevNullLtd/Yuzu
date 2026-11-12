@@ -938,6 +938,32 @@ TEST_CASE("command_v1: a protective action never reports os_gate_unreadable, plu
     CHECK(reason_of(res) == "no_agents_reached");
 }
 
+TEST_CASE("command_v1: every firewall containment action is protective (never os_gate_unreadable, "
+          "plugin_not_found or kill_switched_os)",
+          "[server][command_v1][dispatch][zero_reach]") {
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
+        INFO(action);
+        Rig rig;
+        rig.facts = {.legacy_open = true};
+        ConfinedDispatchOutcome o;
+        o.os_gate_unreadable = true;
+        o.unknown_plugin_count = 1;
+        o.kill_switched_os_count = 1;
+        rig.canned = o;
+        const auto res = rig.post({{"plugin", "firewall"}, {"action", action}, {"agent_ids", Ids{kA}}});
+        CHECK(res->status == 503);
+        CHECK(reason_of(res) == "no_agents_reached");
+    }
+    // An ordinary firewall action keeps the specific cause.
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    ConfinedDispatchOutcome o;
+    o.unknown_plugin_count = 1;
+    rig.canned = o;
+    const auto res = rig.post({{"plugin", "firewall"}, {"action", "state"}, {"agent_ids", Ids{kA}}});
+    CHECK(reason_of(res) == "plugin_not_found");
+}
+
 TEST_CASE("command_v1: real zero-reach causes through the real seam",
           "[server][command_v1][dispatch][zero_reach]") {
     Rig rig;

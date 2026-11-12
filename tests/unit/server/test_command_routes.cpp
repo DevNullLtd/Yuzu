@@ -771,6 +771,66 @@ TEST_CASE("/api/command: a protective action reaches an agent whose inventory la
     CHECK(h.send_to_ids_called.empty());
 }
 
+// The firewall plugin's four containment actions are protective too (owner decision 2026-11-12):
+// reached with the plugin missing from the inventory and through a per-OS kill switch, while the
+// plugin's ordinary actions are not. Exhaustive over the closed set.
+TEST_CASE("/api/command: every firewall containment action is protective; an ordinary firewall "
+          "action is withheld",
+          "[command_routes][protective]") {
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
+        INFO(action);
+        CommandHarness h;
+        auto info = make_agent_info("inv-A");
+        info.add_plugins()->set_name("noop"); // non-empty inventory without the firewall plugin
+        (void)h.registry.register_agent(info);
+        auto res = h.sink.Post("/api/command",
+                               std::string(R"({"plugin":"firewall","action":")") + action +
+                                   R"(","agent_ids":["inv-A"]})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.send_to_ids_called == std::vector<std::string>{"inv-A"});
+    }
+    CommandHarness h;
+    auto info = make_agent_info("inv-A");
+    info.add_plugins()->set_name("noop");
+    (void)h.registry.register_agent(info);
+    auto ordinary = h.sink.Post("/api/command",
+                                R"({"plugin":"firewall","action":"state","agent_ids":["inv-A"]})");
+    REQUIRE(ordinary);
+    CHECK(ordinary->status == 503);
+    CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "plugin_not_found");
+    CHECK(h.send_to_ids_called.empty());
+}
+
+TEST_CASE("/api/command: a per-OS kill switch never refuses a firewall containment action",
+          "[command_routes][protective]") {
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
+        INFO(action);
+        CommandHarness h;
+        auto win = make_agent_info("windows-agent");
+        win.mutable_platform()->set_os("windows");
+        (void)h.registry.register_agent(win);
+        h.kill_switched_os = {"windows"};
+        auto res = h.sink.Post("/api/command",
+                               std::string(R"({"plugin":"firewall","action":")") + action +
+                                   R"(","agent_ids":["windows-agent"]})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.send_to_ids_called == std::vector<std::string>{"windows-agent"});
+    }
+    CommandHarness h;
+    auto win = make_agent_info("windows-agent");
+    win.mutable_platform()->set_os("windows");
+    (void)h.registry.register_agent(win);
+    h.kill_switched_os = {"windows"};
+    auto ordinary = h.sink.Post("/api/command",
+                                R"({"plugin":"firewall","action":"state","agent_ids":["windows-agent"]})");
+    REQUIRE(ordinary);
+    CHECK(ordinary->status == 503);
+    CHECK(nlohmann::json::parse(ordinary->body)["error"]["reason"] == "kill_switched_os");
+    CHECK(h.send_to_ids_called.empty());
+}
+
 TEST_CASE("/api/command: only kill-switched-OS targets reports 503 reason=kill_switched_os",
           "[command_routes][5294]") {
     CommandHarness h;
