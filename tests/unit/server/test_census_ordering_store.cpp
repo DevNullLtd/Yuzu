@@ -831,6 +831,30 @@ std::string census(const std::string& dsn, const std::string& agent, const std::
                             "' AND rule_id = '" + rule + "'");
 }
 
+// "boot_epoch/emit_seq" of a census row with NULL as "-" ("-/-" is an unpaired verdict).
+std::string census_pair_text(const std::string& dsn, const std::string& agent,
+                             const std::string& rule) {
+    return query_scalar(dsn, std::string("SELECT COALESCE(boot_epoch::text, '-') || '/' || "
+                                         "COALESCE(emit_seq::text, '-') FROM ") +
+                                 kSchema + ".guardian_agent_rule_status WHERE agent_id = '" + agent +
+                                 "' AND rule_id = '" + rule + "'");
+}
+
+// The same for the stored event row (the first-delivery pair, written once).
+std::string event_pair_text(const std::string& dsn, const std::string& event_id) {
+    return query_scalar(dsn, std::string("SELECT COALESCE(boot_epoch::text, '-') || '/' || "
+                                         "COALESCE(emit_seq::text, '-') FROM ") +
+                                 kSchema + ".guaranteed_state_events WHERE event_id = '" +
+                                 event_id + "'");
+}
+
+GuaranteedStateEventRow with_pair(GuaranteedStateEventRow e, std::int64_t epoch,
+                                  std::int64_t seq) {
+    e.boot_epoch = epoch;
+    e.emit_seq = seq;
+    return e;
+}
+
 std::string pending_count(const std::string& dsn) {
     return query_scalar(dsn, std::string("SELECT count(*) FROM ") + kSchema +
                                  ".guaranteed_state_events WHERE projection_pending");
@@ -3110,4 +3134,282 @@ TEST_CASE("census ordering: a failed census delete rolls the pending retire back
     CHECK(store.delete_agent("A")); // the re-issue completes the erasure
     CHECK(pending_for(db.dsn(), "A") == "0");
     CHECK(census_rows_for(store, "A") == 0);
+}
+
+// ---- A4a (#5690, UP-14 server PR A): the emit-order pair is stored, never compared. The v4
+// predicate (key K, ingest_seq, order_uncertain, ts_hwm/seq_hwm) decides every verdict exactly as
+// before; these cases pin only where the pair lands.
+
+TEST_CASE("census ordering: a paired apply stores the pair on the event and on the census row",
+          "[pg][guaranteed_state_store][db][census][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+
+    SECTION("the insert arm and the update arm both take the applied event's pair") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e1", "r1", "a", kCompliant, kBase + 100), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        CHECK(event_pair_text(db.dsn(), "e1") == "5/10");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e2", "r1", "a", kDrifted, kBase + 200), 5, 11))
+                    .outcome == EventInsertOutcome::Inserted);
+        CHECK(event_pair_text(db.dsn(), "e2") == "5/11");
+        CHECK(event_pair_text(db.dsn(), "e1") == "5/10"); // written once, never updated
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11");
+        // The verdict is the v4 verdict: the pair changed nothing about it.
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+    }
+    SECTION("an unpaired event stores NULL/NULL on both tables") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kCompliant, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(event_pair_text(db.dsn(), "e1") == "-/-");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "-/-");
+    }
+    SECTION("an applied unpaired verdict clears the pair of the paired verdict it replaces") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e1", "r1", "a", kCompliant, kBase + 100), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        REQUIRE(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kDrifted, kBase + 200)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "-/-");
+        CHECK(event_pair_text(db.dsn(), "e1") == "5/10");
+        CHECK(event_pair_text(db.dsn(), "e2") == "-/-");
+    }
+    SECTION("a paired verdict replaces an unpaired one") {
+        REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kCompliant, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e2", "r1", "a", kDrifted, kBase + 200), 7, 3))
+                    .outcome == EventInsertOutcome::Inserted);
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "7/3");
+    }
+}
+
+TEST_CASE("census ordering: a refused event's pair is never written to the census row",
+          "[pg][guaranteed_state_store][db][census][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+
+    SECTION("an older key with a higher pair is refused by the v4 rule and keeps the row's pair") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e1", "r1", "a", kDrifted, kBase + 200), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e2", "r1", "a", kCompliant, kBase + 100), 6, 99))
+                    .outcome == EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|true");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+        CHECK(event_pair_text(db.dsn(), "e2") == "6/99"); // the event keeps its own pair
+    }
+    SECTION("a refused unpaired event does not clear the row's pair") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e1", "r1", "a", kDrifted, kBase + 200), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kCompliant, kBase + 100)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1").ends_with("|true"));
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+    }
+}
+
+TEST_CASE("census ordering: a repair projects the pair stored with the event, never the redelivery's",
+          "[pg][guaranteed_state_store][db][census][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    install_census_fail(db.dsn(), "NEW.state = 'drifted'");
+    const auto e1 = with_pair(ev("e1", "r1", "a", kDrifted, kBase + 100), 5, 10);
+    REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+    REQUIRE(pending_count(db.dsn()) == "1");
+    REQUIRE(census(db.dsn(), "a", "r1").empty()); // the forced failure left no census row
+    CHECK(event_pair_text(db.dsn(), "e1") == "5/10"); // the pair is stored before the projection
+    remove_census_fail(db.dsn());
+
+    auto redelivered = e1;
+    SECTION("a 0/0 replay repairs from the stored pair") {
+        redelivered.boot_epoch.reset();
+        redelivered.emit_seq.reset();
+    }
+    SECTION("a replay carrying a different pair still repairs from the stored pair") {
+        redelivered.boot_epoch = 9;
+        redelivered.emit_seq = 99;
+    }
+    CHECK(store.insert_event_classified(redelivered).outcome == EventInsertOutcome::Redelivered);
+    CHECK(pending_count(db.dsn()) == "0");
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "drifted|" + key_str(kBase + 100) + "|" + key_str(kBase + 100) + "|false");
+    CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+    CHECK(event_pair_text(db.dsn(), "e1") == "5/10"); // the replay did not rewrite the event
+}
+
+TEST_CASE("census ordering: the batch path stores the pair on both tables",
+          "[pg][guaranteed_state_store][db][census][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.create_rule(make_rule("r2", "guard-two")));
+    const auto n = store.insert_events(
+        {with_pair(ev("b1", "r1", "a", kDrifted, kBase + 200), 4, 20),
+         with_pair(ev("b2", "r1", "a", kCompliant, kBase + 100), 4, 21), // refused by key
+         ev("b3", "r2", "a", kCompliant, kBase + 100)});                 // unpaired
+    REQUIRE(n.has_value());
+    CHECK(*n == 3);
+    CHECK(event_pair_text(db.dsn(), "b1") == "4/20");
+    CHECK(event_pair_text(db.dsn(), "b2") == "4/21");
+    CHECK(event_pair_text(db.dsn(), "b3") == "-/-");
+    CHECK(census_pair_text(db.dsn(), "a", "r1") == "4/20"); // b2 was refused, its pair not written
+    CHECK(census_pair_text(db.dsn(), "a", "r2") == "-/-");
+}
+
+TEST_CASE("census ordering: a direct caller cannot store a half or out-of-range pair",
+          "[pg][guaranteed_state_store][db][census][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    constexpr std::int64_t k2p62 = std::int64_t{1} << 62;
+
+    const auto stored_unpaired = [&](const std::string& id, GuaranteedStateEventRow e) {
+        REQUIRE(store.insert_event_classified(e).outcome == EventInsertOutcome::Inserted);
+        CHECK(event_pair_text(db.dsn(), id) == "-/-");
+    };
+    auto half = ev("h1", "r1", "a", kCompliant, kBase + 100);
+    half.boot_epoch = 5;
+    stored_unpaired("h1", half);
+    auto other_half = ev("h2", "r1", "a", kCompliant, kBase + 110);
+    other_half.emit_seq = 5;
+    stored_unpaired("h2", other_half);
+    stored_unpaired("h3", with_pair(ev("h3", "r1", "a", kCompliant, kBase + 120), k2p62, 1));
+    stored_unpaired("h4", with_pair(ev("h4", "r1", "a", kCompliant, kBase + 130), 1, k2p62));
+    stored_unpaired("h5", with_pair(ev("h5", "r1", "a", kCompliant, kBase + 140), 0, 7));
+    stored_unpaired("h6", with_pair(ev("h6", "r1", "a", kCompliant, kBase + 150), -1, 7));
+    CHECK(census_pair_text(db.dsn(), "a", "r1") == "-/-");
+
+    // The edges of the accepted range are stored as given.
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("ok", "r1", "a", kDrifted, kBase + 200), 1, k2p62 - 1))
+                .outcome == EventInsertOutcome::Inserted);
+    CHECK(event_pair_text(db.dsn(), "ok") == "1/" + std::to_string(k2p62 - 1));
+    CHECK(census_pair_text(db.dsn(), "a", "r1") == "1/" + std::to_string(k2p62 - 1));
+}
+
+TEST_CASE("census ordering: a redelivery never compares or rewrites the pair",
+          "[pg][guaranteed_state_store][db][census][ordering][pair]") {
+    // Plan 4.1 (a), (b), (d): the pair is neither selected nor compared by the duplicate check.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    const auto e1 = with_pair(ev("e1", "r1", "a", kCompliant, kBase + 100), 5, 10);
+    REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+
+    SECTION("(a) a 0/0 replay of a stored paired event is a Redelivery that changes nothing") {
+        auto replay = e1;
+        replay.boot_epoch.reset();
+        replay.emit_seq.reset();
+        const auto dropped = store.events_dropped_total();
+        const auto redelivered = store.events_redelivered_total();
+        CHECK(store.insert_event_classified(replay).outcome == EventInsertOutcome::Redelivered);
+        CHECK(store.events_dropped_total() == dropped);
+        CHECK(store.events_redelivered_total() == redelivered + 1);
+        CHECK(store.event_count() == 1);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "compliant|" + key_str(kBase + 100) + "|" + key_str(kBase + 100) + "|false");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+        CHECK(event_pair_text(db.dsn(), "e1") == "5/10");
+    }
+    SECTION("(b) a replay after a newer verdict applied leaves the newer verdict and pair") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e2", "r1", "a", kDrifted, kBase + 200), 5, 11))
+                    .outcome == EventInsertOutcome::Inserted);
+        auto replay = e1;
+        replay.boot_epoch.reset();
+        replay.emit_seq.reset();
+        CHECK(store.insert_event_classified(replay).outcome == EventInsertOutcome::Redelivered);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11");
+    }
+    SECTION("(d) a replay whose pair differs is a Redelivery, never a Conflict") {
+        const auto dropped = store.events_dropped_total();
+        CHECK(store.insert_event_classified(with_pair(e1, 9, 99)).outcome ==
+              EventInsertOutcome::Redelivered);
+        CHECK(store.events_dropped_total() == dropped);
+        CHECK(event_pair_text(db.dsn(), "e1") == "5/10");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+    }
+}
+
+TEST_CASE("census ordering: an applied event whose pair equals the row's pair is flagged (F8)",
+          "[pg][guaranteed_state_store][db][census][ordering][pair]") {
+    // Two processes of one agent under one boot epoch can send the same pair. PR A has no
+    // comparator, so the v4 rule applies the later key. v5's extended legacy-write trigger flags
+    // a state change that leaves a NON-NULL pair unchanged, where v4 leaves the row clean. This is
+    // a change of the FLAG, never of the VERDICT: the verdict, key and marks below are v4's.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.create_rule(make_rule("r2", "guard-two")));
+
+    // Control: the same two verdicts unpaired are clean (the v4 result).
+    REQUIRE(store.insert_event_classified(ev("c1", "r2", "a", kCompliant, kBase + 100)).outcome ==
+            EventInsertOutcome::Inserted);
+    REQUIRE(store.insert_event_classified(ev("c2", "r2", "a", kDrifted, kBase + 200)).outcome ==
+            EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "a", "r2") ==
+          "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+
+    // Control: a pair that MOVES with the verdict is clean.
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("m1", "r1", "a", kCompliant, kBase + 100), 5, 10))
+                .outcome == EventInsertOutcome::Inserted);
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("m2", "r1", "a", kDrifted, kBase + 200), 5, 11))
+                .outcome == EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "a", "r1") ==
+          "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+
+    // The F8 shape: the later key applies (v4 verdict) with the SAME pair as the row.
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("f1", "r1", "b", kCompliant, kBase + 100), 5, 10))
+                .outcome == EventInsertOutcome::Inserted);
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("f2", "r1", "b", kDrifted, kBase + 200), 5, 10))
+                .outcome == EventInsertOutcome::Inserted);
+    CHECK(census(db.dsn(), "b", "r1") ==
+          "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|true");
+    CHECK(census_pair_text(db.dsn(), "b", "r1") == "5/10");
 }
