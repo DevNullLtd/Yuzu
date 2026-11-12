@@ -126,10 +126,21 @@
 /// reads the active row, then dispatches, with no re-validation in between —
 /// a concurrent release request can commit inside that window. The dispatch
 /// itself cannot be recalled once sent, so an apply read just before a DELETE can
-/// land after the release; the release_pending guard and this component's
-/// status-first rule make the next cycle correct it. The owed-release leg has the
-/// same narrow read-then-dispatch window against a new quarantine of the same device
-/// (the new record's re-verify corrects it within 5 minutes). The window is narrow (one
+/// land after the release. Two orderings:
+///   (1) the apply lands while the record still reads releasing: the
+///       release_pending guard and this component's status-first rule make the
+///       next cycle correct it;
+///   (2) the release completes first and the apply lands after it (DELETE took the
+///       device's `inactive` and ended the record, then the late apply contained the
+///       device): the device is firewalled with NO record naming it.
+///       `mark_endpoint_applied` touches no row, this component erases its entry and
+///       nothing re-reads that device; the only trace is the `quarantine.reapply`
+///       failure row `dispatch accepted record_id=<id> command_id=<id> but the durable
+///       stamp failed: device is not quarantined`, and the way back is a
+///       `firewall.release` sent through the generic dispatch routes.
+/// REST DELETE's own release has the same check-then-dispatch window against a
+/// re-quarantine of the device, as does the owed-release leg (the new record's
+/// re-verify corrects either within 5 minutes). The window is narrow (one
 /// synchronous read-then-dispatch pair inside a single `reconcile_one` call, not
 /// spanning any of this component's own waiting); the proper fix (a database-backed
 /// claim or generation on the active row, checked by the release and the reapply path)

@@ -385,9 +385,14 @@ void QuarantineContainmentReconciler::handle_mutation_reply(
     st.pending = Pending::none;
     if (reply.state == QuarantineEndpointState::busy) {
         // The plugin's mutation gate blocked the command — not a failure, just "already busy".
-        // Wait for the normal claim interval before trying again.
         count("busy");
-        return;
+        // Wait for the normal claim interval before trying again, except for an owed entry: its
+        // one release for this session is already sent (`send_release` set `owed_release_sent`),
+        // so a retry would re-send and re-audit it every claim interval for the life of the
+        // session. It reads status next like any other answer, which writes the one
+        // `forced_release_unconfirmed` row and parks it.
+        if (st.kind != Kind::owed)
+            return;
     }
     // Verify soon, overriding the big claim-time interval so the follow-up isn't delayed a full
     // backoff cycle.

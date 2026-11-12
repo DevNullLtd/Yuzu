@@ -2366,7 +2366,7 @@ The `401` for a changed principal, the `500` for an unwired audit identity write
 session-stamped audit rows are exactly as for `POST` above, with the audit verb
 `quarantine.disable`.
 
-**Response (`200`, the device confirmed the release, or the reconciler had already ended the record):**
+**Response (`200`, the device confirmed the release, or the record was already ended and the device confirmed it):**
 
 ```json
 {
@@ -2416,6 +2416,15 @@ same-principal check and the dispatch check for `firewall.release`); no new perm
 exists. Audit rows name the operator: the `attempt` row's `detail` is `force=true`, the outcome row
 `state=released reason=forced device_confirmed=false record_id=<id>`. A store failure while ending the
 record is a retryable `503` (the record stays releasing), never a `202` that hides it.
+
+**A record already ended by someone else.** When another writer ends the record between this call's
+release request and its own end (the reconciler, or a second `DELETE` for the same device), this call
+answers `200` with that record's real end, read back from the store. The record was ended on the
+device's confirmation: `forced: false, device_confirmed: true`. A forced end by the other writer still
+owes the device a release: the same body as a forced end, `forced: true, device_confirmed: false` and the
+message that the device may still be contained. The audit row is `state=released record_id=<id>
+already_ended device_confirmed=<true|false>` and names no one: the writer that ended the record has its
+own `quarantine.disable` row with the same `record_id`.
 
 > **`400` vs `503` (ADR-0047).** Same distinction as `POST` above — `400`
 > means the device is not currently quarantined or `force` is not `true`/`false` (retrying will not

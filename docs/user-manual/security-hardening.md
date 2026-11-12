@@ -798,13 +798,22 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   could not read at all: check it first when a gauge looks suspiciously static.
 
 **Known limitation.** A release request landing at the exact moment the reconciler is mid-apply for the
-same device can end with the apply arriving after the release: the release_pending guard and the
-status-first rule make the next cycle correct it, but for up to one cycle the device can be contained
-under a record that reads releasing. The owed release has the same narrow window against a new
-quarantine of the same device (the new record's re-verify corrects it within 5 minutes). If you release
-and immediately re-quarantine the same device with a different whitelist, a follow-up
-`firewall.quarantine_status` check is a reasonable sanity step. Tracked for a proper fix (a claim or
-generation token on the active record).
+same device can end with the apply arriving after the release, in one of two ways:
+
+- The apply lands while the record still reads releasing: the release_pending guard and the
+  status-first rule make the next cycle correct it, but for up to one cycle the device can be contained
+  under a record that reads releasing.
+- The release completes first and the apply lands after it: the device is firewalled and **no record
+  names it**. Nothing re-reads it, so nothing corrects it. The only trace is a `quarantine.reapply`
+  failure row in the audit log, `dispatch accepted record_id=<id> command_id=<id> but the durable stamp
+  failed: device is not quarantined`, and the way back is `firewall.release` sent through the generic
+  command routes.
+
+The release a `DELETE` sends and the owed release both check the record and then dispatch, so each has the
+same narrow window against a new quarantine of the same device (the new record's re-verify corrects it
+within 5 minutes). If you release and immediately re-quarantine the same device with a different
+whitelist, a follow-up `firewall.quarantine_status` check is a reasonable sanity step. Tracked for a
+proper fix (a claim or generation token on the active record).
 
 ## IOC Checking
 

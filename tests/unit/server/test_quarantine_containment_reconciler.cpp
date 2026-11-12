@@ -2386,6 +2386,35 @@ TEST_CASE("reconciler (firewall): an owed record that never reads inactive: one 
     CHECK(rig.owed().size() == 1);
 }
 
+TEST_CASE("reconciler (firewall): an owed record whose release is answered busy: one release in the "
+          "session, one forced_release_unconfirmed row, status-only reads after the park, one more release "
+          "on a new session",
+          "[pg][quarantine][reconciler][prq2][owed]") {
+    RECON_RIG(rig);
+    const auto rec = rig.quarantine();
+    REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
+    rig.reply("", "status|active", "status|busy");
+    rig.run(8);
+    // busy is counted, but it does not make the session's release a candidate for a re-send
+    CHECK(rig.counter("busy") >= 1);
+    CHECK(rig.count_sent("firewall.release") == 1);
+    CHECK(rig.rows_with("quarantine.disable", "forced_release_sent record_id=" + std::to_string(rec.id)) == 1);
+    CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed status=active record_id=" +
+                                                  std::to_string(rec.id)) == 1);
+    const auto parked_status_reads = rig.count_sent("firewall.quarantine_status");
+    rig.run(8);
+    CHECK(rig.count_sent("firewall.release") == 1);
+    CHECK(rig.count_sent("firewall.quarantine_status") > parked_status_reads); // status-only reads
+    CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 1);
+    CHECK(rig.owed().size() == 1);
+
+    rig.connect("session-B");
+    rig.run(14);
+    CHECK(rig.count_sent("firewall.release") == 2);
+    CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 2);
+    CHECK(rig.owed().size() == 1);
+}
+
 TEST_CASE("reconciler (firewall): an owed record, device offline: nothing sent, counted in "
           "forced_release_owed{offline}",
           "[pg][quarantine][reconciler][prq2][owed]") {

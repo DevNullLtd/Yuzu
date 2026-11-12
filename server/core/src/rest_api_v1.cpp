@@ -8284,17 +8284,23 @@ void RestApiV1::register_routes(
                 res.status = 200;
                 res.set_content(ok_json(o.str()), "application/json");
             };
-            // The record was already ended by the reconciler when this request tried to end it.
-            const auto ended_by_reconciler = [&] {
-                (void)detail::emit_behavioral_audit(audit, req, res, "quarantine.disable",
-                                                    "success", "Security", agent_id,
-                                                    "state=released " + rec +
-                                                        " ended_by=reconciler");
-                respond_released(false);
+            // The record was already ended when this request tried to end it. A zero-row mark
+            // proves it ended, not who ended it or whether the device was released (the
+            // reconciler, a concurrent DELETE and a forced end all write it), so no actor is
+            // named here (that writer's own `quarantine.disable` row carries the same record_id)
+            // and `device_confirmed` is the record's own end, read back by the caller. Anything
+            // but a confirmed end answers as a forced end: the device may still be contained.
+            const auto already_ended = [&](bool device_confirmed) {
+                (void)detail::emit_behavioral_audit(
+                    audit, req, res, "quarantine.disable", "success", "Security", agent_id,
+                    "state=released " + rec + " already_ended device_confirmed=" +
+                        (device_confirmed ? "true" : "false"));
+                respond_released(!device_confirmed);
             };
 
             // The device answered `inactive`: the record ends on ITS word. "device is not
-            // quarantined" here means the reconciler ended this record first: the same 200.
+            // quarantined" here means another writer ended this record first; this device did
+            // answer `inactive`, so the answer is a confirmed release.
             if (reply && reply->state == QuarantineEndpointState::inactive) {
                 auto marked = quarantine_store->mark_released(agent_id, record_id,
                                                               ReleaseEnd::device_confirmed);
@@ -8306,7 +8312,7 @@ void RestApiV1::register_routes(
                     return;
                 }
                 if (marked.error() == "device is not quarantined") {
-                    ended_by_reconciler();
+                    already_ended(true);
                     return;
                 }
                 // a store failure in the mark: handled below like any other unconfirmed outcome
@@ -8332,7 +8338,20 @@ void RestApiV1::register_routes(
             auto forced = quarantine_store->mark_released(agent_id, record_id, ReleaseEnd::forced);
             if (!forced) {
                 if (forced.error() == "device is not quarantined") {
-                    ended_by_reconciler();
+                    // Another writer ended the record first. Report how it really ended: the
+                    // device confirmed unless a forced end still owes it a release. An unreadable
+                    // history or a missing row is "not confirmed", never the other way.
+                    bool device_confirmed = false;
+                    if (const auto history = quarantine_store->get_history(agent_id)) {
+                        for (const auto& r : *history) {
+                            if (r.id == record_id) {
+                                device_confirmed =
+                                    r.status == "released" && r.device_release_owed_at == 0;
+                                break;
+                            }
+                        }
+                    }
+                    already_ended(device_confirmed);
                     return;
                 }
                 const bool db_error = is_quarantine_db_error(forced.error());

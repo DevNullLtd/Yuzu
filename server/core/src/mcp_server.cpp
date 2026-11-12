@@ -23493,12 +23493,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                         if (err.kind == ContainmentReapplyErrorKind::release_pending) {
                             // Not a transient fault: a release is in flight for this record, and
-                            // containment is not re-applied under it. No retry hint.
+                            // containment is not re-applied under it. The request is refused for
+                            // the state the resource is in (kInvalidParams, as the REST twin's
+                            // 400), not a service fault. No retry hint.
                             mcp_audit("failure", "agent_id=" + agent_id +
                                                      ", release in progress; isolation not "
                                                      "dispatched");
                             res.set_content(
-                                a4_error(kInternalError,
+                                a4_error(kInvalidParams,
                                          "a release is in progress for this device"),
                                 "application/json");
                             return;

@@ -34499,7 +34499,7 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
-        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
         CHECK(body["error"]["message"] == "a release is in progress for this device");
         // not a transient fault: no retry_after_ms
         CHECK((!body["error"].contains("data") || body["error"]["data"]["retry_after_ms"].is_null()));

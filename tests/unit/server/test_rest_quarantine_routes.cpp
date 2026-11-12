@@ -1246,6 +1246,15 @@ void end_as_reconciler(QuarantineStore& store, const std::string& agent) {
     REQUIRE(store.mark_released(agent, (*rec)->id, ReleaseEnd::device_confirmed).has_value());
 }
 
+// Ends the active record the way a concurrent forced DELETE does: no device answer, the device
+// still owed a release.
+void end_as_forced(QuarantineStore& store, const std::string& agent) {
+    auto rec = store.get_status(agent);
+    REQUIRE(rec.has_value());
+    REQUIRE(rec->has_value());
+    REQUIRE(store.mark_released(agent, (*rec)->id, ReleaseEnd::forced).has_value());
+}
+
 } // namespace
 
 #define RELEASE_RIG(h, scripted_reply)                                                             \
@@ -1339,8 +1348,8 @@ TEST_CASE("REST DELETE /api/v1/quarantine: a privilege refusal, a partial releas
     CHECK(find_audit(h, "success") == nullptr);
 }
 
-TEST_CASE("REST DELETE /api/v1/quarantine: a reply of inactive for a record the reconciler ended first is "
-          "also 200, and the success row says so",
+TEST_CASE("REST DELETE /api/v1/quarantine: a reply of inactive for a record another writer ended first is "
+          "also 200, and the success row says it was already ended",
           "[rest][quarantine][release][pg]") {
     RELEASE_RIG(h, "status|inactive");
     h.on_dispatch = [&h] { end_as_reconciler(h.quarantine_store, "agent-B"); };
@@ -1350,7 +1359,8 @@ TEST_CASE("REST DELETE /api/v1/quarantine: a reply of inactive for a record the 
     CHECK(parse_body(res->body)["data"]["released"] == true);
     const auto* success = find_audit(h, "success");
     REQUIRE(success != nullptr);
-    CHECK(success->detail.find("ended_by=reconciler") != std::string::npos);
+    CHECK(success->detail.find("already_ended device_confirmed=true") != std::string::npos);
+    CHECK(success->detail.find("ended_by=") == std::string::npos);
 }
 
 TEST_CASE("REST DELETE /api/v1/quarantine: with no in-flight slot the release is dispatched, nothing is "
@@ -1511,8 +1521,8 @@ TEST_CASE("REST DELETE /api/v1/quarantine?force=true: a privilege refusal is for
     CHECK(owed_list(h.quarantine_store).size() == 1);
 }
 
-TEST_CASE("REST DELETE /api/v1/quarantine?force=true: ends a record already releasing; a record the "
-          "reconciler ended first is a 200 forced false with ended_by=reconciler",
+TEST_CASE("REST DELETE /api/v1/quarantine?force=true: ends a record already releasing; a record another "
+          "writer ended first answers with that record's real end, never a device-confirmed guess",
           "[rest][quarantine][release][force][pg]") {
     SECTION("already releasing") {
         RELEASE_RIG(h, "");
@@ -1537,8 +1547,30 @@ TEST_CASE("REST DELETE /api/v1/quarantine?force=true: ends a record already rele
         CHECK(body["data"]["device_confirmed"] == true);
         const auto* success = find_audit(h, "success");
         REQUIRE(success != nullptr);
-        CHECK(success->detail.find("ended_by=reconciler") != std::string::npos);
+        CHECK(success->detail.find("already_ended device_confirmed=true") != std::string::npos);
+        CHECK(success->detail.find("ended_by=") == std::string::npos);
         CHECK(owed_list(h.quarantine_store).empty()); // the device confirmed: nothing owed
+    }
+    SECTION("ended by a concurrent forced end first") {
+        // The losing call of two forced DELETEs: its guarded mark touches no row, but the device
+        // was never confirmed and is still owed a release, so it must not read as a release.
+        RELEASE_RIG(h, "");
+        h.on_dispatch = [&h] { end_as_forced(h.quarantine_store, "agent-B"); };
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = parse_body(res->body);
+        CHECK(body["data"]["forced"] == true);
+        CHECK(body["data"]["device_confirmed"] == false);
+        CHECK(body["data"]["message"].get<std::string>().find("may still be contained") !=
+              std::string::npos);
+        const auto* success = find_audit(h, "success");
+        REQUIRE(success != nullptr);
+        CHECK(success->detail.find("already_ended device_confirmed=false") != std::string::npos);
+        CHECK(success->detail.find("ended_by=") == std::string::npos);
+        const auto owed = owed_list(h.quarantine_store); // still owed: only the device can clear it
+        REQUIRE(owed.size() == 1);
+        CHECK(owed[0].agent_id == "agent-B");
     }
 }
 
