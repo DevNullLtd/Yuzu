@@ -4514,9 +4514,16 @@ TEST_CASE("census ordering: agent_order_for_agent returns the agent's order row 
         CHECK_FALSE(got->has_value());
     }
     SECTION("a store that cannot answer is an error, never an absent row") {
+        yuzu::MetricsRegistry metrics;
         PgPool dead{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
         GuaranteedStateStore closed(dead);
+        closed.set_metrics(&metrics);
         CHECK_FALSE(closed.agent_order_for_agent("a").has_value());
+        // Counted on the per-device census source, not the gauge's or the rules source.
+        CHECK(degrade_count(metrics, kSourceDevice, "store_not_open") == 1);
+        CHECK(degrade_total(metrics, kSourceDevice) == 1);
+        CHECK(degrade_total(metrics, kSourceGauge) == 0);
+        CHECK(degrade_total(metrics, "guardian_rules") == 0);
     }
 }
 
@@ -4599,15 +4606,58 @@ TEST_CASE("census ordering: unordered_agents lists the agents whose latest unpai
         CHECK(store.unordered_agents(Scope{std::vector<std::string>{}})->count == 0);
         CHECK(store.unordered_agents(Scope{std::vector<std::string>{}})->ids.empty());
     }
+    SECTION("the count-only read agrees with the list read, past the id cap") {
+        // The gauge sweep reads only the count, so it must not drift from the request path's.
+        const auto before = store.unordered_agent_count();
+        REQUIRE(before.has_value());
+        CHECK(*before == 2);
+        CHECK(*before == store.unordered_agents(Scope{})->count);
+        for (int i = 0; i < 53; ++i)
+            send_unpaired(std::format("bulk{:03}", i));
+        const auto after = store.unordered_agent_count();
+        REQUIRE(after.has_value());
+        CHECK(*after == 55);
+        const auto list = store.unordered_agents(Scope{});
+        REQUIRE(list.has_value());
+        CHECK(list->count == *after);
+        CHECK(list->ids.size() == kUnorderedAgentIdCap);
+        // An agent that goes back in order leaves the count-only read too.
+        send_paired("U", 6, 1);
+        CHECK(*store.unordered_agent_count() == 54);
+    }
     SECTION("an engaged-empty scope is answered without a query; a down store is an error") {
+        yuzu::MetricsRegistry metrics;
         PgPool dead{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
         GuaranteedStateStore closed(dead);
+        closed.set_metrics(&metrics);
         const auto empty = closed.unordered_agents(Scope{std::vector<std::string>{}});
         REQUIRE(empty.has_value());
         CHECK(empty->count == 0);
         CHECK(empty->ids.empty());
         CHECK_FALSE(closed.unordered_agents(Scope{}).has_value());
         CHECK_FALSE(closed.unordered_agents(Scope{{"U"}}).has_value());
+        // The request-path read counts on guardian_rules, and only there (the engaged-empty answer
+        // above is not a degrade).
+        CHECK(degrade_count(metrics, "guardian_rules", "store_not_open") == 2);
+        CHECK(degrade_total(metrics, "guardian_rules") == 2);
+        CHECK(degrade_total(metrics, kSourceGauge) == 0);
+        CHECK(degrade_total(metrics, kSourceDevice) == 0);
+        // The count-only read is an error too, counted on the gauge's own source.
+        CHECK_FALSE(closed.unordered_agent_count().has_value());
+        CHECK(degrade_count(metrics, kSourceGauge, "store_not_open") == 1);
+        CHECK(degrade_total(metrics, kSourceGauge) == 1);
+        CHECK(degrade_total(metrics, "guardian_rules") == 2);
+    }
+    SECTION("a failing count-only query is counted on the gauge source as a query error") {
+        yuzu::MetricsRegistry metrics;
+        store.set_metrics(&metrics);
+        exec_sql(db.dsn(), std::string("DROP TABLE ") + kSchema + ".guardian_agent_order CASCADE");
+        CHECK_FALSE(store.unordered_agent_count().has_value());
+        CHECK(degrade_count(metrics, kSourceGauge, "query_error") == 1);
+        CHECK(degrade_total(metrics, "guardian_rules") == 0);
+        CHECK_FALSE(store.unordered_agents(Scope{}).has_value());
+        CHECK(degrade_count(metrics, "guardian_rules", "query_error") == 1);
+        CHECK(degrade_total(metrics, kSourceGauge) == 1);
     }
 }
 

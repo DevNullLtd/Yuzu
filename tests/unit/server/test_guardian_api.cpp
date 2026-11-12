@@ -762,11 +762,19 @@ TEST_CASE("GuardianApi: a failed order read degrades the read, never a silent ze
     YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
     PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
     GuaranteedStateStore store{gs_pool};
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
     REQUIRE(store.create_rule(make_rule("r1", "Guard one")).has_value());
     send_event(store, 1, "a");
     auto api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
     // Every other read still works; only the order table is gone.
     exec_sql(gs_db.dsn(), "DROP TABLE guaranteed_state_store.guardian_agent_order CASCADE");
+    const auto degraded = [&](const char* source) {
+        return metrics
+            .counter("yuzu_server_guardian_read_degrade_total",
+                     {{"reason", "query_error"}, {"source", source}})
+            .value();
+    };
 
     using Scope = std::optional<std::vector<std::string>>;
     CHECK_FALSE(api->status(Scope{}).has_value());
@@ -776,9 +784,18 @@ TEST_CASE("GuardianApi: a failed order read degrades the read, never a silent ze
     REQUIRE(empty.has_value());
     CHECK(empty->unordered_agents == 0);
 
+    // The request-path rollup read counts on guardian_rules, twice (two failed status calls).
+    CHECK(degraded("guardian_rules") == 2);
+    CHECK(degraded("guardian_census_device") == 0);
+    CHECK(degraded("guardian_census") == 0);
+
     GuardianReadFault fault = GuardianReadFault::kNone;
     CHECK_FALSE(api->device_guards("a", &fault).has_value());
     CHECK(fault == GuardianReadFault::kTransient);
+    // The per-device order read counts on the per-device census source, and neither of the others.
+    CHECK(degraded("guardian_census_device") == 1);
+    CHECK(degraded("guardian_rules") == 2);
+    CHECK(degraded("guardian_census") == 0);
 }
 
 TEST_CASE("the unordered-agents gauge is set from a successful read and never from a failed one",
@@ -806,10 +823,21 @@ TEST_CASE("the unordered-agents gauge is set from a successful read and never fr
     sweep();
     CHECK(value() == 1.0);
 
-    // A failed read leaves the previous sample: it is not published as zero.
+    // A failed read leaves the previous sample: it is not published as zero. The failure is
+    // counted on the gauge's own degrade source, so a frozen gauge is visible, and not on the
+    // request path's source.
+    store.set_metrics(&metrics);
     exec_sql(gs_db.dsn(), "DROP TABLE guaranteed_state_store.guardian_agent_order CASCADE");
     sweep();
     CHECK(value() == 1.0);
+    CHECK(metrics
+              .counter("yuzu_server_guardian_read_degrade_total",
+                       {{"reason", "query_error"}, {"source", "guardian_census"}})
+              .value() == 1);
+    CHECK(metrics
+              .counter("yuzu_server_guardian_read_degrade_total",
+                       {{"reason", "query_error"}, {"source", "guardian_rules"}})
+              .value() == 0);
 }
 
 TEST_CASE("the unordered-agents gauge is absent until a read answers",

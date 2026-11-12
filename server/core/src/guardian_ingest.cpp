@@ -111,11 +111,21 @@ void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
 
 void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry& metrics,
                                              const GuaranteedStateStore& store) {
-    // Published only on success: an unanswered read must not read as zero. The fleet-wide scope
-    // (nullopt) also fetches the capped id list; only the exact count is used here.
-    if (const auto unordered = store.unordered_agents(std::nullopt))
-        metrics.gauge(kGuardianCensusUnorderedAgentsMetric)
-            .set(static_cast<double>(unordered->count));
+    // Published only on success: an unanswered read must not read as zero, and a failed one leaves
+    // the last value. The count-only read is bounded and counted on the gauge's own degrade source.
+    // The caller is a bare thread body, so nothing may escape: the handler nests its own
+    // observability (formatting allocates), the pattern of the bridge sweep tick in server.cpp.
+    try {
+        if (const auto unordered = store.unordered_agent_count())
+            metrics.gauge(kGuardianCensusUnorderedAgentsMetric)
+                .set(static_cast<double>(*unordered));
+    } catch (...) {
+        try {
+            spdlog::warn(
+                "guardian census unordered-agents gauge tick failed; keeping the last value");
+        } catch (...) { // NOLINT(bugprone-empty-catch) - nested by design
+        }
+    }
 }
 
 // ── #4666 PR-4: dedicated bounded async logger for the T_server diagnostic line ─────────────

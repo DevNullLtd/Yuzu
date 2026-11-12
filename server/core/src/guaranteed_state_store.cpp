@@ -74,10 +74,9 @@ constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // so an alert can aggregate `by (reason, source)` without missing any family.
 constexpr const char* kDegradeSource = "guardian_state";
 constexpr const char* kDegradeSourceRules = "guardian_rules";
-// "guardian_census" is the census pending-count GAUGE read only
-// (pending_projection_count_checked, #5690): its failure freezes the published
-// gauge at its previous value, so a rising counter on this source with a flat
-// gauge means the gauge is a stale sample.
+// "guardian_census" is the census GAUGE reads only (pending_projection_count_checked, #5690,
+// and unordered_agent_count, UP-14): a failure freezes the published gauge at its previous
+// value, so a rising counter on this source with a flat gauge means the gauge is a stale sample.
 constexpr const char* kDegradeSourceCensus = "guardian_census";
 // "guardian_census_device" is the per-device unrepresented-pending read
 // (unrepresented_pending_for_agent, #7217) and the per-device order read
@@ -4139,6 +4138,63 @@ std::expected<UnorderedAgentsSummary, std::string> GuaranteedStateStore::unorder
         out.count = to_i64(PQgetvalue(res.get(), i, 1)); // the same on every row
     }
     return out;
+}
+
+// The fleet-wide count of `unordered_agents`, and nothing else: no id list, so no sort and no window
+// pass. It serves the 15 s gauge sweep, which would otherwise run the full request-path read
+// (ORDER BY, LIMIT, window count) for a figure it discards the ids of. Bounded like
+// pending_projection_count_checked: a 1 s statement timeout is set first, so a large table can never
+// hold a pool connection for long, and the caller publishes the figure only when this succeeds.
+// Counted on kDegradeSourceCensus, the gauge's own source, never on kDegradeSourceRules: a gauge read
+// and a request read must not share a source, or request noise masks a frozen gauge (see the source
+// comments above). The predicate is `unordered_agents`'s, so the two agree on a quiescent table.
+std::expected<std::int64_t, std::string> GuaranteedStateStore::unordered_agent_count() const {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceCensus, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::unordered_agent_count: store not open");
+        return std::unexpected("database not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceCensus, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::unordered_agent_count: pool acquire timed out");
+        return std::unexpected("no database connection: " + pool_.last_error());
+    }
+    PGconn* conn = lease.get();
+    pg::PgResult begin = pg::exec_params(conn, "BEGIN", std::vector<std::string>{});
+    if (begin.status() != PGRES_COMMAND_OK) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceCensus, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::unordered_agent_count: BEGIN failed: {}",
+                         ::yuzu::log_key_token(PQerrorMessage(conn)));
+        return std::unexpected(std::string("BEGIN failed: ") + PQerrorMessage(conn));
+    }
+    pg::PgTxn txn(conn);
+    pg::PgResult timeout =
+        pg::exec_params(conn, "SET LOCAL statement_timeout = 1000", std::vector<std::string>{});
+    pg::PgResult res =
+        timeout.status() == PGRES_COMMAND_OK
+            ? pg::exec_params(conn,
+                              "SELECT count(*) FROM guaranteed_state_store.guardian_agent_order "
+                              "WHERE unpaired_recv_ns IS NOT NULL "
+                              "AND unpaired_recv_ns > COALESCE(epoch_recv_ns, 0)",
+                              std::vector<std::string>{})
+            : std::move(timeout);
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceCensus, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::unordered_agent_count: query failed: {}",
+                         ::yuzu::log_key_token(PQresultErrorMessage(res.get())));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
+    return to_i64(PQgetvalue(res.get(), 0, 0));
 }
 
 std::size_t GuaranteedStateStore::rule_count() const {

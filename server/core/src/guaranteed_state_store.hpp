@@ -571,6 +571,13 @@ public:
     std::expected<UnorderedAgentsSummary, std::string>
     unordered_agents(const std::optional<std::vector<std::string>>& agent_scope) const;
 
+    /// The fleet-wide count of `unordered_agents` (same predicate), with no id list: the 15 s gauge
+    /// sweep's read, so it does not pay for an ORDER BY / window pass it discards. Runs under a 1 s
+    /// `SET LOCAL statement_timeout`. `std::unexpected`, never a silent zero, on any failure,
+    /// counted on the `guardian_census` degrade source (the gauge's own, never the request path's
+    /// `guardian_rules`). The request path keeps `unordered_agents`.
+    std::expected<std::int64_t, std::string> unordered_agent_count() const;
+
     /// Pairs of ONE device (`agent_id`) that have a retained `projection_pending` event and NO census
     /// row (#7217): evidence the represented-pair reads cannot show. `rule_filter`: `nullopt` = every
     /// rule; engaged-empty = `{0, {}}` without a lease or a seam call; non-empty = only those
