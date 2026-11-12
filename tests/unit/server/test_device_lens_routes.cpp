@@ -22,6 +22,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <yuzu/metrics.hpp>
+
 #include <libpq-fe.h>
 
 #include <functional>
@@ -389,6 +391,78 @@ TEST_CASE("device lenses: DEX lens on a degraded signal-summary read renders the
     // the downstream read then degraded.
     REQUIRE(audited.size() == 1);
     CHECK(audited[0] == "dex.device.view|a-1");
+}
+
+// A failed read of the per-agent order row degrades the whole Guardian lens: the lens reads the
+// device through device_guards(), which also reads the order row (UP-14), so a store whose order
+// table cannot be read renders the degraded placeholder instead of the guard rows, although the
+// census read itself succeeds and the lens never renders ordering. The failed read is counted as a
+// read degrade on the per-device census source. The same lens with the order table present is the
+// control, so the placeholder is proved to come from the order read and not from the fixture.
+TEST_CASE("device lenses: Guardian lens renders the degraded placeholder when only the order read "
+          "fails",
+          "[pg][device][routes][degraded][ordering]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const std::string agent = "guardian-order-degrade-1";
+    REQUIRE(store.create_rule(make_lens_rule("r-order", "Order Guard")));
+    REQUIRE(store.insert_event(make_drift_event("evt-order", "r-order", agent, "drift.detected",
+                                                "2026-04-19T12:00:00Z")));
+
+    auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&, const std::string&) { return true; };
+    std::vector<std::string> audited;
+    auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
+                            const std::string&, const std::string& tid, const std::string&) {
+        audited.push_back(a + "|" + tid);
+        return true;
+    };
+    auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
+    yuzu::server::test::TestRouteSink sink;
+    DeviceLensRoutes routes;
+    routes.register_routes(sink, okScoped, /*dex_api=*/nullptr, guardian_api, audit);
+
+    // Control: the order table is present, so the lens renders the guard row.
+    auto ok = sink.Get("/fragments/device/guardian?id=" + agent + "&bare=1");
+    REQUIRE(ok);
+    CHECK(ok->body.find("Guardian store degraded.") == std::string::npos);
+    CHECK(ok->body.find("Order Guard") != std::string::npos);
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_agent_order")};
+        REQUIRE(d.ok());
+    }
+    // The census read still answers: the failure is the order read alone.
+    const auto statuses = store.agent_rule_statuses_for_agent(agent);
+    REQUIRE(statuses.has_value());
+    CHECK(statuses->size() == 1);
+    const auto degraded_before =
+        metrics
+            .counter("yuzu_server_guardian_read_degrade_total",
+                     {{"reason", "query_error"}, {"source", "guardian_census_device"}})
+            .value();
+
+    auto gd = sink.Get("/fragments/device/guardian?id=" + agent + "&bare=1");
+    REQUIRE(gd);
+    CHECK(gd->status == 200);
+    CHECK(gd->body == "<div class=\"gp-placeholder\"><b>Coming in a later slice</b>Guardian store "
+                      "degraded.</div>");
+    CHECK(gd->body.find("Order Guard") == std::string::npos);
+    // The failed order read is counted on the per-device census source.
+    CHECK(metrics
+              .counter("yuzu_server_guardian_read_degrade_total",
+                       {{"reason", "query_error"}, {"source", "guardian_census_device"}})
+              .value() == degraded_before + 1);
+    // Both opens are audited: the audit records the access, not the read's outcome.
+    REQUIRE(audited.size() == 2);
+    CHECK(audited[1] == "guardian.device.view|" + agent);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
