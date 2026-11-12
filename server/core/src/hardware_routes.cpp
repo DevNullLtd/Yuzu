@@ -861,9 +861,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::optional<std::string> manifest =
                 deps_.manifest_fn ? deps_.manifest_fn(plugin.name) : std::nullopt;
             for (const auto& action : plugin.actions) {
-                // Hidden with the rest of the containment UI: a Run button on the quarantine
-                // plugin's own actions is a quarantine control. REST, MCP and the Instructions
-                // page are unchanged.
+                // Hidden with the rest of the containment UI: a Run button on the four
+                // firewall containment actions (quarantine, release, quarantine_status,
+                // quarantine_allow) is a quarantine control; firewall.state and firewall.rules
+                // stay listed. REST, MCP and the Instructions page are unchanged.
                 if (!deps_.containment_ui &&
                     yuzu::protective::is_quarantine_control_plugin(plugin.name, action))
                     continue;

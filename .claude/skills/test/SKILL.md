@@ -19,13 +19,6 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
                          only. Skips build/upgrade/sanitizers/coverage. Use when content
                          changes (yaml under `content/definitions/`) or after touching the
                          instruction-engine dispatch path.
-/test --instructions-quarantine
-                       — quarantine ceremony (~30-40s): exercises the security.quarantine
-                         cluster (isolate / release / status / whitelist) with the
-                         self-disconnect/auto-resume dance. DO NOT RUN ON A REMOTE / SSH-ONLY
-                         HOST — see safety section below. Destructive and forensic
-                         InstructionDefinitions are never run by /test; drive the runner by
-                         hand (see "`--instructions` mode" below).
 /test --force-cleanup  — tear down THIS RUN's dangling test containers before starting
 /test --keep-stack     — leave docker stacks running after the run (debugging)
 ```
@@ -694,53 +687,6 @@ The manifest (`--manifest PATH`, default `instructions-runner-<run-id>.manifest.
 
 Side effects / how to restore (the runner undoes none of them; this list is NOT exhaustive and every destructive/forensic row in the risk table applies): `device.tags.clear` and `agent.storage.clear` delete the target's tags and storage keys with no undo; `crossplatform.echo.rollup` permanently deletes Echo rows past retention, is not recoverable and has no approval gate; `security.certificates.delete` deletes a certificate; `agent.content_dist.stage`/`execute_staged`/`cleanup`/`upload_file` (`execute_staged` RUNS the staged artefact); `crossplatform.printing.clear_queue` is irreversible; `crossplatform.service.set_start_mode`; `device.script_exec.*` runs arbitrary script text; `agent.http_client.download`; `device.wol.wake`; `workflow.config_search_and_replace`; filesystem writes, registry values and the power plan stay changed until you revert them by hand. The destructive `server.*` definitions (for example `server.policy.invalidate_all`) are skipped, never sent. Forensic rows read behavioural data from the target, and the responses are stored in the server's response store. `testing.chargen.start` streams until stopped, so a targeted run skips it (even with an override); start and stop it by hand through the dashboard or REST with `agent_ids`.
 
-### `--instructions-quarantine` mode (the self-disconnect ceremony)
-
-> **DO NOT RUN ON A REMOTE / SSH-ONLY HOST.** The ceremony briefly cuts ALL external network. If your only access path to the box is SSH-over-the-network, you will lock yourself out until the un-quarantine fires (~25-30s) — and if the un-quarantine fails, you stay locked out until you physically reach the box. Run only on your local dev box (the one with a keyboard and a screen).
->
-> Additional preconditions:
-> - The agent account must have the privileges declared in `docs/agent-privilege-model.md`. Run `sudo bash scripts/install-agent-user.sh` (Linux/macOS) or `powershell -ExecutionPolicy Bypass scripts/install-agent-user.ps1` from an elevated PowerShell (Windows) once per box before the first ceremony run; the install script is idempotent. Verify with `--check` / `-Check`.
-> - If the agent is running as an account WITHOUT the `pfctl` / `iptables` / `netsh` grants, the survivor will dispatch isolate but the firewall won't actually close — the survivor catches that in `confirm-blackout`, dispatches emergency release, and exits FAIL/1 without locking the box. That's the *safe* failure mode; it tells you the install script hasn't been run on this host.
-
-This mode exercises the four-instruction quarantine cluster (`security.quarantine.{isolate,release,status,whitelist}`) including the part the schema-driven runner can't: **the actual network blackout**. Because the blackout cuts Claude Code's path to api.anthropic.com, the ceremony is driven by a detached survivor (`scripts/test/instructions_quarantine_survivor.py`) that:
-
-1. Probes preconditions (UAT reachable, plugin loaded, external connectivity present, Yuzu localhost reachable).
-2. Dispatches `security.quarantine.isolate` with `server_ip=127.0.0.1` and `whitelist_ips=127.0.0.1`. The plugin auto-whitelists loopback on every platform, so localhost endpoints stay reachable.
-3. After a 5s grace, probes external destinations (1.1.1.1, 8.8.8.8, github.com, api.anthropic.com on :443) — they MUST be unreachable. Probes Yuzu localhost (8080, 50051, 8081) — they MUST be reachable.
-4. Sleeps 10s, re-probes external to confirm sustained blackout.
-5. Dispatches `security.quarantine.release`. Probes external to confirm recovery.
-6. Writes `results.json` to the state dir.
-7. (If `--launch-resume`) Tries to spawn a new Terminal with `claude --resume <session-id>` via `osascript` (macOS) or `tmux` (other platforms). Always falls back to writing `<state-dir>/relaunch.sh` for manual use.
-
-**Operator workflow inside Claude Code**:
-
-```bash
-bash scripts/test/instructions-quarantine.sh \
-    --dashboard http://localhost:8080 \
-    --user admin --password 'YuzuUatAdmin1!' \
-    --launch-resume      # macOS only — opens a new Terminal window
-```
-
-This script captures the current Claude session UUID from `~/.claude/projects/-Users-<user>-Yuzu/<uuid>.jsonl` (most recent), backgrounds the survivor via `setsid nohup`, prints PID + state-dir + instructions, and exits 0 immediately. The survivor runs ~30-40s asynchronously.
-
-**During the blackout**, this Claude Code session may lose its connection to api.anthropic.com. The user has three options:
-- Type `/exit` and let the survivor's auto-resume open a new Terminal
-- Wait for the connection to recover (it usually does after un-quarantine)
-- Manually run `bash /tmp/yuzu-quarantine-test/relaunch.sh` after the survivor finishes
-
-**On resume, read the results**:
-```bash
-cat /tmp/yuzu-quarantine-test/results.json
-```
-
-The results document each phase, every probe (with TCP latency), the agent's responses to isolate/release, and any operator-actionable note. Exit codes:
-- 0 — full ceremony passed: blackout sustained, recovery confirmed
-- 1 — blackout incomplete or recovery probe failed (firewall partially or fully not actually closed; OR external reachable mid-blackout)
-- 2 — precondition fail (login, plugin not loaded, no external connectivity at start) — no firewall change happened
-- 3 — release dispatch failed: **operator must clear firewall manually** (`pfctl -F all` / `iptables -F` / `netsh advfirewall reset`). The note in `results.json` tells you which.
-
-**Probe-only mode** (`--probe-only`) runs only the precondition checks via the schema-driven runner — verifies the quarantine plugin is loaded without any firewall side effect. Use this first if you've never run the ceremony on this box.
-
 ## Phase 6 — Sanitizers (PR2)
 
 Sanitizer rebuilds are dispatched to the `yuzu-bigtam-linux` self-hosted pool via `workflow_dispatch`. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.
@@ -930,7 +876,6 @@ The skill is designed so a single gate failure does NOT short-circuit the run. G
 | default | 0, 0b, 1, 2, 4, 5, 8 | 25-45 min | "About to push to dev" |
 | `--full` | 0-8 (PR2/PR3 features lit) | 60-120 min | "About to tag a release" |
 | `--instructions` | 0, 4, 5-instructions, 8 | 8-20 min | "Content YAML changed / dispatch path edited" |
-| `--instructions-quarantine` | 0, 4, ceremony | 30-40s | "Quarantine plugin / firewall behaviour edited" |
 
 Default mode is the recommended pre-push gate. The upgrade test in Phase 2 catches the highest-stakes class of bugs (silent data loss on schema migration) which no other local gate finds.
 

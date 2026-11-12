@@ -933,7 +933,8 @@ TEST_CASE("command_v1: a protective action never reports os_gate_unreadable, plu
     o.unknown_plugin_count = 1;
     o.kill_switched_os_count = 1;
     rig.canned = o;
-    const auto res = rig.post({{"plugin", "quarantine"}, {"action", "status"}, {"agent_ids", Ids{kA}}});
+    const auto res = rig.post(
+        {{"plugin", "firewall"}, {"action", "quarantine_status"}, {"agent_ids", Ids{kA}}});
     CHECK(res->status == 503);
     CHECK(reason_of(res) == "no_agents_reached");
 }

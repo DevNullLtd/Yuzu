@@ -25,7 +25,7 @@
  * PROTECTIVE SEAM (one line): the caller injects the predicate, and it is the
  * canonical protective set, `kProtectivePredicate`, which is
  * `&yuzu::protective::is_protective_action` (common/include/yuzu/protective_actions.hpp):
- * the quarantine control actions plus `__guard__.push_rules`. One predicate, never a
+ * the firewall containment actions plus `__guard__.push_rules`. One predicate, never a
  * second list, so a future widening of that set removes the new action from the
  * switchable units with no edit here. `__guard__.push_rules` is also caught by the
  * reserved-name rule (the control channel), which is checked first. There is no default, so a
@@ -147,7 +147,7 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08,
 // virtualization runtime_posture added by PR12.1-b2; firewall quarantine, release, quarantine_status
 // and quarantine_allow added by PRQ.1), 252 rows.
-inline constexpr std::array<UnitOsRow, 252> kUnitOs{{
+inline constexpr std::array<UnitOsRow, 248> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -307,10 +307,6 @@ inline constexpr std::array<UnitOsRow, 252> kUnitOs{{
     {"processes", "list_tree", kWin | kLin | kMac},
     {"processes", "query", kWin | kLin | kMac},
     {"procfetch", "procfetch_fetch", kWin | kLin | kMac},
-    {"quarantine", "quarantine", kWin | kLin | kMac},
-    {"quarantine", "unquarantine", kWin | kLin | kMac},
-    {"quarantine", "status", kWin | kLin | kMac},
-    {"quarantine", "whitelist", kWin | kLin | kMac},
     {"rdp_control", "set_state", kWin},
     {"rdp_control", "status", kWin},
     {"registry", "get_value", kWin | kLin | kMac},

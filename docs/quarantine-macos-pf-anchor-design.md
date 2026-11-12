@@ -1,7 +1,8 @@
 # macOS device containment through a pf sub-anchor
 
-Status: design note for PRQ.1 (the `firewall` plugin's `quarantine`, `release`,
-`quarantine_status` and `quarantine_allow` on macOS). **The leg is built** in
+Status: design note for the `firewall` plugin's `quarantine`, `release`,
+`quarantine_status` and `quarantine_allow` on macOS, the platform's only
+containment actions (the earlier standalone containment plugin is removed). **The leg is built** in
 `agents/plugins/firewall/src/firewall_quarantine_parsers.hpp` (`PfLeg` and the
 pure pf pieces, unit-tested on every host) and wired in `firewall_plugin.cpp`.
 The security-guardian review of the first draft of this note returned
@@ -12,18 +13,18 @@ live capture on a disposable macOS VM must still answer. Until that capture is i
 the PR body the descriptors say `constrained` for `quarantine` and
 `quarantine_allow`.
 
-Related: `docs/quarantine-windows-firewall-precedence.md` (the Windows rule this
-design mirrors in spirit: default-block, never a Block rule over an Allow),
-`docs/agent-privilege-model.md`, issue #2272 (durable pf-anchor quarantine).
+Related: `docs/agent-privilege-model.md`, issue #2272 (durable pf-anchor quarantine).
+The Windows leg follows the same rule in spirit: default-block, never a Block rule
+over an Allow (see the firewall plugin README).
 
 ## 1. The fault this design starts from
 
 Commit `672896112` (2026-05-06, "fix(quarantine): macOS - set skip on lo0 +
-single-call ruleset load") records a live UAT regression in the legacy
-`quarantine` plugin:
+single-call ruleset load") records a live UAT regression in the earlier,
+now removed, containment plugin:
 
-1. The plugin ran **two** reloads: `pfctl -a yuzu-quarantine -f <tmp>`, then
-   `echo 'anchor "yuzu-quarantine"' | pfctl -f -`.
+1. The plugin ran **two** reloads: a sub-anchor load with `pfctl -a <anchor> -f <tmp>`,
+   then a main-ruleset load of a lone `anchor` reference piped to `pfctl -f -`.
 2. The second reload **replaced the whole main ruleset** with only the anchor
    reference, evicting the system rules macOS loads from `/etc/pf.conf`
    (including whatever the OS relied on for loopback).
@@ -34,8 +35,8 @@ single-call ruleset load") records a live UAT regression in the legacy
 
 The failure was main-ruleset replacement plus loopback state, not anchors as
 such. The fix that shipped is one atomic `pfctl -f` of a main ruleset that starts
-with `set skip on lo0`, and `unquarantine` reloads `/etc/pf.conf`. That fix has a
-cost the catalogue records: release restores the OS default, not what the
+with `set skip on lo0`, and the release reloaded `/etc/pf.conf`. That fix had a
+cost the catalogue recorded: release restores the OS default, not what the
 customer had, so any runtime pf rules the endpoint carried before the quarantine
 are lost, and the action is classed Irreversible.
 
@@ -60,7 +61,7 @@ is final: it ends the evaluation of the other anchors and of the main ruleset.
 Using the wildcard that is already there means nothing in the main ruleset
 changes, so there is no moment at which the system rules are replaced, and
 `release` cannot "restore" anything because nothing was taken. This is the
-correction to the roadmap's flat `yuzu-quarantine` anchor plus an explicit
+correction to the roadmap's flat top-level anchor plus an explicit
 `anchor` line added by a main-ruleset load.
 
 **Name order matters.** `/etc/pf.anchors/com.apple` attaches `200.AirDrop` and
@@ -319,8 +320,9 @@ following equal their pre-quarantine values, and that is the leg's acceptance te
 
 **Not undone: connections.** The state flush at apply time (2.3) is one-way, so
 "Reversible" in the capability catalogue means *rules and enable state*, not every
-connection the host had. That is a change from the legacy row's Irreversible (it
-restored the OS default, not what the customer had) and the catalogue row says so.
+connection the host had. That is a change from the earlier plugin's Irreversible class
+(its release restored the OS default, not what the customer had) and the catalogue row
+says so.
 
 ### 2.7 Residuals, in one place
 
@@ -333,30 +335,27 @@ restored the OS default, not what the customer had) and the catalogue row says s
 - A sibling anchor inserted later that sorts before ours, or a `pass quick` before
   the anchor line in a customer's main ruleset, defeats containment; the first is
   detected by status, the second only by the probe.
-- The reboot gap (section 4) and the legacy clash (section 3).
+- The reboot gap (section 4) and rules left by an earlier build (section 3).
 - Connections cut by the state flush are never restored.
 
-## 3. Coexistence with the legacy plugin
+## 3. Hosts that still carry an earlier build's rules
 
-The retained `quarantine` plugin's pf path replaces the main ruleset with its own
-(a block-all plus its whitelist, loaded by `pfctl -f`) and has **no unique marker**
-in `pfctl -s rules` that a second plugin could test for. On Windows and Linux the
-`firewall` actions refuse (`refused|legacy_quarantine_active`) when the legacy
-plugin's own objects are present (rules named `YuzuQuarantine_*`; the iptables
-chain `yuzu-quarantine`). On macOS that check is not possible, so the clash is a
-**stated residual until the legacy plugin is deleted**:
+The earlier containment plugin's pf path replaced the main ruleset with its own (a
+block-all plus its whitelist, loaded by `pfctl -f`). **This build neither removes nor
+detects what an earlier build left on a host**, so a host quarantined by that plugin
+and then upgraded keeps its block-all main ruleset until an operator reloads
+`/etc/pf.conf` (or reboots, since pf rules are not persisted):
 
-- if the legacy plugin is quarantined first, the main ruleset is the legacy one,
-  which does not reference `com.apple/*`: the `firewall` apply fails
-  `anchor_not_referenced` before the anchor is loaded (nothing is loaded);
-- if `firewall` is quarantined first and the legacy plugin then quarantines, the
-  legacy single-call load replaces the main ruleset and our anchor goes dangling
-  the same way; the legacy `unquarantine` then reloads `/etc/pf.conf`, which makes
-  the reference live again, and the next status or boot re-apply sees a healthy
-  anchor.
+- the main ruleset on such a host does not reference `com.apple/*`, so a `firewall`
+  apply fails `anchor_not_referenced` before the anchor is loaded (nothing is loaded),
+  and `quarantine_status` reports it the same way;
+- once `/etc/pf.conf` is reloaded the reference is live again and the next apply or
+  status sees a healthy anchor.
 
-Neither order strands the host (both end in a block-all), but the operator can
-see two quarantines that disagree. Removing the legacy plugin ends it.
+The server's record for such a device is the record it already held, and the
+reconciler drives it through the firewall actions like any other. The upgrade note
+in `docs/user-manual/upgrading.md` tells operators to release or reload before
+upgrading a contained macOS host.
 
 ## 4. Persistence across reboot, and the gap before it
 
@@ -377,15 +376,14 @@ again; only a record that was already `applying` stays `applying`.
 uncontained, and if the agent never starts it stays uncontained. Nothing in this
 design persists containment at OS level; an Apple-owned launchd plist or a change
 to `/etc/pf.conf` would reintroduce exactly the ownership of the main ruleset this
-design avoids, and is not recommended. The same gap exists on the other legs and in
-the legacy plugin. The catalogue row and the README say so.
+design avoids, and is not recommended. The same gap exists on the other legs and
+existed in the earlier plugin. The catalogue row and the README say so.
 
 ## 5. Sudoers, staging, and what actually bounds the privileged call
 
 The agent runs as an unprivileged account and shells out under `sudo -n --`. The
 firewall plugin's macOS block in `scripts/install-agent-user.sh` grants exactly
-the argv the leg uses, **beside** the existing bare `/sbin/pfctl` grant, which
-stays until the legacy plugin is deleted:
+the argv the leg uses. **There is no bare `/sbin/pfctl` grant**:
 
 ```
 /sbin/pfctl -E
@@ -403,7 +401,7 @@ stays until the legacy plugin is deleted:
 
 **These lines narrow the argv shape. They do not confine pfctl.** A sudoers
 argument glob matches the concatenated argument string, `-X *` and `-f *` accept
-any text, the bare grant beside them accepts anything, and the file named by
+any text, and the file named by
 `-a ... -f` is generated by the agent, so what the privileged process executes is
 agent-authored content. The control that actually bounds the privileged call is the
 pure core: every token that reaches an argv or a ruleset line is built from a
@@ -416,9 +414,9 @@ action. The same statement applies to the Linux `nft -f *` grant and is repeated
 agent account can already author any ruleset these grants will load; that is an
 accepted property of the grant, not a reason to widen it.
 
-**Obligation when the quarantine plugin is removed: remove the bare `/sbin/pfctl`
-grant.** Until then the narrow lines above are cosmetic next to it, and the real
-boundary is server dispatch plus the integrity of the agent process.
+**The bare `/sbin/pfctl` grant is removed**, so the narrow lines above are the whole
+grant (`tests/test_legacy_quarantine_plugin_removed_lexical.py` pins that), and the
+real boundary is server dispatch plus the integrity of the agent process.
 
 **Private staging.** The ruleset is written to `<agent.data_dir>/firewall-staging`,
 a directory the agent creates mode 0700 and verifies (a real directory, owned by
@@ -511,12 +509,9 @@ Reproduction plan (the leg's acceptance test):
 2. Open a long-lived TCP stream to a reachable test target (the **pre-established
    prohibited stream**).
 3. With the agent connected to a server on the VM, dispatch `firewall.quarantine`
-   under the detached survivor pattern
-   (`scripts/test/instructions-quarantine.sh`, whose ceremony confirms that the
-   agent's reply reaches the server and that loopback TCP is unaffected across 60
-   seconds, where the incident died at 29). That ceremony dispatches
-   `security.quarantine.*` today, so for this leg the same steps are run against
-   `firewall.quarantine` / `firewall.release`. What this step must assert is that
+   under a detached survivor pattern: confirm that the agent's reply reaches the
+   server and that loopback TCP is unaffected across 60 seconds (the earlier
+   incident died at 29). What this step must assert is that
    **the reply arrives on the gRPC stream that was already open before the
    apply**: the server log shows no new Subscribe between the dispatch and the
    reply. That is the property `no state` provides across `pfctl -F states`. The
@@ -563,7 +558,7 @@ condition landed:
 | MEDIUM 4 | Disabled with a stored token is repaired; `-X` failure tolerated | 2.4, `pf_enable_plan`, `apply_and_verify` repair |
 | MEDIUM 5 | honest undo; compare rules, Status line, references; flush is one-way; no `-a -F all` | 2.3, 2.4, 2.6 |
 | MEDIUM 6 | `-F states` failure is a failed apply; record before `-E`, leak as residual | 2.3, 2.4 |
-| MEDIUM 7 | bare grant removal; private 0700 `O_EXCL` staging; digits-only token | 5 (bare grant: when the quarantine plugin is removed) |
+| MEDIUM 7 | bare grant removal; private 0700 `O_EXCL` staging; digits-only token | 5 (bare grant removed) |
 | MEDIUM 8 | reboot gap stated | 4, catalogue row, README |
 | LOW 9 | tighter DHCP and ICMPv6; DNS tunnelling residual | 2.2, 2.7 |
 | LOW 10 | exact anchor-reference match; necessary, not sufficient | 2.5 |

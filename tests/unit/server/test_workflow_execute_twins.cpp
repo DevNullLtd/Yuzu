@@ -1315,10 +1315,10 @@ TEST_CASE("workflow execute: a step's final outcome is its LAST attempt, per ste
 
 TEST_CASE("workflow execute: a protective action never reports the three gate-withhold causes",
           "[workflow][twin][zeroreach]") {
-    // quarantine.status is protective: an inventory withhold signal arriving on it is ignored by
+    // firewall.quarantine_status is protective: an inventory withhold signal arriving on it is ignored by
     // classify_zero_reach (dispatch_zero_reach.hpp), so the step reports the generic cause.
     Fx f;
-    f.defs["i-ro"] = def("i-ro", "quarantine", "status");
+    f.defs["i-ro"] = def("i-ro", "firewall", "quarantine_status");
     ConfinedDispatchOutcome out;
     out.unknown_plugin_count = 1;
     f.outcomes["i-ro"] = out;

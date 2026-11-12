@@ -39,28 +39,6 @@
       window.htmx.ajax('GET', path + '&banner=1', { target: '#hw-quarantine-banner', swap: 'outerHTML' });
   }
 
-  // Page-session state after a release: the record is gone but the firewall rules are not
-  // known to be. The fragment cannot say this (it only sees active records), so the page
-  // does, once, and a reload honestly falls back to "No active quarantine record".
-  function showReleased(agent) {
-    var root = document.getElementById('hw-containment');
-    if (!root) return;
-    root.textContent = '';
-    var box = document.createElement('div');
-    box.className = 'hw-empty';
-    var b = document.createElement('b');
-    b.textContent = 'Record released, firewall not confirmed removed. ';
-    box.appendChild(b);
-    box.appendChild(document.createTextNode(
-      'The server record is ended. The device keeps its firewall rules until the quarantine ' +
-      "plugin's unquarantine action runs. "));
-    var a = document.createElement('a');
-    a.href = '/hardware/ci?id=' + enc(agent) + '&lens=actions';
-    a.textContent = 'Open Actions';
-    box.appendChild(a);
-    root.appendChild(box);
-  }
-
   function validateWhitelist(v) {
     var raw = (v.whitelist || '').trim();
     if (!raw) return null;
@@ -76,7 +54,6 @@
     var agent = btn.getAttribute('data-agent') || '';
     var host = btn.getAttribute('data-host') || agent;
     var online = btn.getAttribute('data-online');
-    var mac = btn.getAttribute('data-mac') === '1';
     D.form({
       title: 'Quarantine ' + host,
       body: 'Say why this device is being contained. The reason is stored with the record.',
@@ -94,15 +71,12 @@
     }).then(function (v) {
       if (!v) return null;
       var body = [
-        host + ' will be cut off from the network except the addresses you list and the Yuzu server ' +
-          'address the agent resolved when it last started.',
+        host + ' will be cut off from the network except the addresses you list, the Yuzu server, ' +
+          "DHCP and the device's DNS resolvers.",
         'Instructions sent from Yuzu to this device are withheld until it is released.'
       ];
       if (online === '0')
         body.push('This device is offline. The quarantine is recorded now and applied when it next connects.');
-      if (mac)
-        body.push('On macOS, releasing restores the default firewall rules. Custom pf rules that were ' +
-                  'active before are not restored.');
       return D.form({
         title: 'Quarantine ' + host + '?',
         body: body,
@@ -124,26 +98,19 @@
     D.form({
       title: 'Release ' + host + ' from quarantine?',
       body: [
-        'This ends the quarantine record on the server, so Yuzu can send instructions to the device again.',
-        "It does not remove the device's firewall rules. To restore its network access, run the " +
-          "quarantine plugin's unquarantine action from this device's Actions tab (needs an " +
-          'administrator or an approval).'
+        "This lifts the device's firewall rules. The quarantine record ends when the device confirms, " +
+          'and instructions stay withheld until then.',
+        'If the device is offline, the release is applied when it next connects.'
       ],
       fields: [],
       danger: true,
-      submitLabel: 'Release record',
+      submitLabel: 'Release device',
       submit: function () {
         return D.request('DELETE', '/api/v1/quarantine/' + enc(agent))
           .then(function (res) { return res.ok ? null : failMessage(res); });
       }
-    }).then(function (done) {
-      if (!done) return;
-      showReleased(agent);
-      var b = document.getElementById('hw-quarantine-banner');
-      if (b && window.htmx)
-        window.htmx.ajax('GET', '/fragments/hardware/ci/containment?id=' + enc(agent) + '&banner=1',
-                         { target: '#hw-quarantine-banner', swap: 'outerHTML' });
-    }).catch(function () { /* a dialog was already open */ });
+    }).then(function (done) { if (done) refresh(agent); })
+      .catch(function () { /* a dialog was already open */ });
   }
 
   // Stored data. The result slot lives in the panel fragment (#hw-stored-data-result).

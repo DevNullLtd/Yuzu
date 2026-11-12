@@ -2834,6 +2834,58 @@ tests:
         eval_time: 55m
         exp_samples: []
 
+  # ── YuzuQuarantineReleasePending (PRQ.2) ──────────────────────────────────
+  #
+  # `yuzu_server_quarantine_release_pending{reachability="connected"} > 0`,
+  # for: 15m, warning. A GAUGE like the unconfirmed rule above: `for:` alone is the
+  # sustain requirement. A connected device that cannot finish a requested release
+  # pages; an offline one never does, and a release that completes in time never does.
+
+  # CASE 70 -- a connected release pending for 40 minutes: quiet at 12m (before the hold),
+  # firing a warning at 20m with the full label set.
+  - interval: 1m
+    name: quarantine release pending - a sustained connected release fires warning
+    input_series:
+      - series: 'yuzu_server_quarantine_release_pending{job="yuzu",instance="s1",reachability="connected"}'
+        values: "1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineReleasePending", alertstate="firing", instance="s1", job="yuzu", reachability="connected", severity="warning"}'
+            value: 1
+
+  # CASE 71 -- reachability="offline" NEVER fires, at any volume or duration: a device that
+  # is off cannot confirm a release, and paging on that is paging on correct behaviour.
+  - interval: 1m
+    name: quarantine release pending - offline reachability never fires
+    input_series:
+      - series: 'yuzu_server_quarantine_release_pending{job="yuzu",instance="s1",reachability="offline"}'
+        values: "5x90"
+      - series: 'yuzu_server_quarantine_release_pending{job="yuzu",instance="s1",reachability="connected"}'
+        values: "0x90"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE 72 -- a pending release that clears before the 15m hold never fires.
+  - interval: 1m
+    name: quarantine release pending - a release that completes before 15m never fires
+    input_series:
+      - series: 'yuzu_server_quarantine_release_pending{job="yuzu",instance="s1",reachability="connected"}'
+        values: "1x10 0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineReleasePending"}'
+        eval_time: 40m
+        exp_samples: []
+
   # ── YuzuSessionReapClockAnomaly (HA WS-1/1a, ADR-2002 §4) ─────────────────
   #
   # The DB-clock-integrity monitor: a durable-session reap pass declines on an

@@ -2072,11 +2072,14 @@ costs neither a per-record permission check nor an audit row.
 > re-applies a device's own firewall on reconnect. `last_applied_at` means a system re-dispatch of
 > the stored whitelist was accepted (`agents_reached > 0`) — NOT proof of containment (a
 > gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is set only after
-> a follow-up `quarantine.status` read reports `state|active` — but that read is the target
+> a follow-up `firewall.quarantine_status` read reports the device's rules in force (`status|active`) — but that read is the target
 > agent's own self-report (cert-bound to its identity, not independently corroborated by any
 > network-side signal), so treat it as strong operational evidence of containment, not proof. See
 > `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
 > boundary.
+>
+> **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
+> progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed.
 
 ---
 
@@ -2102,7 +2105,7 @@ Quarantine a device.
 
 > **Dispatch approval check (#6065).** After the scoped `Security:Execute` gate and
 > `whitelist` validation, and before the `attempt` audit row or any record is
-> written, the route runs the shared dispatch check for `quarantine.quarantine`,
+> written, the route runs the shared dispatch check for `firewall.quarantine`,
 > the same one MCP `quarantine_device` runs. REST has no approval-ticket path today, so
 > the check admits only an **administrator**: here that means an account whose account
 > role is `admin` (a live temporary JIT elevation counts as that role). Holding the RBAC
@@ -2125,7 +2128,7 @@ Quarantine a device.
 > |---|---|---|
 > | `403` | RBAC on: the caller holds `Security:Execute` globally but is not an administrator (account role `user`, no live JIT elevation) | `approval_required` |
 > | `403` | RBAC on: the caller's own `Security:Execute` grant is not global (for example it is held only through a management group, or the caller is an administrator only through a JIT elevation), **or the RBAC store could not be read** (a transient failure reads the same as a denial) | `forbidden` |
-> | `400` | The `quarantine.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
+> | `400` | The `firewall.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
 > | `403` | Other chokepoint refusals map the same way (`kill_switched`, `anonymous_operator`); neither is reachable for this pair today, because quarantine is exempt from the per-action kill switch and an unauthenticated request ends at the `401` | `kill_switched`, `anonymous_operator` |
 > | `401` | The request's second session look-up named a different principal than the first (for example a session cookie lapsed and a bearer token for another account is on the same request); written as a `quarantine.enable` row with `result=denied` and `detail` `authenticated principal changed during the request now=<second account>` (the account name has control bytes, spaces, commas, `=` and `;` replaced by `_` and is cut at 128 bytes), naming the first account as the actor | none |
 > | `500` | The dispatch check is not wired on this server (also written as a `quarantine.enable` row with `result=failure`) | none |
@@ -2173,7 +2176,7 @@ Quarantine a device.
 |---|---|---|---|
 | `agent_id` | string | Yes | Target device ID |
 | `reason` | string | No | Human-readable reason for quarantine |
-| `whitelist` | string | No | Comma-separated IPs still allowed to communicate. Validated server-side (#3425): ≤512 characters total, each token ≤45 characters and drawn from `[0-9A-Fa-f.:]` — the same charset the reconciler and MCP's `quarantine_device` retry path require before ever dispatching a stored whitelist. Rejected with `400`, not written. |
+| `whitelist` | string | No | Comma-separated bare IPv4 or IPv6 addresses (at most 32) still allowed to communicate; each is sent to the firewall plugin as an outbound and an inbound exception. Validated server-side by the one rule the reconciler and MCP's `quarantine_device` also apply before dispatching a stored whitelist: a port, a prefix length, an IPv4-mapped form, a leading-zero octet or any other token the plugin's exception grammar cannot express is refused. Rejected with `400` (`whitelist must be comma-separated IPv4 or IPv6 addresses, at most 32`), not written. |
 
 **Response (201):**
 
@@ -2204,7 +2207,7 @@ Quarantine a device.
 >
 > - A `201` here means **the record was written**, not that the device's
 >   firewall is enforcing anything **yet**. To isolate a device immediately,
->   dispatch `quarantine.quarantine` through the normal execution routes as
+>   dispatch `firewall.quarantine` through the normal execution routes as
 >   well — see [Security Hardening](security-hardening.md#device-quarantine).
 >   **As of #3425, "yet" is load-bearing: this route no longer leaves a
 >   record permanently unenforced.** `QuarantineContainmentReconciler`
@@ -2218,13 +2221,10 @@ Quarantine a device.
 >   reachable device does not stay dormant — the one exception is a stored
 >   `whitelist` the re-dispatch validator refuses. As of #3425 (`d1f71c58f`)
 >   this route validates `whitelist` at write time (`400` instead of `201`
->   for a malformed value), the same rule MCP's `quarantine_device` already
->   enforced — so a fresh write here can no longer land in this state. A
->   `validation_failed` reconcile now points at a record written via this
->   route before `d1f71c58f` shipped, or — on a fleet with pre-#3623 history
->   — one migrated from a legacy `quarantine.db` by the since-retired
->   `migrate_from_sqlite` backfill (ADR-0047, which copied `whitelist`
->   verbatim with no validation), not a fresh call. Either way, every reconcile
+>   for a malformed value), the same rule MCP's `quarantine_device`
+>   enforces — so a fresh write here cannot land in this state. A
+>   `validation_failed` reconcile points at a record written under an
+>   earlier, looser rule, not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.
 >   That failure is loud, not silent — the device stays in
 >   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
@@ -2288,7 +2288,7 @@ Quarantine a device.
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `plugin_not_found`, `kill_switched_os` and `os_gate_unreadable` are never produced for a
-> protective action (the quarantine plugin's four actions and `__guard__.push_rules`); see
+> protective action (the firewall plugin's four containment actions and `__guard__.push_rules`); see
 > [Upgrading](upgrading.md#behaviour-change-protective-actions-exempt-from-plugin-enablement).
 >
 > `reason` is a top-level key on the error object, not part of the A4
@@ -2316,9 +2316,9 @@ Quarantine a device.
 > result-set producers still do **not** carry this split — their own
 > response-building code was not extended to surface the richer per-arm
 > result their shared dispatch closure now carries (a separate, smaller
-> follow-up per route). The quarantine
-> plugin's own four actions (`quarantine`, `unquarantine`, `status`,
-> `whitelist`) are exempt so that release stays reachable, and so are four
+> follow-up per route). The firewall
+> plugin's four containment actions (`quarantine`, `release`,
+> `quarantine_status`, `quarantine_allow`) are exempt so that release stays reachable, and so are four
 > server-internal pushes that are not operator dispatch —
 > `echo.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` and
 > `__sync__.now`, a closed set counted (not per-event audited) by
@@ -2335,10 +2335,11 @@ Quarantine a device.
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
 
-Release a device from quarantine. This ends the server's quarantine **record** only: it does
-**not** remove the device's firewall rules. To lift those, run the quarantine plugin's release
-instruction (`security.quarantine.release`, "Release Device from Quarantine") from the Instructions
-page or through `execute_instruction`.
+Release a device from quarantine. The route asks the device to lift its firewall rules (it sends
+`firewall.release` as the caller) and waits up to 5 seconds for the reply. The record **ends only on
+the device's confirmation** (`status|inactive`): `200` when it arrives in time, `202` otherwise. A
+record whose release is not yet confirmed reads `releasing` in the list, stays listed and keeps the
+dispatch refusal; the server's reconciler finishes the release when the device is reachable.
 
 **Permission:** `Security:Execute`, scoped per-device (see the note above)
 
@@ -2346,35 +2347,79 @@ Like `POST`, the release writes a `quarantine.disable` row with `result=attempt`
 before the change and answers `503` (`Sec-Audit-Failed: true`) without releasing
 the device if that row cannot be written.
 
+**Query parameter:** `force` (optional). `true` ends the record without the device's confirmation
+(see below); `false` or absent is the plain call; **any other value, an empty one included, is a `400`**
+(`force must be true or false`) with a `failure` audit row and no release requested or dispatched.
+
 **Dispatch approval check (#6065).** After the scoped gate, and before the `attempt` audit row
 and the release, the route runs the same dispatch approval check as `POST`, for the
-`quarantine.unquarantine` pair: a caller who cannot create a record cannot end one. The
-answers, statuses and reason labels are the table under `POST`, with the pair read as `quarantine.unquarantine` and the audit verb as `quarantine.disable`; a refusal leaves the record
+`firewall.release` pair: a caller who cannot create a record cannot end one. The
+answers, statuses and reason labels are the table under `POST`, with the pair read as `firewall.release` and the audit verb as `quarantine.disable`; a refusal leaves the record
 active, writes a `quarantine.disable` audit row with `result=denied` and `detail`
 `reason=<label> securable=<name>` (no `attempt` row), and increments
 `yuzu_server_dispatch_denied_total{reason}`. The `remediation` text names the MCP supervised
 flow, which has no release tool, so a non-administrator has no path to release through REST,
-the dashboard or MCP; an administrator releases it. Running the plugin's `unquarantine` without
-ending the record does not release the device from the server's side: the record stays active,
-the lens can keep reading the earlier confirmation, and containment is re-applied at the next
-session change, so an administrator should end the record first.
+the dashboard or MCP; an administrator releases it. A repeated `DELETE` on a releasing record
+sends the release again; it is not a `400`.
 
 The `401` for a changed principal, the `500` for an unwired audit identity writer and the
 session-stamped audit rows are exactly as for `POST` above, with the audit verb
 `quarantine.disable`.
 
-**Response:**
+**Response (`200`, the device confirmed the release, or the reconciler had already ended the record):**
 
 ```json
 {
-  "data": { "released": true },
+  "data": { "released": true, "state": "released", "forced": false, "device_confirmed": true },
   "meta": { "api_version": "v1" }
 }
 ```
 
+**Response (`202`, not confirmed yet; the record stays `releasing`):**
+
+```json
+{
+  "data": { "released": false, "state": "releasing", "command_id": "..." },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`202` covers every outcome short of the device's `inactive`: the device is offline, the dispatch was
+refused or threw, no reply arrived in 5 seconds, or the reply was anything else (a privilege refusal
+such as `status|refused|privilege_unavailable`, a partial release). The wait shares the 4-slot live
+in-flight budget with the DEX live route; with no slot free the release is dispatched and the answer
+is `202` without waiting.
+
+**Forced end (`?force=true`, REST only).** For a device that will not return, or one that cannot finish
+a release (a Linux host on the packaged systemd unit refuses every mutating firewall action), the
+same call with `?force=true` runs the same gates and the same release attempt, and where the plain
+call would answer `202` it ends the record at once:
+
+```json
+{
+  "data": {
+    "released": true, "state": "released", "forced": true, "device_confirmed": false,
+    "message": "Record ended without the device's confirmation. The device may still be contained.",
+    "command_id": "..."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+A forced end **does not release the device**. The device may still be contained; the server stops
+refusing commands to it, so the operator has chosen to treat it as reachable; and the reconciler still
+owes it a release, which it reads and sends once per reconnect (`yuzu_server_quarantine_forced_release_owed`),
+and a `firewall.release` sent through any generic route reaches it at any time. A reachable device is
+still released for real: if it answers `inactive` within the wait the answer says `forced: false,
+device_confirmed: true`. The authority is the release's own (the scoped `Security:Execute` gate, the
+same-principal check and the dispatch check for `firewall.release`); no new permission or approval
+exists. Audit rows name the operator: the `attempt` row's `detail` is `force=true`, the outcome row
+`state=released reason=forced device_confirmed=false record_id=<id>`. A store failure while ending the
+record is a retryable `503` (the record stays releasing), never a `202` that hides it.
+
 > **`400` vs `503` (ADR-0047).** Same distinction as `POST` above — `400`
-> means the device is not currently quarantined (retrying will not help);
-> `503` means a genuine store/pool failure (retrying is reasonable).
+> means the device is not currently quarantined or `force` is not `true`/`false` (retrying will not
+> help); `503` means a genuine store/pool failure (retrying is reasonable).
 
 ---
 
@@ -11107,9 +11152,9 @@ narrow the all-OS layer but never widen it, and within the OS layer an `action@o
 }
 ```
 
-For a **protective action** (the quarantine plugin's `quarantine`/`unquarantine`/`status`/`whitelist`
+For a **protective action** (the firewall plugin's `quarantine`/`release`/`quarantine_status`/`quarantine_allow`
 and `__guard__.push_rules`) the state shown is for information only: `enabled: false` can be displayed
-while dispatch still goes ahead (see
+while dispatch still goes ahead. A plugin-level `firewall` row never stops those four and still stops `state` and `rules`, so `protective_exempt=true` on it means 'covers a protective action', not 'gates nothing' (see
 [Security Hardening](security-hardening.md) and [Upgrading](upgrading.md)).
 
 **Errors:** `400` (invalid plugin/action/os, or `?os=` present but empty), `503` (store unavailable).

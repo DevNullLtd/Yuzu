@@ -1,25 +1,26 @@
 /**
- * quarantine_serialization.hpp — bounds concurrent execution of the
- * quarantine plugin's mutating actions to one at a time (#3286). Portable,
- * header-only, no OS calls, no subprocess, no plugin ABI dependency: this is
- * a pure concurrency primitive over the C++ standard library only, so
- * test_quarantine_serialization.cpp exercises it directly with no fixture
- * text and no platform guard.
+ * mutation_gate.hpp — bounds concurrent execution of a plugin's mutating
+ * actions to one at a time (#3286). Portable, header-only, no OS calls, no
+ * subprocess, no plugin ABI dependency: this is a pure concurrency primitive
+ * over the C++ standard library only, so test_mutation_gate.cpp exercises it
+ * directly with no fixture text and no platform guard.
  *
- * Concurrency shape this defends against: every plugin execute() call —
- * quarantine's do_quarantine/do_unquarantine/do_whitelist included — is
- * dispatched onto the agent's shared, bounded thread pool (agent.cpp:2632,
- * `thread_pool_->submit(...)`), and PolicyEvaluator's remediate() path can
- * fire a burst of repeated quarantine dispatches at the same device (e.g. a
- * re-triggered policy evaluation before the first quarantine command has
- * been acknowledged). Without serialization, two concurrent mutations would
- * race on the SAME OS firewall state — two macos_quarantine calls each
- * writing their own temp ruleset and racing over which `pfctl -f` wins, or a
- * do_whitelist "add" reading a whitelist snapshot that a concurrent
- * do_quarantine is simultaneously about to overwrite — producing an
- * inconsistent or silently-clobbered firewall state that no single call's
- * own honest status reporting (Parts A-C of #3283/#3284/#3285) could ever
- * see, because each call only observes its own, individually-correct steps.
+ * Its one user is the firewall plugin's containment actions (quarantine,
+ * release, quarantine_allow). It lives in agents/shared so a second plugin
+ * with mutating actions can reuse it.
+ *
+ * Concurrency shape this defends against: every plugin execute() call is
+ * dispatched onto the agent's shared, bounded thread pool
+ * (`thread_pool_->submit(...)` in agent.cpp), and PolicyEvaluator's remediate()
+ * path can fire a burst of repeated containment dispatches at the same device
+ * (e.g. a re-triggered policy evaluation before the first quarantine command
+ * has been acknowledged). Without serialization, two concurrent mutations would
+ * race on the SAME OS firewall state — two applies each writing their own temp
+ * ruleset and racing over which one wins, or an allow-list "add" reading a
+ * snapshot that a concurrent quarantine is simultaneously about to overwrite —
+ * producing an inconsistent or silently-clobbered firewall state that no single
+ * call's own honest status reporting could ever see, because each call only
+ * observes its own, individually-correct steps.
  *
  * Why the wait budget is bounded at 2 seconds, not something more generous
  * like 20: every waiting caller occupies a pool worker for the ENTIRE
@@ -31,13 +32,12 @@
  * low enough to never threaten the rest of the agent's dispatch surface.
  * This trade is deliberate and is not to be re-litigated per call site.
  *
- * Why `do_status` does NOT take this gate: a read must never queue behind a
- * multi-step mutation — status is exactly the channel an operator or
- * PolicyEvaluator needs available WHILE a mutation is in flight, not one
- * more thing waiting on it. A status read that lands mid-mutation is now
- * honestly reported as `partial`/`degraded`/`uncertain` by Parts A/B of this
- * same change rather than as a false `active`, so gating reads here would
- * only add latency without adding correctness.
+ * Why the status read does NOT take this gate: a read must never queue behind a
+ * multi-step mutation — status is exactly the channel an operator or the
+ * server's reconciler needs available WHILE a mutation is in flight, not one
+ * more thing waiting on it. A status read that lands mid-mutation is honestly
+ * reported as `partial`/`degraded` rather than as a false `active`, so gating
+ * reads here would only add latency without adding correctness.
  */
 #pragma once
 
@@ -51,13 +51,13 @@
 #include <optional>
 #include <utility>
 
-namespace yuzu::quarantine {
+namespace yuzu::shared {
 
 /**
  * A bounded, FIFO, non-blocking-forever gate: a caller that cannot get in
  * within the wait budget gets an honest disengaged optional instead of
  * hanging. Meant to be instantiated once, as a single file-static instance
- * guarding every mutating quarantine action — see quarantine_plugin.cpp's
+ * guarding every mutating containment action — see firewall_plugin.cpp's
  * anonymous-namespace declaration. Neither copyable nor movable; a single
  * static instance never needs to be either.
  *
@@ -71,7 +71,7 @@ namespace yuzu::quarantine {
  *     holders=3 hold=300ms  20s run -> first win at 5.77s, ~12 failed attempts
  *     holders=8 hold=1000ms 20s run -> ZERO wins in 8 attempts
  *
- * The starved thread in the scenario that matters is `unquarantine`. The
+ * The starved thread in the scenario that matters is `release`. The
  * self-sustaining loop: containment partially fails on a host, so the agentic
  * caller cannot confirm isolation, so it retries quarantine_device, so #3127
  * re-dispatches the stored intent, each attempt holding the gate for minutes
@@ -146,7 +146,7 @@ public:
         // noexcept — it can throw std::system_error and it invokes the
         // predicate — and a ticket left in the queue by a throw is never
         // removed by anyone. Once it reaches the head every later try_enter
-        // times out, so quarantine, unquarantine and whitelist all return
+        // times out, so quarantine, release and quarantine_allow all return
         // `status|busy` for the life of the process: the unreleasable-device
         // outcome this class exists to prevent, reached through its own
         // cleanup path.
@@ -215,4 +215,4 @@ private:
     std::deque<std::uint64_t> waiting_;
 };
 
-} // namespace yuzu::quarantine
+} // namespace yuzu::shared

@@ -563,7 +563,6 @@ if build_agent
   subdir('agents/plugins/vuln_scan')
   subdir('agents/plugins/tags')
   subdir('agents/plugins/asset_tags')
-  subdir('agents/plugins/quarantine')
   subdir('agents/plugins/certificates')
   subdir('agents/plugins/ioc')
   subdir('agents/plugins/storage')

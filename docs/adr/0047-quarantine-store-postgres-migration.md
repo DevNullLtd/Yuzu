@@ -486,3 +486,28 @@ the server's view of containment does not include whatever the warning names, th
 firewall enforcement (§11.7, out of scope for this store) may still be independently in effect.
 The ADR-0012 §2(b) documented exception for a one-time legacy backfill's atomic
 insert-plus-completion stamp is no longer exercised by this store.
+
+## Update (2026-11-11) — schema v4: the release is a confirmed step; `release_device` removed
+
+Device containment is now the firewall plugin's four actions only, and the server records a
+release only on the device's own answer. The store changes with it, appended as migration v4
+after the already-shipped v1-v3 (never edited in place):
+
+- `release_requested_at` (`BIGINT NOT NULL DEFAULT 0`): non-zero marks an active record whose
+  release was asked for and not yet confirmed. The stored `status` stays `active` or `released`;
+  the record reads `releasing` through a `CASE` in the select list, so the partial unique index
+  (`quarantine_records(agent_id) WHERE status='active'`) still allows at most one live record per
+  agent and a releasing record still holds it.
+- `endpoint_ttl_expires` (`BIGINT NOT NULL DEFAULT 0`): the device time limit the latest
+  confirming status reply carried, used to recognise a record whose device limit has run out.
+- `device_release_owed_at` (`BIGINT NOT NULL DEFAULT 0`): non-zero marks a record an operator
+  ended by force before the device confirmed; the reconciler still owes that device a release.
+- `release_device` is removed. Ending a record is `request_release` (set the marker),
+  `mark_released` with a closed reason (`device_confirmed` or `forced`) and `clear_release_owed`,
+  each a single guarded statement that updates only the row it was read for.
+
+A record ends in exactly three ways: the device answers `inactive` after a release; the device
+answers `inactive` on a record whose stored device time limit has run out (audited as system
+`ttl_expired`); an operator forces it with `DELETE ...?force=true`. A forced end does not release
+the device, which may still be contained. Fresh-database deployment contract applies: v4 is
+applied to a new database, with no data carried from earlier builds.

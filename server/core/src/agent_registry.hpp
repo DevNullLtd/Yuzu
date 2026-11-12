@@ -331,8 +331,8 @@ private:
 /// this directly rather than re-deriving the condition.
 ///
 /// Protective-action exemption: a PROTECTIVE action
-/// (`yuzu::protective::is_protective_action` — the quarantine plugin's four
-/// actions plus `__guard__.push_rules`) is never refused here: the callback is
+/// (`yuzu::protective::is_protective_action` — the firewall plugin's four
+/// containment actions plus `__guard__.push_rules`) is never refused here: the callback is
 /// not consulted (so a degraded store's nullopt cannot refuse it) and the
 /// returned OS set is empty, which means no `ids_with_os` presence read and no
 /// send-time OS withhold downstream.

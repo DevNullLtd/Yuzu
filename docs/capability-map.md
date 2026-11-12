@@ -575,7 +575,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.6 Device Quarantine (Network Isolation) :white_check_mark: `T2`
 
-`quarantine` plugin (cross-platform). `quarantine` action isolates device from network, whitelisting management server and optional IPs via firewall rules (prefixed `YuzuQuarantine_`). `unquarantine` removes rules and restores access. `status` checks active quarantine state. `whitelist` adds/removes IPs from active quarantine.
+The `firewall` plugin's four containment actions (cross-platform). `quarantine` isolates a device from the network, allowing the management server and optional exceptions, through an own rule group, table or anchor. `release` removes the rules and restores access. `quarantine_status` reports whether containment is in force. `quarantine_allow` adds or removes exceptions on an active quarantine.
 
 ### 9.7 Indicator of Compromise (IOC) Checking :white_check_mark: `T2`
 

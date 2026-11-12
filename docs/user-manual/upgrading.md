@@ -2,6 +2,29 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: device containment is the firewall plugin's four actions; the `quarantine` agent plugin is removed
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**What changed.**
+- The `quarantine` agent plugin and its four actions (`quarantine`, `unquarantine`, `status`, `whitelist`) are gone from the agent, the packages, the gateway plugin list and the capability catalogue. There is no alias. Device containment is the `firewall` plugin's four actions: `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and `firewall.quarantine_allow`. They are the only actions that reach a contained device, and the kill switches never stop them.
+- The four definition ids are renamed: `security.quarantine.isolate`, `.release`, `.status` and `.whitelist` become `security.firewall.quarantine`, `.release`, `.quarantine_status` and `.quarantine_allow`. The `--instructions-quarantine` mode of `/test` and its ceremony scripts are removed.
+- A release is recorded only on the device's own answer. `DELETE /api/v1/quarantine/{agent_id}` asks the device to lift its rules and waits up to 5 seconds: `200` with `state: released` when the device answers, `202` with `state: releasing` otherwise. A record with a release in flight reads `releasing`, stays listed and keeps refusing commands to the device until the device answers `inactive`. The new `DELETE ...?force=true` (REST only) ends the record without the device's answer and answers `200` with `forced: true, device_confirmed: false`: **it does not release the device, which may still be contained**, and the server still owes it a release (see "Device Quarantine" in [Security Hardening](security-hardening.md)).
+- A device time limit that runs out ends the server record, audited as the `system` principal with `ttl_expired`. The quarantine routes set no limit; one set by a `firewall.quarantine` dispatch outside them can end a Security record without `DELETE` authority. This is accepted behaviour.
+- The whitelist on `POST /api/v1/quarantine` and the MCP `quarantine_device` tool is stricter. It accepts bare IPv4 and IPv6 addresses only, at most 32, and refuses a port, a prefix length, an IPv4-mapped form, an IPv4 octet with a leading zero and a host name with `400`. It was a charset check before.
+- The reconciler re-reads a confirmed record's status every 5 minutes and re-applies on drift, and a device whose rules were removed is re-contained without waiting for a reconnect. New: gauges `yuzu_server_quarantine_release_pending{reachability}` and `yuzu_server_quarantine_forced_release_owed{reachability}`, alert `YuzuQuarantineReleasePending`, and the `released` and `release_sent` values of `yuzu_server_quarantine_reapply_total{result}`.
+- `scripts/install-agent-user.sh` no longer grants a bare `/sbin/pfctl` (macOS) or `iptables-save`/`iptables-restore`/`ip6tables-save`/`ip6tables-restore` (Linux). The macOS grant is the narrowed `pfctl` argv of the firewall plugin; Linux keeps the bare `iptables` and `ip6tables` grants for the firewall plugin's fallback when `nft` is absent.
+
+**Who is affected.** Anyone who runs the old definition ids or the `quarantine` plugin by name (scripts, saved instructions, schedules, MCP or REST clients, SIEM rules matching `quarantine.*` plugin or action names), anyone who sends `whitelist` entries that are not bare addresses, and anyone who reads `DELETE` as "released". An instruction naming the removed plugin or ids no longer resolves. Audit rows keep the `quarantine.enable`, `quarantine.disable` and `quarantine.reapply` action names; a `quarantine.disable` row with result `pending` now also means a release sent and awaiting the device's answer.
+
+**Not covered.** This build neither removes nor detects containment rules a build with the removed plugin left on a device: the Windows rules named `YuzuQuarantine_*`, the Linux `yuzu-quarantine` chain and, on macOS, a main ruleset replaced by that plugin. Clear them on the device before bringing it under this build. On macOS reload `/etc/pf.conf`, or reboot, since the firewall plugin's apply fails `anchor_not_referenced` while the main ruleset does not reference `com.apple/*`.
+
+**What to do.**
+- Update scripts and saved instructions to the new definition ids or to `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and `firewall.quarantine_allow`.
+- Send whitelist entries as bare addresses, listing both families for the management server.
+- Treat a `202` or `releasing` as "not yet released", and read the device's status before relying on a `200` from a forced end.
+- Alert on `YuzuQuarantineReleasePending` for a device whose release does not finish.
+
 ## ⚠️ Breaking: the Windows and macOS releases ship the agent only; their archives are renamed and `YuzuServerSetup` is discontinued
 
 **What changed.** The server runs on Linux only (ADR-0035). The Windows and macOS release jobs no longer build the server, and the release assets change:

@@ -41,7 +41,7 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 39> kPluginActionCatalogueC{{
+inline constexpr std::array<CommandCapability, 35> kPluginActionCatalogueC{{
     // ── network_config (agents/plugins/network_config/src/network_config_plugin.cpp) ──
     // All seven actions only report existing adapter/DNS/proxy/route configuration —
     // no local or remote state is ever changed.
@@ -391,8 +391,8 @@ inline constexpr std::array<CommandCapability, 39> kPluginActionCatalogueC{{
         // default-block (every other enabled rule disabled for the duration),
         // an own nftables table (iptables fallback) on Linux, a pf sub-anchor
         // on macOS. Destructive for the dispatch gate (explicit targets, no
-        // broadcast), but Reversible, unlike the legacy `quarantine.quarantine`
-        // row: `firewall.release` undoes the RULES and the ENABLE STATE on
+        // broadcast), but Reversible:
+        // `firewall.release` undoes the RULES and the ENABLE STATE on
         // every leg -- it restores the captured Windows policy and re-enables
         // the rules it disabled, deletes the nft table / iptables chain, and
         // empties the pf anchor and releases its enable token. It does NOT
@@ -437,70 +437,6 @@ inline constexpr std::array<CommandCapability, 39> kPluginActionCatalogueC{{
         .action = "quarantine_allow",
         // Adds or removes operator exceptions on an active containment; add
         // and remove are each other's inverse, so Reversible.
-        .dispatch_class = DispatchClass::Mutating,
-        .mutability = Mutability::Reversible,
-        .securable = "Security",
-        .operation = authz::Operation::Execute,
-        .risk_tier = authz::RiskTier::High,
-        .execute_gate = ExecuteGate::AdminOrApproval,
-    },
-
-    // ── quarantine (agents/plugins/quarantine/src/quarantine_plugin.cpp) ──
-    {
-        .plugin = "quarantine",
-        .action = "quarantine",
-        // Blocks essentially all network traffic except the whitelist —
-        // the single most disruptive action in this catalogue fragment.
-        // `unquarantine` restores reachability and is exercised end-to-end
-        // by scripts/test/instructions_quarantine_survivor.py, which
-        // asserts the box is NOT left locked out — but on macOS,
-        // macos_load_ruleset (quarantine_plugin.cpp) replaces the whole
-        // active pf ruleset via `pfctl -f`, and macos_unquarantine
-        // explicitly restores only the OS-default /etc/pf.conf (or
-        // disables pf) "without trying to remember and replay the prior
-        // state ourselves" — any runtime pf rules the endpoint had before
-        // quarantine are permanently lost. A connectivity-restoration test
-        // does not prove that state is restored, so this row is classified
-        // Irreversible across all platforms rather than claiming a genuine
-        // tested undo that only Linux (Yuzu-owned iptables chain) and
-        // Windows actually have.
-        .dispatch_class = DispatchClass::Destructive,
-        .mutability = Mutability::Irreversible,
-        .securable = "Security",
-        .operation = authz::Operation::Execute,
-        .risk_tier = authz::RiskTier::Critical,
-        .execute_gate = ExecuteGate::AdminOrApproval,
-    },
-    {
-        .plugin = "quarantine",
-        .action = "unquarantine",
-        // Restores reachability by re-invoking the platform release path;
-        // on Linux/Windows this is a clean removal of the Yuzu-owned
-        // isolation rules, but see `quarantine`'s row above for why the
-        // macOS release path is not a state-preserving undo of whatever
-        // was quarantined.
-        .dispatch_class = DispatchClass::Mutating,
-        .mutability = Mutability::Reversible,
-        .securable = "Security",
-        .operation = authz::Operation::Execute,
-        .risk_tier = authz::RiskTier::High,
-        .execute_gate = ExecuteGate::AdminOrApproval,
-    },
-    {
-        .plugin = "quarantine",
-        .action = "status",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Security",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .execute_gate = ExecuteGate::None,
-    },
-    {
-        .plugin = "quarantine",
-        .action = "whitelist",
-        // Adds/removes IPs from an active quarantine's allow-list; add and
-        // remove are each other's inverse, so this is Reversible.
         .dispatch_class = DispatchClass::Mutating,
         .mutability = Mutability::Reversible,
         .securable = "Security",
