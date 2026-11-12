@@ -2882,16 +2882,16 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   census ordering key (the merge gate below says which stage the server is at). Entries that
   carry no pair (journal-paged replays, DEX observations, and an agent whose boot epoch could
   not be claimed) are sent with the pair unset (0/0): two such events order by the census
-  ordering key, and against a paired verdict the server change holds them (item 1). Note on
+  ordering key, and against a paired verdict the server change will hold them (item 1). Note on
   #5690's acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14
   (the server now flags a tied or mis-ordered pair rather than keeping it silently); a policy
   that ordered by receipt sequence alone would close UP-14 but worsen UP-13; only terminal
-  precedence closes both. The server change below is none of these three: it orders by the
-  pair, falls back to the census ordering key between two unpaired events, and uses arrival
-  order only in the flagged recoveries it defines. The test
+  precedence closes both. The server change below is none of these three: once PR B ships it
+  will order by the pair, fall back to the census ordering key between two unpaired events,
+  and use arrival order only in the flagged recoveries it will define. The test
   `#3972 chaos: a third sender holding the stream write mutex ...`
   (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
-- UP-14: the five conditions the SERVER change meets. Actual order of delivery: the census
+- UP-14: the five conditions the SERVER change must meet. Actual order of delivery: the census
   ordering changes (#6830, #7151) merged first, the agent change (#7303) merged on 2026-11-08,
   and the server change follows as two pull requests, PR A then PR B. The server therefore
   ignored the pair between #7303 and PR A. PR A stores the pair, counts unpaired and rejected

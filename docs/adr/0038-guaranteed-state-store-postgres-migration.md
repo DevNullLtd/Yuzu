@@ -305,8 +305,14 @@ tenth cascade store (the order row is part of the `guaranteed_state` store, so t
 and its pins are unchanged).
 
 Erasure of this store remains PARTIAL (owner ruling D1, unchanged): the event log and the DEX
-observations stay until retention expiry, and widening that is still tracked in #7531. The order row
-holds the agent's counters and pair clock only.
+observations stay until retention expiry, and widening that is still tracked in #7531; the event
+log's `boot_epoch` and `emit_seq` columns stay with their events until they expire. The order row
+holds the agent's counters and pair clock only: it is device-level (keyed by `agent_id`), holds
+server receipt-time clock readings and counters, and holds no user content and no behavioural data.
+It is retained until the device is decommissioned, with no TTL and no prune. An agent that vanishes
+without a decommission therefore stays counted in the unordered-agents figure and can crowd the
+first-50 id list. A prune of this table would be a separate clock-guarded-retention decision, not a
+quiet addition.
 
 Known residual, accepted: a first delivery that inserts the agent's order row and has not committed is
 invisible to the DELETE, so a brand-new or just-decommissioned agent's first event can commit an order

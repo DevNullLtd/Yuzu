@@ -1289,6 +1289,26 @@ CREATE INDEX idx_gars_rule ON guardian_agent_rule_status(rule_id);
 -- event, 0 = unusable key); proj_key_capped BOOLEAN; projection_pending BOOLEAN. The partial
 -- index idx_gse_pending ON (rule_id, agent_id) WHERE projection_pending serves the pair lock,
 -- the readers and delete_rule.
+
+-- schema v5 (UP-14, #5690): guaranteed_state_events and guardian_agent_rule_status each gain
+-- boot_epoch BIGINT and emit_seq BIGINT (both NULL = unpaired; no default, no backfill), and the
+-- per-agent order table is added. kV5Ddl in guaranteed_state_store.cpp is the authoritative text.
+CREATE TABLE guardian_agent_order (
+    agent_id          TEXT NOT NULL,
+    epoch             BIGINT,
+    emit_seq_hwm      BIGINT,
+    epoch_recv_ns     BIGINT,
+    retired_epoch     BIGINT,
+    unpaired_recv_ns  BIGINT,
+    unpaired_events   BIGINT NOT NULL DEFAULT 0,
+    unpaired_held     BIGINT NOT NULL DEFAULT 0,
+    pair_regressions  BIGINT NOT NULL DEFAULT 0,
+    pair_stragglers   BIGINT NOT NULL DEFAULT 0,
+    pair_recoveries   BIGINT NOT NULL DEFAULT 0,
+    pair_duplicates   BIGINT NOT NULL DEFAULT 0,
+    retired_events    BIGINT NOT NULL DEFAULT 0,
+    CONSTRAINT guardian_agent_order_pkey PRIMARY KEY (agent_id)
+) WITH (fillfactor = 70);
 ```
 
 The census row is written in the same transaction as the event that causes it, under its own
@@ -1303,9 +1323,10 @@ stored ordering inputs. `order_uncertain` is sticky and disclosed on every read.
 event's `(boot_epoch, emit_seq)` pair on the event row and the census row (NULL when
 unpaired), adds the per-agent table `guardian_agent_order`, and rejects a half-set or
 out-of-range pair at ingest as unpaired, counted; the pair so stored does not yet decide a
-verdict (see section 7.1). Under one `census_upsert`
-savepoint a writer locks every pending event of the pair in `ingest_seq` order in one statement, then the census
-row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. The
+verdict (see section 7.1). A census-bearing first delivery locks the agent's order row first, in its own
+savepoint (a repair runs no such step and takes no order row). Under one `census_upsert`
+savepoint a writer then locks every pending event of the pair in `ingest_seq` order in one
+statement, then the census row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. The
 event-row waits of single-event ingest, repair and `delete_rule` are acyclic; the batch path (no production
 caller) carries no such guarantee. Every census read that returns per-pair state, or a rollup of it, discloses
 `order_uncertain` and `projection_pending` (or `uncertain_rules`); the device-compliance read, which was the one
@@ -1320,7 +1341,7 @@ retained pending backlog; a lock wait, a loaded database or an administrator can
 `guardian_census_device` source of `yuzu_server_guardian_read_degrade_total`. See the user manual's Compliance
 overview for the operator-facing contract. A device decommission (the ninth agent-decommission cascade store, key
 `guaranteed_state`, #5675), for one agent and in one transaction, deletes the agent's `guardian_agent_order` row first (the
-the row a census-bearing first delivery also takes first; no other lock is added and it takes no rule row), then locks the agent's
+row a census-bearing first delivery also takes first; no other lock is added and it takes no rule row), then locks the agent's
 pending events in `ingest_seq` order and sets `projection_pending` false on them, then deletes the agent's census rows;
 the event log and DEX observations are not erased by it and expire by retention (30 days by default; rows written while the retention setting is 0 or below never expire),
 so the erasure is partial.
