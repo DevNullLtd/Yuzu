@@ -131,7 +131,7 @@ TEST_CASE("registry live: bam\\State is never read -- a scratch value under bam 
     // Both owners are constructed above, before any create() can throw, so a failure here still unwinds both
     // (a never-created key closes nothing, and its delete finds no key). A runner account can be refused creating a
     // key here (ACCESS_DENIED): measured as an elevated non-SYSTEM user, a key directly under bam was allowed and
-    // bam\State\UserSettings was refused, while SYSTEM may write both (#7637). That is a limit of the account, not a
+    // bam\State\UserSettings was refused, while SYSTEM could write both on that host (#7637). That is a limit of the account, not a
     // defect, so it SKIPs even with the require flag set (the case then runs only where the account may write, e.g. a
     // LOCAL SYSTEM host); any other error still FAILs under the flag. The missing outcome test is #7638.
     for (ScratchKey* k : {&control, &excluded}) {

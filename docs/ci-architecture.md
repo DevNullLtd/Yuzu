@@ -1286,7 +1286,7 @@ label still fails loud.
 `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
 cannot write `HKLM`) fails instead. The one exception is the Echo bam live case (#6898): a runner account can be refused
 (error 5) creating its scratch keys under `HKLM\SYSTEM\CurrentControlSet\Services\bam` (measured as an elevated non-SYSTEM
-user: a key directly under `bam` was allowed, `bam\State\UserSettings` was refused; LOCAL SYSTEM may write both), and then
+user: a key directly under `bam` was allowed, `bam\State\UserSettings` was refused; LOCAL SYSTEM could write both on that host), and then
 the case SKIPs even with the flag set. The exclusion is proven live only where the account may write (a LOCAL SYSTEM
 host), so while the Windows runner's account stays refused CI does not run it (#7637; the missing test of the skip
 decision is #7638). Any other failure of that case still fails the job. The job-level
@@ -1304,7 +1304,7 @@ and says the bam live case is expected to skip; the three other roots always nee
 `Assert this job left no YuzuTest-* registry keys behind` runs
 the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). The
 could-not-list arm has no self-test of its own (accepted residual): a persistent listing failure is caught pre-suite,
-because the other-scope self-test arm expects exit 0 and a failed listing makes it exit 1. It reports and never deletes (a leftover can be a registry link, and a
+because the other-scope self-test arm expects exit 0 and a failed listing makes it exit 1. The check reports and never deletes (a leftover can be a registry link, and a
 tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
 removes it.
 

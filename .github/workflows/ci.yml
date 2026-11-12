@@ -2506,7 +2506,7 @@ jobs:
           $scope = $env:YUZU_TEST_REGISTRY_SCOPE
           $script = './scripts/ci/check-registry-test-leftovers.ps1'
           # one probe under EACH root the script scans, so dropping a root from it turns this step red. A runner account
-          # can be refused (error 5) creating a key under a bam root (#7637; an elevated administrator on the dev host was
+          # can be refused (error 5) creating a key under a bam root (#7637; an elevated administrator on a test host was
           # refused under bam\State\UserSettings and allowed directly under bam): a refused root is held to a weaker proof
           # (a text check that the script still names the root; it proves presence, not scanning); the three other roots
           # always need a live probe. Only a permission refusal is tolerated: any other error (e.g. a probe that already
@@ -2542,7 +2542,7 @@ jobs:
               try { New-Item -Path $p -ErrorAction Stop | Out-Null; $made += $p; $planted[$root] = $probes[$root] }
               catch {
                 if ($bamRoots -notcontains $root -or $_.CategoryInfo.Category -ne 'PermissionDenied') { throw }
-                Write-Host "::warning::registry leftover check self-test: cannot plant a probe under $root ($($_.Exception.Message)); proving only that the script lists it. The Echo bam live case is expected to SKIP too, so the bam exclusion is not proven live in this job (runner identity $($who.Name), system: $($who.IsSystem); #7637)"
+                Write-Host "::warning::registry leftover check self-test: cannot plant a probe under $root ($($_.Exception.Message)); proving only that the script lists it. The Echo bam live case is expected to SKIP too, so the bam exclusion is not proven live in this job (runner identity $($who.Name), sid $($who.User.Value), system: $($who.IsSystem); #7637)"
                 if (-not (Select-String -LiteralPath $script -SimpleMatch -Quiet -Pattern "'$root'")) {
                   throw "registry leftover check self-test: $script does not list $root"
                 }
@@ -2614,7 +2614,7 @@ jobs:
           # write HKLM, and the Echo bam live case (tests/unit/test_echo_registry_bam_live.cpp, skip_or_fail) SKIPs when the
           # process is not elevated, bam\State cannot be opened or a scratch key under bam is refused; both outcomes are green.
           # In this job a skip is a regression, so "1" turns it into a FAIL. The one exception is the bam live case's
-          # refused scratch-key create (ACCESS_DENIED: the account may not write there, #7637), which SKIPs even with "1".
+          # refused scratch-key create (ACCESS_DENIED: the account may not write under bam, #7637), which SKIPs even with "1".
           YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS: "1"
           # The fixtures' key-name scope (YUZU_TEST_REGISTRY_SCOPE) is the job-level env above.
         run: |
