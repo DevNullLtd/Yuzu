@@ -1147,6 +1147,12 @@ private:
                      const auth::Session& session, const std::string& perm,
                      authz::VisibleSet scope);
 
+    /// `require_list_read`'s body. `require_list_read` is the ONLY caller (it applies the
+    /// service-scope postcondition to whatever this admits); never call this directly.
+    ListReadGate require_list_read_unchecked(const httplib::Request& req, httplib::Response& res,
+                                             const std::string& securable_type,
+                                             const std::string& operation);
+
     std::optional<std::vector<authz::PermPair>> service_scope_global_safe_override_for_test_;
 
     std::size_t mfa_pending_cap_{kMaxPendingTokens};
