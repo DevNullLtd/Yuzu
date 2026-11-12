@@ -125,18 +125,18 @@ TEST_CASE("hw_identity_fn wiring (LEXICAL pin, not behaviour): the offline fallb
 TEST_CASE("build_hw_roster wiring (LEXICAL pin, not behaviour): the roster read feeds "
           "apply_roster_read",
           "[hardware][wiring][lexical][roster_truncated]") {
-    const std::string body2 =
+    const std::string roster_body =
         lambda_body(comment_free_source("server.cpp"), "build_hw_roster", "-> InventoryDevicesResult");
-    REQUIRE_FALSE(body2.empty());
-    const auto read = body2.find("offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)");
-    const auto apply = body2.find("apply_roster_read(result,eps)");
+    REQUIRE_FALSE(roster_body.empty());
+    const auto read = roster_body.find("offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)");
+    const auto apply = roster_body.find("apply_roster_read(result,eps)");
     REQUIRE(read != std::string::npos);
     REQUIRE(apply != std::string::npos);
     CHECK(read < apply);
-    CHECK(count_occurrences(body2, "query_stale_within(") == 1);
-    CHECK(count_occurrences(body2, "apply_roster_read(") == 1);
+    CHECK(count_occurrences(roster_body, "query_stale_within(") == 1);
+    CHECK(count_occurrences(roster_body, "apply_roster_read(") == 1);
     // The rows come from the served partial's `.rows`, not from a re-read.
-    CHECK(count_occurrences(body2, "eps->rows") >= 1);
+    CHECK(count_occurrences(roster_body, "eps->rows") >= 1);
 }
 
 TEST_CASE("hw_ci_detail_fn wiring (LEXICAL pin, not behaviour): one closure feeds REST and MCP",

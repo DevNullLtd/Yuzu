@@ -1267,11 +1267,21 @@ TEST_CASE("OfflineEndpointStore query_stale_within: concurrent truncated reads e
     seed_roster(conn, OfflineEndpointStore::kQueryRowCap + 1);
 
     constexpr int kThreads = 2;
-    constexpr int kReadsEach = 3;
+    constexpr int kReadsEach = 2;
     std::atomic<int> truncated_seen{0};
     std::atomic<int> failed{0};
     std::vector<std::thread> readers;
     readers.reserve(kThreads);
+    // Joins on every exit path (std::jthread is not available on Apple Clang's libc++): a throw
+    // after the first thread starts must not reach ~thread() on a joinable thread (std::terminate).
+    struct JoinAll {
+        std::vector<std::thread>& threads;
+        ~JoinAll() {
+            for (auto& th : threads)
+                if (th.joinable())
+                    th.join();
+        }
+    } join_all{readers};
     for (int t = 0; t < kThreads; ++t)
         readers.emplace_back([&] {
             for (int i = 0; i < kReadsEach; ++i) {

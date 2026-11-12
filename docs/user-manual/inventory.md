@@ -1150,7 +1150,7 @@ counts it is a lower bound. The KPI counts (Total, Online, Offline, Stale) are s
 `kpis.*` are lower bounds, and a search or filter that finds nothing does **not** prove a
 device does not exist. Open the device's record, or call `get_hardware_ci` /
 `GET /api/v1/hardware/{id}`, to confirm one device: that read goes straight to the
-device's row and is exact at any fleet size. The notice is worked out afresh on every
+device's row and is exact at any fleet size (for a device seen within the roster window). The notice is worked out afresh on every
 read, so it disappears by itself when the fleet is back under the cap; the list is never
 refused because of it. The Dashboard's device estate for a caller with fleet-wide read is
 an exact count of every endpoint in the window, so it can read higher than the Hardware
@@ -1182,7 +1182,7 @@ The roster cap is a display and read cap, not a tested capacity. Above it:
 - Online and Offline on the list derive from the live-presence read; if that read fails or is
   truncated, agents connected to another replica read Offline with no flag (#7566).
 - Search, filter and sort run over the capped set, and there is no way to page past the cap
-  (#7567). A device is always reachable by its id.
+  (#7567). A device seen within the window is always reachable by its id.
 
 A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
 deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates

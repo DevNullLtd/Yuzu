@@ -468,10 +468,11 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     // rendered in the empty-result state too: a search that finds nothing proves nothing here.
     if (page.roster_truncated)
         h += "<div id=\"hw-roster-truncated\" class=\"gp-banner hw-partial\"><b>Partial list.</b> More than " +
-             with_thousands(kOfflineRosterRowCap) + " devices were seen in the last 30 days, so this list "
+             with_thousands(kOfflineRosterRowCap) + " devices were seen in the last " + std::to_string(std::chrono::duration_cast<std::chrono::days>(kHardwareRosterWindow).count()) + " days, so this list "
              "shows the " + with_thousands(kOfflineRosterRowCap) + " most recently seen. Older devices are "
-             "not listed and the list cannot be paged past this limit; every count and figure on this page "
-             "(including the page total) is a lower bound, and a search that finds nothing does not "
+             "not listed and the list cannot be paged past this limit. Every device count on this page "
+             "(including the page total) is a lower bound; the CI-coverage ratio and the median "
+             "describe only the listed devices. A search that finds nothing does not "
              "prove a device does not exist &mdash; open a device's record to check it directly.</div>";
     if (page.containment_ui && page.quarantine_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Quarantine state unavailable.</b> The quarantine "
@@ -596,7 +597,7 @@ std::string render_hardware_not_found(const std::string& agent_id) {
 
 std::string render_hardware_roster_unreadable(const std::string& agent_id) {
     return hw_style() + "<div class=\"hw-wrap\"><div class=\"gp-placeholder\"><b>Device roster "
-           "unreadable.</b> The device roster could not be read, so '" + esc(agent_id) +
+           "unreadable.</b> The device's stored record could not be read, so '" + esc(agent_id) +
            "' cannot be looked up &mdash; this is not \"not found\". Retry shortly.</div></div>";
 }
 
@@ -667,8 +668,8 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
             h += "<div><span class=\"ci-lab\">Architecture</span>" + ci_disp(arch) + "</div>";
             h += "</div></div>";
         } else if (detail.identity_degraded) {
-            h += "<div class=\"gp-banner hw-degrade\"><b>Device identity unavailable.</b> The device roster "
-                 "could not be read &mdash; the agent id is shown in place of the hostname, OS is "
+            h += "<div class=\"gp-banner hw-degrade\"><b>Device identity unavailable.</b> The device's stored "
+                 "record could not be read &mdash; the agent id is shown in place of the hostname, OS is "
                  "omitted and last-seen is unknown; this is not \"not found\".</div>";
         }
         if (!detail.ci.has_value()) {

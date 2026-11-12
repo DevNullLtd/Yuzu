@@ -46,6 +46,7 @@
 #include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "http_route_sink.hpp"
 #include "offline_endpoint_store.hpp"
+#include "offline_endpoint_types.hpp" // kOfflineRosterRowCap (static_assert below)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
 
 #include <yuzu/metrics.hpp>
@@ -276,8 +277,9 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // is flagged `offline_roster_degraded` in the envelope + audit detail.
     // #5712: a roster past the store's row cap is a typed PARTIAL, served and flagged
     // `offline_roster_truncated` (and audited, on the 413 path too), never an error. The flag is
-    // mostly reachable only at the machines_max ceiling: that ceiling equals the roster cap, so a
-    // truncated merge is >= cap machines and is gated 413 at any smaller machines_max.
+    // reachable as a 200 only at machines_max == the ceiling AND with every live host inside the
+    // roster: that ceiling equals the roster cap, so a truncated merge is >= cap machines and is
+    // gated 413 at any smaller machines_max (and above the cap whenever a live host is outside it).
     bool offline_degraded = false;
     bool offline_truncated = false;
     if (offline_roster_fn_) {

@@ -122,9 +122,6 @@ void record_presence_store_failure(yuzu::MetricsRegistry* metrics, std::string_v
 
 constexpr const char* kRosterTruncatedMetric = "yuzu_server_agent_presence_roster_truncated_total";
 
-// One `endpoints` row in the column order both roster reads select (agent_id, hostname, os,
-// last_heartbeat_ms, agent_ts, agent_version, arch) — one copy, so the roster scan and the
-// point read can never map a column differently.
 /// An agent_id that can never be a stored key: it holds a NUL byte or is not well-formed UTF-8.
 /// `agent_id` is a Postgres TEXT, which holds neither, so such an id CANNOT match a row; handing
 /// it to the server would raise SQLSTATE 22021 (or be refused by the NUL guard in pg_exec) and
@@ -147,6 +144,9 @@ constexpr const char* kRosterTruncatedMetric = "yuzu_server_agent_presence_roste
     return false;
 }
 
+// One `endpoints` row in the column order both roster reads select (agent_id, hostname, os,
+// last_heartbeat_ms, agent_ts, agent_version, arch) — one copy, so the roster scan and the
+// point read can never map a column differently.
 OfflineEndpoint read_endpoint_row(const PGresult* res, int i) {
     OfflineEndpoint ep;
     ep.agent_id = PQgetvalue(res, i, 0);
@@ -539,11 +539,12 @@ void OfflineEndpointStore::set_metrics(yuzu::MetricsRegistry* m) {
     if (m == nullptr)
         return;
     m->describe(kRosterTruncatedMetric,
-                "#5712: roster reads (Hardware list, viz, MCP topology, Software hostname map) "
-                "served as a truncated partial because more than kQueryRowCap (100000) "
-                "endpoints were inside the window. A steady state on a fleet over the cap, not an "
-                "incident; the consumers render a lower-bound notice. No alert rule: the "
-                "threshold needs fleet data.",
+                "#5712: roster reads served as a truncated partial because more than 100000 "
+                "endpoints were inside the window (the Hardware list, the fleet topology and the "
+                "hostname map behind the Software, Quarantine and containment pages and REST "
+                "lookup-facts). One increment per truncated read, so the rate tracks page loads "
+                "and API polling, not fleet size; use increase() over a window. A steady state on "
+                "a fleet over the cap, not an incident. No alert rule.",
                 "counter");
     m->counter(kRosterTruncatedMetric); // pre-seed at 0 so the series exists before the first cap hit
 }
