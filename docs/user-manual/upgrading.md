@@ -1478,39 +1478,31 @@ refusal that normal operation never triggers.
 **1. The `guardian.` definition-id prefix is reserved (breaking for operator-authored ids).** A
 new instruction definition whose id starts `guardian.` is refused on create, import and the
 dashboard YAML editor, and such a definition is skipped at boot auto-import. No shipped content
-uses the prefix. Definitions that already carry such an id keep executing, but cannot be saved
+uses the prefix. A definition that carries such an id anyway (one written straight to the database, for example) keeps executing, but cannot be saved
 from the YAML editor if the document declares `metadata.id`, and cannot be re-imported. **Before
 you import or author definitions, run the read-only check and rename any id it lists**: see
 [the `guardian.` entry in Server Administration](server-admin.md#vnext-the-guardian-instruction-definition-id-prefix-is-reserved-6062-breaking).
 
 **2. Approvals schema migration v3 (store `approval_manager`).** It adds three text columns to
 `approvals` (`request_json`, `request_digest`, `excluded_roots`), each `NOT NULL DEFAULT ''`, so
-every existing row reads as "binds no request, excludes nobody" and behaves as before. The
+a row that sets none of them reads as "binds no request, excludes nobody". The
 migration is additive and needs no operator step, but it takes a brief `ACCESS EXCLUSIVE` lock on
 `approvals`. If a long-running or idle-in-transaction session holds that table, the replica
 cannot finish the migration and refuses to start (`Refusing to start: approval manager
 migration/open failed`) rather than serve with a half-migrated schema; end the session and start
 it again. It follows the data-only v2 step of the scheduled-approval change (#6096, below), which
-claimed v2 first, so a fresh database runs v2 and then v3 in two separate transactions. The v3
+claimed v2 first, so a fresh database applies each approvals step in its own transaction. The v3
 step is idempotent (`ADD COLUMN IF NOT EXISTS`).
 
 - **Mixed builds are outside the contract.** This release supports a fresh database only (see
   "Deployment contract (hard cutover)" in the Forensics section of this page), so running this build
-  beside an earlier one is not supported. For what the migration itself does: it only adds columns an
-  earlier build never reads, and the migration runner applies only versions above the one stored for
-  the store, with no newer-schema refusal. That is established by reading the runner; it has not been
-  exercised.
+  beside an earlier one is not supported.
 - **A return to the previous build** is outside the "Deployment contract (hard cutover)" in the
-  Forensics section of this page, so it is not a supported operation. For what the migration
-  itself leaves behind: it adds columns the previous build ignores, and the default-empty values
-  hold no bound ticket, which is the case for this whole release. Returning across the #6096
-  change as well has its own consequences, described in that section.
-- **A bound ticket needs every replica on a build that includes this migration.** The previous build
-  does not read `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it,
-  and it redeems without comparing the frozen request. The change that first creates a bound ticket
-  (#6063) must not do so until every replica runs a build that includes this migration. Until it
-  does, a row with a non-empty `request_json` is not expected to exist; if you find one before #6063 ships, the
-  database was written outside the "Deployment contract (hard cutover)"; do not run an earlier build against it.
+  Forensics section of this page, so it is not a supported operation.
+- **A bound ticket needs every replica on this build.** The change that first creates a bound ticket
+  (#6063) must not mint one on a deployment where any replica runs an earlier build; that is outside the
+  "Deployment contract (hard cutover)". Until it ships, a row with a non-empty `request_json` is not expected
+  to exist; if you find one, the database was written outside that contract.
 
 **3. A new audit action and metric: `approval.precondition_denied` and
 `yuzu_approval_precondition_denied_total{origin}`.** When an approved ticket is refused at
@@ -1695,10 +1687,8 @@ repopulates its rows on its next report until the decommission tombstone ships i
 
 No agent sends `certificate_inventory` yet; agents start only once the server advertises that it
 accepts the source, in a separate later change. The server's gateway path (`ProxyInventory`) now
-stores such a blob in this typed store, exactly as the direct `ReportInventory` path does. The
-previous release discarded it there; releases before the typed-source read filter (see "Behaviour change: generic
-inventory reads never return a typed source's rows" below) stored it in the generic store, which that
-filter and the boot purge now exclude. It never reaches the generic inventory store.
+stores such a blob in this typed store, exactly as the direct `ReportInventory` path does. It never reaches the
+generic inventory store (see "Behaviour change: generic inventory reads never return a typed source's rows" below).
 
 Plan capacity before agents start reporting: DER is optional and
 bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
@@ -2120,8 +2110,8 @@ separate scheduled-approval change (#6096, below) adds a data-only approvals ste
   only (no table or column changes), runs inside the migration transaction under a 300 s statement timeout and is
   skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied, and the approvals
   store does not open (the server logs a schema migration failure for that store); investigate the table size and
-  restart. The command outbox also gains a small index on its approval id (`outbox_approval_idx`) in the same
-  migration; its build is bounded by the same 300 s timeout.
+  restart. The command outbox gains a small index on its approval id (`outbox_approval_idx`) in its own schema
+  step (outbox v2, also under a 300 s statement timeout); if that build fails, it is the outbox store that does not open.
 - **Start one replica first (#6096).** Building `outbox_approval_idx` takes a share lock on the outbox table for up
   to 300 s on a large table, so enqueue and claim on other replicas wait meanwhile. A second replica that boots at
   the same time waits on the migration advisory lock under the pool's default lock and statement timeouts and may
@@ -2137,7 +2127,7 @@ separate scheduled-approval change (#6096, below) adds a data-only approvals ste
   ```sql
   SELECT id, status, schedule_id, consumed_at, consumed_by
   FROM approval_manager.approvals
-  WHERE consumed_by LIKE 'schedule:%';
+  WHERE schedule_id <> '' AND consumed_by LIKE 'schedule:%';
   ```
 - This build records in the command outbox which approval ticket each scheduled run used, and refuses to fire a
   ticket the outbox shows was already used by an earlier occurrence. Running it beside an earlier build is outside
@@ -2149,7 +2139,7 @@ separate scheduled-approval change (#6096, below) adds a data-only approvals ste
 The `plugin_config_store` schema moves to v3. It adds the tables of the plugin-enablement store (`enablement_rules`, `enablement_endpoints`, `enablement_meta`) and records a new store id. Nothing is switched on by this schema: there is no operator surface yet and nothing issues desired state, so no endpoint's behaviour changes.
 
 - **What you will see.** `/readyz` gains an `enablement` object and `/health` an `enablement_regressed` flag; neither gates readiness. On first boot the server writes `enablement-anchor` beside its data and reports `anchor_unwitnessed_at_boot: true` once. That is expected and needs no action.
-- **Restoring a backup beside a kept data directory.** The v3 migration seeds a new store id, and the server writes `enablement-anchor` naming it. If the data directory keeps an anchor that names a different store id (for example you restored a database dump taken at another time, or created a fresh database beside a kept data directory), the server logs one warning naming the old and new store id. While nothing has been issued (the anchor's counter and the store's counter are both `0`) that is reported as unwitnessed (`anchor_unwitnessed_at_boot: true` once), the server rewrites the anchor with the current store id, and no regression is declared. If the anchor's counter or the store's counter is above `0`, the server starts with enablement declared regressed (reason `store_id_mismatch`, alert `YuzuEnablementRegressed`); before starting, remove `enablement-anchor` from the data directory or restore it from the same backup point as the dump. If a regression was already declared, the exit is in [Enablement continuity anchor](server-admin.md#enablement-continuity-anchor).
+- **Restoring a backup beside a kept data directory.** The v3 migration seeds a new store id, and the server writes `enablement-anchor` naming it. If the data directory keeps an anchor that names a different store id (for example a dump from another deployment, or a fresh database created beside a kept data directory), the server logs one warning naming the old and new store id. While nothing has been issued (the anchor's counter and the store's counter are both `0`) that is reported as unwitnessed (`anchor_unwitnessed_at_boot: true` once), the server rewrites the anchor with the current store id, and no regression is declared. If the anchor's counter or the store's counter is above `0`, the server starts with enablement declared regressed (reason `store_id_mismatch`, alert `YuzuEnablementRegressed`); before starting, remove `enablement-anchor` from the data directory or restore it from the same backup point as the dump. Restoring this deployment's own older dump over itself keeps the store id, so it is not a mismatch: with counters above `0` it is declared regressed as `store_behind`. If a regression was already declared, the exit is in [Enablement continuity anchor](server-admin.md#enablement-continuity-anchor).
 - **Backups.** The tables ride the existing dump. The anchor file is outside it: keep `enablement-anchor` with the data directory. `scripts/yuzu-backup.sh` and `scripts/yuzu-restore.sh` now copy it.
 - **Alerts.** The `yuzu-enablement` group in `docs/prometheus/yuzu-alerts.yml` ships with this change. Until the later change that issues desired state, only `YuzuEnablementRegressed` and `YuzuEnablementAnchorWriteFailing` can fire.
 
