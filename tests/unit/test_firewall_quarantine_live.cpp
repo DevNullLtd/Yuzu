@@ -930,8 +930,10 @@ TEST_CASE("live: the repair self-check re-applies a containment the host lost, f
 #endif
     CHECK(probe(env.probe_target) != fq::ProbeOutcome::timeout); // honestly uncontained
 
-    // the tick notices and re-applies the STORED set; the parameters it is handed are ignored
-    const auto fixed = rig.run("quarantine", {{"repair", "1"}, {"exceptions", "198.18.0.9"}});
+    // the tick notices and re-applies the STORED set. `repair=1` is bare: do_quarantine refuses
+    // it together with containment parameters (repair_with_containment_parameters), so the
+    // stored set is the only thing it can apply.
+    const auto fixed = rig.run("quarantine", {{"repair", "1"}});
     INFO(fixed.captured);
     CHECK(fixed.rc == 0);
     CHECK(has_row(fixed.captured, "note|repair_tick=1"));
