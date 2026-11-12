@@ -898,6 +898,83 @@ std::expected<void, std::string> GuaranteedStateStore::delete_rule(const std::st
     return {};
 }
 
+bool GuaranteedStateStore::delete_agent(std::string_view agent_id) {
+    if (agent_id.empty()) {
+        spdlog::warn("GuaranteedStateStore: delete_agent called with an empty agent_id - refusing "
+                     "without touching PG");
+        return false;
+    }
+    if (!open_)
+        return false;
+    const std::string id{agent_id};
+    // One transaction, in the census writers' lock order (see the lock-order comment above the
+    // census statements): the agent's pending events are locked in ingest_seq order first, then the
+    // census rows are touched. A projection that wins the pending-row locks makes this wait; this
+    // then deletes the census row it committed. No rule row is locked (a child DELETE does not lock
+    // its parent), so the event-row waits stay acyclic against delete_rule too. The census-row
+    // deletes of this method and of delete_rule's cascade take row locks in heap order, so two
+    // transactions that overlap on several census rows could in principle deadlock; Postgres
+    // aborts one, this method then returns false and the re-issue is idempotent. A pending event
+    // committed after the list is read is not retired here (delete_rule has the same list-read
+    // gap; the sweep of stranded pending evidence is tracked in #7147). Every statement result is
+    // checked: a false return rolls the whole transaction back, so the decommission cascade records
+    // Failed and the re-issue is idempotent. The failure reason is logged at warn level, because
+    // the pool's last_error() is set only by connect and acquire failures and never by a failed
+    // statement.
+    const auto log_step_failure = [&](const char* step, PGconn* conn, const pg::PgResult& res) {
+        // A null result (out of memory, a lost connection) carries no message of its own: the
+        // reason is then on the connection.
+        const char* msg = PQresultErrorMessage(res.get());
+        if (msg == nullptr || *msg == '\0')
+            msg = PQerrorMessage(conn);
+        spdlog::warn("GuaranteedStateStore: delete_agent failed at step '{}' for agent={}: {}",
+                     step, log_id_token(agent_id), ::yuzu::log_key_token(msg ? msg : ""));
+    };
+    const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult locked =
+            pg::exec_params(conn,
+                            "SELECT event_id FROM guaranteed_state_store.guaranteed_state_events "
+                            "WHERE agent_id = $1 AND projection_pending ORDER BY ingest_seq "
+                            "FOR UPDATE",
+                            std::vector<std::string>{id});
+        if (locked.status() != PGRES_TUPLES_OK) {
+            log_step_failure("pending-event lock", conn, locked);
+            return false;
+        }
+        std::vector<std::string> pending_ids;
+        for (int i = 0; i < PQntuples(locked.get()); ++i)
+            pending_ids.emplace_back(PQgetvalue(locked.get(), i, 0));
+        if (!pending_ids.empty()) {
+            // The census rows go below, so the evidence they were projected from is retired with
+            // them: left pending it would be exempt from the reaper forever and would be folded
+            // into the ordering fields of a row a re-registered agent creates under the same id.
+            const std::vector<std::string_view> views(pending_ids.begin(), pending_ids.end());
+            pg::PgResult retired =
+                pg::exec_params(conn,
+                                "UPDATE guaranteed_state_store.guaranteed_state_events "
+                                "SET projection_pending = false WHERE event_id = ANY($1::text[])",
+                                std::vector<std::string>{pg::to_text_array(views)});
+            if (retired.status() != PGRES_COMMAND_OK) {
+                log_step_failure("pending-event retire", conn, retired);
+                return false;
+            }
+        }
+        pg::PgResult census = pg::exec_params(
+            conn,
+            "DELETE FROM guaranteed_state_store.guardian_agent_rule_status WHERE agent_id = $1",
+            std::vector<std::string>{id});
+        if (census.status() != PGRES_COMMAND_OK) {
+            log_step_failure("census delete", conn, census);
+            return false;
+        }
+        return true;
+    });
+    if (!committed)
+        spdlog::debug("GuaranteedStateStore: delete_agent did not commit for agent={}",
+                      log_id_token(agent_id));
+    return committed;
+}
+
 void GuaranteedStateStore::set_on_rule_mutation(std::function<void()> hook) {
     on_rule_mutation_ = std::move(hook);
 }
@@ -1289,18 +1366,22 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // redelivery repairs it. No application-level pair lock, no heal clause and no repair skip:
 // Postgres row locks serialise a pair. Every pending event row of the pair is locked in
 // `ingest_seq` order in ONE statement, then the census row is touched, and `delete_rule` locks the
-// rule's pending rows the same way before it retires them and deletes the rule. On the production
-// paths (single-event ingest, repair, `delete_rule`) every event-row lock is taken by one
-// `ORDER BY ingest_seq FOR UPDATE` statement, so event-row waits are acyclic; the census row
-// follows, and the rule row (a share lock on a census INSERT, an exclusive lock in `delete_rule`)
-// after the events. The two orders around the census and rule rows (the FK check on a census
-// INSERT versus `delete_rule`'s delete and cascade) cannot close a cycle for a visibility reason,
-// not an ordering one: whichever side takes the rule row first, the other waits for it and neither
-// holds a lock the other still needs. INSERT first: its foreign-key check holds a share lock on the
-// rule row, `delete_rule` waits for it, then cascades over the committed census row. DELETE first:
-// the INSERT's foreign-key check waits, then fails 23503 (Rejected). The UPDATE arm takes no
-// rule-row lock at all. `insert_events` (the batch
-// path, no production caller) takes census rows in batch order across pairs and carries no such
+// rule's pending rows the same way before it retires them and deletes the rule. `delete_agent`
+// (the decommission cascade, #5675) is the third writer: it locks the agent's pending rows the same
+// way, then deletes the agent's census rows, and takes no rule-row lock. On the production
+// paths (single-event ingest, repair, `delete_rule`, `delete_agent`) every event-row lock is taken
+// by one `ORDER BY ingest_seq FOR UPDATE` statement, so event-row waits are acyclic (the census-row
+// deletes of `delete_agent` and of `delete_rule`'s cascade take row locks in heap order and could
+// in principle deadlock where they overlap on several rows; Postgres aborts one of them and its
+// caller sees a failure); the census row follows, and the rule row (a share lock on a census
+// INSERT, an exclusive lock in `delete_rule`) after the events. The two orders around the census
+// and rule rows (the FK check on a census INSERT versus `delete_rule`'s delete and cascade) cannot
+// close a cycle for a visibility reason, not an ordering one: whichever side takes the rule row
+// first, the other waits for it and neither holds a lock the other still needs. INSERT first: its
+// foreign-key check holds a share lock on the rule row, `delete_rule` waits for it, then cascades
+// over the committed census row. DELETE first: the INSERT's foreign-key check waits, then fails
+// 23503 (Rejected). The UPDATE arm takes no rule-row lock at all. `insert_events` (the batch path,
+// no production caller) takes census rows in batch order across pairs and carries no such
 // guarantee: two concurrent batches can deadlock, which surfaces per statement as Failed (and
 // then rolls the batch back).
 

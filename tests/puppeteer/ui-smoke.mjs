@@ -389,6 +389,95 @@ async function scenarioDexApps(page) {
   check('dex-apps golden: no page error and no CSP violation while the stubbed page is exercised',
     w.errors().length === 0, JSON.stringify(w.errors()));
   clearStubs(page);
+// #6749: the Engine Principals roster read answers 200 with Sec-Audit-Failed when its audit row
+// was not saved; the Settings page says so once, outside the section that refreshes. A stub
+// proves the PAGE half only (the server half is the dropped-audit C++ test).
+async function scenarioEngineAudit(page) {
+  const w = watch(page);
+  const ROSTER = '/fragments/settings/engine-principals';
+  const SENTENCE = 'An audit record for this read could not be saved. The data shown is still current.';
+  const refresh = async () => {
+    await Promise.all([
+      page.waitForResponse((r) => new URL(r.url()).pathname === ROSTER, { timeout: WAIT_MS }),
+      page.evaluate(() => htmx.trigger(document.body, 'refreshEnginePrincipals')),
+    ]);
+    await settled(page);
+    await quiesce(page);
+  };
+  const banners = () => page.$$eval('#engine-principals-notices .failbox',
+    (els) => els.map((e) => ({ text: e.textContent, role: e.getAttribute('role') })));
+  const rosterShown = () => page.waitForFunction(
+    () => !!document.querySelector('#engine-principals-section #ep-stub'), { timeout: WAIT_MS });
+  const body = '<p id="ep-stub">roster stub</p>';
+
+  // Positive: a failed audit write shows exactly one banner; repeated failures keep one; the
+  // secret-reveal element outside the section survives a refresh; a later healthy refresh keeps it.
+  const rule = await stub(page, { method: 'GET', path: ROSTER, status: 200, contentType: 'text/html',
+    body, headers: { 'Sec-Audit-Failed': 'true' } });
+  await visit(page, '/settings');
+  await rosterShown();
+  await page.waitForSelector('#engine-principals-notices .failbox', { timeout: WAIT_MS });
+  await page.evaluate(() => { document.getElementById('engine-principal-reveal').textContent = 'reveal-sentinel'; });
+  await refresh();
+  await refresh();
+  const shown = await banners();
+  const reveal = await page.$eval('#engine-principal-reveal', (e) => e.textContent);
+  const nested = await page.$eval('#engine-principals-notices',
+    (e) => !e.closest('#engine-principals-section') && !e.closest('#engine-principal-reveal'));
+  check('#6749 a dropped roster audit row shows one alert banner with the Tokens and principals page sentence, '
+    + 'after three failed reads', shown.length === 1 && shown[0].role === 'alert' &&
+    shown[0].text === SENTENCE && rule.calls.length >= 3, JSON.stringify({ shown, calls: rule.calls.length }));
+  check('#6749 the banner sits outside the refreshing section and the reveal survives refreshes',
+    nested && reveal === 'reveal-sentinel', JSON.stringify({ nested, reveal }));
+  rule.headers = {};
+  await refresh();
+  check('#6749 a later healthy refresh keeps the banner (it is not auto-cleared) and still one',
+    (await banners()).length === 1);
+  await quiesce(page);
+  check('#6749 no console error, HTTP >= 400 or page error on the positive leg',
+    w.errors().length === 0, JSON.stringify(w.errors()));
+
+  // Negative control 1: a healthy read shows no banner.
+  clearStubs(page);
+  const healthy = await stub(page, { method: 'GET', path: ROSTER, status: 200, contentType: 'text/html', body });
+  await visit(page, '/settings');
+  await rosterShown();
+  await refresh();
+  check('#6749 control: a healthy roster read shows no banner', (await banners()).length === 0 &&
+    healthy.calls.length >= 2, JSON.stringify({ calls: healthy.calls.length }));
+  await quiesce(page);
+  check('#6749 control: no console error or HTTP >= 400 on the healthy leg', w.errors().length === 0,
+    JSON.stringify(w.errors()));
+
+  // Negative control 2: Sec-Audit-Failed on an UNRELATED fragment (200) and an unrelated 500 show
+  // no Engine Principals banner.
+  clearStubs(page);
+  w.reset();
+  await stub(page, { method: 'GET', path: ROSTER, status: 200, contentType: 'text/html', body });
+  const tokensRule = await stub(page, { method: 'GET', path: '/fragments/settings/tokens', status: 200,
+    contentType: 'text/html', body: '<p>t</p>', headers: { 'Sec-Audit-Failed': 'true' } });
+  const apiRule = await stub(page, { method: 'GET', path: '/fragments/settings/api-tokens', status: 500,
+    contentType: 'text/html', body: '<p>down</p>' });
+  await visit(page, '/settings');
+  await rosterShown();
+  await quiesce(page);
+  check('#6749 control: an unrelated fragment (audit-failed 200, or a 500) shows no Engine Principals banner',
+    (await banners()).length === 0 && w.pageErrors().length === 0 &&
+    tokensRule.calls.length >= 1 && apiRule.calls.length >= 1,
+    JSON.stringify({ banners: await banners(), pageErrors: w.pageErrors(),
+      tokensCalls: tokensRule.calls.length, apiCalls: apiRule.calls.length }));
+
+  // Negative control 3: the roster itself failing (403, with the header) is not a "data is still
+  // current" claim: no banner, the permission note instead.
+  clearStubs(page);
+  w.reset();
+  await stub(page, { method: 'GET', path: ROSTER, status: 403, contentType: 'text/html',
+    body: '<p>no</p>', headers: { 'Sec-Audit-Failed': 'true' } });
+  await visit(page, '/settings');
+  await page.waitForFunction(() => /EnginePrincipal:Read/.test(
+    document.getElementById('engine-principals-section').textContent), { timeout: WAIT_MS });
+  check('#6749 control: a 403 roster read with the header shows the permission note, no banner',
+    (await banners()).length === 0 && w.pageErrors().length === 0, JSON.stringify(w.pageErrors()));
 }
 
 // ---- selftest ------------------------------------------------------------------------
@@ -532,6 +621,7 @@ async function main() {
       ['ctrl-k', scenarioCtrlK],
       ['pki', scenarioPki],
       ['dex-apps', scenarioDexApps],
+      ['engine-audit', scenarioEngineAudit],
     ];
     for (const [name, fn] of scenarios) {
       const p = await browser.newPage();
