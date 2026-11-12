@@ -73,6 +73,14 @@
 
 set -euo pipefail
 
+# Bash 4+ required: cleanup() reads BASHPID (bash 4.0), which under `set -u` aborts the EXIT
+# trap on bash 3.2 (stock macOS /bin/bash) and would leave the stack and its database behind.
+# Refuse to start rather than run with no teardown (#7538).
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+    echo "integration-test.sh needs bash 4+ (got ${BASH_VERSION:-unknown}); on macOS install GNU bash (brew install bash)" >&2
+    exit 2
+fi
+
 # ── Defaults ──────────────────────────────────────────────────────────
 AGENT_COUNT=1
 USE_TLS=false
@@ -251,7 +259,7 @@ fi
 # colliders are the other callers of bind(0) (a concurrent job's own draw, any
 # listener on port 0, the Erlang VM's distribution listener); outbound connections
 # were measured not to collide on Linux (0 of 20,000). So the allocation alone cannot
-# be race-free. Under --free-ports this script therefore does four things:
+# be race-free. Under --free-ports this script therefore does five things:
 #   1. Shrinks the window. Everything that does not need a port (the gateway
 #      release build, the config inputs, the database, the enrolment token) runs
 #      BEFORE the allocation; ports are drawn immediately before the first start.
@@ -323,11 +331,13 @@ fi
 #     locally, longer on a cold debug build), and a gateway-side loss also restarts
 #     the server: the window the allocation leaves is not closed, only retried.
 #   - Detection when `ss` is absent (logged once; the ownership checks are skipped, so
-#     a lost WEB port (index 3) and a foreign listener are then NOT classified and the
-#     run fails with "no bind-failure evidence, not retried", and a bind failure that
-#     leaves no errno line and no exit is invisible). When `ss` cannot attribute a
+#     a lost WEB port (index 3) and a foreign listener are then NOT classified: a
+#     stranger that does not answer HTTP fails the start with "no bind-failure
+#     evidence, not retried", one that answers HTTP is not detected at start-up (the
+#     run fails later), and a bind failure that leaves no errno line and no exit is
+#     invisible). When `ss` cannot attribute a
 #     listener to a process, verify_stack_bound counts it as not foreign and logs it (it
-#     may be ours, hidden by ptrace_scope or a PID namespace), but a web-port stranger
+#     may be ours, hidden by a PID namespace or another user), but a web-port stranger
 #     that the server's own web line betrays IS retried (web_bind_lost: the server's
 #     listener has failed, so whatever holds the port is not it; #7538 G8-N19). A
 #     stranger that answers HTTP on another port of the stack is caught only by
@@ -350,20 +360,31 @@ fi
 #   4. TERM, INT and HUP run `exit 143/130/129` in EVERY mode (reuse included), so the work
 #      directory is kept after a signal. A handler runs only after the FOREGROUND command
 #      returns, so a long step delays the exit where the script used to die at once, and
-#      a SIGKILL sent during that wait runs no cleanup (G8-N08; CI's runner kills the tree
-#      at a step timeout, so the delay cannot defeat it).
+#      a SIGKILL sent during that wait runs no cleanup (in CI the runner signals the
+#      step's shell, not this script: the step ends when that shell exits, about 10 s
+#      after a timeout or cancel, and the orphaned script is SIGKILLed at job end without
+#      cleanup, so the delay cannot extend the step).
 #   5. The gateway release build runs BEFORE the server starts (it ran between them).
 #   6. Readiness is stricter: the server must answer HTTP on /readyz and the gateway on
 #      /healthz (any status, 30 s each), a wait stops early when its process exits, the
-#      budgets are monotonic time (/proc/uptime), and verify_stack_bound checks both
-#      processes are still alive.
+#      budgets are monotonic time (/proc/uptime on Linux; where there is no /proc, $SECONDS,
+#      which follows the wall clock, as macOS does) and also capped in iterations, and
+#      verify_stack_bound checks both processes are still alive.
 #   7. A failed start prints the server.log tail (40 lines) and the whole gateway.log, then
 #      "FAIL: stack start-up failed (fixed ports: ...)", exit 1 (before: wait_for_port's
 #      own line, and a log dump for the gateway only).
 #   8. ERL_CRASH_DUMP=$WORK_DIR/gateway.attemptN.crash (capped by ERL_CRASH_DUMP_BYTES) in
 #      every own-stack mode: the dump no longer lands next to the release, is deleted with
-#      WORK_DIR on a green run, and is not uploaded by CI.
+#      WORK_DIR on a green run, and is not uploaded by CI. The cap is 16 MiB (a dump is
+#      about 4.8 MB; a cap below ~1.1 MB cuts it off before its =proc section).
 #   9. `rm -f "$GW_SYS_CONFIG.orig"` before each sys.config write.
+#  10. cleanup() (every mode, reuse included) returns at once in a forked launch child
+#      (BASHPID != $$), and runs `trap '' TERM INT HUP` before it tears anything down, so
+#      a second signal cannot cut the teardown (and the DROP DATABASE) short.
+#  11. The script refuses to start on bash older than 4 (exit 2): the BASHPID guard above
+#      would otherwise abort the EXIT trap and leave the stack and its database behind.
+#  12. The two psql calls that create and drop this run's database set PGCONNECT_TIMEOUT=10,
+#      so an unanswering database host cannot stall the teardown for minutes.
 # TEST SEAM (never used by CI): YUZU_IT_PORT_HOG_INDEX=<0..7> makes attempt 1 find
 # a stranger listening on that port (index order is the FREE_LIST order below), to
 # prove the retry. It is read only under --free-ports, honoured on attempt 1 only,
@@ -375,23 +396,60 @@ fi
 # of anything that needs a running stack. Inputs from the script: `log`, FREE_PORTS,
 # USE_TLS, WORK_DIR, the SERVER_*/GATEWAY_* PID/STAMP/port variables, the GitHub
 # variables (GITHUB_ACTIONS, GITHUB_STEP_SUMMARY) and, for run_start_attempts, the
-# script's allocate/start/stop functions. It writes BIND_EVIDENCE, SS_ABSENT_LOGGED,
-# START_ATTEMPT and MAX_START_ATTEMPTS, and run_start_attempts can `exit 1`.
+# script's allocate/start/stop functions, the SERVER_*/GW_* port variables (GW_AGENT_PORT,
+# GW_METRICS_PORT, ...), YUZU_IT_PORT_HOG_INDEX (read by run_start_attempts) and, through
+# that, compute_port_derived and write_gateway_config. Globals written: BIND_EVIDENCE,
+# SS_ABSENT_LOGGED, START_ATTEMPT, MAX_START_ATTEMPTS, PROC_PPID/PROC_START (_proc_fields),
+# and the SERVER_*/GATEWAY_* PID and STAMP variables (cleared by stop_own_stack). It moves
+# or removes the per-attempt logs and crash dump in WORK_DIR, and stop_own_stack and
+# run_start_attempts can `exit 1`.
 # --- testable-helpers:begin ---
 
 # Where /proc is (a variable so the test can take it away).
 PROC_ROOT=/proc
 
-# mono_seconds: whole seconds from a monotonic source (/proc/uptime), $SECONDS where
-# there is none. $SECONDS follows the wall clock, so a clock step would make a wait
-# time out at once or run on for the step's length (#7538 G8-N13).
-mono_seconds() {
+# The clock for the wait budgets is chosen ONCE (mono_clock_choose, at start-up) and never
+# mixed: /proc/uptime is monotonic (a wall-clock step cannot make a wait time out at once
+# or run on for the step's length, #7538), $SECONDS follows the wall clock and is used only
+# where there is no /proc/uptime at all. Choosing per call would let one failed read compare
+# an uptime against $SECONDS.
+MONO_SRC=""
+mono_clock_choose() {
     local up=""
     if read -r up _ 2> /dev/null < "$PROC_ROOT/uptime" && [[ "${up%%.*}" =~ ^[0-9]+$ ]]; then
+        MONO_SRC=proc
+    else
+        MONO_SRC=secs
+    fi
+}
+
+# mono_seconds: whole seconds on the chosen clock. With the /proc/uptime clock a failed read
+# prints nothing and returns 1 (never a reading from the other clock).
+mono_seconds() {
+    local up=""
+    [[ -n "$MONO_SRC" ]] || mono_clock_choose
+    if [[ "$MONO_SRC" == proc ]]; then
+        read -r up _ 2> /dev/null < "$PROC_ROOT/uptime" || return 1
+        [[ "${up%%.*}" =~ ^[0-9]+$ ]] || return 1
         echo "${up%%.*}"
     else
         echo "$SECONDS"
     fi
+}
+
+# mono_since <start>: seconds since a mono_seconds reading ("?" and rc 1 when either is
+# unreadable). mono_expired <start> <timeout>: 0 when that many seconds have passed; an
+# unreadable clock is "not yet" (1), and the waits' iteration cap is the backstop.
+mono_since() {
+    local now
+    now="$(mono_seconds)" || { echo "?"; return 1; }
+    [[ "$1" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] || { echo "?"; return 1; }
+    echo $((now - $1))
+}
+mono_expired() {
+    local el
+    el="$(mono_since "$1")" || return 1
+    (( el >= $2 ))
 }
 
 # _proc_fields <pid>: PROC_PPID and PROC_START (field 4 and field 22 of /proc/<pid>/stat:
@@ -413,7 +471,7 @@ _proc_fields() {
 # _ps_stamp <pid>: `ps` start time ("" when gone or when ps fails). It follows the wall
 # clock and the time zone, so it is only the fallback where there is no /proc.
 _ps_stamp() {
-    ps -o lstart= -p "$1" 2> /dev/null | sed 's/^ *//; s/ *$//' || true
+    TZ=UTC0 ps -o lstart= -p "$1" 2> /dev/null | sed 's/^ *//; s/ *$//' || true
 }
 
 # proc_stamp <pid>: the process's identity token, captured at launch and compared before
@@ -512,7 +570,7 @@ bind_failure_in_log() {
 # port_foreign_listener <pid> <port> [unattributed-is-foreign]: 0 (and the `ss` row on
 # stdout) when a process other than <pid> listens on the port: any LISTEN row that names
 # a process and not <pid> (a same-user SO_REUSEPORT co-listener is a row of its own).
-# A row that names no process (`ss` cannot attribute it: ptrace_scope, another user's
+# A row that names no process (`ss` cannot attribute it: another user's process, a
 # non-dumpable process, a PID namespace) is NOT foreign, and is logged, unless the third
 # argument is "yes" (web_bind_lost). 1 when nothing listens, every row is ours, or `ss`
 # is absent (silent here: note_ss_availability logs that once).
@@ -664,7 +722,8 @@ stop_own_stack() {
 
 # verify_stack_bound: after both binders answered, the PIDs are alive and (under
 # --free-ports) neither log carries bind evidence and no port of the stack is
-# listened on by another process (a listener that shows no PID to ss is not counted).
+# listened on by another process (a listener that shows no PID to ss is not counted,
+# except on the web port after the server's own web-listener failure line: web_bind_lost).
 # 0 ok, 10 lost race, 1 a process is gone.
 verify_stack_bound() {
     local label pid port
@@ -770,6 +829,9 @@ run_start_attempts() {
     fi
 }
 # --- testable-helpers:end ---
+
+# Choose the wait-budget clock once, for the whole run (see mono_clock_choose).
+mono_clock_choose
 
 FREE_LIST=()
 PORT_HOG_PID=""
@@ -999,7 +1061,7 @@ cleanup() {
     fi
     # Drop this run's database (created below, salted per run).
     if [[ -n "$IT_DB" && -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
-        psql "$YUZU_TEST_POSTGRES_DSN" -qtAc "DROP DATABASE IF EXISTS \"$IT_DB\" WITH (FORCE);" \
+        PGCONNECT_TIMEOUT=10 psql "$YUZU_TEST_POSTGRES_DSN" -qtAc "DROP DATABASE IF EXISTS \"$IT_DB\" WITH (FORCE);" \
             > /dev/null 2>&1 || true
     fi
     # Clean temp dir. It is kept when YUZU_KEEP_WORK_DIR is set (debugging) and
@@ -1136,7 +1198,7 @@ if ! $REUSE_STACK; then
     # the prefix, so the test-database sweepers can reclaim one this run leaked
     # (SIGKILL, runner loss). Same naming as tests/shell/test_gateway_peer_boot_refusal.sh.
     IT_DB="yuzu_test_$(date +%s)_gwint_${RUN_SALT}"
-    if ! psql "$YUZU_TEST_POSTGRES_DSN" -v ON_ERROR_STOP=1 -qtAc "CREATE DATABASE \"$IT_DB\";" \
+    if ! PGCONNECT_TIMEOUT=10 psql "$YUZU_TEST_POSTGRES_DSN" -v ON_ERROR_STOP=1 -qtAc "CREATE DATABASE \"$IT_DB\";" \
             > /dev/null 2>&1; then
         IT_DB=""
         echo "FAIL: could not CREATE DATABASE on YUZU_TEST_POSTGRES_DSN" >&2
@@ -1191,26 +1253,28 @@ fi
 # wait_listening <port> <name> <pid> [timeout]: wait_for_port that also stops waiting
 # when the process that should bind the port has exited, and does not count a failure.
 # The budget is monotonic time (mono_seconds: /proc/uptime, immune to a wall-clock
-# step), not a count of sleeps. A TCP connect succeeds on a stranger's listener too, so this does not prove the port is ours (wait_http_answers
+# step) with an iteration cap as the backstop. A TCP connect succeeds on a stranger's listener too, so this does not prove the port is ours (wait_http_answers
 # and verify_stack_bound do the rest). `kill -0` sends no signal: on a recycled PID it
 # can only read "alive" and let the wait run to its timeout.
 # 0 listening, 1 timeout, 2 the process exited.
 wait_listening() {
     local port="$1" name="$2" pid="$3" timeout="${4:-15}"
-    local start
-    start="$(mono_seconds)"
+    local start iter=0
+    start="$(mono_seconds)" || start=""
     while ! port_open "$port"; do
         if ! kill -0 "$pid" 2>/dev/null; then
             echo "  ✗ $name: process $pid exited before port $port opened"
             return 2
         fi
         sleep 0.5
-        if [[ $(($(mono_seconds) - start)) -ge $timeout ]]; then
+        # The iteration cap is the backstop when the clock cannot be read (each pass
+        # sleeps 0.5 s, so the cap is never reached before the budget on a readable clock).
+        if mono_expired "$start" "$timeout" || (( ++iter >= timeout * 2 + 2 )); then
             echo "  ✗ $name did not start on port $port within ${timeout}s"
             return 1
         fi
     done
-    echo "  ✓ $name on :$port in $(($(mono_seconds) - start))s"
+    echo "  ✓ $name on :$port in $(mono_since "$start" || true)s"
     return 0
 }
 
@@ -1225,8 +1289,8 @@ wait_listening() {
 # monotonic time. 0 answered, 1 timeout.
 wait_http_answers() {
     local url="$1" name="$2" pid="$3" log_file="$4" timeout="${5:-15}" web_port="${6:-}"
-    local start code
-    start="$(mono_seconds)"
+    local start code iter=0
+    start="$(mono_seconds)" || start=""
     while true; do
         code="$(curl -s -o /dev/null --max-time 2 -w '%{http_code}' "$url" 2>/dev/null || true)"
         if [[ -n "$code" && "$code" != "000" ]]; then
@@ -1242,7 +1306,8 @@ wait_http_answers() {
             return 10
         fi
         sleep 0.5
-        if [[ $(($(mono_seconds) - start)) -ge $timeout ]]; then
+        # Backstop for an unreadable clock (a pass takes at least 0.5 s).
+        if mono_expired "$start" "$timeout" || (( ++iter >= timeout * 2 + 2 )); then
             echo "  ✗ $name not answering HTTP at $url within ${timeout}s"
             return 1
         fi
@@ -1408,8 +1473,8 @@ start_own_stack() {
     # The child clears the EXIT/TERM traps before it execs; $! is still the server's PID.
     # That line is belt and braces only: it cannot close the window between the fork and
     # bash's own reset of the child's traps, where a signal runs cleanup() in the child.
-    # cleanup()'s BASHPID guard closes that (#7538 K19). SIGINT is left as inherited
-    # (ignored by an async child), so `trap - INT` does not change the launched program.
+    # cleanup()'s BASHPID guard closes that (#7538 K19). SIGINT is deliberately not reset
+    # here: it stays as inherited (ignored by an async child), as for a bare `cmd &`.
     # shellcheck disable=SC2086
     ( trap - EXIT TERM; exec "$BUILDDIR/server/core/yuzu-server" "${SERVER_COMMON[@]}" \
         --listen "127.0.0.1:$SERVER_AGENT_PORT" \
@@ -1449,13 +1514,14 @@ start_own_stack() {
     # $! is the launcher's PID (`foreground` execs erlexec -> beam); the subshell execs, so
     # the PID is unchanged, and clears the traps first (see the server above).
     # ERL_CRASH_DUMP keeps a crash dump with the logs instead of overwriting
-    # gateway/_build/prod/rel/yuzu_gw/erl_crash.dump; ERL_CRASH_DUMP_BYTES caps it (a dump
-    # is ~4.8 MB, up to 3 per failed run, kept in WORK_DIR and not uploaded), and a retried
-    # attempt's dump is removed with its log rotation (G8-N21).
+    # gateway/_build/prod/rel/yuzu_gw/erl_crash.dump; ERL_CRASH_DUMP_BYTES caps it at
+    # 16 MiB (a dump is ~4.8 MB, and one cut off below ~1.1 MB loses its =proc section, so
+    # a small cap keeps a useless file). Only the last attempt's dump is kept, in WORK_DIR
+    # and not uploaded: a retried attempt's dump is removed with its log rotation.
     ( trap - EXIT TERM
       RELX_CONFIG_PATH="$GW_SYS_CONFIG" VMARGS_PATH="$GW_VM_ARGS" \
       ERL_CRASH_DUMP="$WORK_DIR/gateway.attempt${START_ATTEMPT}.crash" \
-      ERL_CRASH_DUMP_BYTES=1048576 \
+      ERL_CRASH_DUMP_BYTES=16777216 \
       exec "$GW_REL/bin/yuzu_gw" foreground \
         > "$WORK_DIR/gateway.log" 2>&1 ) &
     GATEWAY_PID=$!
@@ -1472,8 +1538,9 @@ start_own_stack() {
             || { start_failed $? "$WORK_DIR/gateway.log"; return $?; }
     fi
     # The health listener is the one the #7538 failure was on. An HTTP answer does not
-    # prove it is the gateway's (a stranger can answer too); verify_stack_bound below
-    # proves the ownership.
+    # prove it is the gateway's (a stranger can answer too); under --free-ports, where
+    # `ss` can attribute the listener, verify_stack_bound below proves the ownership;
+    # otherwise it checks liveness only (a gateway bind loss halts the beam).
     wait_http_answers "http://127.0.0.1:$GW_HEALTH_PORT/healthz" "Gateway health" "$GATEWAY_PID" \
         "$WORK_DIR/gateway.log" 30 \
         || { start_failed $? "$WORK_DIR/gateway.log"; return $?; }

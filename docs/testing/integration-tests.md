@@ -40,8 +40,8 @@ The script needs Postgres (`YUZU_TEST_POSTGRES_DSN`; it creates a uniquely named
 drops it on exit), `psql`, `openssl`, `curl`, `python3` (and `ps`, only where there is no `/proc`) and Erlang/OTP with `rebar3` (it
 builds the gateway release). `ss` (iproute2) is optional: under `--free-ports` it confirms that
 every port belongs to the process that should hold it, and without it that check is skipped (the
-script logs so once); without `ss` a lost web port is not retried (the run fails with "no
-bind-failure evidence"). `--free-ports` makes concurrent runs on one host safe, with one checkout per
+script logs so once); without `ss` a lost web port is not retried (a stranger that does not answer HTTP fails the start with "no
+bind-failure evidence", and one that answers HTTP is not detected at start-up: the run fails later). `--free-ports` makes concurrent runs on one host safe, with one checkout per
 concurrent run (the gateway release under `gateway/_build` is shared).
 
 If another process takes one of the drawn ports before the stack binds it, `--free-ports` retries

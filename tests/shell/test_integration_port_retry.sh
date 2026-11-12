@@ -40,6 +40,7 @@ track() {
     OWNED+=("$p:$(proc_stamp "$p")")
 }
 cleanup() {
+    [[ "$BASHPID" == "$$" ]] || return 0   # a forked fixture child never runs the test's teardown (UP-R2-1)
     local e p st
     for e in "${OWNED[@]+"${OWNED[@]}"}"; do
         p="${e%%:*}"; st="${e#*:}"
@@ -227,7 +228,7 @@ kill -0 "$stranger" 2>/dev/null && ok "... and the non-child is still alive" || 
 # A reaped child: its PID may be recycled by anyone, so it is never signalled.
 sleep 60 & gone=$!; track "$gone"
 gone_stamp="$(proc_stamp "$gone")"
-kill "$gone"; wait "$gone" 2>/dev/null || true
+kill -9 "$gone"; wait "$gone" 2>/dev/null || true
 expect 1 "a reaped child is not ours" is_own_child "$gone" "$gone_stamp"
 expect 1 "a reaped child with an empty stamp is gone, not unknown" is_own_child "$gone" ""
 signal_own KILL "$gone" "$gone_stamp" && bad "signalled a reaped child" || ok "a reaped child is not signalled"
@@ -265,7 +266,7 @@ expect 0 "ps fallback: an unchanged start time is ours" own_with real "$NOPROC_D
 expect 2 "ps fallback: a clock step is UNKNOWN, not foreign" own_with shift "$NOPROC_DIR" "$own" "$TZ_A"
 expect 2 "ps fallback: a failing ps is UNKNOWN, not foreign" own_with fail "$NOPROC_DIR" "$own" "$TZ_A"
 tz_rc=0; ( TZ=UTC-14 PROC_ROOT="$NOPROC_DIR" is_own_child "$own" "$TZ_A" ) || tz_rc=$?
-[[ "$tz_rc" -eq 2 ]] && ok "ps fallback: a time-zone change is UNKNOWN, not foreign" || bad "time-zone change: rc $tz_rc (expected 2)"
+[[ "$tz_rc" -eq 0 ]] && ok "ps fallback: a time-zone change does not move the stamp (_ps_stamp runs ps under TZ=UTC0)" || bad "time-zone change: rc $tz_rc (expected 0)"
 expect 2 "an unreadable /proc entry for a live pid is UNKNOWN" own_with real "$TMP/fakeproc" "$own" "$own_stamp"
 expect 1 "ps fallback: a reaped child is not ours" own_with real "$NOPROC_DIR" "$gone" "$TZ_A"
 ( export PATH="$TMP/psbin:$PATH" FAKE_PS_MODE=shift; PROC_ROOT="$NOPROC_DIR"; LOGF="$TMP/unk.log"; signal_own TERM "$own" "$TZ_A" ) \
@@ -344,7 +345,7 @@ echo "verify_stack_bound: dead pids, foreign listeners on each of the stack's po
 VSB="$TMP/vsb"; mkdir -p "$VSB"
 sleep 60 & vs_srv=$!; track "$vs_srv"
 sleep 60 & vs_gw=$!; track "$vs_gw"
-sleep 60 & vs_dead=$!; track "$vs_dead"; kill "$vs_dead"; wait "$vs_dead" 2>/dev/null || true
+sleep 60 & vs_dead=$!; track "$vs_dead"; kill -9 "$vs_dead"; wait "$vs_dead" 2>/dev/null || true
 WORK_DIR="$VSB"; USE_TLS=true; FREE_PORTS=true
 SERVER_AGENT_PORT=41001; SERVER_MGMT_PORT=41002; SERVER_GW_PORT=41003; SERVER_WEB_PORT=41004
 GW_AGENT_PORT=41005; GW_MGMT_PORT=41006; GW_METRICS_PORT=41007; GW_HEALTH_PORT=41008
@@ -493,16 +494,34 @@ done
 trap - EXIT
 grep -c child "$M" || true
 K19
+# k19sub.sh <script-with-cleanup>: runs cleanup() in a forked subshell (what a signal in
+# the fork->exec window does) and prints how many times it ran there: deterministic, no race.
+cat > "$TMP/k19sub.sh" <<'K19S'
+#!/usr/bin/env bash
+src="$1"; M="$TMP_K19/marks"; : > "$M"
+eval "$(awk '/^cleanup\(\) \{/{p=1} p{print} p&&/^}/{exit}' "$src")"
+log() { [[ "$1" == "Tearing down..." ]] || return 0; if [[ "$BASHPID" != "$$" ]]; then echo child >> "$M"; else echo parent >> "$M"; fi; }
+signal_own() { return 0; }
+REUSE_STACK=false; AGENT_PIDS=(); AGENT_STAMPS=(); GATEWAY_PID=""; GATEWAY_STAMP=""; SERVER_PID=""; SERVER_STAMP=""
+PORT_HOG_PID=""; PORT_HOG_STAMP=""; IT_DB=""; WORK_DIR=""
+sleep() { :; }
+( cleanup ) > /dev/null 2>&1 || true
+grep -c child "$M" || true
+K19S
 mkdir -p "$TMP/k19"
 k19_count() { TMP_K19="$TMP/k19" bash "$TMP/k19.sh" "$1" "$2" "$3" 2> /dev/null; }
 sed '/\[\[ "\$BASHPID" == "\$\$" \]\] || return 0/d' "$SCRIPT" > "$TMP/script_noguard.sh"
 if grep -q 'BASHPID' "$TMP/script_noguard.sh" && grep -qE '^\s*\[\[ "\$BASHPID" == "\$\$" \]\]' "$TMP/script_noguard.sh"; then
     bad "the no-guard control copy still has the guard"
 fi
-for sig in TERM HUP; do
+sub_base="$(TMP_K19="$TMP/k19" bash "$TMP/k19sub.sh" "$TMP/script_noguard.sh" 2> /dev/null)"
+[[ "$sub_base" -eq 1 ]] && ok "control: without the guard, cleanup() run in a forked subshell tears down there" || bad "control: no-guard cleanup() in a subshell left no mark ($sub_base)"
+sub_got="$(TMP_K19="$TMP/k19" bash "$TMP/k19sub.sh" "$SCRIPT" 2> /dev/null)"
+[[ "$sub_got" -eq 0 ]] && ok "with the guard: cleanup() in a forked subshell does nothing" || bad "with the guard: cleanup() in a subshell tore down ($sub_got)"
+# shellcheck disable=SC2043  # one signal on purpose: the HUP race was replaced by the deterministic subshell control above
+for sig in TERM; do
     base="$(k19_count "$TMP/script_noguard.sh" "$sig" 200)"
-    [[ "$base" -gt 0 ]] && ok "control: without the guard $base of 200 $sig launches ran cleanup() in the child (the harness sees the defect)" \
-        || bad "control: the harness saw no child cleanup without the guard ($sig)"
+    echo "  info control (not asserted: a scheduling race): without the guard $base of 200 $sig launches ran cleanup() in the child"
     got="$(k19_count "$SCRIPT" "$sig" 200)"
     [[ "$got" -eq 0 ]] && ok "with the guard: 0 of 200 $sig launches ran cleanup() in the child" || bad "$got of 200 $sig launches ran cleanup() in the child"
 done
@@ -513,6 +532,14 @@ m1="$(mono_seconds)"; sleep 1.1; m2="$(mono_seconds)"
 [[ "$m1" =~ ^[0-9]+$ && "$m2" =~ ^[0-9]+$ && "$m2" -gt "$m1" ]] && ok "mono_seconds is an integer that advances" || bad "mono_seconds: $m1 then $m2"
 m3="$(PROC_ROOT="$NOPROC_DIR" mono_seconds)"
 [[ "$m3" =~ ^[0-9]+$ ]] && ok "without /proc/uptime it falls back to an integer" || bad "mono_seconds fallback: $m3"
+# One clock, chosen once: after /proc/uptime was chosen, a failed read is a failure, never
+# a $SECONDS reading mixed into a budget that started on the uptime (#7538 G8-N13 follow-up).
+m4_rc=0; m4="$(MONO_SRC=""; mono_clock_choose; PROC_ROOT="$NOPROC_DIR"; mono_seconds)" || m4_rc=$?
+[[ "$m4_rc" -ne 0 && -z "$m4" ]] && ok "a failed /proc/uptime read after the clock was chosen prints nothing and fails (no clock mixing)" \
+    || bad "mono_seconds mixed clocks after a failed read (rc=$m4_rc out='$m4')"
+m5_rc=0; ( MONO_SRC=""; mono_clock_choose; PROC_ROOT="$NOPROC_DIR"; mono_expired "$m2" 1 ) || m5_rc=$?
+[[ "$m5_rc" -eq 1 ]] && ok "an unreadable clock is 'not expired yet' (the wait's iteration cap is the backstop)" \
+    || bad "mono_expired on a failed read returned $m5_rc, not 1"
 
 # ── 6. Lexical pins: the script uses what is tested ───────────────────
 echo "pins: the script wires the tested helpers"
