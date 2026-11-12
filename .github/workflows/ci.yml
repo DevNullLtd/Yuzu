@@ -2460,7 +2460,8 @@ jobs:
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           # Agent-only vcpkg profile (ADR-0035 step 3): no `server` feature
           # (libpq, xmlsec, drogon), plus `tests` for Catch2. Every Windows
-          # workflow on Wee Tam uses this profile, because they share one
+          # workflow uses this profile, because the workflows a Wee Tam runner
+          # picks up all reuse that runner's one persistent
           # vcpkg_installed/x64-windows tree; see docs/build-guide.md.
           "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
             --triplet x64-windows \
