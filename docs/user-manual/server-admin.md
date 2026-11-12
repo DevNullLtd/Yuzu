@@ -594,7 +594,7 @@ on an existing server (see the InstructionStore note in [`upgrading.md`](upgradi
 unaffected. Editing the definition (dashboard YAML editor or `PUT /api/instructions/{id}`) to declare the two
 new columns is optional and cosmetic.
 
-**Before upgrading, check whether this affects you.** Search your scripts, SIEM parsers and saved exports for
+**Check your consumers.** Search your scripts, SIEM parsers and saved exports for
 consumers of `installed_apps`/`crossplatform.software.inventory` output and change any fixed five-field
 pattern to `app|name|version|publisher|install_date[|install_location|bundle_id]`.
 
@@ -1409,9 +1409,9 @@ across both.
 
 **What changed.** This release adds a partial unique index, `scim_resources_external_id_uniq ON scim_resources (external_id) WHERE external_id IS NOT NULL`, applied by the `ScimStore` migration that runs at construction — **unconditionally, regardless of whether `--scim-enable` is set**. Postgres itself detects any pre-existing duplicate non-empty `external_id` and raises a `unique_violation`, which fails the migration; `ScimStore` then reports `!is_open()` and the server refuses to start, the same fail-closed posture every born-on-PG store uses on a failed migration. This is deliberate, not a bug to work around: a duplicate `externalId` is exactly the mis-link hazard ADR-2001's SCIM↔OIDC token-revoke linkage exists to prevent (a duplicate would let link formation pick a SCIM resource arbitrarily and revoke — or fail to revoke — the wrong principal's tokens), so the index is a **stronger** posture than what shipped before, not a regression to relax.
 
-**Who this affects.** Any deployment with existing SCIM data (has ever run `--scim-enable`, even if it isn't set on this upgrade) where two or more `scim_resources` rows share the same non-empty `external_id` — most likely from an IdP connector bug, a manual data-fix gone wrong, or a resource re-provisioned under a new SCIM `id` without the old row ever being cleaned up.
+**Who this affects.** A supported deployment starts from a fresh database (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)), where this migration runs over empty tables and cannot fail. The note applies only to a development or UAT database whose `scim_store` schema was built before this migration and that holds SCIM data (the server has run with `--scim-enable` at some point, even if it is not set now), where two or more `scim_resources` rows share the same non-empty `external_id`, most likely from an IdP connector bug, a manual data-fix gone wrong, or a resource re-provisioned under a new SCIM `id` without the old row ever being cleaned up.
 
-**Before upgrading, run this against your existing database to check:**
+**To check a database for duplicates before the migration runs, use this query:**
 
 ```sql
 SELECT external_id, COUNT(*) FROM scim_store.scim_resources
@@ -1420,7 +1420,7 @@ GROUP BY external_id
 HAVING COUNT(*) > 1;
 ```
 
-**If it returns any rows,** the upgrade will fail to boot until you resolve the duplicates first — deactivate or delete the stale/incorrect row(s) for each `external_id` this query surfaces (keep whichever row is the IdP's actual current resource), then re-run the query until it returns nothing. If it returns no rows, this note does not affect you and the migration applies silently on next boot.
+**If it returns any rows,** the migration fails and the server will not boot until you resolve the duplicates first: deactivate or delete the stale/incorrect row(s) for each `external_id` this query surfaces (keep whichever row is the IdP's actual current resource), then re-run the query until it returns nothing. If it returns no rows, this note does not affect you and the migration applies silently on boot.
 
 ### vNEXT — pre-auth request-body caps now apply to (almost) every route, not just `/mcp/` (#2407) (breaking)
 
@@ -1456,7 +1456,7 @@ go-cohort includes a device outside the role's `Execution:Execute` scope will no
 that device (visible as `skipped` in the deployment's device list) instead of executing on it.
 A role with a global `Execution:Execute` grant sees no change.
 
-**Before upgrading, check for any role combining a scoped `Execution:Execute` grant with
+**Check for any role combining a scoped `Execution:Execute` grant with
 `SoftwareDeployment:Execute`** — that combination is the only one affected. If none of your
 deployment-triggering roles hold a scoped (rather than global) `Execution:Execute` grant, this
 note does not affect you.
@@ -1804,7 +1804,7 @@ update, so an existing `mcp.`-prefixed definition cannot be edited there if its 
 declares `metadata.id` (one that omits it still saves, since the validator only checks a
 declared id).
 
-**What to do.** Before upgrading, check for affected content. Query the instruction database
+**What to do.** Check for affected content. Query the instruction database
 directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
 definitions, and the shipped content alone exceeds that, so an API-based check can report a
 false all-clear. Use a case-sensitive glob-style match — Postgres `LIKE` is case-sensitive by
@@ -1818,10 +1818,10 @@ psql "$YUZU_POSTGRES_DSN" -c \
   "SELECT id FROM instruction_store.instruction_definitions WHERE id ~ '^mcp\.';"
 ```
 
-Any id listed keeps executing after the upgrade and can still be edited through
+Any id listed keeps executing and can still be edited through
 `PUT /api/instructions/{id}`, but re-importing an export of it will fail, and so will saving it
 from the dashboard's YAML editor (that path validates the id on every save, not only on
-create). Rename those definitions before upgrading — create a replacement under a different id
+create). Rename those definitions: create a replacement under a different id
 and delete the original.
 
 ### vNEXT: the `guardian.` instruction-definition id prefix is reserved (#6062) (breaking)
@@ -1856,7 +1856,7 @@ same validation on every save, create or update: an existing `guardian.`-prefixe
 cannot be edited there if its document declares `metadata.id` (a document that omits it still
 saves). Re-importing an export of such a definition also fails.
 
-**What to do.** Before upgrading, look for affected ids. Query the instruction database directly
+**What to do.** Look for affected ids. Query the instruction database directly
 rather than the REST list route: `GET /api/v1/definitions` caps its result at 100 definitions
 and the shipped content alone exceeds that, so an API-based check can report a false all-clear.
 The query is read-only and case-sensitive, matching the reservation:
@@ -1929,7 +1929,7 @@ and the threshold of 3 are tentative and have not been tuned against fleet data.
   address it connects to (for example `http://localhost:8080`; `https://localhost:8443` when the server terminates TLS itself, where an `http://` origin is refused). Direct access needs a local sign-in:
   a deployment that offers only OIDC or SAML sign-in redirects to the public URL, so for those only
   restarting with the flag works.
-- The check cannot be disabled: the remedies are the flag, an API token or rolling back.
+- The check cannot be disabled: the remedies are the flag or an API token.
 - An `Origin: null` request cannot be fixed by configuration: the reserved token `null` is refused as
   an entry, and `Referer` is not consulted once `Origin` is present.
 
