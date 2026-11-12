@@ -1513,8 +1513,8 @@ column that already exists.
   does not read `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it,
   and it redeems without comparing the frozen request. The change that first creates a bound ticket
   (#6063) must not do so until every replica runs a build that includes this migration. Until it
-  does, a row with a non-empty `request_json` is not expected to exist; if you find one, the database
-  is outside the Deployment contract.
+  does, a row with a non-empty `request_json` is not expected to exist; if you find one before #6063 ships, the
+  database was written outside the "Deployment contract (hard cutover)"; do not run an earlier build against it.
 
 **3. A new audit action and metric: `approval.precondition_denied` and
 `yuzu_approval_precondition_denied_total{origin}`.** When an approved ticket is refused at
@@ -2141,7 +2141,8 @@ separate scheduled-approval change (#6096, below) adds a data-only approvals ste
   that boots at the same time waits on the migration advisory lock under the pool's default lock and statement
   timeouts and may fail its boot closed; restarting it recovers, because the migration is then applied. The
   recommendation is to start ONE replica, wait for it to finish migrating, then start the others. These are not
-  measured numbers. A fresh database has no large outbox to build the index over.
+  measured numbers. A fresh database has no large outbox, so the 300 s index build is not a concern there; the
+  concurrent-boot wait still applies.
 - **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
   `approval_manager.approvals`. It is readable only by SQL; no API returns it. Tickets the outbox showed had already
   been used by an earlier occurrence carry the related marker `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`;
@@ -2153,7 +2154,7 @@ separate scheduled-approval change (#6096, below) adds a data-only approvals ste
   WHERE consumed_by = 'schedule:legacy-6096';
   ```
 - **Mixed builds for scheduled approvals (#6096).** Running this build beside an earlier one, or returning to an
-  earlier one, is outside the Deployment contract and not supported. For what an older binary does: it does not
+  earlier one, is outside the "Deployment contract (hard cutover)" and not supported. For what an older binary does: it does not
   consult the outbox ledger or the used marker, so it can re-fire a ticket this build marked used (the old clock
   comparison). This build records in the command outbox which approval ticket each scheduled run used, and refuses
   to fire a ticket the outbox shows was already used by an earlier occurrence. No repair statement is provided for
@@ -9227,9 +9228,10 @@ The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocat
 ## Rollback
 
 A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this
-page, and this page documents no rollback procedure: an earlier binary cannot read a newer schema, and restoring
-backed-up database files is not a supported path. If a deployment misbehaves, stop it, deploy a fresh database on a
-known-good build and re-provision.
+page, and this page documents no rollback procedure. Recovery is to roll forward on the build that wrote the
+database, or to restore a backup taken from this deployment into a fresh deployment (see "Backup recommendation" in [Server Administration](server-admin.md));
+a database or backup written by an earlier build is unsupported. Whether an earlier binary works against a newer
+schema depends on the migration (see "When a server build finds its database ahead of it").
 
 ## Troubleshooting
 
