@@ -2665,7 +2665,8 @@ jobs:
       # concurrent job's live key on the shared box, or the nightly windows-asan leg's unscoped keys. It REPORTS and
       # never deletes: a leftover can be a registry link, and every tree delete follows links (the plugin's own rule),
       # so removal is left to a human. The scan is scripts/ci/check-registry-test-leftovers.ps1, whose two decisions the
-      # self-test step before the suite proves on every run.
+      # self-test step before the suite proves on every run (for a bam root the runner account is refused under, only
+      # that the script still lists the root).
       - name: Assert this job left no YuzuTest-* registry keys behind
         if: success() || failure()
         shell: pwsh
