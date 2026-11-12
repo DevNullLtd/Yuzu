@@ -3,7 +3,10 @@
 #include "authz_model.hpp"
 #include "execution_tracker.hpp"
 
+#include <yuzu/server/auth.hpp>
+
 #include <string>
+#include <utility>
 #include <vector>
 
 /// @file execution_scope_rules.hpp
@@ -23,6 +26,77 @@
 /// from "read failed" and must not be asked to.
 
 namespace yuzu::server {
+
+/// The OWNERSHIP key for execution visibility (#5557): the identity an ownership-based admission
+/// decision compares against `Execution::dispatched_by`. It is derived from a session by
+/// `execution_owner_key()` below and by nothing else, so a service-scoped credential's minting
+/// account can never be handed to an ownership compare by habit.
+///
+/// What it is NOT: an authorization gate. It never engages, widens or narrows a scope. Under an
+/// UNRESTRICTED scope (`nullopt` from the fleet-read gate) every execution is visible whatever
+/// the key is; an empty key only removes the owner disjunct from an ENGAGED scope.
+///
+/// The key is opaque on purpose: it is constructible only from a session (the private
+/// constructor), so `ExecutionOwnerKey{some_string}` and implicit conversion from a string do not
+/// compile. This header is its only definition site.
+class ExecutionOwnerKey {
+public:
+    /// The default key owns nothing.
+    ExecutionOwnerKey() = default;
+
+    /// True when `exec` was dispatched by the key's principal. An empty key owns nothing, so an
+    /// unresolved or empty identity never matches an empty `dispatched_by`.
+    [[nodiscard]] bool owns(const Execution& e) const {
+        return !key_.empty() && e.dispatched_by == key_;
+    }
+
+    /// True when the key owns nothing (service-scoped session or empty username).
+    [[nodiscard]] bool empty() const { return key_.empty(); }
+
+private:
+    explicit ExecutionOwnerKey(std::string key) : key_(std::move(key)) {}
+    friend ExecutionOwnerKey execution_owner_key(const auth::Session&);
+    friend ExecutionScope confined_list_scope(const ExecutionOwnerKey&, const authz::VisibleSet&);
+
+    std::string key_;
+};
+
+/// The ownership key for `s`. Empty (owns nothing) for a service-scoped session, whose `username`
+/// is the MINTING account rather than the credential, and for an empty username; otherwise the
+/// session's own `username`.
+///
+/// Session classes (the service scope decides, not the credential tier):
+///   - cookie, local, OIDC, SAML human, and an API token without a service scope: `username`.
+///   - an MCP-tier token without a service scope: `username`. A tier caps OPERATIONS, not data
+///     scope, so this is deliberate; do not "fix" it.
+///   - an engine principal: `username` (its own principal). A corrupted engine row that also
+///     carries a service scope gets the empty key, because the service scope is tested first.
+///   - any session with a non-empty `token_scope_service`: empty.
+///
+/// A VISIBILITY key only. Audit rows, `dispatched_by` on writes, stream budgets and mutation
+/// attribution keep using `session.username` (the real principal); the empty-username guards in
+/// the handlers also stay on the raw `session.username`, never on `key.empty()`.
+[[nodiscard]] inline ExecutionOwnerKey execution_owner_key(const auth::Session& s) {
+    if (!s.token_scope_service.empty() || s.username.empty())
+        return {};
+    return ExecutionOwnerKey{s.username};
+}
+
+/// The SQL admission scope for a LIST or CHILDREN read: `nullopt` (unrestricted, no pushdown)
+/// when `scope` is unrestricted, otherwise the engaged scope carrying `owner`'s key and the
+/// visible agents. An empty key plus an empty agent set is "visible to nobody" (the tracker's
+/// engaged-empty convention), never "no filter". The ONLY production constructor of an engaged
+/// `ExecutionListScope`: it is a plain data type, so a route that fills `owner` itself bypasses
+/// the key. Pass the result straight to `query_executions_checked` / `get_children_checked`.
+[[nodiscard]] inline ExecutionScope confined_list_scope(const ExecutionOwnerKey& owner,
+                                                        const authz::VisibleSet& scope) {
+    if (!scope)
+        return std::nullopt;
+    ExecutionListScope out;
+    out.owner = owner.key_;
+    out.visible_agents.assign(scope->begin(), scope->end());
+    return out;
+}
 
 /// Is `exec` visible to a caller whose fleet-read scope is `scope`? Mirrors
 /// the #1634 `rest_api_v1.cpp` detail-route logic (`owns_execution ||
@@ -49,6 +123,23 @@ namespace yuzu::server {
     // first visible agent falls, a residual timing side-channel on the
     // admit path (cpp-expert, #3789 Gate 3).
     bool visible = !username.empty() && exec.dispatched_by == username;
+    for (const auto& a : statuses)
+        visible = authz::in_scope(scope, a.agent_id) || visible;
+    return visible;
+}
+
+/// `execution_visible` keyed on an `ExecutionOwnerKey` instead of a raw username: the ownership
+/// disjunct is `owner.owns(exec)`, so a service-scoped session's minting account can never reach
+/// the compare. Same full-scan, no-early-exit shape as the string overload above. The key never
+/// constrains an UNRESTRICTED scope: `!scope` is visible whatever the key is. The string overload
+/// is removed once every call site takes the key.
+[[nodiscard]] inline bool execution_visible(const Execution& exec,
+                                            const std::vector<AgentExecStatus>& statuses,
+                                            const authz::VisibleSet& scope,
+                                            const ExecutionOwnerKey& owner) {
+    if (!scope)
+        return true;
+    bool visible = owner.owns(exec);
     for (const auto& a : statuses)
         visible = authz::in_scope(scope, a.agent_id) || visible;
     return visible;
@@ -128,6 +219,24 @@ confined_projection(const std::vector<AgentExecStatus>& statuses, const authz::V
         return false;
     // Full scan, no early exit — same rationale as `execution_visible`
     // above (cpp-expert NICE, folded in for consistency, #3789 Gate 3).
+    bool all_in_scope = true;
+    for (const auto& a : statuses)
+        all_in_scope = authz::in_scope(scope, a.agent_id) && all_in_scope;
+    return all_in_scope;
+}
+
+/// `admit_confined_mutation` keyed on an `ExecutionOwnerKey`: the zero-status-row dispatcher
+/// window admits `owner.owns(exec)` only, and an empty key (a service-scoped session) never
+/// satisfies it. Rule and full-scan shape identical to the string overload above, which is
+/// removed once every call site takes the key.
+[[nodiscard]] inline bool admit_confined_mutation(const Execution& exec,
+                                                  const std::vector<AgentExecStatus>& statuses,
+                                                  const authz::VisibleSet& scope,
+                                                  const ExecutionOwnerKey& owner) {
+    if (statuses.empty())
+        return owner.owns(exec);
+    if (static_cast<int>(statuses.size()) != exec.agents_targeted)
+        return false;
     bool all_in_scope = true;
     for (const auto& a : statuses)
         all_in_scope = authz::in_scope(scope, a.agent_id) && all_in_scope;
