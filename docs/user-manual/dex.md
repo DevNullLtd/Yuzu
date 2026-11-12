@@ -97,9 +97,11 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   to arm, or a channel went deaf) or **not reporting**. A device counts as not reporting when it
   sends no observer state: the agent runs with `--dex-disable` (`YUZU_AGENT_DEX_DISABLE`), it is on a
   build with no observer, or the server has no recent heartbeat for it (older than 90 seconds); these
-  cases cannot be told apart. When any device is not armed or not reporting, the caption adds that
-  such a device may not be sending all of its crash and hang signals (collection can be incomplete
-  or unavailable), so a quiet list does not cover it. The counts come
+  cases cannot be told apart. Armed means the device's observer is running with at least one source;
+  it does not confirm that every crash source on the device is readable. When any device is not
+  armed or not reporting, the caption adds that such a device may not be sending all of its crash
+  and hang signals (collection can be incomplete or unavailable), so a quiet list does not cover
+  it. The counts come
   from the same snapshot the population is counted from, so the rows add up to the population
   (under All: Windows, Linux, macOS and Other platforms, the last for any operating system the server
   does not recognise). When no observer source is wired the caption has no `Observers now` sentence
@@ -159,18 +161,21 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   refused is not a failure: the page scores under the shipped defaults and a warning names why. A
   healthy read with nothing recorded says `Nothing recorded`, and on a platform whose crash
   sources are partial that an empty list is not proof of stability.
-- **Marked characters.** An application, process, version, module, cohort or device name that
-  contains a bidirectional control or a zero-width character prints that character as visible text,
-  `<U+202E>` for example, instead of acting on it, so two names that differ only by an invisible
-  character never look identical, and a right-to-left override cannot reverse the text around it.
+- **Marked characters.** An application, process, version, module, cohort, management group or
+  device name that contains a bidirectional control or a zero-width character prints that character
+  as visible text, `<U+202E>` for example, instead of acting on it, so two names that differ only
+  by an invisible character never look identical, and a right-to-left override cannot reverse the
+  text around it.
   The set is exactly U+061C, U+200B to U+200F, U+202A to U+202E, U+2060 to U+2064, U+2066 to U+2069 and
   U+FEFF. Ordinary spaces (U+00A0, U+2000 to U+200A, U+2028, U+2029, U+3000) are not marked. A name is
   marked, never stripped. Only text the page prints is marked: tooltips, the application search box
-  and the values of the filter and cohort drop-downs keep the exact bytes, because the browser sends
+  and the values of the filter, scope and cohort drop-downs keep the exact bytes, because the browser sends
   them back and a marker there would stop the filter matching its own entry. A legitimate zero-width
-  joiner (an emoji sequence, Persian text) also prints as a marker. This covers the DEX pages only
-  (Overview, Apps, Catalogue and its drill-downs, Performance, App Performance, the app and device
-  drill-downs); the device, inventory, software and Echo pages do not mark these characters yet.
+  joiner (an emoji sequence, Persian text) also prints as a marker. A management group's name is
+  marked in the App Performance Scope selector and in the page subtitle. This covers the DEX pages
+  only (Overview, Apps, Catalogue and its drill-downs, Performance, App Performance, the app and
+  device drill-downs); the Network tab (the cohort and device names it prints), the device,
+  inventory, software and Echo pages do not mark these characters yet.
 
 The page reads from the shared Apps model, not from the Overview's top-apps aggregation, and
 adds no agent collection. The app detail page cross-links to per-version CPU & memory

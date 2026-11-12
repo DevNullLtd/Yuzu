@@ -103,11 +103,11 @@ This SQL is unsupported and is not recorded in the in-product audit log, so reco
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build. A replica on an earlier build keeps the earlier behaviour, which is outside the deployment contract; this page does not describe it as supported, and it is not a procedure for a rolling or mixed-version upgrade.
 
-## Behaviour change: HEAD on a dynamic route is answered 405 with `Allow: GET`
+## ⚠️ Breaking: HEAD on a dynamic route is answered 405 with `Allow: GET`
 
 **What changed.** Every authenticated dynamic route (`/api/v1/`, the dashboard pages and fragments, `/metrics`) answers `HEAD` with `405 Method Not Allowed` and `Allow: GET`, and the handler is not run. Before, `HEAD` ran the whole handler and discarded the body. The paths that still answer `HEAD` are the four health probes (`/livez`, `/readyz`, `/health`, `/api/health`), static assets, the sign-in pages, the sign-in start and callback GET routes (`/auth/oidc/start`, `/auth/callback`, `/auth/saml/start`), the SCIM GET routes (`/scim/v2/`), and the public CA files (`/api/v1/ca/root`, `/api/v1/ca/crl`); they ride the same unauthenticated-path set as the sign-in pages. A route in that set that accepts only `POST` (`/saml/acs`, the `/login` form posts) has no `HEAD` handler and does not gain one. The `Allow` header names `GET` only, even on a path that also accepts writes. Brotli-encoded dynamic responses are now produced at quality 5 instead of the library's maximum (11), so a very large page is about 25 percent larger on the wire and about 250 times cheaper for the server (a 2.5 MB page: about 9 ms of one worker instead of about 2.5 s).
 
-**Action.** An external monitor or load balancer health check that sends `HEAD` to an authenticated route must send `GET` instead (or use `/health`). Nothing else changes: `GET` responses are the same bytes, compressed or not.
+**Before you upgrade.** Find anything that sends `HEAD` to a route that is not one of the paths listed above as still answering it, and switch it to `GET`, or to a probe path (`/livez`, `/readyz`, `/health`, `/api/health`) where all it needs is liveness: uptime and load balancer health checks, monitoring and synthetic checks, scripts, `curl -I` and `wget --spider` against a dashboard page, an API route or `/metrics`. After the upgrade such a check reads `405` and no longer proves the page or the API works. Nothing else changes: `GET` responses are the same bytes, compressed or not.
 
 ## Behaviour change: the DEX Apps payload gains `observer_state`, `policy.interval_confidence` and `score.tier`
 

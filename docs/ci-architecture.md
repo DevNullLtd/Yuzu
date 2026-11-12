@@ -332,9 +332,11 @@ code.
 
 ### Browser smoke (`/test` Phase 5, `tests/puppeteer/ui-smoke.mjs`)
 
-A local gate in `/test`, not a CI job. It drives a headless browser against the running
-dashboard: it crawls every route the shell nav links to (200, the `Content-Security-Policy`
-header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
+A gate in two parts. The live scenarios run from `/test` only: they need a running dashboard, so they
+are not a required CI job. The selftest pair also runs in CI, in the path-filtered, non-required
+`ui-smoke-selftest` workflow (`.github/workflows/ui-smoke-selftest.yml`, described below). In `/test`
+the gate drives a headless browser against the running dashboard: it crawls every route the shell nav
+links to (200, the `Content-Security-Policy` header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
 discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
 directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
 and runs seven scenarios (four that each force their own precondition, with writes answered by a
