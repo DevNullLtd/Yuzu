@@ -49,6 +49,7 @@ Each check is also run against a mutated copy of the sources and must fail
 there, so a check that stops matching anything cannot pass silently.
 """
 
+import os
 import re
 import shutil
 import subprocess
@@ -384,7 +385,7 @@ class ReleaseAgentOnly(unittest.TestCase):
 
 try:
     import yaml
-except ImportError:  # the docs-lint job installs no PyYAML; the behavioural test then skips
+except ImportError:  # without PyYAML the behavioural test skips (docs-lint requires it: YUZU_REQUIRE_PWSH_TEST)
     yaml = None
 
 
@@ -453,6 +454,20 @@ REFUSAL_CASES = (
     ("ecpg and pgtypes", ("bin/libecpg.dll", "bin/libpgtypes.dll"),
      ["libecpg.dll", "libpgtypes.dll"]),
 )
+
+
+# YUZU_REQUIRE_PWSH_TEST=1 (set by docs-lint.yml, whose ubuntu-24.04 runner
+# ships PowerShell and the system PyYAML) turns a missing prerequisite into a
+# failure, so the behavioural check cannot go silently green in CI.
+_REQUIRE_PWSH = os.environ.get("YUZU_REQUIRE_PWSH_TEST") == "1"
+
+
+class _PrereqCheck(unittest.TestCase):
+    def test_behavioural_prerequisites_present_when_required(self):
+        if not _REQUIRE_PWSH:
+            self.skipTest("YUZU_REQUIRE_PWSH_TEST is not set")
+        self.assertIsNotNone(yaml, "YUZU_REQUIRE_PWSH_TEST=1 but PyYAML is not importable")
+        self.assertTrue(find_pwsh(), "YUZU_REQUIRE_PWSH_TEST=1 but no working pwsh on PATH")
 
 
 @unittest.skipUnless(yaml is not None, "PyYAML not installed")

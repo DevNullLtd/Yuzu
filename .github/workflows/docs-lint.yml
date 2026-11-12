@@ -279,6 +279,10 @@ jobs:
       # check-release-artifacts.sh and build-agent-bundle.sh. Mutation-tests
       # itself. Stdlib only.
       - name: Agent-only release lint
+        env:
+          # The runner image ships pwsh and the system PyYAML: require them so
+          # the behavioural server-DLL refusal test cannot skip silently.
+          YUZU_REQUIRE_PWSH_TEST: '1'
         run: python3 -I tests/test_release_agent_only.py
 
       # The `server` feature option (ADR-0035 ladder step 3): lexical pins on
