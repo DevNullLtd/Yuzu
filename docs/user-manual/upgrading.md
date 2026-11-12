@@ -468,7 +468,7 @@ Not covered by this change, among others: `POST /api/command`, MCP `execute_inst
 
 **Who is affected.** SIEM rules that match `user.role_change` with result `denied` or detail `user_not_found` and were (unknowingly) counting outages; scripts that treat a `404` from the role route as permanent; IdP connectors that treated the old `200` as success.
 
-**What to do.** Retry on `503`. Add `store_unavailable` to any `failure` rule on these actions. The one `503` not to retry is the sticky one an enrolled administrator can get on the role route right after the MFA factor-binding cutover: its error envelope has `retry_after_ms: null` (a transient step-up 503 has `5000`; neither sets a `Retry-After` header), it is audited as `mfa.step_up.required` (not `user.role_change`) with `reason=mfa_proof_unavailable`, and clears only after `yuzu-server --mfa-reset <user>` (see "Breaking: MFA proofs are bound to the factor they were earned with" below). See the SCIM guide, "When the user store cannot answer a deactivation", for what the SCIM change does not cover. The `404` that a store error in the provenance or role read could still produce when deactivating a resource whose mirror reads active was closed afterwards (#6836, next entry).
+**What to do.** Retry on `503`. Add `store_unavailable` to any `failure` rule on these actions. The one `503` not to retry is the sticky one an enrolled administrator can get on the role route when the account reads factor generation `0` (only a database an earlier build wrote holds one, which is unsupported): its error envelope has `retry_after_ms: null` (a transient step-up 503 has `5000`; neither sets a `Retry-After` header), it is audited as `mfa.step_up.required` (not `user.role_change`) with `reason=mfa_proof_unavailable`, and clears only after `yuzu-server --mfa-reset <user>` (see "Breaking: MFA proofs are bound to the factor they were earned with" below). See the SCIM guide, "When the user store cannot answer a deactivation", for what the SCIM change does not cover. The `404` that a store error in the provenance or role read could still produce when deactivating a resource whose mirror reads active was closed afterwards (#6836, next entry).
 
 ## ⚠️ Breaking: a user-store fault in a SCIM provenance or role check is now a retryable 503, not a 404 (#6836)
 
@@ -1222,8 +1222,8 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   `503` still carries `meta.mfa_step_up_required: true` (the binding refusals that carry a `reason` carry `false`; see the MFA factor-binding cutover section below), with no `challenge_url`, and writes an
   `mfa.step_up.required` audit row whose `detail` names the cause (an unexpected failure inside the
   check itself, or a session that could not be fingerprinted, is recorded as
-  `reason=chokepoint_exception`). Retry; re-proving cannot help. A client
-  must treat a `503` as "retry shortly" and prompt for a code only on a `401`. See the
+  `reason=chokepoint_exception`). Re-proving cannot help. A client
+  must treat a `503` as "retry shortly" only while `error.retry_after_ms` is a number (`5000`), stop on `null`, and prompt for a code only on a `401`. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
   The new alert `YuzuStepUpGateUnavailable` fires on it.
 - **SAML sessions cannot satisfy step-up in this release.** They receive `403` on all 41 routes (reason
@@ -1378,8 +1378,8 @@ the session store it uses to end the account's sessions the same way.
   whether the cause is permanent; the REST envelope of the central check carries `retry_after_ms`: `5000` for a
   failed read (a retry may clear it), `null` when there is no hint (a refusal only an administrator repairs, or one this
   gate cannot tell from a transient one). The MCP rendering is implemented and tested, but no MCP tool is step-up gated
-  yet. A client that retries on `503` must stop on `null`. It is persistent for a pre-cutover (generation 0) account, which is the expected
-  cause right after the cutover (the query under "If an enrolled account reads generation `0`" above lists it; an administrator then runs
+  yet. A client that retries on `503` must stop on `null`. It is persistent for an enrolled account whose factor generation is not positive (only a database an earlier build
+  wrote holds one, which is unsupported; the query under "If an enrolled account reads generation `0`" above lists it; an administrator then runs
   `yuzu-server --mfa-reset <user>` on the host, after checking that the account reads `mfa_factor_gen <= 0`, see the
   runbook) and for a binding trigger that is not in force (`reason=mfa_binding_unenforced` for the account store;
   restore the auth store's MFA binding triggers and restart the server; this gate cannot tell a trigger seen not in force from a validation that could not run, so it answers `null` for both, and the cause may still clear by itself). It is transient for a failed read, an inconclusive trigger validation (the `binding_inconclusive` latch,
@@ -1893,7 +1893,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
     approver, an MFA-store fault at the approver's own read: with the step-up window at `0` or negative, or a fault
     between the central check's read and that one; or a binding condition), the answer is `503` with `retry_after_ms: 5000` for the transient causes, and with **no** `retry_after_ms` for the three persistent ones, which no retry clears until an operator repairs them (the account-store binding trigger observed not in force, `mfa_binding_unenforced`; the session store's rebind guard latched not in force, `mfa_proof_unavailable`; and an enrolled account whose factor generation is not positive, `mfa_proof_unavailable`), counted as
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided. While step-up is on, a local approver
-    whose MFA store is unreadable is refused first by the central check: `503` (`retry_after_ms: 5000` for a failed read, `null` for a cause only an administrator repairs), counted as
+    whose MFA store is unreadable is refused first by the central check: `503` (`retry_after_ms: 5000` for a failed read, `null` where there is no retry hint (a cause only an administrator repairs, or one this gate cannot tell from a transient one)), counted as
     `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` and
     `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}`.
   - **An OIDC approver whose stored MFA proof is dated after the database clock** (the replica that took the sign-in ran

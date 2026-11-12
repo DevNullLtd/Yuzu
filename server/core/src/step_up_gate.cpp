@@ -47,8 +47,8 @@ RefusalText refusal_text(const StepUpVerdict& v) {
                 false};
     case StepUpDecision::kStoreUnavailable:
         // A binding decision that could not be made is a blip for some causes (a failed read,
-        // an inconclusive trigger validation) and persistent for others (an account enrolled
-        // before the factor-generation cutover, generation 0; a trigger that is not in force).
+        // an inconclusive trigger validation) and persistent for others (an account whose
+        // factor generation is not positive; a trigger that is not in force).
         // The text must not promise that a retry helps and must not tell the caller to re-prove
         // (re-proving cannot help: the proof cannot be judged), so `mfa_step_up_required` is
         // false; the audit row carries the same `reason=` token that tells the causes apart. The

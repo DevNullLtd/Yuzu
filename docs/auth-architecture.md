@@ -1011,8 +1011,8 @@ gate applied.
   physical streaming replication is unaffected. Application
   code never writes it, and the trigger reverts a direct write. It is not changed by a provisional secret, a TOTP counter advance, recovery-code
   regeneration or a `SecretCodec` re-encryption. The migration seeds nothing (a hard cutover, see "Rollout and cutover" below): every existing row
-  starts at `0` ("never assigned") and the trigger assigns a value from the next enrolment change, so an account that was already
-  enrolled on a carried-over database reads generation `0`, is refused `503` (audit `reason=mfa_proof_unavailable`), and
+  starts at `0` ("never assigned") and the trigger assigns a value from the next enrolment change, so an enrolled account in a database an earlier build
+  wrote (unsupported) reads generation `0`, is refused `503` (audit `reason=mfa_proof_unavailable`), and
   must have its factor cleared with `yuzu-server --mfa-reset <user>` (under `--mfa-enforcement=required`, or `admin-only` for an administrator, the user enrols again at next sign-in).
 - **Decisions are not re-checked under the row lock.** The approve and reject decision, the 39 ordinary
   step-up routes and the JIT elevation routes compare the generation once, at the gate read; only the
@@ -1045,7 +1045,7 @@ gate applied.
   |---|---|---|
   | stored proof unreadable (degraded read, row unusable, or the session store's rebind guard not in force) | `503` | `mfa_proof_unavailable` |
   | binding trigger not observed in force (or a recovery bypass) | `503` | `mfa_binding_unenforced` |
-  | enrolled account whose factor generation is not positive (a tampered row, or an enrolled account on a carried-over database, see "Rollout and cutover"); decided after the unenforced arm | `503` | `mfa_proof_unavailable` |
+  | enrolled account whose factor generation is not positive (a tampered row, or an enrolled account in a database an earlier build wrote, which is unsupported; see "Rollout and cutover"); decided after the unenforced arm | `503` | `mfa_proof_unavailable` |
   | no stored proof (row absent, another principal's, or no instant) | `401` | `mfa_proof_missing` |
   | proof has no generation | `401` | `proof_factor_unbound` |
   | proof generation differs from the account's | `401` | `proof_factor_mismatch` |

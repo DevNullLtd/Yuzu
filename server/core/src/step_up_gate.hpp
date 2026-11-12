@@ -111,9 +111,9 @@ struct StepUpVerdict {
     /// Only for kStoreUnavailable: a HINT that a retry may clear the refusal (a failed read of the
     /// enrolment status or of the stored proof; a read that fails for a persistent reason, such as
     /// an unreadable stored secret, is hinted the same way, as it is on the approver gate). False
-    /// for every cause only an administrator repairs (an enrolled account whose factor generation
-    /// is not positive, a stored-proof binding the session store reports untrusted) and for an
-    /// unenforced trigger, which this gate cannot tell from a validation that could not run, so
+    /// when the durable read succeeded and the account's factor generation is not positive, when
+    /// the session store reports the stored-proof binding untrusted, and for an unenforced
+    /// trigger, which this gate cannot tell from a validation that could not run, so
     /// false means "no retry hint", not "no retry can help". `render_step_up_refusal` turns it into
     /// `retry_after_ms` (5000 or null); every other decision gets the key as null.
     bool retryable{false};

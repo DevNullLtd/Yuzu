@@ -1340,11 +1340,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
       ruling in the #6079 working session that the change ships as a hard
       cutover. The ruling is accepted for that scope only. Acceptance of the
       Conditions and the Residual exposure is NOT YET GIVEN: they are put
-      forward by this draft. In the same working session (2026-11-10) the
+      forward by this draft. In a later working session (2026-11-10) the
       maintainer ruled that this change documents no carry-over or restore
-      procedure for an earlier build's database; that ruling too is a
-      working-session statement. As with the entries above, the ruling is a
-      working-session statement, not a signed decision. The acceptor is also
+      procedure for an earlier build's database. As with the entries above,
+      the rulings are working-session statements, not signed decisions. The acceptor is also
       the committer of the change that introduces this entry, so independent
       review of this acceptance rests on the pull request review (expected, not
       enforced by tooling), not on a second approver.
