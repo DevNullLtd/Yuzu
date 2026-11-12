@@ -1579,6 +1579,25 @@ bool census_bearing(const GuaranteedStateEventRow& row) {
            event_state_from_type(row.event_type) != nullptr;
 }
 
+// The emit-order pair (schema v5) as the store writes it: both set and each in [1, 2^62), else
+// unpaired (0/0 here; NULL/NULL in the columns). Re-validated at every write and on every read
+// back from the events table, so a direct caller or a damaged row can never store or project a
+// half pair. The ingest boundary applies the same bounds (`pair_from_wire`); this is the store's
+// own copy of the rule, not a second source of it.
+struct CensusPair {
+    std::int64_t boot_epoch{0};
+    std::int64_t emit_seq{0};
+};
+
+CensusPair census_pair(std::optional<std::int64_t> boot_epoch,
+                       std::optional<std::int64_t> emit_seq) noexcept {
+    constexpr std::int64_t kPairLimit = std::int64_t{1} << 62;
+    if (boot_epoch && emit_seq && *boot_epoch >= 1 && *boot_epoch < kPairLimit && *emit_seq >= 1 &&
+        *emit_seq < kPairLimit)
+        return {*boot_epoch, *emit_seq};
+    return {};
+}
+
 enum class ProjectionSource {
     FirstDelivery, // the event was just inserted (not pending) in this transaction
     Repair,        // a redelivery of an event stored with pending evidence
@@ -1657,7 +1676,7 @@ bool txn_healthy(PGconn* conn) noexcept {
 // (proj_key, proj_key_capped, ingest_seq) are the projection inputs. Every other row is the `seen`
 // list.
 constexpr const char* kCensusLockAll =
-    "SELECT event_id, proj_key, proj_key_capped, ingest_seq "
+    "SELECT event_id, proj_key, proj_key_capped, ingest_seq, boot_epoch, emit_seq "
     "FROM guaranteed_state_store.guaranteed_state_events "
     "WHERE rule_id = $2 AND agent_id = $1 AND projection_pending "
     "ORDER BY ingest_seq FOR UPDATE";
@@ -1741,16 +1760,21 @@ constexpr const char* kCensusFold =
     "(EXCLUDED.key_ns <> 0 AND EXCLUDED.key_ns = COALESCE(c.key_ns, 0) AND EXCLUDED.state <> "     \
     "c.state)"
 
-// K + sticky upsert. $5 key, $6 seq, $7 capped, $8 seen list, $4 the event's timestamp text.
+// K + sticky upsert. $5 key, $6 seq, $7 capped, $8 seen list, $4 the event's timestamp text,
+// $9 boot_epoch and $10 emit_seq (0/0 = unpaired). The pair rides the verdict: it is written by
+// the same applied test as `state`, so a refused event's pair never reaches the row, and an
+// applied unpaired verdict leaves NULL/NULL. Stored, not compared: nothing here reads $9/$10 to
+// decide.
 constexpr const char* kCensusUpsert =
     "INSERT INTO guaranteed_state_store.guardian_agent_rule_status AS c "
     "(agent_id, rule_id, state, updated_at, key_ns, ingest_seq, ts_hwm, seq_hwm, hwm_recv_ns, "
-    "order_uncertain) "
+    "order_uncertain, boot_epoch, emit_seq) "
     "SELECT $1::text, $2::text, $3::text, $4::text, $5::bigint, $6::bigint, "
     "       NULLIF(GREATEST($5::bigint, COALESCE(pm.mk, 0)), 0), "
     "       GREATEST($6::bigint, COALESCE(" YUZU_CENSUS_SEEN_MAX_SEQ_ ", 0)), "
     "       CASE WHEN $5::bigint > 0 OR pm.mk IS NOT NULL THEN " YUZU_CENSUS_DB_NOW_NS_ " END, "
-    "       ($5::bigint = 0 OR $7::boolean OR pm.mk IS NOT NULL) "
+    "       ($5::bigint = 0 OR $7::boolean OR pm.mk IS NOT NULL), "
+    "       NULLIF($9::bigint, 0), NULLIF($10::bigint, 0) "
     "  FROM (SELECT max(p.proj_key) AS mk "
     "          FROM guaranteed_state_store.guaranteed_state_events p "
     "         WHERE p.event_id = ANY($8::text[]) "
@@ -1767,6 +1791,10 @@ constexpr const char* kCensusUpsert =
     " THEN EXCLUDED.key_ns     ELSE c.key_ns     END, "
     "  ingest_seq = CASE WHEN " YUZU_CENSUS_APPLY_
     " THEN EXCLUDED.ingest_seq ELSE c.ingest_seq END, "
+    "  boot_epoch = CASE WHEN " YUZU_CENSUS_APPLY_
+    " THEN EXCLUDED.boot_epoch ELSE c.boot_epoch END, "
+    "  emit_seq   = CASE WHEN " YUZU_CENSUS_APPLY_
+    " THEN EXCLUDED.emit_seq   ELSE c.emit_seq   END, "
     "  hwm_recv_ns = CASE WHEN EXCLUDED.key_ns > COALESCE(c.ts_hwm, 0) THEN " YUZU_CENSUS_DB_NOW_NS_
     " "
     "                     ELSE c.hwm_recv_ns END, "
@@ -1848,7 +1876,7 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
 //   Abandoned: a savepoint control statement, or the outer pending-evidence write, failed, so
 //              the transaction may be aborted: the caller must return an error without
 //              committing (COMMIT of an aborted transaction reports success to libpq).
-// For a Repair the three inputs are overwritten from the locked row's stored values.
+// For a Repair the three inputs and the pair are overwritten from the locked row's stored values.
 [[nodiscard]] CensusOutcome project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
                                                 const std::function<void()>& lock_barrier,
                                                 const GuaranteedStateEventRow& row,
@@ -1860,6 +1888,10 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
     };
     if (!control("SAVEPOINT census_upsert"))
         return CensusOutcome::Abandoned;
+    // A Repair projects the pair stored with the event (read back below), never the redelivery's.
+    CensusPair pair = source == ProjectionSource::Repair
+                          ? CensusPair{}
+                          : census_pair(row.boot_epoch, row.emit_seq);
 
     const auto fail = [&](pg::PgResult& res) -> CensusOutcome {
         const char* state_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
@@ -1941,6 +1973,12 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
             key = PQgetisnull(lock.get(), i, 1) ? 0 : to_i64(PQgetvalue(lock.get(), i, 1));
             capped = to_bool(PQgetvalue(lock.get(), i, 2));
             seq = to_i64(PQgetvalue(lock.get(), i, 3));
+            const auto nullable = [&](int col) -> std::optional<std::int64_t> {
+                if (PQgetisnull(lock.get(), i, col))
+                    return std::nullopt;
+                return to_i64(PQgetvalue(lock.get(), i, col));
+            };
+            pair = census_pair(nullable(4), nullable(5));
         }
     }
     if (source == ProjectionSource::Repair && !self_found) {
@@ -1964,7 +2002,8 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
         conn, kCensusUpsert,
         std::vector<std::string>{row.agent_id, row.rule_id, std::string(state), row.timestamp,
                                  std::to_string(key), std::to_string(seq),
-                                 capped ? "true" : "false", seen_arr});
+                                 capped ? "true" : "false", seen_arr,
+                                 std::to_string(pair.boot_epoch), std::to_string(pair.emit_seq)});
     if (up.status() != PGRES_TUPLES_OK)
         return fail(up);
     // Fold AGAIN, now that the row exists and is final for this statement: the first fold ran
@@ -2046,6 +2085,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
     const OrderingKey ordering =
         derive_ordering_key(row.agent_ns, row.received_ns != 0 ? row.received_ns : wall_clock_ns());
     const bool bearing = census_bearing(row);
+    const CensusPair wire_pair = census_pair(row.boot_epoch, row.emit_seq);
 
     // ingest_seq is never named: the identity allocates it, and RETURNING hands it back as the
     // event's place in the arrival order.
@@ -2055,9 +2095,10 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
         "(event_id, rule_id, agent_id, event_type, severity, guard_type, guard_category, "
         " detected_value, expected_value, remediation_action, remediation_success, "
         " detection_latency_us, remediation_latency_us, timestamp, ttl_expires_at, detail_json, "
-        " proj_key, proj_key_capped, projection_pending) "
+        " proj_key, proj_key_capped, projection_pending, boot_epoch, emit_seq) "
         "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::boolean,$12::bigint,$13::bigint,$14,"
-        "$15::bigint,$16,$17::bigint,$18::boolean,false) "
+        "$15::bigint,$16,$17::bigint,$18::boolean,false,NULLIF($19::bigint,0),"
+        "NULLIF($20::bigint,0)) "
         "RETURNING ingest_seq",
         std::vector<std::string>{
             row.event_id, row.rule_id, row.agent_id, row.event_type, row.severity, row.guard_type,
@@ -2065,7 +2106,8 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
             std::string(row.remediation_success ? "true" : "false"),
             std::to_string(row.detection_latency_us), std::to_string(row.remediation_latency_us),
             row.timestamp, std::to_string(ttl), row.detail_json, std::to_string(ordering.key),
-            ordering.capped ? "true" : "false"});
+            ordering.capped ? "true" : "false", std::to_string(wire_pair.boot_epoch),
+            std::to_string(wire_pair.emit_seq)});
 
     if (ins.status() != PGRES_TUPLES_OK) {
         const char* sqlstate_p = PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE);
@@ -2228,6 +2270,7 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
     for (const auto& row : rows) {
         const OrderingKey ordering = derive_ordering_key(
             row.agent_ns, row.received_ns != 0 ? row.received_ns : wall_clock_ns());
+        const CensusPair wire_pair = census_pair(row.boot_epoch, row.emit_seq);
         // projection_pending is explicitly false: this path records no pending evidence, so a
         // failed census write aborts the batch (below) instead of stranding the event.
         pg::PgResult ins = pg::exec_params(
@@ -2236,9 +2279,11 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             "(event_id, rule_id, agent_id, event_type, severity, guard_type, guard_category, "
             " detected_value, expected_value, remediation_action, remediation_success, "
             " detection_latency_us, remediation_latency_us, timestamp, ttl_expires_at, "
-            " detail_json, proj_key, proj_key_capped, projection_pending) "
+            " detail_json, proj_key, proj_key_capped, projection_pending, boot_epoch, "
+            " emit_seq) "
             "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::boolean,$12::bigint,$13::bigint,$14,"
-            "$15::bigint,$16,$17::bigint,$18::boolean,false) "
+            "$15::bigint,$16,$17::bigint,$18::boolean,false,NULLIF($19::bigint,0),"
+            "NULLIF($20::bigint,0)) "
             "RETURNING ingest_seq",
             std::vector<std::string>{
                 row.event_id, row.rule_id, row.agent_id, row.event_type, row.severity,
@@ -2246,7 +2291,8 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
                 row.remediation_action, std::string(row.remediation_success ? "true" : "false"),
                 std::to_string(row.detection_latency_us),
                 std::to_string(row.remediation_latency_us), row.timestamp, std::to_string(ttl),
-                row.detail_json, std::to_string(ordering.key), ordering.capped ? "true" : "false"});
+                row.detail_json, std::to_string(ordering.key), ordering.capped ? "true" : "false",
+                std::to_string(wire_pair.boot_epoch), std::to_string(wire_pair.emit_seq)});
         if (ins.status() != PGRES_TUPLES_OK) {
             const char* sqlstate_p = PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE);
             const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
