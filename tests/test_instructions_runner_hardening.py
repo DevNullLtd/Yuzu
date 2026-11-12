@@ -20,6 +20,7 @@ import os
 import shutil
 import signal
 import socket
+import socketserver
 import stat
 import struct
 import subprocess
@@ -81,9 +82,11 @@ class FakeYuzu:
             def log_message(self, *a):
                 pass
 
-            def _send(self, code, body, delay=0.0, headers=None):
+            def _send(self, code, body, delay=0.0, headers=None, before_send=None):
                 if delay:
                     time.sleep(delay)
+                if before_send:
+                    before_send()
                 try:
                     self.send_response(code)
                     for k, v in (headers or {}).items():
@@ -135,6 +138,15 @@ class FakeYuzu:
                     fake.first_post.set()
                     fake.inflight += 1
                     fake.max_inflight = max(fake.max_inflight, fake.inflight)
+                pending = True
+
+                def finish_execute():
+                    nonlocal pending
+                    if pending:
+                        with fake._lock:
+                            fake.inflight -= 1
+                        pending = False
+
                 try:
                     if fake.execute_mode:
                         if fake.execute_mode == "rst":   # a TCP reset instead of an answer
@@ -145,10 +157,12 @@ class FakeYuzu:
                         return
                     code, body, delay = fake.execute(post) if fake.execute else \
                         (200, json.dumps({"command_id": "c-" + post["id"]}).encode(), 0.0)
-                    self._send(code, body, delay, fake.execute_headers)
+                    # Publish completion before making the answer visible to the client.
+                    # It may start its next (serial) POST before this handler returns.
+                    self._send(code, body, delay, fake.execute_headers,
+                               before_send=finish_execute)
                 finally:
-                    with fake._lock:
-                        fake.inflight -= 1
+                    finish_execute()
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
@@ -546,7 +560,19 @@ class Attribution(RunnerCase):
     def test_targeted_definitions_run_one_at_a_time(self):
         defs = [definition(f"t.d{i}", "destructive") for i in range(4)]
         self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.1)
-        r = self.run_runner(defs, overrides={d["id"]: {} for d in defs}, extra=["--parallelism", "4"])
+        write = socketserver._SocketWriter.write
+
+        def delayed_return(writer, body):
+            sent = write(writer, body)
+            if body.startswith(b'{"command_id"'):
+                # Widen the post-response scheduling gap: a serial client can already
+                # issue its next POST while this handler is still unwinding.
+                time.sleep(0.25)
+            return sent
+
+        with mock.patch.object(socketserver._SocketWriter, "write", delayed_return):
+            r = self.run_runner(defs, overrides={d["id"]: {} for d in defs},
+                                extra=["--parallelism", "4"])
         self.assertEqual(r.rc, 0, r.err)
         self.assertEqual(self.fake.max_inflight, 1)
         self.assertIn("one at a time", r.out)

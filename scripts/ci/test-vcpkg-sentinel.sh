@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # test-vcpkg-sentinel.sh — unit tests for vcpkg-triplet-sentinel.sh.
 #
-# Pins the four behaviours the sentinel must preserve:
+# Pins the behaviours the sentinel must preserve:
 #   1. registry-desync recovery (#741): on key drift, BOTH
 #      vcpkg_installed/<triplet>/ and vcpkg_installed/vcpkg/ are wiped.
 #   2. no-op on matching key: neither directory is touched.
 #   3. first-run with no sentinel: exit 0, "no existing tree to wipe".
 #   4. error on missing manifest: exit non-zero.
+#   5. overlay patch edits/additions/removals invalidate both installed state trees.
+#   6. missing configured overlay fails before touching installed state.
 #
 # Runs locally (./scripts/ci/test-vcpkg-sentinel.sh) and from the
 # canary job in ci.yml. No external test framework — plain bash.
@@ -237,6 +239,77 @@ run_sentinel "$WS5" "any-baseline" OUT5 RC5
 assert_msg "[[ $RC5 -ne 0 ]]" "exit code is non-zero (got $RC5)"
 assert_msg "echo \"\$OUT5\" | grep -q 'no vcpkg.json'" \
   "error message names the missing manifest"
+
+rm -rf "$TMPROOT"
+TMPROOT=""
+
+# -----------------------------------------------------------------------
+echo "Test 6: configured overlay-port contents invalidate installed state"
+TMPROOT="$(mktemp -d)"
+WS6="$TMPROOT/t6"
+mk_workspace "$WS6"
+printf '{"overlay-ports":["overlay ports"]}\n' > "$WS6/vcpkg-configuration.json"
+mkdir -p "$WS6/overlay ports/grpc"
+printf 'original patch\n' > "$WS6/overlay ports/grpc/worker.patch"
+OUT6=""; RC6=0
+run_sentinel "$WS6" "overlay-baseline" OUT6 RC6
+seed_desync_state "$WS6"
+run_sentinel "$WS6" "overlay-baseline" OUT6 RC6
+assert_msg "[[ $RC6 -eq 0 && -d '$WS6/vcpkg_installed/$TRIPLET' ]]" \
+  "unchanged overlay preserves installed tree (relative path with spaces)"
+
+for mutation in edit add remove; do
+  case "$mutation" in
+    edit) printf 'fixed patch\n' > "$WS6/overlay ports/grpc/worker.patch" ;;
+    add) printf 'new patch\n' > "$WS6/overlay ports/grpc/second.patch" ;;
+    remove) rm "$WS6/overlay ports/grpc/second.patch" ;;
+  esac
+  seed_desync_state "$WS6"
+  run_sentinel "$WS6" "overlay-baseline" OUT6 RC6
+  assert_msg "[[ $RC6 -eq 0 && ! -d '$WS6/vcpkg_installed/$TRIPLET' ]]" \
+    "overlay $mutation invalidates installed tree"
+  assert_msg "[[ ! -d '$WS6/vcpkg_installed/vcpkg' ]]" \
+    "overlay $mutation invalidates workspace registry"
+done
+
+echo "Test 7: missing configured overlay preserves installed state and fails"
+seed_desync_state "$WS6"
+printf '{"overlay-ports":["missing overlay"]}\n' > "$WS6/vcpkg-configuration.json"
+OLD_KEY="$(cat "$WS6/vcpkg_installed/.${TRIPLET}-cachekey.sha256")"
+run_sentinel "$WS6" "overlay-baseline" OUT6 RC6
+assert_msg "[[ $RC6 -ne 0 ]]" "missing configured input returns failure"
+assert_msg "[[ -d '$WS6/vcpkg_installed/$TRIPLET' && -d '$WS6/vcpkg_installed/vcpkg' ]]" \
+  "invalid overlay configuration does not remove installed state"
+NEW_KEY="$(cat "$WS6/vcpkg_installed/.${TRIPLET}-cachekey.sha256")"
+assert_msg "[[ '$OLD_KEY' == '$NEW_KEY' ]]" "invalid overlay leaves sentinel unchanged"
+echo "Test 8: broken python3 alias falls back to working python"
+WORKING_PYTHON=""
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
+    WORKING_PYTHON="$(command -v "$candidate")"
+    break
+  fi
+done
+[[ -n "$WORKING_PYTHON" ]] || { echo "FAIL: test requires Python"; exit 2; }
+mkdir -p "$TMPROOT/python-bin"
+printf '#!/usr/bin/env bash\nexit 49\n' > "$TMPROOT/python-bin/python3"
+printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$WORKING_PYTHON" > "$TMPROOT/python-bin/python"
+chmod +x "$TMPROOT/python-bin/python3" "$TMPROOT/python-bin/python"
+WS8="$TMPROOT/t8"
+mk_workspace "$WS8"
+mkdir -p "$WS8/ports/grpc"
+printf 'fixture patch\n' > "$WS8/ports/grpc/fix.patch"
+printf '{"overlay-ports":["ports"]}\n' > "$WS8/vcpkg-configuration.json"
+PATH="$TMPROOT/python-bin:$PATH" run_sentinel "$WS8" "python-fallback" OUT8 RC8
+assert_msg "[[ $RC8 -eq 0 ]]" "broken python3 alias uses working python"
+assert_msg "[[ -f '$WS8/vcpkg_installed/.${TRIPLET}-cachekey.sha256' ]]" \
+  "fallback interpreter hashes configured overlay"
+seed_desync_state "$WS8"
+printf '#!/usr/bin/env bash\nexit 49\n' > "$TMPROOT/python-bin/python"
+PATH="$TMPROOT/python-bin:$PATH" run_sentinel "$WS8" "python-unavailable" OUT8 RC8
+assert_msg "[[ $RC8 -ne 0 ]]" "both broken interpreters fail"
+assert_msg "[[ -d '$WS8/vcpkg_installed/$TRIPLET' && -d '$WS8/vcpkg_installed/vcpkg' ]]" \
+  "missing interpreter preserves installed state"
 
 rm -rf "$TMPROOT"
 TMPROOT=""

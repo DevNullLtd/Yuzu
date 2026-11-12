@@ -7,6 +7,7 @@
 #       vcpkg.json
 #     | vcpkg-configuration.json
 #     | triplets/<triplet>.cmake     (when an overlay exists; otherwise empty)
+#     | configured overlay-port file names and contents (when present)
 #     | $VCPKG_COMMIT                (vcpkg baseline pinned in CI env)
 #   )
 #
@@ -26,7 +27,7 @@
 #   - ccache (~/.cache/ccache, %LOCALAPPDATA%\ccache)
 #   - any other vcpkg_installed/<other-triplet>/ tree
 #
-# Cross-platform: bash only, sha256sum (Linux + MSYS2 bash on Windows + macOS).
+# Cross-platform: bash, python3, sha256sum (Linux + MSYS2 Windows + macOS).
 # Idempotent. Exit 0 unconditionally — a sentinel mismatch is a normal state,
 # not a failure. Hard errors (no manifest, missing workspace) exit non-zero.
 
@@ -84,11 +85,68 @@ if [[ -f "$overlay" ]]; then
 fi
 echo "vcpkg-triplet-sentinel.sh: inputs=${inputs[*]}"
 
+# vcpkg includes overlay ports in its package ABI, but our installed-tree
+# sentinel must also observe patch-only changes. Resolve paths relative to
+# the configuration file, as vcpkg does; never hash restored installed trees.
+# An unreadable/missing configured input must fail BEFORE any cache is removed.
+PYTHON_BIN=""
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -c "" >/dev/null 2>&1; then
+    PYTHON_BIN="$candidate"
+    break
+  fi
+done
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "::error::no working Python interpreter found (tried python3, python)" >&2
+  exit 2
+fi
+if ! overlay_hash=$("$PYTHON_BIN" - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+def fail_walk(error):
+    raise error
+
+config = Path("vcpkg-configuration.json")
+if config.exists():
+    overlays = json.loads(config.read_text(encoding="utf-8")).get("overlay-ports", [])
+    if not isinstance(overlays, list):
+        raise ValueError("overlay-ports must be a list")
+    digest = hashlib.sha256()
+    for index, value in enumerate(overlays):
+        if not isinstance(value, str) or not value:
+            raise ValueError("overlay-ports entries must be nonempty paths")
+        root = (config.parent / value).resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError(f"overlay port path is not a directory: {value}")
+        paths = []
+        for directory, subdirs, files in os.walk(root, onerror=fail_walk):
+            for name in subdirs:
+                path = Path(directory) / name
+                if path.is_symlink():
+                    raise ValueError(f"overlay directory symlinks are unsupported: {path}")
+            paths.extend(Path(directory) / name for name in files)
+        for path in sorted(paths):
+            if path.is_symlink() and not path.exists():
+                raise FileNotFoundError(f"broken overlay symlink: {path}")
+            if path.is_file():
+                digest.update(f"{index}\0{path.relative_to(root).as_posix()}\0".encode())
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+    if overlays:
+        print(digest.hexdigest())
+PY
+); then
+  echo "::error::cannot hash configured overlay ports" >&2
+  exit 2
+fi
+
 # Include the vcpkg baseline commit so a baseline bump invalidates every
 # cache (correct: ports may have changed even if our manifest didn't).
 baseline="${VCPKG_COMMIT:-unset}"
 
-if ! want=$( { sha256sum "${inputs[@]}" && printf '%s\n' "$baseline"; } | sha256sum | awk '{print $1}'); then
+if ! want=$( { sha256sum "${inputs[@]}" && printf '%s\n' "$baseline" && printf '%s' "$overlay_hash"; } | sha256sum | awk '{print $1}'); then
   echo "::error::sha256sum pipeline failed" >&2
   exit 2
 fi

@@ -40,8 +40,8 @@ if host_os == 'windows'
   )
   # No-main variant for yuzu_agent_tests AND yuzu_server_tests (#1648/#3507):
   # both suites supply their own main() via the shared unit/test_runner_main.cpp
-  # so they can log Catch2's real return code and, on Windows, hard_exit()
-  # immediately after a clean run — so neither must also pull in Catch2Main.
+  # so they can drain gRPC, log Catch2's return code and apply the platform
+  # exit policy — neither must also pull in Catch2Main.
   catch2_nomain_dep = declare_dependency(
     include_directories: _vcpkg_inc_win,
     dependencies: [_libcatch2],
@@ -50,6 +50,36 @@ else
   catch2_dep = dependency('Catch2', modules: ['Catch2::Catch2WithMain'], method: 'cmake', required: true, include_type: 'system')
   catch2_nomain_dep = dependency('Catch2', modules: ['Catch2::Catch2'], method: 'cmake', required: true, include_type: 'system')
 endif
+
+# Coverage must preserve normal exit even on the platforms whose uninstrumented
+# test runners retain the #3507 hard_exit policy.
+test_runtime_cpp_args = get_option('b_coverage') ? ['-DYUZU_TEST_COVERAGE'] : []
+
+# The server owns an EventEngine for its suite. The agent runner must remain
+# thread-quiescent for its fork-without-exec death tests, so it uses the ordinary
+# entry point. Compile the server entry once and share it with the regression.
+grpc_test_runner = static_library(
+  'yuzu_grpc_test_runner',
+  'unit/test_runner_main.cpp',
+  include_directories: include_directories('../agents/core/src'),
+  cpp_args: test_runtime_cpp_args + ['-DYUZU_TEST_GRPC_RUNTIME'],
+  dependencies: [catch2_nomain_dep, grpcpp_dep],
+)
+
+# Exercise the actual shared entry point in a fresh process, with no unrelated
+# fixture holding an EventEngine reference that could mask missing ownership.
+grpc_runtime_test_exe = executable(
+  'yuzu_grpc_runtime_tests',
+  files('unit/test_grpc_runtime_lifetime.cpp'),
+  include_directories: include_directories('../agents/core/src'),
+  cpp_args: test_runtime_cpp_args,
+  link_with: grpc_test_runner,
+  dependencies: [catch2_nomain_dep, grpcpp_dep,
+                 dependency('openssl', required: true, include_type: 'system')],
+)
+test('grpc runtime lifetime', grpc_runtime_test_exe,
+     args: ['--durations=yes'],
+     suite: ['agent', 'server'], timeout: 60)
 
 # ── Test fixture: plugin with a reserved name (#453) ─────────────────────────
 # Built only when tests are enabled; test_plugin_loader.cpp scans against this
@@ -741,7 +771,7 @@ agent_test_exe = executable(
   # define: on Windows meson.project_source_root() is a native path, and unescaped
   # backslashes either fail to compile or silently mangle the path (see that define's
   # own comment for the full reasoning).
-  cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args +
+  cpp_args: test_runtime_cpp_args + test_partial_init_args + agent_platform_args + agent_test_native_args +
             ['-DYUZU_AGENT_SRC_DIR="' +
              (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
              '"',
@@ -1471,10 +1501,9 @@ if build_server
   server_test_exe = executable(
     'yuzu_server_tests',
     files(
-      # Custom Catch2 entry point (#1648/#3507 diagnostic + Windows-only
-      # hard_exit) — logs Session::run()'s real return value; see
+      # Custom Catch2 entry point (gRPC lifetime + platform exit policy)
+      # logs Session::run()'s real return value; see
       # unit/test_runner_main.cpp and catch2_nomain_dep above.
-      'unit/test_runner_main.cpp',
       'unit/server/test_auth.cpp',
       'unit/server/test_auth_routes.cpp',
       'unit/server/test_auth_list_read_gate.cpp',
@@ -2159,7 +2188,7 @@ if build_server
     # test_mcp_stream_bridge.cpp. Catch2 emits per-TEST_CASE COMDAT sections and
     # MSVC's C1128 limit is a hard 65,279 - so the gap is a build-time cliff on one
     # platform only, with no runtime component. Free on every other compiler.
-    cpp_args: https_cpp_args + test_partial_init_args +
+    cpp_args: test_runtime_cpp_args + https_cpp_args + test_partial_init_args +
               ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG',
                # #2407 route-inventory test (test_body_cap_route_inventory.cpp):
                # mechanically scans the real server/core/src tree at test run
@@ -2207,6 +2236,7 @@ if build_server
     # actually needs it. GCC/Clang are unaffected (larger default stacks,
     # and no /STACK equivalent needed here).
     link_args: (cxx.get_id() == 'msvc' ? ['/STACK:16777216'] : []),
+    link_with: grpc_test_runner,
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here
@@ -2219,7 +2249,7 @@ if build_server
     # it links Catch2 without Catch2Main.
     # cli11_dep: test_server_ota_options.cpp parses real CLI::App argv in-process
     # to pin the OTA flag/env contract (header-only, no link cost).
-    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system')],
+    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, grpcpp_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system')],
   )
   # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
   # promised): test() entries over the SAME binary, partitioned by Catch2
@@ -4078,12 +4108,15 @@ if _bash_test.found()
   )
   # #4262: -Dbuild_examples=false must keep configuring a real build.
   # Configure-only smoke test (no compile) so it stays cheap on every leg;
-  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  # Standalone invocation skips when its default host triplet is unpopulated.
   # platform: OS-contract test, runs on every leg (docs is OS-independent and Linux-only since 2026-10-21);
-  # it selects the per-OS vcpkg triplet (`uname -s`).
+  # It inherits this build's dependency paths, including sanitizer triplets.
   test('build_examples=false gating smoke test',
     _bash_test,
-    args: [files('shell/test_build_examples_gating.sh')],
+    args: [files('shell/test_build_examples_gating.sh'),
+           '-Dcmake_prefix_path=' + ','.join(get_option('cmake_prefix_path')),
+           '-Dpkg_config_path=' + ','.join(get_option('pkg_config_path')),
+           '-Db_sanitize=' + get_option('b_sanitize')],
     suite: 'platform',
     timeout: 120,
   )

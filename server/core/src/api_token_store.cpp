@@ -1645,6 +1645,15 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
                 return false;
             }
 
+            // The mint commits its durable initiator before publishing the RAM
+            // grace entry. Reject another operator even in that publication gap;
+            // this is denial only, never authority to reveal an uncached secret.
+            if (!successor->rotation_initiator.empty() &&
+                successor->rotation_initiator != requesting_user) {
+                error_msg = "rotation in progress by a different operator";
+                return false;
+            }
+
             // Idempotency window, cache side: the raw secret itself must
             // still be resident and unexpired. `cached_raw`/`cached_user`
             // are the FUNCTION-scope variables declared above (not

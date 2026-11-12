@@ -44,6 +44,7 @@ ENV PATH="/opt/vcpkg:${PATH}"
 # ── Install vcpkg packages (the expensive step — cached in the image) ───
 WORKDIR /tmp/vcpkg-build
 COPY vcpkg.json vcpkg-configuration.json ./
+COPY ports/ ports/
 RUN /opt/vcpkg/vcpkg install \
         --triplet x64-linux \
         --x-manifest-root=/tmp/vcpkg-build \

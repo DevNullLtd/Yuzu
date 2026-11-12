@@ -388,6 +388,7 @@ equal_size_rsa_pems(DateA, DateB, N) ->
                    #{cert := Der} = public_key:pkix_test_root_cert(
                                       "yuzu-cert-files-test",
                                       [{validity, {{2020, 1, 1}, Date}},
+                                       {digest, sha256},
                                        {key, {rsa, 2048, 65537}}]),
                    pem([Der])
            end,
@@ -412,7 +413,8 @@ replace_keeping_mtime(Path, Bin) ->
 mint(Date) ->
     #{cert := Der} = public_key:pkix_test_root_cert(
                        "yuzu-cert-files-test",
-                       [{validity, {{2020, 1, 1}, Date}}, {key, {namedCurve, secp256r1}}]),
+                       [{validity, {{2020, 1, 1}, Date}}, {key, {namedCurve, secp256r1}},
+                        {digest, sha256}]),
     Der.
 
 pem(Ders) ->

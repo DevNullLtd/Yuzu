@@ -1568,6 +1568,46 @@ TEST_CASE("ApiTokenStore: concurrent rotate_engine_credential calls for the same
     CHECK(active.size() == 2);
 }
 
+TEST_CASE("ApiTokenStore: rotation rejects another operator before raw-cache publication",
+          "[pg][token][rotation][publication]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check([](const std::string&) { return EngineLookupStatus::Active; });
+    const std::string principal = "engine:rotation-publication";
+    const auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine"));
+
+    bool interleaved = false;
+    store.test_hook_before_store_rotation_raw_ = [&] {
+        interleaved = true;
+        // The pair and initiator are committed; the raw secret is not cached yet.
+        auto other =
+            store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "operator-b");
+        REQUIRE_FALSE(other.has_value());
+        CHECK(other.error() == "rotation in progress by a different operator");
+        // Durable identity must never substitute for a resident raw secret.
+        auto same =
+            store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "operator-a");
+        REQUIRE_FALSE(same.has_value());
+        CHECK(same.error() == "rotation grace window elapsed; confirm or revoke");
+    };
+    auto minted = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "operator-a");
+    REQUIRE(interleaved);
+    REQUIRE(minted.has_value());
+    CHECK(store.list_active_for_principal(principal).size() == 2);
+    auto replay = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "operator-a");
+    REQUIRE(replay.has_value());
+    CHECK(*replay == *minted);
+    // Epoch expiry retains precedence; durable identity does not extend the window.
+    auto expired = store.rotate_engine_credential(principal, kDefaultOverlapSecs,
+                                                  now + ApiTokenStore::rotation_grace_secs() + 1,
+                                                  "operator-b");
+    REQUIRE_FALSE(expired.has_value());
+    CHECK(expired.error() == "rotation grace window elapsed; confirm or revoke");
+}
+
 TEST_CASE("ApiTokenStore: rotate_engine_credential never leaves an orphaned rotation pair — "
           "mint and pair-stamp always commit together (Hermes F2)",
           "[pg][token][rotation]") {

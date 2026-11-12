@@ -140,6 +140,14 @@ Every `dependency()` is marked `include_type: 'system'` so vcpkg/gRPC/abseil/pro
 ## vcpkg
 
 - Manifest `vcpkg.json`; pinned baseline `9eec002df1cd109f8f104cd966a763daf9751489` (matches `vcpkgGitCommitId` in CI). `builtin-baseline` is required by the abseil `version>=` constraint — without it vcpkg resolves against HEAD.
+- `vcpkg-configuration.json` selects the `ports/grpc` overlay. Its secure-target patch releases
+  worker OpenSSL state before publishing thread retirement; the server test entry point separately
+  owns and drains the default EventEngine. Both are required for the nightly shutdown treatment.
+  Agent fixtures retain scoped ownership: their fork-without-exec death tests require a
+  thread-quiescent process, so their entry point cannot hold a persistent worker pool.
+  A baseline bump does not update an overlay: refresh the upstream port and review the local patch
+  as described in `ports/grpc/README.txt`, then rebuild the instrumented dependencies. The CI
+  sentinel includes overlay contents in its invalidation key.
 - OpenSSL is **required on every platform including Windows** — gRPC's TLS/JWT/PEM paths compile against OpenSSL headers regardless of linkage, so `grpc.lib` needs `libssl`+`libcrypto`; it is an unconditional top-level dep (the old `!windows`/schannel filter was disproven, #375).
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
 - **libpq (ADR-0006/0008):** on Windows it is a **DLL** (the static override covers only the grpc stack), shipped via the release zip's vcpkg-DLL sweep; `libpq_dep` is gated on `build_server` (agent stays SQLite); manifest pins `default-features: false, features: [openssl]`; the buildtype-conditional `_vcpkg_lib_win` pick is load-bearing (pure-C libpq has no `detect_mismatch`, so a wrong-CRT lib links silently). No cmake target carries static libpq's full closure (`libpgcommon`/`libpgport` live in `libpq.pc`'s `Libs.private`) — `meson.build`'s `libpq_dep` block wires it explicitly. libpq 18 no longer installs `libpgcommon.lib`/`libpgport.lib` on Windows, so only `libpq.lib` is required there; the other two are linked when present.

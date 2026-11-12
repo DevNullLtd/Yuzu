@@ -1,0 +1,2 @@
+- **Drain gRPC workers before OpenSSL cleanup.** Release each secure worker's OpenSSL thread state before publishing retirement, and keep the server test runtime alive until its suite finishes so sanitizer runs exercise normal shutdown safely.
+- **Reject competing engine-credential rotations during cache publication.** Check the committed rotation initiator before the raw-secret cache is populated; this denial does not authorize secret re-serving or extend the grace window.

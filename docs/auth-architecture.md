@@ -4873,6 +4873,13 @@ walkthrough.
   `success` a one-time effect. The confirm is never a silent success no-op:
   the initiator grace binding is evicted post-confirm, so a success answer
   would attest without verifying initiation.
+  **Engine rotation retry during cache publication:** the committed successor's
+  durable `rotation_initiator` rejects a different operator before the raw-secret
+  cache is available. This is a denial check only: raw re-serve still requires
+  the unexpired RAM entry and its matching operator; epoch expiry keeps its
+  precedence. A same-operator retry before cache publication still receives the
+  existing grace-window conflict. Human rotation already rejects a caller who
+  does not own the predecessor before reaching the grace-cache path.
 - **Confirm-identity binding survives a server restart (#2961).** The
   maker-checker check that only the operator who called `rotate` may
   `confirm` used to be resolvable **only** from the in-process

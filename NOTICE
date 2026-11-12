@@ -79,6 +79,13 @@ section is maintained manually; see `vcpkg.json` and
   Nayuki QR-Code-generator (vendored) ... MIT
   IBM Plex Sans / Mono (vendored) ....... SIL OFL 1.1
 
+The upstream build recipe, CMake helpers and inherited patches in
+`ports/grpc/` were copied from microsoft/vcpkg at commit
+9eec002df1cd109f8f104cd966a763daf9751489. Those imported files are MIT-licensed;
+the Microsoft copyright and full permission notice are retained in
+`ports/LICENSE-vcpkg.txt`. The local `00017-openssl-worker-cleanup.patch` and
+`README.txt` are Yuzu additions, not part of that upstream copy.
+
 Before cutting the first AGPL-era release, run an SBOM / attribution
 aggregator (e.g. scancode-toolkit or OSS Review Toolkit) over the
 produced binaries and append any missing upstream notices here.

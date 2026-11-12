@@ -185,8 +185,10 @@ struct ApiToken {
     // treated as a wildcard by the confirm-identity resolver — see
     // `resolve_rotation_initiator`'s doc comment. Deliberately NOT consulted
     // by `try_reserve`'s raw-secret re-serve (F4 stays RAM-only); it exists
-    // solely to survive a restart for `confirm_rotation`/
-    // `confirm_token_rotation`'s identity check (F5).
+    // to survive a restart for `confirm_rotation`/
+    // `confirm_token_rotation`'s identity check (F5), and to reject a different
+    // engine-rotation operator before the RAM grace entry is published. That
+    // denial never authorizes a raw-secret reveal or extends its grace window.
     //
     // Cleared back to '' on the SURVIVING row at all FOUR sites that resolve
     // rotation state, alongside `rotation_group`/`supersedes_token_id`/

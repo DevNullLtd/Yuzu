@@ -21,7 +21,7 @@
 #   docker build --target deps -t yuzu-server-deps -f deploy/docker/Dockerfile.server .
 #   docker build -t yuzu-server -f deploy/docker/Dockerfile.server .
 
-# ── Stage 1: deps — toolchain + vcpkg packages (cached when vcpkg.json unchanged) ─
+# ── Stage 1: deps — toolchain + vcpkg packages (cached while dependency inputs are unchanged) ─
 FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS deps
 
 # TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
@@ -57,8 +57,9 @@ ENV VCPKG_ROOT=/opt/vcpkg
 
 WORKDIR /src
 
-# Copy only the vcpkg manifest — this layer is cached until deps change
+# Copy dependency inputs — this layer is cached until manifests or overlay ports change
 COPY vcpkg.json vcpkg-configuration.json ./
+COPY ports/ ports/
 RUN --mount=type=cache,target=/opt/vcpkg/buildtrees \
     --mount=type=cache,target=/opt/vcpkg/downloads \
     --mount=type=cache,target=/root/.cache/vcpkg \

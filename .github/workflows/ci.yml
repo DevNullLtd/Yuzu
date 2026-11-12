@@ -3219,11 +3219,9 @@ jobs:
   # copy of a byte-identical tree (six such duplicates were live at once,
   # against a 10 GB repo cache cap).
   #
-  # Known gap: the canary cache key hashes vcpkg.json /
-  # vcpkg-configuration.json / triplets/x64-linux.cmake, but the
-  # `ci-infrastructure` path class does not match those files. A manifest
-  # or baseline bump merged to dev therefore does not re-warm the new key
-  # until some unrelated CI-infra push lands.
+  # The CI-infrastructure classifier includes the canary's dependency inputs
+  # (manifests, x64-linux triplet and ports/), so dependency-only pushes also
+  # re-warm the matching cache key.
   detect-ci-changes:
     name: "Detect CI infrastructure changes"
     needs: [trusted_inputs]
@@ -3396,8 +3394,8 @@ jobs:
       - name: Restore vcpkg installed packages (canary)
         # Key tracks only what changes the canary's vcpkg output: the
         # manifest (vcpkg.json), the registry/baseline config
-        # (vcpkg-configuration.json), and the pinned VCPKG_COMMIT (in the key
-        # prefix). The canary installs the BUILTIN `x64-linux` triplet — no
+        # (vcpkg-configuration.json), ports/** overlay contents, and the pinned
+        # VCPKG_COMMIT (in the key prefix). The canary installs the BUILTIN `x64-linux` triplet — no
         # `triplets/x64-linux.cmake` overlay exists today — so the repo's
         # custom triplet descriptors (asan/tsan/static/windows) do NOT affect
         # this build. Hashing the whole `triplets/*.cmake` glob cold-started
@@ -3431,7 +3429,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/x64-linux.cmake') }}
+          key: vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/x64-linux.cmake', 'ports/**') }}
           restore-keys: |
             vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
 

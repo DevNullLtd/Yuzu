@@ -47,6 +47,7 @@ ENV VCPKG_ROOT=/opt/vcpkg
 
 WORKDIR /src
 COPY vcpkg.json vcpkg-configuration.json ./
+COPY ports/ ports/
 # sharing=locked on buildtrees: buildx builds linux/amd64 and linux/arm64
 # concurrently, and both mount this cache; vcpkg takes an exclusive
 # buildtrees/vcpkg-running.lock, so a shared (default) mount makes the second

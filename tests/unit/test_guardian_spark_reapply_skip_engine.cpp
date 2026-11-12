@@ -2759,8 +2759,9 @@ TEST_CASE("#5547 (option A): a wedge drained after its claim popped is a carried
 // Astra's scenario (plan section 2). The unattributed debt of a failed full_sync is inherited by
 // every later application. A later full_sync that sweeps fine but fails to reconcile A is NOT a
 // successful authoritative full sync, so the inherited debt survives it, and a delta naming A can
-// clear only A. Only a clean full_sync discharges the debt, and it acknowledges in that same call.
-// The unattributed debt is a teardown throw (the runtime's detach fault).
+// clear only A. Once the earlier asynchronous arms have completed, a clean full_sync discharges
+// the debt and acknowledges in that same call. The unattributed debt is a teardown throw
+// (the runtime's detach fault).
 // Mutations: the discharge conditioned on full_sync() alone (the second full_sync clears the debt,
 // so the delta naming A acknowledges); the discharge deleted (the last full_sync never clears it);
 // begin_full_application dropping the inherited latch (the debt is forgotten at the second step).
@@ -2782,13 +2783,18 @@ TEST_CASE("#5547: an inherited latch survives a full_sync that fails to reconcil
     r.rt().set_detach_fault_for_test(true);
     r.dispatch(push_bytes({x}, kNext));
     REQUIRE(r.wait_armed(2)); // r1 survived the failed teardown; x armed
+    REQUIRE(r.wait_compliant({"x"})); // the next watch belongs to a, not an unsettled x
     tick_n(r);
     REQUIRE(r.engine->policy_generation() == kGen); // premise: held below kNext
     REQUIRE(r.persisted_generation().value_or(0) == kGen);
 
     // Step 2: a full_sync that sweeps fine but whose reconcile of a throws.
+    // Park the accepted asynchronous arm: twenty maintenance ticks do not promise
+    // that its worker has run, even when the fake watch normally returns immediately.
+    r.fm->hang_next_watch();
     probe->throw_once("a");
     r.dispatch(push_bytes({x, a}, kNext));
+    REQUIRE(r.fm->wait_entered_hang(5s));
     tick_n(r);
     CHECK(r.engine->policy_generation() == kGen);
 
@@ -2797,6 +2803,16 @@ TEST_CASE("#5547: an inherited latch survives a full_sync that fails to reconcil
     tick_n(r);
     CHECK(r.engine->policy_generation() == kGen);
     CHECK(r.persisted_generation().value_or(0) == kGen);
+
+    // Finish the earlier arm before asking the final full_sync to acknowledge
+    // synchronously. An accepted-but-pending arm must hold the generation; that is
+    // the production contract, not a failure to discharge the inherited latch.
+    CHECK(r.engine->ack_pending_count_for_test() > 0);
+    r.fm->release_hang();
+    drain_until_idle(r);
+    REQUIRE(r.wait_compliant({"x", "a"}));
+    REQUIRE(r.engine->policy_generation() == kGen); // inherited debt still holds
+    REQUIRE(r.persisted_generation().value_or(0) == kGen);
 
     // Step 4: a clean full_sync discharges the debt and acknowledges in that same call.
     r.dispatch(push_bytes({x, a}, kNext));

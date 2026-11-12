@@ -3261,8 +3261,18 @@ see the comment above the two `test('server ...', ...)` entries in
 "have the inputs to vcpkg actually changed?". Key:
 
 ```
-sha256(vcpkg.json + vcpkg-configuration.json + triplets/<triplet>.cmake + $VCPKG_COMMIT)
+sha256(vcpkg.json + vcpkg-configuration.json + triplets/<triplet>.cmake + $VCPKG_COMMIT + overlay-port digest)
 ```
+
+The overlay-port digest covers every file's relative name and content under the
+`overlay-ports` directories in `vcpkg-configuration.json`, in deterministic order.
+Relative paths resolve from that configuration file. Patch edits, added files and
+removed files invalidate the installed tree even when the port version stays the
+same. Missing or unreadable configured inputs fail before invalidation; nested
+directory symlinks are refused rather than silently omitting their contents.
+The sentinel probes `python3`, then `python`, for a working interpreter to parse
+the configuration and hash these inputs (Windows may expose a nonworking
+`python3` App Execution Alias). With no overlay ports, the prior key calculation is unchanged.
 
 Stored at `vcpkg_installed/.<triplet>-cachekey.sha256`. On drift, wipes
 `vcpkg_installed/<triplet>/` AND `vcpkg_installed/vcpkg/` (the
@@ -3515,10 +3525,10 @@ throwaway `trusted-fork/pr-<N>` branch, so whatever fork code writes lands in a
 scope no `dev`/`main`/PR run can restore from, and the wrapper purges it after
 the run (#4471). Every PR bases on `dev`, so a dev-scoped entry serves all of them; main-only
 warming left the scope empty for five weeks and each PR saved a private ~843 MB
-duplicate (#3233). Note the canary key hashes `vcpkg.json` /
-`vcpkg-configuration.json` / `triplets/x64-linux.cmake`, which the
-`ci-infrastructure` class does not match, so a manifest bump on `dev` does not
-itself re-warm the new key.
+duplicate (#3233). The canary key hashes `vcpkg.json`,
+`vcpkg-configuration.json`, `triplets/x64-linux.cmake` and `ports/**`.
+The `ci-infrastructure` classifier matches those same inputs, so a manifest,
+baseline or overlay-port patch change on `dev` re-warms its new key.
 
 ## Cache pruning + weekly maintenance
 
