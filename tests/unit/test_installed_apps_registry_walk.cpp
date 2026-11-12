@@ -26,6 +26,7 @@
 
 #ifdef _WIN32
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -107,6 +108,7 @@ HKEY fake_handle(std::uintptr_t n) {
 }
 const HKEY kFakeRoot = fake_handle(0x10);  // a root that opens
 const HKEY kDeniedRoot = fake_handle(0x11); // a root whose open is denied
+const HKEY kMissingRoot = fake_handle(0x12); // a root whose key does not exist
 constexpr std::uintptr_t kHiveHandle = 0x20;
 constexpr std::uintptr_t kChildBase = 0x100;
 
@@ -117,6 +119,8 @@ struct FakeOps {
     LSTATUS open(HKEY parent, const wchar_t* sub, REGSAM, HKEY* out) const {
         if (parent == kDeniedRoot)
             return ERROR_ACCESS_DENIED;
+        if (parent == kMissingRoot)
+            return ERROR_FILE_NOT_FOUND;
         if (parent == kFakeRoot) {
             *out = fake_handle(kHiveHandle);
             open_handles.insert(kHiveHandle);
@@ -282,15 +286,63 @@ TEST_CASE("walk: ERROR_MORE_DATA on one name skips it, degrades, and continues",
     CHECK(ops.open_handles.empty());
 }
 
-TEST_CASE("list_inventory: a healthy walk emits inv rows, rc 0, no status",
+TEST_CASE("list_inventory: a healthy walk emits inv rows, rc 0, one OK/FULL status",
           "[installed_apps][registry][windows]") {
-    FakeOps ops{{app("AppA")}};
+    FakeEntry a = app("AppA");
+    a.values["InstallLocation"] = "C:\\Program Files\\AppA";
+    FakeOps ops{{a}};
     FakeCtx ctx;
     const rw::UninstallRoot roots[] = {kOkRoot};
     CHECK(rw::list_inventory(ctx, roots, ops, [](std::size_t) {}) == 0);
     REQUIRE(ctx.lines.size() == 1);
     CHECK(ctx.lines[0].rfind("inv|AppA|", 0) == 0);
-    CHECK(ctx.statuses.empty());
+    // Row 1.4: the row has 14 tokens (13 bars) and the last is the registry's InstallLocation,
+    // exactly.
+    CHECK(std::count(ctx.lines[0].begin(), ctx.lines[0].end(), '|') == 13);
+    CHECK(ctx.lines[0].substr(ctx.lines[0].rfind('|') + 1) == "C:\\Program Files\\AppA");
+    // The clean pass declares itself complete (parsers::emit_inventory): the sync collector
+    // reads an undeclared answer as UNKNOWN and withholds the rows.
+    REQUIRE(ctx.statuses.size() == 1);
+    CHECK(ctx.statuses[0].status == YUZU_RESULT_STATUS_OK);
+    CHECK(ctx.statuses[0].completeness == YUZU_RESULT_COMPLETENESS_FULL);
+}
+
+TEST_CASE("list_inventory: a denied own-HKCU root is logged but never degrades the walk",
+          "[installed_apps][registry][windows]") {
+    // Windows-only: runs on the Windows agent leg (kingsley), not on a macOS or Linux host.
+    // plugin windows_roots() row 3: {HKCU, absent_ok = true, degrades_walk = false}.
+    FakeOps ops{{app("AppA")}};
+    FakeCtx ctx;
+    std::vector<std::size_t> failed;
+    const rw::UninstallRoot roots[] = {kOkRoot,
+                                       {kDeniedRoot, L"Uninstall", 0, /*absent_ok=*/true,
+                                        /*degrades_walk=*/false}};
+    CHECK(rw::list_inventory(ctx, roots, ops, [&](std::size_t i) { failed.push_back(i); }) == 0);
+    REQUIRE(ctx.lines.size() == 1);
+    CHECK(ctx.lines[0].rfind("inv|AppA|", 0) == 0);
+    REQUIRE(ctx.statuses.size() == 1);
+    CHECK(ctx.statuses[0].status == YUZU_RESULT_STATUS_OK);
+    CHECK(ctx.statuses[0].completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(failed == std::vector<std::size_t>{1});
+}
+
+TEST_CASE("list_inventory: a missing WOW6432Node view on x64 degrades the walk",
+          "[installed_apps][registry][windows]") {
+    // Windows-only: runs on the Windows agent leg (kingsley), not on a macOS or Linux host.
+    // plugin windows_roots() row 2: the 32-bit view is machine scope and, on the 64-bit OS the
+    // plugin ships for, must exist (absent_ok = false), so its absence is a broken hive.
+    FakeOps ops{{app("AppA")}};
+    FakeCtx ctx;
+    std::vector<std::size_t> failed;
+    const rw::UninstallRoot roots[] = {kOkRoot,
+                                       {kMissingRoot, L"Uninstall", 0, /*absent_ok=*/false,
+                                        /*degrades_walk=*/true}};
+    CHECK(rw::list_inventory(ctx, roots, ops, [&](std::size_t i) { failed.push_back(i); }) == 1);
+    CHECK(ctx.lines.empty());
+    REQUIRE(ctx.statuses.size() == 1);
+    CHECK(ctx.statuses[0].status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(ctx.statuses[0].completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(failed == std::vector<std::size_t>{1});
 }
 
 TEST_CASE("list_inventory: a failed root yields rc 1, no rows, CONSTRAINED/PARTIAL",

@@ -1,9 +1,9 @@
 #pragma once
 
 // installed_apps_inventory.hpp -- pure parsing/formatting helpers for the
-// `list_inventory` action (software-inventory blob contract v2, ADR-0016).
+// `list_inventory` action (software-inventory blob contract v3, ADR-0016).
 //
-// The v2 contract: fields an ecosystem does not store stay EMPTY, never
+// The contract: fields an ecosystem does not store stay EMPTY, never
 // synthesised. Every function here is a pure string operation -- no popen, no
 // platform #ifdefs -- so the unit test (test_installed_apps_inventory.cpp)
 // exercises the exact code the plugin runs against per-ecosystem fixture
@@ -29,9 +29,9 @@
 namespace yuzu::installed_apps::inventory {
 
 // One `inv|` row. Member order == wire order after the prefix -- the blob
-// contract v2 field order the agent core hashes and the server re-parses:
+// contract v3 field order the agent core hashes and the server re-parses:
 //   name, version, publisher, install_date, kind, ecosystem, epoch, release,
-//   arch, signature_status, distro_id, distro_version
+//   arch, signature_status, distro_id, distro_version, install_location
 struct InvRecord {
     std::string name;
     std::string version;      // upstream version, release/revision stripped
@@ -58,6 +58,10 @@ struct InvRecord {
                                   // tamper detection.
     std::string distro_id;        // /etc/os-release ID (Linux rows only)
     std::string distro_version;   // /etc/os-release VERSION_ID (Linux rows only)
+    std::string install_location; // Windows InstallLocation, macOS the .app path, Linux empty (no
+                                  // single prefix). Wire token 14 (blob v3 slot 13). The agent
+                                  // core keeps it only under a known machine root, blanking any
+                                  // other value (installed_software_v3.hpp machine_install_location).
 };
 
 // Epoch/version/release triple shared by the deb and pacman splitters.
@@ -352,7 +356,22 @@ inline std::string pipe_safe(std::string_view v) {
     return out;
 }
 
-// The one place that knows the 13-token `inv|` row layout. Keep in lockstep
+// A path that holds '|' keeps its place in the row: the bar becomes U+FFFD (a visibly altered
+// path) rather than being deleted (which would silently merge two different directories);
+// tab, CR and LF are deleted as pipe_safe does.
+inline std::string install_location_safe(std::string_view v) {
+    std::string out;
+    out.reserve(v.size());
+    for (char c : v) {
+        if (c == '|')
+            out += "\xEF\xBF\xBD";
+        else if (c != '\t' && c != '\r' && c != '\n')
+            out.push_back(c);
+    }
+    return out;
+}
+
+// The one place that knows the 14-token `inv|` row layout. Keep in lockstep
 // with parse_installed_apps_output (agents/core/src/sync_source_installed_software.cpp).
 inline std::string format_inv_row(const InvRecord& r) {
     std::string out = "inv";
@@ -364,6 +383,8 @@ inline std::string format_inv_row(const InvRecord& r) {
         out.push_back('|');
         out += pipe_safe(f);
     }
+    out.push_back('|');
+    out += install_location_safe(r.install_location);
     return out;
 }
 

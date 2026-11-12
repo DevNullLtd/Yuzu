@@ -78,6 +78,8 @@ Preflight checks:
 7. `docker-compose.full-uat.yml` includes `--data-dir`
 8. `origin/dev` and `origin/main` are reconciled (no divergence either direction)
 
+Windows and macOS releases are agent-only (ADR-0035 ladder step 2): `release.yml` builds no Windows or macOS server and no `YuzuServerSetup`, and the Windows and macOS archives are `yuzu-agent-windows-x64.zip` and `yuzu-agent-macos-arm64.tar.gz`. `tests/test_release_agent_only.py` (Docs Lint and `meson test`) fails if a server build or an old archive name comes back, or if the archive names in `release.yml`, `scripts/check-release-artifacts.sh` and `scripts/build-agent-bundle.sh` disagree, so there is no hand check left for this. The first release after step 2 is also the first real run of the changed Windows and macOS jobs: watch them, especially the Windows "Verify the agent runs from the packaged archive" step.
+
 Optional `--full` adds a local C++ + Erlang compile (~2 min).
 
 **Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).
@@ -236,7 +238,9 @@ Match the failure against this table. **All entries have happened in real Yuzu r
 | `Run EUnit tests` fails with non-zero exit + "Failed: 0" in log | meck fixture cancellation false-positive (known #336/#337 class) | The step's parser (`scripts/gateway_test_summary.py cancel-tolerant`) tolerates this — it passes with a `::warning::` **only when the last summary is eunit's `Failed: 0` line with `Passed: N` nonzero** (some sets cancelled, the rest ran). If it doesn't, paste the eunit.log tail and check if a new module is leaking processes. |
 | `Run EUnit tests` fails with `::error::EUnit printed no recognisable test summary` | rebar3 failed before any test ran (compile/dependency error), or its summary wording changed | Read the eunit.log head for the rebar3 error; if the wording changed, update `scripts/gateway_test_summary.py` (all gateway test gates share it). |
 | `Run EUnit tests` fails with `::error::EUnit executed zero tests` | Every EUnit set was cancelled or nothing was discovered (`Failed: 0.  Skipped: 0.  Passed: 0.`). Before #4800 this passed with only a `::warning::` | **Intentional hard fail — do not work around it.** Nothing was tested. Find the setup that crashes in every module (paste the eunit.log head) or the moved test dir. |
-| `Linking target server/core/yuzu-server` fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, then "Re-run failed jobs" on the newest run; see Recovery. Long-form: see `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
+| `Linking target agents/core/yuzu-agent` (or `yuzu_agent_core.dll`) fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, then "Re-run failed jobs" on the newest run; see Recovery. Long-form: see `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
+| `Verify the agent runs from the packaged archive` fails on `build-windows` | The Windows agent archive lacks a DLL the agent or `yuzu_agent_core.dll` imports (exit `-1073741515`, STATUS_DLL_NOT_FOUND), lacks plugin DLLs, contains `yuzu-server.exe`, or the agent hung (the step kills it after 60 s) | Read the step log. A transient cause (a hang, a runner problem): "Re-run failed jobs" on the newest run, as in Recovery above. A real packaging defect needs a commit, then re-tag as Recovery describes. No GitHub Release exists yet, but the docker-publish jobs do not wait for `build-windows`, so this tag's images may already be pushed |
+| `Notarize binaries` fails with "notarization status is 'Invalid'" on `build-macos` | Apple rejected the agent binary or a dylib (only once `MACOS_SIGNING_CERT` is set; macOS signing is dormant until then) | `xcrun notarytool log <id>` with the id printed in the step log (the step prints the notarization result). Fix the signing with a commit, then re-tag as Recovery describes. No GitHub Release exists yet, but this tag's images may already be pushed |
 
 For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed ("Re-run failed jobs" on the newest run; see Recovery — or a fix and re-tag, or abort).
 
@@ -253,10 +257,9 @@ Required assets (the `--verify` mode of this skill checks each):
 ```
 yuzu-linux-x64.tar.gz
 yuzu-gateway-linux-x64.tar.gz
-yuzu-windows-x64.zip
+yuzu-agent-windows-x64.zip
 YuzuAgentSetup-X.Y.Z.exe
-YuzuServerSetup-X.Y.Z.exe
-yuzu-macos-arm64.tar.gz
+yuzu-agent-macos-arm64.tar.gz
 YuzuAgent-X.Y.Z-macos-arm64.pkg
 yuzu-server_X.Y.Z_amd64.deb
 yuzu-server-X.Y.Z-1.x86_64.rpm

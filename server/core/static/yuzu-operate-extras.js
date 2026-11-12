@@ -901,7 +901,7 @@
                'inside a name such as updated_at or created_by.'],
         fields: [{ name: 'sql', label: 'SQL (SELECT only)', type: 'textarea', rows: 6,
                    maxlength: 4096, required: true,
-                   placeholder: "SELECT name, pid FROM process_live WHERE name = 'chrome.exe'" }],
+                   placeholder: "SELECT name, start_count FROM process_hourly WHERE name = 'chrome.exe'" }],
         submitLabel: 'Review'
       }).then(function (v) {
         if (!v) return;
@@ -1089,7 +1089,7 @@
             { name: 'parent', label: 'Parent scope', type: 'select', options: parents },
             { name: 'sql', label: 'SQL (SELECT only)', type: 'textarea', rows: 6,
               maxlength: 100000, required: true,
-              placeholder: "SELECT DISTINCT pid FROM process_live WHERE name = 'chrome.exe'" },
+              placeholder: "SELECT DISTINCT name FROM process_hourly WHERE name = 'chrome.exe'" },
             { name: 'name', label: 'Name (optional)', type: 'text', maxlength: 120 },
             { name: 'empty', label: 'Devices that return 0 rows', type: 'select', options: [
               { label: 'Leave out', value: 'no' }, { label: 'Include', value: 'yes' }] }

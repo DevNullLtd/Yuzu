@@ -2,9 +2,12 @@
 
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "mcp_retry.hpp"   // mcp::kMcpStoreFaultRetryMs: the shared transient-fault retry floor
 #include "query_int_parse.hpp"
+#include "rbac_text.hpp" // rbac_text_is_clean: the shared clean-identifier predicate
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
+#include "utf8_sanitize.hpp" // sanitize_utf8_strict: keeps error bodies serialisable
 
 #include <nlohmann/json.hpp>
 
@@ -13,6 +16,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server::schedule {
 
@@ -37,6 +41,89 @@ std::optional<std::string> read_schedule_int(const nlohmann::json& j, const char
                std::to_string(hi);
     out = static_cast<int>(*v);
     return std::nullopt;
+}
+
+/// Writes the file's A4-style error envelope (the same shape as the 503 "service unavailable"
+/// answers below) with the given status and message.
+void send_error(httplib::Response& res, int status, std::string_view message) {
+    res.status = status;
+    res.set_content(
+        nlohmann::json({{"error", {{"code", status}, {"message", std::string(message)}}},
+                        {"meta", {{"api_version", "v1"}}}})
+            .dump(),
+        "application/json");
+}
+
+/// A path id is an identifier: a NUL, other control byte or DEL is refused before any store call.
+[[nodiscard]] bool schedule_id_is_clean(const std::string& id) noexcept {
+    return rbac_text_is_clean(id);
+}
+
+/// Why an owner-scoped write (`delete_schedule`, `set_enabled`) reported "no row changed".
+enum class MissCause {
+    NotFound,   ///< the store answered and the caller owns no such schedule
+    StoreFault, ///< the store could not answer, or the caller's own row exists but was not written
+};
+
+/// The engine's write methods return a bare bool, so a store fault and an absent row look the
+/// same. Classify a false result with one owner-filtered point read by (id, owner), independent
+/// of any listing cap: an unreadable store, or a row that exists and belongs to `user`, is a
+/// store fault (the write did not apply to a row it should have matched). Only an answered read
+/// that shows no such owned row is NotFound (a row owned by someone else is deliberately the
+/// same answer, so ids cannot be probed across owners).
+[[nodiscard]] MissCause classify_write_miss(const ScheduleEngine& engine, const std::string& id,
+                                            const std::string& user) {
+    switch (engine.owned_schedule_exists_checked(id, user)) {
+    case OwnedScheduleLookup::Absent:
+        return MissCause::NotFound;
+    case OwnedScheduleLookup::Exists:
+    case OwnedScheduleLookup::Unreadable:
+        break;
+    }
+    return MissCause::StoreFault;
+}
+
+/// True when `create_schedule` failed because the store could not take the write (not the
+/// request). `kScheduleCreateValueRefusedError` (a field value the store refused as invalid text
+/// or as violating a constraint) and every request-validation text are answered 400 instead.
+[[nodiscard]] bool create_error_is_store_fault(const std::string& err) {
+    return err == kScheduleCreateNotOpenError || err == kScheduleCreateInsertFailedError;
+}
+
+/// A NUL byte in a free-text create field (the store cannot hold one).
+[[nodiscard]] bool contains_nul(const std::string& s) noexcept {
+    return s.find('\0') != std::string::npos;
+}
+
+/// The 503 for a create whose write ran and whose transaction did not report success: the
+/// schedule may or may not exist. Carries NO `retry_after_ms`: the answer tells the client to
+/// look at the stored schedules before it acts again.
+void send_create_outcome_unknown(httplib::Response& res) {
+    res.status = 503;
+    res.set_content(
+        nlohmann::json(
+            {{"error",
+              {{"code", 503},
+               {"message", "schedule create outcome unknown: the schedule may or may not exist; "
+                           "list schedules before creating it again"},
+               {"outcome", "unknown"}}},
+             {"meta", {{"api_version", "v1"}}}})
+            .dump(),
+        "application/json");
+}
+
+/// The 503 for a store fault: the same A4 envelope as `send_error` plus the shared transient-fault
+/// `retry_after_ms` hint.
+void send_store_fault(httplib::Response& res) {
+    res.status = 503;
+    res.set_content(
+        nlohmann::json({{"error",
+                         {{"code", 503},
+                          {"message", "schedule store unavailable"},
+                          {"retry_after_ms", mcp::kMcpStoreFaultRetryMs}}},
+                        {"meta", {{"api_version", "v1"}}}})
+            .dump(),
+        "application/json");
 }
 
 } // namespace
@@ -138,6 +225,22 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             sched.time_of_day = j.value("time_of_day", "00:00");
             sched.scope_expression = j.value("scope_expression", "");
             sched.requires_approval = j.value("requires_approval", false);
+            // A NUL byte cannot be stored in a text column: refuse it here, before the engine,
+            // so the answer is a client error with a denied row rather than a store fault.
+            for (const std::string* field :
+                 {&sched.name, &sched.definition_id, &sched.frequency_type, &sched.time_of_day,
+                  &sched.scope_expression}) {
+                if (contains_nul(*field)) {
+                    (void)deps.audit_fn(req, "schedule.create", "denied", "schedule", "",
+                                        "field_contains_nul");
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", "a schedule field must not contain a NUL byte"}})
+                            .dump(),
+                        "application/json");
+                    return;
+                }
+            }
             // Strict integers with the documented ranges (#4644): a wrapped or fractional value
             // used to become a different, valid-looking schedule, and nothing is created on a 400.
             for (const auto& err :
@@ -191,6 +294,21 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
 
             auto result = deps.schedule_engine->create_schedule(sched);
             if (!result) {
+                if (result.error() == kScheduleCreateOutcomeUnknownError) {
+                    (void)deps.audit_fn(req, "schedule.create", "failure", "schedule", "",
+                                        "outcome_unknown");
+                    send_create_outcome_unknown(res);
+                    return;
+                }
+                if (create_error_is_store_fault(result.error())) {
+                    (void)deps.audit_fn(req, "schedule.create", "failure", "schedule", "",
+                                        "store_error");
+                    send_store_fault(res);
+                    return;
+                }
+                if (result.error() == kScheduleCreateValueRefusedError)
+                    (void)deps.audit_fn(req, "schedule.create", "denied", "schedule", "",
+                                        "invalid_field_value");
                 res.status = 400;
                 res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                 "application/json");
@@ -201,9 +319,18 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Schedule created","level":"success"}})");
             res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
-        } catch (const std::exception& e) {
+        } catch (const nlohmann::json::parse_error&) {
+            // A fixed text: the parser's own message can quote the offending input, including a
+            // byte that is not valid UTF-8, which `dump()` would then refuse to serialise.
             res.status = 400;
-            res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
+            res.set_content(nlohmann::json({{"error", "invalid JSON in request body"}}).dump(),
+                            "application/json");
+        } catch (const std::exception& e) {
+            // Scrubbed to valid UTF-8 so the error body can always be serialised.
+            res.status = 400;
+            res.set_content(
+                nlohmann::json({{"error", sanitize_utf8_strict(e.what())}}).dump(),
+                "application/json");
         }
     });
 
@@ -220,6 +347,12 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
+        if (!schedule_id_is_clean(id)) {
+            (void)deps.audit_fn(req, "schedule.delete", "denied", "schedule", "",
+                                "invalid_schedule_id");
+            send_error(res, 400, "invalid schedule id");
+            return;
+        }
         // An interim deny_service_scoped_schedule() call used to sit here
         // (delete_schedule is username-owner-scoped below, and a
         // service-scoped token shares its creating principal's username —
@@ -243,6 +376,11 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
             (void)deps.audit_fn(req, "schedule.delete", "success", "schedule", id, "");
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Schedule deleted","level":"success"}})");
+        } else if (classify_write_miss(*deps.schedule_engine, id, user) ==
+                   MissCause::StoreFault) {
+            (void)deps.audit_fn(req, "schedule.delete", "failure", "schedule", id, "store_error");
+            send_store_fault(res);
+            return;
         }
         res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
     });
@@ -298,15 +436,30 @@ void register_schedule_routes(HttpRouteSink& sink, Deps deps) {
         // value — a real, pre-existing, NOT-yet-fixed gap this retirement
         // discovered but does not resolve; see #3378.
 
+        const char* const audit_action = enabled ? "schedule.enable" : "schedule.disable";
+        if (!schedule_id_is_clean(id)) {
+            (void)deps.audit_fn(req, audit_action, "denied", "schedule", "",
+                                "invalid_schedule_id");
+            send_error(res, 400, "invalid schedule id");
+            return;
+        }
+
         // M-01 (#1806): owner-scoped enable/disable, same as delete above.
         auto session = deps.resolve_session_fn(req);
         auto user = session ? session->username : std::string();
-        bool changed = deps.schedule_engine->set_enabled(id, enabled, user);
-        if (changed) {
-            // L-04 (#1806): enable/disable had no audit trail at all.
-            (void)deps.audit_fn(req, enabled ? "schedule.enable" : "schedule.disable", "success",
-                                "schedule", id, "");
+        const bool changed = deps.schedule_engine->set_enabled(id, enabled, user);
+        if (!changed) {
+            // No row changed: answer what actually happened, never the requested state.
+            if (classify_write_miss(*deps.schedule_engine, id, user) == MissCause::StoreFault) {
+                (void)deps.audit_fn(req, audit_action, "failure", "schedule", id, "store_error");
+                send_store_fault(res);
+                return;
+            }
+            send_error(res, 404, "schedule not found");
+            return;
         }
+        // L-04 (#1806): enable/disable had no audit trail at all.
+        (void)deps.audit_fn(req, audit_action, "success", "schedule", id, "");
         res.set_content(nlohmann::json({{"enabled", enabled}}).dump(), "application/json");
     });
 }
