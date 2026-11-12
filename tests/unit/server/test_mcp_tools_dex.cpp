@@ -573,7 +573,7 @@ TEST_CASE("dex score policy mcp: the three tools are served with their security 
             CHECK(desc.find("NOT your stored policy") != std::string::npos);
         }
         if (e["name"] == "set_dex_score_policy") {
-            CHECK(desc.find("rolling upgrade") != std::string::npos);
+            CHECK(desc.find("unsupported_version") != std::string::npos);
         }
         if (e["name"] == "reset_dex_score_policy") {
             CHECK(desc.find("gates this MCP tool, not the capability") != std::string::npos);

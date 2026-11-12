@@ -344,7 +344,7 @@ TEST_CASE("writer: version 3 is refused with the reader's own wording",
     const auto r = w.put("default", R"({"version":3})");
     CHECK(r.status == St::Invalid);
     CHECK(r.message == "unsupported_version at version: 3 above the supported 2");
-    // The refusal says what to do: a rolling upgrade can leave a newer document stored.
+    // The refusal says what to do: a newer build can have written the stored document.
     CHECK(r.remediation.find("version 2") != std::string::npos);
     CHECK(r.remediation.find("leave the stored document alone") != std::string::npos);
 }

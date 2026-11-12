@@ -142,9 +142,7 @@ on the step-up routes, approvals and JIT elevation until `yuzu-server --mfa-rese
 
 **What to do.** Nothing is required to keep a working integration working. No database-schema or persisted-state migration is needed. A client that validates responses strictly must accept the new fields, and should adopt them only once every replica is upgraded.
 
-**Rolling upgrade.** The new keys are produced per replica. A replica that has not been upgraded does not send them, so during the roll a consumer can receive a body without `uncertain_guards`, `unrepresented_pending_guards` or `unrepresented_pending_rule_ids`. A missing key means unknown and is never `0`; a consumer that defaults it to `0` would render a false clean state for a device that has pending evidence. Adopt the new fields only once every replica is upgraded.
-
-**Rollback.** Rolling back removes the new keys and the lens notice, and the device reads stop reporting pending evidence that has no census row. No data changes in either direction, so nothing needs converting.
+**Missing keys.** A missing `uncertain_guards`, `unrepresented_pending_guards` or `unrepresented_pending_rule_ids` means unknown and is never `0`; a consumer that defaults it to `0` would render a false clean state for a device that has pending evidence.
 
 ## ⚠️ Breaking: a deprovision whose credential revoke does not persist is now a 500 and the account stays active (#4772)
 
@@ -189,9 +187,6 @@ start**.
   failure; the lines above it carry the PostgreSQL error.
 - **`/readyz`** includes `revocation_source_store` in its gating checks; a node that did not open it
   does not serve.
-- **Rolling back** to an older server leaves the `revocation_source_store` schema in place; the older
-  binary ignores it. Nothing is dropped, and upgrading again reuses it (registrations, and the CAs'
-  anti-rollback marks, survive a rollback).
 - **Four new step-up routes and 39 securable types.** The four mutating routes are step-up gated (41 gated
   routes in total), and RBAC now seeds a `RevocationSource` securable (Administrator only; see
   [RBAC](rbac.md)). Nothing is fetched yet: this release registers CRL sources only.
@@ -248,7 +243,6 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - **Setting it:** `export YUZU_GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 16)"` (bash, zsh), `$env:YUZU_GRAFANA_ADMIN_PASSWORD = [guid]::NewGuid().ToString('N')` (PowerShell), or a `YUZU_GRAFANA_ADMIN_PASSWORD=<value>` line in a `.env` next to the compose file. Keep it out of git and keep the same value across shells.
 - **An existing Grafana keeps its old password.** Grafana reads the variable only when it first creates its database, so on an existing `grafana-data` (development and root UAT files) or `grafana-uat-data` (the two `deploy/docker/` UAT files) volume, setting it changes nothing, and a stack started from the previous files still accepts `admin`/`admin` on port 3000, on every interface. After upgrading, change it with the variable set: `docker compose exec grafana grafana cli admin reset-admin-password '<new password>'`, or remove the volume (`down -v`, which also deletes Grafana's own dashboards and settings). The UAT launchers' `start` runs `down -v` and so resets it.
 - **Stopping a stack whose password you no longer have:** `down`, `ps` and `logs` accept any non-empty value: `YUZU_GRAFANA_ADMIN_PASSWORD=x docker compose -f <file> down` (the root `docker-compose.uat.yml` also needs a non-empty `YUZU_GW_COOKIE`, and `docker-compose.full-uat.yml` run by hand also needs `UAT_CONFIG`). Plain `docker stop` needs nothing.
-- **Rolling back:** the previous files run again unchanged; a password set with `reset-admin-password` stays in Grafana's database.
 - Details: [Server administration](server-admin.md), "Grafana admin password".
 
 ## ⚠️ Breaking: policy YAML is read as written whatever its line endings; lists it cannot read are refused (#2123)
@@ -297,8 +291,6 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 **Before you upgrade.** Search those stores for `WITH`, `NATURAL`, `USING`, a `$` that is not a `$Table_Name` placeholder, or any of `? : @ #`, outside string literals, and rewrite the queries.
 
 **Mixed fleet.** An agent that is not yet upgraded still answers these queries, so one stored query answers differently per agent version. Compare a result set's `device_count` with the source execution's `agents_failure` to see whether agents refused it.
-
-**Rolling back.** Clean: nothing is stored differently, and an older agent accepts the queries again.
 
 ## ⚠️ Breaking: stored response rows are capped per command and device (256 by default) (#561)
 
@@ -519,8 +511,6 @@ The `GET` deny runs after the kill switches, the `Origin` check, the protocol-ve
 
 **Switching class strands sessions.** The per-principal session cap (fixed at 8; there is no flag for it) counts by principal, not by class. A client that switches class keeps its old-class sessions counted until the 30-minute idle TTL passes (a stranded session that still has an attached stream is kept alive by the stream's per-tick liveness check, which slides the TTL, until that stream disconnects), so the new class can meet `-32010` (`429`, "Session limit reached"). The `-32010` hint to end an unused session via `DELETE` cannot be followed by a client that has switched class, because the `DELETE` answers `404`. Recover by sending `DELETE` with the old credential, by waiting out the idle TTL once no stream is attached, or by restarting the server; there is no administrator reap path.
 
-**Rolling upgrade.** The class binding and the `GET` deny are enforced per replica. A replica that has not been upgraded yet still has the old behaviour, so finish the roll promptly.
-
 ## New: v1 REST and MCP twins for command dispatch, execution cancel and rerun, and stored-definition execute (#2146)
 
 Additive, apart from one change to existing behaviour (the MCP approval-ticket mint's pending-approval cap, below); no
@@ -610,17 +600,6 @@ What an operator should know:
   `instruction_execute` and `mcp` (`metrics.md`). The platform events `command.dispatched`, `execution.created`, `execution.completed`,
   `approval.created` and `instruction.executed` are also published by the new twins (`analytics-events.md`).
 
-**Rolling upgrade.** Every check here is per replica. A replica that has not been upgraded does not serve the new
-REST routes (`404`) or the new MCP tools, so a client or load balancer can meet either behaviour during the roll:
-adopt the new routes only once every replica is upgraded. The mint-cap change above, and the new `requested` and
-`pending` audit results, likewise appear only from upgraded replicas, so a mixed-version roll writes the old mint
-rows and the new ones side by side.
-
-**Rollback.** Rolling back to the previous build removes the new routes and tools (clients get `404`, or the tool
-is unavailable) and restores the old fail-open mint cap and its old refusal wording. This change adds no database
-migration or schema change in either direction; execution rows, approvals and audit rows already written stay in
-place.
-
 ## Behaviour change: result-set producers refuse a gated definition action for a non-administrator (#2146)
 
 **What changed.** `create_result_set_from_instruction_result` and `reevaluate_result_set` (MCP) no longer stamp ticket provenance on the dispatch, so a consumed supervised-tier approval ticket is no longer approval for the `plugin.action` of the stored definition they run. If that action is gated (admin or approval), a non-administrator caller is refused with `-32003` and `error.data.reason = approval_required` (permanent, `retry_after_ms` null), and no execution record is created. `create_result_set_from_echo_query` and `execute_bundle` are unchanged.
@@ -628,10 +607,6 @@ place.
 **Who is affected.** Supervised-tier (ticket-then-recall) tokens that ran a gated action through these two tools: the ticket is still minted and approved, but the recall now refuses, and the ticket is spent. Operator-tier tokens whose owner is not an administrator were already refused by the dispatch gate and now receive the explicit reason instead of a generic "no agents reached" error.
 
 **What to do.** Run the call with an administrator token, or ask an administrator to change the definition to a non-gated action.
-
-**Rolling upgrade.** The check is enforced per replica. A replica that has not been upgraded still honours a consumed supervised-tier ticket on these two tools, so the fix holds across the cluster only once every replica is upgraded; until then the same recall can run on one replica and be refused (`-32003`, `approval_required`) on another.
-
-**Rollback.** Rolling back restores the old behaviour: a ticket again lifts the gate of a stored definition's action, including one repointed after the ticket was approved. No data changes in either direction.
 
 ## Behaviour change: supervised-tier approval tickets bind the resolved definition effect (#2146)
 
@@ -645,7 +620,7 @@ The ticket for `execute_instruction_definition`, `create_result_set_from_instruc
 
 **What to do.** Run the workflow through the MCP tool `execute_workflow`, which takes an approval ticket (`-32006` with an `approval_id`, approval, recall), or from a session or an API token without an MCP tier, or run its steps one at a time through `execute_instruction`, which is approval-gated per step. Do not remove the tier from a token that does other work only to run workflows: the tier constrains every other operation that token performs.
 
-**Rollback.** There is no supported rollback of this release (see the Rollback paragraph of "workflow execution is capped per principal and idempotent on a client key" below, and "Deployment contract (hard cutover)"). This gate on its own changes no data, but an earlier build lets a `supervised` token run a workflow without a ticket again.
+**Rollback.** There is no supported rollback of this release (see "Deployment contract (hard cutover)"). This gate on its own changes no data, but an earlier build lets a `supervised` token run a workflow without a ticket again.
 
 ## ⚠️ Breaking: workflow execution is capped per principal and idempotent on a client key (#2146)
 
@@ -707,10 +682,6 @@ Minting is a cookie-session write: it needs a same-site `Origin` or `Referer` (s
 
 **Residual closed.** The #4754 section above noted that a non-elevated cookie session that obtained an elevated cookie session's `Mcp-Session-Id` could receive that session's replayed frames. Cookie sessions can no longer hold an `/mcp/v1/` session at all, so that path is closed.
 
-**Rolling upgrade.** The check is enforced per replica. A replica that has not been upgraded yet still admits tierless callers, so finish the roll promptly. Mint tiered tokens and switch clients to them before you start the roll: a tierless client behind a load balancer would otherwise see intermittent `403` and `200` answers while upgraded and old replicas serve it side by side.
-
-**Rollback.** Rolling a replica back to the previous build reopens the gap on that replica: it admits tierless callers again. No data changes with this feature (no schema, no stored state), and there is no flag to restore or remove.
-
 ## Behaviour change: a malformed engine rotation pair is a terminal 409, a rotate on stale linkage is refused, and engine revoke audit detail (#6716)
 
 **What changed.** Confirming a rotation for an engine principal that has two active credentials which are not a linked rotation pair (the stored rows are malformed) now answers `409` (REST `POST /api/v1/engine-principals/{id}/credentials/confirm`) and `kInvalidParams` (MCP `confirm_engine_rotation`). It used to answer a retryable `503` (`kInternalError` over MCP), although no retry can repair it. The metric `yuzu_engine_principal_confirm_total` moves with it: that case now counts under `result="conflict"`, no longer `transient`. Separately, a rotate (`POST .../credentials/rotate`) that finds one active credential still carrying unresolved rotation metadata, for example after its predecessor was revoked out of band, now answers `409` (REST) or `kInvalidParams` (MCP `rotate_engine_credential`) instead of minting a second successor. Before this change that rotate answered success (`200` on REST) with a new secret, and the success itself produced the malformed pair; a script that rotated a sole stale credential and treated success as done will now see the refusal. The remedy is to `GET` the principal, inspect the credential, and (only if it is confirmed stale) revoke it with `DELETE /api/v1/tokens/{token_id}` and mint a fresh one. The engine `rotate`, `confirm` and `DELETE /api/v1/engine-principals/{id}` routes also now send `Retry-After: 2` and `retry_after_ms: 2000` on their retryable `503`s, and the MCP `confirm_engine_rotation` tool sends `retry_after_ms: 5000` on retryable errors (none on terminal ones). Two more changes touch `DELETE /api/v1/engine-principals/{id}`. When the identity revoke reports that nothing was done, the route now reads the principal again: if a concurrent revoke already finished, the answer is `200` where it used to be `503`, and the success audit row's detail is `credentials_revoked=<N>; revoked_by_concurrent_request` (plus `; superseded_by_not_persisted` if `superseded_by` was sent). The failure audit row for an identity revoke that failed after the credentials were revoked now ends `; credentials_revoked=<N>`. The old failure detail `store_unavailable`, which both surfaces wrote when the identity revoke reported that nothing was done, is gone. It is replaced by `revoke matched no active row but the principal is still active; credentials_revoked=<N>`, or, when the re-read finds the principal gone or cannot read it, `revoke matched no active row and the principal is no longer found; credentials_revoked=<N>` and `revoke matched no active row and the re-read failed: <reason>; credentials_revoked=<N>`. A SIEM or alert rule that matches the exact `detail` text of `engine_principal.revoke` rows (including one that matches `store_unavailable`) should be reviewed. The MCP tool `revoke_engine_principal` now matches the REST route on the failure rows and the race: the count in the failure row, the re-read, and the idempotent success are new. Its normal success row still differs from REST: REST writes the credential count (`credentials_revoked=<N>`), MCP writes the sanitised `reason`. That `detail` is now the `reason` with spaces, `=`, `,` and control bytes replaced by `_` (it was the raw text), and a concurrent-revoke row appends `; reason=<sanitised reason>`. The REST success row's `superseded_by=` value is sanitised the same way. A sanitised reason cannot forge the `credentials_revoked=` count, but it can still contain the text `revoked_by_concurrent_request`, so match the race row on its `credentials_revoked=<N>; revoked_by_concurrent_request` prefix. The `revoke_engine_principal` tool's retryable errors already carried `retry_after_ms: 5000` before this change, so that is not new.
@@ -759,8 +730,6 @@ Minting is a cookie-session write: it needs a same-site `Origin` or `Referer` (s
 
 **Not changed.** After you assign or remove a role, the page redraws only the Role assignments panel, so the enforcement switch can lag until the next reload (for example after granting yourself `Administrator`). Reload the page. Also unchanged: with enforcement off, a local administrator account that holds no `Administrator` grant is still drawn a live switch, and turning enforcement on is refused with a `409` ("assign yourself Administrator first"). See "Why is a control disabled or missing?" in [RBAC](rbac.md).
 
-**Rollback.** Rolling back restores the account-role hint; no data is migrated.
-
 ## ⚠️ Breaking: the Settings Engine Principals panel needs EnginePrincipal:Read; an account administrator without it is refused (#5882)
 
 **What changed.** The Settings **Engine Principals** panel (`GET /fragments/settings/engine-principals`) used to admit exactly the callers the `/settings` page admits (an effective administrator). It now gates on `EnginePrincipal:Read`, the permission the REST route and the `list_engine_principals` MCP tool already use. The panel applies the same permission test as the route and differs from it in the ways listed under "Where the panel and the route differ", none of which admits a caller the route refuses. No permission, role or topology-floor entry changed.
@@ -791,10 +760,6 @@ Minting is a cookie-session write: it needs a same-site `Origin` or `Referer` (s
 
 **Audit.** A successful roster read now writes one `engine_principal.list` row with `result=success` and `count=<principals>`, as the route does; before, the panel wrote none. An engine session that holds the permission is refused with `result=denied`, `detail=engine_session_denied`, and an MCP-tier token with `detail=mcp_session_denied`. A refused browser session now writes no denial row on the panel (it loads on every page view; the old administrator gate wrote an `auth.admin_required` row for a refused non-administrator); a refused API token or engine credential still writes one, now as `auth.permission_required` where the old gate wrote `auth.admin_required`. The Detail check is one more permission test, made only when the roster holds a revoked principal: an API token that passes `EnginePrincipal:Read` but lacks `AuditLog:Read` writes one denied `auth.permission_required` row (its detail names `AuditLog:Read`) on that view although the view is served, and a browser session in the same position writes none. This arises only with RBAC enabled: with it off, both permissions are floored to an effective administrator, who holds both. Searches for `auth.permission_required` denials will therefore see such a row beside a successful `engine_principal.list` row. The `403` the panel itself sends to an engine session or an MCP-tier token now carries `Cache-Control: no-store`, and its `200` responses (the roster, including one whose credential counts cannot be read, and the in-page notes for an absent engine-principal store and for an unreadable roster) now carry `Cache-Control: no-store, private` and `Vary: Cookie`, as the Access tokens panel's do; the REST route sends neither header (not one of the listed differences above, which cover permission, refusal, store-failure and audit).
 
-**Rolling upgrade.** During a rolling upgrade, a page served by a replica that has not been upgraded can sit on "Loading..." for a caller the upgraded replica refuses; reload (copy any credential secret shown on the page first) once every replica is upgraded.
-
-**Rollback.** Rolling back restores the administrator-only panel gate; no data is migrated.
-
 ## Behaviour change: the Settings Access reviews panel refuses engine principal sessions (#6744)
 
 **What changed.** The Settings **Access reviews** panel (`GET /fragments/settings/access-reviews` and its campaign view `GET /fragments/settings/access-reviews/campaign`) now answers `403` to an engine principal session, as every `/api/v1/access-reviews` route already did. Before, an engine principal that held `AccessReview:Read` through a custom role was refused by the routes but could read the grant table and campaign attestation rows through the panel. No permission, role or route changed.
@@ -804,10 +769,6 @@ Minting is a cookie-session write: it needs a same-site `Origin` or `Referer` (s
 **Audit.** A refused engine session writes one denied row with detail `engine_session_denied`: `access_review.list` for the panel, `access_review.get` for the campaign view, the verbs the routes use, each with an empty target as on the routes. A person's successful view still writes no row on this panel. The `403` carries `Cache-Control: no-store`.
 
 **Not changed.** The other Settings panels gated on a read permission alone (Access tokens, Management groups, Tag compliance) have REST read routes that do not refuse engine sessions, so their panels do not either. The Audit and reviews page (`/access/audit`), including its own Access tokens panel, already refused engine sessions.
-
-**Rolling upgrade.** The refusal applies per replica: until every replica is upgraded, an engine principal can still be served the panel by a replica that has not been.
-
-**Rollback.** Rolling back re-opens the exposure (an engine holding a custom `AccessReview:Read` role can again be served both panels); no data is migrated.
 
 ## ⚠️ Breaking: access-review attestations require the reviewer to differ from the subject of the grant, and every decision is kept (#4752)
 
@@ -847,15 +808,11 @@ This section applies to development and pre-release servers built with the #6535
 
 **What changed.** The fenced leader election mints its epoch as `GREATEST((GREATEST(timeline, previous_epoch >> 32) << 32) + counter, previous_epoch + 1)`, where the timeline is the Postgres WAL timeline of the primary the server is connected to and `previous_epoch` is the epoch already stored in `leader_elector.leader_state`. Every promotion of a streaming standby starts a new timeline, so a new leader's epoch is higher than a paused former leader's, even when the promotion lost the previous election (asynchronous replication, or a degraded non-strict quorum). The previous-epoch floor keeps a restore, `pg_upgrade` or logical-replication cutover onto a cluster with a lower timeline from minting below the stored value. The cases this still does not cover are listed in `docs/user-manual/ha-postgres.md` and ADR-2002 section 3. The safe-to-scale gate is not lifted by this change; running a second replica is still unsupported.
 
-**What you will see.** `yuzu_server_leader_epoch` and `leader_elector.leader_state.current_leader_epoch` jump from small numbers to values of at least 4294967297 on the first election after the upgrade. After a promotion of a cluster whose real timeline is ahead of the stored one (the normal case) `value >> 32` (the timeline part) rises by at least 1; the low 32 bits (`value & 4294967295`, the election count) keep counting, so do not read "a multiple of 4294967296" as the signature of a failover. In PromQL use `floor(yuzu_server_leader_epoch / 4294967296)` for the timeline part. Panels or alerts that assumed small integers or a +1 step per election need updating. One schema step runs automatically: the `leader_epoch_seq` sequence is capped at 4294967295 (about four billion elections); if it were ever reached (`yuzu_server_leader_acquire_failures_total{cause="epoch_record"}` rising), `ALTER SEQUENCE leader_elector.leader_epoch_seq RESTART` is a safe remedy. The same cause also appears if `leader_elector.leader_state.current_leader_epoch` was corrupted to exactly 9223372036854775807 (the maximum; a value one below it mints once and then fails): the server log line `failed to record epoch ... (server said: ...)` names the cause (`bigint out of range` or `reached maximum value of sequence`). Repair the row with `DELETE FROM leader_elector.leader_state WHERE lock_key = 'server_background_leader';` (the next election mints from the real timeline and the sequence), then run the `issuer_epoch` reset in the Rollback paragraph below (you can run it while the elector is retrying; it only matters if a larger epoch was already issued). `reached maximum value of sequence` is cured by the `ALTER SEQUENCE ... RESTART` above, not by the DELETE.
+**What you will see.** `yuzu_server_leader_epoch` and `leader_elector.leader_state.current_leader_epoch` jump from small numbers to values of at least 4294967297 on the first election after the upgrade. After a promotion of a cluster whose real timeline is ahead of the stored one (the normal case) `value >> 32` (the timeline part) rises by at least 1; the low 32 bits (`value & 4294967295`, the election count) keep counting, so do not read "a multiple of 4294967296" as the signature of a failover. In PromQL use `floor(yuzu_server_leader_epoch / 4294967296)` for the timeline part. Panels or alerts that assumed small integers or a +1 step per election need updating. One schema step runs automatically: the `leader_epoch_seq` sequence is capped at 4294967295 (about four billion elections); if it were ever reached (`yuzu_server_leader_acquire_failures_total{cause="epoch_record"}` rising), `ALTER SEQUENCE leader_elector.leader_epoch_seq RESTART` is a safe remedy. The same cause also appears if `leader_elector.leader_state.current_leader_epoch` was corrupted to exactly 9223372036854775807 (the maximum; a value one below it mints once and then fails): the server log line `failed to record epoch ... (server said: ...)` names the cause (`bigint out of range` or `reached maximum value of sequence`). Repair the row with `DELETE FROM leader_elector.leader_state WHERE lock_key = 'server_background_leader';` (the next election mints from the real timeline and the sequence), then reset the plugin enablement issuer epoch, which orders epochs and would otherwise keep the larger packed value and reject every enablement batch as fenced: connect to the Yuzu database as the application role (or the schema owner), for example `docker exec -it yuzu-postgres psql -U yuzu -d yuzu` (on the HA profile run it on the current primary: find it with `docker exec yuzu-ha-pg1 patronictl -c /run/patroni/patroni.yml list`, then `docker exec -it <primary node> psql -U yuzu -d yuzu`), and run `UPDATE plugin_config_store.enablement_meta SET issuer_epoch = 0 WHERE id = 1;`. You can run it while the elector is retrying; it only matters if a larger epoch was already issued, and nothing else reads that column. `reached maximum value of sequence` is cured by the `ALTER SEQUENCE ... RESTART` above, not by the DELETE.
 
 **New requirements for the server's election connection.** It must reach the read-write primary (not a standby, and not a transaction-mode pooler), and its database role must be allowed to run `pg_current_wal_lsn()` and `pg_walfile_name()` (the default for an ordinary role on PostgreSQL 16 and later; some managed services restrict WAL functions, so test `SELECT pg_walfile_name(pg_current_wal_lsn());` as the Yuzu role). If it cannot read the timeline the server logs `cannot read the Postgres timeline`, the elector stays closed, and the leader-only background passes (scheduled work, policy dispatch, quarantine reconcile, CRL re-publish) stay paused, on a single-replica deployment too. The failure is counted as `yuzu_server_leader_acquire_failures_total{cause="connect"}`, `YuzuLeaderNoLeader` fires after five minutes, and `/readyz` stays green. Fix the DSN or the role and the next election attempt recovers without a restart.
 
-**After a restore, `pg_upgrade` or cutover.** The previous-epoch floor handles a restore in which `leader_elector.leader_state` survives. A logical-replication cutover or a table-only restore does not carry the `leader_epoch_seq` sequence: the first election after it mints exactly the stored epoch plus one and advances the sequence (logged as `the leader_epoch_seq sequence was behind the stored leader_state epoch`), so later elections are separated by the sequence again. The repair needs `SELECT` and `UPDATE` on `leader_elector.leader_epoch_seq` (the role that created the schema has it; a split owner/runtime role may not, in which case the server logs "could not be advanced" and every election stays at the stored epoch plus one). You may run it yourself beforehand: `SELECT setval('leader_elector.leader_epoch_seq', GREATEST((SELECT current_leader_epoch & 4294967295 FROM leader_elector.leader_state WHERE lock_key = 'server_background_leader'), 1));`. The server logs a warning at each election while the stored epoch carries a higher timeline than the real one: fencing within the timeline is unaffected, but only the sequence (not the timeline) separates epochs against a lossy promotion until the real timeline reaches the stored one. The warning is expected to persist until then; on a single-replica deployment there is nothing to do and no second replica to protect. If `leader_state` was lost or recreated while `plugin_config_store.enablement_meta` was kept, run the reset below.
-
-**Rolling upgrade.** Upgrade every replica before relying on the new guarantee. While a build without this change can still win the election, it mints small epochs again: fencing within one timeline still works, but the lossy-promotion protection does not, and an older leader that takes over after a new-build leader has issued plugin-enablement batches has those batches rejected as fenced until the reset below is run or the upgrade finishes.
-
-**Rollback.** Rolling back to a build without this change keeps leadership working (an older build opens against the newer schema and its election mints a different epoch, which is all the equality fence needs; the epoch it mints is smaller, not larger, than the stored one). It is NOT safe for the plugin enablement store, which orders epochs: `plugin_config_store.enablement_meta.issuer_epoch` keeps the packed value and the older build then rejects every enablement batch as fenced. After the last new-build server has stopped, connect to the Yuzu database as the application role (or the schema owner), for example `docker exec -it yuzu-postgres psql -U yuzu -d yuzu` (on the HA profile run it on the current primary: find it with `docker exec yuzu-ha-pg1 patronictl -c /run/patroni/patroni.yml list`, then `docker exec -it <primary node> psql -U yuzu -d yuzu`), and run `UPDATE plugin_config_store.enablement_meta SET issuer_epoch = 0 WHERE id = 1;`. The symptom without it is enablement batches rejected as fenced; nothing else reads that column, and nothing in the server issues enablement batches yet, so today the wedge is latent.
+**After a restore, `pg_upgrade` or cutover.** The previous-epoch floor handles a restore in which `leader_elector.leader_state` survives. A logical-replication cutover or a table-only restore does not carry the `leader_epoch_seq` sequence: the first election after it mints exactly the stored epoch plus one and advances the sequence (logged as `the leader_epoch_seq sequence was behind the stored leader_state epoch`), so later elections are separated by the sequence again. The repair needs `SELECT` and `UPDATE` on `leader_elector.leader_epoch_seq` (the role that created the schema has it; a split owner/runtime role may not, in which case the server logs "could not be advanced" and every election stays at the stored epoch plus one). You may run it yourself beforehand: `SELECT setval('leader_elector.leader_epoch_seq', GREATEST((SELECT current_leader_epoch & 4294967295 FROM leader_elector.leader_state WHERE lock_key = 'server_background_leader'), 1));`. The server logs a warning at each election while the stored epoch carries a higher timeline than the real one: fencing within the timeline is unaffected, but only the sequence (not the timeline) separates epochs against a lossy promotion until the real timeline reaches the stored one. The warning is expected to persist until then; on a single-replica deployment there is nothing to do and no second replica to protect. If `leader_state` was lost or recreated while `plugin_config_store.enablement_meta` was kept, run the `issuer_epoch` reset given under "What you will see" above.
 
 ## New: fleet gauges and a sample alert for agents whose command-dedup store failed to open (#3663)
 
@@ -985,8 +942,6 @@ The agent now creates an empty file `guardian_boot_epoch.lock` in its `--data-di
 - To diagnose a report of "agent not enforcing rule X after upgrade", collect: the agent version (a build without this change forgets the rule, see Restart and rollback), the agent's `prefer_spark` setting, the server's policy generation against the one the agent reports, whether the last push to that agent was a delta, the agent's `guaranteed_state.reconcile` audit rows, and the agent log lines of the original failure listed above.
 
 **Restart and rollback.** The carried state lives in agent memory only. Restarting the agent discards it, but does not by itself repair what caused it. The agent re-arms its cached rules at boot and a rule that still cannot arm is recorded again, in which case it reports generation `0` with the companion tag `yuzu.guardian_boot_rearm_unresolved` rather than its persisted generation. A rule that was never persisted (a persist failure on the push) is not among the cached rules, and no reconcile follows while the agent's generation equals the server's, so send a full push for it. If the store fault that stopped the persist is still present, that full push fails partway too (see "No automatic full push follows" above), so fix the store first. Rolling an agent back to an earlier build restores the behaviour this change removes: an omitting delta forgets the unresolved rule and the generation can be acknowledged while the rule is unarmed. An agent on the earlier build also resets its arm counts on every replacement, so a falling `yuzu_fleet_guardian_arm_failed` after a rollback is not evidence of repair; compare agent versions. No data change is involved.
-
-**Rolling upgrades.** Agents that have not been upgraded keep the previous behaviour, and the fleet gauges sum agents that behave differently until all are upgraded. No server configuration or data migration is required; the server change is the metric HELP text.
 
 ## ⚠️ Breaking: seven runtime-config keys are administrator-only on `PUT /api/config/{key}`
 
@@ -2419,12 +2374,6 @@ is refused (`FAILED_PRECONDITION`, counted as
 - **Updated alert rules.** If you import `docs/prometheus/yuzu-alerts.yml`, re-import it: the
   `YuzuGatewaySessionHeldByOtherAgent` expression now also matches `op="announce_connected"`, and this
   release adds the metric `yuzu_server_gateway_route_session_dedup_total`.
-- **Rolling back** to the previous binary boots and works (it ignores the migration; its queries still
-  find the unique index), but the unique index now rejects its racing duplicate write as a generic
-  route-write error (`yuzu_server_gateway_route_write_failed_total{reason="db_error"}`, and
-  `YuzuGatewayRouteWriteFailed` after about 5 minutes if it persists). The old binary's `ProxyRegister`
-  then fails closed (`UNAVAILABLE`), while `announce_connected` stays fail-open: the in-memory placement
-  is not unpublished. The tombstones the migration wrote are not undone.
 
 **Action.** None for a normal upgrade. On a very large directory, schedule the first start for a quiet
 period and raise any startup probe timeout. To learn WHICH agents share a session id (the migration
@@ -2776,9 +2725,6 @@ with no management-group role then sees no agents. (2) Run the collector on an
 admin-owned token; while RBAC is off that token carries full admin authority, so
 prefer (1) for evidence collectors.
 
-**Rolling upgrade.** An older replica still serves the trail to non-admins until
-every replica is upgraded.
-
 **Bounded audit reads.** `GET /api/audit` now clamps `limit` to 1000 and returns
 `400` for an `offset` above 10000, matching `GET /api/v1/audit` and the MCP tool.
 Callers that paged deeper or asked for more than 1000 rows should narrow the
@@ -2846,10 +2792,7 @@ skipped when the IdP's key set is parsed, with the warning
   Before upgrading, confirm a break-glass account is named and enrolled, and that you can run
   `yuzu-server --break-glass-arm` on the server host (see "Hardened auth mode" below); the local-password
   path does not use the OIDC callback.
-- **Rollback.** There is no setting, flag or environment variable that lowers these checks; they are fixed
-  in the server. Rolling back to the previous release accepts such keys again (a weaker posture) and needs no
-  data change, because nothing is persisted. It is the recovery if you are locked out under `sso-only` with
-  no armed break-glass account.
+- **Fixed in the server.** No setting, flag or environment variable lowers these checks. If you are locked out under `sso-only`, see "Breaking the glass" and the `--auth-mode=standard` last resort in "Hardened auth mode".
 
 Also in this release (a fix, not a break): a token with no `kid` member is now checked against each usable
 signing key of the IdP in turn, at most the first 16 in the order published, instead of only the first. An
@@ -2954,7 +2897,7 @@ What you may notice:
 - A dashboard Baseline deploy or delete whose fan-out is abandoned because a store read degraded is audited `result=degraded` (detail containing `fan-out deferred to reconcile`) and shows a warning toast; the Baseline change itself is saved. The reconcile converges the fleet once the store recovers only if the generation bump succeeded.
 - `yuzu_server_guardian_agent_generation_ahead_total` rising: at least one agent holds a policy generation above the server's. It does not count agents, is sampled at most once a minute per replica, and the shipped alert `YuzuGuardianAgentGenerationAhead` (warning) fires on it. Follow the restore runbook in [Guaranteed State](guaranteed-state.md), which uses the raise operation above.
 
-**Rolling upgrades with more than one server.** A replica still on the previous release keeps the old behaviour (no budget, and a narrowed push on a degraded tag or property read) until it is upgraded. The REST, MCP and dashboard policy-bump fan-out now also aborts on a degraded tag or property read (#5610): REST answers `503`, MCP returns an internal error with a retry hint, and the dashboard answers `200` with a warning toast. A replica still on the previous release narrows the push instead.
+**Policy-bump fan-out.** The REST, MCP and dashboard policy-bump fan-out aborts on a degraded tag or property read (#5610): REST answers `503`, MCP returns an internal error with a retry hint, and the dashboard answers `200` with a warning toast.
 
 No config or data migration is required. The agent binary does change (the lower-generation refusal above); agents that have not been upgraded keep the previous behaviour.
 
@@ -3027,20 +2970,7 @@ indexed. To find a response that lost facets, search the server log (a `cap` or 
 logs a warning with its `response_id`); a `value_too_long` exclusion logs only at debug level, so at the
 default level only the counter shows it.
 
-**Rolling upgrade.** The change is server-only: there is no schema, configuration, agent or gateway step,
-the order in which replicas are upgraded does not matter, and rolling back is starting the previous
-server binary. What differs during a rollout:
-
-- **Ingest decides the facets.** A facet is lost, or kept, on whichever replica ingested the response. An
-  old replica that ingests a response carrying a value too long for the database index drops ALL facets
-  of that response; a new replica excludes only the long value and keeps the rest.
-- **Every replica reads the same table.** Every replica reads the same `response_facets` rows, so a group
-  built from a response that an OLD replica ingested is short whichever replica builds the group.
-  Upgrading the replica that serves the group does not repair it; use the workaround above.
-- **A typed filter with a NUL or invalid UTF-8 byte.** A new replica matches such a filter in the form it
-  is stored in; an old replica cuts a NUL filter short at the database (so it can match a different
-  value) and fails the read for invalid UTF-8, which shows as an unavailable count. During a rollout the
-  same request can therefore answer differently on different replicas.
+**Scope.** The change is server-only: there is no schema, configuration, agent or gateway step.
 
 See [`response-store.md`](response-store.md) (Facets are bounded).
 
@@ -3136,15 +3066,6 @@ enforces (the six above), and 13 more differ only in `description` text and enfo
 `yuzu_server_instruction_param_rejected_total{route="instruction_execute",reason}`. See
 [Audit log](audit-log.md) and [Metrics](metrics.md).
 
-**Rollback.** No migration and no schema change. Rolling the server back removes the check, and while replicas
-run different releases the same call can be refused by one and accepted by another. A release without the check
-still rewrites a stored schema in one case: a YAML-editor save on the older release writes `{}` over it, because
-that route builds the definition from the YAML alone. The other update routes of the older release (`PUT`,
-response templates) write back the schema they loaded. A definition that was hit this way is not validated, on
-this release or any other, until its schema is replaced (see
-[Replacing a stored parameter schema](instructions.md#replacing-a-stored-parameter-schema)); rolling forward
-does not restore it.
-
 ## Behaviour change: response routes parse numeric parameters strictly and exports are bounded (#4644, #4703)
 
 **Breaking for scripts that relied on a malformed value being silently misread.** On the legacy
@@ -3214,9 +3135,7 @@ final record rather than matching lines. There is no
 cursor: to read past a cap pull once per `agent_id`, or set `until` to the oldest `timestamp`
 received (inclusive, so de-duplicate on `id`).
 
-**Rolling upgrade.** Replicas on the old and the new build answer a malformed value differently
-(`200` versus `400`), so a client can see both during the rollout. No configuration or data
-migration is needed. Two new counters report the effect:
+**Counters.** No configuration or data migration is needed. Two new counters report the effect:
 `yuzu_server_response_param_rejected_total{surface}` and
 `yuzu_server_response_export_truncated_total{surface,cause}`
 ([Metrics](metrics.md#response-store-metrics)).
@@ -3463,8 +3382,6 @@ and the free-space guidance are in [Installed-Software Inventory](inventory.md) 
 
 **Breaking — the second first-run account and the Windows installer's `/OPERATOR_USER`/`/OPERATOR_PASS` are removed (#5343).** They were written to `yuzu-server.cfg` only and were never provisioned into the PostgreSQL auth store, so the account they created could never sign in. First-run setup now prompts for the administrator only, and a fresh Windows install that passes a non-empty `/OPERATOR_USER=` or `/OPERATOR_PASS=` is refused with **exit code 7** (nothing changed; an upgrade given `/OPERATOR_PASS=` still gets exit code 11, and an upgrade given `/OPERATOR_USER=` alone gets exit code 7). Remove both parameters from fresh-install command lines and create further accounts in Settings → User Management (`POST /api/settings/users`). Upgrades are unaffected: an existing installation keeps its accounts, and a leftover `yuzu-server.cfg` entry that has no stored account is reported by name in a warning at boot — delete that line.
 
-**Rolling upgrades with more than one server.** A server still on the previous release keeps checking `yuzu-server.cfg` first and caching hashes, so it can keep accepting an old password after a change or reset made on an upgraded server, and it has no password routes (`404`). Upgrade every server before using **Change password** / **Reset password**, or before relying on a password change to lock someone out.
-
 **Passwords over 1024 bytes stop working.** The new maximum applies at sign-in too: `/login` answers a password longer than 1024 bytes as a wrong password, without hashing it, and the attempt counts toward [account lockout](server-admin.md#server-cli-flags). An account whose existing password is longer than that (only possible if it was set outside the product, for example a hand-generated config entry) can no longer sign in. An administrator resets it to a shorter one (Settings → User Management → **Reset password**, then **Unlock** if it locked); if it is the only administrator, use the direct-SQL fallback in the [auth-db-recovery runbook](../ops-runbooks/auth-db-recovery.md#password-reset).
 
 **What to use instead.**
@@ -3482,17 +3399,6 @@ The plugin kill switch can now be narrowed per agent OS (`windows`, `linux`, `da
 `plugin_config_store` schema moves to v2 (`ALTER TABLE kill_switches ADD COLUMN os`). Existing
 plugin and action rows read back unchanged, so nothing flips on upgrade.
 
-- **Rollback.** v2 is an additive column and an older server starts on it without complaint (there
-  is no schema-ahead guard). A server older than this change ignores every `<plugin>@<os>` row:
-  per-OS OFF stops being enforced and its `GET` reports `enabled=true`.
-- **Mixed versions.** An older replica applies `PUT .../kill-switch?os=<os>` as the PLUGIN-LEVEL
-  row. `enabled=true` can therefore re-enable a plugin you stopped for the whole fleet, and
-  `enabled=false` stops the plugin on every OS. Set per-OS rows only after every replica runs this
-  build, and never write one from an older binary. After a rollback per-OS OFF rows stay stored
-  but are not enforced: if the plugin must stay stopped, set its plugin-level OFF row. Find your
-  rows in the `plugin_config.kill_switch.set` audit entries (`target_id`
-  `<plugin>[.<action>]@<os>`) and confirm each with `GET ...?os=<os>` once every replica is back on
-  this build.
 - **Limits.** An agent whose OS is unknown or empty is never withheld. The OS is what the agent
   reports and is matched exactly (`windows`, `linux`, `darwin`). The MCP pre-dispatch dry run cannot
   see the per-OS layer. Remote agents (connected through another replica) rely on the presence
@@ -3544,13 +3450,7 @@ deploy or heartbeat reconcile.
 
 Also be aware of:
 
-- **Rollback.** An older server has no exemption and honours stored OFF rows again, which can strand
-  a quarantine release or hold back a rule push. Before rolling back, `PUT enabled=true` on every
-  protective-pair OFF row you found (each layer and OS), then roll back.
-- **Mixed versions.** During a rolling upgrade an older replica still honours a held row (or a degraded store or
-  plugin-inventory gap) and refuses a protective dispatch while an upgraded replica delivers it, so the outcome depends on which replica serves the
-  heartbeat or the reconcile. Lifting a hold arms rules fleet-wide on the next reconcile, including
-  `enforce` rules, so expect a burst of arming rather than a gradual one.
+- **Lifting a hold.** When the hold ends, rules arm fleet-wide on the next reconcile, including `enforce` rules, so expect a burst of arming rather than a gradual one.
 - **Agents without the quarantine plugin.** The server no longer withholds a protective dispatch
   because the agent's reported plugin inventory lacks the plugin. `dispatch_confirmed` means the
   plugin registry **accepted the frame**; it is never proof of isolation. A
@@ -3579,9 +3479,6 @@ unchanged rules that motivated them runs only on the Spark path, which productio
   unchanged is not rewritten. A crash after the omitted rows are removed and before the carried
   rules are rewritten leaves the previous rows for carried rules until the next push (a restart then
   re-arms those, including a rule the push had disabled or changed).
-- **Rollback.** The row format is unchanged. An older agent reads the rows without complaint, and
-  its own full_sync clear-and-reinsert restores the old write pattern. A newer agent rewrites any
-  row whose bytes differ. There is no migration and a downgrade is safe.
 
 ## ⚠️ Docker Compose: copy `/etc/yuzu/certs` out of the server container before you recreate it (0.14.0 → 0.14.1, #5370)
 
@@ -3702,8 +3599,6 @@ volumes:
 ```
 
 A new named volume takes its owner from the image's `/etc/yuzu/certs`, which the `yuzu-server` image creates owned by `yuzu`, so a fresh install needs no `chown`. The chiselled `yuzu-server-chisel` image creates that directory only from 0.14.1; on 0.14.0 and earlier chiselled images a new volume is owned by root and the server cannot write to it. The demo stack (`docker-compose.demo.yml`) runs a one-shot `server-certs-init` service that gives the volume to the server user, so it also works with older chiselled images.
-
-**Rolling back.** To return to 0.14.0, change only the image tag/`YUZU_VERSION`; keep the 0.14.1 compose with its `server-certs` line. Reverting the compose file strands the keys on the undeclared volume, and `down -v` under the old file deletes Postgres while leaving the keys.
 
 **If the server is failing with `kek_unresolvable`.** Work out which failure it is before you touch anything; several of them leave the keys intact, and only the last one means they are gone. These checks change nothing:
 
@@ -3918,11 +3813,6 @@ plus one new prerequisite.**
   /api/v1/execution-statistics/agents` was listed here and is now confined; see "Behaviour change:
   per-agent execution statistics are confined to the caller's scope (#3526)".)
 
-**Rollback.** Redeploy the previous binary. The plain `Execution:Read` gate returns, so
-group-scoped-only operators go back to `403` on the fragment. The `visible_agents` filter is a
-read-time parameter with no stored state, so there is nothing to migrate or clean up. Audit rows
-already written with `result=denied` for `mcp.summarize_working_set` remain in the audit store.
-
 ## Behaviour change: service-scoped tokens, the `ITServiceOwner` ceiling on the fleet-read gate, and `GET /api/v1/upload-grants` (#3526)
 
 Two chokepoints let a service-scoped API token reach more than the `ITServiceOwner` role allows (found
@@ -4000,9 +3890,6 @@ wait was up to about 500 ms, not 2 s (a pool that saturated only after the call 
 by the full 2 s). The change lowers that bound to 250 ms and, once the breaker is open, answers the
 request without a pool touch.
 
-**Rollback.** Downgrading the binary restores the previous behaviour for all of the above. The change
-adds no schema and persists no state.
-
 To find affected callers, search the audit log for `action=auth.fleet_read_required` with
 `result=denied` and a detail containing "ITServiceOwner permission" (definitive deny, `403`) versus
 "RBAC read degraded" (store fault, `503`), for the sibling gate `action=auth.scoped_permission_required`
@@ -4027,7 +3914,6 @@ On Linux, `vuln_scan` (`scan`, `config_scan`) now reports a config file it could
 
 - **Affected:** scripts that index `summary` positionally or assert six rows; CEL or severity filters (a "no critical/high" policy passes a host it could not measure); dashboards keyed on MEDIUM counts on RHEL-family hosts where a non-root agent cannot read a mode-0600 `sshd_config`.
 - **Recommended:** treat `UNREADABLE` as not assessed, and use `summary|UNREADABLE|<n>` as the coverage signal.
-- No operator action is required, and rollback is safe (output strings only).
 
 ## Behaviour change: OTA refusal reason for an unreadable agent trust bundle (0.14.0 → 0.14.1, #5249)
 
@@ -4240,12 +4126,6 @@ plan to restart any released 0.13.0 or rc6 agent that stays rejected; see Older 
 gateway registry starts and hot code upgrade is not supported for this change. A node that had the
 new code loaded without a restart has no index table, rejects every heartbeat as
 `registry_unavailable`, and reports `sessions_index` in `/readyz` (503 while the table is missing).
-
-**Rollback.** Redeploy the previous gateway release. The only new state is the in-memory session index,
-and there is no wire, agent or server change, so nothing needs migrating; agents with the reconnect
-fix re-register on their own (released agents may need a restart, see the next paragraph for older
-agents), and a rollback removes the connection check. This path
-is derived from the change and was not run.
 
 **Older agents.** A rejected agent recovers by re-registering through its `NOT_FOUND` handling
 (escalating cooldown, 2 s doubling to a 300 s cap). That logic exists from v0.13.0 (checked in the
@@ -6642,8 +6522,8 @@ honest**, so expect these to fire more often after upgrading:
 
 ### No migration, no schema change
 
-Rollback is data-safe. A mixed fleet is safe: an older agent simply keeps the older, less
-honest plugin reporting until it is upgraded.
+This change needs no migration and has no schema change.
+
 ## Product packs migrate to Postgres (ProductPackStore, ADR-0054)
 
 The `ProductPackStore` — operator-installed product packs behind `POST/GET/DELETE
@@ -6896,12 +6776,6 @@ after this upgrade means generating a new client secret with your identity provi
   error, rather than a response indistinguishable from "nothing configured" (`GET`)
   or a `400` validation failure (`PUT`). No change to either route's success-path
   response shape.
-- **Rolling back:** because the legacy `runtime-config.db`'s content is never moved or renamed
-  (only its permission bits change, per above), reverting to a pre-cutover binary restores your
-  pre-cutover overrides — including a plaintext OIDC client secret, if one was there — exactly
-  as they were. Anything you
-  set through Settings on the Postgres-backed binary lives only in Postgres and is
-  lost on rollback (reapply it after rolling forward again).
 - No Settings UI or dashboard-visible change beyond the one-time reset. See
   [`security-hardening.md`](security-hardening.md) for the pre-existing OIDC secret
   redaction behaviour (unchanged by this migration) and `docs/adr/0060-runtime-config-store-postgres-migration.md`
@@ -6942,13 +6816,6 @@ never fired unsigned. A degraded read on `GET /api/v1/offload-targets` or
 `GET /api/v1/offload-targets/{id}` now returns **503**, distinguishable from a genuine
 "no targets configured" (empty list) or "no such id" (404).
 
-**Rolling back:** because the legacy `offload_targets.db` is never touched by the
-Postgres-backed binary (not read, not moved, not deleted), reverting to a pre-cutover
-binary restores whatever was in that file **before** the cutover, exactly as it was.
-Any target registered through `POST /api/v1/offload-targets` on the Postgres-backed
-binary lives only in Postgres and is lost on rollback (re-register it after rolling
-forward again).
-
 ## ⚠️ Behaviour change: OTA package catalog resets on Postgres cutover (UpdateRegistry, ADR-0061)
 
 `UpdateRegistry` — the OTA agent-update catalog behind the gRPC `CheckForUpdate`/
@@ -6988,14 +6855,6 @@ reachability — this now affects the ordinary default deployment, not an opt-in
 with `--no-ota` sees no change — the check is vacuously true and never enters the failed list. On
 `/health`/`/api/health`, a new `stores.update_registry: "ok"`/`"error"` key appears in the JSON
 body for **every** deployment, `--no-ota` or not.
-
-**Rolling back:** because the legacy `update_packages.db` is never written by the
-Postgres-backed binary (opened read-only at most once, at boot, for the row-count warning
-above — never moved, never deleted, never modified), reverting to a pre-cutover binary
-restores whatever was in that file **before** the cutover, exactly as it was. Any package
-uploaded through the Postgres-backed binary lives only in Postgres and is lost on rollback
-(re-upload it after rolling forward again) — but its binary on disk under `update_dir`
-survives regardless, since the cutover never touches that directory.
 
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 
@@ -7096,8 +6955,7 @@ for it to re-drive. The `400`-vs-`503` split is otherwise unchanged.
 
 ### No migration, no schema change
 
-Rollback is data-safe. A mixed fleet is safe: the dispatch gate is server-side and applies
-regardless of agent version.
+This change needs no migration and has no schema change. The dispatch gate is server-side and applies regardless of agent version.
 
 ## ⚠️ Behaviour change: raw dispatch now enforces InstructionDefinition approval governance (#1398)
 
@@ -7186,9 +7044,8 @@ unsupported.
 
 `ApprovalManager`'s SQLite schema gains two additive columns (`target_plugin`, `target_action`,
 migration v8) — no backfill, no data loss, safe on a large existing `approvals` table (constant
-default, metadata-only `ALTER TABLE`). Rollback is safe: an older binary ignores the two new
-columns on read and simply doesn't populate them on write, which the new binary's fail-closed
-matching correctly treats as "must re-request" rather than a corruption state.
+default, metadata-only `ALTER TABLE`). A row with no recorded target is treated by the fail-closed
+matching as "must re-request", not as a corruption state.
 
 ### No config flag, no override
 
@@ -7956,13 +7813,6 @@ decommissioned device's data. `SoftwareLicensing:Delete`, `Inventory:Delete`, an
 `GuaranteedState:Delete` continue to gate their own unrelated surfaces exactly as before — only the
 erasure cascade's gate moved.
 
-**Rolling upgrade (the seventh store, `offline_endpoint`).** During a rolling upgrade, a DELETE
-served by a replica that has not been upgraded runs the old cascade, returns `200`, and does not
-erase the presence row; a response whose `stores` map has no `offline_endpoint` key did not erase
-it, and the `sle.agent.decommission` success audit row that replica writes lists its own stores
-(no `offline_endpoint`), so it is not evidence the presence row was erased. Re-issue the DELETE
-once every replica runs this version.
-
 ### vNEXT — Hardware CI list requires `Inventory:Read`, not the old Devices page's `Infrastructure:Read` (breaking for custom roles)
 
 `/devices` now 302-redirects to `/hardware` (the Hardware CI list) and `/device?id=` redirects to
@@ -8448,11 +8298,6 @@ holds, and on agent builds that do not yet carry the #5183 reconnect fix (shippe
 stay rejected only if they do. Then **upgrade every gateway before you rely on `source_ip`
 in the audit log**: an older gateway still forwards the `gateway_observed_peer` the agent
 sent, so a forged address passes through it.
-
-**Rolling back.** Restore the old image **and** the old config together, then verify as
-above. Restoring only the image leaves the old-image-plus-new-config pairing, which serves
-nothing and reports healthy. Restoring only the config leaves the new-image-plus-old-config
-pairing, which refuses to start.
 
 **Symptoms of a wrong pairing.**
 
@@ -9097,19 +8942,6 @@ behave identically.
 `auth.db` failing the integrity check at startup puts the unit
 cleanly into `failed` instead of spinning. Recovery procedure:
 [`docs/ops-runbooks/auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md).
-
-**Rollback to a pre-AuthDB release** (only if you have not yet
-written user state via the new dashboard):
-
-1. Stop the v0.12.0 server.
-2. Move `auth.db` aside (`mv auth.db auth.db.v0.12.0`).
-3. Restore `yuzu-server.cfg` from your pre-upgrade backup.
-4. Reinstall the prior release binary.
-5. Start the server. It reads `yuzu-server.cfg` as before.
-
-If you HAVE written user state via v0.12.0's dashboard, that state
-is in `auth.db` only — rolling back loses it. Export users via
-`GET /api/v1/settings/users` first if rollback is required.
 
 ### v0.12.0 — Guardian PR 2
 

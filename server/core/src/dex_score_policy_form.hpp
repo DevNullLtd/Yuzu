@@ -12,7 +12,7 @@
  * strict parser and range validator of dex_score_policy_json.hpp refuse it exactly as they
  * refuse the REST body. A value that is not a number is emitted as a JSON string, so the
  * parser names that exact field ("must be a number"). The canonical dump demotes a document
- * with no model parameter to version 1, so the rolling-upgrade rule holds.
+ * with no model parameter to version 1, so a document with no model parameter keeps its version 1 revision.
  *
  * OVERRIDE ROWS. A submitted row is dropped from the document when its image is blank or its
  * Remove box is ticked, so the JSON override index and the submitted form row index differ

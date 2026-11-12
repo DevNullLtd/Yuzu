@@ -932,14 +932,7 @@ revocation the newer binary just recorded; the newer binary's freshness pass
 republishes to cover it (and can do so on every tick for as long as the older
 binary keeps publishing).
 
-**Rollback** to the previous release is safe: an older binary boots against the
-v4 schema and ignores the new column. It will not self-heal a missed CRL (rolling
-forward again republishes once), and its default-cert inventory purge fails
-while any revoked default leaf exists (logged, harmless) because the trigger stays
-in place — which is the point: it cannot un-revoke anything. Multi-replica PKI also still
-needs WS-6 slices 6.2 (enrollment) and 6.3 (CA key and KEK custody): today the
-freshness pass runs only on the elected leader, and a leader whose CA directory
-lacks the CA key can never publish.
+The CRL freshness pass runs only on the elected leader; a leader whose CA directory lacks the CA key cannot publish or refresh the CRL.
 
 ### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
 
@@ -1225,13 +1218,6 @@ no-backfill, since this store never existed before 3.3).
   path without that claim. This is a deliberate, tracked gap — restoring
   per-device concurrency enforcement for the outbox path is a follow-up, not
   an oversight.
-
-**Rollback note:** a `pending` outbox row committed by a 3.3-or-later binary
-is invisible to a pre-3.3 binary, which has no outbox reader. Rolling back
-mid-flight leaves that occurrence undelivered until you roll forward again —
-a narrow window, and no data corruption (the row stays durable in Postgres
-and delivers as soon as a 3.3-or-later binary is running and holds
-leadership).
 
 ### vNEXT — manual policy remediation is now claimed durably, cross-replica (HA WS-3 3.4; breaking for automation asserting `agents == len(agent_ids)`)
 
@@ -1699,19 +1685,6 @@ it has an MCP approval in flight.
 schedule id, not through the MCP recall, so the origin check never sees it and a scheduled run
 outstanding across the upgrade still fires. If nothing is awaiting an MCP recall when you upgrade,
 there is nothing to do.
-
-**Rolling BACK across this release re-opens the check, and rolling forward does not close it
-again — but as of this same release, it does not stay open either.** The back-fill runs once, as a
-schema migration. An older server started against an already-migrated database does not re-run it
-and does not refuse to start; approvals it mints while you are rolled back record no minting
-surface at all (the column is never set). Rolling forward will not revisit those rows, because the
-migration has already run — but the MCP mint in this same release always declares its own surface
-(see the "MCP mint now declares its own surface" entry below), so a row with no recorded surface is
-no longer the value that grants: it is refused at recall exactly like a declared foreign surface,
-not exempted. There is no window in which a rollback-minted ticket is redeemable once you are back
-on a current server. Treat a roll-back as a window during which such tickets simply won't work
-later — mint fresh ones after rolling forward rather than relying on anything minted during the
-roll-back.
 
 **What happens.** This release records which surface minted each approval, and rows that predate the
 column carry no surface at all. Rather than assume one they may not have come from, the upgrade
@@ -2449,15 +2422,13 @@ one of the hottest tables on the server.
 metadata-only "fast default" on PG 11+, not a table rewrite) but is still an
 `ACCESS EXCLUSIVE` DDL statement: it must wait for every transaction
 currently touching `api_tokens` to finish before it can run, and every new
-transaction on the table queues behind it in turn while it waits. During a
-rolling upgrade, an outgoing replica's still-open request handling can hold
-such a transaction open. This is bounded and loud, not silent: the pool's
+transaction on the table queues behind it in turn while it waits. A
+request still open on the table can hold such a transaction open. This is bounded and loud, not silent: the pool's
 `lock_timeout` (10s, `pg_pool.hpp`) cancels the migration's `ALTER` if it
 queues that long, and `ApiTokenStore` construction fails closed exactly as
 it does for any other migration failure — the new binary refuses to start
 with a clear log line rather than serving degraded or hanging the table. If
-you see this on a rolling upgrade, retry once traffic quiesces (a load
-balancer draining the outgoing replica is usually enough); it is not a data
+you see this, retry once traffic on the table quiesces; it is not a data
 integrity concern either way.
 
 ### vNEXT — a device quarantined while offline now re-contains itself automatically on reconnect (#3425) (breaking)

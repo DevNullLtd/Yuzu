@@ -974,7 +974,7 @@ TEST_CASE("openapi_spec_json(): DexScorePolicyDocument types the stored shape an
 
     const std::string put_desc =
         spec["paths"]["/dex/score-policy"]["put"].value("description", "");
-    CHECK(put_desc.find("rolling upgrade") != std::string::npos);
+    CHECK(put_desc.find("unsupported_version") != std::string::npos);
 
     // The GET text and the component agree on when `model` is present.
     const std::string get_desc =
