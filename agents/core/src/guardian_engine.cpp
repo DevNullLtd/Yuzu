@@ -2563,7 +2563,9 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                 // #5719: the scoped detach returns the kept rules it tore down because their key
                 // was faulted, dead or unreadable, each with the cause recorded for the key. It is
                 // installed as the engine's override so that, for such a rule whose attach is then
-                // rebuilt and reports a reason, reconcile_rule_locked tallies THAT cause: after the
+                // rebuilt and reports a reason, reconcile_rule_locked tallies THAT cause, but only
+                // when the attach targets the key the cause was recorded against (a rule the same
+                // push moves to another key is a first attach of that key): after the
                 // detach the kept rule's own attach sees KeyBusy (an io-class mechanism whose
                 // disarm claim is still queued) or FirstAttach (an inline type, or a disarm that
                 // already completed) depending on timing, not the key's cause. The local map is
@@ -3768,6 +3770,16 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         if (placement == RulePlacement::Arm) {
             withdraw_legacy_guard_locked(rule.rule_id());
             unsupported_rules_.erase(rule.rule_id()); // F7: about to arm (or fail arming) - not Unsupported either way
+            // #5719: the key this attach targets, taken BEFORE `spec` is moved. A forced cause (the
+            // scoped detach's record for a kept rule on a faulted key) applies only when it was
+            // recorded against this same key. Diagnostic only: a failure to build it leaves it
+            // empty, which matches no forced entry, so the rule is reported under its own
+            // attach's reason.
+            std::string forced_target_key;
+            try {
+                forced_target_key = spark_key(*spec);
+            } catch (...) {
+            }
             // rung 9c PR-2 Unit 6: non-waiting entry point - attach_rule() no longer blocks
             // for its own claim's outcome. `res` resolves to Armed (already committed,
             // synchronously - an inline-type arm, or a same-key claim whose owner already
@@ -3776,17 +3788,6 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
             // (#4221 up-2) - re-observing an already-Wedged head via an identical retry,
             // whose receipt is in that case already terminal) before ever throwing a
             // synchronous error.
-            // #5719: the key this attach targets, taken BEFORE `spec` is moved, and only for a
-            // rule the scoped detach recorded a forced cause for. Diagnostic only: a failure to
-            // build it leaves it empty, which matches no forced entry, so the rule is reported
-            // under its own attach's reason.
-            std::string forced_target_key;
-            if (const auto fit = forced_rebuilds_.find(rule.rule_id()); fit != forced_rebuilds_.end()) {
-                try {
-                    forced_target_key = spark_key(*spec);
-                } catch (...) {
-                }
-            }
             auto res = spark_runtime_->attach_rule(GuardianSparkRuntime::NonWaiting{},
                                                    rule.rule_id(), std::move(*spec),
                                                    std::move(*assertion),

@@ -3161,14 +3161,15 @@ TEST_CASE("#5719 engine: the full_sync rebuild line reports first_attach, then r
           "Guardian: full_sync preserved 4 rule(s) (skipped re-arm) ids=[r0,r1,r2,r3] more=0");
 }
 
-// (b) A kept rule on a faulted key, torn down by the full_sync's scoped detach, is reported with the
+// (b) A kept rule on a faulted key that stays on that key, torn down by the full_sync's scoped
+// detach, is reported with the
 // FORCED cause (faulted_key, with its id), never key_busy and never first_attach, even though the
 // attach path itself sees one of those after the teardown. A shared key reports BOTH siblings.
 // Mutations: drop forced_rebuilds_ (the rule shows key_busy or first_attach: red); consult
 // forced_rebuilds_ only for a first_attach (the io-class key_busy shows: red); record the forced
 // reason for one sibling of a shared key only (the shared case lists one id: red).
-// Third section: drop the key match when the forced cause is applied (the retargeted rule shows
-// faulted_key instead of first_attach: red).
+// Third and fourth sections: drop the key match when the forced cause is applied (the retargeted
+// rule shows faulted_key instead of first_attach: red).
 TEST_CASE("#5719 engine: a kept rule on a faulted key is reported faulted_key with its id, never "
           "key_busy or first_attach",
           "[spark][guardian][reconcile][4415prA][5719]") {
@@ -3250,7 +3251,41 @@ TEST_CASE("#5719 engine: a kept rule on a faulted key is reported faulted_key wi
         CHECK(line == expected_rebuild_line({{"s1", GuardianRebuildReason::FirstAttach}}));
         CHECK(line.find("first_attach=1 ") != std::string::npos);
         CHECK(line.find("faulted_key=0") != std::string::npos);
+        // Premises: the scoped detach tore the faulted key down once, and s1 armed on its new key
+        // once; without them the line above could read first_attach with or without the key match.
+        CHECK(r.fm->unwatch_calls(k1) == 1);
+        CHECK(r.fm->watch_calls(file_key(p3)) == 1);
         check_untouched(*r.fm, "s0", k0);
+    }
+    SECTION("two rules share a faulted key, one is retargeted: each is reported by its key") {
+        Rig r;
+        r.open();
+        const auto shared = r.make_file("shared"), other = r.make_file("other");
+        const auto moved = r.make_file("moved");
+        const std::string ks = file_key(shared), ko = file_key(other);
+        REQUIRE(file_key(moved) != ks);
+        r.dispatch(
+            push_bytes({file_rule("a", shared), file_rule("b", shared), file_rule("s", other)}, kGen));
+        REQUIRE(r.wait_armed(3));
+        REQUIRE(r.wait_compliant({"a", "b", "s"}));
+        REQUIRE(r.wait_generation(kGen));
+        REQUIRE(r.settle());
+
+        r.fm->fire_fault(ks, true, "handle went deaf");
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return r.health_events("a", false) >= 1 && r.health_events("b", false) >= 1; },
+            15s));
+        // a moves to its own file in the same full push; b stays on the faulted shared key.
+        r.dispatch(
+            push_bytes({file_rule("a", moved), file_rule("b", shared), file_rule("s", other)}, kGen));
+        CHECK(r.settle());
+        const auto line = r.engine->last_full_sync_rebuild_line_for_test();
+        CHECK(line == expected_rebuild_line({{"a", GuardianRebuildReason::FirstAttach},
+                                             {"b", GuardianRebuildReason::KeyFaulted}}));
+        CHECK(line.find("first_attach=1 ") != std::string::npos);
+        CHECK(line.find("faulted_key=1 ids=[b]") != std::string::npos);
+        CHECK(r.fm->watch_calls(file_key(moved)) == 1);
+        check_untouched(*r.fm, "s (healthy sibling)", ko);
     }
 }
 
@@ -3530,7 +3565,8 @@ TEST_CASE("#5719 engine: a rule id with the valid special characters is listed v
 // only for an outcome that reported one. The forced entry is seeded from the post-attach hook (the
 // apply thread, under mtx_), after the push's scoped detach installed its own: no runtime state the
 // Rig can build pairs a forced entry with the retained-wedge pre-check return, so this pins the
-// ENGINE's decision, not the runtime's reachability of that pairing.
+// ENGINE's decision, not the runtime's reachability of that pairing. The entry carries the rule's
+// own target key, so the key match passes and only the reason check stands between it and the line.
 // Mutation: consult forced_rebuilds_ before (or without) checking res->rebuild_reason (the rule
 // id h appears under faulted_key in the rebuild line: red).
 TEST_CASE("#5719 engine: a forced-rebuild entry never turns a wedge re-observation into a rebuild",
@@ -3549,9 +3585,10 @@ TEST_CASE("#5719 engine: a forced-rebuild entry never turns a wedge re-observati
     REQUIRE(r.wait_compliant({"s0", "s1"}));
     suppressed_repushes(r, bytes, hk, kValve);
 
-    r.engine->set_post_attach_hook_for_test([&r](const std::string& id) {
+    r.engine->set_post_attach_hook_for_test([&r, &ksvc](const std::string& id) {
         if (id == "h")
-            r.engine->force_rebuild_reason_unlocked_for_test("h", GuardianRebuildReason::KeyFaulted);
+            r.engine->force_rebuild_reason_unlocked_for_test("h", GuardianRebuildReason::KeyFaulted,
+                                                             ksvc);
     });
     r.dispatch(bytes); // the forced Reapply: h's wedge is re-observed
     CHECK(r.settle());

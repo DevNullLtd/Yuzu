@@ -892,8 +892,8 @@ public:
     /// record only when attach_rule reported a reason, which no runtime state a Rig can build
     /// pairs with a forced entry. No production caller.
     /// `key` is the spark key the forced entry was recorded against (empty matches nothing).
-    void force_rebuild_reason_unlocked_for_test(const std::string& rule_id, GuardianRebuildReason why,
-                                                std::string key = {}) {
+    void force_rebuild_reason_unlocked_for_test(const std::string& rule_id,
+                                                GuardianRebuildReason why, std::string key = {}) {
         forced_rebuilds_[rule_id] = ForcedRebuildEntry{std::move(key), why};
     }
 

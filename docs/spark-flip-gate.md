@@ -1711,28 +1711,35 @@ flip, with a red-first test each:
     captured-log test that the line is logged exactly once. That captured-log test SKIPs where
     its in-band probe line is not captured, so that protection is Linux-only until the macOS and
     Windows runs. The new cases have run on Linux debug, and `[5719]` and `[4415prA]` have also run
-    clean under TSan and under ASan/UBSan (at the commit that added the resume hook; later
-    commits changed comments, docs and one assertion, and were not re-run under sanitizers).
+    clean under TSan and under ASan/UBSan (at the commit that added the resume hook; the later
+    retarget label change in `reuse_existing_locked`, the new `SparkKeyRuleIndex::mapped_to_other_key`
+    and the key-qualified forced-reason override in `GuardianEngine` were not re-run under sanitizers).
     Windows (MSVC) and macOS (Apple Clang) runs of them are outstanding. The Armed return that attach_rule makes
     after it re-inspects its claim (the case in which the claim settled before attach_rule
     re-inspected it) carries a rebuild reason, and the io-class forced-resume SECTION of the R2
     case in `test_guardian_spark_reapply_skip_runtime.cpp` forces it through a test-only resume hook
     (`set_attach_resume_hook_for_test`) and asserts `Armed` and the reason. Rig observation (a local, never-committed change set `prefer_spark` true in an agent built for the run;
-    the logs were local and are not kept in the repository; one Linux box and one Windows box, so not a
-    fleet): on Linux, three flipped agents beside one unflipped control, 356 full pushes each with a
-    retarget every sixth, logged `other=0` and 60 `first_attach` tokens per agent (the occupied-key
-    retarget label fixed in this PR), and the same box produced `faulted_key`, `key_busy` and
-    `unknown_episode` (a stalled and a dropped system bus); on Windows, `baseline_empty` and
-    `baseline_differs` (a missing watched file, and a rule re-authored with another `expected_hash`).
-    `dead_key`, `health_unknown` and `subscription_replaced` were never produced on either OS: they need
-    a broken engine invariant, a backend that throws, or a race, so they are covered by unit tests
-    only. The three failure counters read zero on every rebuild line of every run (they count a backend
-    throw or an allocation failure, which no rig input produced). Soaks: Linux 30 minutes, resident
-    memory flat at about 123 MB for the last 13 minutes, file descriptors 27 to 29 and flat (the two
-    extra are the Echo plugin's database files, also present in the unflipped control); Windows 20
-    minutes, handles rose by about 40 in the first 8 minutes then stayed flat, working set 123 to
-    136 MB, so a slow growth of a few megabytes is not ruled out. This is evidence for the line, not
-    a flip-safety proof. (c) MEASURED, release build (base `45f727420` against branch tip
+    builds 98751a8e9f, bef3833969 and 9ab8d55c09, never the key-qualified forced-cause fix, which is
+    covered by unit tests only; the raw logs were not retained, so this is the author's own report and
+    cannot be re-checked from the repository; one Linux box and one Windows box, so not a fleet). On
+    Linux, three flipped agents beside one unflipped control, 356 full pushes each with a retarget
+    every sixth, logged `other=0` and 60 `first_attach` tokens per agent (the occupied-key retarget
+    label fixed in this PR); the same box produced `faulted_key` (a dropped system bus), `key_busy` and
+    `unknown_episode` (a stalled bus). On Windows, `baseline_empty` and `baseline_differs` (a missing
+    watched file, and a rule re-authored with another `expected_hash`). Never produced on either OS:
+    `content_changed`, `dead_key`, `health_unknown` and `subscription_replaced`; the last three need a
+    broken engine invariant, a backend that throws, or a race, so they are covered by unit tests only.
+    The three failure counters were read from a rig-only probe line printed after each rebuild line
+    (the third Linux round and both Windows runs; the earlier Linux rounds had no such line) and were
+    zero on every one of those lines (they count a backend throw or an allocation failure, which no rig
+    input produced). Soaks: Linux 30 minutes, resident memory peaked at 128.8 MB at about 12 minutes
+    and stayed near 123 MB for the last 13 (about +20 KB/min late; the unflipped control +16 KB/min),
+    file descriptors 27 to 29 and flat (the two extra are the Echo plugin's database files, also present
+    in the control). Windows 20 minutes: handles rose by about 40 in the first 8 minutes then stayed
+    flat, working set 123 to 136 MB against 61 to 62 MB and 494 to 497 handles for the unflipped control
+    on the same box, so the flipped agent used about twice the control's memory there. Neither soak
+    rules out a slow leak (Linux: under about 20 KB/min; Windows: a few MB over 20 minutes is
+    unexplained). This is evidence for the line, not a flip-safety proof. (c) MEASURED, release build (base `45f727420` against branch tip
     `3f8dd8d0d`, uncommitted throwaway harness; counts are exact, wall times are not): Linux
     (shared box; the cells that waited for a 1-minute load of 8 or less recorded it, the box
     never went below about 4) S0, S5 and S3s at R up to 5000 and S1d up to R=1000 with fake
