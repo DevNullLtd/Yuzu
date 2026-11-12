@@ -67,12 +67,8 @@
 /// target is stored). It is NOT a reachability proof, and the server does not
 /// compare the device's allow-list with the stored whitelist: a
 /// `firewall.quarantine_allow` sent outside the quarantine routes changes the
-/// device and not the record. The one difference the device itself reports is
-/// `kAllowSetUnchangedNote` on a `firewall.quarantine` reply: the device was
-/// already contained under other operator exceptions and kept them. The reconciler
-/// does not confirm a record that has never been confirmed on that note (it is left
-/// unconfirmed, audited and alerted); it cannot make the device take the new
-/// whitelist, which needs a release and a new quarantine.
+/// device and not the record. The one difference the device reports is
+/// `kAllowSetUnchangedNote`; the reconciler header says how it is handled.
 
 #include <cstddef>
 #include <cstdint>
