@@ -547,6 +547,13 @@ void OfflineEndpointStore::set_metrics(yuzu::MetricsRegistry* m) {
                 "a fleet over the cap, not an incident. No alert rule.",
                 "counter");
     m->counter(kRosterTruncatedMetric); // pre-seed at 0 so the series exists before the first cap hit
+    // The per-device point read's two failure series, pre-seeded so the first failure is an
+    // increase from 0 that increase() sees, not a series born at 1 (docs/observability-conventions.md,
+    // bounded-label counters). The other `op` values of this family are not seeded here: that is the
+    // existing shape of the family and is not widened by this change.
+    for (const char* reason : {"store_unavailable", "db_error"})
+        m->counter("yuzu_server_agent_presence_store_failed_total",
+                   {{"op", "find_within"}, {"reason", reason}});
 }
 
 std::expected<FleetStateCounts, PresenceReadError>

@@ -12,6 +12,7 @@
 
 #include "hardware_routes.hpp"
 #include "hardware_section_integrity.hpp"
+#include "offline_endpoint_types.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_forensics_tier_fixture.hpp"
@@ -1125,7 +1126,7 @@ TEST_CASE("route: GET /api/v1/hardware — a truncated roster is 200 with roster
         auto body = nlohmann::json::parse(res->body, nullptr, false);
         REQUIRE_FALSE(body.is_discarded());
         CHECK(body["data"]["roster_truncated"] == true);
-        CHECK(body["data"]["roster_cap"] == 100000);
+        CHECK(body["data"]["roster_cap"] == yuzu::server::kOfflineRosterRowCap);
         CHECK(body["data"]["ci_degraded"] == false); // a partial is not a degraded read
         CHECK(body["data"]["count"] == 1);
         REQUIRE(h.audits.back() == "inventory.devices|success");

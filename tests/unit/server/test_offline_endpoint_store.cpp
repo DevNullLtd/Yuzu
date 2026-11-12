@@ -1118,6 +1118,24 @@ TEST_CASE("OfflineEndpointStore pre-seeds the roster-truncated counter at zero",
           std::string::npos);
 }
 
+// The point read's two failure series exist at 0 once metrics are attached, so the first failure
+// is an increase() from 0 and not a series born at 1. Kills: dropping the pre-seed in set_metrics.
+TEST_CASE("OfflineEndpointStore pre-seeds the find_within failure series at zero",
+          "[offline][roster_truncated]") {
+    yuzu::MetricsRegistry metrics;
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    OfflineEndpointStore store{pool};
+    store.set_metrics(&metrics);
+    const auto text = metrics.serialize();
+    for (const char* reason : {"store_unavailable", "db_error"}) {
+        const std::string series =
+            std::string("yuzu_server_agent_presence_store_failed_total{op=\"find_within\",reason=\"") +
+            reason + "\"} 0";
+        INFO(series);
+        CHECK(text.find(series) != std::string::npos);
+    }
+}
+
 // A malformed agent_id (a NUL byte, ill-formed UTF-8) can never be a stored key, so find_within
 // answers a CONFIRMED absence for it without a store read: no failure counter, no warn, no "store
 // unavailable" for an input that can never succeed. The roster scan this replaces answered absent too.

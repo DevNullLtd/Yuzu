@@ -475,7 +475,7 @@ rules for the `viz_routes.cpp::handle_topology` merge:
 - **Typed partial, flagged, never refused (#5712).** The offline read returns the
   newest `kOfflineRosterRowCap` (100,000) endpoints and says when more existed. A
   truncated read is still merged and served, with `offline_roster_truncated: true` in the
-  envelope on REST and MCP and ` offline_roster_truncated=1` on the `viz.fleet_topology`
+  envelope on REST and MCP and `offline_roster_truncated=1` on the `viz.fleet_topology`
   audit detail — on the `413` oversize audit row too. It is not `offline_roster_degraded`
   and it is not an error; do not "fix" it into either. **It is rarely reachable as a `200`:**
   `kMachinesMaxCeiling` equals the roster cap and the `machines_max` gate runs after the

@@ -4234,11 +4234,11 @@ No config or data migration is required.
 **Not a Breaking lead:** the change is additive, but two new fields are `required` in the response schemas, and one lookup changes answer.
 
 - **`GET /api/v1/hardware` and MCP `list_hardware_ci`:** the response gains `roster_truncated` and `roster_cap` (`100000`). Both are always present and `required` in the OpenAPI `HardwareListPage` schema and the MCP output schema. `roster_truncated` is `true` only when more than 100,000 endpoints exist in the window (a fleet of exactly 100,000 is exact); the totals, `devices_omitted` and `kpis` are then lower bounds.
-- **Rolling upgrade:** a schema-validating MCP or OpenAPI client may reject a response from a replica that is not yet upgraded, because it lacks `roster_truncated` and `roster_cap`. Treat a missing `roster_truncated` as unknown, not `false`, and retry until every replica is upgraded (rolling back reintroduces the same mismatch).
+- **Build skew:** every replica runs this build (see "Deployment contract (hard cutover)" in the Forensics section of this page). A client that finds `roster_truncated` or `roster_cap` missing from a response is talking to an unsupported build; treat it as that, not as `false`.
 - **Offline identity lookup:** a device's offline identity (the Hardware record, the decommission confirmation hostname, the containment lens) is now an exact point read. An enrolled offline device older than the newest 100,000 no longer returns `404` (see the `op="find_within"` counter label under the roster-read section above).
 - **Fleet topology:** `GET /api/v1/viz/fleet/topology` and MCP `get_fleet_topology` carry `offline_roster_truncated: true` only when the offline roster was truncated and the request was allowed past `machines_max` (otherwise a `413`, #7550).
 
-No schema or data migration; rolling back to the previous build is safe.
+No schema or data migration.
 
 ## Informational: internal-CA CRL publish/audit/observability follow-ups (HA WS-6, #4828–#4830)
 
