@@ -3,7 +3,10 @@
 Status: implemented on `feat/roster-truncation-5712`; plan reviewed in-session by the
 enterprise-architect review agent before any code (verdict APPROVE WITH CHANGES, changes adopted; the
 review output is not committed, so this is the author's relay, not an independent record). Acceptance criterion 2 of #5712 asked
-for this note before the code; the decisions below are the ones that review attacked.
+for this note before the code; the decisions below are the ones that review attacked. Provenance:
+an earlier implementation of #5712 and two follow-up issues filed with it were lost with a
+previous working session and were not recovered, so this design is a reconstruction and the
+filed follow-ups (#7549, #7550, #7551 and later) are a fresh set, not the original one.
 
 ## The defect
 

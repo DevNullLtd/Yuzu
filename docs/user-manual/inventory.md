@@ -1175,12 +1175,15 @@ The roster cap is a display and read cap, not a tested capacity. Above it:
 - The Hardware CI columns come from a separate read with its own 100,000-row cap (ordered by
   hostname), so CI columns can be blank for devices that are listed (#7549).
 - Fleet topology answers `413` above the ceiling and cannot be raised past it (#7550).
-- The Software and Quarantine hostname column shows the `agent_id` for a device outside the
-  capped roster.
+- The Software and Quarantine hostname column, and the host type-ahead and "of N hosts" count on
+  the Software page, show only devices inside the capped roster (a host outside it appears as
+  its `agent_id`, or not at all in the type-ahead).
 - The CI record's online state comes from the local session map of the replica serving the
   request (#7551).
-- Online and Offline on the list derive from the live-presence read; if that read fails or is
-  truncated, agents connected to another replica read Offline with no flag (#7566).
+- Online and Offline on the list derive from the live-presence read. On a deployment with more
+  than one server replica, if that read fails, or the fleet has more than 100,000 live agents (in
+  which case it is refused every time, not just briefly), agents connected to another replica
+  read Offline with no flag, and the Offline tile is not a true lower bound (#7566).
 - Search, filter and sort run over the capped set, and there is no way to page past the cap
   (#7567). A device seen within the window is always reachable by its id.
 

@@ -471,9 +471,11 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
              with_thousands(kOfflineRosterRowCap) + " devices were seen in the last " + std::to_string(std::chrono::duration_cast<std::chrono::days>(kHardwareRosterWindow).count()) + " days, so this list "
              "shows the " + with_thousands(kOfflineRosterRowCap) + " most recently seen. Older devices are "
              "not listed and the list cannot be paged past this limit. Every device count on this page "
-             "(including the page total) is a lower bound; the CI-coverage ratio and the median "
-             "describe only the listed devices. A search that finds nothing does not "
-             "prove a device does not exist &mdash; open a device's record to check it directly.</div>";
+             "(including the page total) is a lower bound, and the median describes only the listed "
+             "devices. On a fleet this large the CI columns, and so the CI-coverage ratio, can also be "
+             "blank or low for listed devices even when no CI warning shows. A search that finds "
+             "nothing does not prove a device does not exist &mdash; open a device's record to check "
+             "it directly.</div>";
     if (page.containment_ui && page.quarantine_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Quarantine state unavailable.</b> The quarantine "
              "records could not be read or checked &mdash; a row without a Quarantined pill here is "
