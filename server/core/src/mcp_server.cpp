@@ -71,6 +71,7 @@
 // handler's pre-validation can never diverge from what the store accepts.
 #include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
+#include "mgmt_group_owner_gate.hpp"        // the one management-group owner-arm predicate
 #include "rbac_admin_predicate.hpp"       // A2: is_rbac_administrator/is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp"      // A2: kRbacAssignableRoles/is_rbac_assignable_role — closed 7-role set
 #include "dex_window.hpp"               // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (pure, store-free/httplib-free window resolver — narrower than dex_routes.hpp, which this file no longer needs)
@@ -14143,15 +14144,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 httplib::Response probe; // throwaway: the fleet-wide arm, never sent
                 bool authorized = perm_fn(req, probe, "UserManagement", "Read");
-                if (!authorized && session->token_scope_service.empty()) {
-                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                            gr.role_name == "ITServiceOwner") {
-                            authorized = true;
-                            break;
-                        }
-                    }
-                }
+                if (!authorized)
+                    authorized = group_owner_admits(*mgmt_store, group_id, *session,
+                                                    RbacAdminSurface::kMcp);
                 if (!authorized) {
                     mcp_audit("denied", "forbidden");
                     res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
@@ -14226,15 +14221,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 httplib::Response probe; // throwaway: the fleet-wide arm, never sent
                 bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-                if (!authorized && session->token_scope_service.empty()) {
-                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                            gr.role_name == "ITServiceOwner") {
-                            authorized = true;
-                            break;
-                        }
-                    }
-                }
+                if (!authorized)
+                    authorized = group_owner_admits(*mgmt_store, group_id, *session,
+                                                    RbacAdminSurface::kMcp);
                 if (!authorized) {
                     mcp_audit("denied", "forbidden");
                     res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
@@ -30761,21 +30750,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Same multi-store (rbac_store + mgmt_store) authority check as
                     // the REST route: fleet-wide ManagementGroup:Write OR the caller
                     // already holding ITServiceOwner on the 'Service: <scope_service>'
-                    // management group (skipped for a service-scoped MCP token).
+                    // management group (the owner arm skips a service-scoped or
+                    // engine-classed session: mgmt_group_owner_gate.hpp).
                     httplib::Response probe; // throwaway: the fleet-wide arm, never sent
                     bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-                    if (!authorized && mgmt_store && session->token_scope_service.empty()) {
+                    if (!authorized && mgmt_store) {
                         auto svc_group = mgmt_store->find_group_by_name("Service: " + scope_service);
-                        if (svc_group) {
-                            for (const auto& gr : mgmt_store->get_group_roles(svc_group->id)) {
-                                if (gr.principal_type == "user" &&
-                                    gr.principal_id == session->username &&
-                                    gr.role_name == "ITServiceOwner") {
-                                    authorized = true;
-                                    break;
-                                }
-                            }
-                        }
+                        if (svc_group)
+                            authorized = group_owner_admits(*mgmt_store, svc_group->id, *session,
+                                                            RbacAdminSurface::kMcp);
                     }
                     if (!authorized) {
                         mcp_audit("denied", "ITServiceOwner authority required");

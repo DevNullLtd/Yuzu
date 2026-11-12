@@ -16,6 +16,7 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
+#include "mgmt_group_owner_gate.hpp" // the one management-group owner-arm predicate
 #include "rbac_admin_predicate.hpp" // A2: is_rbac_administrator / is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 7-role set
 #include "mgmt_group_error.hpp" // mgmt_group_error_is_store_fault: one classifier for REST and MCP
@@ -5097,25 +5098,14 @@ void RestApiV1::register_routes(
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
-                     // guardian-confinement-2298 PR3 §3e: the ITServiceOwner-of-
-                     // this-group fallback below checks GROUP MEMBERSHIP only —
-                     // it never consults token_scope_service, so a service-scoped
-                     // token whose minter is ITServiceOwner of ANY group would
-                     // otherwise read that group's role graph regardless of the
-                     // token's own service tag. The fleet-wide arm above already
-                     // gets the §3a flip's service-scope handling (via perm_fn);
-                     // a service-scoped token must go through THAT arm only —
-                     // never this membership fallback.
-                     if (session->token_scope_service.empty()) {
-                         for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                             if (gr.principal_type == "user" &&
-                                 gr.principal_id == session->username &&
-                                 gr.role_name == "ITServiceOwner") {
-                                 authorized = true;
-                                 break;
-                             }
-                         }
-                     }
+                     // The ITServiceOwner-of-this-group fallback checks GROUP
+                     // MEMBERSHIP only, so it is decided in ONE place
+                     // (mgmt_group_owner_gate.hpp): a service-scoped token
+                     // (guardian-confinement-2298 PR3 §3e), an MCP-tier session and
+                     // an engine-classed session must go through the fleet-wide arm
+                     // above only, never this membership fallback.
+                     authorized = group_owner_admits(*mgmt_store, group_id, *session,
+                                                     RbacAdminSurface::kRest);
                  }
                  if (!authorized) {
                      res.status = 403;
@@ -5197,19 +5187,11 @@ void RestApiV1::register_routes(
                   // flip's default-deny instead of an unfiltered role check.
                   httplib::Response probe; // throwaway: the fleet-wide arm, never sent
                   bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-                  // The ITServiceOwner-of-this-group fallback checks GROUP
-                  // MEMBERSHIP only, never token_scope_service — same reasoning
-                  // as the GET handler's identical guard above.
-                  if (!authorized && session->token_scope_service.empty()) {
-                      auto group_roles = mgmt_store->get_group_roles(group_id);
-                      for (const auto& gr : group_roles) {
-                          if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                              gr.role_name == "ITServiceOwner") {
-                              authorized = true;
-                              break;
-                          }
-                      }
-                  }
+                  // The ITServiceOwner-of-this-group fallback is decided by the one
+                  // shared predicate — same reasoning as the GET handler above.
+                  if (!authorized)
+                      authorized = group_owner_admits(*mgmt_store, group_id, *session,
+                                                      RbacAdminSurface::kRest);
                   if (!authorized) {
                       res.status = 403;
                       res.set_content(detail::a4_error(res, "forbidden"), "application/json");
@@ -5321,22 +5303,25 @@ void RestApiV1::register_routes(
             // guardian-confinement-2298 PR3 §3e: same fix as the POST handler
             // above — routed through perm_fn instead of a direct
             // rbac_store->check_permission call, and the ITServiceOwner
-            // membership fallback is skipped for a service-scoped token.
+            // membership fallback is the one shared predicate.
             httplib::Response probe; // throwaway: the fleet-wide arm, never sent
-            bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-            if (!authorized && session->token_scope_service.empty()) {
-                auto group_roles = mgmt_store->get_group_roles(group_id);
-                for (const auto& gr : group_roles) {
-                    if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                        gr.role_name == "ITServiceOwner") {
-                        authorized = true;
-                        break;
-                    }
-                }
-            }
-            if (!authorized) {
+            const bool fleet_wide = perm_fn(req, probe, "ManagementGroup", "Write");
+            const bool owner_only =
+                !fleet_wide &&
+                group_owner_admits(*mgmt_store, group_id, *session, RbacAdminSurface::kRest);
+            if (!fleet_wide && !owner_only) {
                 res.status = 403;
                 res.set_content(detail::a4_error(res, "forbidden"), "application/json");
+                return;
+            }
+            // A caller admitted ONLY as owner of this group may remove only the roles POST lets
+            // it delegate (Operator, Viewer): it cannot remove a peer owner's row.
+            if (owner_only && role_name != "Operator" && role_name != "Viewer") {
+                res.status = 403;
+                res.set_content(
+                    detail::a4_error(res, "an ITServiceOwner of this group can remove only Operator and "
+                                          "Viewer roles"),
+                    "application/json");
                 return;
             }
 
@@ -5903,24 +5888,17 @@ void RestApiV1::register_routes(
             // consistency — behavior-identical to the old call for an
             // ordinary RBAC-on caller, since both resolve to the same
             // rbac_store->check_permission under require_permission's
-            // RBAC-enforced branch. The token_scope_service.empty() guard on
-            // the fallback below costs nothing and matches the roles fix's
-            // shape, guarding against a future change that grants
-            // ITServiceOwner an ApiToken permission.
+            // RBAC-enforced branch. The owner arm below is the shared predicate
+            // (mgmt_group_owner_gate.hpp), which refuses a service-scoped session
+            // exactly as the roles routes do, guarding against a future change
+            // that grants ITServiceOwner an ApiToken permission.
             httplib::Response probe; // throwaway: the fleet-wide arm, never sent
             bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-            if (!authorized && mgmt_store && session->token_scope_service.empty()) {
+            if (!authorized && mgmt_store) {
                 auto svc_group = mgmt_store->find_group_by_name("Service: " + scope_service);
-                if (svc_group) {
-                    auto group_roles = mgmt_store->get_group_roles(svc_group->id);
-                    for (const auto& gr : group_roles) {
-                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                            gr.role_name == "ITServiceOwner") {
-                            authorized = true;
-                            break;
-                        }
-                    }
-                }
+                if (svc_group)
+                    authorized = group_owner_admits(*mgmt_store, svc_group->id, *session,
+                                                    RbacAdminSurface::kRest);
             }
             if (!authorized) {
                 res.status = 403;
