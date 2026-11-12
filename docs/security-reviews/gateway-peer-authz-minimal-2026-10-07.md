@@ -655,3 +655,13 @@ itself on a refusal" and "renew before `notAfter`" statements stand; and the ups
 channel opens one connection per endpoint, as the previous client did (`pool_size` can raise it);
 the pin and the per-call checks on the server are unaffected. See
 `docs/user-manual/gateway.md`, "The upstream client".
+
+## Update (2026-11-12): CI now runs the pinned gateway hop end to end
+
+The bullet "CI does not exercise a pinned gateway hop end to end" above no longer describes the
+tree. Since #5652/#5653 (2026-10-16), `scripts/integration-test.sh --tls` passes the server no
+acknowledgement (`PEER_FLAGS` is empty in its `--tls` branch; only the plaintext branch passes
+`--insecure-gateway-peer`), so the hop is pinned, and `.github/workflows/ci.yml`'s "Gateway
+real-wire test (pinned TLS)" step runs `scripts/integration-test.sh --tls --free-ports
+--gateway-ct` on every Linux run. The unit tests over a real mTLS harness still cover both
+listener modes as described; the rig now adds an end-to-end run of the pinned hop.
