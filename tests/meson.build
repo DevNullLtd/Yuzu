@@ -1395,6 +1395,7 @@ echo_test_exe = executable(
     'unit/test_echo_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_echo_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
+    'unit/test_echo_registry_bam_live.cpp',       # #6898: [windows][bam] live check of the bam\State exclusion (empty TU off Windows)
     'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
     'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
     'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, retired names
