@@ -399,6 +399,33 @@ TEST_CASE("InstructionStore: NUL in an unsanitised column is a client error and 
         REQUIRE(stored->has_value());
         CHECK((*stored)->concurrency_mode == "per-device");
     }
+
+    SECTION("update refuses a NUL in type, which update_definition does not close to a set") {
+        // The legacy dashboard PUT stores whatever string it is given as type, so this column
+        // reaches the bind unchecked on update (create closes it to question/action).
+        auto created = store.create_definition(base);
+        REQUIRE(created.has_value());
+        auto def = base;
+        def.id = *created;
+        def.type = nul;
+        auto result = store.update_definition(def);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "type"));
+        auto stored = store.get_definition(*created);
+        REQUIRE(stored.has_value());
+        REQUIRE(stored->has_value());
+        CHECK((*stored)->type == "question");
+    }
+
+    SECTION("import refuses a NUL escape in a non-JSON visualization_spec string") {
+        store.set_require_signed_definitions(false);
+        const std::string body =
+            R"({"name":"Nul Column Probe","type":"question","plugin":"system_info",)"
+            R"("action":"query","visualization_spec":"not json\u0000"})";
+        auto result = store.import_definition_json(body);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "visualization_spec"));
+    }
 }
 
 // ── spec.scope (scope-walking DSL) validation (PR-E) ────────────────────────

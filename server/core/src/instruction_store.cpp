@@ -515,10 +515,11 @@ std::optional<std::string> validate_parameter_schema_write(const std::string& pa
 // ---------------------------------------------------------------------------
 
 namespace {
-// The columns bound to Postgres WITHOUT sanitize_pg_text (structured text and free-form
-// concurrency_mode; id, type and approval_mode are closed-charset or closed-set checked
-// elsewhere). A NUL in any of them is refused at the create/import/update chokepoint as a client
-// error. pg::exec_params refuses a NUL parameter (SQLSTATE 22021) where libpq used to truncate it
+// The columns bound to Postgres WITHOUT sanitize_pg_text (structured text, free-form
+// concurrency_mode, and type: validate_and_prepare closes type to question/action on create, but
+// update_definition does not and the legacy dashboard PUT stores any string; id and approval_mode
+// are closed-charset or closed-set checked elsewhere). A NUL in any of them is refused at the
+// create/import/update chokepoint as a client error. pg::exec_params refuses a NUL parameter (SQLSTATE 22021) where libpq used to truncate it
 // silently, so an unguarded one surfaces as a 503 "outcome unknown" store fault for what is a
 // permanent 400. yaml_source has its own message in validate_definition_scope.
 std::optional<std::string> reject_nul_in_unsanitised_columns(const InstructionDefinition& def) {
@@ -526,6 +527,7 @@ std::optional<std::string> reject_nul_in_unsanitised_columns(const InstructionDe
         const char* name;
         const std::string& value;
     } columns[] = {
+        {"type", def.type},
         {"parameter_schema", def.parameter_schema},
         {"result_schema", def.result_schema},
         {"concurrency_mode", def.concurrency_mode},
