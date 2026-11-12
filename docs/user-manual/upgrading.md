@@ -1498,23 +1498,23 @@ two separate transactions, and one already at v2 runs only v3. The v3 step is id
 branch, which recorded the same columns as version 2, upgrades cleanly instead of failing on a
 column that already exists.
 
-- **Rolling upgrade.** An older replica never touches the new columns and keeps redeeming the
-  tickets it and this build mint, all of which are unbound. The migration runner applies only
-  versions above the one stored for the store and has no newer-schema refusal, so an older binary
-  starts against a newer database: a build with neither change against a v2 or v3 database, and a
-  build with the #6096 change but not this one (highest version 2) against a v3 database. That is
-  established by reading the runner; it has not been exercised as a live rolling restart.
+- **Mixed builds are outside the contract.** This release supports a fresh database only (see
+  "Deployment contract (hard cutover)" in the Forensics section of this page), so running this build
+  beside an earlier one is not supported. For what the migration itself does: it only adds columns an
+  earlier build never reads, and the migration runner applies only versions above the one stored for
+  the store, with no newer-schema refusal. That is established by reading the runner; it has not been
+  exercised.
 - **A return to the previous build** is outside the "Deployment contract (hard cutover)" in the
   Forensics section of this page, so it is not a supported operation. For what the migration
   itself leaves behind: it adds columns the previous build ignores, and the default-empty values
   hold no bound ticket, which is the case for this whole release. Returning across the #6096
   change as well has its own consequences, described in that section.
-- **Rollback is NOT supported once a bound ticket exists.** The previous build does not read
-  `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it, and it
-  redeems without comparing the frozen request. The change that first creates a bound ticket
-  (#6063) must not do so until every replica runs a build that includes this migration, and must
-  define what rollback means after that point. Until it does, a row with a non-empty
-  `request_json` is not expected to exist; if you find one, do not roll back.
+- **A bound ticket needs every replica on a build that includes this migration.** The previous build
+  does not read `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it,
+  and it redeems without comparing the frozen request. The change that first creates a bound ticket
+  (#6063) must not do so until every replica runs a build that includes this migration. Until it
+  does, a row with a non-empty `request_json` is not expected to exist; if you find one, the database
+  is outside the Deployment contract.
 
 **3. A new audit action and metric: `approval.precondition_denied` and
 `yuzu_approval_precondition_denied_total{origin}`.** When an approved ticket is refused at
@@ -2136,12 +2136,12 @@ separate scheduled-approval change (#6096, below) adds a data-only approvals ste
   and the approvals store does not open (the server logs a schema migration failure for that store); investigate
   the table size and restart. The command outbox also gains a small index on its approval id
   (`outbox_approval_idx`) at the same upgrade; its build is bounded by the same 300 s timeout.
-- **Upgrade one replica first when the outbox table is large (#6096).** Building `outbox_approval_idx` takes a share
+- **Start one replica first when the outbox table is large (#6096).** Building `outbox_approval_idx` takes a share
   lock on the outbox table for up to 300 s, so enqueue and claim on other replicas wait meanwhile. A second replica
   that boots at the same time waits on the migration advisory lock under the pool's default lock and statement
   timeouts and may fail its boot closed; restarting it recovers, because the migration is then applied. The
   recommendation is to start ONE replica, wait for it to finish migrating, then start the others. These are not
-  measured numbers.
+  measured numbers. A fresh database has no large outbox to build the index over.
 - **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
   `approval_manager.approvals`. It is readable only by SQL; no API returns it. Tickets the outbox showed had already
   been used by an earlier occurrence carry the related marker `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`;
@@ -2152,20 +2152,12 @@ separate scheduled-approval change (#6096, below) adds a data-only approvals ste
   FROM approval_manager.approvals
   WHERE consumed_by = 'schedule:legacy-6096';
   ```
-- **Mixed versions and rollback for scheduled approvals (#6096).** Recommended practice: drain or stop every replica
-  that predates this change before anyone approves scheduled work. The command outbox records which approval ticket
-  each scheduled run used, and the new binary refuses to fire a ticket the outbox shows was already used by an
-  earlier occurrence, so a ticket fired by an older leader is inert after the upgrade. A rolled-back binary does
-  not consult the outbox ledger or the used marker, so an older binary can re-fire a ticket the new binary marked
-  used (the old clock comparison); rolling back restores the old behaviour, including that exposure. After a rollback
-  followed by a second upgrade, run this once, because a rejected ticket spent under the older binary would
-  otherwise skip one occurrence. It also retires approved-but-unfired scheduled tickets, which then ask again:
-
-  ```sql
-  UPDATE approval_manager.approvals
-  SET consumed_at = EXTRACT(EPOCH FROM now())::bigint, consumed_by = 'schedule:legacy-6096'
-  WHERE schedule_id <> '' AND consumed_at = 0 AND status IN ('approved','rejected');
-  ```
+- **Mixed builds for scheduled approvals (#6096).** Running this build beside an earlier one, or returning to an
+  earlier one, is outside the Deployment contract and not supported. For what an older binary does: it does not
+  consult the outbox ledger or the used marker, so it can re-fire a ticket this build marked used (the old clock
+  comparison). This build records in the command outbox which approval ticket each scheduled run used, and refuses
+  to fire a ticket the outbox shows was already used by an earlier occurrence. No repair statement is provided for
+  a database an earlier binary has written.
 - Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
   from it.
 
@@ -9234,13 +9226,10 @@ The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocat
 
 ## Rollback
 
-If an upgrade causes issues:
-
-1. Stop the new version
-2. Restore the backed-up `.db` and `.cfg` files
-3. Start the previous version binary
-
-**Important:** Rolling back after a schema migration requires restoring the database files from backup. The old binary cannot read the new schema.
+A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this
+page, and this page documents no rollback procedure: an earlier binary cannot read a newer schema, and restoring
+backed-up database files is not a supported path. If a deployment misbehaves, stop it, deploy a fresh database on a
+known-good build and re-provision.
 
 ## Troubleshooting
 
