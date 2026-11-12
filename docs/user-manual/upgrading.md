@@ -37,7 +37,7 @@ The top-level directory inside each archive is renamed the same way (`yuzu-agent
 - If you run the server on Windows or macOS, follow "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md): the old server's data cannot be carried over, so you deploy a new Linux server (the container image or the Linux packages), enroll agents with it as new installations, and delete the old server's leftover files, which hold secrets.
 - Do not unpack the new agent archive over a directory a server still runs from.
 
-**Known limitations.** Until a later release removes the server's dependencies from the Windows build (ADR-0035 step 3), the Windows archive still contains `libpq.dll`, `drogon.dll`, `trantor.dll` and the `libxmlsec1` DLLs, which the agent never loads. Separately, the Windows and macOS SBOMs are generated from the whole build workspace, so they list thousands of components the archive does not ship or load, the server's dependencies among them; a dependency scan of an SBOM therefore reports components the agent does not use.
+**Known limitations.** The Windows and macOS SBOMs are generated from the whole build workspace, so they can list components the archive does not ship or load; a dependency scan of an SBOM can therefore report components the agent does not use. (From the release that carries ADR-0035 step 3 the Windows archive no longer contains the server's DLLs such as `libpq.dll`.)
 
 ## ⚠️ Breaking: role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte
 

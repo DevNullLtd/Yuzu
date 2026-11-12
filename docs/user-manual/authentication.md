@@ -909,6 +909,11 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
 Service-scoped tokens:
 - Cannot access any `/api/v1/admin/*` routes (403 Forbidden)
 - Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
+- Can be minted only by a caller holding the global `ManagementGroup:Write`
+  permission or `ITServiceOwner` on the `Service: <scope_service>` management
+  group; the `ITServiceOwner` arm is refused for an engine-classed session
+  and, on REST, for any MCP-tier session (those callers need the global
+  permission), and a service-scoped token cannot mint a token at all
 - Carry a session role floored to the base `user` level regardless of the
   minting principal's own role — an `ITServiceOwner` RBAC grant is the
   authority ceiling for a service-scoped token, never the minter's role, and
