@@ -52,9 +52,10 @@ Recommended order for a fresh install:
 > **on** immediately applies role-scoped visibility — a user without a
 > management-group role assignment will see **no agents** (including on the Echo
 > fleet scan), and the role-grant endpoints themselves require an existing group
-> role, which can be a chicken-and-egg lockout. The broadest grant is an
-> `Operator` or `Viewer` role on the root "All Devices" group (a group-scoped `ITServiceOwner` grant is
-> refused); see [`management-groups.md`](management-groups.md) for the delegation API.
+> role, which can be a chicken-and-egg lockout. The management-group roles that
+> can be delegated are `Operator` and `Viewer` (a group-scoped `ITServiceOwner`
+> grant is refused); see [`management-groups.md`](management-groups.md) for the
+> delegation API.
 
 > **SSO-only fleets:** only a LOCAL `auth.users` administrator can pass the
 > enable guard above — an SSO session cannot pass the RBAC-off predicate
