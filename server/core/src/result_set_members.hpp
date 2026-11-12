@@ -9,11 +9,14 @@
 /// owner may not hold the Forensics tier for. The materializer is a background thread with no
 /// request, so the creating principal's Forensics visibility cannot be resolved here: the read
 /// excludes the Forensics plugins outright (`deny_all()`), and an unwired set refuses every row.
-/// A Forensics-sourced set therefore materializes empty, for every creator.
+/// A Forensics-sourced set therefore materializes empty, for every creator, while the execution
+/// tracker (which reads no rows) still says every agent answered: a complete-empty set. The async
+/// producers refuse such a source before they dispatch (`plugin_may_seed_result_set`).
 
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -23,6 +26,20 @@
 #include "result_set_store.hpp"
 
 namespace yuzu::server {
+
+/// The 400 / -32602 message for a refused Forensics-tier source (REST and MCP share it).
+inline constexpr std::string_view kSourceNotSupportedMessage =
+    "RESULT_SET_SOURCE_NOT_SUPPORTED: a result set cannot be built from a Forensics-tier plugin "
+    "because its stored responses are withheld from result-set membership";
+
+/// False when `plugin` is Forensics-tier: its stored responses never reach a result set's
+/// membership, so a set built from it would read as complete and empty. `forensics` is the set the
+/// response reads use; null (an unwired test harness) refuses nothing, since the server refuses to
+/// boot without the set and every production surface carries it.
+[[nodiscard]] inline bool plugin_may_seed_result_set(std::string_view plugin,
+                                                     const ForensicsPluginSet* forensics) {
+    return forensics == nullptr || !forensics->contains(plugin);
+}
 
 /// The membership of a pending set: the agent ids that satisfy the matcher, plus how many agents
 /// are absent from it because their query failed. Derives from the id vector so a caller that only

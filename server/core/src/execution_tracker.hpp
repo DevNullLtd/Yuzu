@@ -149,6 +149,11 @@ struct AgentExecStatus {
     /// sdk/include/yuzu/plugin.h). 0 (PLUGIN_RESULT_UNDECLARED) for legacy
     /// rows and for any response whose plugin never reported a typed status.
     int plugin_result_status{0};
+    /// True when the frame this status came from was NOT kept by the response store (an ingest-time
+    /// failure, or a cap refusal of a non-terminal frame). Written in the same upsert as the
+    /// status and STICKY: the stored value is the OR of every write, so no later write clears it.
+    /// Not part of the event payload.
+    bool response_dropped{false};
 };
 
 // ── Execution statistics (capability 1.9) ────────────────────────────
@@ -400,6 +405,12 @@ public:
     [[nodiscard]] std::expected<std::optional<Execution>, std::string>
     get_execution_checked(const std::string& id) const;
     ExecutionSummary get_summary(const std::string& id) const;
+    /// Agents of `execution_id` whose response the response store did not fully keep (their status
+    /// row says `response_dropped`: a terminal answer or a streamed frame is missing). Their answer
+    /// is missing from every stored-response read, so a consumer building membership from stored
+    /// rows must treat each as unanswered. `nullopt` when the count could not be read (store not
+    /// open, no connection, query failure): the caller must not read that as zero.
+    [[nodiscard]] std::optional<int64_t> count_response_dropped(const std::string& execution_id) const;
     std::vector<AgentExecStatus> get_agent_statuses(const std::string& execution_id) const;
     /// #1634 (Doomgoose review finding, important) — degrade-distinguishable
     /// twin of `get_agent_statuses`, for the #1634 visibility/audit call
@@ -502,8 +513,9 @@ public:
     /// not re-reduce a value equal to the persisted text, so a caller that passes raw Forensics
     /// text publishes it to the outbox and the bus on its first write. A lexical gate
     /// (`tests/test_forensics_tier_wiring_lexical.py`) pins exactly one caller; a second caller
-    /// needs a reviewed edit there.
-    void update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
+    /// needs a reviewed edit there. True when the status row was written (false when the tracker
+    /// is closed or the upsert failed twice).
+    bool update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
 
     /// PR 2: set agents_targeted post-creation. Used by the workflow execute

@@ -9,6 +9,7 @@
  *   - agent-reported values are HTML-escaped (no stored XSS)
  *   - route gating: authed renders / unauth → 302 / perm-denied → 403 before audit
  */
+#include "dex_api_local.hpp"
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "dex_routes.hpp"
 #include "guaranteed_state_store.hpp"
@@ -19,6 +20,8 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -1248,31 +1251,6 @@ TEST_CASE("DEX device history rows drill to the observation detail", "[pg][dex][
     CHECK(html.find("id=\"dex-obs-detail\"") != std::string::npos);
 }
 
-TEST_CASE("DEX apps list: ranks apps by crashes+hangs, drillable", "[pg][dex][routes]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    seed_crash(store, "c1", "WS-1", "AcmeCRM.exe", "AcmeCRM.dll", "windows", kDayA + "T10:00:00Z");
-    seed_crash(store, "c2", "WS-2", "AcmeCRM.exe", "ntdll.dll", "windows", kDayA + "T11:00:00Z");
-    seed_hang(store, "h1", "WS-1", "chrome.exe", kDayA + "T12:00:00Z");
-
-    auto html = render_dex_apps_fragment(&store, "", 7);
-    CHECK(html.find("Applications") != std::string::npos);
-    CHECK(html.find("AcmeCRM.exe") != std::string::npos);
-    CHECK(html.find("chrome.exe") != std::string::npos);
-    // app rows drill to the per-app blast-radius view; the Apps subnav tab is present
-    CHECK(html.find("name=AcmeCRM.exe") != std::string::npos);
-    CHECK(html.find("/fragments/dex/apps") != std::string::npos);
-}
-
-TEST_CASE("DEX apps list: empty store → no-data placeholder", "[pg][dex][routes]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    GuaranteedStateStore store(pool);
-    auto html = render_dex_apps_fragment(&store, "", 7);
-    CHECK(html.find("No data") != std::string::npos);
-}
-
 // Kills: a wrong active_key literal on /dex — apply_shell lights nothing and says nothing for an
 // unknown key, so only a test that fetches the page can see it. The page handler touches only
 // auth_fn_ and apply_shell, so no store is wired and this runs without Postgres.
@@ -1541,10 +1519,44 @@ TEST_CASE("DEX routes: auth/perm gating + dispatch", "[pg][dex][routes][rbac]") 
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
         routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit);
+        // The Apps tab reads the same DexApi::apps model as the REST twin: wire a LocalDexApi over this
+        // store, with the seeded agents online so the share/rate/score figures exist too.
+        auto apps_fleet = []() {
+            DexFleet f;
+            f.connected_agents = {{"WS-1", "windows"}, {"WS-2", "windows"}, {"WS-3", "windows"}};
+            return f;
+        };
+        auto api = make_local_dex_api(&store, apps_fleet, {});
+        routes.set_dex_api(api);
         auto apps = sink.Get("/fragments/dex/apps");
         REQUIRE(apps);
         CHECK(apps->status == 200);
         CHECK(apps->body.find("chrome.exe") != std::string::npos); // the seeded crasher ranks
+
+        // Row-scoped, not a whole-page search: inside the chrome.exe row, the Crashes cell (the
+        // third <td>) equals chrome.exe's crashes figure in the REST payload for the same store.
+        const auto model = api->apps("7d", "all");
+        REQUIRE(!model.degraded); // dex_apps_json asserts on a degraded model and would abort the shard
+        const auto payload = nlohmann::json::parse(dex_apps_json(model));
+        int64_t expected_crashes = -1;
+        for (const auto& a : payload["apps"])
+            if (a["subject"] == "chrome.exe")
+                expected_crashes = a["crashes"].get<int64_t>();
+        REQUIRE(expected_crashes > 0);
+        const auto& body = apps->body;
+        const auto name_at = body.find(">chrome.exe</a>");
+        REQUIRE(name_at != std::string::npos);
+        const auto row_start = body.rfind("<tr", name_at);
+        const auto row_end = body.find("</tr>", name_at);
+        REQUIRE(row_start != std::string::npos);
+        const std::string row = body.substr(row_start, row_end - row_start);
+        const auto td1 = row.find("<td", 0);
+        const auto td2 = row.find("<td", td1 + 1); // Score
+        const auto td3 = row.find("<td", td2 + 1); // Crashes
+        const auto td4 = row.find("<td", td3 + 1);
+        REQUIRE(td4 != std::string::npos);
+        CHECK(row.substr(td3, td4 - td3) ==
+              "<td class=\"gp-num\">" + std::to_string(expected_crashes) + "</td>");
     }
 
     SECTION("unauthenticated shell redirects to /login") {
