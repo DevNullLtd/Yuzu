@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -4363,6 +4364,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
           "set_discovery_negative_cache_for_test - set_resolver_for_test - "
           "add_test_jwks_key - winhttp_url_agrees_for_test - "
           "clear_nat64_discovery_cache_for_test - expire_nat64_discovery_cache_for_test - "
+          "set_bounded_lookup_for_test - "
           "vet_egress_target_for_test or pending_flow_count_for_test "
           "(source pin)",
           "[oidc][oidc_binding][source_pin]") {
@@ -4379,6 +4381,7 @@ TEST_CASE("OIDC test seams: no production file references set_binding_digest_fai
                                              "winhttp_url_agrees_for_test",
                                              "clear_nat64_discovery_cache_for_test",
                                              "expire_nat64_discovery_cache_for_test",
+                                             "set_bounded_lookup_for_test",
                                              "vet_egress_target_for_test",
                                              "pending_flow_count_for_test"};
     std::size_t scanned = 0;
@@ -4514,6 +4517,30 @@ TEST_CASE(
     CHECK(count(hpp, "discovery_retry_window_{kDiscoveryNegativeCacheMs}") == 1);
     CHECK(count(hpp, "int timeout_ms = kHttpOperationTimeoutMs") == 2);
     CHECK(count(cpp, "kHttpTotalBoundMultiplier * t") == 2); // the watchdog and set_max_timeout
+}
+
+TEST_CASE("OIDC sign-in start and callback share the per-source login rate-limit bucket "
+          "(source pin)",
+          "[oidc][source_pin]") {
+    // The pre-routing is_login predicate is an inline expression in server.cpp, so pin by scan.
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp", std::ios::binary);
+    REQUIRE(in.good());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const auto text = ss.str();
+    const auto at =
+        text.find("auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;");
+    REQUIRE(at != std::string::npos);
+    // Whitespace-insensitive: column alignment in server.cpp must not break the pin.
+    const auto squash = [](std::string s) {
+        std::erase_if(s, [](unsigned char c) { return std::isspace(c) != 0; });
+        return s;
+    };
+    const auto window = squash(text.substr(at > 3000 ? at - 3000 : 0, at > 3000 ? 3000 : at));
+    CHECK(window.find(squash("(req.path == \"/auth/oidc/start\" && req.method == \"GET\")")) !=
+          std::string::npos);
+    CHECK(window.find(squash("(req.path == \"/auth/callback\" && req.method == \"GET\")")) !=
+          std::string::npos);
 }
 
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN
