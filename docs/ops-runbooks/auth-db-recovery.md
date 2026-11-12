@@ -2025,7 +2025,7 @@ restart once the store is back.
 
 ## MFA binding enforcement failed
 
-**Triage first.** If the gauge reads `0` and `YuzuMfaBindingNotEnforced` is firing, continue here. If the gauge reads `1`, no alert fires, and an approver or step-up request is refused `503` `mfa_proof_unavailable`, the account reads factor generation `0`: go to "Enrolled accounts at generation 0" under "Post-restore verification" and run `yuzu-server --mfa-reset <user>`.
+**Triage first.** If `yuzu_auth_mfa_binding_enforcement_ok` reads `0` and `YuzuMfaBindingNotEnforced` is firing, continue here. If the gauge reads `1`, no alert fires, and an approver or step-up request is refused `503` `mfa_proof_unavailable`, do not reset anyone yet: run the generation query in "Enrolled accounts at generation 0" under "Post-restore verification". Only an account that query returns needs `yuzu-server --mfa-reset <user>`. A refusal that carries `retry_after_ms` `5000`, or one for an account the query does not return, is a transient read fault: retry once, then check `YuzuSessionStoreDegraded` and pool health.
 
 `YuzuMfaBindingNotEnforced` fires (critical) when `yuzu_auth_mfa_binding_enforcement_ok{store}` reads `0`
 for a minute. A validation on this replica has observed that one of the two database triggers that
