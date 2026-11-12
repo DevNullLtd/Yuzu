@@ -4326,6 +4326,19 @@ test('guardian_backend reader wiring lexical gate (#2240)',
   timeout: 60,
 )
 
+# Agent-decommission cascade wiring (#5675): every field of AgentDecommissionStores must be handed a
+# live store pointer in ServerImpl::decommission_agent (server.cpp). A store registered in the
+# cascade but never wired there is Skipped for every operator decommission, and no unit test sees
+# it (the route test injects its own decommission_fn; the drift guard pins only the COUNT).
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' for the same
+# reason as the gate above.
+test('agent decommission cascade wiring lexical gate (#5675)',
+  _python3_test,
+  args: [files('test_decommission_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Echo rename upgrade window: static lexical gate pinning that agent.cpp still CALLS the tested
 # tar.db adoption helper and the KV re-key after KvStore::open( and before the first plugin
 # init (no Agent::run() seam exists to test that, #1492). Carries its own in-memory mutation

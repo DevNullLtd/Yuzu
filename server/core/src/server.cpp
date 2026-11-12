@@ -10946,17 +10946,17 @@ public:
     }
 
     /// Decommission an agent for good: fan `delete_agent(agent_id)` across every
-    /// per-agent store this server owns, durably erasing the machine's stored
-    /// rows (ADR-0024 Decision 11 — the GDPR-erasure path; the per-store
-    /// `delete_agent` methods had no production caller before this). Best-effort
-    /// in execution, ACCOUNTABLE in result, and null-tolerant: a store that is
-    /// not configured (e.g. no Postgres reachable, so every per-agent store —
-    /// all born-on-PG — is absent) is skipped, and one store's failure never
-    /// aborts the others — but
-    /// each `delete_agent` now reports its commit status, so a delete that did
-    /// NOT commit is recorded `Failed` (not `Deleted`) and
-    /// `DecommissionResult::ok()` confirms erasure across every configured store.
-    /// A caller relying on this as Art.17 erasure evidence MUST check `ok()`.
+    /// per-agent store this server owns, durably erasing the rows each store deletes
+    /// for the machine (ADR-0024 Decision 11, the GDPR-erasure path; the per-store
+    /// `delete_agent` methods had no production caller before this). The Guardian store keeps
+    /// its event log and DEX observations until retention expiry (see agent_decommission.hpp).
+    /// Best-effort in execution, ACCOUNTABLE in result, and null-tolerant: a store that is not
+    /// configured (e.g. no Postgres reachable, so every per-agent store — all born-on-PG — is
+    /// absent) is skipped, and one store's failure never aborts the others — but each
+    /// `delete_agent` now reports its commit status, so a delete that did NOT commit is recorded
+    /// `Failed` (not `Deleted`) and `DecommissionResult::ok()` confirms erasure, store by store, of
+    /// what each configured store deletes. A caller relying on this as Art.17 erasure evidence MUST
+    /// check `ok()`.
     ///
     /// The cascade is built HERE from the LIVE store pointers on each call
     /// (never a long-lived borrow), so it is inherently safe against the store
@@ -10969,8 +10969,10 @@ public:
     /// PR7.2) — a device-level erasure grant covering the cascade's whole blast
     /// radius — plus audit-before-erase fail-closed (Decision 11). ADDING A STORE
     /// BELOW? Add it to `AgentDecommissionStores`, `agent_decommission.cpp`'s
-    /// registration list, and `kCascadeStoreCount` — the securable no longer
-    /// changes.
+    /// registration list, `kCascadeStoreCount` and this initializer (nothing but
+    /// tests/test_decommission_wiring_lexical.py notices a store registered but never
+    /// wired here: it would be Skipped for every operator decommission); the securable
+    /// no longer changes.
     /// Today's OTHER agent-removal paths (registry session teardown, enrollment
     /// deny/remove, cert revocation) are non-durable-data by design and deliberately
     /// do NOT auto-erase (a revoked-for-compromise agent's forensic rows must
@@ -10985,6 +10987,7 @@ public:
             .app_usage = app_usage_store_.get(),
             .offline_endpoint = offline_endpoint_store_.get(),
             .certificate_inventory = certificate_inventory_store_.get(),
+            .guaranteed_state = guaranteed_state_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
