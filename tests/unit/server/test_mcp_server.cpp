@@ -41,6 +41,7 @@
 #include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_result_set_store_pg_helper.hpp" // ResultSetStorePg — #2146 Batch B2
+#include "test_mgmt_group_pg_helper.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
@@ -5388,7 +5389,8 @@ TEST_CASE("MCP create_api_token: a scope_service token requires ITServiceOwner a
     grant.principal_type = "user";
     grant.principal_id = "test-user";
     grant.role_name = "ITServiceOwner";
-    REQUIRE(mgmt.assign_role(grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this mint arm.
+    yuzu::test::plant_group_role_row(db.dsn(), grant);
 
     yuzu::test::ApprovalManagerPg allowed_appr_bundle;
     yuzu::server::ApprovalManager& allowed_appr = *allowed_appr_bundle;
@@ -29245,7 +29247,8 @@ TEST_CASE("MCP list_management_group_roles: ITServiceOwner-of-this-group fallbac
     owner_grant.principal_type = "user";
     owner_grant.principal_id = "test-user"; // matches McpTestServer's default mock_username
     owner_grant.role_name = "ITServiceOwner";
-    REQUIRE(store.assign_role(owner_grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+    yuzu::test::plant_group_role_row(db.dsn(), owner_grant);
 
     McpTestServer ts;
     ts.mgmt_store_for_test = &store;
@@ -29296,7 +29299,8 @@ TEST_CASE("MCP list_management_group_roles: ManagementGroup:Read leading gate de
     owner_grant.principal_type = "user";
     owner_grant.principal_id = "test-user";
     owner_grant.role_name = "ITServiceOwner";
-    REQUIRE(store.assign_role(owner_grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+    yuzu::test::plant_group_role_row(db.dsn(), owner_grant);
 
     McpTestServer ts;
     ts.mgmt_store_for_test = &store;
@@ -29371,7 +29375,8 @@ TEST_CASE("MCP management-group roles tools: the owner arm refuses an engine-cla
     owner_grant.principal_type = "user";
     owner_grant.principal_id = "test-user";
     owner_grant.role_name = "ITServiceOwner";
-    REQUIRE(store.assign_role(owner_grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+    yuzu::test::plant_group_role_row(db.dsn(), owner_grant);
     // assign_management_group_role needs a non-null rbac_store and never dereferences it on this
     // path (see the happy-path case below).
     yuzu::server::pg::PgPool bad_pool{

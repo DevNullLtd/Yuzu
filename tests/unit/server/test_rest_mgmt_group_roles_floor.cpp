@@ -215,9 +215,10 @@ TEST_CASE("GET /management-groups/{id}/roles requires the floored UserManagement
         // no UserManagement grant at all, while the POST/DELETE handlers on this same
         // path already let it MUTATE assignments via an ITServiceOwner fallback. A
         // read-denied/write-allowed posture is both a broken workflow and incoherent.
-        auto assigned = h.mgmt_bundle->assign_role(
-            GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-        REQUIRE(assigned.has_value());
+        // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+        // and this test.
+        yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                         GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
         h.perm_override = [](const std::string& securable, const std::string& op) {
             return !(securable == "UserManagement" && op == "Read");
@@ -230,9 +231,10 @@ TEST_CASE("GET /management-groups/{id}/roles requires the floored UserManagement
     SECTION("a non-owner is still denied even when someone ELSE owns the group") {
         // The fallback must be scoped to the CALLER, not merely to the group having
         // an owner — otherwise any group with an ITServiceOwner would be world-readable.
-        auto assigned = h.mgmt_bundle->assign_role(
-            GroupRoleAssignment{gid, "user", "someone-else", "ITServiceOwner"});
-        REQUIRE(assigned.has_value());
+        // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+        // and this test.
+        yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                         GroupRoleAssignment{gid, "user", "someone-else", "ITServiceOwner"});
 
         h.perm_override = [](const std::string& securable, const std::string& op) {
             return !(securable == "UserManagement" && op == "Read");
@@ -253,9 +255,10 @@ TEST_CASE("GET /management-groups/{id}/roles requires the floored UserManagement
 
     SECTION("guardian-confinement-2298 §3e: ITServiceOwner OF THIS GROUP does NOT "
              "save a service-scoped token") {
-        auto assigned = h.mgmt_bundle->assign_role(
-            GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-        REQUIRE(assigned.has_value());
+        // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+        // and this test.
+        yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                         GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
         h.perm_override = [](const std::string& securable, const std::string& op) {
             return !(securable == "UserManagement" && op == "Read");
@@ -382,9 +385,10 @@ TEST_CASE("POST /management-groups/{id}/roles: ITServiceOwner OF THIS GROUP is "
     auto grp = h.mgmt_bundle->create_group(g);
     REQUIRE(grp.has_value());
     const std::string gid = *grp;
-    auto assigned = h.mgmt_bundle->assign_role(
-        GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-    REQUIRE(assigned.has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+    // and this test.
+    yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
     h.perm_override = [](const std::string& securable, const std::string& op) {
         return !(securable == "ManagementGroup" && op == "Write");
@@ -406,9 +410,10 @@ TEST_CASE("POST /management-groups/{id}/roles: a service-scoped token is denied 
     auto grp = h.mgmt_bundle->create_group(g);
     REQUIRE(grp.has_value());
     const std::string gid = *grp;
-    auto assigned = h.mgmt_bundle->assign_role(
-        GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-    REQUIRE(assigned.has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+    // and this test.
+    yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
     h.perm_override = [](const std::string& securable, const std::string& op) {
         return !(securable == "ManagementGroup" && op == "Write");
@@ -455,9 +460,10 @@ TEST_CASE("DELETE /management-groups/{id}/roles: a service-scoped token is denie
     auto grp = h.mgmt_bundle->create_group(g);
     REQUIRE(grp.has_value());
     const std::string gid = *grp;
-    auto assigned = h.mgmt_bundle->assign_role(
-        GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-    REQUIRE(assigned.has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+    // and this test.
+    yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
     h.perm_override = [](const std::string& securable, const std::string& op) {
         return !(securable == "ManagementGroup" && op == "Write");
@@ -493,9 +499,10 @@ struct OwnerArmFixture {
         REQUIRE(grp.has_value());
         gid = *grp;
         if (caller_is_owner) {
-            REQUIRE(h.mgmt_bundle
-                        ->assign_role(GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"})
-                        .has_value());
+            // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes the
+            // owner arm and these tests.
+            yuzu::test::plant_group_role_row(
+                h.mgmt_bundle.dsn(), GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
         }
     }
 
@@ -567,8 +574,10 @@ TEST_CASE("DELETE /management-groups/{id}/roles: an owner-arm caller removes onl
           "Viewer rows",
           "[pg][rest][mgmt_group][authz][owner_gate]") {
     OwnerArmFixture f("owner-gate-delete");
-    REQUIRE(f.h.mgmt_bundle->assign_role(GroupRoleAssignment{f.gid, "user", "peer", "ITServiceOwner"})
-                .has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner (the DELETE path stays
+    // unrestricted so an existing row is removable).
+    yuzu::test::plant_group_role_row(f.h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{f.gid, "user", "peer", "ITServiceOwner"});
     REQUIRE(f.h.mgmt_bundle->assign_role(GroupRoleAssignment{f.gid, "user", "op1", "Operator"})
                 .has_value());
     f.deny_fleet_wide();
@@ -593,8 +602,10 @@ TEST_CASE("DELETE /management-groups/{id}/roles: a fleet-wide ManagementGroup:Wr
           "still remove an ITServiceOwner row",
           "[pg][rest][mgmt_group][authz][owner_gate]") {
     OwnerArmFixture f("owner-gate-delete-fleet", /*caller_is_owner=*/false);
-    REQUIRE(f.h.mgmt_bundle->assign_role(GroupRoleAssignment{f.gid, "user", "peer", "ITServiceOwner"})
-                .has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner (the DELETE path stays
+    // unrestricted so an existing row is removable).
+    yuzu::test::plant_group_role_row(f.h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{f.gid, "user", "peer", "ITServiceOwner"});
 
     auto res = f.del(R"({"principal_id":"peer","role_name":"ITServiceOwner"})");
     REQUIRE(res);
@@ -1146,8 +1157,9 @@ TEST_CASE("management-group mutations: a caller without ManagementGroup:Write ge
     }
 
     SECTION("an ITServiceOwner of the group still gets the 400 and the denied row") {
-        REQUIRE(h.mgmt_bundle->assign_role(GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"})
-                    .has_value());
+        // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+        yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                         GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
         auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
                                R"({"principal_id":"someone","role_name":"View\u0000er"})");
         REQUIRE(res);
