@@ -467,6 +467,123 @@ CREATE OR REPLACE TRIGGER guardian_agent_rule_status_flag_legacy
     FOR EACH ROW EXECUTE FUNCTION guardian_agent_rule_status_flag_legacy_write();
 )SQL";
 
+// Schema v5 (#5690, UP-14): the event pair (boot_epoch, emit_seq) on both tables and the
+// per-agent order table, sized for the whole regime machine (retired epoch, the straggler and
+// duplicate counters, the two receipt clocks) so a later change adds nothing but a v6. Nullable
+// columns with no default are catalog-only: no rewrite, so no disk headroom and no long lock
+// (the 3 s lock_timeout bounds the wait for the brief ACCESS EXCLUSIVE). NULL/NULL is an
+// unpaired event or verdict; there is no backfill, and no CHECK constraint (the ingest bounds
+// the pair, and a database must keep a row it cannot judge).
+// Every statement replays over a used v5 (a reset to 4 re-runs this text): IF NOT EXISTS and
+// CREATE OR REPLACE, never a drop.
+constexpr const char* kV5Ddl = R"SQL(
+SET LOCAL lock_timeout = '3s';
+ALTER TABLE guaranteed_state_events
+    ADD COLUMN IF NOT EXISTS boot_epoch BIGINT,
+    ADD COLUMN IF NOT EXISTS emit_seq BIGINT;
+ALTER TABLE guardian_agent_rule_status
+    ADD COLUMN IF NOT EXISTS boot_epoch BIGINT,
+    ADD COLUMN IF NOT EXISTS emit_seq BIGINT;
+CREATE TABLE IF NOT EXISTS guardian_agent_order (
+    agent_id          TEXT NOT NULL,
+    epoch             BIGINT,
+    emit_seq_hwm      BIGINT,
+    epoch_recv_ns     BIGINT,
+    retired_epoch     BIGINT,
+    unpaired_recv_ns  BIGINT,
+    unpaired_events   BIGINT NOT NULL DEFAULT 0,
+    unpaired_held     BIGINT NOT NULL DEFAULT 0,
+    pair_regressions  BIGINT NOT NULL DEFAULT 0,
+    pair_stragglers   BIGINT NOT NULL DEFAULT 0,
+    pair_recoveries   BIGINT NOT NULL DEFAULT 0,
+    pair_duplicates   BIGINT NOT NULL DEFAULT 0,
+    retired_events    BIGINT NOT NULL DEFAULT 0,
+    CONSTRAINT guardian_agent_order_pkey PRIMARY KEY (agent_id)
+);
+-- The v4 tripwire, extended: a verdict change that leaves a NON-NULL pair unchanged is also
+-- flagged. This version's upsert moves the pair with the verdict, so only an earlier build
+-- (which never writes the pair) can do that to a paired row. A v4 INSERT, or a v4 write to a
+-- row whose pair is NULL, is as clean here as under v4. The trigger itself is v4's; only the
+-- function body is replaced.
+CREATE OR REPLACE FUNCTION guardian_agent_rule_status_flag_legacy_write() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF (NEW.state IS DISTINCT FROM OLD.state OR NEW.updated_at IS DISTINCT FROM OLD.updated_at)
+       AND ((NEW.key_ns IS NOT DISTINCT FROM OLD.key_ns
+             AND NEW.ingest_seq IS NOT DISTINCT FROM OLD.ingest_seq)
+            OR (NEW.boot_epoch IS NOT NULL
+                AND NEW.boot_epoch IS NOT DISTINCT FROM OLD.boot_epoch
+                AND NEW.emit_seq IS NOT DISTINCT FROM OLD.emit_seq)) THEN
+        NEW.order_uncertain := true;
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+)SQL";
+
+// Shape check for schema v5: the ONE text run by the migration (before it stamps the version)
+// and by the boot probe `ordering_schema_defect`, for the reason kV4ShapeCheck gives. It
+// reads the four pair columns, the order table (every column, type, nullability and default;
+// permanent and ordinary; the primary key by name and column) and the tripwire function body.
+// The body is matched by the three fragments of the pair test, so v4's body, which compiles and
+// is attached to the same trigger, is refused. `pg_get_functiondef` returns the body verbatim.
+constexpr const char* kV5ShapeCheck = R"SQL(
+DO $do$
+DECLARE
+  bad text := '';
+  r record;
+  fdef text;
+  e regclass := 'guaranteed_state_store.guaranteed_state_events'::regclass;
+  c regclass := 'guaranteed_state_store.guardian_agent_rule_status'::regclass;
+  o regclass := to_regclass('guaranteed_state_store.guardian_agent_order');
+BEGIN
+  IF o IS NULL OR NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = o AND relkind = 'r' AND relpersistence = 'p')
+    THEN bad := bad || ' table guardian_agent_order(permanent, ordinary)'; END IF;
+  FOR r IN SELECT * FROM (VALUES
+      (e, 'boot_epoch', 'bigint'::regtype, false, NULL::text),
+      (e, 'emit_seq', 'bigint'::regtype, false, NULL),
+      (c, 'boot_epoch', 'bigint'::regtype, false, NULL),
+      (c, 'emit_seq', 'bigint'::regtype, false, NULL),
+      (o, 'agent_id', 'text'::regtype, true, NULL),
+      (o, 'epoch', 'bigint'::regtype, false, NULL),
+      (o, 'emit_seq_hwm', 'bigint'::regtype, false, NULL),
+      (o, 'epoch_recv_ns', 'bigint'::regtype, false, NULL),
+      (o, 'retired_epoch', 'bigint'::regtype, false, NULL),
+      (o, 'unpaired_recv_ns', 'bigint'::regtype, false, NULL),
+      (o, 'unpaired_events', 'bigint'::regtype, true, '0'),
+      (o, 'unpaired_held', 'bigint'::regtype, true, '0'),
+      (o, 'pair_regressions', 'bigint'::regtype, true, '0'),
+      (o, 'pair_stragglers', 'bigint'::regtype, true, '0'),
+      (o, 'pair_recoveries', 'bigint'::regtype, true, '0'),
+      (o, 'pair_duplicates', 'bigint'::regtype, true, '0'),
+      (o, 'retired_events', 'bigint'::regtype, true, '0')) v(rel, col, typ, nn, dflt)
+    WHERE v.rel IS NOT NULL
+  LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                    WHERE a.attrelid = r.rel AND a.attname = r.col AND NOT a.attisdropped AND a.atttypid = r.typ
+                      AND a.attnotnull = r.nn AND a.attidentity = '' AND a.attgenerated = ''
+                      AND (CASE WHEN r.dflt IS NULL THEN d.oid IS NULL ELSE pg_get_expr(d.adbin, d.adrelid) = r.dflt END))
+      THEN bad := bad || ' ' || r.rel::text || '.' || r.col; END IF;
+  END LOOP;
+  IF o IS NOT NULL AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = o AND conname = 'guardian_agent_order_pkey'
+                  AND contype = 'p' AND conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = o AND attname = 'agent_id')])
+    THEN bad := bad || ' order table primary key guardian_agent_order_pkey(agent_id)'; END IF;
+  SELECT pg_get_functiondef(fp.oid) INTO fdef
+    FROM pg_trigger t JOIN pg_proc fp ON fp.oid = t.tgfoid
+   WHERE t.tgrelid = c AND t.tgname = 'guardian_agent_rule_status_flag_legacy'
+     AND fp.proname = 'guardian_agent_rule_status_flag_legacy_write';
+  IF fdef IS NULL
+     OR strpos(fdef, 'NEW.boot_epoch IS NOT NULL') = 0
+     OR strpos(fdef, 'NEW.boot_epoch IS NOT DISTINCT FROM OLD.boot_epoch') = 0
+     OR strpos(fdef, 'NEW.emit_seq IS NOT DISTINCT FROM OLD.emit_seq') = 0
+    THEN bad := bad || ' census trigger function guardian_agent_rule_status_flag_legacy_write(pair test)'; END IF;
+  IF bad <> '' THEN
+    RAISE EXCEPTION 'guaranteed_state_store v5: object not as this version creates it:%', bad USING ERRCODE = 'P0001';
+  END IF;
+END
+$do$;
+)SQL";
+
 // ── Postgres schema (ADR-0038): the FINAL column set of all 8 SQLite
 // migrations, collapsed into one v1. Unqualified DDL — the migration runner
 // sets search_path to `guaranteed_state_store` for the migration transaction.
@@ -605,6 +722,9 @@ const std::vector<pg::PgMigration>& migrations() {
         // v4 (#5690): the migration text is the DDL followed by the shape check, so a database
         // carrying an adopted object of the wrong shape rolls back unstamped.
         {4, std::string(kV4Ddl) + kV4ShapeCheck},
+        // v5 (#5690, UP-14): the pair columns and the per-agent order table, with the same
+        // shape check, so an adopted object of the wrong shape rolls back unstamped.
+        {5, std::string(kV5Ddl) + kV5ShapeCheck},
     };
     return kMigrations;
 }
@@ -648,34 +768,75 @@ std::string census_schema_defect(PGconn* conn) {
     return {};
 }
 
-// Boot probe for schema v4: the same shape check the migration ran, again on every start,
-// because a database stamped 4 is skipped by the runner. Returns an empty string when every v4
-// object is as this version creates it, else the cause for the boot error. A refusal our own
-// check raised (SQLSTATE P0001) carries the objects it found wrong and the remedy; any other
-// failure is reported as a probe failure with the libpq message sanitised.
-std::string ordering_schema_defect(PGconn* conn) {
-    pg::PgResult res = pg::exec_params(conn, kV4ShapeCheck, std::vector<std::string>{});
+// Runs one schema's shape check. Returns false with `out` empty when every object is as that
+// version creates it. Otherwise returns true with `out` the cause for the boot error: our own
+// refusal (SQLSTATE P0001) carries the objects it found wrong (`refused` is set, so the caller
+// appends that version's remedy), any other failure is a probe failure with the libpq message
+// sanitised (no remedy).
+bool shape_check_failed(PGconn* conn, const char* shape_check, const char* fallback,
+                        std::string& out, bool& refused) {
+    out.clear();
+    refused = false;
+    pg::PgResult res = pg::exec_params(conn, shape_check, std::vector<std::string>{});
     if (res.status() == PGRES_COMMAND_OK)
-        return {};
+        return false;
     const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
-    if (state == nullptr || std::string_view(state) != "P0001")
-        return std::string("ordering schema probe failed: ") +
-               ::yuzu::log_key_token(PQerrorMessage(conn));
+    if (state == nullptr || std::string_view(state) != "P0001") {
+        out = std::string("ordering schema probe failed: ") +
+              ::yuzu::log_key_token(PQerrorMessage(conn));
+        return true;
+    }
     const char* primary = PQresultErrorField(res.get(), PG_DIAG_MESSAGE_PRIMARY);
-    return std::string(primary != nullptr ? primary
-                                          : "guaranteed_state_store v4: object not as "
-                                            "this version creates it") +
-           ". Back up the database first and stop every replica. If v4 was never used (no "
-           "census row has key_ns and no event has proj_key or projection_pending), drop the "
-           "named objects (a missing column needs no drop) and run \"UPDATE public.schema_meta "
-           "SET version = 3 WHERE store = "
-           "'guaranteed_state_store'\", then restart, which re-runs the v4 migration. If v4 was "
-           "used, dropping an object discards ordering evidence, so reconcile by hand (a missing "
-           "seq_hwm or hwm_recv_ns column needs no drop: the version-3 reset adds it without "
-           "loss). A "
-           "sequence refusal is repaired, with every replica stopped, by setval of the "
-           "ingest_seq sequence to the larger of the event maximum and the census ingest_seq and "
-           "seq_hwm maxima with is_called true; the store never reseeds it";
+    out = primary != nullptr ? primary : fallback;
+    refused = true;
+    return true;
+}
+
+// Boot probe for schemas v4 and v5: the same shape checks the migrations ran, again on every
+// start, because a database stamped 4 or 5 is skipped by the runner. v4 is checked first and its
+// remedy (reset to 3) is unchanged; a defect only v5 has names a reset to 4, which re-runs only
+// the v5 migration (its text replays over a used v5). Returns an empty string when every object
+// is as this version creates it, else the cause for the boot error.
+std::string ordering_schema_defect(PGconn* conn) {
+    std::string cause;
+    bool refused = false;
+    if (shape_check_failed(conn, kV4ShapeCheck,
+                           "guaranteed_state_store v4: object not as this version creates it",
+                           cause, refused)) {
+        if (!refused)
+            return cause;
+        return cause +
+               ". Back up the database first and stop every replica. If v4 was never used (no "
+               "census row has key_ns and no event has proj_key or projection_pending), drop the "
+               "named objects (a missing column needs no drop) and run \"UPDATE public.schema_meta "
+               "SET version = 3 WHERE store = "
+               "'guaranteed_state_store'\", then restart, which re-runs the v4 migration. If v4 "
+               "was "
+               "used, dropping an object discards ordering evidence, so reconcile by hand (a "
+               "missing "
+               "seq_hwm or hwm_recv_ns column needs no drop: the version-3 reset adds it without "
+               "loss). A "
+               "sequence refusal is repaired, with every replica stopped, by setval of the "
+               "ingest_seq sequence to the larger of the event maximum and the census ingest_seq "
+               "and "
+               "seq_hwm maxima with is_called true; the store never reseeds it";
+    }
+    if (shape_check_failed(conn, kV5ShapeCheck,
+                           "guaranteed_state_store v5: object not as this version creates it",
+                           cause, refused)) {
+        if (!refused)
+            return cause;
+        return cause +
+               ". Back up the database first and stop every replica. If v5 was never used (no "
+               "event or census row has boot_epoch or emit_seq and guardian_agent_order is "
+               "empty), drop the named objects (a missing column needs no drop) and run "
+               "\"UPDATE public.schema_meta SET version = 4 WHERE store = "
+               "'guaranteed_state_store'\", then restart, which re-runs the v5 migration. If v5 "
+               "was used, dropping an object discards ordering evidence, so reconcile by hand "
+               "(a wrong trigger function body needs no drop: the version-4 reset replaces it "
+               "without loss)";
+    }
+    return {};
 }
 
 } // namespace
