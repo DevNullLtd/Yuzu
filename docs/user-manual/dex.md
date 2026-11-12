@@ -111,8 +111,8 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   read has no per-version exposure to compare, and it is never printed as 0 points. A withheld
   score reads `Withheld` and says why in words: some affected devices are offline, no population
   to score against, counts that disagree, a faulty score policy, or below the reporting floor
-  (count only, and its last-seen time is withheld too; the live read cannot return it today because
-  the floor is one device).
+  (count only, with its last-seen time withheld too; the live read cannot reach this state today
+  because the floor is one device).
 - **Versions.** Each application expands to its versions (the unknown-version bucket reads
   `unknown version`; an application with none says `version not collected`). Up to 20 versions per
   application and 100 applications are listed, those with the most devices affected, and a note

@@ -1184,6 +1184,7 @@ TEST_CASE("DEX apps UI: populated page across the window matrix (goldens)", "[de
     // The page is application-centric: no agent identity key or column anywhere on it.
     CHECK_FALSE(contains(page_all, "agent_id"));
     CHECK_FALSE(contains(page_all, "agent-id"));
+    CHECK_FALSE(contains(page_all, "device?id=")); // the per-device drill, which names an agent by value
     // Every chip carries both the window and the platform, as canonical tokens: the four platform
     // chips keep the current window, the four window chips keep the current platform.
     CHECK(count_of(page_all, "&amp;platform=") == 8);
@@ -1238,12 +1239,32 @@ TEST_CASE("DEX apps UI: below-floor row reads count only", "[dex][golden][apps_u
     CHECK(contains(cell(page, "wide.exe", "", kColRate), "below the reporting floor: count only"));
     CHECK(contains(cell(page, "wide.exe", "", kColScore), "Below the reporting floor: count only."));
     CHECK(contains(cell(page, "wide.exe", "", kColDevices), "count only"));
-    // a singleton's exact last-seen time is withheld with the rest of its figures
+    // a below-floor row's exact last-seen time is withheld with the rest of its figures
     CHECK(contains(cell(page, "wide.exe", "", kColLastSeen), "withheld"));
     CHECK_FALSE(contains(cell(page, "wide.exe", "", kColLastSeen), "<span class=\"nw\">"));
     // the neighbouring row is untouched
     CHECK(contains(cell(page, "app1.exe", "", kColShare), "14.0%"));
     check_golden("apps__below-floor", page);
+}
+
+TEST_CASE("DEX apps UI: a below-floor version row withholds its last-seen time too", "[dex][apps_ui]") {
+    // figure_cells serves application and version rows alike; pin the version row separately.
+    auto model = populated_model();
+    REQUIRE(model.apps[0].subject == "wide.exe");
+    DexStabilityFigures* ver = nullptr;
+    for (auto& v : model.apps[0].versions)
+        if (v.version == "3.0.1")
+            ver = &v.figures;
+    REQUIRE(ver != nullptr);
+    ver->score = stability_detail::withheld_result("below_floor");
+    ver->share_affected.reset();
+    ver->rate_per_1000.reset();
+    const auto page = render_dex_apps_fragment(model, 7, "all");
+    CHECK(contains(cell(page, "wide.exe", "3.0.1", kColLastSeen), "withheld"));
+    CHECK_FALSE(contains(cell(page, "wide.exe", "3.0.1", kColLastSeen), "<span class=\"nw\">"));
+    // the application's own head row and the sibling version keep their timestamps
+    CHECK(contains(cell(page, "wide.exe", "", kColLastSeen), "<span class=\"nw\">"));
+    CHECK(contains(cell(page, "wide.exe", "", kColLastSeen), "04:00:00Z"));
 }
 
 TEST_CASE("DEX apps UI: versions including the unknown-version bucket", "[dex][golden][apps_ui]") {
@@ -1345,6 +1366,7 @@ TEST_CASE("DEX apps UI: unknown and zero population read in words", "[dex][golde
     CHECK(contains(cell(unknown, "app1.exe", "", kColScore), "Population unknown, so there is nothing to measure against."));
     CHECK(contains(cell(unknown, "app1.exe", "", kColDevices), "online count unknown"));
     CHECK(contains(cell(unknown, "app1.exe", "", kColCrashes), ">12<")); // window-wide counts still show
+    CHECK(contains(cell(unknown, "app1.exe", "", kColLastSeen), "<span class=\"nw\">")); // so does the stamp
     CHECK_FALSE(contains(unknown, "<b>Small counts:</b>")); // no share or rate to tag
     check_golden("apps__no-population", unknown);
 
@@ -1352,6 +1374,7 @@ TEST_CASE("DEX apps UI: unknown and zero population read in words", "[dex][golde
     CHECK(contains(zero, "<b>Population</b> 0 devices online now (all platforms)."));
     CHECK(contains(cell(zero, "app1.exe", "", kColShare), "not calculated: no device online"));
     CHECK(contains(cell(zero, "app1.exe", "", kColScore), "No device is online to measure against."));
+    CHECK(contains(cell(zero, "app1.exe", "", kColLastSeen), "<span class=\"nw\">")); // still shows its stamp
     CHECK_FALSE(contains(zero, "<b>Small counts:</b>"));
 }
 
@@ -1578,6 +1601,12 @@ TEST_CASE("DEX apps UI: every withheld score reads in words and the token is esc
         CHECK(contains(score, "<span class=\"dx-sc\">Withheld</span>"));
         CHECK(contains(score, c.words));
         CHECK_FALSE(contains(score, c.token)); // a known token is never printed raw
+        // Last seen is withheld only for below_floor; every other withheld score still shows the stamp
+        const auto seen = cell(page, model.apps[0].subject, "", kColLastSeen);
+        if (std::string_view(c.token) == "below_floor")
+            CHECK(contains(seen, "withheld"));
+        else
+            CHECK(contains(seen, "<span class=\"nw\">"));
     }
     // an unknown token is shown, escaped
     auto model = populated_model();

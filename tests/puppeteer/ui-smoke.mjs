@@ -3,10 +3,10 @@
 //   1. NAV CRAWL  every shell nav route answers 200 with the CSP header and no page errors,
 //                 and the discovered set matches EXPECTED (nav drift fails both ways).
 //   2. OVERFLOW   submit controls stay inside their form/dialog and the viewport (#5576).
-//   3. SCENARIOS  five scenarios (#6076, add user, #5840, #6074, #6749), each forcing its own
-//                 precondition, with writes answered by a request stub so nothing is written to the
-//                 server; and the DEX Apps tab (AP-3.2): a live keyboard half, then a committed
-//                 golden page served through a GET stub.
+//   3. SCENARIOS  six scenarios: five that each force their own precondition (#6076, add user,
+//                 #5840, #6074, #6749), with writes answered by a request stub so nothing is
+//                 written to the server, and the DEX Apps tab (AP-3.2): a live keyboard half, then
+//                 a committed golden page served through a GET stub.
 // One line per check; exit 1 when any check fails.
 //
 // `--selftest` needs no stack and no login: it proves the checks can fail, against a local
@@ -390,6 +390,7 @@ async function scenarioDexApps(page) {
     w.errors().length === 0, JSON.stringify(w.errors()));
   clearStubs(page);
 }
+
 // #6749: the Engine Principals roster read answers 200 with Sec-Audit-Failed when its audit row
 // was not saved; the Settings page says so once, outside the section that refreshes. A stub
 // proves the PAGE half only (the server half is the dropped-audit C++ test).
