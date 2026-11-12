@@ -404,7 +404,8 @@ std::string last_seen_text(const std::string& ts) {
 
 std::string figure_cells(const DexStabilityFigures& f, const RowCtx& c) {
     return score_cell(f, c) + count_cells(f) + devices_cell(f) + share_cell(f, c) + rate_cell(f, c) +
-           "<td class=\"gp-mute\">" + last_seen_text(f.last_seen) + "</td>";
+           "<td class=\"gp-mute\">" + (is_floor(f) ? std::string("withheld") : last_seen_text(f.last_seen)) +
+           "</td>";
 }
 
 std::string app_body(const DexAppStability& a, const DexAppsModel& m, const std::string& window) {
@@ -415,14 +416,14 @@ std::string app_body(const DexAppStability& a, const DexAppsModel& m, const std:
     const std::string label =
         a.subject.empty()
             ? std::string("&lt;unknown&gt;")
-            : "<a hx-get=\"/fragments/dex/app?name=" + url_query_value(a.subject) + "&window=" + window +
+            : "<a hx-get=\"/fragments/dex/app?name=" + url_query_value(a.subject) + "&amp;window=" + window +
                   "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" style=\"cursor:pointer;\">" +
                   esc(a.subject) + "</a>";
     std::string first = label;
     if (a.profile == DexPolicyProfile::Override)
         first += " <span class=\"dx-tag\">override</span>";
     if (a.version_count == 0)
-        first += "<span class=\"gp-mute\">version not collected</span>";
+        first += " <span class=\"gp-mute\">version not collected</span>";
     else
         first += "<details class=\"dx-vx\"><summary>" + n(a.version_count) + " version" +
                  (a.version_count == 1 ? "" : "s") + "</summary></details>";

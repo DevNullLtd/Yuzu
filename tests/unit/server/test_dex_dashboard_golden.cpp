@@ -1181,19 +1181,22 @@ TEST_CASE("DEX apps UI: populated page across the window matrix (goldens)", "[de
     CHECK(contains(cell(page_all, "app1.exe", "", kColRate), "300.0"));
     CHECK(contains(cell(page_all, "app1.exe", "", kColScore), "excellent 90.7"));
     CHECK(contains(page_all, "<b>Window-wide figures:</b>"));
+    // The page is application-centric: no agent identity key or column anywhere on it.
+    CHECK_FALSE(contains(page_all, "agent_id"));
+    CHECK_FALSE(contains(page_all, "agent-id"));
     // Every chip carries both the window and the platform, as canonical tokens: the four platform
     // chips keep the current window, the four window chips keep the current platform.
     CHECK(count_of(page_all, "&amp;platform=") == 8);
     CHECK(count_of(page_all, "hx-get=\"/fragments/dex/apps?window=all&amp;platform=") == 5);
     CHECK(count_of(page_all, "&amp;platform=all\" hx-target") == 5);
     // The drill link keeps its shape; the window is the canonical token.
-    CHECK(contains(page_all, "<a hx-get=\"/fragments/dex/app?name=app1.exe&window=all\" "
+    CHECK(contains(page_all, "<a hx-get=\"/fragments/dex/app?name=app1.exe&amp;window=all\" "
                              "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
                              "style=\"cursor:pointer;\">app1.exe</a>"));
     check_golden("apps__win-all", page_all);
 
     const auto page_24h = render_dex_apps_fragment(model, 1, "all");
-    CHECK(contains(page_24h, "/fragments/dex/app?name=wide.exe&window=24h"));
+    CHECK(contains(page_24h, "/fragments/dex/app?name=wide.exe&amp;window=24h"));
     CHECK(count_of(page_24h, "hx-get=\"/fragments/dex/apps?window=24h&amp;platform=") == 5);
     check_golden("apps__win-24h", page_24h);
 }
@@ -1235,6 +1238,9 @@ TEST_CASE("DEX apps UI: below-floor row reads count only", "[dex][golden][apps_u
     CHECK(contains(cell(page, "wide.exe", "", kColRate), "below the reporting floor: count only"));
     CHECK(contains(cell(page, "wide.exe", "", kColScore), "Below the reporting floor: count only."));
     CHECK(contains(cell(page, "wide.exe", "", kColDevices), "count only"));
+    // a singleton's exact last-seen time is withheld with the rest of its figures
+    CHECK(contains(cell(page, "wide.exe", "", kColLastSeen), "withheld"));
+    CHECK_FALSE(contains(cell(page, "wide.exe", "", kColLastSeen), "<span class=\"nw\">"));
     // the neighbouring row is untouched
     CHECK(contains(cell(page, "app1.exe", "", kColShare), "14.0%"));
     check_golden("apps__below-floor", page);
@@ -1874,7 +1880,7 @@ TEST_CASE("DEX apps UI: agent-reported and customer-authored strings are escaped
     CHECK(contains(page, "a&amp;b"));
     CHECK(contains(page, "<span class=\"nw\">&lt;ts&gt;</span>")); // no 'T': one span around the escaped whole
     // the drill hx-get carries the percent-encoded subject
-    CHECK(contains(page, "/fragments/dex/app?name=%3Cscript%3E%22x&window=7d"));
+    CHECK(contains(page, "/fragments/dex/app?name=%3Cscript%3E%22x&amp;window=7d"));
     // an empty subject is words, not a link
     const auto unk = render_dex_apps_fragment(
         model_of({apps_total_row("", 2, 0, 1, 2, 0, 1, 1, "2026-10-14T01:00:00Z")}, 50), 7, "all");
