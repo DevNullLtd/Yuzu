@@ -45369,6 +45369,8 @@ TEST_CASE("MCP runtime config: the administrator-only keys are refused with a de
     auto owned = set_runtime_config_call(ts, "dex_score_policy", "{}");
     REQUIRE(owned.contains("error"));
     CHECK(owned["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // The refusal points an MCP caller at the MCP tool, not only at the REST route.
+    CHECK(owned.dump().find("set_dex_score_policy") != std::string::npos);
     for (const auto& entry : ts.audit_log)
         CHECK_FALSE(entry.starts_with("config.update"));
 }

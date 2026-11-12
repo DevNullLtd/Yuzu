@@ -40,17 +40,21 @@ std::optional<WriteRefusal> write_refusal(const std::string& key, const auth::Se
         return std::nullopt;
 
     // A route-owned key (today only dex_score_policy: one document with its own writers,
-    // PUT/DELETE /api/v1/dex/score-policy and the Scoring tab's POSTs, which validate it whole; a
-    // generic single-value write could leave it half-edited).
+    // PUT/DELETE /api/v1/dex/score-policy, the Scoring tab's POSTs and the MCP tools
+    // set_dex_score_policy / reset_dex_score_policy, all over apply_dex_score_policy, which
+    // validates it whole; a generic single-value write could leave it half-edited). The MCP
+    // set_runtime_config tool forwards this refusal verbatim, so the text below names the
+    // MCP tool beside the REST route.
     if (*write_class == ConfigWriteClass::RouteOwned) {
         const bool dex = key == kDexScorePolicyKey;
         return WriteRefusal{
             .kind = WriteRefusal::Kind::RouteOwned,
             .message = dex ? std::string("dex_score_policy is not written through this route; use "
-                                         "PUT /api/v1/dex/score-policy")
+                                         "PUT /api/v1/dex/score-policy (over MCP: "
+                                         "set_dex_score_policy)")
                            : key + " is written only through its own route",
             .remediation = dex ? "send the whole policy document to PUT /api/v1/dex/score-policy "
-                                 "with If-Match"
+                                 "with If-Match (over MCP: set_dex_score_policy with if_match)"
                                : "use the route that owns this key",
             .audit_detail = {}};
     }

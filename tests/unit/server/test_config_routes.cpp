@@ -227,7 +227,8 @@ TEST_CASE("config_routes: PUT /api/config/dex_score_policy is refused with a typ
     CHECK(b["error"]["message"].get<std::string>().find("PUT /api/v1/dex/score-policy") !=
           std::string::npos);
     CHECK(b["error"]["remediation"] ==
-          "send the whole policy document to PUT /api/v1/dex/score-policy with If-Match");
+          "send the whole policy document to PUT /api/v1/dex/score-policy with If-Match (over MCP: "
+          "set_dex_score_policy with if_match)");
     CHECK(h.audits.empty());
     // The permission gate still runs first.
     REQUIRE(h.perm_calls.size() == 1);

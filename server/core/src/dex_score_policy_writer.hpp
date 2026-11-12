@@ -4,7 +4,8 @@
  * @file dex_score_policy_writer.hpp
  * The one write path for the customer DEX score policy: validate, persist, audit, refresh.
  * apply_dex_score_policy() sits behind PUT and DELETE /api/v1/dex/score-policy and is the
- * entry the Settings panel reuses, so the two surfaces cannot drift.
+ * entry the Settings panel and the MCP tools set_dex_score_policy / reset_dex_score_policy
+ * reuse, so the three surfaces cannot drift.
  *
  * Header-only and store-free: it includes no store, httplib or clock type. Every boundary is
  * an injected closure (the observed store read, the store compare-and-set / -remove, the audit
@@ -37,8 +38,9 @@
  * overwritten a commit this request did make.
  *
  * Failure of the later audit rows (success, failure, no_change) never changes the answer: the
- * store state they describe already exists, and the handler's Sec-Audit-Failed header carries
- * the signal.
+ * store state they describe already exists, and the handler carries the signal
+ * (Sec-Audit-Failed on the REST routes and the Scoring tab, audit_persisted:false in the MCP
+ * tool result).
  *
  * Audit row size. The whole canonical document (about 150 KB at the override limit, at most
  * about 220 KB when image keys and names need escaping, always under the 256 KiB cap) rides

@@ -5838,8 +5838,8 @@ another OIDC field, restart first so the process is not holding the old value.
 > it, on every status. These refusals use the A4 envelope (`correlation_id` present): `403`
 > `cross-site request refused`, the `403` for a refused administrator-class write (see **Permission**; it carries a `remediation` and no `permission` field), `503` `audit log unavailable; the change was not made`
 > (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`) and the `400` for
-> `dex_score_policy` (written through `PUT /api/v1/dex/score-policy`, the DEX Scoring tab and the MCP tools `set_dex_score_policy` and `reset_dex_score_policy`, never through this route; no audit
-> row). An unknown key is a bare `400` and writes no audit row.
+> `dex_score_policy`, which is written through `PUT /api/v1/dex/score-policy`, the DEX Scoring tab and the MCP tools `set_dex_score_policy` and `reset_dex_score_policy`, never through this route.
+> That `400` writes no audit row, and neither does the bare `400` for an unknown key.
 
 **Error (503) - runtime config store unavailable.** A genuine DB/crypto write failure, distinguished
 from caller-input validation at the seam so it never returns a `400`-shaped body instead:

@@ -1143,9 +1143,10 @@ TEST_CASE("openapi_spec_json(): the components lookup row is typed and its keys 
     for (const auto& k : item["required"])
         required.insert(k.get<std::string>());
     std::set<std::string> served;
-    for (const auto& [k, v] : yuzu::server::software_list::component_row_json(
-                                  yuzu::server::SoftwareComponentRow{}, {})
-                                  .items())
+    // Bound to a local: a range-for over .items() of a temporary dangles before C++23 (P2718R0).
+    const json served_row = yuzu::server::software_list::component_row_json(
+        yuzu::server::SoftwareComponentRow{}, {});
+    for (const auto& [k, v] : served_row.items())
         served.insert(k);
     CHECK(documented == served);
     CHECK(required == served); // the serialiser emits every key on every row
@@ -2799,10 +2800,26 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
             INFO("score-policy " << method << " response wording");
             CHECK(response_text(method, "409").find("is answered here too") != std::string::npos);
             const std::string r503 = response_text(method, "503");
-            CHECK(r503.find("retry_after_ms 5000") != std::string::npos);
-            CHECK(r503.find("retry_after_ms 2000") != std::string::npos);
+            CHECK(r503.find("another score policy write in this process is still running "
+                            "(retry_after_ms 2000)") != std::string::npos);
+            CHECK(r503.find("the audit store refused the row so nothing was changed "
+                            "(retry_after_ms 5000, Sec-Audit-Failed: true)") != std::string::npos);
             CHECK(r503.find("retry with the old If-Match answers 409") != std::string::npos);
         }
+        // The writer's audit hook sets Sec-Audit-Failed on the 200 (outcome row missing) and the
+        // 503 (attempted row refused) of the PUT and the DELETE; the read declares none.
+        for (const char* method : {"put", "delete"}) {
+            for (const char* code : {"200", "503"}) {
+                INFO("score-policy " << method << " " << code << " header");
+                const json* header = find_at(spec, {"paths", "/dex/score-policy", method,
+                                                    "responses", code, "headers",
+                                                    "Sec-Audit-Failed", "schema", "enum"});
+                REQUIRE(header != nullptr);
+                CHECK(*header == json::array({"true"}));
+            }
+        }
+        CHECK(find_at(spec, {"paths", "/dex/score-policy", "get", "responses", "200", "headers",
+                             "Sec-Audit-Failed"}) == nullptr);
         // The denied row is best effort: said once, in the PUT description.
         const json* put_desc = find_at(spec, {"paths", "/dex/score-policy", "put", "description"});
         REQUIRE(put_desc != nullptr);
