@@ -50,7 +50,10 @@ there, so a check that stops matching anything cannot pass silently.
 """
 
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -377,6 +380,108 @@ class ReleaseAgentOnly(unittest.TestCase):
                 srcs[which] = srcs[which].replace(old, new, 1)
                 self.assertNotEqual(problems(srcs["release"], srcs["check"], srcs["bundle"]), [],
                                     f"{name!r} was not caught")
+
+
+try:
+    import yaml
+except ImportError:  # the docs-lint job installs no PyYAML; the behavioural test then skips
+    yaml = None
+
+
+def server_dll_refusal(release_text: str) -> str:
+    """The server-DLL refusal of the Verify step, taken from release.yml with a
+    YAML parser (nothing is retyped here).
+
+    The step's `run:` body also expands the zip, needs a built tree and runs
+    yuzu-agent.exe, none of which exist on a test box. The refusal is the two
+    statements that read only `$top.FullName`: the `$serverDlls = ...` line and
+    the `if ($serverDlls.Count ...)` line right after it. Those two lines are cut
+    out by their anchors (a missing anchor fails loudly), and the caller supplies
+    `$top` as a fixture root, which is the one variable they read."""
+    doc = yaml.safe_load(release_text)
+    steps = doc["jobs"]["build-windows"]["steps"]
+    body = [s["run"] for s in steps if s.get("name") == VERIFY_STEP]
+    if len(body) != 1:
+        raise AssertionError(f"expected exactly one {VERIFY_STEP!r} step, found {len(body)}")
+    lines = body[0].splitlines()
+    first = [i for i, l in enumerate(lines) if l.startswith("$serverDlls =")]
+    if len(first) != 1 or not lines[first[0] + 1].startswith("if ($serverDlls.Count"):
+        raise AssertionError("server-DLL refusal anchors not found in the Verify step")
+    return "\n".join(lines[first[0]:first[0] + 2])
+
+
+def run_refusal(pwsh: str, release_text: str, files):
+    """Run the refusal under pwsh against a fixture tree holding `files`
+    (relative paths); returns (exit code, combined output)."""
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_srvdll_") as tmp:
+        top = Path(tmp) / "yuzu-agent"
+        top.mkdir()
+        for rel in files:
+            f = top / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"")
+        script = Path(tmp) / "refusal.ps1"
+        # As GitHub Actions wraps a pwsh step: stop on error, run as a file.
+        script.write_text("$ErrorActionPreference = 'stop'\n"
+                          f"$top = [pscustomobject]@{{ FullName = '{top}' }}\n"
+                          + server_dll_refusal(release_text) + "\n", encoding="utf-8")
+        r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
+                           capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+
+
+def find_pwsh():
+    """A pwsh on PATH that actually runs, else None."""
+    exe = shutil.which("pwsh")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "-NoProfile", "-NonInteractive", "-Command", "'ok'"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return exe if r.returncode == 0 and "ok" in r.stdout else None
+
+
+# Lowercase names only: on Linux pwsh `-Include` matches case-sensitively, on
+# Windows it does not, so a mixed-case fixture would test the host, not the step.
+REFUSAL_CASES = (
+    ("clean", ("bin/yuzu-agent.exe", "bin/zlib1.dll", "plugins/x/x.dll"), []),
+    ("top-level libpq", ("bin/yuzu-agent.exe", "bin/libpq.dll"), ["libpq.dll"]),
+    ("nested xmlsec", ("bin/yuzu-agent.exe", "plugins/x/libxmlsec1-openssl.dll"),
+     ["libxmlsec1-openssl.dll"]),
+    ("ecpg and pgtypes", ("bin/libecpg.dll", "bin/libpgtypes.dll"),
+     ["libecpg.dll", "libpgtypes.dll"]),
+)
+
+
+@unittest.skipUnless(yaml is not None, "PyYAML not installed")
+@unittest.skipUnless(find_pwsh(), "no working pwsh on PATH")
+class ServerDllRefusalBehaviour(unittest.TestCase):
+    """Runs the real refusal from release.yml (ADR-0035 step 3, QE-2)."""
+
+    def setUp(self):
+        self.pwsh = find_pwsh()
+        self.release = RELEASE.read_text(encoding="utf-8")
+
+    def check_cases(self, release_text):
+        bad = []
+        for name, files, named in REFUSAL_CASES:
+            code, out = run_refusal(self.pwsh, release_text, files)
+            if named:
+                if code == 0 or not all(n in out for n in named):
+                    bad.append(f"{name}: exit {code}, output {out!r}")
+            elif code != 0:
+                bad.append(f"{name}: exit {code}, output {out!r}")
+        return bad
+
+    def test_refusal_behaviour(self):
+        self.assertEqual(self.check_cases(self.release), [])
+
+    def test_dropping_a_pattern_is_caught(self):
+        mutant = self.release.replace('"libecpg*.dll", ', "", 1)
+        self.assertNotEqual(mutant, self.release, "mutation anchor not found")
+        self.assertNotEqual(self.check_cases(mutant), [], "dropping libecpg* was not caught")
 
 
 if __name__ == "__main__":
