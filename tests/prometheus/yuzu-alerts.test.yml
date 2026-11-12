@@ -1641,6 +1641,37 @@ tests:
           - labels: 'ALERTS{alertname="YuzuResponsePerAgentCapDrops", alertstate="firing", instance="s1", job="yuzu", reason="per_agent_cap", severity="info"}'
             value: 1
 
+  # CASE 24c -- an unverified-frame record overflow must not page
+  # YuzuResponseIngestDrops (no store remediation applies), but must fire its
+  # own informational alert with no hold. The series rises on every sample
+  # (as in cases 23 and 24b), so without the exclusion YuzuResponseIngestDrops
+  # WOULD fire by 15m: the negative leg is not vacuous.
+  - interval: 1m
+    name: response ingest drops - unverified frame record overflow has its own alert
+    input_series:
+      - series: 'yuzu_server_response_ingest_dropped_total{job="yuzu",instance="s1",reason="unverified_registry_overflow"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuUnverifiedFrameRecordOverflow", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuUnverifiedFrameRecordOverflow", alertstate="firing", reason="unverified_registry_overflow", severity="info"}'
+            value: 1
+
+  # CASE 24d -- a store-health reason does not fire the unverified-frame alert.
+  - interval: 1m
+    name: response ingest drops - a store-health reason does not fire the unverified-frame alert
+    input_series:
+      - series: 'yuzu_server_response_ingest_dropped_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuUnverifiedFrameRecordOverflow", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+
   # ── YuzuRbacReadDegraded ────────────────────────────────────────────────
   #
   # #2703 fjarvis F2/F3 fix: rbac_enabled_non_canonical and

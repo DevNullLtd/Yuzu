@@ -1789,6 +1789,36 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
     yuzu::scope::collect_attribute_suffixes(expr, "from_result_set:", out);
 }
 
+// The from_result_set:<id> references whose result depends on the set being COMPLETE: every
+// use other than a plain membership test (the bare atom, which the parser lowers to EXISTS)
+// outside any NOT. An incomplete set (an agent failed or never answered) is missing members, so a
+// plain positive reference can only under-match, but under a NOT (or LEN, STARTSWITH ...) a
+// missing member evaluates as "matches". Such references must abort on an incomplete set.
+static void collect_completeness_dependent_result_set_ids(const yuzu::scope::Expression& expr,
+                                                          bool negated,
+                                                          std::vector<std::string>& out) {
+    constexpr std::string_view kPrefix = "from_result_set:";
+    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
+        if (!cond->attribute.starts_with(kPrefix)) {
+            // A synthetic form (LEN/STARTSWITH) wraps the real attribute: never a plain test.
+            const auto real = yuzu::scope::classify_synthetic(cond->attribute).real;
+            if (real.starts_with(kPrefix))
+                out.push_back(std::string(real.substr(kPrefix.size())));
+            return;
+        }
+        const bool plain = !negated && cond->op == yuzu::scope::CompOp::Exists;
+        if (!plain)
+            out.push_back(cond->attribute.substr(kPrefix.size()));
+    } else if (const auto* comb = std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
+        if (*comb) {
+            const bool child_negated =
+                (*comb)->op == yuzu::scope::CombOp::Not ? !negated : negated;
+            for (const auto& child : (*comb)->children)
+                collect_completeness_dependent_result_set_ids(child, child_negated, out);
+        }
+    }
+}
+
 // props.<key> and tag:<key> collection use the same shared
 // yuzu::scope::collect_attribute_suffixes (scope_engine.hpp) — added with
 // ADR-0050 for exactly this preload pattern. Folding props onto it (Gate 7,
@@ -1952,10 +1982,25 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
         }
         if (rs_store && !principal.empty()) {
             const std::string owner(principal);
+            std::vector<std::string> needs_complete;
+            collect_completeness_dependent_result_set_ids(expr, false, needs_complete);
             for (const auto& rsid : refs) {
                 if (rs_members.contains(rsid))
                     continue;
                 auto mem = rs_store->member_set_owned(rsid, owner);
+                // An owned set that cannot be used as scope. The caller passed the owner check,
+                // so the id and cause go in the detail (fixed tokens, the id neutralised). A
+                // pending set may fill (transient); a failed set, or an incomplete one where a
+                // missing member would match, will not change by retrying (permanent). An
+                // expected state, so a warning, not an error.
+                const auto unusable = [&rsid, &owner](ScopeEvalError::Kind kind,
+                                                      std::string_view cause) {
+                    spdlog::warn("AgentRegistry::evaluate_scope: result-set {} (owner={}) cannot "
+                                 "be used as scope (cause={}) — aborting scope evaluation",
+                                 ::yuzu::log_id_token(rsid), ::yuzu::log_id_token(owner), cause);
+                    return std::unexpected(ScopeEvalError{
+                        kind, "cause=" + std::string(cause) + " result_set=" + audit_token(rsid)});
+                };
                 if (!mem) {
                     // #4981 PR-1 A1/A3: member_set_owned's rewritten single-
                     // statement query now type-distinguishes a genuine DB
@@ -1973,6 +2018,13 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                     // test: a set deleted between a caller's own pre-dispatch
                     // ownership gate and this preload used to surface here as
                     // a SUCCESSFUL empty membership, not an error).
+                    // A set that is not ready (pending or failed) has no usable membership;
+                    // it is owned (the owner check ran first), so naming it leaks nothing.
+                    if (mem.error() == ResultSetError::NotReady)
+                        return unusable(ScopeEvalError::Kind::ResultSetUnusable, "pending");
+                    if (mem.error() == ResultSetError::Failed)
+                        return unusable(ScopeEvalError::Kind::ResultSetUnusablePermanent,
+                                        "failed");
                     const bool owner_check_failed = mem.error() == ResultSetError::NotFound ||
                                                     mem.error() == ResultSetError::NotOwner;
                     spdlog::error("AgentRegistry::evaluate_scope: member_set_owned {} for "
@@ -1984,6 +2036,10 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                                                           : ScopeEvalError::Kind::StoreDegraded,
                                       rsid});
                 }
+                // Incomplete and referenced where a missing member would match (under NOT, LEN,
+                // STARTSWITH): only re-running the producer changes that.
+                if (!mem->complete && std::ranges::find(needs_complete, rsid) != needs_complete.end())
+                    return unusable(ScopeEvalError::Kind::ResultSetUnusablePermanent, "incomplete");
                 // #4981 PR-1 A4: touch EVERY owned result (empty or not) — an
                 // owned-but-empty set is now a real, distinguishable success
                 // case (A1), not indistinguishable from not-owned, so it

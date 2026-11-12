@@ -162,6 +162,7 @@
 #include "saml_provider.hpp"
 #include "quarantine_store.hpp"
 #include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
+#include "refusal_log_throttle.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_members.hpp" // #4990
 #include "result_set_store.hpp"
@@ -2563,7 +2564,8 @@ public:
         metrics_.describe("yuzu_server_response_ingest_dropped_total",
                           "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
                           "by reason (store_not_open/pool_acquire_timeout/query_error/"
-                          "malformed_identity_field/per_agent_cap) - the executions ladder still tracks the "
+                          "malformed_identity_field/per_agent_cap/unverified_registry_overflow) "
+                          "- the executions ladder still tracks the "
                           "command; a sustained non-zero rate means drawer/Echo result history is "
                           "silently lossy. malformed_identity_field is distinct: an "
                           "instruction_id/execution_id/plugin containing an embedded NUL byte was "
@@ -2571,7 +2573,17 @@ public:
                           "here means an agent sent a malformed identity field, not store "
                           "unhealth. per_agent_cap is likewise agent behaviour: an agent exceeded "
                           "the per-(command, agent) row cap (--response-max-rows-per-agent), "
-                          "not store unhealth",
+                          "not store unhealth. unverified_registry_overflow is not a row either: "
+                          "it counts entries evicted from the in-memory record of answers that may "
+                          "be missing (a streaming frame whose provenance lookup failed, or an "
+                          "answer the store did not keep, for example per_agent_cap, "
+                          "malformed_identity_field or a failed terminal finalize, whose tracker "
+                          "write failed: closed, or failed twice; only the latter logs "
+                          "'upsert failed twice', a closed tracker or store leaves only the "
+                          "store_not_open count; a failed terminal finalize is "
+                          "counted in no reason here, its evidence is the "
+                          "finalize_terminal_status log line), or an over-long agent id; the "
+                          "affected answers are reported as not fully stored instead",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "
@@ -2597,7 +2609,7 @@ public:
         // spurious always-zero series for a reason it can never emit.
         for (const auto reason :
              {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field",
-              "per_agent_cap"})
+              "per_agent_cap", "unverified_registry_overflow"})
             metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_response_read_degrade_total",
@@ -15132,8 +15144,10 @@ private:
     // owner-resolve against), "owner_check_failed" (#4981 PR-1 A3, a
     // referenced set is absent/expired/not owned — including the Finding A
     // TOCTOU case), "presence_degraded" (#4981 PR-1 B, the cross-replica
-    // presence read could not answer), or "unresolvable" (a store the atom
-    // needs was never wired at this call site). Without this, a dispatch
+    // presence read could not answer), "result_set_unusable" (a referenced
+    // set is not ready, or is incomplete where a missing member would match,
+    // for example under NOT, LEN or STARTSWITH), or "unresolvable" (a store
+    // the atom needs was never wired at this call site). Without this, a dispatch
     // silently reduced to 0 targets by an ABORT is indistinguishable in
     // telemetry/audit from a genuine "0 agents matched" (UP-12) — an operator
     // investigating "why did my command reach nobody" would find nothing. The
@@ -19056,14 +19070,50 @@ private:
                             if (p.source_execution_id.empty())
                                 continue;
                             bool terminal = false;
+                            // Targeted agents that never answered: absent from a set filled at
+                            // the timeout, and not counted in agents_failed. Never 0 without
+                            // proof that every agent answered.
+                            int64_t targeted = 0, responded = 0, dropped = 0;
+                            bool count_unreadable = false; // filled as incomplete without the count
                             if (execution_tracker_) {
                                 auto sum = execution_tracker_->get_summary(p.source_execution_id);
-                                terminal = sum.agents_targeted > 0 &&
-                                           sum.agents_responded >= sum.agents_targeted;
+                                targeted = sum.agents_targeted;
+                                responded = sum.agents_responded;
+                                terminal = targeted > 0 && responded >= targeted;
                             }
                             const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
                             if (!terminal && !timed_out)
                                 continue;
+                            // Only a set about to be filled pays for the dropped-answer count. A
+                            // count that cannot be read skips the set for this tick (it retries on
+                            // the next) and never reads as zero; once the set is three timeouts
+                            // old it is filled as incomplete instead of staying pending.
+                            if (execution_tracker_) {
+                                const auto lost =
+                                    execution_tracker_->count_response_dropped(p.source_execution_id);
+                                const auto use = rs_matcher::fill_count_decision(
+                                    lost, now - p.created_at, kPendingTimeoutSeconds * 3);
+                                if (!lost) {
+                                    static RefusalLogThrottle unreadable_log(
+                                        std::chrono::seconds(30));
+                                    if (unreadable_log.should_warn(p.id))
+                                        spdlog::warn("result set {}: dropped-answer count for "
+                                                     "execution {} unreadable; {} (at most one "
+                                                     "log per 30 s per set)",
+                                                     p.id, p.source_execution_id,
+                                                     use ? "the set is filled as incomplete "
+                                                           "once its members are read"
+                                                         : "fill retried next tick");
+                                }
+                                if (!use)
+                                    continue;
+                                count_unreadable = !lost;
+                                dropped = *use;
+                            }
+                            // An agent counted as responded whose answer was not persisted is
+                            // absent from the stored rows the membership is built from: unanswered.
+                            const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
+                                targeted, responded, execution_tracker_ != nullptr, dropped);
 
                             // Membership: every responder whose (status,
                             // output) satisfies the pending row's matcher.
@@ -19108,12 +19158,20 @@ private:
                                              "answered execution {} with a failure and never "
                                              "matched",
                                              p.id, agents_failed, p.source_execution_id);
-                            if (result_set_store_->materialize(p.id, members, agents_failed)) {
+                            if (result_set_store_->materialize(p.id, members, agents_failed,
+                                                              agents_unanswered)) {
                                 metrics_
                                     .counter("yuzu_result_sets_total",
                                              {{"source_kind", p.source_kind},
                                               {"result", "materialized"}})
                                     .increment();
+                                // Counted once, for the fill that actually happened.
+                                if (count_unreadable)
+                                    metrics_
+                                        .counter("yuzu_result_sets_total",
+                                                 {{"source_kind", p.source_kind},
+                                                  {"result", "count_unreadable"}})
+                                        .increment();
                             } else {
                                 // Don't count a materialization that didn't happen
                                 // (review finding bug_008); surface the failure so
