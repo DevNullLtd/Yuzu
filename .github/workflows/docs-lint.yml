@@ -256,6 +256,14 @@ jobs:
           node --version
           YUZU_REQUIRE_NODE=1 python3 tests/test_swagger_page_behaviour.py
 
+      # OpenAPI authoring: a dev-side author adding an operation to rest_api_v1.cpp meets the C++
+      # completeness tests one kind of mistake per full Linux build (no operationId, then the
+      # checksum pin, then an untyped success response outside kUntyped). This lexical twin reports
+      # all of them at once, plus the 15,000-byte literal segment ceiling, with no build. Stdlib
+      # only; also registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: OpenAPI operation authoring (operationId, pin, typed responses)
+        run: python3 -I tests/test_openapi_operation_authoring.py
+
       # Changelog promote --append (#5221): folds post-promotion hotfix
       # fragments into an already-promoted release section. Stdlib only.
       - name: Changelog promote --append
