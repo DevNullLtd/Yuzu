@@ -286,6 +286,35 @@ census-bearing event (after a state change, an agent restart or a rule push; not
 evidence (the retained events are redelivered with no repair), so the agent is stopped first. The owner
 will revisit that later; it is tracked in #7532.
 
+## Update (2026-11-12) - a decommission also deletes the agent's order row, first (UP-14, H1)
+
+This is the Update the 2026-11-09 Update above calls for, in the one respect it widens. Schema v5
+adds the per-agent order table `guardian_agent_order` (one row per agent), whose row every
+census-bearing first delivery locks first, before the pair's pending events, the census row and the
+rule row. `GuaranteedStateStore::delete_agent` now deletes that agent's row as the FIRST statement of its
+existing single transaction, so the lock order of every census writer is the same: agent row, pending
+events in `ingest_seq` order, census rows, never a rule row. The delete is never a transaction of its
+own: a later statement's failure rolls it back with the rest. Without the delete a decommissioned
+agent would keep its order row; taking it after the pending events would invert the order against a
+first delivery.
+
+The 2026-11-09 sentence that `delete_agent` "adds no new lock" is therefore true of the pending-event and
+census steps and no longer of the method as a whole: it now takes the agent's order-row lock, first.
+Nothing else is added: no advisory lock, no rule-mutation hook, no policy-generation bump, no push, and no
+tenth cascade store (the order row is part of the `guaranteed_state` store, so the nine-store count
+and its pins are unchanged).
+
+Erasure of this store remains PARTIAL (owner ruling D1, unchanged): the event log and the DEX
+observations stay until retention expiry, and widening that is still tracked in #7531. The order row
+holds the agent's counters and pair clock only.
+
+Known residual, accepted: a first delivery that inserts the agent's order row and has not committed is
+invisible to the DELETE, so a brand-new or just-decommissioned agent's first event can commit an order
+row after `delete_agent` returned. A running agent also re-creates its order row with its census
+row (tracker #7532), the same class as the pending-list race of #7147. The decommissioned agent then
+has an order row again. That is accepted: the row holds counters and the pair clock only, and a later
+decommission deletes it.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).

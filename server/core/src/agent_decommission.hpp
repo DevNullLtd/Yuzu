@@ -16,11 +16,11 @@
 /// cascade. §27 builds the fan-out AND wires its first production caller.
 ///
 /// WHAT `Deleted` MEANS IS PER STORE. For most stores it means every row the store holds for the
-/// device was erased. It does not for `guaranteed_state` (#5675): that store deletes the compliance
-/// census rows and retires the pending census evidence, and the Guardian event log and the DEX
-/// observations are retained until retention expiry (never, when the retention setting is 0 or
-/// below). The Art.17 reading of a result must therefore go through each store's own contract, not
-/// through the word `Deleted` alone.
+/// device was erased. It does not for `guaranteed_state` (#5675): that store deletes the device's
+/// per-agent order row and the compliance census rows and retires the pending census evidence,
+/// and the Guardian event log and the DEX observations are retained until retention expiry (never,
+/// when the retention setting is 0 or below). The Art.17 reading of a result must therefore go
+/// through each store's own contract, not through the word `Deleted` alone.
 ///
 /// STANDING RULE — the gate is the single `Decommission:Delete` securable, so
 /// adding a store no longer changes WHO can decommission — but it DOES widen WHAT

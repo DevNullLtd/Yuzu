@@ -1319,9 +1319,11 @@ for one request, never in neither. The count read runs under a 5 s statement tim
 retained pending backlog; a lock wait, a loaded database or an administrator cancel is reported the same way) is a non-transient failure, reported separately from an ordinary store degrade and counted on the
 `guardian_census_device` source of `yuzu_server_guardian_read_degrade_total`. See the user manual's Compliance
 overview for the operator-facing contract. A device decommission (the ninth agent-decommission cascade store, key
-`guaranteed_state`, #5675) takes the same two steps in the same order for one agent: it locks the agent's pending events
-in `ingest_seq` order, sets `projection_pending` false on them, then deletes the agent's census rows, adding no lock; the
-event log and DEX observations are not erased by it and expire by retention (30 days by default; rows written while the retention setting is 0 or below never expire).
+`guaranteed_state`, #5675), for one agent and in one transaction, deletes the agent's `guardian_agent_order` row first (the
+the row a census-bearing first delivery also takes first; no other lock is added and it takes no rule row), then locks the agent's
+pending events in `ingest_seq` order and sets `projection_pending` false on them, then deletes the agent's census rows;
+the event log and DEX observations are not erased by it and expire by retention (30 days by default; rows written while the retention setting is 0 or below never expire),
+so the erasure is partial.
 
 ### 9.2 REST API endpoints
 
