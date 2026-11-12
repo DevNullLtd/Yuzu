@@ -20185,8 +20185,8 @@ private:
             }
             // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
             // clamped to DeviceInventoryStore's kListRowCap (100k)" per that store's own
-            // limit-clamp contract, not "zero rows" — (symmetric with the full
-            // offline_endpoint_store_ materialize above), joined by agent_id via the pure
+            // limit-clamp contract, not "zero rows" — (symmetric with the capped
+            // offline roster read above, #5712), joined by agent_id via the pure
             // attach_device_ci (inventory_ci_join.cpp). `out` is the
             // UNFILTERED roster — confinement is HardwareRoutes' `scoped_roster` on the
             // FleetReadGate scope, downstream of this join; attach_device_ci only ever

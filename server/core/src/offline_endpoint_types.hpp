@@ -41,7 +41,8 @@ struct OfflineEndpoint {
     std::string arch;
 };
 
-/// `query_live_ids`'s and `query_stale_within`'s typed failure surface (#4981 PR-1, Finding B;
+/// The typed failure surface of the presence reads `query_live_ids`, `query_stale_within` and
+/// `find_within` (#4981 PR-1, Finding B;
 /// #5531). Only `query_live_ids` produces `Truncated`: `query_stale_within` serves a capped roster
 /// as a typed PARTIAL success (`OfflineRoster::truncated`, #5712), never as this error.
 /// `StoreUnavailable`/`DbError` mirror `record_presence_store_failure`'s
@@ -61,7 +62,8 @@ enum class PresenceReadError { StoreUnavailable, DbError, Truncated };
 /// the fleet is back under the cap — there is no latch. A truncated roster is a LOWER BOUND: an
 /// endpoint absent from `rows` may still exist, so a miss in it is never proof of absence.
 /// A plain aggregate on purpose: nothing converts a bare `std::vector<OfflineEndpoint>` into one, so
-/// a consumer that ignores `truncated` cannot be written by accident.
+/// a consumer cannot receive a vector and forget a flag exists. (It does not stop a consumer that
+/// reads `.rows` and ignores `truncated` on purpose: the display-only hostname map does exactly that.)
 struct OfflineRoster {
     std::vector<OfflineEndpoint> rows;
     bool truncated = false;

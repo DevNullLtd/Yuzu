@@ -477,14 +477,13 @@ rules for the `viz_routes.cpp::handle_topology` merge:
   truncated read is still merged and served, with `offline_roster_truncated: true` in the
   envelope on REST and MCP and ` offline_roster_truncated=1` on the `viz.fleet_topology`
   audit detail — on the `413` oversize audit row too. It is not `offline_roster_degraded`
-  and it is not an error; do not "fix" it into either. **It is only reachable at the
-  ceiling:** `kMachinesMaxCeiling` equals the roster cap and the `machines_max` gate runs
-  after the merge, so a truncated merge is at least 100,000 machines. At the default
-  `machines_max` (5000), or any value below the ceiling, that is a `413` — the flag is on
-  its audit row, and the response is not a partial body. A `200` with the flag therefore
-  needs `machines_max=100000` and every live host inside the roster; one live host outside
-  it is a permanent `413` at the ceiling whose "raise the cap" advice cannot be followed
-  (tracked as a follow-up). The flag is a fact about stale hosts only: a host absent from
+  and it is not an error; do not "fix" it into either. **It is rarely reachable as a `200`:**
+  `kMachinesMaxCeiling` equals the roster cap and the `machines_max` gate runs after the
+  merge, so a truncated merge is at least 100,000 machines: a `413` at any `machines_max`
+  below the ceiling (the default is 5000), with the flag on its audit row and no partial
+  body; a `200` with the flag needs `machines_max=100000` with every live host inside the
+  roster. One live host outside it is a permanent `413` at the ceiling whose "raise the
+  cap" advice cannot be followed (#7550). The flag is a fact about stale hosts only: a host absent from
   `machines` may still exist.
 - **`yuzu_viz_offline_hosts_total`** counts offline nodes merged (described in
   the `server.cpp` viz metric block — keep it described, `promtool`-clean).

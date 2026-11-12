@@ -8,6 +8,7 @@
 
 #include "device_data_render.hpp"
 #include "hardware_routes.hpp"
+#include "offline_endpoint_types.hpp" // kOfflineRosterRowCap (the partial-list notice)
 
 #include "device_containment_render.hpp"
 #include "device_estate_render.hpp"
@@ -198,7 +199,8 @@ std::string kpi(const char* label, std::string value, const char* extra_class = 
 }
 
 /// 100000 -> "100,000" (the roster cap, worded in the partial-list notice from the store's own constant).
-std::string with_thousands(long long n) {
+/// Unsigned: a count, never negative (a signed overload would put the comma before the sign).
+std::string with_thousands(unsigned long long n) {
     std::string digits = std::to_string(n);
     std::string out;
     int run = 0;
@@ -468,7 +470,8 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
         h += "<div id=\"hw-roster-truncated\" class=\"gp-banner hw-partial\"><b>Partial list.</b> More than " +
              with_thousands(kOfflineRosterRowCap) + " devices were seen in the last 30 days, so this list "
              "shows the " + with_thousands(kOfflineRosterRowCap) + " most recently seen. Older devices are "
-             "not listed, the counts above are lower bounds, and a search that finds nothing does not "
+             "not listed and the list cannot be paged past this limit; every count and figure on this page "
+             "(including the page total) is a lower bound, and a search that finds nothing does not "
              "prove a device does not exist &mdash; open a device's record to check it directly.</div>";
     if (page.containment_ui && page.quarantine_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Quarantine state unavailable.</b> The quarantine "

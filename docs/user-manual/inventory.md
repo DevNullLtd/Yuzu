@@ -1164,6 +1164,26 @@ offline device outside the newest 100,000 still shows its identity. The Software
 Quarantine pages' hostname column is display-only and reads the same capped roster: a
 device outside it shows its `agent_id` in place of the hostname.
 
+The KPI strip's other figures (CI coverage, the manufacturer breakdown, median memory and
+"Showing a-b of N") are derived from the same capped roster and are lower bounds too; the
+notice says so, though only the four count tiles carry the `≥` mark.
+
+### Known limits above 100,000 devices
+
+The roster cap is a display and read cap, not a tested capacity. Above it:
+
+- The Hardware CI columns come from a separate read with its own 100,000-row cap (ordered by
+  hostname), so CI columns can be blank for devices that are listed (#7549).
+- Fleet topology answers `413` above the ceiling and cannot be raised past it (#7550).
+- The Software and Quarantine hostname column shows the `agent_id` for a device outside the
+  capped roster.
+- The CI record's online state comes from the local session map of the replica serving the
+  request (#7551).
+- Online and Offline on the list derive from the live-presence read; if that read fails or is
+  truncated, agents connected to another replica read Offline with no flag (#7566).
+- Search, filter and sort run over the capped set, and there is no way to page past the cap
+  (#7567). A device is always reachable by its id.
+
 A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
 deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates
 it. A device that is never decommissioned stays listed as Offline for the 30-day window,

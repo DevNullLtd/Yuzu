@@ -59,6 +59,13 @@
 #include <utility>
 #include <vector>
 
+// #5712: the fleet-topology merge runs BEFORE the machines_max gate, and the offline roster it merges
+// is capped at kOfflineRosterRowCap, so a truncated merge is at least that many machines. That makes
+// it a 413 at any machines_max below the ceiling ONLY while the two are equal; the design note and
+// docs/fleet-viz-invariants.md state it that way. If you change either constant, revisit them.
+static_assert(yuzu::server::VizRoutes::kMachinesMaxCeiling == yuzu::server::kOfflineRosterRowCap,
+              "viz machines_max ceiling must equal the offline roster cap (#5712 / #7550)");
+
 namespace yuzu::server {
 
 namespace {

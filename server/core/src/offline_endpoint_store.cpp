@@ -9,6 +9,7 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <yuzu/log_token.hpp> // utf8_sequence_length (find_within id pre-check)
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
@@ -119,12 +120,33 @@ void record_presence_store_failure(yuzu::MetricsRegistry* metrics, std::string_v
     }
 }
 
-
 constexpr const char* kRosterTruncatedMetric = "yuzu_server_agent_presence_roster_truncated_total";
 
 // One `endpoints` row in the column order both roster reads select (agent_id, hostname, os,
 // last_heartbeat_ms, agent_ts, agent_version, arch) — one copy, so the roster scan and the
 // point read can never map a column differently.
+/// An agent_id that can never be a stored key: it holds a NUL byte or is not well-formed UTF-8.
+/// `agent_id` is a Postgres TEXT, which holds neither, so such an id CANNOT match a row; handing
+/// it to the server would raise SQLSTATE 22021 (or be refused by the NUL guard in pg_exec) and
+/// read as a store failure for an input that can never succeed. Reuses
+/// `yuzu::utf8_sequence_length` (log_token.hpp), the same rules PostgreSQL's UTF8 encoding applies.
+[[nodiscard]] bool agent_id_cannot_be_stored(std::string_view id) noexcept {
+    for (std::size_t i = 0; i < id.size();) {
+        const auto c = static_cast<unsigned char>(id[i]);
+        if (c == 0)
+            return true;
+        if (c < 0x80) {
+            ++i;
+            continue;
+        }
+        const std::size_t len = ::yuzu::utf8_sequence_length(id, i);
+        if (len == 0)
+            return true;
+        i += len;
+    }
+    return false;
+}
+
 OfflineEndpoint read_endpoint_row(const PGresult* res, int i) {
     OfflineEndpoint ep;
     ep.agent_id = PQgetvalue(res, i, 0);
@@ -474,6 +496,12 @@ OfflineRosterRead OfflineEndpointStore::query_stale_within(std::chrono::seconds 
 
 OfflineEndpointRead OfflineEndpointStore::find_within(std::string_view agent_id,
                                                       std::chrono::seconds window) {
+    // A malformed id (NUL byte, ill-formed UTF-8) can never be a stored key: that is a CONFIRMED
+    // absence by construction, decided without a store read, so no failure counter, no warn and
+    // no "store unavailable" for an input that can never succeed (the roster scan this replaces
+    // answered absent for it too).
+    if (agent_id_cannot_be_stored(agent_id))
+        return std::optional<OfflineEndpoint>{};
     if (!open_)
         return std::unexpected(PresenceReadError::StoreUnavailable);
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);

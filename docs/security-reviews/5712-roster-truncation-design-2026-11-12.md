@@ -1,7 +1,8 @@
 # #5712 — honest roster truncation: design note
 
-Status: implemented on `feat/roster-truncation-5712`; plan reviewed by the Fable-tier architect
-(APPROVE WITH CHANGES, all changes adopted) before any code. Acceptance criterion 2 of #5712 asked
+Status: implemented on `feat/roster-truncation-5712`; plan reviewed in-session by the
+enterprise-architect review agent before any code (verdict APPROVE WITH CHANGES, changes adopted; the
+review output is not committed, so this is the author's relay, not an independent record). Acceptance criterion 2 of #5712 asked
 for this note before the code; the decisions below are the ones that review attacked.
 
 ## The defect
@@ -46,7 +47,16 @@ sort at fleet scale. The cap lives once, as `kOfflineRosterRowCap` in the store-
 KPIs are **not** re-sourced from `fleet_state_counts`: that read is documented NOT CONFINED and the KPI
 strip describes the caller's scoped roster. A truncated read is audited (`roster_truncated=1`) on the
 list verbs. A scoped caller sees the one bit (their own rows can be among the missing; the Dashboard's
-`at_least` already showed them the same fact) and never a count; `devices_omitted` stays withheld.
+`at_least` already showed management-group-confined callers the same fact) and never a roster count.
+`devices_omitted` is erased for confined callers on MCP; on REST it is emitted to confined callers
+(a pre-existing divergence, unchanged here). The `roster_truncated` bit and the constant `roster_cap`
+reach scoped callers INCLUDING service-scoped tokens (the Dashboard precedent covers
+management-group-confined callers only; `DashboardSummaryRoutes` denies service-scoped tokens). It
+discloses only the coarse fact "more than 100,000 roster rows in the window", not a count. ACCEPTED,
+because a confined caller's own rows can be among the missing.
+
+Truncation is per surface because the windows differ: 30 days for Hardware, 7 days for fleet
+topology (viz).
 
 A miss under truncation is not proof of absence: filters, search and sort run over the capped set.
 The notice therefore also renders when the result is empty, and the REST/MCP descriptions point at the
@@ -60,15 +70,20 @@ needs `machines_max=100000` with every live host inside the roster. The permanen
 
 **D3 — a point read for identity.** `OfflineEndpointStore::find_within(agent_id, window)` is a
 primary-key lookup with the roster's own window predicate (`>=`), so it is exact at any fleet size and a
-miss is a *confirmed* absence. `hw_identity_fn` uses it instead of scanning the roster; the live-session
+miss is a *confirmed* absence. The Hardware list and the point read use the same 30-day window. An
+`agent_id` containing NUL or invalid UTF-8 is also a confirmed absence (no store error, no counter, no
+warn), so the caller returns the same 404 "not found" as for any unknown id. `hw_identity_fn` uses it instead of scanning the roster; the live-session
 short-circuit is unchanged. The scan overload of `offline_identity_row` is deleted, so a linear-scan path
 cannot be reused. Consequential fixes with no code of their own: the decommission confirmation hostname
 and the containment lens `identity_known` are correct beyond the cap. No new existence oracle: every
-caller authorises the id before the read.
+caller that renders the identity authorises first. The stored-data panel (`device_estate_routes.cpp`)
+reads the identity even when its decommission gate is Denied/Unchecked but renders the hostname only on
+Allowed, so nothing observable changes.
 
 **D4 — observability.** A fleet over the cap is a steady state, so a per-read warn would be permanent
 log spam. New unlabelled counter `yuzu_server_agent_presence_roster_truncated_total` (pre-seeded at 0,
-one increment per truncated read, debug log), no alert (a threshold needs fleet data, the same posture
+one increment per truncated read, debug log; operational telemetry, not evidence: the audit rows are
+the evidence of record), no alert (a threshold needs fleet data, the same posture
 as its sibling family). `reason="truncated"` of the failure counter stays `query_live_ids`-only; the
 point read counts failures under `op="find_within"`.
 
@@ -77,6 +92,13 @@ point read counts failures under `op="find_within"`.
 - #7549 — the CI join (`list_device_ci(0)`) has its own silent 100,000-row cap, ordered by hostname.
 - #7550 — fleet topology is a permanent 413 over the roster cap.
 - #7551 — the CI record decides online from the local session map; the list uses `all_ids()`.
+- The Hardware Online/Offline derivation uses `AgentRegistry::all_ids()` (`live_presence().value_or({})`),
+  so on a failed or truncated live-presence read cross-replica agents silently read offline with no flag
+  (#5007 tracks other callers; new follow-up #7566).
+- No enumeration path past the cap: the cap applies before search and filters, and only a per-device
+  point read by known id is exact (#7567).
+- The KPI-adjacent figures (CI coverage tile, manufacturer breakdown, median memory, "Showing a-b of N")
+  are not `>=`-marked; the notice states the counts are lower bounds.
 - The per-render uncached full roster read (a perf sibling of #1783) and the silent hostname map past
   the cap are recorded here and in the user manual; neither is a correctness defect of this change.
 

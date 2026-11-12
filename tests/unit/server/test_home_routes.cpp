@@ -607,7 +607,7 @@ TEST_CASE("summary: a scoped caller never touches the estate seam", "[home][rout
 // "bounded at 100k and labelled"), and the label being inferred from a row COUNT: a fleet of
 // exactly the cap is a complete read and stays exact. #5712: the label is the store's typed bit.
 TEST_CASE("summary: a scoped roster read flagged truncated is labelled a lower bound",
-          "[home][route]") {
+          "[home][route][roster_truncated]") {
     auto render = [](std::size_t n, bool truncated) {
         HomeHarness h;
         h.scope = std::unordered_set<std::string>{"a", "b"};

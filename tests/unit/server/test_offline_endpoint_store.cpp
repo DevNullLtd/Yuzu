@@ -16,9 +16,15 @@
 
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 using yuzu::server::OfflineEndpoint;
 using yuzu::server::OfflineEndpointStore;
@@ -906,11 +912,11 @@ TEST_CASE("OfflineEndpointStore query_stale_within serves a typed partial past k
           "complete exactly at the cap",
           "[pg][offline][slow][roster_truncated]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::MetricsRegistry metrics; // declared before the store: it outlives it, as in ServerImpl
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     OfflineEndpointStore store{pool};
     REQUIRE(store.is_open());
-    yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
 
     PgConn conn{PQconnectdb(db.dsn().c_str())};
@@ -934,7 +940,7 @@ TEST_CASE("OfflineEndpointStore query_stale_within serves a typed partial past k
         auto r = store.query_stale_within(std::chrono::hours(1));
         REQUIRE(r.has_value()); // never unexpected(Truncated): a partial is served, not refused
         CHECK(r->truncated);
-        CHECK(r->rows.size() == cap); // the extra detection row is dropped, not served
+        REQUIRE(r->rows.size() == cap); // the extra detection row is dropped, not served
         CHECK(r->rows.front().agent_id == "cap-1"); // newest first
         CHECK(find(r->rows, "cap-" + std::to_string(OfflineEndpointStore::kQueryRowCap)) != nullptr);
         CHECK(find(r->rows, "cap-" + std::to_string(OfflineEndpointStore::kQueryRowCap + 1)) == nullptr);
@@ -990,7 +996,7 @@ TEST_CASE("OfflineEndpointStore find_within is exact for a device beyond kQueryR
 }
 
 TEST_CASE("OfflineEndpointStore find_within: hit, confirmed absence, and the roster's own window",
-          "[pg][offline]") {
+          "[pg][offline][roster_truncated]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
@@ -1034,7 +1040,7 @@ TEST_CASE("OfflineEndpointStore find_within: hit, confirmed absence, and the ros
 }
 
 TEST_CASE("OfflineEndpointStore find_within is StoreUnavailable on a store that never opened",
-          "[offline]") {
+          "[offline][roster_truncated]") {
     PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
     OfflineEndpointStore store{pool};
     REQUIRE_FALSE(store.is_open());
@@ -1047,15 +1053,15 @@ TEST_CASE("OfflineEndpointStore find_within is StoreUnavailable on a store that 
 // remove, reached through a DB fault instead of the cap); the failures going uncounted.
 TEST_CASE("OfflineEndpointStore find_within reports DbError and StoreUnavailable, counted under "
           "op=find_within, never an absence",
-          "[pg][offline][slow]") {
+          "[pg][offline][slow][roster_truncated]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
 
     SECTION("DbError on a genuine query failure") {
+        yuzu::MetricsRegistry metrics;
         PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
         REQUIRE(short_lock_pool.valid());
         OfflineEndpointStore store{short_lock_pool};
         REQUIRE(store.is_open());
-        yuzu::MetricsRegistry metrics;
         store.set_metrics(&metrics);
 
         yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
@@ -1079,11 +1085,11 @@ TEST_CASE("OfflineEndpointStore find_within reports DbError and StoreUnavailable
     }
 
     SECTION("StoreUnavailable when the pool is exhausted") {
+        yuzu::MetricsRegistry metrics;
         PgPool pool{{.conninfo = db.dsn(), .size = 1}};
         REQUIRE(pool.valid());
         OfflineEndpointStore store{pool};
         REQUIRE(store.is_open());
-        yuzu::MetricsRegistry metrics;
         store.set_metrics(&metrics);
 
         auto held = pool.acquire();
@@ -1101,13 +1107,186 @@ TEST_CASE("OfflineEndpointStore find_within reports DbError and StoreUnavailable
 // The new counter exists from the moment metrics are attached, so a Prometheus scrape sees the
 // series at 0 before the first cap hit (rate() over a never-created series reads as absent).
 TEST_CASE("OfflineEndpointStore pre-seeds the roster-truncated counter at zero",
-          "[pg][offline]") {
+          "[pg][offline][roster_truncated]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::MetricsRegistry metrics;
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     REQUIRE(pool.valid());
     OfflineEndpointStore store{pool};
-    yuzu::MetricsRegistry metrics;
     store.set_metrics(&metrics);
     CHECK(metrics.serialize().find("yuzu_server_agent_presence_roster_truncated_total 0") !=
           std::string::npos);
+}
+
+// A malformed agent_id (a NUL byte, ill-formed UTF-8) can never be a stored key, so find_within
+// answers a CONFIRMED absence for it without a store read: no failure counter, no warn, no "store
+// unavailable" for an input that can never succeed. The roster scan this replaces answered absent too.
+// Kills: the id reaching Postgres (SQLSTATE 22021 / the NUL guard) and surfacing as a DbError that
+// marks the identity read degraded and bumps `op=find_within,reason=db_error` for a fuzzer's input.
+TEST_CASE("OfflineEndpointStore find_within answers a malformed agent_id as a confirmed absence",
+          "[offline][roster_truncated]") {
+    const std::vector<std::string> malformed = {
+        std::string("\xFF"),                 // stray continuation / invalid lead byte
+        std::string("a\xC3"),                // truncated two-byte sequence
+        std::string("\xC0\xAF"),             // overlong encoding of '/'
+        std::string("\xED\xA0\x80"),         // a UTF-16 surrogate
+        std::string("a\0b", 3),              // an embedded NUL
+    };
+    SECTION("on a store that never opened: still an absence, not StoreUnavailable") {
+        PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+        OfflineEndpointStore store{pool};
+        REQUIRE_FALSE(store.is_open());
+        for (const auto& id : malformed) {
+            auto r = store.find_within(id, std::chrono::hours(1));
+            REQUIRE(r.has_value());
+            CHECK_FALSE(r->has_value());
+        }
+        // A well-formed id on the same store is still a store failure (the pre-check is narrow).
+        auto ok = store.find_within("fine-id", std::chrono::hours(1));
+        REQUIRE_FALSE(ok.has_value());
+        CHECK(ok.error() == PresenceReadError::StoreUnavailable);
+    }
+    SECTION("a valid multibyte id is NOT malformed and reaches the store") {
+        PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+        OfflineEndpointStore store{pool};
+        auto r = store.find_within("h\xC3\xA9llo-\xE2\x82\xAC", std::chrono::hours(1)); // "héllo-€"
+        REQUIRE_FALSE(r.has_value()); // store not open => StoreUnavailable, proving it was not short-circuited
+        CHECK(r.error() == PresenceReadError::StoreUnavailable);
+    }
+}
+
+TEST_CASE("OfflineEndpointStore find_within: a malformed id on an open store counts no failure",
+          "[pg][offline][roster_truncated]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::MetricsRegistry metrics;
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_metrics(&metrics);
+    REQUIRE(store.upsert("real", "h", "linux", now_ms(), 0));
+
+    for (const std::string& id : {std::string("\xFF"), std::string("a\0b", 3), std::string("\xC0\xAF")}) {
+        auto r = store.find_within(id, std::chrono::hours(1));
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->has_value());
+    }
+    for (const char* reason : {"db_error", "store_unavailable"})
+        CHECK(metrics
+                  .counter("yuzu_server_agent_presence_store_failed_total",
+                           {{"op", "find_within"}, {"reason", reason}})
+                  .value() == 0);
+    // The store is unharmed: a valid id right after still resolves.
+    auto hit = store.find_within("real", std::chrono::hours(1));
+    REQUIRE(hit.has_value());
+    CHECK(hit->has_value());
+}
+
+// Ties at the cut. The roster orders by last_heartbeat_ms only (the sole index), so rows sharing the
+// cutoff millisecond are cut arbitrarily: WHICH of them survive may differ between reads, but the
+// flag, the served count, uniqueness, newest-first order and every row ABOVE the tie group may not.
+// 99,950 distinct newer rows + 100 rows on one older millisecond: the cap cuts through the tie group.
+// Kills: a duplicate row served across the cut, a short or long page, a flag that depends on the
+// tie, and a non-monotone order.
+TEST_CASE("OfflineEndpointStore query_stale_within: a tie group straddling the cut keeps flag, count, "
+          "uniqueness and order stable",
+          "[pg][offline][slow][roster_truncated]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+    const int cap = OfflineEndpointStore::kQueryRowCap;
+    const int distinct = cap - 50;
+    const std::int64_t t0 = now_ms();
+    const std::string hi =
+        "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms, agent_ts) "
+        "SELECT 'hi-' || g, 'h', 'linux', " + std::to_string(t0) + " - 1000 - g, 0 FROM generate_series(1, " +
+        std::to_string(distinct) + ") g";
+    const std::string tie =
+        "INSERT INTO endpoint_state.endpoints (agent_id, hostname, os, last_heartbeat_ms, agent_ts) "
+        "SELECT 'tie-' || g, 'h', 'linux', " + std::to_string(t0) + " - 200000, 0 FROM generate_series(1, 100) g";
+    PgResult a{PQexec(conn.get(), hi.c_str())};
+    REQUIRE(a.ok());
+    PgResult b{PQexec(conn.get(), tie.c_str())};
+    REQUIRE(b.ok());
+
+    std::vector<std::string> above_first;
+    for (int pass = 0; pass < 3; ++pass) {
+        auto r = store.query_stale_within(std::chrono::hours(1));
+        REQUIRE(r.has_value());
+        CHECK(r->truncated);
+        REQUIRE(r->rows.size() == static_cast<std::size_t>(cap));
+
+        std::set<std::string> seen;
+        std::int64_t prev = std::numeric_limits<std::int64_t>::max();
+        std::size_t ties = 0;
+        std::vector<std::string> above;
+        for (const auto& e : r->rows) {
+            CHECK(seen.insert(e.agent_id).second); // no duplicate across the cut
+            CHECK(e.last_heartbeat_ms <= prev);    // newest first, monotone non-increasing
+            prev = e.last_heartbeat_ms;
+            if (e.agent_id.rfind("tie-", 0) == 0)
+                ++ties;
+            else
+                above.push_back(e.agent_id);
+        }
+        CHECK(ties == 50);                                          // exactly the room left under the cap
+        CHECK(above.size() == static_cast<std::size_t>(distinct)); // every row above the tie group survives
+        if (pass == 0)
+            above_first = above;
+        else
+            CHECK(above == above_first); // only the tie group may rotate between reads
+    }
+    // The point read is exact for EVERY tie row, whether or not the roster served it.
+    for (int g = 1; g <= 100; ++g) {
+        auto hit = store.find_within("tie-" + std::to_string(g), std::chrono::hours(1));
+        REQUIRE(hit.has_value());
+        CHECK(hit->has_value());
+    }
+}
+
+// The counter is bumped from every HTTP worker that renders an over-cap roster. Two readers, a few
+// reads each, against one seeded over-cap table: every read is truncated and the counter equals the
+// number of reads (a lost increment, or a latched flag, breaks the equality). Sized small on purpose:
+// each read materialises 100,001 rows and the CI runners share one box (#1871).
+TEST_CASE("OfflineEndpointStore query_stale_within: concurrent truncated reads each count once",
+          "[pg][offline][slow][roster_truncated]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::MetricsRegistry metrics;
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_metrics(&metrics);
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    seed_roster(conn, OfflineEndpointStore::kQueryRowCap + 1);
+
+    constexpr int kThreads = 2;
+    constexpr int kReadsEach = 3;
+    std::atomic<int> truncated_seen{0};
+    std::atomic<int> failed{0};
+    std::vector<std::thread> readers;
+    readers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t)
+        readers.emplace_back([&] {
+            for (int i = 0; i < kReadsEach; ++i) {
+                auto r = store.query_stale_within(std::chrono::hours(1));
+                if (!r.has_value())
+                    ++failed;
+                else if (r->truncated && r->rows.size() == static_cast<std::size_t>(OfflineEndpointStore::kQueryRowCap))
+                    ++truncated_seen;
+            }
+        });
+    for (auto& th : readers)
+        th.join();
+
+    CHECK(failed.load() == 0);
+    CHECK(truncated_seen.load() == kThreads * kReadsEach);
+    CHECK(metrics.counter("yuzu_server_agent_presence_roster_truncated_total").value() ==
+          static_cast<double>(kThreads * kReadsEach));
 }

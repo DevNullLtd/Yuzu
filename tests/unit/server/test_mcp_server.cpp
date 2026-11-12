@@ -38015,6 +38015,10 @@ TEST_CASE("MCP get_fleet_topology: a truncated offline roster is merged and flag
         R"({"jsonrpc":"2.0","method":"tools/call","id":13,"params":{"name":"get_fleet_topology",)"
         R"("arguments":{"machines_max":2}}})");
     REQUIRE(big);
+    // It IS the oversize refusal (an error naming machines_max), not a 200 that happens to be audited.
+    const auto big_body = nlohmann::json::parse(big->body);
+    REQUIRE(big_body.contains("error"));
+    CHECK(big_body["error"]["message"].get<std::string>().find("machines_max") != std::string::npos);
     REQUIRE(ts.audit_details.size() == 2);
     CHECK(ts.audit_details[1].find("offline_roster_truncated=1") != std::string::npos);
 }

@@ -1076,7 +1076,13 @@ TEST_CASE("route: list fragment — a truncated roster is served with a lower-bo
     REQUIRE(contains(res->body, "Partial list."));
     REQUIRE(contains(res->body, "100,000"));           // the store's cap, worded
     REQUIRE_FALSE(contains(res->body, "Hardware roster unavailable"));
-    REQUIRE(contains(res->body, "&ge;&nbsp;1"));       // a KPI count is a floor, not the fleet
+    // Every count tile is a floor, not the fleet: the marker sits in the SAME tile as each label
+    // (a marker applied to only some tiles would leave the others reading as exact).
+    REQUIRE(contains(res->body, "&ge;&nbsp;1</div><div class=\"l\">Total CIs"));
+    REQUIRE(contains(res->body, "&ge;&nbsp;1</div><div class=\"l\">Online"));
+    REQUIRE(contains(res->body, "&ge;&nbsp;0</div><div class=\"l\">Offline"));
+    REQUIRE(contains(res->body, "&ge;&nbsp;0</div><div class=\"l\">Stale"));
+    REQUIRE(contains(res->body, "cannot be paged past this limit"));
     REQUIRE(h.audits.back() == "inventory.devices|success");
     REQUIRE(contains(h.audit_details.back(), "roster_truncated=1"));
 

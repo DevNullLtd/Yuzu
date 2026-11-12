@@ -932,7 +932,7 @@ TEST_CASE(
 // bit unset), a healthy read being flagged degraded, and (#5712) a truncated read being treated
 // as a failure (refused / degraded) or its truncated bit being dropped.
 TEST_CASE("apply_roster_read: failed read sets every degraded bit; healthy read touches nothing",
-          "[hardware][model]") {
+          "[hardware][model][roster_truncated]") {
     InventoryDevicesResult failed;
     CHECK_FALSE(apply_roster_read(failed, OfflineRosterRead{std::unexpected(PresenceReadError::DbError)}));
     CHECK(failed.roster_degraded);
@@ -1012,7 +1012,7 @@ TEST_CASE("apply_tag_read: every failed read degrades and every healthy read pop
 // the stale-boundary mutant (`>=` for `>` on kHardwareStaleAfterMs). #5712: it now maps the POINT
 // read (`find_within`), whose empty answer is a CONFIRMED absence.
 TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullopt",
-          "[hardware][model]") {
+          "[hardware][model][roster_truncated]") {
     const auto err = offline_identity_row(
         OfflineEndpointRead{std::unexpected(PresenceReadError::StoreUnavailable)}, 10 * kDayMs, fake_age);
     REQUIRE_FALSE(err.has_value());
