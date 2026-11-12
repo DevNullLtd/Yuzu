@@ -478,12 +478,12 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      libpgtypes, libpq, libxmlsec1, libxmlsec1-openssl, trantor), so the "verify afterwards" instruction above is a permanent
      gate, pinned (with mutants) in `tests/test_release_agent_only.py`. This supersedes step 2's
      note that the DLL sweep was left unchanged.
-   - **Not yet verified.** The release-time DLL refusal has never run on a real release
-     (lexical pins only; the Windows rehearsal exercises it), the reverse vcpkg reconcile on
-     Windows and macOS is unexercised, and nothing was run on macOS. If the refusal fails on
+   - **Not yet verified.** The release-time DLL refusal has never run on a real release (it
+     ran in the Windows rehearsal below, which is not a release), nothing was run on macOS
+     (no box), and the added publish wait below is untimed. If the refusal fails on
      a release tag, nothing is pushed: `docker-publish`, `docker-publish-chisel` and
      `docker-publish-postgres` now all need `build-windows` and `build-macos` (UP-12, pinned in `tests/test_release_agent_only.py`), so a failed agent
-     packaging step pushes no versioned image (the postgres image no longer publishes in parallel with the builds). The rehearsal still has to confirm the
+     packaging step pushes no versioned image (the postgres image no longer publishes in parallel with the builds). An RC tag still has to confirm the
      added wait (the images now start after the slowest agent build, ~40 min).
    - **Interim gap until step 5: no native server stack on macOS.** `scripts/start-UAT.sh`
      and the native-stack phases of `/test` need a server binary, which macOS no longer
@@ -494,9 +494,35 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      new switch and the install opt-out.
    - Proof: static pins plus a Windows rehearsal on a build box (not a CI run, not a release;
      the first stable tag after this change is the first real run of the changed release jobs).
-     TODO(senior): record the rehearsal results here (agent-only configure and build,
-     `-Dserver=enabled` refusal, `setup.sh` profile, vcpkg-tree profile flip, old-branch
-     reconfigure, archive DLL check).
+     Rehearsal (2026-11-12, Windows 11 build box, MSVC 19.44, Meson 1.11.1, pwsh 7.6, scratch
+     clones and a scratch vcpkg copy and binary cache; workflow step bodies extracted from the
+     YAML, never retyped):
+     - `ci.yml`'s Windows install, configure (no server switch: "Server: off", no server
+       target) and build pass; `meson test --suite agent` 19/19. `-Dserver=enabled` is refused
+       with the ADR-0035 message. `release.yml`'s install (none of the nine server DLLs),
+       `-Dserver=disabled` configure and build pass, with no `yuzu-server.exe`.
+     - The archive refusal, run on a real packaged zip under both a plain `pwsh -File` and the
+       Actions template: a clean archive passes and `yuzu-agent.exe --help` runs; `bin\libpq.dll`,
+       a nested `xmlsec1-openssl.dll` plus `bin\LIBPQ.DLL`, and `libecpg.dll` plus
+       `libpgtypes.dll` alone are each refused, naming every planted file, before `--help`.
+       Without `-Recurse` the refusal never fires (the reason the pin keeps it).
+     - vcpkg reconcile in place, both directions, with `scripts/setup.sh`: full to agent-only
+       removes the nine DLLs; agent-only to full restores them; killing vcpkg during a
+       binary-cache restore or during `Installing libpq` converges on the next run; the agent
+       builds and `--suite agent` passes in both directions; a pre-step-3 checkout with no
+       re-install fails its configure naming libpq, and its `setup.sh` fixes it. One gap: a
+       kill while vcpkg is REMOVING libpq (full to agent-only) leaves libpq `purge ok
+       half-installed` with part of its files on disk, and re-running the agent-only install
+       does not finish the purge (3 of 3). `libpq.dll` was already gone each time, a
+       pre-step-3 configure still fails loudly, and the archive refusal catches any surviving
+       DLL; the remedy is to delete `vcpkg_installed` (or run a full install) and re-run
+       `setup.sh` (`docs/windows-build.md`).
+     - Persistent build dirs alternated between this change and its parent (`ci.yml`'s
+       `build-windows-agent-debug`, and the `build-windows-asan` configure with
+       `-Dbuild_server=false`): every reconfigure and build passes without a wipe. A
+       pre-step-3 checkout reconfiguring a step-3 dir prints Meson's "build_server is
+       deprecated" notice and drops the stored `server` value (harmless; step 4 must allow
+       for it).
 4. **Code + build/CI plumbing** — remove server-side `_WIN32` / `__APPLE__`-specific branches under
    `server/core/` (retain POSIX/Linux; do not disturb `agents/shared/` or `sdk/`, which stay
    cross-platform); and remove the plumbing that exists only for the non-Linux server: the
@@ -514,7 +540,9 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    help) on every persistent dir (Wee Tam's, the macOS and Linux runners', and
    developers' `build-*`), done together with the Wee Tam deprovisioning. `main`'s nightly still passes
    `-Dbuild_server=false` until `main` carries step 3, so delete a persistent dir only once
-   the branch that removes the option is the one its jobs build.
+   the branch that removes the option is the one its jobs build. (Measured in the step-3
+   rehearsal: a branch that still declares the option, reconfiguring a dir that stored the
+   step-3 `server` value, drops it silently and prints Meson's deprecation notice.)
 5. **Docs + dev workflow** — retire the server sections of `docs/windows-build.md`; scope
    `docs/darwin-compat.md` to the agent and **document the replacement macOS server dev workflow**
    (Linux builder container / VM / Docker image) and the `/test` platform-asymmetry
