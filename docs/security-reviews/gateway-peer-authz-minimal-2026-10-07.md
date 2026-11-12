@@ -663,5 +663,5 @@ tree. Since #5652/#5653 (2026-10-16), `scripts/integration-test.sh --tls` passes
 acknowledgement (`PEER_FLAGS` is empty in its `--tls` branch; only the plaintext branch passes
 `--insecure-gateway-peer`), so the hop is pinned, and `.github/workflows/ci.yml`'s "Gateway
 real-wire test (pinned TLS)" step runs `scripts/integration-test.sh --tls --free-ports
---gateway-ct` on every Linux run. The unit tests over a real mTLS harness still cover both
+--gateway-ct` on the Linux gcc-15 debug leg of the `ci.yml` build matrix (the step is gated to `matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'`). The unit tests over a real mTLS harness still cover both
 listener modes as described; the rig now adds an end-to-end run of the pinned hop.
