@@ -655,8 +655,27 @@ class VerifyTests(unittest.TestCase):
         verify = top.index(f"cosign verify {repo}@$DIGEST")
         for first_use in ("docker pull", "docker run", "docker create"):
             self.assertLess(verify, top.index(first_use), first_use)
-        for use in (f"docker pull {repo}@$DIGEST", f"docker run --rm -v \"$PWD:/out\" {repo}@$DIGEST"):
-            self.assertIn(use, top)
+        # SEC10-2: a failed or skipped verify must stop BEFORE any pull/run/create, also
+        # when the block is pasted whole. Only a successful cosign sets VERIFIED, and every
+        # step-3 reference takes it through ${VERIFIED:?...}; none may use $DIGEST.
+        step3 = top[top.index("  # 3."):top.index("  A registry verify does NOT cover")]
+        vslice = top[verify:top.index("  # 3.")]
+        self.assertIn("VERIFIED=\n", top[:verify])
+        self.assertIn("&& VERIFIED=$DIGEST", vslice)
+        self.assertEqual(vslice.count("cosign "), 1)
+        toks = vslice.replace("\\\n", " ").split()
+        self.assertEqual(toks[toks.index("--certificate-identity") + 1], ident)
+        self.assertEqual(toks[toks.index("--certificate-oidc-issuer") + 1], ISSUER)
+        self.assertNotIn("-regexp", vslice)
+        gated = f"{repo}@${{VERIFIED:?step 2 did not verify - stop}}"
+        uses = [ln for ln in step3.splitlines() if "docker " in ln and not ln.lstrip().startswith("#")]
+        self.assertEqual(len(uses), 3, uses)
+        for ln in uses:
+            self.assertIn(gated, ln)
+        self.assertIn("docker create", step3)
+        self.assertNotIn("$DIGEST", step3)
+        for use in ("docker pull", 'docker run --rm -v "$PWD:/out"'):
+            self.assertIn(f"{use} {gated}", step3)
         self.assertIn("does NOT cover an image that was mirrored", top)
         # the macOS README only points at that flow, before the xattr line
         self.assertIn("@sha256:", mac)
@@ -840,7 +859,20 @@ class MutationSelfTest(unittest.TestCase):
          "  cosign verify ${IMAGE_REPO}@\\$DIGEST \\\\", "  cosign verify ${IMAGE_REF} \\\\",
          ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
         ("readme-runs-by-tag-not-digest",
-         "  docker run --rm -v \"\\$PWD:/out\" ${IMAGE_REPO}@\\$DIGEST\n", "  docker run --rm -v \"\\$PWD:/out\" ${IMAGE_REF}\n",
+         "  docker run --rm -v \"\\$PWD:/out\" ${IMAGE_REPO}@\\${VERIFIED:?step 2 did not verify - stop}\n", "  docker run --rm -v \"\\$PWD:/out\" ${IMAGE_REF}\n",
+         ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
+        ("readme-step3-gate-removed",
+         "  docker pull ${IMAGE_REPO}@\\${VERIFIED:?step 2 did not verify - stop}\n", "  docker pull ${IMAGE_REPO}@\\$DIGEST\n",
+         ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
+        ("readme-create-gate-removed",
+         "cid=\\$(docker create ${IMAGE_REPO}@\\${VERIFIED:?step 2 did not verify - stop})", "cid=\\$(docker create ${IMAGE_REPO}@\\$DIGEST)",
+         ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
+        ("readme-verify-result-ignored",
+         "--certificate-oidc-issuer ${SIGNER_ISSUER} && VERIFIED=\\$DIGEST\n", "--certificate-oidc-issuer ${SIGNER_ISSUER}; VERIFIED=\\$DIGEST\n",
+         ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
+        ("readme-identity-loosened",
+         "    --certificate-identity https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG} \\\\\n",
+         "    --certificate-identity-regexp https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/.* \\\\\n",
          ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
         ("windows-readme-claims-authenticode",
          "Yuzu Agent — windows-x64 — ${VERSION}  (NOT Authenticode-signed today, #239)",
@@ -861,6 +893,10 @@ class MutationSelfTest(unittest.TestCase):
         "readme-verify-removed": ("unzip",),
         "readme-verifies-the-tag-not-the-digest": ("unzip",),
         "readme-runs-by-tag-not-digest": ("unzip",),
+        "readme-step3-gate-removed": ("unzip",),
+        "readme-create-gate-removed": ("unzip",),
+        "readme-verify-result-ignored": ("unzip",),
+        "readme-identity-loosened": ("unzip",),
         "windows-readme-claims-authenticode": ("unzip",),
         "staging-never-cleaned": ("unzip",),
         "manifest-read-failure-silent": ("!root",),

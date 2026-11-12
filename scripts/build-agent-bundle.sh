@@ -434,20 +434,24 @@ Verify the image, then extract the whole tree
   from that same @sha256: reference and from nothing else (CI-published images
   only; a hand-built image is not signed, so there is nothing to verify):
 
-  # 1. resolve the tag to a digest at the registry
+  # 1. resolve the tag to a digest at the registry (needs docker buildx; if this
+  #    prints an error or an empty digest, stop: step 3 refuses to run)
+  VERIFIED=
   DIGEST=\$(docker buildx imagetools inspect ${IMAGE_REF} --format '{{.Manifest.Digest}}')
 
-  # 2. verify that digest against the exact, tag-bound signer identity
+  # 2. verify that digest against the exact, tag-bound signer identity; only a
+  #    successful verify sets VERIFIED
   cosign verify ${IMAGE_REPO}@\$DIGEST \\
     --certificate-identity https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG} \\
-    --certificate-oidc-issuer ${SIGNER_ISSUER}
+    --certificate-oidc-issuer ${SIGNER_ISSUER} && VERIFIED=\$DIGEST
 
-  # 3. only if step 2 succeeded: pull, then self-extract into ./yuzu-agents/
-  docker pull ${IMAGE_REPO}@\$DIGEST
-  docker run --rm -v "\$PWD:/out" ${IMAGE_REPO}@\$DIGEST
+  # 3. every line below takes the verified digest and is refused when step 2 failed
+  #    or was skipped: pull, then self-extract into ./yuzu-agents/
+  docker pull ${IMAGE_REPO}@\${VERIFIED:?step 2 did not verify - stop}
+  docker run --rm -v "\$PWD:/out" ${IMAGE_REPO}@\${VERIFIED:?step 2 did not verify - stop}
 
   # or copy out without running anything in the container:
-  cid=\$(docker create ${IMAGE_REPO}@\$DIGEST); docker cp "\$cid:/opt/yuzu-agents" .; docker rm "\$cid"
+  cid=\$(docker create ${IMAGE_REPO}@\${VERIFIED:?step 2 did not verify - stop}) && docker cp "\$cid:/opt/yuzu-agents" . && docker rm "\$cid"
 
   A registry verify does NOT cover an image that was mirrored under another name,
   loaded with "docker load", or built locally: none of those is the object the

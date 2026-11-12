@@ -324,7 +324,7 @@ if [[ "$GH_MAJOR" -lt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -lt 50 ) ]]; then
   echo "     upgrade: curl -sSL https://github.com/cli/cli/releases/latest/download/gh_\$(gh api repos/cli/cli/releases/latest --jq .tag_name | sed s/v//)_linux_amd64.tar.gz -o /tmp/gh.tgz && tar xzf /tmp/gh.tgz -C /tmp && install -m755 /tmp/gh_*_linux_amd64/bin/gh ~/.local/bin/gh"
 fi
 
-gh release download "vX.Y.Z" --pattern 'SHA256SUMS*'
+gh release download "vX.Y.Z" --pattern 'SHA256SUMS*' --pattern 'yuzu-linux-x64.tar.gz'
 
 # cosign FIRST: verify the keyless signature on SHA256SUMS + both images, with the
 # EXACT tag-bound identity (never a wildcard). Signer = the repo that ran release.yml.
@@ -340,14 +340,19 @@ for img in yuzu-server yuzu-gateway; do
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     "ghcr.io/$OWNER/$img:X.Y.Z" || { echo "FAIL: $img signature did not verify; stop"; exit 1; }
 done
-# only now is SHA256SUMS trustworthy: check the assets in this directory against it
-# (download them first; a missing file fails the check)
-sha256sum -c SHA256SUMS || { echo "FAIL: an asset does not match SHA256SUMS"; exit 1; }
+# only now is SHA256SUMS trustworthy: check the assets downloaded above against it.
+# --ignore-missing skips the other assets SHA256SUMS lists; the archive's own OK line
+# is required so "nothing was verified" can never pass
+sha256sum -c --ignore-missing SHA256SUMS | tee sha256-check.out
+{ [[ "${PIPESTATUS[0]}" -eq 0 ]] && grep -qx 'yuzu-linux-x64.tar.gz: OK' sha256-check.out; } \
+  || { echo "FAIL: yuzu-linux-x64.tar.gz is missing or does not match SHA256SUMS"; exit 1; }
 
 # gh attestation: verifies SLSA build provenance bound to the exact workflow run
 if [[ "$GH_MAJOR" -gt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -ge 50 ) ]]; then
-  gh attestation verify yuzu-linux-x64.tar.gz --repo DevNullLtd/Yuzu
-  gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo DevNullLtd/Yuzu
+  gh attestation verify yuzu-linux-x64.tar.gz --repo DevNullLtd/Yuzu \
+    || { echo "FAIL: tarball attestation did not verify; stop"; exit 1; }
+  gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo DevNullLtd/Yuzu \
+    || { echo "FAIL: yuzu-server image attestation did not verify; stop"; exit 1; }
 fi
 ```
 

@@ -129,25 +129,29 @@ that moved after you pulled. `<signer>` is `Tr3kkR/Yuzu` for releases up to
 `v0.13.x` and `DevNullLtd/Yuzu` after (see "Verify integrity" below).
 
 ```bash
-# 1. resolve the tag to a digest at the registry
+# 1. resolve the tag to a digest at the registry (needs docker buildx; if this prints
+#    an error or an empty digest, stop: step 3 refuses to run)
+VERIFIED=
 DIGEST=$(docker buildx imagetools inspect ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> \
   --format '{{.Manifest.Digest}}')
 
-# 2. verify that digest against the exact, tag-bound identity
+# 2. verify that digest against the exact, tag-bound identity; only a successful
+#    verify sets VERIFIED
 cosign verify "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-  --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>'
+  --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>' \
+  && VERIFIED=$DIGEST
 
-# 3. only if step 2 succeeded, pull and use that same @sha256: reference
-docker pull "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}"
+# 3. every line below takes the verified digest and is refused when step 2 failed or
+#    was skipped (also when this whole block is pasted at once)
+docker pull "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${VERIFIED:?step 2 did not verify - stop}"
 
 # Self-extract the whole tree into ./yuzu-agents/ :
-docker run --rm -v "$PWD:/out" "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}"
+docker run --rm -v "$PWD:/out" "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${VERIFIED:?step 2 did not verify - stop}"
 
 # …or copy it out without running anything in the container:
-cid=$(docker create "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}")
-docker cp "$cid:/opt/yuzu-agents" .
-docker rm "$cid"
+cid=$(docker create "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${VERIFIED:?step 2 did not verify - stop}") \
+  && docker cp "$cid:/opt/yuzu-agents" . && docker rm "$cid"
 
 # Other entrypoint verbs:
 docker run --rm <img> list     # recursive listing
