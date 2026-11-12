@@ -2879,22 +2879,32 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   admission; the Spark outbox stamp). A server that compares the pair orders a retained
   verdict against a newer one by it, and that order depends on neither the wall clock nor
   arrival order; a server that does not compare it ignores the pair and keeps ordering by its
-  census ordering key. The census ordering key stays the key for entries that carry no pair:
-  journal-paged replays, DEX observations, and an agent whose boot epoch could not be claimed
-  are sent with the pair unset (0/0). Note on #5690's
-  acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14 (the
-  server now flags a tied or mis-ordered pair rather than keeping it silently);
-  receipt-sequence ordering closes UP-14 but worsens UP-13; only terminal precedence
-  closes both. The test `#3972 chaos: a third sender holding the stream write mutex ...`
+  census ordering key (the merge gate below says which stage the server is at). Entries that
+  carry no pair (journal-paged replays, DEX observations, and an agent whose boot epoch could
+  not be claimed) are sent with the pair unset (0/0): two such events order by the census
+  ordering key, and against a paired verdict the server change holds them (item 1). Note on
+  #5690's acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14
+  (the server now flags a tied or mis-ordered pair rather than keeping it silently); a policy
+  that ordered by receipt sequence alone would close UP-14 but worsen UP-13; only terminal
+  precedence closes both. The server change below is none of these three: it orders by the
+  pair, falls back to the census ordering key between two unpaired events, and uses arrival
+  order only in the flagged recoveries it defines. The test
+  `#3972 chaos: a third sender holding the stream write mutex ...`
   (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
-- Merge gate for the agent change (UP-14; conditions the UP-14 SERVER change must meet before
-  the agent change merges, in the fixed order census change, server change, agent change).
-  This agent change activates ordering against a server that may already use the pair; it stays
-  blocked until the receiving change satisfies items 1 to 5 and the integrated range is reviewed.
-  Status will be tracked on #5690 and in the agent change's pull request description (one
-  checkbox per item) once that pull request exists:
-  1. The comparator orders per (agent_id, rule_id), compares the pair only when both sides
-     carry a nonzero pair and otherwise uses the census ordering key. Tests: isolation between agents and
+- UP-14: the five conditions the SERVER change meets. Actual order of delivery: the census
+  ordering changes (#6830, #7151) merged first, the agent change (#7303) merged on 2026-11-08,
+  and the server change follows as two pull requests, PR A then PR B. The server therefore
+  ignored the pair between #7303 and PR A. PR A stores the pair, counts unpaired and rejected
+  pairs and exposes the counts, but does not compare the pair: between PR A and PR B the
+  verdict decision is the census ordering key alone. PR B adds the comparison, the hold and
+  the recovery. Tracking unit: #5690. The one checkbox per item goes in the server pull
+  requests' descriptions: item 5 on PR A, items 1 to 4 on PR B. Until PR B merges, items 1
+  to 4 are not met and the UP-14 residual stands as described above. The conditions:
+  1. The comparator orders per (agent_id, rule_id) and compares the pair when both sides
+     carry one. An unpaired event against a paired verdict is held (refused, flagged, counted)
+     while the agent's pair clock is fresh, and applied by arrival, flagged, once the clock is
+     stale (the pair-regime analogue of the census stale-mark recovery); two unpaired events
+     order by the census ordering key. Tests: isolation between agents and
      rules (one agent's pair never affects another agent's rows), ordered to unordered to
      ordered transitions, and a test that rejects "an unset pair ranks lowest". The pair is
      agent-asserted and unauthenticated.
@@ -2921,7 +2931,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      live senders sharing one agent_id, a lock holder stamping a pair while a process that
      was refused the data-directory lock (`instance_lock_not_held`) or an older build sends
      0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
-     that is in turn ranked above it), the outcome is stated, and a test covers it. Two
+     that is in turn ranked above it; met as: no apply reversal within a regime, and every
+     transition between regimes is one-way, flagged and time-fenced), the outcome is stated,
+     and a test covers it. Two
      stamping senders on separate data directories under one fixed agent id (independent
      epochs) still order totally, but their events rank against each other by epochs that
      are unrelated across instances, and the count below cannot see them because both send a
@@ -2934,14 +2946,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      exposes that uncertainty or obtains fresh state; census-ordering-key fallback, metadata retention,
      or documenting the selected result alone does not satisfy this criterion.
   5. The server change's hunk for fields 24 and 25 is the authority (the agreed split: the
-     server change owns the fields); the agent change takes the server change's version of
-     the hunk when it merges origin/dev. That comment must say boot_epoch is not guaranteed
+     server change owns the fields). That comment must say boot_epoch is not guaranteed
      monotonic across restarts (lost row, clock-ahead pin, equal epoch, 2^62 ceiling) and
-     must define UP-14. This item is a compatibility and documentation criterion; it does not
-     close items 1 to 4.
+     must define UP-14; PR A carries it. This item is a compatibility and documentation
+     criterion; it does not close items 1 to 4.
 - Owner: Dave Rae (maintainer), for the UP-14 server change that must meet items 1 to 5.
-  Receiving tracking unit: #5690. No server pull request for the pair comparison exists yet;
-  when it does, its description carries one checkbox per item and links back here.
+  Receiving tracking unit: #5690. Both server pull requests are described as "Part of #5690"
+  (no auto-close keyword) and link back here.
 - Milestone: PR #5776.
 - Revisit trigger: PR-5 (F14 flip) soak. During the first flip soak, inspect
   `send_order_hold_releases`, `send_stalls` and `send_exceptions` per endpoint on the pilot
