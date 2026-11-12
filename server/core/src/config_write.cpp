@@ -39,12 +39,12 @@ std::optional<WriteRefusal> write_refusal(const std::string& key, const auth::Se
     if (!write_class)
         return std::nullopt;
 
-    // A route-owned key (today only dex_score_policy: one document with its own writers,
+    // A route-owned key (today only dex_score_policy) is one document with its own writers:
     // PUT/DELETE /api/v1/dex/score-policy, the Scoring tab's POSTs and the MCP tools
-    // set_dex_score_policy / reset_dex_score_policy, all over apply_dex_score_policy, which
-    // validates it whole; a generic single-value write could leave it half-edited). The MCP
-    // set_runtime_config tool forwards this refusal verbatim, so the text below names the
-    // MCP tool beside the REST route.
+    // set_dex_score_policy / reset_dex_score_policy, all over apply_dex_score_policy. That
+    // function validates the document whole; a generic single-value write could leave it
+    // half-edited. The MCP set_runtime_config tool forwards this refusal verbatim, so the
+    // text below names the MCP tool beside the REST route.
     if (*write_class == ConfigWriteClass::RouteOwned) {
         const bool dex = key == kDexScorePolicyKey;
         return WriteRefusal{

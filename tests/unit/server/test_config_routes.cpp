@@ -226,6 +226,7 @@ TEST_CASE("config_routes: PUT /api/config/dex_score_policy is refused with a typ
     CHECK(b["error"]["code"] == 400);
     CHECK(b["error"]["message"].get<std::string>().find("PUT /api/v1/dex/score-policy") !=
           std::string::npos);
+    CHECK(b["error"]["message"].get<std::string>().ends_with("(over MCP: set_dex_score_policy)"));
     CHECK(b["error"]["remediation"] ==
           "send the whole policy document to PUT /api/v1/dex/score-policy with If-Match (over MCP: "
           "set_dex_score_policy with if_match)");

@@ -4,7 +4,7 @@
  * @file dex_score_policy_writer.hpp
  * The one write path for the customer DEX score policy: validate, persist, audit, refresh.
  * apply_dex_score_policy() sits behind PUT and DELETE /api/v1/dex/score-policy and is the
- * entry the Settings panel and the MCP tools set_dex_score_policy / reset_dex_score_policy
+ * entry the DEX Scoring tab and the MCP tools set_dex_score_policy / reset_dex_score_policy
  * reuse, so the three surfaces cannot drift.
  *
  * Header-only and store-free: it includes no store, httplib or clock type. Every boundary is

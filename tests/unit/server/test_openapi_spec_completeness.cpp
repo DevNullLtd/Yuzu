@@ -2818,6 +2818,9 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
                 CHECK(*header == json::array({"true"}));
             }
         }
+        // The read declares its ETag header and no Sec-Audit-Failed (it writes no audit row).
+        REQUIRE(find_at(spec, {"paths", "/dex/score-policy", "get", "responses", "200", "headers",
+                               "ETag"}) != nullptr);
         CHECK(find_at(spec, {"paths", "/dex/score-policy", "get", "responses", "200", "headers",
                              "Sec-Audit-Failed"}) == nullptr);
         // The denied row is best effort: said once, in the PUT description.
