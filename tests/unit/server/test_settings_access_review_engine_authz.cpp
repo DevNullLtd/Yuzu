@@ -563,3 +563,39 @@ TEST_CASE("access-review fragments: the regime or the credential changing betwee
         CHECK(r.denied_details("access_review.list").empty());
     }
 }
+
+// ── #6940: the grant/attestation evidence is never cached ────────────────────
+namespace {
+/// One `Cache-Control` and one `Vary`: `set_header` appends, and `get_header_value` returns the
+/// first, so a duplicate would hide from a value-only assertion.
+void check_private_no_store(const httplib::Response& res) {
+    CHECK(res.get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res.get_header_value("Vary") == "Cookie");
+    CHECK(res.headers.count("Cache-Control") == 1);
+    CHECK(res.headers.count("Vary") == 1);
+}
+} // namespace
+
+TEST_CASE("access-review fragments: both GETs answer no-store, private with Vary: Cookie, once",
+          "[pg][settings][access_review][cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, ar_engine_tpl);
+    Rig r{db_.dsn()};
+    const auto bob = r.cookie("bob", auth::Role::user);
+
+    const auto list = r.cookie_get(kListFragment, bob);
+    REQUIRE(list);
+    REQUIRE(list->status == 200);
+    check_private_no_store(*list);
+
+    const auto get = r.cookie_get(r.campaign_path(), bob);
+    REQUIRE(get);
+    REQUIRE(get->status == 200);
+    CHECK_THAT(get->body, ContainsSubstring(kCampaignTitle)); // the evidence itself, not a note
+    check_private_no_store(*get);
+
+    // The in-page empty shell is a 200 of the same fragment: same headers.
+    const auto empty = r.cookie_get(std::string(kGetFragment) + "?id=", bob);
+    REQUIRE(empty);
+    REQUIRE(empty->status == 200);
+    check_private_no_store(*empty);
+}
