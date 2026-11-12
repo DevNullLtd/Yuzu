@@ -80,6 +80,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
@@ -87,6 +88,7 @@
 #include <regex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -237,6 +239,16 @@ std::string context_at(const std::string& s, std::size_t pos, std::size_t ctx = 
     return s.substr(start, end - start);
 }
 
+// What follows the fragment's leading shared <style> block (the whole string when it has none), so
+// a placeholder literal is pinned without restating the stylesheet.
+std::string after_style(const std::string& html) {
+    constexpr std::string_view kEnd = "</style>";
+    if (!html.starts_with("<style>"))
+        return html;
+    const auto end = html.find(kEnd);
+    return end == std::string::npos ? html : html.substr(end + kEnd.size());
+}
+
 // Golden-file byte-for-byte compare for one rendered HTML fragment (or, when
 // YUZU_UPDATE_GOLDEN is set in the environment, REGENERATION instead of
 // comparison). `cell` is a stable, descriptive filename stem (no
@@ -251,7 +263,11 @@ std::string context_at(const std::string& s, std::size_t pos, std::size_t ctx = 
 //   pane: every control that swaps into the shared pane carries its stale-response guard, so the
 //         count of hx-target="#guardian-detail" equals the count of hx-sync="#guardian-detail:replace";
 //   keyboard: no filter chip and no sub-navigation tab is a bare anchor (an anchor with no href is
-//         not in the tab order), and every chip says whether it is pressed.
+//         not in the tab order), and every chip says whether it is pressed;
+//   style: a fragment that renders a text-link button (.dx-lk) or a sub-navigation tab also carries
+//         the shared reset rule (`:where(button.dx-lk,...){all:unset}` in dex_fragment_style()). A
+//         pane swap replaces the previous fragment's <style>, so a button without it paints as a
+//         user-agent button. Markup text cannot show a painted button; this pins its cause.
 void check_pane_and_keyboard_invariants(const std::string& cell, const std::string& html) {
     const auto count = [&](const std::string& needle) {
         std::size_t n = 0;
@@ -261,6 +277,8 @@ void check_pane_and_keyboard_invariants(const std::string& cell, const std::stri
     };
     INFO("golden cell '" << cell << "'");
     CHECK(count("hx-target=\"#guardian-detail\"") == count("hx-sync=\"#guardian-detail:replace\""));
+    if (count("<button type=\"button\" class=\"dx-lk") + count("class=\"gp-subnav\"") != 0)
+        CHECK(count("where(button.dx-lk") >= 1);
     CHECK(count("<a class=\"gp-chip") == 0);
     std::size_t chips = count("<button type=\"button\" class=\"gp-chip");
     CHECK(count("aria-pressed=") == chips);
@@ -852,7 +870,7 @@ TEST_CASE("DEX golden: overview fragment — window x visible matrix", "[pg][dex
 
 TEST_CASE("DEX golden: app fragment — null store placeholder (window=24h)", "[dex][golden]") {
     const auto html = render_dex_app_fragment(nullptr, "app1.exe", "24h");
-    CHECK(html == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
+    CHECK(after_style(html) == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
                   "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">&larr; Reliability overview</button><div "
                   "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
                   "is not open.</div>");
@@ -861,7 +879,7 @@ TEST_CASE("DEX golden: app fragment — null store placeholder (window=24h)", "[
 
 TEST_CASE("DEX golden: app fragment — null store placeholder (window=all)", "[dex][golden]") {
     const auto html = render_dex_app_fragment(nullptr, "app1.exe", "all");
-    CHECK(html == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
+    CHECK(after_style(html) == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
                   "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">&larr; Reliability overview</button><div "
                   "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
                   "is not open.</div>");
@@ -952,7 +970,7 @@ TEST_CASE("DEX golden: app fragment — no crashes/hangs for this app", "[pg][de
 
 TEST_CASE("DEX golden: device fragment — null store placeholder (window=24h)", "[dex][golden]") {
     const auto html = render_dex_device_fragment(nullptr, "dex-gold-1", "24h");
-    CHECK(html == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
+    CHECK(after_style(html) == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=24h\" "
                   "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">&larr; Reliability overview</button><div "
                   "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
                   "is not open.</div>");
@@ -961,7 +979,7 @@ TEST_CASE("DEX golden: device fragment — null store placeholder (window=24h)",
 
 TEST_CASE("DEX golden: device fragment — null store placeholder (window=all)", "[dex][golden]") {
     const auto html = render_dex_device_fragment(nullptr, "dex-gold-1", "all");
-    CHECK(html == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
+    CHECK(after_style(html) == "<button type=\"button\" class=\"dx-lk gp-back\" hx-get=\"/fragments/dex/overview?window=all\" "
                   "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"#guardian-detail:replace\">&larr; Reliability overview</button><div "
                   "class=\"gp-placeholder\"><b>Reliability data unavailable</b>The signal store "
                   "is not open.</div>");
@@ -2275,17 +2293,49 @@ TEST_CASE("DEX overview: a name with control characters prints markers in its te
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
+    // One crash whose subject, component, code and symbolic text each carry a marked character.
     const std::string proc = std::string("bad") + kRlo + "name.exe";
-    seed_crash(store, "mk1", "dex-gold-1", proc, "ntdll.dll", "windows", kRecent);
+    const std::string mod = std::string("ntdll") + kZwsp + ".dll";
+    const std::string code = std::string("0xC0") + kZwsp + "05";
+    const std::string sym = std::string("ACCESS") + kRlo + "_VIOLATION";
+    seed_signal(store, "mk1", "dex-gold-1", "process.crashed",
+                "{\"subject\":\"" + proc + "\",\"reason\":\"" + code + "\",\"symbolic\":\"" + sym +
+                    "\",\"component\":\"" + mod + "\",\"platform\":\"windows\"}",
+                kRecent);
     DexFleet fleet;
     fleet.windows_online = 1;
     fleet.connected_os = {"windows"};
     fleet.connected_agents = {{"dex-gold-1", "windows"}};
-    const auto html = render_dex_overview_fragment(&store, "", 0, fleet);
-    CHECK(contains(html, ">bad&lt;U+202E&gt;name.exe</button>"));
-    CHECK(contains(html, "name=bad%E2%80%AEname.exe"));
-    CHECK_FALSE(any_marker_inside_a_tag(html));
-    CHECK_FALSE(contains(html, kRlo));
+    const auto overview = render_dex_overview_fragment(&store, "", 0, fleet);
+    CHECK(contains(overview, ">bad&lt;U+202E&gt;name.exe</button>"));
+    CHECK(contains(overview, "name=bad%E2%80%AEname.exe"));
+    CHECK_FALSE(any_marker_inside_a_tag(overview));
+    CHECK_FALSE(contains(overview, kRlo));
+
+    // Every other DEX fragment that prints those strings: a marker is printed, none sits in a tag, and
+    // the raw character is never printed.
+    const auto check_fragment = [](const char* name, const std::string& html,
+                                   std::initializer_list<const char*> printed) {
+        INFO(name);
+        for (const char* marked : printed)
+            CHECK(contains(html, marked));
+        CHECK_FALSE(any_marker_inside_a_tag(html));
+        CHECK_FALSE(contains(html, kRlo));
+        CHECK_FALSE(contains(html, kZwsp));
+    };
+    check_fragment("app drill", render_dex_app_fragment(&store, proc, "all"),
+                   {"bad&lt;U+202E&gt;name.exe", "ntdll&lt;U+200B&gt;.dll", "0xC0&lt;U+200B&gt;05",
+                    "ACCESS&lt;U+202E&gt;_VIOLATION"});
+    check_fragment("device drill", render_dex_device_fragment(&store, "dex-gold-1", "all"),
+                   {"bad&lt;U+202E&gt;name.exe", "ntdll&lt;U+200B&gt;.dll",
+                    "ACCESS&lt;U+202E&gt;_VIOLATION 0xC0&lt;U+200B&gt;05"});
+    check_fragment("Catalogue signal", render_dex_catalogue_signal_fragment(&store, "", 0, "process.crashed"),
+                   {"bad&lt;U+202E&gt;name.exe"});
+    const auto obs = store.dex_observation("mk1");
+    REQUIRE(obs.has_value());
+    check_fragment("observation", render_dex_observation_fragment(*obs),
+                   {"bad&lt;U+202E&gt;name.exe", "ntdll&lt;U+200B&gt;.dll", "0xC0&lt;U+200B&gt;05",
+                    "ACCESS&lt;U+202E&gt;_VIOLATION"});
 }
 
 TEST_CASE("DEX apps UI: with control characters in every agent-reported string no DEX fragment marks a tag",

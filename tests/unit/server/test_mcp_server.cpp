@@ -11492,6 +11492,19 @@ TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregat
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.app.view") == std::string::npos);
 
+    // The served payload validates against the output schema the tool declares. The schema is
+    // fetched from tools/list and must be an object, so the check can never pass vacuously.
+    {
+        auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7504})");
+        REQUIRE(listed);
+        nlohmann::json schema;
+        for (const auto& t : nlohmann::json::parse(listed->body)["result"]["tools"])
+            if (t["name"] == "list_dex_apps")
+                schema = t["outputSchema"];
+        REQUIRE(schema.is_object());
+        CHECK(yuzu::test::schema_violation(schema, payload) == "");
+    }
+
     // Rule 1: the MCP payload's key sets equal the shared serializer's.
     yuzu::server::DexAppsModel one;
     one.window = "all";

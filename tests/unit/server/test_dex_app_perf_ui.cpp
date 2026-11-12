@@ -507,6 +507,23 @@ TEST_CASE("render_dex_app_perf_trend: version-devices click-to-expand affordance
         CHECK_FALSE(has(h, "hx-on")); // CSP: no eval-compiled handlers
     }
 
+    SECTION("the affordance is a native button, in the tab order, with no pane attributes") {
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "", {}, 10, 7);
+        const auto open = h.find("<button type=\"button\" class=\"dx-lk gp-mute\" hx-get=\"/fragments/dex/perf/app/devices?");
+        REQUIRE(open != std::string::npos);
+        const auto tag = h.substr(open, h.find('>', open) - open);
+        CHECK(has(tag, "hx-target=\"closest tr\""));
+        CHECK(has(tag, "hx-swap=\"afterend\""));
+        CHECK(has(tag, "hx-trigger=\"click once\""));
+        // It swaps a row, not the pane: no pane target and no sync, and no inline cursor style.
+        CHECK_FALSE(has(tag, "#guardian-detail"));
+        CHECK_FALSE(has(tag, "hx-sync"));
+        CHECK_FALSE(has(tag, "style="));
+        CHECK(has(h, "&#9656; devices</button>"));
+        // No href-less anchor is left on the row.
+        CHECK_FALSE(has(h, "<a style=\"cursor:pointer\" class=\"gp-mute\""));
+    }
+
     SECTION("the unknown-version (\"\") bucket also gets the affordance") {
         const auto h = render_dex_app_perf_trend("linuxapp", {unknown}, "", {}, 10, 7);
         CHECK(has(h, "/fragments/dex/perf/app/devices?app=linuxapp&amp;version="));
@@ -589,6 +606,23 @@ TEST_CASE("render_dex_app_perf_trend: a version with a zero-width character keep
         INFO(h.substr(at, end - at));
         CHECK_FALSE(has(h.substr(at, end - at), "&lt;U+"));
     }
+}
+
+TEST_CASE("render_dex_app_perf_trend: the active device-model cohort prints a marker in the subtitle "
+          "and keeps raw bytes in its option value",
+          "[dex][app_perf][ui][marking]") {
+    AppPerfVersionSummary v1;
+    v1.version = "1.0";
+    v1.latest_day = 200;
+    v1.device_count = 5;
+    v1.cpu_mean = 3.0;
+    const std::string model = std::string("Lat") + kZwsp + "itude";
+    const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "", {}, 10, 7, "", {model}, model);
+    // The subtitle is a text node: the marker is printed, so the cohort cannot read as another one.
+    CHECK(has(h, "devices modeled Lat&lt;U+200B&gt;itude"));
+    CHECK_FALSE(has(h, std::string("devices modeled Lat") + kZwsp));
+    // The value the browser sends back keeps its raw bytes.
+    CHECK(has(h, std::string("<option value=\"Lat") + kZwsp + "itude\" selected>"));
 }
 
 TEST_CASE("render_dex_app_perf_picker: a search query with a zero-width character keeps raw bytes in "

@@ -309,13 +309,17 @@ void bump_policy_generation_on(PGconn* conn) {
 // count-plus-sampled-log as `dex_read_checked`, but a degrade comes back as the `DexReadFault`
 // that caused it so the caller can tell the causes apart. `body` returns the same
 // `std::expected<Result, DexReadFault>`; the metric label of a fault it returns is that fault's
-// token.
+// token. A caller that passes `timeout_sampler` gives the statement-timeout log line its own
+// sampler, so a run of other faults cannot suppress it and the reverse (the counter increments
+// either way).
 template <typename Result, typename Body>
 std::expected<Result, DexReadFault>
 dex_read_faulted(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* method,
-                 DegradeSampler& sampler, Body&& body) {
+                 DegradeSampler& sampler, Body&& body, DegradeSampler* timeout_sampler = nullptr) {
     const auto degrade = [&](DexReadFault f, const char* what) {
-        if (const auto d = note_read_degrade(metrics, dex_read_fault_token(f), kDegradeSource, sampler);
+        DegradeSampler& s =
+            (f == DexReadFault::kStatementTimeout && timeout_sampler) ? *timeout_sampler : sampler;
+        if (const auto d = note_read_degrade(metrics, dex_read_fault_token(f), kDegradeSource, s);
             d.should_log)
             spdlog::warn("GuaranteedStateStore::{}: {}", method, what);
         return std::unexpected(f);
@@ -2285,6 +2289,7 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                                                     per_subject_caps) const {
     static DegradeSampler sampler;
     static DegradeSampler budget_sampler; // a refusal storm must not hide a real fault's log line
+    static DegradeSampler timeout_sampler; // nor a run of other faults the statement-timeout line
     struct Slot {
         std::atomic<int>& n;
         ~Slot() { n.fetch_sub(1, std::memory_order_relaxed); }
@@ -2442,7 +2447,8 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 out.push_back(std::move(r));
             }
             return out;
-        });
+        },
+        &timeout_sampler);
 }
 
 std::vector<DexAppCrashCount>

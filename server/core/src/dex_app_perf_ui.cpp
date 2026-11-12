@@ -450,7 +450,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                 break;
             }
     } else if (is_model) {
-        scope_name = "devices modeled " + esc(active_model);
+        scope_name = "devices modeled " + esc_text(active_model);
     }
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc_text(app_name) +
          " <span class=\"gp-mute dx-sub\">&mdash; by version, "
@@ -621,11 +621,13 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             // reports, echo_proc_perf.cpp).
             const std::string devices_qs =
                 "app=" + url_encode(app_name) + "&amp;version=" + url_encode(v.version);
-            devices_cell += " <a style=\"cursor:pointer\" class=\"gp-mute\" "
+            // A native button (keyboard reachable) styled as the muted text link it replaces. It
+            // swaps a row, not the pane, so it carries none of the pane attributes.
+            devices_cell += " <button type=\"button\" class=\"dx-lk gp-mute\" "
                             "hx-get=\"/fragments/dex/perf/app/devices?" +
                             devices_qs +
                             "\" hx-target=\"closest tr\" hx-swap=\"afterend\" "
-                            "hx-trigger=\"click once\">&#9656; devices</a>";
+                            "hx-trigger=\"click once\">&#9656; devices</button>";
         }
         h += "<tr><td>" + ver + tag + "</td><td>" + fmt_pct(v.cpu_mean) + "</td><td>" +
              pctile_cell(v.cpu_p95) + "</td><td>" + spark(v.cpu_series) + "</td><td>" +

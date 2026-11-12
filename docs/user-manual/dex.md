@@ -69,9 +69,11 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
 - **Keyboard.** The sub-navigation tabs, the filter chips and the text links (an application name,
   the drill-down and back links, the link to Scoring) are native buttons: each takes focus in the
   normal tab order, opens with Enter or Space, and shows a focus ring. They look the same as before.
-  Two kinds of control on the DEX pages are still pointer-only: the cards (the Overview's explore
-  cards, its hardware cards and the Catalogue's family cards) and the clickable signal row in a
-  Catalogue family (a row opens its drill-down on click).
+  The per-version "devices" link on the App Performance trend is a native button too. These
+  controls on the DEX pages are still pointer-only: the cards (the Overview's explore cards, its
+  hardware cards and the Catalogue's family cards), the clickable rows (a signal row in a
+  Catalogue family, and a signal-history row on a device), and the text links on the Network tab
+  (its drill-down links and its back link).
 - **Platform and window.** Native buttons (keyboard-reachable) choose All platforms, Windows,
   macOS or Linux (default All platforms) and 24h, 7d, 30d or All. Every figure is restricted to the
   selected platform; share, rate and score use the devices online now, while crashes, hangs,
@@ -136,8 +138,9 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   one exposes only its summary.
 - **Failures.** A read that could not be completed is an error panel that shows no population,
   coverage, policy or interval line and no table; it is never an empty list. The panel's wording
-  follows the cause, and the cause is always printed as a code token. The REST `503` and the MCP error
-  carry the same token. The page answers `200` for every cause so the panel is shown.
+  follows the cause, and the cause is printed as a code token for every cause except `invalid_scope`,
+  whose panel names the platform filter instead. The REST `503` and the MCP error carry the same
+  token. The page answers `200` for every cause so the panel is shown.
 
   | Reason | What the page says | What to do |
   |---|---|---|

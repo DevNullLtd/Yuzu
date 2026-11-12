@@ -31,7 +31,9 @@ namespace yuzu::server {
 /// points at a shorter window (at 24h, at the database); score_policy_unavailable and
 /// score_policy_invalid point at Scoring; store_not_open and query_error point at the database;
 /// invalid_scope names the platform filter; an empty reason gets the generic text and any other
-/// token the generic text with the token shown. The token is always printed as a code element.
+/// token the generic text with the token shown. Every panel but invalid_scope's prints the token as
+/// a code element (an empty reason has none to print); invalid_scope's names the platform filter
+/// instead.
 std::string render_dex_apps_fragment(const DexAppsModel& model, int window_days,
                                      const std::string& platform);
 

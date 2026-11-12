@@ -414,8 +414,8 @@ input.dx-ctl{min-width:220px}
 .gp-subnav button{padding:8px 14px;font-weight:500;color:var(--mut);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
 .gp-subnav button:hover{color:var(--ink)}
 .gp-subnav button.on{color:var(--ink);font-weight:600;border-bottom-color:var(--hl)}
-.gp-table .dx-lk{color:var(--ink);font-weight:600}
-.gp-table .dx-lk:hover{color:var(--primary-h)}
+.gp-table .dx-lk:not(.gp-mute){color:var(--ink);font-weight:600}
+.gp-table .dx-lk:not(.gp-mute):hover{color:var(--primary-h)}
 button.gp-chip{line-height:inherit;font-variant-numeric:inherit}
 .gp-chip:focus-visible,.dx-lk:focus-visible,.gp-subnav button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 .gp-stack>span{background:var(--c4)}
@@ -1867,12 +1867,14 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
     // Window-scoped to match the overview row that linked here (C-S1/UP-11): the
     // token (e.g. "7d") resolves to the same `since` cutoff the overview used.
     const std::string since = iso_days_ago(window_to_days(window));
+    // The back and drill links are text-link buttons: the shared style block rides in this
+    // fragment (a pane swap drops the previous one), on every return path.
+    const std::string head = dex_fragment_style() + back_to_overview(window);
     if (!store)
-        return back_to_overview(window) +
-               placeholder("Reliability data unavailable", "The signal store is not open.");
+        return head + placeholder("Reliability data unavailable", "The signal store is not open.");
 
     const auto s = store->dex_app_summary(process_name, since);
-    std::string h = back_to_overview(window);
+    std::string h = head;
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc_text(process_name) +
          "</h1></div><div class=\"gp-sub\">Crash &amp; hang blast radius across the "
          "fleet.</div></div></div>";
@@ -1959,9 +1961,12 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
     // open audit-logged (dex.device.view) — without an on-page banner.
     // Window-scoped to match the linking overview row (C-S1/UP-11).
     const std::string since = iso_days_ago(window_to_days(window));
+    // The back link is a text-link button: the shared style block rides in this fragment (a pane
+    // swap drops the previous one), on every return path. The page also hosts the click-to-load
+    // perf panels (dx-perfrow / dx-strips).
+    const std::string head = dex_fragment_style() + back_to_overview(window);
     if (!store)
-        return back_to_overview(window) +
-               placeholder("Reliability data unavailable", "The signal store is not open.");
+        return head + placeholder("Reliability data unavailable", "The signal store is not open.");
 
     // A4: click-to-load device perf panel. Deliberately NOT auto-loaded: the
     // route behind the hx-get dispatches a real echo.sql to the device AND
@@ -2014,8 +2019,7 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
         "usage-class, audited</span></div>";
 
     const auto s = store->dex_device_summary(agent_id, since);
-    // The device page hosts the click-to-load perf panels (dx-perfrow / dx-strips).
-    std::string h = dex_fragment_style() + back_to_overview(window);
+    std::string h = head;
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc_text(agent_id) +
          "</h1></div><div class=\"gp-sub\">Device signal history.</div></div></div>";
     if (s.signals == 0)

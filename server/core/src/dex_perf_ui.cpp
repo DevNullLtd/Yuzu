@@ -36,6 +36,7 @@ namespace yuzu::server {
 
 // Shared with dex_routes.cpp (declared in dex_routes.hpp).
 std::string dex_subnav(const std::string& active, int window_days);
+std::string dex_fragment_style();
 std::string dex_window_token(int window_days);
 
 namespace {
@@ -449,7 +450,9 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
         title = std::string("Worst devices by current ") + m;
     }
 
-    std::string h;
+    // The back link and the device drills are text-link buttons: the shared style block rides in
+    // this fragment (a pane swap drops the previous one).
+    std::string h = dex_fragment_style();
     // Back link preserves the cohort key, so returning from an image-cohort
     // drill lands on the image table, not the default (grill fix).
     h += dex_pane_link("/fragments/dex/perf?window=" + w +

@@ -417,8 +417,13 @@ TEST_CASE("devices fragment: titles, escape, honest empty states", "[dex][perf][
     CHECK(worst.find("Worst devices by current CPU") != std::string::npos);
     CHECK(worst.find("<img src=x>") == std::string::npos); // agent_id escaped
     CHECK(worst.find("&lt;img") != std::string::npos);
+    // Its back link and device drills are text-link buttons, and a pane swap drops the previous
+    // fragment's <style>: the shared reset rule must ride in this fragment (else they paint as
+    // user-agent buttons).
+    CHECK(worst.find("<button type=\"button\" class=\"dx-lk") != std::string::npos);
+    CHECK(worst.find("where(button.dx-lk") != std::string::npos);
 
-    auto nr = render_dex_perf_devices_fragment(snap, DexPerfMetric::kCpu, true, std::nullopt,
+    auto nr =render_dex_perf_devices_fragment(snap, DexPerfMetric::kCpu, true, std::nullopt,
                                                50, 7);
     CHECK(nr.find("Everyone is reporting") != std::string::npos); // honest empty complement
 }
