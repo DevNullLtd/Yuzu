@@ -19,8 +19,9 @@
 ///
 /// Two layers, split by I/O:
 ///
-/// LAYER A (this header, inline, PURE — no I/O, no includes beyond the
-/// standard library): the whitelist mapper, the params builder, and the
+/// LAYER A (this header, inline, PURE — no I/O, standard library only; the one
+/// out-of-line helper, `combined_output`, takes a forward-declared
+/// `StoredResponse`): the whitelist mapper, the params builder, and the
 /// agent-side status-reply parser. Mirrors `quarantine_dispatch_decision.hpp`'s
 /// "pure on purpose" discipline — a unit test can exhaust every branch
 /// without a store, an agent, or a build dir.
@@ -186,8 +187,8 @@ struct ContainmentReply {
 }
 
 /// The device judges its own time limit on ITS clock, and a contained device blocks NTP
-/// (firewall_quarantine_parsers.hpp:1391-1392), so its clock can run ahead of the
-/// server's by a few seconds or more. This allowance is the one knob: an `inactive`
+/// (see the `ttl_expired` handling in firewall_quarantine_parsers.hpp), so its clock can
+/// run ahead of the server's by a few seconds or more. This allowance is the one knob: an `inactive`
 /// answer within it of the stored limit is read as the limit running out; further ahead
 /// than that reads as drift and is re-applied.
 inline constexpr std::int64_t kDeviceLimitLapseTolerance{300};
