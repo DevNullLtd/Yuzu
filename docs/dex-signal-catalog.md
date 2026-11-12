@@ -614,3 +614,9 @@ isolated lab/test machines that are not managed endpoints, not ingested by a
 customer SIEM, and not a potential forensic-evidence source.** To exercise the
 collector on a real endpoint, trigger or wait for *genuine* events (restart a
 test service, run a disk check) rather than injecting security-provider events.
+
+## Routed-concern invariants
+
+Moved verbatim from the `Guardian / Guaranteed State` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Guardian / Guaranteed State — real-time agent-side policy enforcement (guard categories, YAML DSL, `__guard__` wire protocol, approval workflow, quarantine; §24 invariants). DEX families: ruleless signal observations (`rule_id="__observation__"`, `event_type` = obs_type — the ruleless-ness IS the discriminator); plus state-poll/perf-breach, blast-radius/alert-routing, device+app perf-over-time, `/auto` VERIFY. CRITICAL: `kDexCohortFloor` is ONE device (ruled 2026-10-14): every app-perf, cohort, tag and Apps read publishes any point or figure with >=1 device — by app/version/cohort value only, never an `agent_id`, behind `GuaranteedState:Read`; a cohort of one keyed by a per-device tag value is that device's exact figures, un-audited, and the opt-in Prometheus cohort export puts the same on `/metrics`, NOT behind `GuaranteedState:Read`. `/auto` VERIFY has NO floor; its audited `dex.app_perf.compare` read is the control. (2) The "which devices" drill (`list_devices_for_version`, `GET /api/v1/dex/perf/app/devices`, MCP `list_dex_app_perf_devices`) is floor-free (names `agent_id`s), gated on `require_fleet_read` (ADR-0017) + the `dex.app_perf.devices.view` audit verb. BRD map `docs/dex-brd-coverage.md` is local-only/untracked (commercially sensitive) — ask the operator if missing.

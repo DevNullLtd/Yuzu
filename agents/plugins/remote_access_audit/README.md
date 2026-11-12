@@ -219,3 +219,8 @@ config|port|-|-
 - Tests: `tests/test_remote_access_audit_definition.py` · `tests/unit/test_remote_access_audit_config_parsers.cpp` · `tests/unit/test_remote_access_audit_keys_parsers.cpp` · `tests/unit/test_remote_access_audit_legs.cpp` · `tests/unit/test_remote_access_audit_local_dispatcher.cpp` · `tests/unit/test_remote_access_audit_posix_fs.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->
+
+### Recorded owner choices and open gaps (from the routed-concern row)
+
+- **Owner choices (grill, 2026-10-17).** Q3: "User, key type, SHA256 fingerprint, option names". Q5: "Also read Remote Login state". The plan's consequence, stated as fact: macOS walks the entries of `/Users` owned by uid 500 or above and `/var/root`, the account is the home directory's name, and every walked home is reported, keyless ones included.
+- **Known gap cited, not fixed by this plugin:** #5261. (#4990 is closed by the Forensics tier on stored-response reads; see that routed-concern row.)
