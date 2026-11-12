@@ -213,6 +213,7 @@
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 #include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: every capability fragment, spelled once
+#include "plugin_init_failed_labels.hpp" // catalogue-bounded plugin label (yuzu_fleet_plugin_init_failed)
 #include "forensics_plugin_set.hpp"   // #4990: catalogue-derived Forensics plugin set (response read tier)
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
@@ -2739,8 +2740,14 @@ public:
                           "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
                           "Agents reporting a plugin that failed init, by plugin name (absent "
-                          "when none; at most 64 named labels, the rest under plugin=other)",
+                          "when none). The label is bounded to the server's plugin catalogue: a "
+                          "well-formed name the catalogue does not know is summed under "
+                          "plugin=unknown, which sums each agent's distinct reported names (tokens), so "
+                          "one agent can add several; matching is exact and case sensitive (see "
+                          "yuzu_fleet_plugin_init_failed_rejected, which counts agents)",
                           "gauge");
+        metrics_.describe(yuzu::server::kPluginInitFailedRejectedGauge,
+                          yuzu::server::kPluginInitFailedRejectedHelp, "gauge");
         metrics_.describe("yuzu_fleet_inventory_sync_skipping",
                           "Agents currently reporting heartbeats whose daily-sync source skipped "
                           "its latest collection cycle(s) (heartbeat tag "
@@ -5345,6 +5352,12 @@ public:
                                                "tier would exclude nothing"});
             startup_failed_ = true;
         }
+
+        // The plugin label of yuzu_fleet_plugin_init_failed is bounded to this server's own
+        // catalogue: an agent-reported name the catalogue does not know is summed under
+        // plugin="unknown" and can neither displace a real plugin nor collide with one. Set once,
+        // before the health recompute thread's first sweep (started in run()).
+        health_store_.set_known_plugins(yuzu::server::catalogue_plugin_names(capability_registry_));
 
         // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
         // BEFORE any Postgres-backed store and validated by a probe checkout so
