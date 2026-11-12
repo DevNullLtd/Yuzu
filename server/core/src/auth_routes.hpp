@@ -1130,6 +1130,23 @@ private:
                                   const std::string& audit_detail,
                                   const authz::CeilingResult& ceiling);
 
+    /// The ONE response when a list gate would hand a service-scoped session UNRESTRICTED
+    /// authority (a corrupted service-scoped engine row; minting refuses it). Shared by
+    /// `require_fleet_read` and `require_list_read`: counts
+    /// `yuzu_server_authz_service_scope_unrestricted_refused_total{gate,site}`, logs, writes one
+    /// audit row (the gate's own action, FIXED text) and answers `kEngineEntry` 403 /
+    /// `kPostcondition` 500, never naming a `.permission` (clause 5). Extend, never fork.
+    void refuse_service_scoped_unrestricted(const httplib::Request& req, httplib::Response& res,
+                                            const auth::Session& session, const std::string& perm,
+                                            authz::UnrestrictedRefusalGate gate,
+                                            authz::UnrestrictedRefusalSite site);
+
+    /// `require_fleet_read`'s one admit point: the only place a `ListAuthority` is minted.
+    [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
+    admit_fleet_read(const httplib::Request& req, httplib::Response& res,
+                     const auth::Session& session, const std::string& perm,
+                     authz::VisibleSet scope);
+
     std::optional<std::vector<authz::PermPair>> service_scope_global_safe_override_for_test_;
 
     std::size_t mfa_pending_cap_{kMaxPendingTokens};

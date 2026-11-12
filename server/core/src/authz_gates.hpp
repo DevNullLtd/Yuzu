@@ -2,6 +2,8 @@
 
 #include "authz_model.hpp"
 
+#include <yuzu/server/auth.hpp> // auth::Session (service_scope_authority_ok)
+
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -112,7 +114,25 @@ enum class GateFailure : std::uint8_t {
                      ///< token, the ITServiceOwner ceiling read failing
                      ///< (`service_ceiling_check` returned Degraded; a
                      ///< DEFINITIVE ceiling deny is Forbidden).
+    InvariantViolated, ///< 500, not retryable: an admit that would have handed a
+                       ///< service-scoped session unrestricted authority.
 };
+
+/// THE one predicate for "may this admit stand": a service-scoped session must never hold
+/// UNRESTRICTED authority, so its scope must be engaged (an engaged-empty scope is deny-all and
+/// passes). `Scope` is any optional-shaped scope where empty means unrestricted: `VisibleSet`
+/// (`require_fleet_read`) or `ListReadGate::scope` (`require_list_read`). Shared by both gates;
+/// a second copy of this rule is a defect.
+template <class Scope>
+[[nodiscard]] inline bool service_scope_authority_ok(const auth::Session& session,
+                                                     const Scope& scope) {
+    return session.token_scope_service.empty() || scope.has_value();
+}
+
+/// The `gate` and `site` labels of `yuzu_server_authz_service_scope_unrestricted_refused_total`
+/// (closed sets; `refuse_service_scoped_unrestricted` maps them to label text).
+enum class UnrestrictedRefusalGate : std::uint8_t { kFleetRead, kListRead };
+enum class UnrestrictedRefusalSite : std::uint8_t { kEngineEntry, kPostcondition };
 
 /// Move-only witness over an already-composed `VisibleSet` — the product of
 /// `AuthRoutes::require_fleet_read`. `in_scope`/`filter` are the only

@@ -44,6 +44,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -1615,4 +1616,34 @@ TEST_CASE("ceiling read: the acquire budget is the 250 ms authz budget and not t
     done.fire();
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == "pool acquire timeout");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// authz::service_scope_authority_ok: the ONE predicate behind the unrestricted-authority
+// refusal shared by require_fleet_read and require_list_read (#5557 D-E / D-L). Pure: no store.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("service_scope_authority_ok: a service-scoped session may never hold unrestricted "
+          "authority; an engaged scope (including an empty one) always passes",
+          "[authz_gates][service_scope]") {
+    auth::Session service_scoped;
+    service_scoped.token_scope_service = "A";
+    auth::Session plain; // token_scope_service empty
+
+    const authz::VisibleSet unrestricted = std::nullopt;
+    const authz::VisibleSet engaged = std::unordered_set<std::string>{"a1"};
+    const authz::VisibleSet engaged_empty = std::unordered_set<std::string>{};
+
+    CHECK_FALSE(authz::service_scope_authority_ok(service_scoped, unrestricted));
+    CHECK(authz::service_scope_authority_ok(service_scoped, engaged));
+    CHECK(authz::service_scope_authority_ok(service_scoped, engaged_empty)); // deny-all is engaged
+    CHECK(authz::service_scope_authority_ok(plain, unrestricted));
+    CHECK(authz::service_scope_authority_ok(plain, engaged));
+
+    // The same predicate over ListReadGate's scope type (std::optional<std::vector<...>>).
+    const std::optional<std::vector<std::string>> list_unrestricted;
+    const std::optional<std::vector<std::string>> list_engaged{std::vector<std::string>{}};
+    CHECK_FALSE(authz::service_scope_authority_ok(service_scoped, list_unrestricted));
+    CHECK(authz::service_scope_authority_ok(service_scoped, list_engaged));
+    CHECK(authz::service_scope_authority_ok(plain, list_unrestricted));
 }
