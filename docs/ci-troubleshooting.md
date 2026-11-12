@@ -617,7 +617,7 @@ cut before ADR-0035 step 1, the job uses `build-windows-debug` and starts
 cold every time.
 
 **Root cause:** ADR-0035 ladder step 1 made `ci.yml`'s Windows leg
-agent-only (`-Dbuild_server=false`) and moved it to
+agent-only (`-Dbuild_server=false` then; since step 3 no switch, via the `server` option's `auto`) and moved it to
 `build-windows-agent-{debug,release}`. Meson keeps a stored option across
 `meson setup --reconfigure`, and the branch-switch wipe does not fire on
 detached-HEAD PR checkouts, so a branch that still configures the server
@@ -682,7 +682,7 @@ rollback also needs them re-provisioned.
 `--suite ['server-nonpg'] matched ZERO entries` is a branch whose workflow
 selects server suites against an agent-only build dir. That cannot happen
 with the renamed dirs; if it does, a build dir was copied or a
-`-Dbuild_server` value was set by hand — wipe that dir.
+`-Dbuild_server` or `-Dserver` value was set by hand — wipe that dir.
 
 ---
 

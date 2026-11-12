@@ -44,6 +44,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OPTIONS = ROOT / "meson.options"
 BUILD = ROOT / "meson.build"
+SETUP = ROOT / "scripts" / "setup.sh"
+GATING = ROOT / "tests" / "shell" / "test_build_examples_gating.sh"
 
 DERIVE = "_server_opt = get_option('server').disable_auto_if(host_machine.system() != 'linux')"
 ASSIGN = "build_server   = _server_opt.allowed() and get_option('build_server')"
@@ -158,6 +160,55 @@ class ServerFeatureOptionLexical(unittest.TestCase):
             self.assertNotEqual(problems(self.options, self.build, others), [])
 
 
+SETUP_GUARD = 'if [[ "$HOST_OS" != "linux" && -z "$CROSS_FILE" ]]; then\n'
+SETUP_ARGS = "  VCPKG_INSTALL_ARGS+=(--x-no-default-features --x-feature=tests)\n"
+
+
+def setup_problems(setup: str, gating: str) -> list:
+    """setup.sh installs the agent-only profile off Linux, with Catch2
+    unconditionally; the gating test asserts there is no server target off
+    Linux. Both are named in the ADR-0035 step-3 Status block."""
+    found = []
+    i = setup.find(SETUP_GUARD)
+    if i < 0:
+        return ["setup.sh: the non-Linux, no-cross-file agent-only vcpkg block is gone"]
+    block = setup[i:setup.find("\nfi\n", i)]
+    if SETUP_ARGS not in block + "\n":
+        found.append("setup.sh: off Linux the install must pass `--x-no-default-features --x-feature=tests` "
+                     "unconditionally (a plain run after `--tests` must not drop Catch2)")
+    if re.search(r"\bif\b[^\n]*\$TESTS", block):
+        found.append("setup.sh: --x-feature=tests must not be conditional on --tests off Linux")
+    if '"yuzu-server" in names' not in gating or 'uname_s != "Linux"' not in gating:
+        found.append("test_build_examples_gating.sh: must assert no yuzu-server target off Linux")
+    return found
+
+
+class SetupAndGatingLexical(unittest.TestCase):
+    def setUp(self):
+        self.setup = SETUP.read_text(encoding="utf-8")
+        self.gating = GATING.read_text(encoding="utf-8")
+
+    def test_source_is_clean(self):
+        self.assertEqual(setup_problems(self.setup, self.gating), [])
+
+    def test_mutations_are_caught(self):
+        mutations = {
+            "tests feature conditional again": ("setup", SETUP_ARGS,
+                "  VCPKG_INSTALL_ARGS+=(--x-no-default-features)\n  if $TESTS; then\n    VCPKG_INSTALL_ARGS+=(--x-feature=tests)\n  fi\n"),
+            "tests feature dropped": ("setup", SETUP_ARGS, "  VCPKG_INSTALL_ARGS+=(--x-no-default-features)\n"),
+            "opt-out dropped": ("setup", SETUP_ARGS, "  VCPKG_INSTALL_ARGS+=(--x-feature=tests)\n"),
+            "block removed": ("setup", SETUP_GUARD, 'if [[ "$HOST_OS" == "none" ]]; then\n'),
+            "gating server-target assertion dropped": ("gating", '"yuzu-server" in names', "False"),
+            "gating off-Linux condition dropped": ("gating", 'uname_s != "Linux"', "False"),
+        }
+        for name, (which, old, new) in mutations.items():
+            with self.subTest(mutation=name):
+                srcs = {"setup": self.setup, "gating": self.gating}
+                self.assertIn(old, srcs[which], f"mutation anchor for {name!r} not found")
+                srcs[which] = srcs[which].replace(old, new, 1)
+                self.assertNotEqual(setup_problems(srcs["setup"], srcs["gating"]), [], f"{name!r} was not caught")
+
+
 def _tool(name):
     return shutil.which(name)
 
@@ -206,6 +257,13 @@ class ServerFeatureOptionBehaviour(unittest.TestCase):
     def test_linux_enabled_contradicting_deprecated_false_is_an_error(self):
         out = self.configure("linux", "-Dserver=enabled", "-Dbuild_server=false")
         self.assertIn("-Dserver=enabled contradicts the deprecated -Dbuild_server=false", out)
+
+    def test_linux_deprecated_false_says_why_the_server_is_off(self):
+        out = self.configure("linux", "-Dbuild_server=false")
+        self.assertIn("Server: off because the deprecated -Dbuild_server=false is set", out)
+        # An explicit -Dserver=disabled is the supported spelling: no deprecation nag.
+        out = self.configure("linux", "-Dserver=disabled", "-Dbuild_server=false")
+        self.assertNotIn("deprecated -Dbuild_server=false is set", out)
 
     def test_linux_auto_does_not_turn_the_server_off(self):
         out = self.configure("linux")

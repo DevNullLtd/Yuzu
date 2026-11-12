@@ -2272,7 +2272,7 @@ jobs:
       #
       # The "-agent-" in the dir names (ADR-0035 ladder step 1): this leg
       # configures agent-only (with -Dbuild_server=false at step 1; since step 3
-      # through the server option's auto default), while branches cut before
+      # with no switch at all, through the `server` option's auto default), while branches cut before
       # step 1 still configure the server. Meson keeps a stored option across
       # `meson setup --reconfigure`, and the branch-switch wipe below does not
       # fire on detached-HEAD PR checkouts, so a shared dir would hand

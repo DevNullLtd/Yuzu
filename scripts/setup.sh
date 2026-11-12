@@ -125,14 +125,14 @@ fi
 # The server is Linux-only (ADR-0035). On a Windows or macOS host with no cross
 # file the build is agent-only (meson's `server` option is auto, which is off
 # for a non-Linux target), so install the agent-only vcpkg profile: no `server`
-# feature (libpq, xmlsec, drogon), and `tests` only with --tests. Every
-# cross file under meson/cross/ targets Linux, so a cross build keeps the full
-# manifest. Linux is unchanged (full manifest: server + tests).
+# feature (libpq, xmlsec, drogon), and ALWAYS the `tests` feature (Catch2), as CI
+# does: a plain `setup.sh` run after `setup.sh --tests` must not drop Catch2
+# from a build dir that stored build_tests=true. Every cross file under
+# meson/cross/ targets Linux, so a cross build keeps the full manifest. Linux
+# is unchanged (full manifest: server + tests). Pinned by
+# tests/test_server_feature_option.py.
 if [[ "$HOST_OS" != "linux" && -z "$CROSS_FILE" ]]; then
-  VCPKG_INSTALL_ARGS+=(--x-no-default-features)
-  if $TESTS; then
-    VCPKG_INSTALL_ARGS+=(--x-feature=tests)
-  fi
+  VCPKG_INSTALL_ARGS+=(--x-no-default-features --x-feature=tests)
   echo "   agent-only profile (ADR-0035): the server builds on Linux only"
 fi
 "$VCPKG_EXE" "${VCPKG_INSTALL_ARGS[@]}"

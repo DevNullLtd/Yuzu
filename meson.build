@@ -135,6 +135,8 @@ endif
 build_server   = _server_opt.allowed() and get_option('build_server')
 if not build_server and host_machine.system() != 'linux'
   message('Server: off (the Yuzu server is Linux-only, ADR-0035; this ' + host_machine.system() + ' build is agent-only)')
+elif _server_opt.allowed() and not build_server
+  message('Server: off because the deprecated -Dbuild_server=false is set (use -Dserver=disabled; ADR-0035 step 3)')
 endif
 build_examples = get_option('build_examples')
 build_tests    = get_option('build_tests')

@@ -440,6 +440,48 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    and `tests/test_release_agent_only.py` (`release.yml`, step 2). This includes `release.yml`'s
    `build-windows` and `build-macos` jobs: verify afterwards that the Windows agent archive no
    longer carries `libpq.dll` or the other server-port DLLs.
+
+   *Status: done — #TBD.* As implemented, with these deviations and additions:
+   - **Option name: `server`** (feature, default `auto`). `auto` builds the server on a Linux
+     target (judged by `host_machine.system()`, so a Linux-target cross build from any host stays
+     legal) and is off for any other target; `-Dserver=enabled` on a non-Linux target is a
+     configure error carrying the ADR message; `disabled` never builds it.
+   - **`build_server` is KEPT, deprecated** (`deprecated: true`, default `true`), still honoured
+     as an extra off-switch, and `-Dserver=enabled` together with a stored `build_server=false`
+     is an error. Deleting it would break every build dir and branch that stored or passes it;
+     its removal is owned by step 4, with the build-dir wipe (step 4's text now says so). On
+     Linux, a server turned off only by the deprecated boolean says so at configure.
+   - **vcpkg choice.** The manifest default is unchanged (`server` and `tests` stay default
+     features, so Linux and the images keep the full set). Non-Linux paths opt out instead:
+     `ci.yml` Windows/macOS, `nightly.yml` Windows ASan and `codeql.yml` Windows install with
+     `--x-no-default-features --x-feature=tests`; `release.yml`'s Windows and macOS jobs with
+     `--x-no-default-features` (no tests); `scripts/setup.sh` on a Windows or macOS host without
+     a cross file always passes `--x-no-default-features --x-feature=tests` (a plain run after
+     `--tests` must not drop Catch2 from a build dir that stored `build_tests=true`; pinned).
+     The agent Dockerfiles use `-Dserver=disabled`. Every Windows workflow therefore shares one
+     profile on Wee Tam's shared `vcpkg_installed/x64-windows` tree.
+   - **No server switch in CI.** The Windows and macOS `ci.yml` legs, nightly Windows ASan and
+     CodeQL Windows pass no `-Dserver` at all (`auto` is already off there), because a stored
+     non-default option in a persistent build dir breaks an older branch's reconfigure.
+     `release.yml` is the exception and passes `-Dserver=disabled`, as it builds fresh.
+   - **Deviation: `tests/shell/test_build_examples_gating.sh` passes no off-switch.** The text
+     above said it must pass `-Dbuild_server=false` or `disabled`; with `auto` it configures
+     agent-only off Linux on its own, so adding a flag would test less. Instead, off Linux it now
+     asserts from the introspected targets that no `yuzu-server` target exists.
+   - **Added: `release.yml` refuses server-port DLLs.** The "Verify the agent runs from the
+     packaged archive" step fails if the archive holds a `libpq*`, `drogon*`, `trantor*`,
+     `jsoncpp*` or `*xmlsec*` DLL, so the "verify afterwards" instruction above is a permanent
+     gate, pinned (with mutants) in `tests/test_release_agent_only.py`. This supersedes step 2's
+     note that the DLL sweep was left unchanged.
+   - Pins: `tests/test_server_feature_option.py` (new: lexical pins with mutants, a real
+     configure for Windows, macOS and Linux targets, and the `setup.sh` / gating pins),
+     `tests/test_release_agent_only.py` and `scripts/ci/test_runner_health_check.py` move to the
+     new switch and the install opt-out.
+   - Proof: static pins plus a Windows rehearsal on a build box (not a CI run, not a release;
+     the first stable tag after this change is the first real run of the changed release jobs).
+     TODO(senior): record the rehearsal results here (agent-only configure and build,
+     `-Dserver=enabled` refusal, `setup.sh` profile, vcpkg-tree profile flip, old-branch
+     reconfigure, archive DLL check).
 4. **Code + build/CI plumbing** — remove server-side `_WIN32` / `__APPLE__`-specific branches under
    `server/core/` (retain POSIX/Linux; do not disturb `agents/shared/` or `sdk/`, which stay
    cross-platform); and remove the plumbing that exists only for the non-Linux server: the
@@ -449,6 +491,12 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    paragraph, and the server-dep entries in `deploy/windows/README.md` / `toolchain-contract.json`
    (its Postgres pin). Remove only the libpq branch: CLAUDE.md's "Windows grpc/protobuf/abseil is
    load-bearing — both halves" rule survives, because the agent still links that stack.
+   Also in this step: **remove the deprecated `build_server` boolean** that step 3 kept declared
+   (`meson.options`, its two reads in `meson.build`, and the pins in
+   `tests/test_server_feature_option.py`). Deleting it makes Meson refuse to reconfigure any
+   build dir that stored it ("Unknown options", even with `--wipe`), so this is a build-dir
+   wipe-or-rename event on every persistent dir (Wee Tam's, the macOS and Linux runners', and
+   developers' `build-*`), done together with the Wee Tam deprovisioning.
 5. **Docs + dev workflow** — retire the server sections of `docs/windows-build.md`; scope
    `docs/darwin-compat.md` to the agent and **document the replacement macOS server dev workflow**
    (Linux builder container / VM / Docker image) and the `/test` platform-asymmetry

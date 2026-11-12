@@ -17,16 +17,16 @@ The gateway's Erlang/OTP needs no activation step: Meson resolves the pinned rel
 
 ## Agent-only vcpkg install
 
-`vcpkg.json` defaults to the `server` and `tests` features (libpq, xmlsec, drogon, catch2), so a plain `vcpkg install --triplet x64-windows --x-manifest-root=.` is expected to be unchanged (checked with `--dry-run` on `arm64-osx` and `x64-linux` only). An agent-only Windows build opts out and skips them (`libpq` is a from-source PostgreSQL build, `drogon` pulls trantor and jsoncpp):
+`vcpkg.json` defaults to the `server` and `tests` features (libpq, xmlsec, drogon, catch2), so a plain `vcpkg install --triplet x64-windows --x-manifest-root=.` installs the server ports too. A Windows build is always agent-only (ADR-0035), so it opts out and skips them (`libpq` is a from-source PostgreSQL build, `drogon` pulls trantor and jsoncpp):
 
 ```bash
 vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features
 vcpkg install --triplet x64-windows --x-manifest-root=. --x-no-default-features --x-feature=tests  # + -Dbuild_tests=true
 ```
 
-Neither form touches `triplets/x64-windows.cmake` or the hand-wired grpc/protobuf/abseil branch (#375). `zlib` is declared in the base manifest because the `_libzlib` find_library in the root `meson.build` requires it. vcpkg reconciles `vcpkg_installed/x64-windows` on every install, so a runner should be able to alternate between the default and the opt-out form without a cache-key change (reproduced on `arm64-osx`, not on Windows; see `docs/build-guide.md` "Dependency features"). **Not exercised on Windows:** `x64-windows` could not be planned on the authoring host, and no CI leg uses `--x-no-default-features` on a Windows triplet; the default form is exercised by `ci.yml`, `release.yml`, `nightly.yml` and `codeql.yml`.
+Neither form touches `triplets/x64-windows.cmake` or the hand-wired grpc/protobuf/abseil branch (#375). `zlib` is declared in the base manifest because the `_libzlib` find_library in the root `meson.build` requires it. vcpkg reconciles `vcpkg_installed/x64-windows` on every install in both directions (see `docs/build-guide.md` "Dependency features"), which is why every Windows workflow now uses the one agent-only profile. `ci.yml`, `nightly.yml` and `codeql.yml` pass `--x-no-default-features --x-feature=tests`, `release.yml` passes `--x-no-default-features`, and `scripts/setup.sh` on a Windows host passes the former.
 
-**CI is agent-only on Windows (ADR-0035 ladder step 1).** The server is a Linux-only component. `ci.yml`'s Windows leg and `codeql.yml`'s Windows row configure with `-Dbuild_server=false` (as `nightly.yml`'s Windows ASan job already did), so no server code is built or tested on Wee Tam by those workflows; since ladder step 2, `release.yml` builds and ships the agent only as well. They still run the default vcpkg install above (server ports included) until ladder step 3 switches every Windows workflow to the opt-out form together.
+**Windows builds the agent only (ADR-0035 ladder steps 1 to 3).** The server is a Linux-only component. Meson's `server` option is `auto`, which is off for a non-Linux target, so a Windows configure builds no server and needs no flag (`-Dserver=enabled` there is a configure error; `release.yml` passes `-Dserver=disabled` explicitly, `ci.yml`, `nightly.yml` and `codeql.yml` pass nothing so a stored option never breaks an older branch's reconfigure of Wee Tam's persistent build dirs). No server code is built or tested on Wee Tam, and every Windows workflow installs the agent-only vcpkg profile above.
 
 ## Toolchain paths
 
@@ -158,7 +158,8 @@ meson test -C build-windows --suite server --print-errorlogs
 ```
 
 The release zip (`yuzu-agent-windows-x64.zip`, agent only since ADR-0035
-ladder step 2) still bundles every vcpkg DLL, `libpq.dll` included, next to
-the agent: the sweep copies the whole `vcpkg_installed/x64-windows/bin`, and
-the server ports leave the Windows vcpkg install only in ladder step 3. The
-agent does not load them.
+ladder step 2) bundles every DLL in `vcpkg_installed/x64-windows/bin`. Since
+ladder step 3 the release install is agent-only, so `libpq.dll` and the other
+server-port DLLs are not installed and not shipped, and the release job's
+archive check fails if `libpq`, `drogon`, `trantor`, `jsoncpp` or `xmlsec`
+DLLs appear in the archive.

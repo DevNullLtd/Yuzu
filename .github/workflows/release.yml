@@ -900,6 +900,10 @@ jobs:
           $agent = Join-Path $bin "yuzu-agent.exe"
           if (-not (Test-Path $agent)) { Write-Error "yuzu-agent.exe missing from the archive"; exit 1 }
           if (Test-Path (Join-Path $bin "yuzu-server.exe")) { Write-Error "yuzu-server.exe found in the agent archive"; exit 1 }
+          # ADR-0035 step 3: the install is agent-only, so a server-only DLL in the archive means the
+          # vcpkg profile regressed. Names are the server ports' DLLs (libpq, drogon, trantor, jsoncpp, xmlsec).
+          $serverDlls = @(Get-ChildItem -Path $top.FullName -Recurse -File -Include "libpq*.dll", "drogon*.dll", "trantor*.dll", "jsoncpp*.dll", "*xmlsec*.dll" | ForEach-Object { $_.Name })
+          if ($serverDlls.Count -gt 0) { Write-Error "server-only DLLs in the agent archive: $($serverDlls -join ', ')"; exit 1 }
           $built = @(Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse).Count
           $packed = @(Get-ChildItem -Path (Join-Path $top.FullName "plugins") -Filter "*.dll").Count
           if ($built -lt 1 -or $packed -ne $built) { Write-Error "plugin DLLs: built $built, in the archive $packed"; exit 1 }
@@ -1088,9 +1092,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
-          # ADR-0006) runs autoreconf during its build and the hosted macOS
-          # image doesn't ship autotools.
+          # autoconf/automake/libtool: installed back when vcpkg's libpq port
+          # (Postgres substrate, ADR-0006) ran autoreconf on this leg. This
+          # install is agent-only since ADR-0035 step 3 (no libpq), so they
+          # may no longer be needed; kept until a macOS run proves the leg
+          # builds without them (the hosted image doesn't ship autotools).
           #
           # cmake deliberately excluded from this brew line, pinned via pipx
           # below instead. 2026-07-16: brew's floating `cmake` drifted to
