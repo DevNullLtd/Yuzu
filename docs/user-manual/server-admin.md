@@ -906,8 +906,7 @@ What changes on **every** deployment, including single-server:
   `--cert-san`) deleted their old inventory rows, including revoked ones, so a
   revoked default leaf was accepted again and dropped from the CRL. Revoked rows
   are now kept, and the database now refuses to delete them (migration v4
-  trigger) — during a rolling upgrade an older server's default-cert purge fails
-  with "failed to purge prior default-cert inventory rows" instead. **This does not restore a revocation already lost that way:** the
+  trigger). **This does not restore a revocation already lost that way:** the
   purged serial is no longer in the inventory, so revoking it again returns
   `404`. This only affects you if you revoked a default server certificate (for
   example because its key may have leaked) **and** the default certificates were
@@ -925,12 +924,7 @@ What changes on **every** deployment, including single-server:
   because it keeps the issuing key the leaked certificate chains to. A re-root
   re-enrolls the whole fleet.
 
-Single-server remains the only supported topology. If you nevertheless run two
-server versions against one database during an upgrade, a publish from the
-**older** binary does not take the lock and can still publish a CRL that omits a
-revocation the newer binary just recorded; the newer binary's freshness pass
-republishes to cover it (and can do so on every tick for as long as the older
-binary keeps publishing).
+Single-server remains the only supported topology.
 
 The CRL freshness pass runs only on the elected leader; a leader whose CA directory lacks the CA key cannot publish or refresh the CRL.
 
@@ -1096,7 +1090,7 @@ that holds it).
 - **`YuzuLeaderFlapping` (warning).** Six or more acquisitions in 30 minutes across
   a **multi-replica** deployment: a network or Postgres failover flap, or a
   handover loop. Compare with `YuzuServerPostgresUnreachable` and
-  `yuzu_server_leader_lost_total{cause="liveness_failed"}`. A rolling upgrade of an
+  `yuzu_server_leader_lost_total{cause="liveness_failed"}`. A planned restart of an
   N-replica deployment legitimately adds up to N acquisitions; the threshold
   leaves room for four replicas. **It usually does not detect a single
   replica in a restart loop**: the counter is synced at scrape time, so a boot whose
@@ -1229,12 +1223,7 @@ replicas racing a remediate call for the same policy/agent can no longer both
 dispatch a fix. (This is the guarantee for when the safe-to-scale gate lifts, ADR-2002 §7c; exactly one server replica is supported today.)
 
 **Scope of the guarantee.** This holds between replicas running the **same
-schema version**. A rolling upgrade across the migration boundary can
-transiently run an old binary that predates the durable claim alongside a new
-one; that mixed-version window is covered today only by the safe-to-scale gate
-(`docs/ha-delivery-matrix.md`, which is procedural and not lifted), pending a
-durable cluster-capability admission gate (#6528). The exposure is one-directional: a row written by an old
-binary carries claim-generation `0`, a value a new binary never mints.
+schema version**; a supported deployment runs every replica on this build (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)).
 Separately, this is effectively-once, not exactly-once (consistent with
 ADR-2002): a replica that pauses for longer than `fixing_stale_seconds`
 between winning a claim and actually sending a command over gRPC — the fix,
@@ -2417,7 +2406,7 @@ schema change ever applied to `api_tokens` since it shipped — every
 authenticated request validates a Bearer token against this table, so it is
 one of the hottest tables on the server.
 
-**Not breaking, but worth knowing before a rolling upgrade.** `ALTER TABLE
+**Not breaking, but worth knowing about the migration.** `ALTER TABLE
 ... ADD COLUMN ... DEFAULT ''` takes Postgres's briefest possible form (a
 metadata-only "fast default" on PG 11+, not a table rewrite) but is still an
 `ACCESS EXCLUSIVE` DDL statement: it must wait for every transaction
@@ -3954,9 +3943,7 @@ The server emits an audit event on every branch:
 > leaves the person's account (and, after an early refusal, their tokens and
 > sessions) live and raises a critical analytics event: an operator has to
 > act. No alert rule ships for these series yet (tracked in
-> #5673). A replica
-> running a build without this rule does not enforce it, so drain old
-> replicas during a rolling upgrade. A server with an authentication
+> #5673). A server with an authentication
 > database but no RBAC store refuses to start.
 
 ### Changing and resetting passwords
@@ -6100,7 +6087,7 @@ A **revocation source** tells the server which certificate authority to check ce
 
 **Audit.** Every read and change is audited (`crypto.revocation_source.*`; see the [audit log](audit-log.md)). A change writes an `attempted` row first and is refused with a `503` if that row cannot be stored. The URLs you register, with the address classes you confirmed, are recorded in the audit detail (so an audit row can carry an internal host name; limit who can read the audit log accordingly).
 
-**Startup and rollback.** The `revocation_source_store` schema is created at start and is fail-closed: if the server cannot create or open it, it logs `[PG] Refusing to start: revocation-source store migration/open failed ...` and exits with status `1` (the database role needs `CREATE` on the database), and `/readyz` lists it as a gating check. Rolling back to an older server leaves the schema in place and unused; see [Upgrading](upgrading.md).
+**Startup.** The `revocation_source_store` schema is created at start and is fail-closed: if the server cannot create or open it, it logs `[PG] Refusing to start: revocation-source store migration/open failed ...` and exits with status `1` (the database role needs `CREATE` on the database), and `/readyz` lists it as a gating check.
 
 **Backup and erasure.** The registrations live in the `revocation_source_store` schema of the PostgreSQL database and are covered by the whole-database dump. They hold operator-supplied configuration (`created_by` is the registering administrator's username); there is no per-subject data.
 

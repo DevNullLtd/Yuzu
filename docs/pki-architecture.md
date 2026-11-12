@@ -285,10 +285,7 @@ every revocation the previous one did. The lock does not block `GET /api/v1/ca/c
   "already revoked"). The check compares counts, never timestamps written by
   different replicas' clocks. It relies on the revoked set being append-only,
   which the database enforces (trigger `ca_issued_keep_revoked`, migration v4) —
-  so even an older binary's unconditional default-cert purge during a rolling
-  upgrade cannot delete a revoked row; that purge statement fails instead and the
-  older binary logs "failed to purge prior default-cert inventory rows" and
-  continues with a few stale non-revoked rows.
+  so no purge can delete a revoked row.
 - **Boot.** Replicas booting together each publish once, leaving up to N
   consecutive CRL versions for N replicas — harmless.
 - **What the lock does not cover.** Restoring the database to an earlier point in
