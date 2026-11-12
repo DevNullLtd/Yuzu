@@ -11,6 +11,7 @@
 #include "rollout_pct_reject.hpp" // the shared malformed-rollout_pct 400 + toast
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <format>
 
@@ -35,6 +36,7 @@
 #include "sso_boot_guard.hpp" // oidc_config_complete + publish_oidc_provider_gauges (#4160)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
+#include "rbac_text.hpp"        // rbac_text_is_clean: the shared clean-text predicate
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
@@ -58,6 +60,8 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <mutex>
+#include <random>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -694,6 +698,25 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
     return html;
 }
 
+/// Does the registry already hold exactly what this upload wrote? The row for the
+/// package key must carry the same file name, hash, size, mandatory flag and rollout.
+/// Used after a registry write reported failure: a connection lost after the commit
+/// looks like a failed write, and the row read back tells the two apart.
+///
+/// Declared here, not in a header, so the unit test can reach it; it has no other caller.
+[[nodiscard]] bool row_carries_upload(const std::vector<UpdatePackage>& rows,
+                                      const UpdatePackage& pkg);
+bool row_carries_upload(const std::vector<UpdatePackage>& rows, const UpdatePackage& pkg) {
+    for (const auto& row : rows) {
+        if (row.platform != pkg.platform || row.arch != pkg.arch || row.version != pkg.version)
+            continue;
+        return row.sha256 == pkg.sha256 && row.filename == pkg.filename &&
+               row.mandatory == pkg.mandatory && row.rollout_pct == pkg.rollout_pct &&
+               row.file_size == pkg.file_size;
+    }
+    return false;
+}
+
 namespace {
 // #5342 Gate 8 (F4): the Settings MFA init/verify refusal when the account's
 // password changed during the enrolment (AuthDBError::CredentialChanged).
@@ -725,6 +748,267 @@ std::string bulk_audit_detail(const std::vector<std::string>& ids) {
     }
     return d;
 }
+
+/// One lock for every operation that publishes or unlinks OTA package files, so an
+/// upload's backup/restore of a filename cannot interleave with another upload or a
+/// delete of the same filename.
+std::mutex& ota_package_files_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+/// Keeps the files an OTA upload is about to replace until the registry row is
+/// written, so a failed registry write puts the previously published package back
+/// instead of leaving the directory without it.
+///
+/// `preserve(path)` is called for every path the upload may replace or remove,
+/// BEFORE the first publish. A present regular file is kept under a unique name in
+/// the same directory (`<name>.yuzu_prev_<unique>`): a hard link when the
+/// filesystem allows it, otherwise a copy that never overwrites an existing name.
+/// The live name is never renamed aside, so it is never absent while the new file
+/// is published over it. A name that already exists is retried with a fresh suffix
+/// (a bounded number of times). `commit()` deletes the kept copies.
+///
+/// `rollback()` puts everything back: a path that had a predecessor gets it back
+/// (rename over whatever was published there; when the kept name and the live name
+/// are still the same file the kept name is just removed), a path that had none is
+/// removed. Paths are restored in the reverse order they were kept. It returns
+/// whether every path ended as intended; a restore that fails leaves the kept copy
+/// in place and logs its name, so a predecessor is never deleted unreplaced, and
+/// `restore_failure_text()` names the copies still on disk. The caller calls it
+/// explicitly before answering, so the answer can say whether the restore held; the
+/// destructor calls it only when neither `commit()` nor `rollback()` ran.
+class OtaPredecessorGuard {
+public:
+    OtaPredecessorGuard() { entries_.reserve(2); }
+    OtaPredecessorGuard(const OtaPredecessorGuard&) = delete;
+    OtaPredecessorGuard& operator=(const OtaPredecessorGuard&) = delete;
+    OtaPredecessorGuard(OtaPredecessorGuard&&) = delete;
+    OtaPredecessorGuard& operator=(OtaPredecessorGuard&&) = delete;
+    ~OtaPredecessorGuard() {
+        if (!settled_)
+            (void)rollback();
+    }
+
+    /// False when something is at `path` and cannot be kept (not a regular file, an
+    /// unreadable status, or neither a link nor a copy could be made). True when
+    /// nothing is there or the existing file is now kept. A false return leaves no
+    /// entry and no partial kept copy behind.
+    [[nodiscard]] bool preserve(const std::filesystem::path& path) {
+        constexpr int kMaxAttempts = 8;
+        std::error_code ec;
+        const auto st = std::filesystem::symlink_status(path, ec);
+        if (st.type() == std::filesystem::file_type::not_found) {
+            entries_.push_back({path, {}, Predecessor::absent});
+            return true;
+        }
+        if (ec || st.type() != std::filesystem::file_type::regular) {
+            spdlog::error("OTA upload: cannot keep the existing {} (not a readable regular file)",
+                          path.filename().string());
+            return false;
+        }
+
+        // The entry exists BEFORE any kept copy does, so an exception between the two
+        // cannot leave a copy nothing tracks. Its backup name is set only to a name
+        // this call is about to create (and cleared again when that name turned out
+        // to be someone else's), so a rollback in that state removes only our own.
+        entries_.push_back({path, {}, Predecessor::pending});
+        Entry& entry = entries_.back();
+        bool links_usable = true;
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            auto backup = path;
+            backup += ".yuzu_prev_" + unique_suffix();
+            entry.backup = std::move(backup);
+
+            if (links_usable) {
+                std::error_code link_ec;
+                std::filesystem::create_hard_link(path, entry.backup, link_ec);
+                if (!link_ec) {
+                    entry.state = Predecessor::kept;
+                    return true;
+                }
+                if (link_ec == std::errc::file_exists) {
+                    entry.backup.clear();
+                    continue;
+                }
+                // Links are not available here (another filesystem, a refusal, a link
+                // limit): keep a copy instead.
+                links_usable = false;
+            }
+
+            std::error_code time_ec;
+            const auto mtime = std::filesystem::last_write_time(path, time_ec);
+            std::error_code copy_ec;
+            std::filesystem::copy_file(path, entry.backup, std::filesystem::copy_options::none,
+                                       copy_ec);
+            if (!copy_ec) {
+                // A copy gets a new modification time; the binary/signature pair is
+                // judged by those times, so the copy carries the original's.
+                if (!time_ec) {
+                    std::error_code set_ec;
+                    std::filesystem::last_write_time(entry.backup, mtime, set_ec);
+                    if (set_ec)
+                        spdlog::warn("OTA upload: could not carry the modification time to the "
+                                     "kept copy of {}: {}",
+                                     path.filename().string(), set_ec.message());
+                }
+                entry.state = Predecessor::kept;
+                return true;
+            }
+            if (copy_ec == std::errc::file_exists) {
+                entry.backup.clear();
+                continue;
+            }
+            spdlog::error("OTA upload: cannot keep the existing {}: {}", path.filename().string(),
+                          copy_ec.message());
+            break;
+        }
+
+        // Failed: drop a partial copy of ours (the name is cleared whenever it was
+        // not ours) and forget the entry, so the live file is untouched and untracked.
+        if (!entry.backup.empty()) {
+            std::error_code rm_ec;
+            std::filesystem::remove(entry.backup, rm_ec);
+        }
+        entries_.pop_back();
+        return false;
+    }
+
+    /// The new files stay; the kept copies are deleted. A copy that cannot be
+    /// deleted is logged by name and left, and the rest are still deleted.
+    void commit() noexcept {
+        settled_ = true;
+        for (const auto& e : entries_) {
+            if (e.state != Predecessor::kept)
+                continue;
+            std::error_code ec;
+            std::filesystem::remove(e.backup, ec);
+            if (ec)
+                log_kept_copy_left(e.backup, ec);
+        }
+    }
+
+    /// True when every path was put back (or removed) as intended. Safe to call more
+    /// than once: later calls return the first result without touching the disk.
+    [[nodiscard]] bool rollback() noexcept {
+        if (settled_)
+            return restore_ok_;
+        settled_ = true;
+        // Each entry is restored on its own: one that throws is recorded as not restored
+        // and the others are still put back.
+        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+            try {
+                restore_one(*it);
+            } catch (...) {
+                restore_ok_ = false;
+            }
+        }
+        return restore_ok_;
+    }
+
+    /// Settles the guard WITHOUT touching the disk: the new files stay where they are
+    /// and every kept copy stays too. Used when it cannot be known whether the registry
+    /// row was written, so neither deleting the kept copies (a commit) nor putting them
+    /// back (a rollback) is safe. The kept copies are then left for the operator.
+    void abandon() noexcept { settled_ = true; }
+
+    /// Plain text (not markup) for the answer to a request whose restore failed.
+    [[nodiscard]] std::string restore_failure_text() const {
+        std::string text = "The upload failed and the previous package could not be fully restored";
+        if (kept_names_.empty())
+            return text + "; see the server log.";
+        text += kept_names_.size() == 1 ? ". The previous file is kept as "
+                                        : ". The previous files are kept as ";
+        for (std::size_t i = 0; i < kept_names_.size(); ++i) {
+            if (i)
+                text += ", ";
+            text += kept_names_[i];
+        }
+        return text + "; see the server log.";
+    }
+
+private:
+    enum class Predecessor {
+        absent,  ///< nothing was at the path
+        pending, ///< a kept copy is being made (it may or may not exist yet)
+        kept,    ///< the previous file is kept under `backup`
+    };
+    struct Entry {
+        std::filesystem::path live;
+        std::filesystem::path backup; ///< the kept copy; empty when none is named
+        Predecessor state;
+    };
+
+    static void log_kept_copy_left(const std::filesystem::path& backup,
+                                   const std::error_code& ec) noexcept {
+        try {
+            spdlog::warn("OTA upload: the kept copy {} could not be removed: {}",
+                         backup.filename().string(), ec.message());
+        } catch (...) {
+        }
+    }
+
+    void restore_one(const Entry& e) {
+        std::error_code ec;
+        switch (e.state) {
+        case Predecessor::absent:
+            std::filesystem::remove(e.live, ec);
+            if (ec) {
+                restore_ok_ = false;
+                spdlog::error("OTA upload: the new {} could not be removed: {}",
+                              e.live.filename().string(), ec.message());
+            }
+            return;
+        case Predecessor::pending:
+            // The live file was never touched; only a partial kept copy can exist.
+            if (!e.backup.empty())
+                std::filesystem::remove(e.backup, ec);
+            return;
+        case Predecessor::kept:
+            break;
+        }
+        // Nothing was published over the path: the kept name and the live name are one
+        // file, and a rename of one onto the other would leave both. Drop the kept name.
+        std::error_code same_ec;
+        const bool same = std::filesystem::equivalent(e.backup, e.live, same_ec);
+        if (same && !same_ec) {
+            std::filesystem::remove(e.backup, ec);
+            if (ec)
+                log_kept_copy_left(e.backup, ec);
+            return;
+        }
+        std::filesystem::rename(e.backup, e.live, ec);
+        if (ec) {
+            restore_ok_ = false;
+            kept_names_.push_back(e.backup.filename().string());
+            spdlog::error("OTA upload: the previous {} could not be restored; it is kept as {}",
+                          e.live.filename().string(), e.backup.filename().string());
+        }
+    }
+
+    static std::string unique_suffix() {
+        static std::atomic<unsigned long long> seq{0};
+        const unsigned long long n = seq.fetch_add(1);
+        unsigned long long salt = 0;
+        try {
+            std::random_device rd;
+            salt = (static_cast<unsigned long long>(rd()) << 32) ^ rd();
+        } catch (...) {
+            // No entropy source: never a constant. The clock, the counter and the
+            // counter's address keep two names apart across requests and processes.
+            const auto ticks = static_cast<unsigned long long>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            salt = ticks ^ (n * 0x9E3779B97F4A7C15ULL) ^
+                   static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(&seq));
+        }
+        return std::format("{:016x}_{}", salt, n);
+    }
+
+    std::vector<Entry> entries_;
+    std::vector<std::string> kept_names_;
+    bool settled_{false};
+    bool restore_ok_{true};
+};
 } // namespace
 
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
@@ -3251,6 +3535,7 @@ void SettingsRoutes::register_routes(
                 res.status = 500;
                 return;
             }
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
         });
 
@@ -3288,6 +3573,7 @@ void SettingsRoutes::register_routes(
         std::string filter = auth::effective_role(*session) == auth::Role::admin
                                  ? std::string{}
                                  : session->username; // JIT elevation → admin view
+        no_store_private(res);
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 
@@ -3398,6 +3684,7 @@ void SettingsRoutes::register_routes(
                  if (refuse_engine_session(req, res, *session, "access_review.list",
                                            "AccessReview"))
                      return;
+                 no_store_private(res);
                  res.set_content(render_access_review_fragment(req), "text/html; charset=utf-8");
              });
 
@@ -3419,6 +3706,7 @@ void SettingsRoutes::register_routes(
                  if (refuse_engine_session(req, res, *session, "access_review.get",
                                            "AccessReview"))
                      return;
+                 no_store_private(res);
                  res.set_content(render_access_review_campaign_fragment(req, id),
                                  "text/html; charset=utf-8");
              });
@@ -3517,6 +3805,7 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
+                 no_store_private(res);
                  res.set_content(render_analytics_fragment(), "text/html; charset=utf-8");
              });
 
@@ -4901,6 +5190,7 @@ void SettingsRoutes::register_routes(
 
         if (username.empty() || password.empty()) {
             res.status = 400;
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username) +
                                 "<script>document.getElementById('user-feedback')."
                                 "className='feedback feedback-error';"
@@ -5047,6 +5337,7 @@ void SettingsRoutes::register_routes(
                                             "User", username, "role=" + role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"User created","level":"success"}})");
+        no_store_private(res);
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
     });
 
@@ -5323,6 +5614,7 @@ void SettingsRoutes::register_routes(
             run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
         case auth::RemoveUserOutcome::LastAdministratorRefused:
@@ -5545,6 +5837,7 @@ void SettingsRoutes::register_routes(
                       "same_role=" + auth::role_to_string(new_role));
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Role unchanged","level":"info"}})");
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
         }
@@ -5628,6 +5921,7 @@ void SettingsRoutes::register_routes(
                                             "old_role=" + old_role_str + ",new_role=" + new_role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Role updated","level":"success"}})");
+        no_store_private(res);
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
     });
 
@@ -5691,6 +5985,7 @@ void SettingsRoutes::register_routes(
                            bad_input
                                ? R"({"showToast":{"message":"Invalid token parameters","level":"error"}})"
                                : R"({"showToast":{"message":"Enrollment store unavailable - token not created","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -5722,6 +6017,7 @@ void SettingsRoutes::register_routes(
             res.status = bad_input ? 400 : 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - token NOT revoked","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -5735,6 +6031,7 @@ void SettingsRoutes::register_routes(
             *revoked
                 ? R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})"
                 : R"j({"showToast":{"message":"Token not found - nothing revoked (it may have been removed)","level":"warning"}})j");
+        no_store_private(res);
         res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
     });
 
@@ -6042,6 +6339,7 @@ void SettingsRoutes::register_routes(
         std::string filter = auth::effective_role(*session) == auth::Role::admin
                                  ? std::string{}
                                  : session->username; // JIT elevation → admin view
+        no_store_private(res);
         res.set_content(render_api_tokens_fragment(result.value(), filter),
                         "text/html; charset=utf-8");
     });
@@ -6188,6 +6486,7 @@ void SettingsRoutes::register_routes(
         std::string filter = auth::effective_role(*session) == auth::Role::admin
                                  ? std::string{}
                                  : session->username; // JIT elevation → admin view
+        no_store_private(res);
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 
@@ -6211,6 +6510,7 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - nothing approved","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -6220,6 +6520,7 @@ void SettingsRoutes::register_routes(
         spdlog::info("Bulk approved {} pending agent(s) by {}", count, session->username);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) approved","level":"success"}})");
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
@@ -6237,6 +6538,7 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - nothing denied","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -6246,6 +6548,7 @@ void SettingsRoutes::register_routes(
         spdlog::info("Bulk denied {} pending agent(s) by {}", count, session->username);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) denied","level":"warning"}})");
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
@@ -6262,6 +6565,7 @@ void SettingsRoutes::register_routes(
         res.status = 400;
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Invalid agent id","level":"error"}})");
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
         return true;
     };
@@ -6296,6 +6600,7 @@ void SettingsRoutes::register_routes(
             toast(bad_input ? "Invalid agent id"
                             : "Enrollment store unavailable - agent NOT " + past,
                   "error");
+            no_store_private(res);
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -6322,6 +6627,7 @@ void SettingsRoutes::register_routes(
                   "warning");
             break;
         }
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     };
 
@@ -6379,6 +6685,7 @@ void SettingsRoutes::register_routes(
                             break;
                         }
                     }
+                    no_store_private(res);
                     res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
                 });
 
@@ -6839,6 +7146,22 @@ void SettingsRoutes::register_routes(
         }
 
         auto uploaded = SETTINGS_REQ_GET_FILE(req, "file");
+
+        // The platform, arch and filename become row keys and path components:
+        // a NUL or other control byte, or a byte sequence that is not valid UTF-8,
+        // in any of them is refused before anything is written. The audit row
+        // carries a fixed token and an empty target id, never the supplied value.
+        if (!rbac_text_is_clean(platform) || !rbac_text_is_clean(arch) ||
+            !rbac_text_is_clean(uploaded.filename) || !is_valid_utf8(platform) ||
+            !is_valid_utf8(arch) || !is_valid_utf8(uploaded.filename)) {
+            audit_fn_(req, "ota.package.uploaded", "denied", "UpdatePackage", "",
+                      "invalid_package_field");
+            res.status = 400;
+            res.set_content("<span class=\"feedback-error\">The platform, architecture and "
+                            "filename must be valid text without control characters.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
         // Case-INSENSITIVE: the server may store packages on a case-insensitive
         // filesystem (macOS, Windows), where "foo.SIG" and "foo.sig" are the
         // same file, so a case-sensitive guard is bypassable there.
@@ -6956,12 +7279,46 @@ void SettingsRoutes::register_routes(
         const auto sidecar_path = signature_sidecar_path(out_path);
         const bool signed_upload = !signature_pem.empty();
 
+        // The files this upload replaces are kept until the registry row is
+        // written, and put back if it is not. The lock keeps another upload or a
+        // delete of the same filename out of that window; it is declared before the
+        // guard so the rollback runs while it is still held.
+        const std::lock_guard<std::mutex> package_files_lock(ota_package_files_mutex());
+        OtaPredecessorGuard predecessors;
+
+        // Every failure answer below first puts the previous files back, explicitly, so
+        // the answer can say whether that held. True: everything is as it was and the
+        // "nothing was changed" wording that follows is accurate. False: the restore
+        // failed, the response is already the 500 that names the kept file, and the
+        // caller returns without writing its own.
+        const auto restored_or_answered = [&]() -> bool {
+            if (predecessors.rollback())
+                return true;
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">" +
+                                html_escape(predecessors.restore_failure_text()) + "</span>",
+                            "text/html; charset=utf-8");
+            return false;
+        };
+
+        if (!predecessors.preserve(out_path) || !predecessors.preserve(sidecar_path)) {
+            if (!restored_or_answered())
+                return;
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Could not prepare the package "
+                            "directory. Nothing was changed; retry the upload.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+
         if (signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
             // Nothing has been written yet: the previous binary and its signature
             // are both untouched, so this is a clean refusal, not a partial state.
             spdlog::error("OTA upload for {}/{}: the signature sidecar could not be written; "
                           "the previous package is unchanged",
                           platform, arch);
+            if (!restored_or_answered())
+                return;
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Could not store the signature. "
                             "Nothing was changed \u2014 retry the upload.</span>",
@@ -6986,6 +7343,8 @@ void SettingsRoutes::register_routes(
         const auto fail_binary = [&](const char* msg) {
             std::error_code rm_ec;
             std::filesystem::remove(bin_tmp, rm_ec);
+            if (!restored_or_answered())
+                return;
             res.status = 500;
             res.set_content(std::string("<span class=\"feedback-error\">") + msg + "</span>",
                             "text/html; charset=utf-8");
@@ -7025,13 +7384,14 @@ void SettingsRoutes::register_routes(
         // last, per the ordering rule above, so no failure above this line could
         // have left the served package unprotected.
         if (!signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
-            spdlog::error("OTA upload for {}/{}: the stale signature could not be removed; "
-                          "the package is served with a signature that does not cover it",
+            spdlog::error("OTA upload for {}/{}: the previous signature could not be removed; "
+                          "the previous package is being restored",
                           platform, arch);
+            if (!restored_or_answered())
+                return;
             res.status = 500;
-            res.set_content("<span class=\"feedback-error\">The binary was published but its "
-                            "old signature could not be removed. Agents will refuse this "
-                            "package until you retry.</span>",
+            res.set_content("<span class=\"feedback-error\">The old signature could not be "
+                            "removed, so the upload was rolled back. Retry the upload.</span>",
                             "text/html; charset=utf-8");
             return;
         }
@@ -7056,10 +7416,58 @@ void SettingsRoutes::register_routes(
         pkg.rollout_pct = rollout_pct;
         pkg.file_size = static_cast<int64_t>(uploaded.content.size());
 
-        // Upload path: the row is best-effort here and the failure is already
-        // visible in the log; the rollout path is the one that audits a committed
-        // transition and therefore must not discard this.
-        (void)update_registry_->upsert_package(pkg);
+        // The files above are already published. If the registry row is not
+        // written, `predecessors` puts back whatever they replaced (and removes
+        // them where there was nothing), so the update directory and the registry
+        // agree again, and the request reports the failure instead of success.
+        bool recorded = update_registry_->upsert_package(pkg);
+        if (!recorded) {
+            // A connection lost after the commit looks like a failed write although the
+            // row is there, and the same fault usually makes the read-back fail too. So
+            // there are three outcomes. The row read back carries exactly what this
+            // request wrote: the upload did happen, the new files stay and the request
+            // goes down the success path. The listing was read and the row is absent or
+            // different: the write did not happen, the previous files go back. The
+            // listing could not be read: it is NOT known, and neither deleting the kept
+            // copies nor restoring them is safe, so everything is left in place for the
+            // operator and the answer says so.
+            const auto listing = update_registry_->list_packages_checked();
+            if (!listing) {
+                spdlog::error("OTA upload for {}/{}: the registry write reported failure and "
+                              "the row could not be read back; the new files and the previous "
+                              "files are both left in place",
+                              platform, arch);
+                audit_fn_(req, "ota.package.uploaded", "failure", "UpdatePackage",
+                          platform + "/" + arch + "/" + version, "outcome_unknown");
+                predecessors.abandon();
+                respond_lifecycle_store_unavailable(
+                    res, "The registry did not confirm whether the package was recorded. The "
+                         "new files were kept, and the previous files are kept as copies "
+                         "named *.yuzu_prev_*. Check the package list, then retry the same "
+                         "upload: it is safe to repeat.");
+                return;
+            }
+            if (row_carries_upload(*listing, pkg)) {
+                spdlog::warn("OTA upload for {}/{}: the registry write reported failure but "
+                             "the row carries this upload; treating it as written",
+                             platform, arch);
+                recorded = true;
+            }
+        }
+        if (!recorded) {
+            spdlog::error("OTA upload for {}/{}: the registry row could not be written; the "
+                          "previous files are being restored",
+                          platform, arch);
+            audit_fn_(req, "ota.package.uploaded", "failure", "UpdatePackage",
+                      platform + "/" + arch + "/" + version, "store_error");
+            if (!restored_or_answered())
+                return;
+            respond_lifecycle_store_unavailable(
+                res, "The package could not be recorded. Nothing was changed; retry the "
+                     "upload.");
+            return;
+        }
+        predecessors.commit();
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
 
@@ -7096,6 +7504,64 @@ void SettingsRoutes::register_routes(
                     auto arch = req.matches[2].str();
                     auto version = req.matches[3].str();
 
+                    // A NUL or other control byte in a key is refused up front;
+                    // the audit row carries a fixed token and an empty target id.
+                    if (!rbac_text_is_clean(platform) || !rbac_text_is_clean(arch) ||
+                        !rbac_text_is_clean(version) || !is_valid_utf8(platform) ||
+                        !is_valid_utf8(arch) || !is_valid_utf8(version)) {
+                        audit_fn_(req, "ota.package.deleted", "denied", "UpdatePackage", "",
+                                  "invalid_package_field");
+                        res.status = 400;
+                        res.set_content("<span class=\"feedback-error\">The platform, "
+                                        "architecture and version must be valid text without "
+                                        "control characters.</span>",
+                                        "text/html; charset=utf-8");
+                        return;
+                    }
+
+                    const std::lock_guard<std::mutex> package_files_lock(
+                        ota_package_files_mutex());
+
+                    // The package is looked up with a CHECKED read: a listing that
+                    // failed is not "no such package", and going on would remove the
+                    // row while leaving its files behind and audit a miss.
+                    auto listing = update_registry_->list_packages_checked();
+                    if (!listing) {
+                        spdlog::error("OTA package delete for {}/{} v{}: the package list could "
+                                      "not be read; nothing was removed",
+                                      platform, arch, version);
+                        audit_fn_(req, "ota.package.deleted", "failure", "UpdatePackage",
+                                  platform + "/" + arch + "/" + version, "store_error");
+                        respond_lifecycle_store_unavailable(
+                            res, "The package could not be looked up. Nothing was changed; "
+                                 "retry the delete.");
+                        return;
+                    }
+
+                    // The registry row goes FIRST, and the files are unlinked only
+                    // once that succeeded: a failed row delete leaves the package
+                    // exactly as it was (row, binary and sidecar all present).
+                    const auto matched_pkg = [&]() -> std::optional<UpdatePackage> {
+                        for (auto& pkg : *listing) {
+                            if (pkg.platform == platform && pkg.arch == arch &&
+                                pkg.version == version)
+                                return std::move(pkg);
+                        }
+                        return std::nullopt;
+                    }();
+
+                    if (!update_registry_->remove_package(platform, arch, version)) {
+                        spdlog::error("OTA package delete for {}/{} v{}: the registry row could "
+                                      "not be removed; the package files were left in place",
+                                      platform, arch, version);
+                        audit_fn_(req, "ota.package.deleted", "failure", "UpdatePackage",
+                                  platform + "/" + arch + "/" + version, "store_error");
+                        respond_lifecycle_store_unavailable(
+                            res, "The package could not be removed. Nothing was changed; "
+                                 "retry the delete.");
+                        return;
+                    }
+
                     PackageDeleteOutcome outcome;
                     // Each remove gets its OWN error_code. Sharing one lets the
                     // second call's result overwrite the first, so a failed
@@ -7103,31 +7569,26 @@ void SettingsRoutes::register_routes(
                     // wholly successful.
                     std::error_code bin_ec;
                     std::error_code sig_ec;
-                    auto packages = update_registry_->list_packages();
-                    for (const auto& pkg : packages) {
-                        if (pkg.platform == platform && pkg.arch == arch &&
-                            pkg.version == version) {
-                            outcome.matched = true;
-                            auto bin_path = update_registry_->binary_path(pkg);
-                            outcome.binary_removed = std::filesystem::remove(bin_path, bin_ec);
-                            // Remove the signature sidecar with it. Leaving it
-                            // behind would let a later upload of a same-named
-                            // package inherit a signature made over DIFFERENT
-                            // bytes — which the agent would then reject as
-                            // tampered, with no obvious cause.
-                            outcome.signature_removed = std::filesystem::remove(
-                                update_registry_->signature_path(pkg), sig_ec);
-                            if (bin_ec) {
-                                outcome.binary_error = bin_ec.message();
-                            }
-                            if (sig_ec) {
-                                outcome.signature_error = sig_ec.message();
-                            }
-                            break;
+                    if (matched_pkg) {
+                        const auto& pkg = *matched_pkg;
+                        outcome.matched = true;
+                        auto bin_path = update_registry_->binary_path(pkg);
+                        outcome.binary_removed = std::filesystem::remove(bin_path, bin_ec);
+                        // Remove the signature sidecar with it. Leaving it
+                        // behind would let a later upload of a same-named
+                        // package inherit a signature made over DIFFERENT
+                        // bytes — which the agent would then reject as
+                        // tampered, with no obvious cause.
+                        outcome.signature_removed = std::filesystem::remove(
+                            update_registry_->signature_path(pkg), sig_ec);
+                        if (bin_ec) {
+                            outcome.binary_error = bin_ec.message();
+                        }
+                        if (sig_ec) {
+                            outcome.signature_error = sig_ec.message();
                         }
                     }
 
-                    update_registry_->remove_package(platform, arch, version);
                     spdlog::info("OTA package deleted: {}/{} v{}", platform, arch, version);
                     // Audited for the same reason as the upload: this removes a
                     // binary AND its signature from the fleet's update surface.
@@ -7289,13 +7750,15 @@ void SettingsRoutes::register_routes(
     // `target_type="user"` + `success/failure` used elsewhere in
     // auth_routes — Gate 4 consistency B1+B2 picks the spec lane.
     //
-    // `Cache-Control: no-store, private` is set on every response that
-    // contains a one-time secret (init's otpauth URI / base32 secret,
-    // verify's recovery codes, recovery-codes regenerate) so the
-    // browser/proxy/CDN cannot retain the material past the response
-    // lifetime (Gate 4 unhappy-path UP-9).
+    // `Cache-Control: no-store, private` and `Vary: Cookie` are set on every
+    // MFA response that renders data: the one-time secrets (init's otpauth URI / base32 secret,
+    // verify's recovery codes, recovery-codes regenerate) and the MFA state of
+    // the account (the fragment and its re-renders), so the browser/proxy/CDN
+    // cannot retain the material past the response lifetime (Gate 4
+    // unhappy-path UP-9, #6940).
     auto set_no_store = [](httplib::Response& res) {
         res.set_header("Cache-Control", "no-store, private");
+        res.set_header("Vary", "Cookie");
         res.set_header("Pragma", "no-cache");
         res.set_header("Referrer-Policy", "no-referrer");
     };
@@ -7341,7 +7804,8 @@ void SettingsRoutes::register_routes(
     // for a request the central gate admitted, or by a TestRouteSink test
     // that bypasses pre-routing.
 
-    sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/settings/mfa", [this, set_no_store](const httplib::Request& req,
+                                                            httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
         auto session = auth_fn_(req, res);
@@ -7349,6 +7813,7 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        set_no_store(res);
         res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
     });
 
@@ -7367,6 +7832,7 @@ void SettingsRoutes::register_routes(
         if (!db) {
             audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
                       "auth_db unavailable");
+            set_no_store(res);
             res.set_content(
                 render_mfa_fragment(*session, {}, {}, {}, {}, "MFA backend unavailable"),
                 "text/html; charset=utf-8");
@@ -7384,6 +7850,7 @@ void SettingsRoutes::register_routes(
             // Settings init/verify).
             audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                       "credential_changed");
+            set_no_store(res);
             res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                 kMfaCredentialChangedMsg),
                             "text/html; charset=utf-8");
@@ -7415,6 +7882,7 @@ void SettingsRoutes::register_routes(
                           ? std::string{"csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
                                         "fail-closed)"}
                           : std::string{msg});
+            set_no_store(res);
             res.set_content(render_mfa_fragment(*session, {}, {}, {}, {}, msg),
                             "text/html; charset=utf-8");
             return;
@@ -7441,6 +7909,7 @@ void SettingsRoutes::register_routes(
                   auto code = extract_form_value(req.body, "code");
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
@@ -7456,6 +7925,7 @@ void SettingsRoutes::register_routes(
                       // the credential change); the session is being revoked.
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                                 "credential_changed");
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           kMfaCredentialChangedMsg),
                                       "text/html; charset=utf-8");
@@ -7475,6 +7945,7 @@ void SettingsRoutes::register_routes(
                       // again but offered only a confirm box that can never succeed.
                       audit_fn_(req, "mfa.enroll.cancelled", "ok", "User", session->username,
                                 "reason=provisional_secret_changed; nothing enrolled");
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "Enrollment was cancelled or replaced. "
                                                           "Start enrollment again."),
@@ -7507,6 +7978,7 @@ void SettingsRoutes::register_routes(
                           audit_fn_(req, "mfa.enroll.race", "ok", "User", session->username,
                                     "already enrolled by a concurrent verify; no duplicate "
                                     "enrollment");
+                          set_no_store(res);
                           res.set_content(
                               render_mfa_fragment(*session, {}, {}, {}, session->username,
                                                   "MFA is already enrolled on this account."),
@@ -7537,6 +8009,7 @@ void SettingsRoutes::register_routes(
                               ? "Authentication store is temporarily unavailable — retry shortly."
                               : "Code rejected. Try the next code shown by your authenticator "
                                 "(codes refresh every 30 seconds).";
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {},
                                                           session->username, msg),
                                       "text/html; charset=utf-8");
@@ -7630,6 +8103,7 @@ void SettingsRoutes::register_routes(
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
@@ -7657,6 +8131,7 @@ void SettingsRoutes::register_routes(
                                       "(mfa_regenerate_recovery_codes, fail-closed, existing codes "
                                       "unchanged)"
                                     : "regeneration failed");
+                      set_no_store(res);
                       res.set_content(
                           render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Could not regenerate codes. Your existing "
@@ -7673,7 +8148,8 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post("/api/settings/mfa/disable",
-              [this, origin_safe](const httplib::Request& req, httplib::Response& res) {
+              [this, set_no_store, origin_safe](const httplib::Request& req,
+                                                httplib::Response& res) {
                   if (!origin_safe(req, res, "/api/settings/mfa/disable"))
                       return;
                   if (!admin_fn_(req, res))
@@ -7683,6 +8159,9 @@ void SettingsRoutes::register_routes(
                       res.status = 401;
                       return;
                   }
+                  // ONE call for every response path below (a repeat would append a second
+                  // Cache-Control header): the state-of-MFA fragments and the sign-out reply.
+                  set_no_store(res);
                   // MFA step-up gate (see recovery-codes above): stripping the factor the gate
                   // checks needs a fresh proof. Before the enforcement guard and any mutation.
                   if (step_up_fn_ &&

@@ -88,7 +88,7 @@ URL structure:
 
 The source of truth is the agent's `echo_config` table — the `<source>_enabled` keys, set by the `echo.configure` action. The server does not currently maintain a centralised "Echo config" mirror; the data path is **request-driven**:
 
-1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_rows` count + `<source>_oldest_ts` per source; the server reads `<source>_rows`; an agent that sends only `<source>_live_rows`, from before the roll-up-only release, is shown with a dash and an upgrade note, never with that figure as the count) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
+1. Page load fans out `echo.status` (extended in PR-A to emit the four `<source>_enabled` values + the `<source>_rows` count + `<source>_oldest_ts` per source; the server reads `<source>_rows`; a source with no `<source>_rows` shows a dash) to every device the page's scope resolves to. Scope is the active scope chip (default `__all__` for fresh page load).
 2. Responses stream back via the standard agent-streaming pipeline.
 3. Server collates into a transient in-memory table; renders as HTMX OOB swaps.
 4. Empty rows (`enabled=true` for all four sources) are dropped — the table only shows the *paused* state, not the entire fleet.
@@ -128,7 +128,7 @@ Per-source independence (the #539 invariant) means re-enabling one source on a d
 
 ### 3.4 Purge action
 
-The "Purge data" button on a row is more dangerous than re-enable — it tells the agent to drop every row from `<source>_live`, `<source>_hourly`, `<source>_daily`, `<source>_monthly` for that source, *without* re-enabling the collector. The use case is "we paused process collection 8 weeks ago for forensic preservation; we have what we need, the disk is filling up, drop the rows but keep the collector paused."
+The "Purge data" button on a row is more dangerous than re-enable — it tells the agent to drop every row from the `<source>_hourly`, `<source>_daily` and `<source>_monthly` tiers for that source, *without* re-enabling the collector. The use case is "we paused process collection 8 weeks ago for forensic preservation; we have what we need, the disk is filling up, drop the rows but keep the collector paused."
 
 Server dispatches a new agent action `echo.purge_source` with `{source: <name>}`. The action is gated behind a typed-hostname confirmation ("type the device hostname to confirm purge of `process` data"), per the destructive-action discipline in the project root `CLAUDE.md`. Audit row: `action: echo.source.purge, principal: <session>, result: success|failure, detail: device=<id> source=<name>` — the dispatch audit row does **not** carry `rows_deleted` (see the as-shipped note below).
 
@@ -526,3 +526,9 @@ Audit actions: `echo.status.scan` (Scan fleet — PR-A.A), `echo.source.reenable
 - Should the retention-paused list also surface `<source>_enabled=true` devices that have *zero* recent rows (silent collector failure)? Useful for SRE but visually noisy in IR; defer to PR-G.
 - The "Purge data" action should ideally be replaced by an "Export then purge" flow that puts the rows into a signed evidence bundle before deletion — a SOC 2 CC7.2 evidence requirement. Defer to a follow-up issue once the retention-paused list ships.
 - Multi-device re-enable (select-many in the table, single click "Re-enable selected") is an obvious affordance once the table has rows; ship in PR-A only if the single-row path is solid.
+
+## Routed-concern invariants
+
+Moved verbatim from the `Echo dashboard` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Echo dashboard — frames, URLs, permissions. New source: CORE pattern (`docs/echo-implementer.md` §8), NOT the self-contained tier pattern; ARP/DNS + Capture-sources frame: ADR-0015 (Windows-first; DNS is usage-class PII). Untrusted `echo.sql` runs only via read-only `EchoDatabase::execute_user_query` (authorizer allowlist), not trusted `execute_query` (#760/#631). Per-source enable/disable fails CLOSED via `canonical_source_enabled`'s tri-state (#560). `EchoDatabase::open` integrity-checks + quarantines a corrupt `echo.db` aside or fails closed — never re-open-and-trust (#559). New streaming sources implement `ProcStreamCollector`, no parallel path (`docs/echo-module-loads.md`).

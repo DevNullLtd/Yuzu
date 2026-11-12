@@ -545,7 +545,7 @@ std::string sha256_hex(const std::string& in) {
 // Sort/dedup key walks every STORED field in blob order (name..source; wire slot 14 is
 // reserved and not stored; slot 13, install_location, is '' on the v2 path) so two entries
 // differing only in one field are distinct rows, not duplicates.
-// The agent (sync_source_installed_software.cpp) sorts and dedups on the same fields in
+// The agent (v3_normalise_rows in installed_software_v3.cpp) sorts and dedups on the same fields in
 // the same order, package_id and source last; the two must stay identical or the canonical
 // hashes diverge → permanent always-full. Records differing only in the reserved slot
 // 14 collapse to one row here.
@@ -1082,8 +1082,8 @@ std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> en
     // ONLY when package_id or source is non-empty; slots 13-14 are reserved and written
     // empty (see below). A v2 agent's records therefore hash
     // to exactly the pre-extension bytes, so its stored content_hash keeps matching
-    // (no permanent need_full loop). The agent side (installed_software_canonical_blob
-    // in agents/core/src/sync_source_installed_software.cpp) MUST mirror this rule;
+    // (no permanent need_full loop). The agent side (the v3 writer's record_of / v3_section_hash
+    // in agents/core/src/installed_software_v3.cpp) MUST mirror this rule;
     // parse_software_blob accepts both shapes. Fields 0x1F-separated, records 0x1E-
     // terminated.
     std::string canon;
