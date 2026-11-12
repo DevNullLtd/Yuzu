@@ -1915,11 +1915,20 @@ struct ReconRig {
     }
 };
 
-#define RECON_RIG(rig, ...)                                                                        \
+// No __VA_OPT__: MSVC's default preprocessor does not support it, so the optional re-verify
+// interval is a second macro instead of a variadic argument.
+#define RECON_DBS()                                                                                \
     YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);                                             \
     YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_recon_tpl);                                          \
-    YUZU_REQUIRE_PG_DB_TPL(adb, quarantine_recon_audit_tpl);                                       \
-    ReconRig rig(qdb.dsn(), rdb.dsn(), adb.dsn() __VA_OPT__(, ) __VA_ARGS__)
+    YUZU_REQUIRE_PG_DB_TPL(adb, quarantine_recon_audit_tpl)
+
+#define RECON_RIG(rig)                                                                             \
+    RECON_DBS();                                                                                   \
+    ReconRig rig(qdb.dsn(), rdb.dsn(), adb.dsn())
+
+#define RECON_RIG_REVERIFY(rig, reverify)                                                          \
+    RECON_DBS();                                                                                   \
+    ReconRig rig(qdb.dsn(), rdb.dsn(), adb.dsn(), reverify)
 
 const std::vector<std::string> kApplyThenVerify{"firewall.quarantine", "firewall.quarantine_status"};
 
@@ -1991,7 +2000,7 @@ TEST_CASE("reconciler (firewall): apply dispatches the mapped STORED whitelist, 
 TEST_CASE("reconciler (firewall): a confirmed record is re-read after the interval, never blinks "
           "out of the unconfirmed gauge and writes no second CONFIRMED row",
           "[pg][quarantine][reconciler][prq2]") {
-    RECON_RIG(rig, std::chrono::milliseconds(30));
+    RECON_RIG_REVERIFY(rig, std::chrono::milliseconds(30));
     rig.quarantine();
     rig.confirm("status|active");
     const auto first_stamp = rig.active()->last_confirmed_at;
@@ -2016,7 +2025,7 @@ TEST_CASE("reconciler (firewall): a confirmed record is re-read after the interv
 TEST_CASE("reconciler (firewall): drift - a re-verify that no longer confirms writes one drift row, "
           "clears confirmed and the next cycle re-applies through the chokepoint",
           "[pg][quarantine][reconciler][prq2]") {
-    RECON_RIG(rig, std::chrono::milliseconds(30));
+    RECON_RIG_REVERIFY(rig, std::chrono::milliseconds(30));
     const auto rec = rig.quarantine("10.0.0.1");
     rig.confirm("status|active");
     // The device's rules stop being enforced.
@@ -2070,7 +2079,7 @@ TEST_CASE("reconciler (firewall): a confirm whose reply carried a time limit cha
           "[pg][quarantine][reconciler][prq2][drift]") {
     const auto offset = GENERATE(std::int64_t{-5000}, std::int64_t{0}, std::int64_t{5000});
     CAPTURE(offset);
-    RECON_RIG(rig, std::chrono::milliseconds(30));
+    RECON_RIG_REVERIFY(rig, std::chrono::milliseconds(30));
     const auto rec = rig.quarantine("10.0.0.1");
     rig.confirm("status|active\nnote|ttl_expires=" + std::to_string(rig.clock + offset));
     CHECK(rig.has_row("quarantine.reapply", "success", "CONFIRMED record_id=" + std::to_string(rec.id)));
