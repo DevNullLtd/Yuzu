@@ -46,11 +46,17 @@
 #
 # --free-ports takes every port from the OS (one allocation call, so no two are
 # equal) instead of the 5005x/5006x defaults, which makes concurrent runs on one
-# host safe, and retries the start-up (at most 3 attempts) when one of those ports
-# is taken between allocation and bind (#7538; what that does and does not
-# guarantee is stated under "Free ports" below). The CI runner pool shares ONE OS identity across 4 runner agents
-# (#1871), so the CI step uses it; the Postgres database, work directory and the
-# gateway's Erlang node name and cookie are salted per run in every mode.
+# host safe (one checkout per concurrent run: the gateway release under
+# gateway/_build is shared), and retries the start-up (at most 3 attempts) when
+# one of those ports is taken between allocation and bind (#7538; what that does
+# and does not guarantee is stated under "Free ports" below). The CI runner pool
+# shares ONE OS identity across 4 runner agents (#1871), so the CI step uses it;
+# the Postgres database, work directory and the gateway's Erlang node name and
+# cookie are salted per run in every mode.
+#
+# Environment (test seam, never used by CI): YUZU_IT_PORT_HOG_INDEX=<0..7> makes
+# attempt 1 find a stranger on one of the ports, to prove the retry (see "Free
+# ports"). Classifier test: tests/shell/test_integration_port_retry.sh.
 #
 # Prerequisites:
 #   - C++ binaries built:  build-<os>/server/core/yuzu-server
@@ -58,7 +64,8 @@
 #   - Erlang/OTP + rebar3 (the gateway release is built here: rebar3 as prod release)
 #   - Postgres: YUZU_TEST_POSTGRES_DSN (the server fails closed without it); a
 #     uniquely named database is created for the run and dropped on exit
-#   - psql, openssl, curl, python3
+#   - psql, openssl, curl, python3, ps; ss (iproute2) is optional: without it the
+#     --free-ports port-ownership check is skipped (logged)
 #   - grpcurl (optional, for gRPC probing)
 #
 # A missing prerequisite fails the script (exit 1); it never reports a skip, so a
@@ -104,7 +111,10 @@ WORK_DIR=""
 IT_DB=""
 SERVER_PID=""
 GATEWAY_PID=""
+SERVER_STAMP=""
+GATEWAY_STAMP=""
 AGENT_PIDS=()
+AGENT_STAMPS=()
 
 # Port matrix — single-host layout that gives every binder its own port.
 # Server side uses 5005x, gateway side uses 5006x. Every port is
@@ -237,57 +247,270 @@ fi
 # allocate_free_ports asks the kernel for 8 free ports in ONE call (the sockets are
 # all held until the list is printed, so no two are equal) and then releases them.
 # The server and gateway bind them later. In between, another process can take one:
-# the CI pool runs 4 runner agents as ONE OS identity on one host (#1871), and any
-# outbound connection draws from the same ephemeral range `:0` hands out. So the
-# allocation alone cannot be race-free. Under --free-ports this script therefore
-# does three things:
+# the CI pool runs 4 runner agents as ONE OS identity on one host (#1871), and the
+# colliders are the other callers of bind(0) (a concurrent job's own draw, any
+# listener on port 0, the Erlang VM's distribution listener); outbound connections
+# were measured not to collide on Linux (0 of 20,000). So the allocation alone cannot
+# be race-free. Under --free-ports this script therefore does four things:
 #   1. Shrinks the window. Everything that does not need a port (the gateway
 #      release build, the config inputs, the database, the enrolment token) runs
 #      BEFORE the allocation; ports are drawn immediately before the first start.
 #   2. Detects a lost race and retries, at most 3 attempts in total. A start counts
-#      as a lost race ONLY when a started process exited or answered without
-#      binding AND the evidence is a bind failure: a bind-failure line in the
-#      server's or gateway's log (eaddrinuse, Address already in use, Failed to
-#      add port, Failed to start gRPC server, Web/Redirect listener failed to
-#      bind), or one of our ports being listened on by a process that is not the
-#      one that should hold it (checked with `ss` after the stack is up, because
-#      a foreign listener makes a TCP connect to the port succeed and
-#      wait-for-port alone cannot tell). On a lost race every process of the
-#      attempt is stopped and reaped (the gateway's node name is reused), ALL 8
-#      ports are drawn again, every value derived from them (server flags, the
-#      gateway's sys.config, the log lines) is rebuilt, and the attempt's logs are
-#      kept as server.attemptN.log / gateway.attemptN.log. Any other start failure
-#      (a crash, a timeout, a bad flag, a failed readiness) fails immediately, and
-#      so does a bind failure on the third attempt: a retry never masks a product
-#      start-up bug.
-#   3. Says so: each retry is logged with the port that was taken.
+#      as a lost race when it did not complete (a started process exited, timed out
+#      or never answered) AND the evidence is a BIND failure, which is one of:
+#        a. the errno itself in the server's or the gateway's log: `eaddrinuse`
+#           (Erlang) or `Address already in use` (gRPC core, in the line it logs
+#           for a failed AddListeningPort);
+#        b. for the server's web listener ONLY: its failure line ("Web listener
+#           failed to bind or exited with an error") TOGETHER WITH a listener on the
+#           web port that is not the server (`ss`). The line names no errno and is
+#           also printed when the listener exits for a non-bind reason, so it is
+#           not evidence on its own;
+#        c. (verify_stack_bound, after both started) one of our ports listened on by
+#           a process that is not the one that should hold it (`ss`).
+#      NOT evidence: gRPC's generic "Failed to start gRPC server" (printed for ANY
+#      BuildAndStart failure: a TLS certificate or key error, a key mismatch) and the
+#      "Failed to add port" prefix (it also wraps non-bind reasons). On a lost race
+#      every process of the attempt is stopped and reaped (the gateway's node name is
+#      reused), ALL 8 ports are drawn again, every value derived from them (server
+#      flags, the gateway's sys.config, the log lines) is rebuilt, and the attempt's
+#      logs are kept as server.attemptN.log / gateway.attemptN.log. Any other start
+#      failure (a crash, a timeout, a bad flag, a TLS error, a failed readiness)
+#      fails immediately, and so does a bind failure on the third attempt. So a retry
+#      cannot mask a start-up failure that carries no bind evidence; a product
+#      failure that DOES print the errno would be retried, which is why step 3 exists.
+#      The classifier is locked by tests/shell/test_integration_port_retry.sh.
+#   3. Says so: each retry is logged with the evidence and the port that was taken,
+#      and under GITHUB_ACTIONS is also a ::warning:: annotation and a line in
+#      $GITHUB_STEP_SUMMARY, so a recurring race is visible behind a green step.
+#   4. Signals only its own processes: stop_own_stack and cleanup signal a PID only
+#      while is_own_child proves it is still a live child of this shell with the
+#      start time captured at launch, so a PID bash has reaped and the kernel has
+#      recycled (another job, same OS identity) is never signalled.
+#
+# Per-index record (YUZU_IT_PORT_HOG_INDEX=0..7, --tls --free-ports; the plaintext
+# gateway has one listener on the agent port and no management port). None is
+# silent, so the `ss` ownership check is defence in depth: it never fired in these runs.
+#   idx  port taken                  when taken                         evidence in the log
+#   0    server agent gRPC           FATAL: the server exits            gRPC "Address already in use"
+#   1    server management gRPC      FATAL: the server exits            gRPC "Address already in use"
+#   2    server gateway-upstream     FATAL: the server exits            gRPC "Address already in use"
+#   3    server web                  LOGGED only: the server STAYS UP,  "Web listener failed to bind or
+#                                    the TCP wait passes on the         exited with an error" (no errno);
+#                                    stranger's listener                needs the ss check (2.b)
+#   4    gateway agent gRPC          FATAL: the beam halts              {listen_failed,eaddrinuse}
+#   5    gateway management (--tls)  FATAL: the beam halts              {listen_failed,eaddrinuse}
+#   6    gateway metrics             FATAL: the beam halts              {listen,eaddrinuse}
+#   7    gateway health              FATAL: the beam halts              "Health endpoint failed to
+#                                                                       listen on port N: eaddrinuse"
 # NOT guaranteed:
 #   - A port taken AFTER a successful start (the script never restarts the server
 #     or the gateway, so no later bind happens on these ports; a future restart on
 #     the same ports would reopen the window and must either handle it or fail
 #     with a line saying so).
-#   - Detection when `ss` is absent (the ownership check is skipped; a bind
-#     failure that leaves no log line and no exit is then invisible) or when the
-#     foreign process is hidden from `ss -p` (the listener is still seen as not
-#     ours, which counts).
+#   - The gateway's four ports stay unbound for the whole server start (about 3 s
+#     locally, longer on a cold debug build), and a gateway-side loss also restarts
+#     the server: the window the allocation leaves is not closed, only retried.
+#   - Detection when `ss` is absent (logged once; the ownership checks are skipped, so
+#     a web-listener loss and a foreign listener are then NOT classified, and a bind
+#     failure that leaves no errno line and no exit is invisible) or when `ss` cannot
+#     attribute a listener to a process (counted as not foreign and logged: it may be
+#     ours, hidden by ptrace_scope or a PID namespace). A same-user stranger that
+#     shares one of the server's ports through SO_REUSEPORT (gRPC and httplib set
+#     it) IS seen: ss prints one row per socket, and a row without our PID is foreign.
+#   - A bind failure whose log line was lost (a full disk) is reported as "not a port
+#     bind failure".
 #   - Three consecutive races (the third failure is reported as such and fails).
 #   - Reuse mode and runs WITHOUT --free-ports: the fixed or overridden ports are
-#     the caller's choice and one start failure is final.
+#     the caller's choice and one start failure is final (no bind classification, no
+#     retry).
 # TEST SEAM (never used by CI): YUZU_IT_PORT_HOG_INDEX=<0..7> makes attempt 1 find
 # a stranger listening on that port (index order is the FREE_LIST order below), to
 # prove the retry. It is read only under --free-ports, honoured on attempt 1 only,
-# logged, and refused (exit 2) when GITHUB_ACTIONS is set.
+# logged, and refused (exit 2) when GITHUB_ACTIONS is set or CI=true.
+# ── Process ownership and the bind-failure classifier ────────────────
+# Everything between the two markers is extracted and sourced by
+# tests/shell/test_integration_port_retry.sh, which locks its behaviour with fixture
+# logs, a fake `ss` and real child processes. Keep it free of anything that needs a
+# running stack. (`log` and FREE_PORTS come from the script.)
+# --- testable-helpers:begin ---
+
+# proc_stamp <pid>: the process's start time as `ps` prints it ("" when it is gone).
+# Captured at launch and compared before every signal, so a recycled PID differs.
+proc_stamp() {
+    ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' || true
+}
+
+# is_own_child <pid> <stamp>: 0 only while <pid> is a live CHILD OF THIS SHELL whose
+# start time is still <stamp> (the one captured at launch). A child bash has reaped
+# is gone from `ps`; a PID the kernel has recycled is another job's process (the CI
+# pool shares one OS identity across 4 runners, #1871), so it has another parent or
+# another start time. An empty <pid> or <stamp> is never ours. The check and the
+# signal that follows are two steps; the window between them is not closed (a
+# microsecond, on a PID that was ours a moment ago).
+is_own_child() {
+    local pid="$1" stamp="$2" parent
+    [[ -n "$pid" && -n "$stamp" ]] || return 1
+    parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    [[ "$parent" == "$$" ]] || return 1
+    [[ "$(proc_stamp "$pid")" == "$stamp" ]]
+}
+
+# signal_own <signal> <pid> <stamp>: signal <pid> ONLY while is_own_child. 1 when not.
+signal_own() {
+    is_own_child "$2" "$3" || return 1
+    kill "-$1" "$2" 2>/dev/null || true
+}
+
+# The lines of a log that prove a failed BIND: the errno, as the Erlang gateway
+# prints it (`{listen_failed,eaddrinuse}`, `{listen,eaddrinuse}`, `...: eaddrinuse`)
+# and as gRPC core prints it for a failed AddListeningPort ("Error in bind for
+# address ...: Address already in use"). NOT matched, on purpose: "Failed to start
+# gRPC server" (server.cpp prints it for ANY BuildAndStart failure, e.g. a TLS
+# certificate or key error), "Failed to add port" (the same wrapper around other
+# reasons) and "Web listener failed to bind or exited with an error" (httplib's
+# listen() returns false on a bind failure and also on a fatal accept error, and the
+# line carries no errno): see web_bind_lost for the last.
+BIND_FAILURE_RE='eaddrinuse|Address already in use'
+WEB_LISTENER_FAILED_RE='Web listener failed to bind or exited with an error'
+BIND_EVIDENCE=""
+SS_ABSENT_LOGGED=false
+
+# bind_failure_in_log <log>: 0 when the log carries the bind errno (and records it).
+bind_failure_in_log() {
+    local line
+    line="$(grep -E -m1 -- "$BIND_FAILURE_RE" "$1" 2>/dev/null || true)"
+    [[ -n "$line" ]] || return 1
+    BIND_EVIDENCE="$(basename "$1"): $line"
+    return 0
+}
+
+# port_foreign_listener <pid> <port>: 0 (and the `ss` row on stdout) when a process
+# other than <pid> listens on the port: any LISTEN row that names a process and not
+# <pid> (a same-user SO_REUSEPORT co-listener is a row of its own). 1 when nothing
+# listens, every row is ours, a row names no process (`ss` cannot attribute it, which
+# is logged: it may be ours, hidden by ptrace_scope or a PID namespace), or `ss` is
+# absent (logged once; the residual named under "Free ports").
+port_foreign_listener() {
+    local pid="$1" port="$2" rows row
+    if ! command -v ss > /dev/null 2>&1; then
+        if ! $SS_ABSENT_LOGGED; then
+            SS_ABSENT_LOGGED=true
+            log "  ss not found: the port-ownership check is skipped (#7538 residual)" >&2
+        fi
+        return 1
+    fi
+    rows="$(ss -ltnp "sport = :$port" 2>/dev/null | grep '^LISTEN' || true)"
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        if ! grep -q 'pid=' <<< "$row"; then
+            log "  ss shows a listener on :$port that names no process; not counted as foreign: $row" >&2
+            continue
+        fi
+        if ! grep -q "pid=${pid}[,)]" <<< "$row"; then
+            echo "$row"
+            return 0
+        fi
+    done <<< "$rows"
+    return 1
+}
+
+# web_bind_lost <server-log> <server-pid> <web-port>: 0 (BIND_EVIDENCE set) when the
+# web listener reported its failure AND the web port is listened on by a process
+# that is not the server. Neither half is enough alone (see BIND_FAILURE_RE).
+web_bind_lost() {
+    local line foreign
+    line="$(grep -E -m1 -- "$WEB_LISTENER_FAILED_RE" "$1" 2>/dev/null || true)"
+    [[ -n "$line" ]] || return 1
+    foreign="$(port_foreign_listener "$2" "$3")" || return 1
+    BIND_EVIDENCE="$(basename "$1"): $line; port $3 is listened on by a process other than $2: $foreign"
+    return 0
+}
+
+# bind_loss_in_log <log> [<server-pid> <web-port>]: 0 on bind evidence in <log>: the
+# errno, or (server log only, when the pid and port are given) web_bind_lost.
+bind_loss_in_log() {
+    bind_failure_in_log "$1" && return 0
+    [[ -n "${2:-}" && -n "${3:-}" ]] && web_bind_lost "$1" "$2" "$3"
+}
+# start_failed <rc> <log> [<server-pid> <web-port>]: classify a failed wait. Returns 10
+# for a lost port race (rc 10 from a wait, or bind evidence in the log, only under
+# --free-ports), else 1. A wait that timed out or saw the process exit is a lost race
+# only when the log proves a failed BIND.
+start_failed() {
+    local rc="$1" log_file="$2"
+    if [[ "$rc" -eq 10 ]] || { $FREE_PORTS && bind_loss_in_log "$log_file" "${3:-}" "${4:-}"; }; then
+        return 10
+    fi
+    return 1
+}
+
+# emit_race_annotation <attempt> <max> <evidence>: under GITHUB_ACTIONS, a ::warning::
+# annotation and a $GITHUB_STEP_SUMMARY line for a retried attempt, so a recurring race
+# (or a product failure that prints the bind errno) is visible behind a green step.
+emit_race_annotation() {
+    [[ -n "${GITHUB_ACTIONS:-}" ]] || return 0
+    local raw="attempt $1 of $2 lost a port before bind: ${3:0:400}"
+    raw="${raw//$'\r'/ }"
+    raw="${raw//$'\n'/ }"
+    # Workflow-command data escapes % (a log line can carry one).
+    echo "::warning title=#7538 port race::${raw//%/%25}"
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        echo "- #7538 integration-test port race: $raw (retried on 8 new ports)" \
+            >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+    fi
+}
+# stop_own_stack: stop and reap the server and gateway of a failed attempt, so the
+# next attempt cannot collide with the old gateway node name (one EPMD per host) or
+# with a half-dead process still holding a port. A process that already exited (the
+# usual case on a lost race: bash has reaped it, and the kernel may have recycled
+# its PID) is NOT signalled: signal_own needs a live child of this shell.
+stop_own_stack() {
+    local i
+    signal_own TERM "$GATEWAY_PID" "$GATEWAY_STAMP" || true
+    signal_own TERM "$SERVER_PID" "$SERVER_STAMP" || true
+    local entry pid stamp
+    for entry in "$GATEWAY_PID:$GATEWAY_STAMP" "$SERVER_PID:$SERVER_STAMP"; do
+        pid="${entry%%:*}"; stamp="${entry#*:}"
+        [[ -n "$pid" ]] || continue
+        for i in $(seq 1 100); do
+            is_own_child "$pid" "$stamp" || break
+            sleep 0.1
+        done
+        if is_own_child "$pid" "$stamp"; then
+            signal_own KILL "$pid" "$stamp" || true
+            for i in $(seq 1 50); do
+                is_own_child "$pid" "$stamp" || break
+                sleep 0.1
+            done
+        fi
+        if is_own_child "$pid" "$stamp"; then
+            echo "FAIL: process $pid of the failed attempt did not exit; not starting another on its names and ports" >&2
+            exit 1
+        fi
+        # Reap only a child proven gone (a wait on a live one blocks).
+        [[ -n "$stamp" ]] && { wait "$pid" 2>/dev/null || true; }
+    done
+    SERVER_PID=""; SERVER_STAMP=""
+    GATEWAY_PID=""; GATEWAY_STAMP=""
+}
+# --- testable-helpers:end ---
+
 FREE_LIST=()
 PORT_HOG_PID=""
+PORT_HOG_STAMP=""
 
 allocate_free_ports() {
     command -v python3 > /dev/null 2>&1 || { echo "FAIL: --free-ports needs python3" >&2; exit 1; }
-    # shellcheck disable=SC2207
-    FREE_LIST=($(python3 -c "
+    local drawn
+    # `|| {...}`: under `set -e` a failing assignment would exit before any message.
+    drawn="$(python3 -c "
 import socket
 s = [socket.socket() for _ in range(8)]
 [x.bind(('127.0.0.1', 0)) for x in s]
-print(*[x.getsockname()[1] for x in s])"))
+print(*[x.getsockname()[1] for x in s])")" || { echo "FAIL: python3 could not allocate 8 free ports" >&2; exit 1; }
+    # shellcheck disable=SC2206
+    FREE_LIST=($drawn)
     if [[ "${#FREE_LIST[@]}" -ne 8 ]]; then
         echo "FAIL: could not allocate 8 free ports" >&2
         exit 1
@@ -301,8 +524,8 @@ print(*[x.getsockname()[1] for x in s])"))
 # The test seam: a stranger listening on one of this attempt's ports.
 start_port_hog() {
     local index="$1" port i
-    if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-        echo "FAIL: YUZU_IT_PORT_HOG_INDEX is a local test seam and is refused when GITHUB_ACTIONS is set" >&2
+    if [[ -n "${GITHUB_ACTIONS:-}" || "${CI:-}" == true ]]; then
+        echo "FAIL: YUZU_IT_PORT_HOG_INDEX is a local test seam and is refused in CI (GITHUB_ACTIONS or CI=true is set)" >&2
         exit 2
     fi
     if ! [[ "$index" =~ ^[0-7]$ ]]; then
@@ -311,13 +534,14 @@ start_port_hog() {
     fi
     port="${FREE_LIST[$index]}"
     log "TEST SEAM (#7538): a stranger takes port $port (index $index) before the stack starts (attempt 1 only)"
-    python3 -c "
+    ( trap - EXIT TERM INT; exec python3 -c "
 import socket, time
 s = socket.socket()
 s.bind(('127.0.0.1', $port))
 s.listen(16)
-time.sleep(3600)" > /dev/null 2>&1 &
+time.sleep(3600)" > /dev/null 2>&1 ) &
     PORT_HOG_PID=$!
+    PORT_HOG_STAMP="$(proc_stamp "$PORT_HOG_PID")"
     for i in $(seq 1 40); do
         port_open "$port" && return 0
         sleep 0.25
@@ -328,9 +552,12 @@ time.sleep(3600)" > /dev/null 2>&1 &
 
 stop_port_hog() {
     if [[ -n "$PORT_HOG_PID" ]]; then
-        kill "$PORT_HOG_PID" 2>/dev/null || true
-        wait "$PORT_HOG_PID" 2>/dev/null || true
+        # Reap only what was signalled: a wait on a process that was not stopped blocks.
+        if signal_own TERM "$PORT_HOG_PID" "$PORT_HOG_STAMP"; then
+            wait "$PORT_HOG_PID" 2>/dev/null || true
+        fi
         PORT_HOG_PID=""
+        PORT_HOG_STAMP=""
     fi
 }
 
@@ -465,28 +692,25 @@ cleanup() {
     if $REUSE_STACK; then
         log "  Reuse mode — leaving Phase 4 server/gateway/agent processes running."
     else
-        # Stop agents
-        for pid in "${AGENT_PIDS[@]}"; do
-            kill "$pid" 2>/dev/null || true
+        # Signal only processes this shell still owns (is_own_child: a live child with the
+        # start time captured at launch): a PID that has exited and been recycled by
+        # another job (one OS identity, 4 runners, #1871) is never signalled.
+        local idx
+        for idx in "${!AGENT_PIDS[@]}"; do
+            signal_own TERM "${AGENT_PIDS[$idx]}" "${AGENT_STAMPS[$idx]:-}" || true
         done
-        # Stop gateway
-        if [[ -n "$GATEWAY_PID" ]]; then
-            kill "$GATEWAY_PID" 2>/dev/null || true
-        fi
-        # Stop server
-        if [[ -n "$SERVER_PID" ]]; then
-            kill "$SERVER_PID" 2>/dev/null || true
-        fi
+        signal_own TERM "$GATEWAY_PID" "$GATEWAY_STAMP" || true
+        signal_own TERM "$SERVER_PID" "$SERVER_STAMP" || true
         # The #7538 test seam's stranger, if a run died while it was up.
-        [[ -n "$PORT_HOG_PID" ]] && kill -9 "$PORT_HOG_PID" 2>/dev/null || true
+        signal_own KILL "$PORT_HOG_PID" "$PORT_HOG_STAMP" || true
         # Wait for all to exit
         sleep 1
         # Force-kill stragglers
-        for pid in "${AGENT_PIDS[@]}"; do
-            kill -9 "$pid" 2>/dev/null || true
+        for idx in "${!AGENT_PIDS[@]}"; do
+            signal_own KILL "${AGENT_PIDS[$idx]}" "${AGENT_STAMPS[$idx]:-}" || true
         done
-        [[ -n "$GATEWAY_PID" ]] && kill -9 "$GATEWAY_PID" 2>/dev/null || true
-        [[ -n "$SERVER_PID" ]] && kill -9 "$SERVER_PID" 2>/dev/null || true
+        signal_own KILL "$GATEWAY_PID" "$GATEWAY_STAMP" || true
+        signal_own KILL "$SERVER_PID" "$SERVER_STAMP" || true
     fi
     # Drop this run's database (created below, salted per run).
     if [[ -n "$IT_DB" && -n "${YUZU_TEST_POSTGRES_DSN:-}" ]]; then
@@ -504,6 +728,13 @@ cleanup() {
     log "Cleanup done."
 }
 trap cleanup EXIT
+# A signal-terminated run (a step timeout or a cancel) must not look like success: with
+# no handler bash exits from the signal and the EXIT trap sees $?=0, so cleanup would
+# delete the work directory and the logs a CI failure upload needs. Exit non-zero from
+# the handler instead (128 + signal), so cleanup keeps the logs.
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
 
 # ── Create temp work directory ────────────────────────────────────────
 # YUZU_IT_TMPDIR lets CI keep the work directory inside the runner's own temp
@@ -600,7 +831,7 @@ compute_port_derived
 
 # ── Per-run database and server config (own-stack only) ───────────────
 if ! $REUSE_STACK; then
-    for tool in psql openssl curl python3; do
+    for tool in psql openssl curl python3 ps; do
         if ! command -v "$tool" > /dev/null 2>&1; then
             echo "FAIL: $tool not on PATH (required by this script)" >&2
             exit 1
@@ -666,65 +897,43 @@ fi
 # The two binders start together, as one attempt, so that a lost port race (#7538,
 # see "Free ports" above) can stop both and start again on fresh ports.
 
-# The lines of a log that report a failed bind: the server's gRPC and web listeners
-# and the gateway's (`{listen_failed,eaddrinuse}`).
-BIND_FAILURE_RE='eaddrinuse|Address already in use|Failed to add port|Failed to start gRPC server|(Web|Redirect) listener failed to bind'
-BIND_EVIDENCE=""
-
-# bind_failure_in_log <log>: 0 when the log carries a bind-failure line (and records it).
-bind_failure_in_log() {
-    local line
-    line="$(grep -E -m1 -- "$BIND_FAILURE_RE" "$1" 2>/dev/null || true)"
-    [[ -n "$line" ]] || return 1
-    BIND_EVIDENCE="$(basename "$1"): $line"
-    return 0
-}
-
-# port_foreign_listener <pid> <port>: 0 (and the `ss` line on stdout) when something
-# listens on the port and the process that should hold it does not. 1 when the port
-# is not listening, is ours, or `ss` is not there (the residual named in "Free ports").
-port_foreign_listener() {
-    local pid="$1" port="$2" line
-    command -v ss > /dev/null 2>&1 || return 1
-    line="$(ss -ltnp "sport = :$port" 2>/dev/null | grep '^LISTEN' || true)"
-    [[ -n "$line" ]] || return 1
-    if grep -q "pid=$pid," <<< "$line"; then
-        return 1
-    fi
-    echo "$line"
-    return 0
-}
-
 # wait_listening <port> <name> <pid> [timeout]: wait_for_port that also stops waiting
 # when the process that should bind the port has exited, and does not count a failure.
+# The budget is wall time ($SECONDS), not a count of sleeps. A TCP connect succeeds on
+# a stranger's listener too, so this does not prove the port is ours (wait_http_answers
+# and verify_stack_bound do the rest). `kill -0` sends no signal: on a recycled PID it
+# can only read "alive" and let the wait run to its timeout.
 # 0 listening, 1 timeout, 2 the process exited.
 wait_listening() {
     local port="$1" name="$2" pid="$3" timeout="${4:-15}"
-    local elapsed=0
+    local start=$SECONDS
     while ! port_open "$port"; do
         if ! kill -0 "$pid" 2>/dev/null; then
             echo "  ✗ $name: process $pid exited before port $port opened"
             return 2
         fi
         sleep 0.5
-        elapsed=$((elapsed + 1))
-        if [[ $elapsed -ge $((timeout * 2)) ]]; then
+        if [[ $((SECONDS - start)) -ge $timeout ]]; then
             echo "  ✗ $name did not start on port $port within ${timeout}s"
             return 1
         fi
     done
-    echo "  ✓ $name on :$port in $((elapsed / 2))s"
+    echo "  ✓ $name on :$port in $((SECONDS - start))s"
     return 0
 }
 
-# wait_http_ready <url> <name> <pid> <log> [timeout]: waits for an HTTP answer from
-# the process under test. A listener that is not ours accepts the TCP connect but
-# never answers HTTP, so unlike wait_listening this proves the port is ours. It also
-# stops early on the process exiting (2) or, under --free-ports, a bind-failure line
-# in <log> (10). 0 ready, 1 timeout.
-wait_http_ready() {
-    local url="$1" name="$2" pid="$3" log_file="$4" timeout="${5:-15}"
-    local elapsed=0 code
+# wait_http_answers <url> <name> <pid> <log> [timeout] [web-port]: waits until the URL
+# ANSWERS HTTP, with any status (a 503 from /readyz still counts: this proves a
+# listener of the right kind answers, not that the service is healthy, which the
+# tests that follow assert). A listener that is not ours accepts the TCP connect but
+# usually never answers HTTP, so unlike wait_listening this separates the two. It
+# also stops early on the process exiting (2) or, under --free-ports, bind evidence
+# in <log> (10; pass the server's web port as <web-port> for the server's log, so
+# its web-listener line can be confirmed against the port's owner). The budget is
+# wall time. 0 answered, 1 timeout.
+wait_http_answers() {
+    local url="$1" name="$2" pid="$3" log_file="$4" timeout="${5:-15}" web_port="${6:-}"
+    local start=$SECONDS code
     while true; do
         code="$(curl -s -o /dev/null --max-time 2 -w '%{http_code}' "$url" 2>/dev/null || true)"
         if [[ -n "$code" && "$code" != "000" ]]; then
@@ -735,43 +944,39 @@ wait_http_ready() {
             echo "  ✗ $name: process $pid exited before $url answered"
             return 2
         fi
-        if $FREE_PORTS && bind_failure_in_log "$log_file"; then
+        if $FREE_PORTS && bind_loss_in_log "$log_file" "$pid" "$web_port"; then
             echo "  ✗ $name: $BIND_EVIDENCE"
             return 10
         fi
         sleep 0.5
-        elapsed=$((elapsed + 1))
-        if [[ $elapsed -ge $((timeout * 2)) ]]; then
+        if [[ $((SECONDS - start)) -ge $timeout ]]; then
             echo "  ✗ $name not answering HTTP at $url within ${timeout}s"
             return 1
         fi
     done
 }
 
-# start_failed <rc> <log>: classify a failed wait. Returns 10 for a lost port race (a
-# bind-failure line in the log, only under --free-ports), else 1.
-start_failed() {
-    local rc="$1" log_file="$2"
-    if [[ "$rc" -eq 10 ]] || { $FREE_PORTS && bind_failure_in_log "$log_file"; }; then
-        return 10
-    fi
-    return 1
-}
-
 # verify_stack_bound: after both binders answered, the PIDs are alive and (under
-# --free-ports) neither log carries a bind-failure line and every port the stack
-# should hold is held by its own process. 0 ok, 10 lost race, 1 a process is gone.
+# --free-ports) neither log carries bind evidence and no port of the stack is
+# listened on by another process (a listener that shows no PID to ss is not counted).
+# 0 ok, 10 lost race, 1 a process is gone.
 verify_stack_bound() {
     local label pid port
     for label in server gateway; do
         pid="$SERVER_PID"; [[ "$label" == gateway ]] && pid="$GATEWAY_PID"
         if ! kill -0 "$pid" 2>/dev/null; then
             echo "  ✗ $label process $pid is not running after start"
+            # A process that died on a bind failure is a lost race, not a crash.
+            if $FREE_PORTS && { bind_failure_in_log "$WORK_DIR/server.log" || bind_failure_in_log "$WORK_DIR/gateway.log"; }; then
+                echo "  ✗ $BIND_EVIDENCE"
+                return 10
+            fi
             return 1
         fi
     done
     $FREE_PORTS || return 0
-    if bind_failure_in_log "$WORK_DIR/server.log" || bind_failure_in_log "$WORK_DIR/gateway.log"; then
+    if bind_loss_in_log "$WORK_DIR/server.log" "$SERVER_PID" "$SERVER_WEB_PORT" \
+            || bind_failure_in_log "$WORK_DIR/gateway.log"; then
         return 10
     fi
     local checks=("$SERVER_PID:$SERVER_AGENT_PORT:server agent" "$SERVER_PID:$SERVER_MGMT_PORT:server management"
@@ -792,42 +997,15 @@ verify_stack_bound() {
     return 0
 }
 
-# stop_own_stack: stop and reap the server and gateway of a failed attempt, so the
-# next attempt cannot collide with the old gateway node name (one EPMD per host) or
-# with a half-dead process still holding a port.
-stop_own_stack() {
-    local pid i
-    for pid in "$GATEWAY_PID" "$SERVER_PID"; do
-        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
-    done
-    for pid in "$GATEWAY_PID" "$SERVER_PID"; do
-        [[ -n "$pid" ]] || continue
-        for i in $(seq 1 100); do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 0.1
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null || true
-            for i in $(seq 1 50); do
-                kill -0 "$pid" 2>/dev/null || break
-                sleep 0.1
-            done
-        fi
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "FAIL: process $pid of the failed attempt did not exit; not starting another on its names and ports" >&2
-            exit 1
-        fi
-        wait "$pid" 2>/dev/null || true
-    done
-    SERVER_PID=""
-    GATEWAY_PID=""
-}
-
 # write_gateway_config: the gateway's sys.config for the CURRENT ports. Rebuilt on
 # every attempt, because every listener port in it is one of the drawn ones.
 write_gateway_config() {
 # The sys.config below replaces the release's own (RELX_CONFIG_PATH).
 GW_SYS_CONFIG="$WORK_DIR/gw_sys.config"
+# With RELX_REPLACE_OS_VARS set in the caller's environment the release script copies
+# the config to <config>.orig on its first launch and regenerates from that copy on
+# later ones, which would start attempt 2 on attempt 1's ports. Drop the copy.
+rm -f "$GW_SYS_CONFIG.orig"
 # Keys shared by both modes.
 GW_COMMON_CFG="
         {upstream_addr, \"127.0.0.1\"},
@@ -975,8 +1153,10 @@ start_own_stack() {
     # affects no other test. 19a runs after that driver because it enrols TOTP on
     # the admin, after which a password-only login answers 202 mfa_required.
     STEPUP_WINDOW_SECS=3
+    # The child clears the EXIT/TERM/INT traps before it execs: a signal between fork and
+    # exec must not run this script's cleanup() in the child. $! is still the server's PID.
     # shellcheck disable=SC2086
-    "$BUILDDIR/server/core/yuzu-server" "${SERVER_COMMON[@]}" \
+    ( trap - EXIT TERM INT; exec "$BUILDDIR/server/core/yuzu-server" "${SERVER_COMMON[@]}" \
         --listen "127.0.0.1:$SERVER_AGENT_PORT" \
         --management "127.0.0.1:$SERVER_MGMT_PORT" \
         --web-address 127.0.0.1 \
@@ -988,32 +1168,40 @@ start_own_stack() {
         --gateway-upstream "127.0.0.1:$SERVER_GW_PORT" \
         $PEER_FLAGS \
         $MGMT_FLAGS \
-        > "$WORK_DIR/server.log" 2>&1 &
+        > "$WORK_DIR/server.log" 2>&1 ) &
     SERVER_PID=$!
+    SERVER_STAMP="$(proc_stamp "$SERVER_PID")"
     log "  Server PID: $SERVER_PID"
 
     # 30s budget — yuzu-server cold-starts walk ~20 MigrationRunners and
     # routinely take 12+ seconds; the prior 15s headroom was too tight on
     # WSL2 dev boxes (parity with linux-start-UAT.sh:197).
     wait_listening "$SERVER_WEB_PORT" "C++ server web UI" "$SERVER_PID" 30 \
-        || { start_failed $? "$WORK_DIR/server.log"; return $?; }
+        || { start_failed $? "$WORK_DIR/server.log" "$SERVER_PID" "$SERVER_WEB_PORT"; return $?; }
     wait_listening "$SERVER_AGENT_PORT" "C++ server agent gRPC" "$SERVER_PID" 30 \
-        || { start_failed $? "$WORK_DIR/server.log"; return $?; }
+        || { start_failed $? "$WORK_DIR/server.log" "$SERVER_PID" "$SERVER_WEB_PORT"; return $?; }
     wait_listening "$SERVER_GW_PORT" "C++ server gateway gRPC" "$SERVER_PID" 30 \
-        || { start_failed $? "$WORK_DIR/server.log"; return $?; }
+        || { start_failed $? "$WORK_DIR/server.log" "$SERVER_PID" "$SERVER_WEB_PORT"; return $?; }
     # A stranger on one of these ports accepts the connect above, so also require an
-    # HTTP answer from the server itself on its web port.
-    wait_http_ready "http://127.0.0.1:$SERVER_WEB_PORT/readyz" "C++ server web UI" "$SERVER_PID" \
-        "$WORK_DIR/server.log" 30 \
-        || { start_failed $? "$WORK_DIR/server.log"; return $?; }
+    # HTTP answer on the web port (a stranger there usually never answers, and the
+    # server's own web-listener failure line is confirmed against the port's owner).
+    wait_http_answers "http://127.0.0.1:$SERVER_WEB_PORT/readyz" "C++ server web UI" "$SERVER_PID" \
+        "$WORK_DIR/server.log" 30 "$SERVER_WEB_PORT" \
+        || { start_failed $? "$WORK_DIR/server.log" "$SERVER_PID" "$SERVER_WEB_PORT"; return $?; }
     log "  Server is ready."
 
     log "Starting Erlang gateway (agents=$GW_AGENT_PORT, upstream=127.0.0.1:$SERVER_GW_PORT, metrics=$GW_METRICS_PORT, health=$GW_HEALTH_PORT)..."
-    # No subshell: $! must be the launcher's PID (`foreground` execs erlexec -> beam).
-    RELX_CONFIG_PATH="$GW_SYS_CONFIG" VMARGS_PATH="$GW_VM_ARGS" \
-        "$GW_REL/bin/yuzu_gw" foreground \
-        > "$WORK_DIR/gateway.log" 2>&1 &
+    # $! is the launcher's PID (`foreground` execs erlexec -> beam); the subshell execs, so
+    # the PID is unchanged, and clears the traps first (see the server above).
+    # ERL_CRASH_DUMP keeps a lost attempt's crash dump with the logs instead of
+    # overwriting gateway/_build/prod/rel/yuzu_gw/erl_crash.dump.
+    ( trap - EXIT TERM INT
+      RELX_CONFIG_PATH="$GW_SYS_CONFIG" VMARGS_PATH="$GW_VM_ARGS" \
+      ERL_CRASH_DUMP="$WORK_DIR/gateway.attempt${START_ATTEMPT}.crash" \
+      exec "$GW_REL/bin/yuzu_gw" foreground \
+        > "$WORK_DIR/gateway.log" 2>&1 ) &
     GATEWAY_PID=$!
+    GATEWAY_STAMP="$(proc_stamp "$GATEWAY_PID")"
     log "  Gateway PID: $GATEWAY_PID"
 
     # Poll the gateway's agent-facing gRPC port until it's bound. Gateway
@@ -1027,7 +1215,7 @@ start_own_stack() {
     fi
     # The health listener is the one the #7538 failure was on; /healthz answering
     # proves it is the gateway's.
-    wait_http_ready "http://127.0.0.1:$GW_HEALTH_PORT/healthz" "Gateway health" "$GATEWAY_PID" \
+    wait_http_answers "http://127.0.0.1:$GW_HEALTH_PORT/healthz" "Gateway health" "$GATEWAY_PID" \
         "$WORK_DIR/gateway.log" 30 \
         || { start_failed $? "$WORK_DIR/gateway.log"; return $?; }
     verify_stack_bound || return $?
@@ -1098,7 +1286,11 @@ VMARGS
         echo "--- gateway.log ---"
         cat "$WORK_DIR/gateway.log" 2>/dev/null || true
         if [[ "$START_RC" -ne 10 ]]; then
-            echo "FAIL: stack start-up failed (not a port bind failure, not retried)" >&2
+            if $FREE_PORTS; then
+                echo "FAIL: stack start-up failed (no bind-failure evidence, not retried)" >&2
+            else
+                echo "FAIL: stack start-up failed (fixed ports: a bind failure is not classified or retried; see the logs above)" >&2
+            fi
             exit 1
         fi
         if [[ "$START_ATTEMPT" -ge "$MAX_START_ATTEMPTS" ]]; then
@@ -1106,8 +1298,11 @@ VMARGS
             exit 1
         fi
         log "#7538 port race: attempt $START_ATTEMPT of $MAX_START_ATTEMPTS lost a port before bind ($BIND_EVIDENCE); drawing 8 new ports and starting again"
+        emit_race_annotation "$START_ATTEMPT" "$MAX_START_ATTEMPTS" "$BIND_EVIDENCE"
         stop_own_stack
         stop_port_hog
+        # A short jittered pause: a burst of bind(0) callers on the host rarely lasts longer.
+        sleep "0.$((RANDOM % 9 + 1))"
         mv -f "$WORK_DIR/server.log" "$WORK_DIR/server.attempt${START_ATTEMPT}.log" 2>/dev/null || true
         mv -f "$WORK_DIR/gateway.log" "$WORK_DIR/gateway.attempt${START_ATTEMPT}.log" 2>/dev/null || true
         START_ATTEMPT=$((START_ATTEMPT + 1))
@@ -1156,8 +1351,9 @@ if ! $REUSE_STACK; then
         AGENT_CERT_FLAGS=()
         $USE_TLS && AGENT_CERT_FLAGS=(--cert-dir "$AGENT_DATA_DIR/certs")
 
+        # The child clears the traps before it execs (see the server launch).
         # shellcheck disable=SC2086
-        "$BUILDDIR/agents/core/yuzu-agent" \
+        ( trap - EXIT TERM INT; exec "$BUILDDIR/agents/core/yuzu-agent" \
             --server "127.0.0.1:$GW_AGENT_PORT" \
             --agent-id "integration-agent-$i" \
             --data-dir "$AGENT_DATA_DIR" \
@@ -1166,8 +1362,9 @@ if ! $REUSE_STACK; then
             ${AGENT_PLUGIN_FLAGS[@]+"${AGENT_PLUGIN_FLAGS[@]}"} \
             ${AGENT_CERT_FLAGS[@]+"${AGENT_CERT_FLAGS[@]}"} \
             $TLS_AGENT_FLAGS \
-            > "$WORK_DIR/agent-$i.log" 2>&1 &
+            > "$WORK_DIR/agent-$i.log" 2>&1 ) &
         AGENT_PIDS+=($!)
+        AGENT_STAMPS+=("$(proc_stamp "$!")")
     done
 
     # Wait for agents to register. Poll the server's /metrics for
@@ -2158,4 +2355,3 @@ fi
 
 log "All integration tests passed successfully!"
 exit 0
-
