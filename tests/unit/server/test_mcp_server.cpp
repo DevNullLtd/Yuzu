@@ -42,10 +42,12 @@
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_result_set_store_pg_helper.hpp" // ResultSetStorePg — #2146 Batch B2
 #include "test_response_execution_authz_pg_helper.hpp"
+#include "test_execution_owner_scope_rig.hpp" // #5557: shared real-gate rig + the real-session seam below
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
 #include "approval_model.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
+#include "mcp_admission.hpp"         // #5557: make_admission_auth_fn for the real-session seam
 #include "sqlite_raii.hpp"
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
 #include "audit_store.hpp"
@@ -1312,6 +1314,19 @@ struct McpTestServer {
     std::function<bool(const std::string& securable, const std::string& op)>
         perm_override_for_test{};
 
+    /// #5557 (D-M): TEST-ONLY real-session seam. When `real_session_auth_for_test` is set, the
+    /// fixture's authentication hook is that resolver wrapped in the PRODUCTION admission
+    /// (`mcp::make_admission_auth_fn`, the same composition server.cpp registers), so a tierless
+    /// token or a cookie session is refused 403 before any tool runs and `mock_username`,
+    /// `mock_tier`, `mock_token_scope_service`, `mock_role`, `mock_principal_kind` and
+    /// `mock_auth_source` are all ignored. When `real_perm_fn_for_test` is set it replaces the
+    /// permissive mock permission hook (and `perm_override_for_test`). Both default empty, which
+    /// leaves every pre-existing test on the historical mocks. `ExecutionOwnerRig::wire_mcp`
+    /// sets them together with the real `fleet_read_fn_for_test`/`list_read_fn_for_test`, so one
+    /// `AuthRoutes` is the session source for authentication, permission and fleet-read.
+    yuzu::server::mcp::McpServer::AuthFn real_session_auth_for_test{};
+    yuzu::server::mcp::McpServer::PermFn real_perm_fn_for_test{};
+
     /// ADR-0016: optionally wire a typed SoftwareInventoryStore so
     /// query_installed_software is exercised end-to-end. Default nullptr keeps
     /// existing tests on the "Software inventory store unavailable" path.
@@ -1595,7 +1610,7 @@ private:
         mock_tier = tier;
 
         // Mock auth: returns a session with the configured tier (or nullopt)
-        auto auth_fn =
+        yuzu::server::mcp::McpServer::AuthFn auth_fn =
             [this](const httplib::Request& /*req*/,
                    httplib::Response& res) -> std::optional<yuzu::server::auth::Session> {
             if (!mock_auth_enabled) {
@@ -1615,9 +1630,9 @@ private:
 
         // Mock permission: always allow, unless a test wires perm_override_for_test
         // to deny a specific securable/op (then mimic require_permission's 403).
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                              const std::string& securable_type,
-                              const std::string& operation) -> bool {
+        yuzu::server::mcp::McpServer::PermFn perm_fn =
+            [this](const httplib::Request&, httplib::Response& res,
+                   const std::string& securable_type, const std::string& operation) -> bool {
             if (perm_override_for_test && !perm_override_for_test(securable_type, operation)) {
                 res.status = 403;
                 res.set_content(R"({"error":"forbidden"})", "application/json");
@@ -1646,6 +1661,17 @@ private:
                 return audit_succeeds_for_action_(action);
             return audit_succeeds_;
         };
+
+        // #5557 (D-M): the real-session seam. The resolver is wrapped in the PRODUCTION admission
+        // (the one composition server.cpp registers for every MCP verb), with the fixture's own
+        // audit recorder as the admission audit sink, so a refused credential leaves its
+        // `mcp.session.reject` row in `audit_log` exactly as production would write it.
+        if (real_session_auth_for_test) {
+            auth_fn = yuzu::server::mcp::make_admission_auth_fn(real_session_auth_for_test,
+                                                                audit_fn, metrics_for_test);
+        }
+        if (real_perm_fn_for_test)
+            perm_fn = real_perm_fn_for_test;
 
         // Mock agents: return two test agents
         auto agents_fn = [this]() -> nlohmann::json {
@@ -53275,4 +53301,103 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a pending parent is refus
         CHECK((*child)->agents_failed == 2);
         CHECK((*child)->agents_unanswered == 3);
     }
+}
+
+// ── #5557 (D-M): the test-only real-session seam, proved against TODAY's behaviour ──────────────
+//
+// `ExecutionOwnerRig::wire_mcp` makes ONE real AuthRoutes the session source for MCP
+// authentication (wrapped in the production admission), permission, fleet-read and list-read.
+// These cases assert no fix. The admission case is a permanent control (tierless and cookie
+// credentials never reach a tool); the [owner_rig_current] case pins the minter-keyed leak so the
+// MCP conversion commit (#5557, commit 8) flips exactly one block.
+namespace {
+
+std::vector<std::string> mcp_list_execution_ids(const std::unique_ptr<httplib::Response>& res) {
+    std::vector<std::string> ids;
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    for (const auto& e : body["result"]["structuredContent"]["executions"])
+        ids.push_back(e["id"].get<std::string>());
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+std::unique_ptr<httplib::Response> mcp_list_executions_as(McpTestServer& ts,
+                                                          const std::string& token) {
+    return ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5557,"params":{"name":"list_executions","arguments":{"definition_id":"def-owner-rig"}}})",
+        {{"Authorization", "Bearer " + token}});
+}
+
+} // namespace
+
+TEST_CASE("MCP real-session seam: production admission refuses a tierless service token and a "
+          "cookie session before any tool runs",
+          "[pg][mcp][execution][owner_rig][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ExecutionOwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly"); // ignored by the seam: the tier comes from the real credential
+
+    auto expect_refused = [&](std::unique_ptr<httplib::Response> res) {
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("requires an MCP-tier bearer token") != std::string::npos);
+        // No execution data of any kind in a refused response.
+        for (const auto& id : r.all_seeded_ids())
+            CHECK(res->body.find(id) == std::string::npos);
+    };
+    // A tierless SERVICE-SCOPED token (valid on REST) and a cookie session (valid on REST).
+    expect_refused(mcp_list_executions_as(ts, r.creds.svc_a));
+    {
+        const auto cookie = r.cookie_session("mina");
+        expect_refused(ts.call_raw(
+            "POST",
+            R"({"jsonrpc":"2.0","method":"tools/call","id":5557,"params":{"name":"list_executions"}})",
+            {{"Cookie", "yuzu_session=" + cookie}}));
+    }
+    // The refusal is the production admission's own audit row, written through the fixture sink.
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") ==
+          2);
+}
+
+// ASSERT-CURRENT. FLIPS in the MCP conversion commit (#5557, commit 8): the service-scoped
+// credential's list must become exactly the agent-evidence set (`service_a_ids()`), with the two
+// minter rows below gone and `minter_in_a` kept. The non-service controls stay as asserted:
+// MCP's owner-only filter for a confined non-service caller is deliberate (D2 option A).
+TEST_CASE("MCP real-session seam: list_executions through a tiered service-scoped token "
+          "still serves the minter's own dispatches",
+          "[pg][mcp][execution][owner_rig][owner_rig_current][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ExecutionOwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+
+    // The real session reaches the tool: the owner-only filter is keyed on the MINTER (mina),
+    // which is the leak: minter_out and minter_pending are out of service A's scope.
+    auto svc = mcp_list_executions_as(ts, r.creds.mcp_svc_a);
+    REQUIRE(svc);
+    CHECK(svc->status == 200);
+    CHECK(mcp_list_execution_ids(svc) ==
+          yuzu::test::ExecutionOwnerRig::sorted(
+              {r.ids.minter_out, r.ids.minter_in_a, r.ids.minter_pending}));
+
+    // Controls. Non-service group-scoped bob: owner-only (his own dispatches), none of carol's
+    // a1 executions. Global mina: unconfined, every seeded id. dan (no grant): refused at the
+    // fleet-read gate, which is the real gate here, not the fixture's permissive fake.
+    auto bob = mcp_list_executions_as(ts, r.creds.mcp_bob);
+    REQUIRE(bob);
+    CHECK(mcp_list_execution_ids(bob) ==
+          yuzu::test::ExecutionOwnerRig::sorted({r.ids.bob_out, r.ids.bob_pending}));
+    auto mina = mcp_list_executions_as(ts, r.creds.mcp_mina);
+    REQUIRE(mina);
+    CHECK(mcp_list_execution_ids(mina) == r.all_seeded_ids());
+    auto dan = mcp_list_executions_as(ts, r.creds.mcp_dan);
+    REQUIRE(dan);
+    CHECK(dan->status == 403);
+    for (const auto& id : r.all_seeded_ids())
+        CHECK(dan->body.find(id) == std::string::npos);
 }
