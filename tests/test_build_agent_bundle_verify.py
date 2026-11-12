@@ -644,13 +644,26 @@ class VerifyTests(unittest.TestCase):
         win = (tree / "windows-x64" / "README.txt").read_text()
         mac = (tree / "macos-arm64" / "README.txt").read_text()
         ident = f"https://github.com/{NEW}/.github/workflows/release.yml@refs/tags/v0.15.0"
-        image = "ghcr.io/example/yuzu-agent-bundle-chisel:0.15.0"
-        for name, text in (("top", top), ("mac", mac)):
-            with self.subTest(readme=name):
-                self.assertIn(f"cosign verify {image}", text)
-                self.assertIn(f"--certificate-identity {ident}", text)
-                self.assertIn(f"--certificate-oidc-issuer {ISSUER}", text)
-        self.assertLess(mac.index("cosign verify"), mac.index("xattr -dr com.apple.quarantine"))
+        repo = "ghcr.io/example/yuzu-agent-bundle-chisel"
+        # SEC9-1: cosign resolves a TAG at the registry and never reads the local image, so
+        # the README must verify by DIGEST and only then pull/run/extract that same digest.
+        self.assertIn(f"docker buildx imagetools inspect {repo}:0.15.0", top)
+        self.assertIn(f"cosign verify {repo}@$DIGEST", top)
+        self.assertNotRegex(top, r"cosign verify \S+:0\.15\.0")
+        self.assertIn(f"--certificate-identity {ident}", top)
+        self.assertIn(f"--certificate-oidc-issuer {ISSUER}", top)
+        verify = top.index(f"cosign verify {repo}@$DIGEST")
+        for first_use in ("docker pull", "docker run", "docker create"):
+            self.assertLess(verify, top.index(first_use), first_use)
+        for use in (f"docker pull {repo}@$DIGEST", f"docker run --rm -v \"$PWD:/out\" {repo}@$DIGEST"):
+            self.assertIn(use, top)
+        self.assertIn("does NOT cover an image that was mirrored", top)
+        # the macOS README only points at that flow, before the xattr line
+        self.assertIn("@sha256:", mac)
+        self.assertNotIn("cosign verify", mac)
+        self.assertLess(mac.index("@sha256:"), mac.index("xattr -dr com.apple.quarantine"))
+        self.assertIn("SmartScreen", top)
+        self.assertIn("Gatekeeper", top)
         self.assertIn("NOT Authenticode-signed today, #239", win)
         self.assertIn("NOT Authenticode-signed today, #239", top)
         for text in (top, win, mac):
@@ -820,8 +833,14 @@ class MutationSelfTest(unittest.TestCase):
          'matches="$(sums_hashes "$f" sanitised)" || die "cannot read SHA256SUMS while looking up $f"',
          'matches="$(sums_hashes "$f" sanitised)" || true',
          ["test_unreadable_manifest_after_cosign_dies_with_a_message"]),
-        ("mac-readme-image-verify-removed",
-         "  #   cosign verify ${IMAGE_REF} \\\\", "  #   true ${IMAGE_REF} \\\\",
+        ("readme-verify-removed",
+         "  cosign verify ${IMAGE_REPO}@\\$DIGEST \\\\", "  true ${IMAGE_REPO}@\\$DIGEST \\\\",
+         ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
+        ("readme-verifies-the-tag-not-the-digest",
+         "  cosign verify ${IMAGE_REPO}@\\$DIGEST \\\\", "  cosign verify ${IMAGE_REF} \\\\",
+         ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
+        ("readme-runs-by-tag-not-digest",
+         "  docker run --rm -v \"\\$PWD:/out\" ${IMAGE_REPO}@\\$DIGEST\n", "  docker run --rm -v \"\\$PWD:/out\" ${IMAGE_REF}\n",
          ["test_readmes_do_not_overclaim_signing_and_name_the_image_verification"]),
         ("windows-readme-claims-authenticode",
          "Yuzu Agent — windows-x64 — ${VERSION}  (NOT Authenticode-signed today, #239)",
@@ -839,7 +858,9 @@ class MutationSelfTest(unittest.TestCase):
         "shasum-wrong-algorithm": ("shasum", "perl"),
         "fixed-staging-dir": ("unzip",),
         "keep-staging-silent": ("unzip",),
-        "mac-readme-image-verify-removed": ("unzip",),
+        "readme-verify-removed": ("unzip",),
+        "readme-verifies-the-tag-not-the-digest": ("unzip",),
+        "readme-runs-by-tag-not-digest": ("unzip",),
         "windows-readme-claims-authenticode": ("unzip",),
         "staging-never-cleaned": ("unzip",),
         "manifest-read-failure-silent": ("!root",),

@@ -121,14 +121,31 @@ matching bundle automatically — manual builds are only needed off-cycle.
 > pulling a still-private image must first authenticate:
 > `echo <PAT-with-read:packages> | docker login ghcr.io -u <github-user> --password-stdin`.
 
+Verify the image **by digest first**, then pull and extract from that same
+`@sha256:` reference. `cosign verify` of a tag is answered by the registry; it
+never reads an image already on your machine, so a verify of `:<version>` says
+nothing about a mirrored, `docker load`ed or locally built image, nor about a tag
+that moved after you pulled. `<signer>` is `Tr3kkR/Yuzu` for releases up to
+`v0.13.x` and `DevNullLtd/Yuzu` after (see "Verify integrity" below).
+
 ```bash
-docker pull ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version>
+# 1. resolve the tag to a digest at the registry
+DIGEST=$(docker buildx imagetools inspect ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> \
+  --format '{{.Manifest.Digest}}')
+
+# 2. verify that digest against the exact, tag-bound identity
+cosign verify "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" \
+  --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+  --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>'
+
+# 3. only if step 2 succeeded, pull and use that same @sha256: reference
+docker pull "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}"
 
 # Self-extract the whole tree into ./yuzu-agents/ :
-docker run --rm -v "$PWD:/out" ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version>
+docker run --rm -v "$PWD:/out" "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}"
 
 # …or copy it out without running anything in the container:
-cid=$(docker create ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version>)
+cid=$(docker create "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}")
 docker cp "$cid:/opt/yuzu-agents" .
 docker rm "$cid"
 
@@ -297,8 +314,10 @@ cosign verify-blob --bundle UPSTREAM-SHA256SUMS.sigstore \
 `UPSTREAM-SHA256SUMS.sigstore` is absent from bundles built before this check
 existed, and the first release that carries a `SHA256SUMS.sigstore` to rebuild
 from is v0.11.0-rc1. The check that covers what you extracted is the
-signature on the **image** (below): verify it on the image you pulled before
-you trust or run anything in it.
+signature on the **image**: verify it by digest, as in "Use it (partner)" above,
+before you pull, run or extract anything, and extract from that same `@sha256:`
+reference. A registry verify does not cover a mirrored, `docker load`ed or
+locally built image.
 
 **Nothing in the bundle is code-signed today.** The release workflow's
 Authenticode steps for the Windows binaries and installer are skipped (no
@@ -312,13 +331,15 @@ below verified, because the cosign signatures are the only authenticity check.
 
 The **image itself** (when built by the `docker-publish-agent-bundle` release
 job) is cosign-keyless-signed with SLSA provenance and a CycloneDX/SPDX SBOM, so
-a partner's security team can verify it before trusting the pull:
+a partner's security team can verify it before trusting the pull. The command is
+the digest form from "Use it (partner)"; `DIGEST` is resolved with the same
+`docker buildx imagetools inspect` call:
 
 ```bash
-cosign verify ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> \
+cosign verify "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>'
-gh attestation verify oci://ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> --repo <owner>/Yuzu
+gh attestation verify "oci://ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" --repo <owner>/Yuzu
 ```
 
 `<signer>` is the repository that ran `release.yml` for that tag (`DevNullLtd/Yuzu` since the 2026-09-28 move, `Tr3kkR/Yuzu` before it); the identity is an exact, tag-bound match, and `<owner>` is the registry owner.

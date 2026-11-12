@@ -133,6 +133,7 @@ done
 VERSION="${VERSION#v}"                 # normalise: store without leading v
 TAG="v${VERSION}"                      # release tag carries the v
 IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+IMAGE_REPO="${REGISTRY}/${IMAGE_NAME}"   # the README verifies and pulls this by digest, not by tag
 
 # ── Signer identity (hard-coded era table; NEVER derived from REPO_SLUG) ───
 # The Fulcio certificate SAN of a release's SHA256SUMS signature names the repo
@@ -426,13 +427,31 @@ This is a DELIVERY image, not a runtime: it ships the agent for three operating
 systems so you can copy the right one onto each endpoint. Nothing here runs the
 Windows or macOS binaries — a Linux container cannot.
 
-Extract the whole tree
+Verify the image, then extract the whole tree
 ----------------------------------------------------------------------------
-  # self-extract into ./yuzu-agents/ :
-  docker run --rm -v "\$PWD:/out" ${IMAGE_REF}
+  A cosign check of a TAG is answered by the registry: it never reads an image
+  already on your machine. So verify the image by DIGEST, then pull and extract
+  from that same @sha256: reference and from nothing else (CI-published images
+  only; a hand-built image is not signed, so there is nothing to verify):
+
+  # 1. resolve the tag to a digest at the registry
+  DIGEST=\$(docker buildx imagetools inspect ${IMAGE_REF} --format '{{.Manifest.Digest}}')
+
+  # 2. verify that digest against the exact, tag-bound signer identity
+  cosign verify ${IMAGE_REPO}@\$DIGEST \\
+    --certificate-identity https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG} \\
+    --certificate-oidc-issuer ${SIGNER_ISSUER}
+
+  # 3. only if step 2 succeeded: pull, then self-extract into ./yuzu-agents/
+  docker pull ${IMAGE_REPO}@\$DIGEST
+  docker run --rm -v "\$PWD:/out" ${IMAGE_REPO}@\$DIGEST
 
   # or copy out without running anything in the container:
-  cid=\$(docker create ${IMAGE_REF}); docker cp "\$cid:/opt/yuzu-agents" .; docker rm "\$cid"
+  cid=\$(docker create ${IMAGE_REPO}@\$DIGEST); docker cp "\$cid:/opt/yuzu-agents" .; docker rm "\$cid"
+
+  A registry verify does NOT cover an image that was mirrored under another name,
+  loaded with "docker load", or built locally: none of those is the object the
+  signature names. Pull from the signed registry by digest, as above.
 
 Layout
 ----------------------------------------------------------------------------
@@ -452,12 +471,12 @@ Integrity
   - UPSTREAM-SHA256SUMS(.sigstore): the release archives and installers the
     build downloaded matched the signed ${TAG} release manifest. It does not
     cover payload/ as laid out here.
-  - The bundle IMAGE signature: the only check that covers what you extracted.
-    Verify the image you pulled BEFORE trusting or running anything in it
-    (published by CI; a hand-built image is not signed):
-      cosign verify ${IMAGE_REF} \\
-        --certificate-identity https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG} \\
-        --certificate-oidc-issuer ${SIGNER_ISSUER}
+  - The bundle IMAGE signature: the only check that covers what you extracted,
+    and only when you verified the digest you then pulled and extracted from
+    (steps 1 to 3 at the top of this file).
+  - Without a code signature, Windows SmartScreen may warn on the agent and
+    installer, and macOS Gatekeeper will quarantine and may refuse a copied
+    binary or the .pkg; see #239.
 
   SHA256SUMS           checksums of every file in THIS tree
   UPSTREAM-SHA256SUMS  the checksums from the ${TAG} GitHub release; this
@@ -509,14 +528,12 @@ DEMO (no-TLS stack, foreground) — simplest:
     --enrollment-token <TOKEN> \\
     --plugin-dir "\$PWD/plugins" --data-dir ./data --log-level info
   # The macOS agent is NOT signed or notarized (see docs/agent-bundle.md), so
-  # Gatekeeper will quarantine copied files. The sha256 files in this bundle only
+  # Gatekeeper will quarantine copied files and may refuse to open them until
+  # quarantine is cleared (see #239). The sha256 files in this bundle only
   # show it is internally consistent; what authenticates payload/ is the bundle
-  # IMAGE signature. Clear quarantine only after this succeeds on the image you
-  # pulled (CI-published images only):
-  #   cosign verify ${IMAGE_REF} \\
-  #     --certificate-identity https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG} \\
-  #     --certificate-oidc-issuer ${SIGNER_ISSUER}
-  # then:
+  # IMAGE signature. Clear quarantine only if you verified the image by digest
+  # (steps 1 to 3 in ../README.txt) and extracted this tree from that same
+  # @sha256: reference:
   #   xattr -dr com.apple.quarantine ./bin ./plugins
 
 PERSISTENT (launchd daemon via the .pkg; the .pkg is not signed or notarized either):

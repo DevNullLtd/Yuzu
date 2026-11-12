@@ -9,6 +9,13 @@ All examples assume you have downloaded the release assets from
 <https://github.com/DevNullLtd/Yuzu/releases> into the current directory, and
 that the tag under verification is `v0.11.0`. Substitute as needed.
 
+> **Warning: older release pages show a wildcard command.** The GitHub release
+> pages published before this page's exact commands (v0.7.0-rc1 to v0.15.0, 18
+> pages) print a `cosign verify` command whose identity is a wildcard
+> (`--certificate-identity-regexp '.*'`). A wildcard accepts a signature from
+> any GitHub repository, so it proves almost nothing. Do not copy it: use the
+> exact, tag-bound commands on this page.
+
 ## Which owner applies to your release
 
 Yuzu moved from the personal account `Tr3kkR` to the `DevNullLtd` organisation
@@ -60,7 +67,7 @@ certificate at build time and cannot be restamped.
 #   macOS:         brew install gh
 #   Windows:       winget install --id GitHub.cli
 
-# cosign for Sigstore signature verification
+# cosign v2.6.2 or later, for Sigstore signature verification
 #   Ubuntu/Debian: curl -sSLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x cosign-*
 #   macOS:         brew install cosign
 #   Windows:       winget install --id Sigstore.Cosign
