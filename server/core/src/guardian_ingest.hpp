@@ -114,6 +114,20 @@ inline constexpr const char* kGuardianPairRejectReasons[] = {"half_set", "out_of
 void apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch, std::uint64_t emit_seq,
                      yuzu::MetricsRegistry* metrics);
 
+/// Gauge of agents "currently unordered": the latest accepted unpaired census-bearing event is
+/// later than the agent's pair clock (`GuaranteedStateStore::unordered_agents`). Fleet-wide, no
+/// labels (never by agent: the per-agent view is the `ordering` field of the per-device read).
+/// Described in server.cpp and deliberately NOT pre-seeded, like `..._census_pending_events`: a
+/// zero before the first answered read would read as "no unordered agents".
+inline constexpr char kGuardianCensusUnorderedAgentsMetric[] =
+    "yuzu_server_guardian_census_unordered_agents";
+
+/// Periodic-sweep body for `kGuardianCensusUnorderedAgentsMetric`: reads the fleet-wide count and
+/// sets the gauge ONLY when the store answered. A store that cannot answer leaves the previous
+/// sample in place (a failed read must not publish a fresh zero).
+void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry& metrics,
+                                             const GuaranteedStateStore& store);
+
 /// Prometheus metric name for the store-operation latency histogram: server-side latency of
 /// `insert_event_classified` (the classify+store SQLite txn) for one Guardian event, split by
 /// outcome `status`. Shared by the observe site (guardian_ingest.cpp) and the describe +

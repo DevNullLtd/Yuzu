@@ -148,6 +148,13 @@ struct GuardianStatusRollup {
     std::int64_t drifted_rules{0};
     std::int64_t errored_rules{0};
     std::int64_t uncertain_rules{0}; // rules with an order-uncertain or pending represented pair
+    /// Agents currently unordered (see `GuardianAgentOrder::currently_unordered`) inside the
+    /// caller's scope: the exact count, and the first `kUnorderedAgentIdCap` ids in byte order.
+    /// `unordered_agents > unordered_agent_ids.size()` means the list is truncated. 0 does not
+    /// establish that every agent sends an order pair: an agent that sent no census-bearing event
+    /// has no order row and is in neither figure.
+    std::int64_t unordered_agents{0};
+    std::vector<std::string> unordered_agent_ids;
 };
 
 /// One row of `guardian_agent_order` (schema v5): the per-agent pair clock and its counters, as the
@@ -168,6 +175,13 @@ struct GuardianAgentOrder {
     std::int64_t pair_recoveries{0};
     std::int64_t pair_duplicates{0};
     std::int64_t retired_events{0};
+
+    /// "Currently unordered": the latest accepted unpaired census-bearing event is later than the
+    /// pair clock (a NULL clock reads as 0). The store applies the same predicate in SQL for the
+    /// fleet count (`unpaired_recv_ns IS NOT NULL AND unpaired_recv_ns > COALESCE(epoch_recv_ns, 0)`).
+    [[nodiscard]] bool currently_unordered() const noexcept {
+        return unpaired_recv_ns.has_value() && *unpaired_recv_ns > epoch_recv_ns.value_or(0);
+    }
 };
 
 /// Agents "currently unordered" (`unpaired_recv_ns` set and later than `COALESCE(epoch_recv_ns, 0)`)
@@ -287,6 +301,10 @@ struct GuardianDeviceGuardsReport {
     /// completeness.
     std::int64_t unrepresented_pending_guards{0};
     std::vector<std::string> unrepresented_pending_rule_ids;
+    /// The device's `guardian_agent_order` row (the stored emit-order pair clock and its
+    /// counters), or `nullopt` when the device never had a census-bearing event accepted (or was
+    /// decommissioned). Stored and counted, not yet compared: no verdict is held or refused on it.
+    std::optional<GuardianAgentOrder> ordering;
 };
 
 } // namespace yuzu::server

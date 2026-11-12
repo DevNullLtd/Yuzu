@@ -109,6 +109,10 @@ void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
                           {{"status", std::string(event_insert_status_label(status))}}, buckets);
 }
 
+void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry&, const GuaranteedStateStore&) {
+    // Stub, red until the next commit.
+}
+
 // ── #4666 PR-4: dedicated bounded async logger for the T_server diagnostic line ─────────────
 // See the full design rationale on the declarations in guardian_ingest.hpp. This is
 // deliberately much lighter than agents/core/src/log_handoff.hpp's LogHandoff: one 1024-slot

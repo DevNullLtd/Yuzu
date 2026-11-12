@@ -15,6 +15,8 @@
  */
 
 #include "guardian_api_local.hpp"
+#include "guardian_ingest.hpp"
+#include "guardian_order_json.hpp"
 
 #include "baseline_store.hpp"
 #include "guaranteed_state_store.hpp"
@@ -24,7 +26,10 @@
 #include "../test_helpers.hpp"
 #include "test_events_table_lock.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <libpq-fe.h>
 
@@ -534,4 +539,287 @@ TEST_CASE("GuardianApi: a statement timeout of the unrepresented read is kStatem
     auto report = api->device_guards("agent-1", &fault);
     REQUIRE(report.has_value());
     CHECK(fault == GuardianReadFault::kNone);
+}
+
+// ── UP-14 server PR A5a: the stored per-agent ordering state on the device view, the fleet rollup
+// and the sweep gauge. The seam forwards the store's reads (`agent_order_for_agent`,
+// `unordered_agents`); what is pinned here is the wiring, the scope, the cap, the degrade and the
+// shared JSON rendering. ──
+
+namespace {
+
+using yuzu::server::GuardianAgentOrder;
+using yuzu::server::kUnorderedAgentIdCap;
+
+// One census-bearing event for (agent, "r1"). `pair` set = a paired event, unset = unpaired. `n`
+// makes the event id and the agent stamp unique so every call is a first delivery.
+void send_event(GuaranteedStateStore& store, int n, const std::string& agent,
+                std::optional<std::pair<std::int64_t, std::int64_t>> pair = std::nullopt) {
+    GuaranteedStateEventRow e = make_event("ord-" + std::to_string(n), "r1", agent);
+    e.agent_ns = yuzu::test::iso8601_to_ns("2026-04-19T12:00:00Z") + n * 1'000'000'000LL;
+    if (pair) {
+        e.boot_epoch = pair->first;
+        e.emit_seq = pair->second;
+    }
+    const auto r = store.insert_event_classified(e);
+    REQUIRE(r.outcome == yuzu::server::EventInsertOutcome::Inserted);
+}
+
+} // namespace
+
+TEST_CASE("guardian order json: every key is present, unset columns are null and "
+          "currently_unordered follows the pair clock",
+          "[guardian_api][ordering][pair]") {
+    using yuzu::server::render_guardian_agent_order_json;
+    GuardianAgentOrder o;
+    o.agent_id = "a";
+
+    SECTION("a row with nothing set renders nulls, zero counters and not unordered") {
+        const auto j = nlohmann::json::parse(render_guardian_agent_order_json(o));
+        for (const char* k : {"epoch", "emit_seq_hwm", "epoch_recv_ns", "retired_epoch",
+                              "unpaired_recv_ns"}) {
+            INFO(k);
+            REQUIRE(j.contains(k));
+            CHECK(j[k].is_null());
+        }
+        for (const char* k : {"unpaired_events", "unpaired_held", "pair_regressions",
+                              "pair_stragglers", "pair_recoveries", "pair_duplicates",
+                              "retired_events"}) {
+            INFO(k);
+            REQUIRE(j.contains(k));
+            CHECK(j[k] == 0);
+        }
+        REQUIRE(j.contains("currently_unordered"));
+        CHECK(j["currently_unordered"] == false);
+        CHECK(j.size() == 13);
+    }
+    SECTION("every column maps to its own key") {
+        o.epoch = 5;
+        o.emit_seq_hwm = 10;
+        o.epoch_recv_ns = 1'700'000'000'000'000'000LL;
+        o.retired_epoch = 3;
+        o.unpaired_recv_ns = 1'700'000'000'000'000'001LL;
+        o.unpaired_events = 1;
+        o.unpaired_held = 2;
+        o.pair_regressions = 3;
+        o.pair_stragglers = 4;
+        o.pair_recoveries = 5;
+        o.pair_duplicates = 6;
+        o.retired_events = 7;
+        const auto j = nlohmann::json::parse(render_guardian_agent_order_json(o));
+        CHECK(j["epoch"] == 5);
+        CHECK(j["emit_seq_hwm"] == 10);
+        CHECK(j["epoch_recv_ns"].get<std::int64_t>() == 1'700'000'000'000'000'000LL);
+        CHECK(j["retired_epoch"] == 3);
+        CHECK(j["unpaired_recv_ns"].get<std::int64_t>() == 1'700'000'000'000'000'001LL);
+        CHECK(j["unpaired_events"] == 1);
+        CHECK(j["unpaired_held"] == 2);
+        CHECK(j["pair_regressions"] == 3);
+        CHECK(j["pair_stragglers"] == 4);
+        CHECK(j["pair_recoveries"] == 5);
+        CHECK(j["pair_duplicates"] == 6);
+        CHECK(j["retired_events"] == 7);
+        CHECK(j["currently_unordered"] == true); // unpaired later than the clock
+    }
+    SECTION("currently_unordered is strict: an equal time is not unordered, a NULL clock reads 0") {
+        o.unpaired_recv_ns = 100;
+        CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
+              true); // NULL clock = 0
+        o.epoch_recv_ns = 100;
+        CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
+              false); // equal
+        o.epoch_recv_ns = 101;
+        CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
+              false); // the pair clock is later
+        o.epoch_recv_ns = 99;
+        CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
+              true);
+        o.unpaired_recv_ns.reset(); // no unpaired event ever: never unordered
+        CHECK(nlohmann::json::parse(render_guardian_agent_order_json(o))["currently_unordered"] ==
+              false);
+    }
+}
+
+TEST_CASE("GuardianApi::device_guards: the ordering block is the agent's order row, null when the "
+          "agent has none",
+          "[pg][guardian_api][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    REQUIRE(store.create_rule(make_rule("r1", "Guard one")).has_value());
+    send_event(store, 1, "unpaired-only");
+    send_event(store, 2, "paired-only", std::pair<std::int64_t, std::int64_t>{5, 10});
+    send_event(store, 3, "paired-then-unpaired", std::pair<std::int64_t, std::int64_t>{5, 10});
+    send_event(store, 4, "paired-then-unpaired");
+    auto api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
+
+    const auto ordering_of = [&](const char* agent) {
+        GuardianReadFault fault = GuardianReadFault::kTransient;
+        auto report = api->device_guards(agent, &fault);
+        REQUIRE(report.has_value());
+        CHECK(fault == GuardianReadFault::kNone);
+        return report->ordering;
+    };
+
+    SECTION("an unpaired agent is currently unordered and has no pair clock") {
+        const auto o = ordering_of("unpaired-only");
+        REQUIRE(o.has_value());
+        CHECK(o->agent_id == "unpaired-only");
+        CHECK_FALSE(o->epoch.has_value());
+        CHECK_FALSE(o->epoch_recv_ns.has_value());
+        CHECK(o->unpaired_recv_ns.has_value());
+        CHECK(o->unpaired_events == 1);
+        CHECK(o->currently_unordered());
+    }
+    SECTION("a paired agent is not currently unordered") {
+        const auto o = ordering_of("paired-only");
+        REQUIRE(o.has_value());
+        CHECK(o->epoch == std::optional<std::int64_t>{5});
+        CHECK(o->emit_seq_hwm == std::optional<std::int64_t>{10});
+        CHECK(o->epoch_recv_ns.has_value());
+        CHECK_FALSE(o->unpaired_recv_ns.has_value());
+        CHECK(o->unpaired_events == 0);
+        CHECK_FALSE(o->currently_unordered());
+    }
+    SECTION("an unpaired event after the pair clock makes a paired agent unordered again") {
+        const auto o = ordering_of("paired-then-unpaired");
+        REQUIRE(o.has_value());
+        CHECK(o->epoch == std::optional<std::int64_t>{5});
+        CHECK(o->unpaired_events == 1);
+        CHECK(o->currently_unordered());
+    }
+    SECTION("an agent with no order row has a null ordering and the read still answers") {
+        GuardianReadFault fault = GuardianReadFault::kTransient;
+        auto report = api->device_guards("nobody", &fault);
+        REQUIRE(report.has_value());
+        CHECK(fault == GuardianReadFault::kNone);
+        CHECK(report->guards.empty());
+        CHECK_FALSE(report->ordering.has_value());
+    }
+    SECTION("the ordering equals the store's own row") {
+        const auto o = ordering_of("paired-then-unpaired");
+        const auto row = store.agent_order_for_agent("paired-then-unpaired");
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        REQUIRE(o.has_value());
+        CHECK(yuzu::server::render_guardian_agent_order_json(*o) ==
+              yuzu::server::render_guardian_agent_order_json(**row));
+    }
+}
+
+TEST_CASE("GuardianApi::status: unordered_agents and its ids are the scoped, capped store read",
+          "[pg][guardian_api][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    REQUIRE(store.create_rule(make_rule("r1", "Guard one")).has_value());
+    auto api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
+    using Scope = std::optional<std::vector<std::string>>;
+
+    SECTION("an empty fleet answers a successful zero") {
+        const auto r = api->status(Scope{});
+        REQUIRE(r.has_value());
+        CHECK(r->unordered_agents == 0);
+        CHECK(r->unordered_agent_ids.empty());
+    }
+    SECTION("only currently-unordered agents count, ids in byte order") {
+        send_event(store, 1, "U2");
+        send_event(store, 2, "U1");
+        send_event(store, 3, "P", std::pair<std::int64_t, std::int64_t>{5, 10});
+        const auto r = api->status(Scope{});
+        REQUIRE(r.has_value());
+        CHECK(r->unordered_agents == 2);
+        CHECK(r->unordered_agent_ids == std::vector<std::string>{"U1", "U2"});
+    }
+    SECTION("a confined scope sees only visible agents, and a hidden one never inflates the count") {
+        send_event(store, 1, "VIS");
+        send_event(store, 2, "HIDDEN");
+        send_event(store, 3, "VIS-PAIRED", std::pair<std::int64_t, std::int64_t>{5, 10});
+        const auto r = api->status(Scope{{"VIS", "VIS-PAIRED"}});
+        REQUIRE(r.has_value());
+        CHECK(r->unordered_agents == 1);
+        CHECK(r->unordered_agent_ids == std::vector<std::string>{"VIS"});
+        const auto none = api->status(Scope{{"nobody"}});
+        REQUIRE(none.has_value());
+        CHECK(none->unordered_agents == 0);
+        CHECK(none->unordered_agent_ids.empty());
+    }
+    SECTION("the id list is capped and the count is exact") {
+        constexpr int kAgents = 55;
+        for (int i = kAgents - 1; i >= 0; --i)
+            send_event(store, i + 1, std::format("ag{:03}", i));
+        const auto r = api->status(Scope{});
+        REQUIRE(r.has_value());
+        CHECK(r->unordered_agents == kAgents);
+        REQUIRE(r->unordered_agent_ids.size() == kUnorderedAgentIdCap);
+        CHECK(r->unordered_agent_ids.front() == "ag000");
+        CHECK(r->unordered_agent_ids.back() == "ag049");
+    }
+}
+
+TEST_CASE("GuardianApi: a failed order read degrades the read, never a silent zero or null",
+          "[pg][guardian_api][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    REQUIRE(store.create_rule(make_rule("r1", "Guard one")).has_value());
+    send_event(store, 1, "a");
+    auto api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
+    // Every other read still works; only the order table is gone.
+    exec_sql(gs_db.dsn(), "DROP TABLE guaranteed_state_store.guardian_agent_order CASCADE");
+
+    using Scope = std::optional<std::vector<std::string>>;
+    CHECK_FALSE(api->status(Scope{}).has_value());
+    CHECK_FALSE(api->status(Scope{{"a"}}).has_value());
+    // An engaged-empty scope is zero without a query (INV-2), so it answers even now.
+    const auto empty = api->status(Scope{std::vector<std::string>{}});
+    REQUIRE(empty.has_value());
+    CHECK(empty->unordered_agents == 0);
+
+    GuardianReadFault fault = GuardianReadFault::kNone;
+    CHECK_FALSE(api->device_guards("a", &fault).has_value());
+    CHECK(fault == GuardianReadFault::kTransient);
+}
+
+TEST_CASE("the unordered-agents gauge is set from a successful read and never from a failed one",
+          "[pg][guardian_api][ordering][pair][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    REQUIRE(store.create_rule(make_rule("r1", "Guard one")).has_value());
+    yuzu::MetricsRegistry metrics;
+    const auto value = [&] {
+        return metrics.gauge(yuzu::server::detail::kGuardianCensusUnorderedAgentsMetric).value();
+    };
+    const auto sweep = [&] {
+        yuzu::server::detail::publish_guardian_census_unordered_gauge(metrics, store);
+    };
+
+    send_event(store, 1, "u1");
+    send_event(store, 2, "u2");
+    send_event(store, 3, "p", std::pair<std::int64_t, std::int64_t>{5, 10});
+    sweep();
+    CHECK(value() == 2.0);
+
+    // A paired event after the unpaired one clears that agent: the next sweep sees one.
+    send_event(store, 4, "u1", std::pair<std::int64_t, std::int64_t>{7, 1});
+    sweep();
+    CHECK(value() == 1.0);
+
+    // A failed read leaves the previous sample: it is not published as zero.
+    exec_sql(gs_db.dsn(), "DROP TABLE guaranteed_state_store.guardian_agent_order CASCADE");
+    sweep();
+    CHECK(value() == 1.0);
+}
+
+TEST_CASE("the unordered-agents gauge is absent until a read answers",
+          "[pg][guardian_api][ordering][pair][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(gs_db, guardianstate_tpl);
+    PgPool gs_pool{{.conninfo = gs_db.dsn(), .size = 2}};
+    GuaranteedStateStore store{gs_pool};
+    exec_sql(gs_db.dsn(), "DROP TABLE guaranteed_state_store.guardian_agent_order CASCADE");
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::publish_guardian_census_unordered_gauge(metrics, store);
+    CHECK(metrics.serialize().find(yuzu::server::detail::kGuardianCensusUnorderedAgentsMetric) ==
+          std::string::npos);
 }
