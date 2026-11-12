@@ -80,7 +80,7 @@ chosen by the **requested version**: a pre-release can carry the installers of
 earlier pre-releases beside its own (v0.13.0-rc6 also holds the rc4 `.deb` and
 `.rpm`), so the script derives the exact file names for that version and
 refuses to build if none, or more than one, exists. It **refuses to build** on
-any failure, including a missing `cosign` (required, v3.x, no skip flag), a
+any failure, including a missing `cosign` (required, v2.6.2 or later, no skip flag), a
 missing `.sigstore`, or a legacy release that carries only `SHA256SUMS.bundle`.
 The signer is a fixed table by version, not read from `origin`: `Tr3kkR/Yuzu`
 up to `v0.13.x`, `DevNullLtd/Yuzu` after the 2026-09-28 move (see
@@ -91,7 +91,7 @@ the table. The only legitimate signers are those two repositories: never set
 on the default means a tampered release or the wrong download source (rule out
 an old cosign, a wrong clock and a Sigstore network failure first).
 
-Requirements: `gh` (authenticated), `cosign` v3.x with network access to
+Requirements: `gh` (authenticated), `cosign` v2.6.2 or later with network access to
 Sigstore's TUF root (there is no offline mode; `--trusted-root` is not wired
 in), `sha256sum` or `shasum`, `git`, and a Yuzu checkout. A full build also
 needs `docker` and `unzip`. The script is bash; run it on Linux or macOS, or
@@ -286,7 +286,7 @@ sha256sum -c SHA256SUMS          # the laid-out tree is intact (NOT proof it is 
 # build verified before use; UPSTREAM-SHA256SUMS.sigstore is its cosign bundle.
 # It authenticates the release archives and installers, not payload/ as laid out.
 # SIGNER_REPO is Tr3kkR/Yuzu for releases up to v0.13.x, DevNullLtd/Yuzu after.
-# Needs cosign v3.x and network access to Sigstore's TUF root:
+# Needs cosign v2.6.2 or later and network access to Sigstore's TUF root:
 SIGNER_REPO=DevNullLtd/Yuzu
 TAG=v<version>
 cosign verify-blob --bundle UPSTREAM-SHA256SUMS.sigstore \

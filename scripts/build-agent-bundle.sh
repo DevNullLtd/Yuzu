@@ -180,7 +180,7 @@ if [ "$VERIFY_ONLY" = 0 ]; then
 fi
 # cosign is mandatory: SHA256SUMS is only trustworthy once its signature is
 # verified, so a missing cosign is a hard stop, never a skipped check.
-command -v cosign >/dev/null 2>&1 || die "need cosign on PATH to verify SHA256SUMS' signature (no skip flag, by design) — install cosign v3 from the Sigstore releases (https://docs.sigstore.dev/cosign/system_config/installation/) or your package manager, and check 'cosign version' is v3.x (tested with v3.1.3; the release workflow uses v3.0.5; an older cosign may not read the .sigstore bundle)"
+command -v cosign >/dev/null 2>&1 || die "need cosign on PATH to verify SHA256SUMS' signature (no skip flag, by design) — install cosign from the Sigstore releases (https://docs.sigstore.dev/cosign/system_config/installation/) or your package manager, and check 'cosign version' is v2.6.2 or later (verified with v2.6.2, v3.0.5 and v3.1.3; an older cosign is untested and may not read the .sigstore bundle)"
 command -v gh >/dev/null 2>&1 || die "need the GitHub CLI (gh), authenticated, to download release assets — 'brew install gh && gh auth login'"
 
 DL=""; SMOKE_TMP=""
@@ -252,7 +252,7 @@ if ! cosign verify-blob \
   fail "The only legitimate signers are Tr3kkR/Yuzu (<= 0.13.x) and DevNullLtd/Yuzu (after)."
   fail "A mismatch on the default path means a tampered release or the wrong download source."
   fail "NEVER set --signer-repo to the subject cosign reports above."
-  fail "Rule out first: cosign older than v3.x ('cosign version'), a wrong system clock, or a"
+  fail "Rule out first: cosign older than v2.6.2 ('cosign version'), a wrong system clock, or a"
   fail "Sigstore/TUF network failure. There is no offline mode: check your proxy/DNS and re-run;"
   fail "if it persists for about an hour, or cosign reports an expired or unverifiable trusted"
   fail "root, treat it as permanent and update cosign."

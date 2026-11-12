@@ -278,7 +278,7 @@ subject cosign prints. A network error reaching Sigstore's TUF root usually
 clears on a re-run (cosign needs network access to the TUF root, or a local
 `--trusted-root`; there is no offline mode in `scripts/build-agent-bundle.sh`); if
 it persists for about an hour, or cosign reports an expired or unverifiable
-trusted root, update cosign (v3.x) instead of waiting.
+trusted root, update cosign (v2.6.2 or later) instead of waiting.
 
 **`SHA256SUMS.sigstore: no such file`** — the v0.7.x releases ship the
 bundle only under the legacy filename `SHA256SUMS.bundle`; v0.8.0-rc0 to

@@ -308,7 +308,7 @@ class VerifyTests(unittest.TestCase):
         r = self.run_script("--version", "0.15.0", cosign_rc=1,
                             cosign_stderr="Error: expected SAN github.com/Attacker/Yuzu")
         self.assertFailed(r, "Tr3kkR/Yuzu", "DevNullLtd/Yuzu", "tampered release or the wrong download source",
-                          "NEVER set --signer-repo", "cosign older than v3.x",
+                          "NEVER set --signer-repo", "cosign older than v2.6.2",
                           "There is no offline mode", "treat it as permanent")
         self.assertNotIn("wrong --signer-repo", r.stdout + r.stderr)
 
@@ -355,7 +355,7 @@ class VerifyTests(unittest.TestCase):
     def test_cosign_absent_fails_closed(self):
         self.release("0.15.0")
         r = self.run_script("--version", "0.15.0", cosign=False)
-        self.assertFailed(r, "need cosign on PATH", "install cosign v3", "cosign version")
+        self.assertFailed(r, "need cosign on PATH", "install cosign from the Sigstore releases", "cosign version")
         self.assertNotIn("have no cosign package", r.stdout + r.stderr)
         self.assertFalse((self.logs / "gh.argv").exists(), "must stop before downloading")
 
