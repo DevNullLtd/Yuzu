@@ -2833,14 +2833,14 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
         // The step-up wording: mfa_step_up_required is false on the SAML and engine 403s, and the
         // envelope description says every step-up refusal carries a remediation bar two defensive
         // fault paths.
-        CHECK(desc->get<std::string>().find("adds mfa_step_up_required to meta (false on the 403)") !=
-              std::string::npos);
+        CHECK(desc->get<std::string>().find(
+                  "adds mfa_step_up_required to meta (false on the 403)") != std::string::npos);
         const json* envelope_desc =
             find_at(spec, {"components", "schemas", "A4ErrorEnvelope", "description"});
         REQUIRE(envelope_desc != nullptr);
-        CHECK(envelope_desc->get<std::string>().find(
-                  "with a remediation, but never retry_after_ms (two defensive fault paths differ") !=
-              std::string::npos);
+        CHECK(envelope_desc->get<std::string>().find("with a remediation, but never "
+                                                     "retry_after_ms (two defensive fault paths "
+                                                     "differ") != std::string::npos);
 
         // The score-policy PUT and DELETE word the retry rule, the audit refusal (5000), the busy
         // writer (2000) and the replay of an applied write in their own responses; the behaviour
@@ -2862,6 +2862,10 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
             CHECK(response_text(method, "429").find("Server-wide, not specific to this route") !=
                   std::string::npos);
             CHECK(response_text(method, "429").find("per-principal quota") != std::string::npos);
+            CHECK(response_text(method, "429").find("refused before routing, so nothing was "
+                                                    "changed") != std::string::npos);
+            CHECK(response_text(method, "429").find("a suggested wait before retrying") !=
+                  std::string::npos);
             const json* retry_after = find_at(spec, {"paths", "/dex/score-policy", method,
                                                      "responses", "429", "headers", "Retry-After",
                                                      "schema", "type"});
