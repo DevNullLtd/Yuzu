@@ -1238,21 +1238,23 @@ bool has_attempt_row(const QuarantineRouteHarness& h) {
     return find_audit(h, "attempt") != nullptr;
 }
 
-// Ends the active record the way the reconciler does once it reads `inactive`.
-void end_as_reconciler(QuarantineStore& store, const std::string& agent) {
+// Ends the active record the way `end` says: `device_confirmed` as the reconciler does once it
+// reads `inactive`; `forced` as a concurrent forced DELETE does (no device answer, the device
+// still owed a release).
+void end_record_as(QuarantineStore& store, const std::string& agent, ReleaseEnd end) {
     auto rec = store.get_status(agent);
     REQUIRE(rec.has_value());
     REQUIRE(rec->has_value());
-    REQUIRE(store.mark_released(agent, (*rec)->id, ReleaseEnd::device_confirmed).has_value());
+    REQUIRE(store.mark_released(agent, (*rec)->id, end).has_value());
 }
 
-// Ends the active record the way a concurrent forced DELETE does: no device answer, the device
-// still owed a release.
-void end_as_forced(QuarantineStore& store, const std::string& agent) {
-    auto rec = store.get_status(agent);
-    REQUIRE(rec.has_value());
-    REQUIRE(rec->has_value());
-    REQUIRE(store.mark_released(agent, (*rec)->id, ReleaseEnd::forced).has_value());
+// Runs one statement on a fresh connection to the test database, for the races that need the
+// store's own table changed underneath a request.
+void exec_sql(const std::string& dsn, const char* sql) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r{PQexec(conn.get(), sql)};
+    REQUIRE(r.ok());
 }
 
 } // namespace
@@ -1352,7 +1354,9 @@ TEST_CASE("REST DELETE /api/v1/quarantine: a reply of inactive for a record anot
           "also 200, and the success row says it was already ended",
           "[rest][quarantine][release][pg]") {
     RELEASE_RIG(h, "status|inactive");
-    h.on_dispatch = [&h] { end_as_reconciler(h.quarantine_store, "agent-B"); };
+    h.on_dispatch = [&h] {
+        end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::device_confirmed);
+    };
     auto res = h.del("agent-B");
     REQUIRE(res);
     CHECK(res->status == 200);
@@ -1538,7 +1542,9 @@ TEST_CASE("REST DELETE /api/v1/quarantine?force=true: ends a record already rele
     }
     SECTION("ended by the reconciler first") {
         RELEASE_RIG(h, "");
-        h.on_dispatch = [&h] { end_as_reconciler(h.quarantine_store, "agent-B"); };
+        h.on_dispatch = [&h] {
+            end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::device_confirmed);
+        };
         auto res = h.del("agent-B", "?force=true");
         REQUIRE(res);
         CHECK(res->status == 200);
@@ -1555,7 +1561,7 @@ TEST_CASE("REST DELETE /api/v1/quarantine?force=true: ends a record already rele
         // The losing call of two forced DELETEs: its guarded mark touches no row, but the device
         // was never confirmed and is still owed a release, so it must not read as a release.
         RELEASE_RIG(h, "");
-        h.on_dispatch = [&h] { end_as_forced(h.quarantine_store, "agent-B"); };
+        h.on_dispatch = [&h] { end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::forced); };
         auto res = h.del("agent-B", "?force=true");
         REQUIRE(res);
         CHECK(res->status == 200);
@@ -1571,6 +1577,54 @@ TEST_CASE("REST DELETE /api/v1/quarantine?force=true: ends a record already rele
         const auto owed = owed_list(h.quarantine_store); // still owed: only the device can clear it
         REQUIRE(owed.size() == 1);
         CHECK(owed[0].agent_id == "agent-B");
+    }
+    SECTION("the record's row is gone when the losing call reads its history") {
+        // A zero-row mark proves the record ended, but a row that is not there cannot show how:
+        // a missing row is "not confirmed", never a confirmed release.
+        RELEASE_RIG(h, "");
+        h.on_dispatch = [&h, &qdb] {
+            end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::forced);
+            exec_sql(qdb.dsn(), "DELETE FROM quarantine_store.quarantine_records");
+        };
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = parse_body(res->body);
+        CHECK(body["data"]["forced"] == true);
+        CHECK(body["data"]["device_confirmed"] == false);
+        const auto* success = find_audit(h, "success");
+        REQUIRE(success != nullptr);
+        CHECK(success->detail.find("already_ended device_confirmed=false") != std::string::npos);
+        CHECK(success->detail.find("ended_by=") == std::string::npos);
+        const auto history = h.quarantine_store.get_history("agent-B");
+        REQUIRE(history.has_value());
+        CHECK(history->empty()); // the read worked; it just found nothing
+    }
+    SECTION("the history cannot be read when the losing call looks up its record") {
+        // Fail ONLY the history read, after the winning forced end: its CASE compares
+        // release_requested_at with 0, which no longer type-checks once the column is text. The
+        // guarded mark never reads that column, so it still answers "device is not quarantined"
+        // and the handler reaches the history read. An unreadable history is "not confirmed".
+        RELEASE_RIG(h, "");
+        h.on_dispatch = [&h, &qdb] {
+            end_record_as(h.quarantine_store, "agent-B", ReleaseEnd::forced);
+            exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records "
+                                "ALTER COLUMN release_requested_at DROP DEFAULT, "
+                                "ALTER COLUMN release_requested_at TYPE text "
+                                "USING release_requested_at::text");
+        };
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = parse_body(res->body);
+        CHECK(body["data"]["forced"] == true);
+        CHECK(body["data"]["device_confirmed"] == false);
+        const auto* success = find_audit(h, "success");
+        REQUIRE(success != nullptr);
+        CHECK(success->detail.find("already_ended device_confirmed=false") != std::string::npos);
+        CHECK(success->detail.find("ended_by=") == std::string::npos);
+        CHECK(find_audit(h, "failure") == nullptr);
+        CHECK_FALSE(h.quarantine_store.get_history("agent-B").has_value()); // the read is degraded
     }
 }
 

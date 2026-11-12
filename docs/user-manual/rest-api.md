@@ -2419,12 +2419,14 @@ record is a retryable `503` (the record stays releasing), never a `202` that hid
 
 **A record already ended by someone else.** When another writer ends the record between this call's
 release request and its own end (the reconciler, or a second `DELETE` for the same device), this call
-answers `200` with that record's real end, read back from the store. The record was ended on the
-device's confirmation: `forced: false, device_confirmed: true`. A forced end by the other writer still
-owes the device a release: the same body as a forced end, `forced: true, device_confirmed: false` and the
-message that the device may still be contained. The audit row is `state=released record_id=<id>
-already_ended device_confirmed=<true|false>` and names no one: the writer that ended the record has its
-own `quarantine.disable` row with the same `record_id`.
+answers `200` with that record's real end. A forced call reads that end back from the store; a call
+whose own wait read `inactive` reads nothing back and answers on the device's word. A record ended on
+the device's confirmation: `forced: false, device_confirmed: true`. A forced end by the other writer
+still owes the device a release: the same body as a forced end, `forced: true, device_confirmed: false`
+and the message that the device may still be contained. A forced call that cannot read the record back
+(the read fails or the row is gone) answers the same way, never as a confirmed end. The audit row is
+`state=released record_id=<id> already_ended device_confirmed=<true|false>` and names no one: the
+writer that ended the record has its own `quarantine.disable` row with the same `record_id`.
 
 > **`400` vs `503` (ADR-0047).** Same distinction as `POST` above — `400`
 > means the device is not currently quarantined or `force` is not `true`/`false` (retrying will not

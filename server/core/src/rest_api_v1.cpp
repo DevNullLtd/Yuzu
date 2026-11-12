@@ -8343,13 +8343,10 @@ void RestApiV1::register_routes(
                     // history or a missing row is "not confirmed", never the other way.
                     bool device_confirmed = false;
                     if (const auto history = quarantine_store->get_history(agent_id)) {
-                        for (const auto& r : *history) {
-                            if (r.id == record_id) {
-                                device_confirmed =
-                                    r.status == "released" && r.device_release_owed_at == 0;
-                                break;
-                            }
-                        }
+                        const auto it =
+                            std::ranges::find(*history, record_id, &QuarantineRecord::id);
+                        device_confirmed = it != history->end() && it->status == "released" &&
+                                           it->device_release_owed_at == 0;
                     }
                     already_ended(device_confirmed);
                     return;
