@@ -191,13 +191,14 @@ apb::CommandResponse make_error_event(const std::string& event_id) {
 apb::CommandResponse make_rule_event(const std::string& event_id, const std::string& rule_id,
                                      std::int64_t ts_seconds = 1718000000,
                                      std::int32_t ts_nanos = 0, bool with_timestamp = true,
-                                     std::uint64_t boot_epoch = 0, std::uint64_t emit_seq = 0) {
+                                     std::uint64_t boot_epoch = 0, std::uint64_t emit_seq = 0,
+                                     const char* event_type = "service.stopped") {
     gpb::GuaranteedStateEvent ev;
     ev.set_event_id(event_id);
     ev.set_rule_id(rule_id);
     ev.set_boot_epoch(boot_epoch);
     ev.set_emit_seq(emit_seq);
-    ev.set_event_type("service.stopped");
+    ev.set_event_type(event_type);
     ev.set_severity("high");
     ev.set_detected_value("stopped");
     ev.set_expected_value("running");
@@ -952,17 +953,66 @@ TEST_CASE("guardian ingest: a rejected pair does not refuse the event (UP-14 D5)
     const auto ingest = [&](const std::string& id, std::uint64_t boot, std::uint64_t seq) {
         ingest_guardian_response(
             store, "agent-A",
-            make_rule_event(id, "rule-1", 1718000000, 0, true, boot, seq),
+            make_rule_event(id, "rule-1", 1718000000, 0, true, boot, seq, "drift.detected"),
             nullptr, nullptr, &metrics);
     };
+    // The stored pair of an event ("-" is NULL), read back from the event row and the census row.
+    const auto scalar = [&](const std::string& sql) {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(r.ok());
+        return PQntuples(r.get()) == 1 ? std::string(PQgetvalue(r.get(), 0, 0)) : std::string{};
+    };
+    const auto event_pair = [&](const std::string& id) {
+        return scalar("SELECT coalesce(boot_epoch::text, '-') || '/' || coalesce(emit_seq::text, "
+                      "'-') FROM guaranteed_state_store.guaranteed_state_events WHERE event_id = '" +
+                      id + "'");
+    };
+    const auto census_pair = [&](const std::string& agent) {
+        return scalar("SELECT coalesce(boot_epoch::text, '-') || '/' || coalesce(emit_seq::text, "
+                      "'-') FROM guaranteed_state_store.guardian_agent_rule_status WHERE agent_id "
+                      "= '" +
+                      agent + "' AND rule_id = 'rule-1'");
+    };
+    // The census write needs the rule to exist (an undefined rule is refused by its foreign key).
+    yuzu::server::GuaranteedStateRuleRow rule;
+    rule.rule_id = "rule-1";
+    rule.name = "Rule one";
+    rule.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: GuaranteedStateRule\n";
+    rule.version = 1;
+    rule.enabled = true;
+    rule.enforcement_mode = "enforce";
+    rule.severity = "high";
+    rule.os_target = "windows";
+    rule.created_at = "2026-04-19T12:00:00Z";
+    rule.updated_at = "2026-04-19T12:00:00Z";
+    rule.created_by = "alice";
+    rule.updated_by = "alice";
+    REQUIRE(store.create_rule(rule).has_value());
+
+    // A pair the agent sent reaches the event row and the census row as (boot_epoch, emit_seq),
+    // in that order and not swapped, and the order row's pair clock follows it.
     ingest("p-ok", 3, 4);
+    CHECK(event_pair("p-ok") == "3/4");
+    CHECK(census_pair("agent-A") == "3/4");
+    const auto order = store.agent_order_for_agent("agent-A");
+    REQUIRE(order.has_value());
+    REQUIRE(order->has_value());
+    CHECK((*order)->epoch == std::optional<std::int64_t>{3});
+    CHECK((*order)->emit_seq_hwm == std::optional<std::int64_t>{4});
+
     ingest("p-none", 0, 0);
     CHECK(pair_rejected_count(metrics, "half_set") == 0);
     CHECK(pair_rejected_count(metrics, "out_of_range") == 0);
+    CHECK(event_pair("p-none") == "-/-");
     ingest("p-half", 3, 0);
     ingest("p-big", k2p62, 4);
     CHECK(pair_rejected_count(metrics, "half_set") == 1);
     CHECK(pair_rejected_count(metrics, "out_of_range") == 1);
+    // A withheld pair leaves the event row unpaired (NULL/NULL), never a half pair.
+    CHECK(event_pair("p-half") == "-/-");
+    CHECK(event_pair("p-big") == "-/-");
     // Every event, rejected pair or not, is stored; the refusal counter never moved.
     CHECK(store.event_count() == 4);
     CHECK(rejected() == 0);
