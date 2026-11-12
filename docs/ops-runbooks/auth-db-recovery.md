@@ -1608,7 +1608,7 @@ container. Then check all of the following:
   proxy's own access log, which you match to the row by time. Confirm that the
   time and source fit the person who was meant to enrol that account, and record the result in the change ticket.
   An account that enrolled when its owner did not, or from an address that is not theirs, was pre-empted.
-- A test approval succeeds on a signed-in session (see "After upgrading, verify approvals on a test request" in
+- A test approval succeeds on a signed-in session (see "Verify approvals on a test request" in
   [Upgrading](../user-manual/upgrading.md)).
 
 **To abort.** If you stop before step 3, or decide not to continue, restore the enforcement setting and
@@ -1735,7 +1735,7 @@ administrator time per approver (an estimate, not a measurement), against the tw
 deployment-wide effects of path A.
 
 Afterwards, confirm each approver in the query from step 0 no longer appears and that a test approval
-succeeds on a signed-in session (see "After upgrading, verify approvals on a test request" in
+succeeds on a signed-in session (see "Verify approvals on a test request" in
 [Upgrading](../user-manual/upgrading.md)). Also check that at least one enrolled, authorised approver exists
 who is not the submitter of each request you expect to be decided: a request cannot be decided by its own
 submitter, and an administrator who is the only enrolled approver cannot approve their own request.

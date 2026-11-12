@@ -1457,8 +1457,7 @@ the session store it uses to end the account's sessions the same way.
 - **Security schemes.** The top-level `security` was one requirement that asked for the bearer token, the `X-Yuzu-Token` header and the session cookie together. It is now three alternatives, any one of which authenticates. The `cookieAuth` scheme names the real cookie, `yuzu_session` (it said `session`). `GET /ca/root` and `GET /ca/crl` carry `security: []` because they are public. In builds after 0.15.0 the document marks `POST /elevate`, `POST /elevate/revoke`, `POST /users/me/password` and `POST /users/{username}/password` as accepting the session cookie only (`security: [{cookieAuth}]`), and the five `/uploads` routes name the grant or session header they authenticate with (the new `uploadGrantAuth` and `uploadSessionAuth` schemes), so a generated client no longer sends a bearer token those routes do not accept. An integration that holds only an API token, an MCP token or an engine credential cannot call the four cookie-only routes at all; that was already true, and the document says so from those builds on. A generator or gateway that enforced the old combined requirement, or that copied the cookie name, needs the current document imported again; a gateway that enforced the old top-level requirement would have demanded an operator credential on the agent-authenticated `/uploads` routes.
 - **Operations the server does not serve.** 14 operations in three groups (License Management, Device Tokens and Software Deployment) are in the document but are not registered by the server today, so each carries an `x-yuzu-unavailable` note. A client generated from the document has a method for each of them, and calling one fails because the route does not exist. Skip them, or filter on the marker before generating.
 - **Revalidate instead of refetching.** Send the `ETag` of the last response back in `If-None-Match` and an unchanged document answers `304` with no body. Without it, every request is built and compressed again: on a 32-core host a request that accepts brotli took about 1.4 seconds for the default form and about 2.0 seconds for `?guides=true`, and 24 such requests in parallel did not make `/health` miss a response (it answered in 1.4 to 5.5 ms). The compressed bytes are not cached, so the cost is CPU per uncached request. Hosts with 2 to 4 cores were not measured and will saturate sooner, so a script that polls the document, or a monitor that fetches `/swagger`'s data on a timer, should send `If-None-Match`. A browser loading `/swagger` revalidates by itself. In 0.15.0 the comparison is exact, so a proxy that rewrites the `ETag` to a weak one defeats it. In builds after 0.15.0 a weak validator (`W/"..."`), a list of validators and `*` on its own match too, so a proxy that weakens or merges validators does not defeat it; a header that is not a valid `If-None-Match` is answered with the full document.
-- **New operation: `GET /api/v1/rbac/enforcement` (and the MCP tool `get_rbac_enforcement`).** It is one of the added operations and reads the RBAC enforcement state (see `docs/user-manual/rbac.md`). During a rolling upgrade a replica that has not been upgraded is expected to answer `404` for the route and unknown-tool for the MCP tool; this is the expected behaviour of an older build and has not been observed on a live rolling upgrade. Retry the call, or direct it to an upgraded replica. An older replica is also expected to audit the MCP attempt as `mcp.get_rbac_enforcement` with `result=denied` and `detail=unknown tool`, so a SIEM rule on denied MCP rows can fire for a tool that exists on the upgraded replicas; that noise is expected until every replica is upgraded. On an upgraded replica each successful read writes an `rbac.enforcement.read` audit row with `target_id` `rbac_enabled`, the same `target_id` as `rbac.enforcement_changed`, so a SIEM rule written on `rbac.enforcement%` or on that `target_id` alone now also matches reads; match `rbac.enforcement_changed` exactly if you mean changes only.
-- **Rolling back.** The document is compiled into the server, so rolling back to the previous binary or image restores the previous document, and nothing is migrated. Clients generated from the new document keep their method names until they are regenerated; regenerating against the older server returns the path-derived method names and mostly untyped responses, the `ETag` header is no longer sent, the `/swagger` page is gone and `?guides=true` is ignored, and a hash taken from the new document no longer matches. Regenerate clients and re-baseline any pin after a rollback.
+- **New operation: `GET /api/v1/rbac/enforcement` (and the MCP tool `get_rbac_enforcement`).** It is one of the added operations and reads the RBAC enforcement state (see `docs/user-manual/rbac.md`). Each successful read writes an `rbac.enforcement.read` audit row with `target_id` `rbac_enabled`, the same `target_id` as `rbac.enforcement_changed`, so a SIEM rule written on `rbac.enforcement%` or on that `target_id` alone now also matches reads; match `rbac.enforcement_changed` exactly if you mean changes only.
 
 ## Correction: webhook subscriptions to `command.completed` and `policy.violation` have never delivered
 
@@ -1481,22 +1480,19 @@ new instruction definition whose id starts `guardian.` is refused on create, imp
 dashboard YAML editor, and such a definition is skipped at boot auto-import. No shipped content
 uses the prefix. Definitions that already carry such an id keep executing, but cannot be saved
 from the YAML editor if the document declares `metadata.id`, and cannot be re-imported. **Before
-upgrading, run the read-only check and rename anything it lists**: see
+you import or author definitions, run the read-only check and rename any id it lists**: see
 [the `guardian.` entry in Server Administration](server-admin.md#vnext-the-guardian-instruction-definition-id-prefix-is-reserved-6062-breaking).
 
 **2. Approvals schema migration v3 (store `approval_manager`).** It adds three text columns to
 `approvals` (`request_json`, `request_digest`, `excluded_roots`), each `NOT NULL DEFAULT ''`, so
 every existing row reads as "binds no request, excludes nobody" and behaves as before. The
 migration is additive and needs no operator step, but it takes a brief `ACCESS EXCLUSIVE` lock on
-`approvals`. If a long-running or idle-in-transaction session holds that table, the upgraded
-replica cannot finish the migration and refuses to start (`Refusing to start: approval manager
+`approvals`. If a long-running or idle-in-transaction session holds that table, the replica
+cannot finish the migration and refuses to start (`Refusing to start: approval manager
 migration/open failed`) rather than serve with a half-migrated schema; end the session and start
 it again. It follows the data-only v2 step of the scheduled-approval change (#6096, below), which
-claimed v2 first, so a database upgraded from a build with neither change runs v2 and then v3 in
-two separate transactions, and one already at v2 runs only v3. The v3 step is idempotent
-(`ADD COLUMN IF NOT EXISTS`), so a development or UAT database that ran an earlier build of this
-branch, which recorded the same columns as version 2, upgrades cleanly instead of failing on a
-column that already exists.
+claimed v2 first, so a fresh database runs v2 and then v3 in two separate transactions. The v3
+step is idempotent (`ADD COLUMN IF NOT EXISTS`).
 
 - **Mixed builds are outside the contract.** This release supports a fresh database only (see
   "Deployment contract (hard cutover)" in the Forensics section of this page), so running this build
@@ -1538,7 +1534,7 @@ example `execute_instruction`, `quarantine_device`, `revoke_certificate` and
 its excluded roots cannot be read, or its stored request does not match its digest. Through MCP it surfaces as the same "approval already used (one-time ticket)" refusal a replay gets, and the
 audit row reads `refused: foreign_origin`; the cause is only in the server log. Approving a
 ticket always records a distinct reviewer, so ordinary operation never triggers this: it
-indicates a row edited by hand, restored from a backup or written by an older build, and such a
+indicates a row edited by hand or restored from a backup, and such a
 ticket stays unredeemable until its seven-day lifetime ends. Separately, a ticket whose row was
 rewritten by another transaction between the check and the consuming statement (and, rarely,
 VACUUM FULL or CLUSTER running at that moment, which move the row) is also refused, audited as
@@ -1694,10 +1690,7 @@ database, as for every other store; if the schema cannot be created the server r
 (fail-closed, ADR-0007). `/readyz` includes `certificate_inventory_store` once the server is up, so a degraded store after boot shows there.
 
 `DELETE /api/v1/sle/agents/{id}` now fans out across **eight** stores: the response's `stores` map
-gains a `certificate_inventory` key and `deleted` reaches 8 when every store is configured. During a
-rolling upgrade a replica that has not been upgraded runs the old cascade and returns `200` without
-that key; it did not erase certificate rows. Re-issue the DELETE once every replica is upgraded (the
-same advice as for the presence row, #5682). Erasure is not durable yet: a still-running agent
+gains a `certificate_inventory` key and `deleted` reaches 8 when every store is configured. Erasure is not durable yet: a still-running agent
 repopulates its rows on its next report until the decommission tombstone ships in a later change.
 
 No agent sends `certificate_inventory` yet; agents start only once the server advertises that it
@@ -1707,8 +1700,7 @@ previous release discarded it there; releases before the typed-source read filte
 inventory reads never return a typed source's rows" below) stored it in the generic store, which that
 filter and the boot purge now exclude. It never reaches the generic inventory store.
 
-**Rolling back** leaves the `certificate_inventory_store` schema in the database; it is harmless to
-the older binary and is not read. Plan capacity before agents start reporting: DER is optional and
+Plan capacity before agents start reporting: DER is optional and
 bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
 [Server administration](server-admin.md#fleet-certificate-inventory-storage)).
 
@@ -1800,15 +1792,15 @@ A refused request writes no quarantine record and releases none. The `403` bodie
 
 ## ⚠️ Breaking: approving or rejecting a request now needs an interactive session and an enrolled MFA factor with a fresh proof; MCP cannot approve (#6061, #6079)
 
-**Before you upgrade (checklist).**
+**Before you bring approvers into service (checklist).**
 
-1. List your administrators and everyone who holds `Approval:Approve` (see "Find affected automation before you upgrade" below). With RBAC enforcement off (the shipped default) the approvers are exactly the accounts with `role = 'admin'`; the step-0 query in step 2 returns the local ones that are not yet enrolled.
+1. List your administrators and everyone who holds `Approval:Approve` (see "Find automation that approves without a signed-in browser session" below). With RBAC enforcement off (the shipped default) the approvers are exactly the accounts with `role = 'admin'`; the step-0 query in step 2 returns the local ones that are not yet enrolled.
 2. Check who is enrolled: run the step-0 SQL, the first block of [Path A in the recovery runbook](../ops-runbooks/auth-db-recovery.md#path-a-an-enrolment-sign-in-window). On a Linux package install the `psql "$YUZU_POSTGRES_DSN"` blocks in this section fail in an interactive shell, because the DSN lives only in the env file, which is readable only by root and the `yuzu` account; read the value into a shell variable (do not source the file, because a DSN containing `&` or spaces breaks as shell) with `YUZU_POSTGRES_DSN=$(sudo sed -n 's/^YUZU_POSTGRES_DSN=//p' /etc/yuzu/yuzu-server.env)` and then run each block as written.
 3. Enrol each administrator in Settings → Security and sign-in → Two-factor sign-in; another administrator cannot do it for them.
 4. Plan each non-administrator approver (possible only once RBAC enforcement is on): it needs the runbook path, not Settings.
 5. A SAML deployment has no approver path (#6098); give those approvers a local or OIDC account first.
 6. Have at least two enrolled approvers: a submitter cannot review their own request, so a single enrolled approver cannot decide that approver's own requests.
-7. After the upgrade, run the approvals-refused query (step 6 of "After upgrading, verify approvals on a test request" below) to see whether approvals are being refused and why.
+7. Once the deployment is running, run the approvals-refused query (step 6 of "Verify approvals on a test request" below) to see whether approvals are being refused and why.
 8. Owners of scripts that run `yuzu-server --mfa-reset`, and of SIEM rules on `mfa.disabled` or `mfa.reset.breakglass`: `--mfa-reset` now exits `1` when ending the sessions fails (`result=partial`), when the audit store refuses its intent row, and when the clear itself fails; every clear writes two audit rows; a failed session delete is `result=partial`, not `success` (details in the `--mfa-reset` notice below).
 
 **What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
@@ -1942,14 +1934,13 @@ non-admin approver under `optional` or `admin-only` is in the same position and 
 
 **If you set `--mfa-step-up-window-secs=0`,** approval no longer loses its MFA requirement: approve and reject use a
 300-second window instead, and still require an enrolled factor. The setting still switches the step-up gate off for
-the other step-up endpoints. Decisions made **before** the upgrade, and in particular any made with the setting at
-`0`, gain no retroactive assurance: review every `approval.approve` audit row with `result=success` from that period,
-and check every `attempted` row that has no outcome row (compare counts per `target_id`). A build that has #6061
-also writes a `result=attempted` row first, so do not count both, and a decision whose outcome row failed to write
-leaves only the `attempted` row (see [Audit Log](audit-log.md)). A build that predates #6061 writes no
-`attempted` row, only the outcome row.
+the other step-up endpoints. Decisions already in the audit log gain no retroactive assurance, in particular any made with the setting at
+`0`: review every `approval.approve` audit row with `result=success` from that period,
+and check every `attempted` row that has no outcome row (compare counts per `target_id`). The approver gate
+writes a `result=attempted` row first, so do not count both, and a decision whose outcome row failed to write
+leaves only the `attempted` row (see [Audit Log](audit-log.md)).
 
-**Find affected automation before you upgrade.** Nothing is listed for you, so search the audit log for
+**Find automation that approves without a signed-in browser session.** Nothing is listed for you, so search the audit log for
 callers that approved or rejected without a signed-in browser session.
 
 - **Over MCP.** Audit rows with action `mcp.approve_request` or `mcp.reject_request` are MCP approvals. The
@@ -1972,19 +1963,18 @@ callers that approved or rejected without a signed-in browser session.
   `user_agent` and `source_ip` for those.
 
 The search only sees what the audit retention window still holds, so an empty result is not proof that nothing
-approves by token. Before upgrading, also check which service accounts and API tokens hold `Approval:Approve`
+approves by token. Also check which service accounts and API tokens hold `Approval:Approve`
 and move each approval step to a person on a signed-in session. No audit query lists a token or service account
-that holds `Approval:Approve` but has never approved: after this change it is refused anyway, so the check is
+that holds `Approval:Approve` but has never approved: it is refused anyway, so the check is
 about finding automation to move, not about finding exposure. To list what is granted, read the RBAC grants
 (`GET /api/v1/rbac/roles/assignments`, or the Access Reviews export `GET /api/v1/access-reviews/export`; both
 need `AccessReview:Read`) and match each principal's roles against the roles that carry `Approval:Approve`.
 `GET /api/v1/tokens` lists only the calling user's own tokens, so check each token owner's grants.
 
 **What that search cannot see.** The audit query finds token and MCP approvers only. The approvers most likely
-to hit the new behaviour are human accounts, which carry `principal_class = 'human'` and so look the same before
-and after the upgrade: SAML users (refused), OIDC users whose identity provider asserts no MFA-method
-`amr` (now refused `mfa_proof_missing`; before this change they passed unless `--mfa-enforcement=required`), and local
-accounts with no enrolled factor (now refused `mfa_not_enrolled`; before this change they passed without a second factor). To
+to hit the new behaviour are human accounts, which carry `principal_class = 'human'`, so that query does not single them out: SAML users (refused), OIDC users whose identity provider asserts no MFA-method
+`amr` (refused `mfa_proof_missing`), and local
+accounts with no enrolled factor (refused `mfa_not_enrolled`). To
 list the SAML and `amr`-less OIDC operators who have signed in, query the login rows in the audit store (the
 retention window applies):
 
@@ -2013,11 +2003,11 @@ ORDER BY username;
 ```
 
 `role` is the account's legacy role column, not its RBAC grants, so compare the result with who holds
-`Approval:Approve`. An account listed here is refused as an approver (`mfa_not_enrolled`) after the upgrade, so enrol it first if it is meant to approve; a non-admin needs the enrolment sign-in window described above.
+`Approval:Approve`. An account listed here is refused as an approver (`mfa_not_enrolled`), so enrol it first if it is meant to approve; a non-admin needs the enrolment sign-in window described above.
 With RBAC enforcement off (the shipped default), a non-admin account is refused `403` "admin role required" before
 the MFA check, so `mfa_not_enrolled` is what an administrator sees, and a non-admin sees it only once enforcement is on.
 
-**After upgrading, verify approvals on a test request.** Use a test device and a harmless, read-only
+**Verify approvals on a test request.** Use a test device and a harmless, read-only
 instruction, and do not skip the safety notes in step 1: an execute call that is not held for approval really
 dispatches.
 
@@ -2123,53 +2113,43 @@ separate scheduled-approval change (#6096, below) adds a data-only approvals ste
   occurrence), so one approval runs at most one occurrence whatever the clocks say (#6096). A used ticket keeps its
   status (`approved` or `rejected`); only its use time and user are filled in. The schedule's own run times are
   still stamped by the server that advances it; they only decide when an occurrence is due.
-- **Scheduled approvals are retired once on upgrade (#6096).** Before this release a spent scheduled ticket was
-  never marked used; it was recognised as spent by comparing clocks. The approvals schema step (v2) therefore marks
-  every outstanding approved or rejected ticket that belongs to a schedule as used, once per database, with no clock
-  comparison. A schedule that was holding an occurrence for an approval you had already given (approved but not yet
-  fired when you upgraded) asks again for that held occurrence, and a rejection you had already given no longer skips
-  that occurrence: the schedule asks again. Pending requests, requests from the dashboard and MCP, and tickets
-  already used are untouched. Nothing to do. The step is data only (no table or column changes). It touches
-  every unsettled approved or rejected scheduled ticket, including old rejected ones (rejected tickets never expire
-  and are never swept); that is normally small. It runs inside the upgrade transaction under a 300 s statement
-  timeout and is skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied,
-  and the approvals store does not open (the server logs a schema migration failure for that store); investigate
-  the table size and restart. The command outbox also gains a small index on its approval id
-  (`outbox_approval_idx`) at the same upgrade; its build is bounded by the same 300 s timeout.
-- **Start one replica first when the outbox table is large (#6096).** Building `outbox_approval_idx` takes a share
-  lock on the outbox table for up to 300 s, so enqueue and claim on other replicas wait meanwhile. A second replica
-  that boots at the same time waits on the migration advisory lock under the pool's default lock and statement
-  timeouts and may fail its boot closed; restarting it recovers, because the migration is then applied. The
-  recommendation is to start ONE replica, wait for it to finish migrating, then start the others. These are not
-  measured numbers. A fresh database has no large outbox, so the 300 s index build is not a concern there; the
-  concurrent-boot wait still applies.
-- **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
-  `approval_manager.approvals`. It is readable only by SQL; no API returns it. Tickets the outbox showed had already
-  been used by an earlier occurrence carry the related marker `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`;
-  tickets settled by a normal fire or skip carry `schedule:<schedule id>:<n>`. To list the legacy ones:
+- **The approvals v2 step is data only (#6096).** A scheduled ticket is marked used when its occurrence is queued
+  (a rejected ticket when it skips its occurrence), not recognised as spent by comparing clocks. The approvals
+  schema step (v2) marks every outstanding approved or rejected ticket that belongs to a schedule as used, once per
+  database, with no clock comparison. On a fresh deployment the table is empty, so it changes nothing. It is data
+  only (no table or column changes), runs inside the migration transaction under a 300 s statement timeout and is
+  skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied, and the approvals
+  store does not open (the server logs a schema migration failure for that store); investigate the table size and
+  restart. The command outbox also gains a small index on its approval id (`outbox_approval_idx`) in the same
+  migration; its build is bounded by the same 300 s timeout.
+- **Start one replica first (#6096).** Building `outbox_approval_idx` takes a share lock on the outbox table for up
+  to 300 s on a large table, so enqueue and claim on other replicas wait meanwhile. A second replica that boots at
+  the same time waits on the migration advisory lock under the pool's default lock and statement timeouts and may
+  fail its boot closed; restarting it recovers, because the migration is then applied. Start ONE replica, wait for
+  it to finish migrating, then start the others. These are not measured numbers. A fresh database has no large
+  outbox, so the index build is short there; the concurrent-boot wait still applies.
+- **Where the used marker lives (#6096).** A ticket's `consumed_by` in `approval_manager.approvals` records what
+  settled it. It is readable only by SQL; no API returns it. A ticket the outbox showed had already been used by an
+  earlier occurrence carries `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`; a ticket settled by a normal
+  fire or skip carries `schedule:<schedule id>:<n>`. The value `schedule:legacy-6096` is written only by the v2
+  step, so a fresh deployment has none. To list the scheduled tickets and what settled them:
 
   ```sql
-  SELECT id, status, schedule_id, consumed_at
+  SELECT id, status, schedule_id, consumed_at, consumed_by
   FROM approval_manager.approvals
-  WHERE consumed_by = 'schedule:legacy-6096';
+  WHERE consumed_by LIKE 'schedule:%';
   ```
-- **Mixed builds for scheduled approvals (#6096).** Running this build beside an earlier one, or returning to an
-  earlier one, is outside the "Deployment contract (hard cutover)" and not supported. For what an older binary does: it does not
-  consult the outbox ledger or the used marker, so it can re-fire a ticket this build marked used (the old clock
-  comparison). This build records in the command outbox which approval ticket each scheduled run used, and refuses
-  to fire a ticket the outbox shows was already used by an earlier occurrence. No repair statement is provided for
-  a database an earlier binary has written.
-- Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
-  from it.
+- This build records in the command outbox which approval ticket each scheduled run used, and refuses to fire a
+  ticket the outbox shows was already used by an earlier occurrence. Running it beside an earlier build is outside
+  the "Deployment contract (hard cutover)" and not supported.
+- The seven days of an approved ticket are counted from its `reviewed_at`.
 
 ## Behaviour change: plugin-enablement tables and the continuity anchor (`plugin_config_store` schema v3, ADR-3006)
 
-The `plugin_config_store` schema moves to v3. It adds the tables of the plugin-enablement store (`enablement_rules`, `enablement_endpoints`, `enablement_meta`) and records a new store id. Nothing flips on upgrade: there is no operator surface yet and nothing issues desired state, so no endpoint's behaviour changes.
+The `plugin_config_store` schema moves to v3. It adds the tables of the plugin-enablement store (`enablement_rules`, `enablement_endpoints`, `enablement_meta`) and records a new store id. Nothing is switched on by this schema: there is no operator surface yet and nothing issues desired state, so no endpoint's behaviour changes.
 
-- **What you will see.** `/readyz` gains an `enablement` object and `/health` an `enablement_regressed` flag; neither gates readiness. On the first boot after the upgrade the server writes `enablement-anchor` beside its data and reports `anchor_unwitnessed_at_boot: true` once. That is expected and needs no action.
-- **Rollback is safe.** v3 only adds tables, and an older server starts on it without complaint (there is no schema-ahead guard) and ignores them.
-- **Rolling upgrade.** No behaviour change: a replica on the older release ignores the new tables.
-- **Retrying a failed upgrade.** The v3 migration seeds a new store id, and the server writes `enablement-anchor` naming it. If you then restore the pre-upgrade dump and upgrade again, the new store id no longer matches the surviving anchor, and the server logs one warning naming the old and new store id. While nothing has been issued (the anchor's counter and the store's counter are both `0`) that is reported as unwitnessed (`anchor_unwitnessed_at_boot: true` once), the server rewrites the anchor with the current store id, and no regression is declared; the same applies to a fresh database with a kept data directory. If the anchor's counter or the store's counter is above `0`, the server starts with enablement declared regressed (reason `store_id_mismatch`, alert `YuzuEnablementRegressed`); before retrying, remove `enablement-anchor` from the data directory or restore it from the same backup point as the dump. If a regression was already declared, the exit is in [Enablement continuity anchor](server-admin.md#enablement-continuity-anchor).
+- **What you will see.** `/readyz` gains an `enablement` object and `/health` an `enablement_regressed` flag; neither gates readiness. On first boot the server writes `enablement-anchor` beside its data and reports `anchor_unwitnessed_at_boot: true` once. That is expected and needs no action.
+- **Restoring a backup beside a kept data directory.** The v3 migration seeds a new store id, and the server writes `enablement-anchor` naming it. If the data directory keeps an anchor that names a different store id (for example you restored a database dump taken at another time, or created a fresh database beside a kept data directory), the server logs one warning naming the old and new store id. While nothing has been issued (the anchor's counter and the store's counter are both `0`) that is reported as unwitnessed (`anchor_unwitnessed_at_boot: true` once), the server rewrites the anchor with the current store id, and no regression is declared. If the anchor's counter or the store's counter is above `0`, the server starts with enablement declared regressed (reason `store_id_mismatch`, alert `YuzuEnablementRegressed`); before starting, remove `enablement-anchor` from the data directory or restore it from the same backup point as the dump. If a regression was already declared, the exit is in [Enablement continuity anchor](server-admin.md#enablement-continuity-anchor).
 - **Backups.** The tables ride the existing dump. The anchor file is outside it: keep `enablement-anchor` with the data directory. `scripts/yuzu-backup.sh` and `scripts/yuzu-restore.sh` now copy it.
 - **Alerts.** The `yuzu-enablement` group in `docs/prometheus/yuzu-alerts.yml` ships with this change. Until the later change that issues desired state, only `YuzuEnablementRegressed` and `YuzuEnablementAnchorWriteFailing` can fire.
 
