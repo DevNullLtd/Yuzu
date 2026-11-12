@@ -586,7 +586,7 @@ The Hardware list: the device roster (identity fields as for `/devices`) plus de
 
 | Status | Meaning |
 |---|---|
-| `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. At most the 100,000 most recently seen endpoints within the 30-day window are served, with no truncation signal yet. While `tags_degraded` is `true`, a `tag` filter (or a tag match in `q`) sees no tags and answers an empty list. |
+| `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. At most the 100,000 most recently seen endpoints within the 30-day window are served; `roster_truncated` is `true` (and `roster_cap` is `100000`) when more existed, and then `total_matching`, `pagination.total`, `devices_omitted` and every `kpis` figure are lower bounds and a search that finds nothing does not prove a device is absent (confirm one with `GET /api/v1/hardware/{id}`, which reads that device exactly). A truncated list is still a `200`; the flag clears by itself when the fleet is back under the cap. While `tags_degraded` is `true`, a `tag` filter (or a tag match in `q`) sees no tags and answers an empty list. |
 | `400` | Unrecognised `sort`, `os` or `status` token, or an invalid `tag` key. |
 | `403` | Caller lacks `Inventory:Read`. |
 | `503` | Route misconfigured (roster provider unwired), the device roster could not be read (`retry_after_ms` set), the audit row could not be persisted, or the authorization store is unavailable (`retry_after_ms` 5000). A failed roster read is never a `200` with an empty list. |

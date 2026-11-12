@@ -102,6 +102,12 @@ struct InventoryDevicesResult {
     /// True when the durable roster read itself failed (#5531): `rows` is then
     /// empty-because-unread, never empty-because-no-devices.
     bool roster_degraded = false;
+    /// True when the roster read was a typed PARTIAL (#5712): the newest `kOfflineRosterRowCap`
+    /// endpoints are in `rows` and more existed. `rows` is then a LOWER BOUND — every count over
+    /// it is "at least", and a device missing from it may still exist (so a search miss proves
+    /// nothing). Derived per read, so it clears when the fleet is back under the cap. NOT an
+    /// error: every surface still answers 200 / a normal MCP result with the rows it has.
+    bool roster_truncated = false;
 };
 
 } // namespace yuzu::server

@@ -197,12 +197,31 @@ std::string kpi(const char* label, std::string value, const char* extra_class = 
            std::move(value) + "</div><div class=\"l\">" + label + "</div></div>";
 }
 
-std::string kpis_html(const HardwareKpis& k, bool ci_degraded) {
+/// 100000 -> "100,000" (the roster cap, worded in the partial-list notice from the store's own constant).
+std::string with_thousands(long long n) {
+    std::string digits = std::to_string(n);
+    std::string out;
+    int run = 0;
+    for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+        if (run == 3) {
+            out.insert(out.begin(), ',');
+            run = 0;
+        }
+        out.insert(out.begin(), *it);
+        ++run;
+    }
+    return out;
+}
+
+std::string kpis_html(const HardwareKpis& k, bool ci_degraded, bool lower_bound) {
+    // #5712: over a truncated roster every count is a floor, so it is marked "at least" rather
+    // than shown as the fleet. The marker is a plain entity (no JS, no tooltip dependency).
+    const std::string lb = lower_bound ? "&ge;&nbsp;" : "";
     std::string h = "<div class=\"gp-tiles\">";
-    h += kpi("Total CIs", std::to_string(k.total));
-    h += kpi("Online", std::to_string(k.online));
-    h += kpi("Offline", std::to_string(k.offline));
-    h += kpi("Stale", std::to_string(k.stale), k.stale > 0 ? "warn" : "");
+    h += kpi("Total CIs", lb + std::to_string(k.total));
+    h += kpi("Online", lb + std::to_string(k.online));
+    h += kpi("Offline", lb + std::to_string(k.offline));
+    h += kpi("Stale", lb + std::to_string(k.stale), k.stale > 0 ? "warn" : "");
     h += kpi("CI coverage", ci_degraded ? "&mdash;" : (std::to_string(k.with_ci) + " / " + std::to_string(k.total)));
     // Readouts over the scoped roster: hidden when no device has synced the figure, and
     // when the CI columns themselves are degraded (a blank would read as "none").
@@ -442,6 +461,15 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     if (tags_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
              "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
+    // #5712: a partial roster is SERVED, with this notice — never a refusal (#5371). It lives in
+    // the swap target beside the degrade banners so every htmx re-render keeps it, and it is
+    // rendered in the empty-result state too: a search that finds nothing proves nothing here.
+    if (page.roster_truncated)
+        h += "<div id=\"hw-roster-truncated\" class=\"gp-banner hw-partial\"><b>Partial list.</b> More than " +
+             with_thousands(kOfflineRosterRowCap) + " devices were seen in the last 30 days, so this list "
+             "shows the " + with_thousands(kOfflineRosterRowCap) + " most recently seen. Older devices are "
+             "not listed, the counts above are lower bounds, and a search that finds nothing does not "
+             "prove a device does not exist &mdash; open a device's record to check it directly.</div>";
     if (page.containment_ui && page.quarantine_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Quarantine state unavailable.</b> The quarantine "
              "records could not be read or checked &mdash; a row without a Quarantined pill here is "
@@ -509,8 +537,8 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
                                           bool tags_degraded) {
     constexpr const char* kRosterBanner =
         "<div class=\"gp-banner hw-degrade\"><b>Hardware roster unavailable.</b> The device roster could "
-        "not be read. This is <b>not</b> \"no devices\" &mdash; reads here are authoritative, so "
-        "this banner is shown instead of an empty table. Retry shortly.</div>";
+        "not be read. This is <b>not</b> \"no devices\" &mdash; a failed read is shown as this "
+        "banner, never as an empty table. Retry shortly.</div>";
     // #5531: the banner must also replace a results_only re-render, keeping the
     // #hw-results swap target (and its data-url) alive for the next retry.
     if (roster_unavailable && results_only)
@@ -530,7 +558,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
         return h;
     }
 
-    h += kpis_html(page.kpis, ci_degraded);
+    h += kpis_html(page.kpis, ci_degraded, page.roster_truncated);
 
     const HardwareListQuery& q = page.query;
     h += "<section class=\"hw-panel\"><div class=\"hw-hd\"><h2>Hardware inventory</h2><div class=\"hw-end\">";

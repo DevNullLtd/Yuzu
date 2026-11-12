@@ -267,12 +267,18 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // machines_max cap counts the merged total.
     // #5531: a FAILED read renders live-only (never hard-fails the request) and
     // is flagged `offline_roster_degraded` in the envelope + audit detail.
+    // #5712: a roster past the store's row cap is a typed PARTIAL, served and flagged
+    // `offline_roster_truncated` (and audited, on the 413 path too), never an error. The flag is
+    // mostly reachable only at the machines_max ceiling: that ceiling equals the roster cap, so a
+    // truncated merge is >= cap machines and is gated 413 at any smaller machines_max.
     bool offline_degraded = false;
+    bool offline_truncated = false;
     if (offline_roster_fn_) {
         auto persisted = offline_roster_fn_(std::chrono::seconds(kOfflineStaleWindowSecs));
         if (persisted) {
+            offline_truncated = persisted->truncated;
             const auto before = snap->machines.size();
-            snap = merge_offline_topology(std::move(snap), *persisted);
+            snap = merge_offline_topology(std::move(snap), persisted->rows);
             const auto merged_count = snap->machines.size() - before;
             if (merged_count > 0 && metrics_)
                 metrics_->counter("yuzu_viz_offline_hosts_total")
@@ -291,7 +297,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "",
                       "oversize machines=" + std::to_string(snap->machines.size()) +
-                          " cap=" + std::to_string(machines_max));
+                          " cap=" + std::to_string(machines_max) +
+                          (offline_truncated ? " offline_roster_truncated=1" : ""));
         if (metrics_)
             metrics_->counter("yuzu_viz_oversize_response_total").increment();
         return;
@@ -301,6 +308,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     nlohmann::json j = *snap;
     if (offline_degraded)
         j["offline_roster_degraded"] = true;
+    if (offline_truncated)
+        j["offline_roster_truncated"] = true;
     // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): dump_topology_safe()
     // (fleet_topology_types.hpp) substitutes U+FFFD instead of throwing on a
     // byte-clamped multi-byte codepoint - clamp_field() truncates by byte
@@ -334,7 +343,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
                   "machines=" + std::to_string(snap->machines.size()) +
                       " include_vuln=" + (include_vuln ? "1" : "0") + (fresh ? " fresh=1" : "") +
                       (as_fragment ? " fragment=1" : "") +
-                      (offline_degraded ? " offline_roster_degraded=1" : ""));
+                      (offline_degraded ? " offline_roster_degraded=1" : "") +
+                      (offline_truncated ? " offline_roster_truncated=1" : ""));
     }
 
     if (metrics_) {
