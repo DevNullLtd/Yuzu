@@ -78,7 +78,7 @@ Before invoking `/test` (the pre-commit/pre-push gate skill) on a fresh macOS de
 | Tool | Install | Why |
 |---|---|---|
 | autoconf/automake/libtool | `brew install autoconf automake libtool` | Only if you build a server vcpkg profile on macOS, which is unsupported (ADR-0035): vcpkg's libpq port runs autoreconf. The agent-only profile macOS uses since ladder step 3 has no libpq |
-| GNU bash 5+ | `brew install bash` | `mapfile` and `declare -A` are bash-4-only; stock `/bin/bash` 3.2 trips the version guards in `preflight.sh`, `perf-gate.sh`, `teardown.sh`, `test-fixtures-verify.sh` |
+| GNU bash 5+ | `brew install bash` | `mapfile` and `declare -A` are bash-4-only; stock `/bin/bash` 3.2 trips the version guards in `preflight.sh`, `perf-gate.sh`, `teardown.sh`, `test-fixtures-verify.sh`, `integration-test.sh` (exit 2; its teardown reads `BASHPID`) |
 | Erlang/OTP 28.4+ (same major; Homebrew `erlang` 29 is refused) | via kerl or `brew install erlang@28` locally (Meson resolves it at configure; `scripts/ensure-erlang.sh` for shells); CI downloads a hash-pinned build into `$RUNNER_TEMP` per job (#4841) | Gateway build + EUnit + dialyzer |
 | OrbStack or Docker Desktop | GUI / `brew install --cask orbstack` | Phase 1 image build + Phase 2 upgrade-test. Without a running Docker daemon both phases SKIP gracefully (the rest of `/test` continues), but you cannot exercise the upgrade-test surface |
 
