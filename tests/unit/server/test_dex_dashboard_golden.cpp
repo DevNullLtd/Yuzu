@@ -1262,7 +1262,7 @@ TEST_CASE("DEX apps UI: a below-floor version row withholds its last-seen time t
     const auto page = render_dex_apps_fragment(model, 7, "all");
     CHECK(contains(cell(page, "wide.exe", "3.0.1", kColLastSeen), "withheld"));
     CHECK_FALSE(contains(cell(page, "wide.exe", "3.0.1", kColLastSeen), "<span class=\"nw\">"));
-    // the application's own head row and the sibling version keep their timestamps
+    // the application's own head row keeps its timestamp
     CHECK(contains(cell(page, "wide.exe", "", kColLastSeen), "<span class=\"nw\">"));
     CHECK(contains(cell(page, "wide.exe", "", kColLastSeen), "04:00:00Z"));
 }
