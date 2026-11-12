@@ -68,8 +68,8 @@ constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // family (dex_read<>/dex_observation, fail-soft — an empty/degraded result
 // is returned to the caller), "guardian_rules" for the AUTHORITATIVE
 // rule/status reads (get_rule/list_rules/agent_rule_statuses*/rule_names*/
-// errored_rule_count/uncertain_rule_count, fail-hard — a std::expected error is returned and the
-// caller decides how to fail) (#4856), and the two census sources below. All
+// errored_rule_count/uncertain_rule_count/unordered_agents, fail-hard — a std::expected error is
+// returned and the caller decides how to fail) (#4856), and the two census sources below. All
 // bump the SAME counter, yuzu_server_guardian_read_degrade_total{reason,source},
 // so an alert can aggregate `by (reason, source)` without missing any family.
 constexpr const char* kDegradeSource = "guardian_state";
@@ -80,7 +80,8 @@ constexpr const char* kDegradeSourceRules = "guardian_rules";
 // gauge means the gauge is a stale sample.
 constexpr const char* kDegradeSourceCensus = "guardian_census";
 // "guardian_census_device" is the per-device unrepresented-pending read
-// (unrepresented_pending_for_agent, #7217). It is a separate source on purpose:
+// (unrepresented_pending_for_agent, #7217) and the per-device order read
+// (agent_order_for_agent). It is a separate source on purpose:
 // that read fails hard on the request path (REST 503 / MCP error) and publishes
 // no gauge, so folding it into "guardian_census" would make request noise mask a
 // real gauge freeze and would make a per-device 503 read as a stale gauge.
@@ -4014,14 +4015,124 @@ std::expected<std::size_t, std::string> GuaranteedStateStore::uncertain_rule_cou
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
+// One device's `guardian_agent_order` row (schema v5). No row is an answer (nullopt); a store that
+// cannot answer is std::unexpected, never a nullopt. Counted on kDegradeSourceCensusDevice like the
+// other per-device census read: it fails hard on the request path and publishes no gauge.
 std::expected<std::optional<GuardianAgentOrder>, std::string>
-GuaranteedStateStore::agent_order_for_agent(std::string_view) const {
-    return std::unexpected("not implemented");
+GuaranteedStateStore::agent_order_for_agent(std::string_view agent_id) const {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceCensusDevice, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::agent_order_for_agent: store not open");
+        return std::unexpected("database not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceCensusDevice, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::agent_order_for_agent: pool acquire timed out");
+        return std::unexpected("no database connection: " + pool_.last_error());
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, epoch, emit_seq_hwm, epoch_recv_ns, retired_epoch, unpaired_recv_ns, "
+        "unpaired_events, unpaired_held, pair_regressions, pair_stragglers, pair_recoveries, "
+        "pair_duplicates, retired_events "
+        "FROM guaranteed_state_store.guardian_agent_order WHERE agent_id = $1::text",
+        std::vector<std::string>{std::string(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceCensusDevice, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::agent_order_for_agent: query failed: {}",
+                         ::yuzu::log_key_token(PQresultErrorMessage(res.get())));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<GuardianAgentOrder>{};
+    PGresult* r = res.get();
+    const auto opt = [r](int col) -> std::optional<std::int64_t> {
+        if (PQgetisnull(r, 0, col))
+            return std::nullopt;
+        return to_i64(PQgetvalue(r, 0, col));
+    };
+    const auto num = [r](int col) { return to_i64(PQgetvalue(r, 0, col)); };
+    GuardianAgentOrder o;
+    o.agent_id = text_col(r, 0, 0);
+    o.epoch = opt(1);
+    o.emit_seq_hwm = opt(2);
+    o.epoch_recv_ns = opt(3);
+    o.retired_epoch = opt(4);
+    o.unpaired_recv_ns = opt(5);
+    o.unpaired_events = num(6);
+    o.unpaired_held = num(7);
+    o.pair_regressions = num(8);
+    o.pair_stragglers = num(9);
+    o.pair_recoveries = num(10);
+    o.pair_duplicates = num(11);
+    o.retired_events = num(12);
+    return std::optional<GuardianAgentOrder>{std::move(o)};
 }
 
+// Agents "currently unordered": the latest accepted unpaired census-bearing event is later than the
+// pair clock (NULL clock reads as 0, so a never-paired agent qualifies). The scope contract is
+// uncertain_rule_count's: an engaged-empty scope is zero without a query (ADR-0017 INV-2), a
+// non-empty one is applied IN SQL before the count and the id list (INV-3). One statement, so the
+// count and the ids come from one snapshot; the window count is taken before the LIMIT.
 std::expected<UnorderedAgentsSummary, std::string> GuaranteedStateStore::unordered_agents(
-    const std::optional<std::vector<std::string>>&) const {
-    return std::unexpected("not implemented");
+    const std::optional<std::vector<std::string>>& agent_scope) const {
+    static DegradeSampler sampler;
+    if (agent_scope && agent_scope->empty())
+        return UnorderedAgentsSummary{};
+    if (!open_) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::unordered_agents: store not open");
+        return std::unexpected("database not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::unordered_agents: pool acquire timed out");
+        return std::unexpected("no database connection: " + pool_.last_error());
+    }
+    std::string sql = "SELECT agent_id, count(*) OVER () FROM "
+                      "guaranteed_state_store.guardian_agent_order "
+                      "WHERE unpaired_recv_ns IS NOT NULL "
+                      "AND unpaired_recv_ns > COALESCE(epoch_recv_ns, 0)";
+    std::vector<std::string> params;
+    if (agent_scope) {
+        std::vector<std::string_view> views;
+        views.reserve(agent_scope->size());
+        for (const std::string& a : *agent_scope)
+            views.emplace_back(a);
+        sql += " AND agent_id = ANY($1::text[])";
+        params.push_back(pg::to_text_array(views));
+    }
+    sql += " ORDER BY agent_id COLLATE \"C\" LIMIT " + std::to_string(kUnorderedAgentIdCap);
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules, sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::unordered_agents: query failed: {}",
+                         ::yuzu::log_key_token(PQresultErrorMessage(res.get())));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
+    UnorderedAgentsSummary out;
+    const int rows = PQntuples(res.get());
+    out.ids.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        out.ids.push_back(text_col(res.get(), i, 0));
+        out.count = to_i64(PQgetvalue(res.get(), i, 1)); // the same on every row
+    }
+    return out;
 }
 
 std::size_t GuaranteedStateStore::rule_count() const {
