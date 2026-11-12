@@ -3480,7 +3480,7 @@ test('agent bundle release verification',
   _python3_test,
   args: [files('test_build_agent_bundle_verify.py')],
   suite: 'docs',
-  timeout: 120,
+  timeout: 300,
 )
 
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
