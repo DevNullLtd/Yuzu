@@ -1463,9 +1463,15 @@ jobs:
   # Runs on the self-hosted Linux runner (native dockerd, systemd-managed).
   # Both images build in parallel via matrix; buildx registry cache persists
   # across releases so repeat runs with unchanged vcpkg/rebar deps are fast.
+  # build-windows and build-macos are in the needs: so a failed agent
+  # packaging step (e.g. the Windows "Verify the agent runs from the packaged
+  # archive" refusal) stops the push before any :X.Y.Z image exists; without
+  # them the images were pushed while no GitHub Release was created (ADR-0035
+  # step 3, UP-12). Neither build job has an `if:`, so neither is skipped on
+  # any tag, and docker-publish has no `if:` that reads needs.*.
   docker-publish:
     name: "Publish ${{ matrix.image }} image"
-    needs: [release-guard, build-linux, build-gateway]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
     permissions:

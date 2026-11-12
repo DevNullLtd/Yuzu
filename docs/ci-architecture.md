@@ -424,6 +424,8 @@ Runs in `release.yml`'s `release` job after the artifacts are downloaded and
 flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
 `gh release create`. When it fails, no GitHub release, `SHA256SUMS` or
 signature exists yet, but **the container images are already published**:
+`docker-publish` also needs `build-windows` and `build-macos` (ADR-0035 step 3), so a failed
+agent packaging step stops its push (the chisel and postgres image jobs do not wait for them);
 the `release` job needs `docker-publish`, `docker-publish-postgres` and
 `docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
 `:latest`) first (the agent-bundle image needs `release`, so it is not
