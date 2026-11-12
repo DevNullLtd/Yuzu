@@ -494,7 +494,8 @@ int main(int argc, char* argv[]) {
         ->default_val(100)
         ->envname("YUZU_RATE_LIMIT");
     app.add_option("--login-rate-limit", login_rate_limit,
-                   "Max login attempts/second per IP (default: 10)")
+                   "Max login attempts/second per IP (default: 10); also SAML and OIDC sign-in "
+                   "start and callback")
         ->default_val(10)
         ->envname("YUZU_LOGIN_RATE_LIMIT");
     app.add_option("--principal-max-concurrency", cfg.principal_max_concurrency,

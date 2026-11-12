@@ -2572,6 +2572,41 @@ TEST_CASE("openapi_spec_json(): the ResultSet schema declares what result_set_js
     CHECK(partial.at("partial").get<bool>());
 }
 
+TEST_CASE("result_set_json: partial reads both counters and agents_unanswered is emitted",
+          "[result_set][agents_unanswered]") {
+    using yuzu::server::result_set_json;
+    using yuzu::server::ResultSet;
+
+    SECTION("complete: both counters zero") {
+        const json j = result_set_json(ResultSet{});
+        CHECK(j.at("agents_failed").get<long long>() == 0);
+        CHECK(j.at("agents_unanswered").get<long long>() == 0);
+        CHECK_FALSE(j.at("partial").get<bool>());
+    }
+    SECTION("failed only") {
+        ResultSet r;
+        r.agents_failed = 2;
+        const json j = result_set_json(r);
+        CHECK(j.at("agents_failed").get<long long>() == 2);
+        CHECK(j.at("agents_unanswered").get<long long>() == 0);
+        CHECK(j.at("partial").get<bool>());
+    }
+    SECTION("unanswered only") {
+        ResultSet r;
+        r.agents_unanswered = 3;
+        const json j = result_set_json(r);
+        CHECK(j.at("agents_failed").get<long long>() == 0);
+        CHECK(j.at("agents_unanswered").get<long long>() == 3);
+        CHECK(j.at("partial").get<bool>());
+    }
+    SECTION("both") {
+        ResultSet r;
+        r.agents_failed = 1;
+        r.agents_unanswered = 1;
+        CHECK(result_set_json(r).at("partial").get<bool>());
+    }
+}
+
 TEST_CASE("openapi_spec_json(): the re-eval and from-echo-query routes document the stale-source refusal",
           "[openapi][result_set][stale_source]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
