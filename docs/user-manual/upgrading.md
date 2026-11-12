@@ -1504,10 +1504,11 @@ column that already exists.
   starts against a newer database: a build with neither change against a v2 or v3 database, and a
   build with the #6096 change but not this one (highest version 2) against a v3 database. That is
   established by reading the runner; it has not been exercised as a live rolling restart.
-- **Rollback to the previous build** is therefore expected to work while no bound ticket exists,
-  which is the case for this whole release: the previous build ignores the columns and the
-  default-empty values lose nothing. Rolling back across the #6096 change as well has its own
-  consequences, described in that section.
+- **A return to the previous build** is outside the "Deployment contract (hard cutover)" in the
+  Forensics section of this page, so it is not a supported operation. For what the migration
+  itself leaves behind: it adds columns the previous build ignores, and the default-empty values
+  hold no bound ticket, which is the case for this whole release. Returning across the #6096
+  change as well has its own consequences, described in that section.
 - **Rollback is NOT supported once a bound ticket exists.** The previous build does not read
   `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it, and it
   redeems without comparing the frozen request. The change that first creates a bound ticket
