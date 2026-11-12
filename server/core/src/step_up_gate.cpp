@@ -66,13 +66,19 @@ RefusalText refusal_text(const StepUpVerdict& v) {
                     {},
                     false};
         }
-        [[fallthrough]];
-    case StepUpDecision::kUnwired:
-    case StepUpDecision::kUnsupportedClass:
-    case StepUpDecision::kEvaluationFailed:
         return {503,
                 "authentication store is temporarily unavailable",
                 "retry shortly or contact an administrator",
+                {},
+                true};
+    case StepUpDecision::kUnwired:
+    case StepUpDecision::kUnsupportedClass:
+    case StepUpDecision::kEvaluationFailed:
+        // These answer `retry_after_ms: null` (no retry hint), so the remediation must not tell
+        // the caller to retry: a client that stops on null would be told two different things.
+        return {503,
+                "authentication store is temporarily unavailable",
+                "contact an administrator",
                 {},
                 true};
     case StepUpDecision::kStatusFailed:

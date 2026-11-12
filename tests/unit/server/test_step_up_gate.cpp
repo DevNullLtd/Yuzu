@@ -922,6 +922,12 @@ TEST_CASE("render_step_up_refusal: 503 for store outage, unwired store and unsup
         const auto j = body_of(res);
         CHECK(j["error"]["message"] == "authentication store is temporarily unavailable");
         CHECK_FALSE(j["meta"].contains("challenge_url"));
+        // A refusal that answers `retry_after_ms: null` must not also tell the caller to retry.
+        const auto remediation = j["error"]["remediation"].get<std::string>();
+        if (d == StepUpDecision::kStoreUnavailable)
+            CHECK(remediation.find("retry shortly") != std::string::npos);
+        else
+            CHECK(remediation.find("retry shortly") == std::string::npos);
     }
 }
 
@@ -944,6 +950,13 @@ TEST_CASE("render_step_up_refusal: retry_after_ms is 5000 only for a retryable s
         // `retryable` is read for no other decision
         {StepUpDecision::kUnwired, "", true, false},
         {StepUpDecision::kChallenge, "proof_factor_mismatch", true, false},
+        {StepUpDecision::kPass, "", true, false},
+        {StepUpDecision::kSamlDenied, "", true, false},
+        {StepUpDecision::kStatusFailed, "", true, false},
+        {StepUpDecision::kUnsupportedClass, "", true, false},
+        {StepUpDecision::kEvaluationFailed, "", true, false},
+        {StepUpDecision::kEngineDenied, "", true, false},
+        {StepUpDecision::kFactorCredentialNonLocal, "", true, false},
     };
     for (const auto& row : rows) {
         StepUpVerdict v;

@@ -1302,9 +1302,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
     is introduced with no upgrade path and no supported carry-over of an earlier
     build's database: an enrolled account that reads factor generation `0` (a tampered row, or
     a database an earlier build wrote) is refused by every gate that compares a
-    proof with the factor. This entry supersedes the operator wording of the
-    2026-10-28 mixed-version entry above, which described a rolling-upgrade
-    window; this build has no such window, and mixed-version operation is
+    proof with the factor. This entry supersedes the operator wording and the
+    marker-query Condition of the 2026-10-28 mixed-version entry above, which
+    described a rolling-upgrade window; this build has no such window, and mixed-version operation is
     unsupported. Operator wording: `docs/user-manual/upgrading.md`, the MFA
     cutover section. The maintainer's recorded ruling of 2026-10-24 covers one
     thing only: shipping #6079 as a hard cutover with no upgrade path. It does
