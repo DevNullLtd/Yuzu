@@ -6,10 +6,12 @@
 /// (`get_guardian_device_guards`) both call this, so the two surfaces cannot drift on a key, a
 /// null or the `currently_unordered` derivation. Pure: no store, no I/O.
 
-#include "guardian_types.hpp"
-
+#include <cstdint>
 #include <format>
+#include <optional>
 #include <string>
+
+#include "guardian_types.hpp"
 
 namespace yuzu::server {
 
