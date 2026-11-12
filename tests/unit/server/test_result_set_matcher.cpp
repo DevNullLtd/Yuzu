@@ -10,12 +10,16 @@
  */
 
 #include "result_set_matcher.hpp"
+#include "unverified_frame_registry.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server::rs_matcher;
@@ -779,4 +783,365 @@ TEST_CASE("instruction raw capture predicate: stored param first then schema def
     CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), ""));
     CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), "not json"));
     CHECK_FALSE(instruction_reads_raw_capture_table(nlohmann::json::object(), R"({"properties":{}})"));
+}
+
+TEST_CASE("unanswered_agent_count: terminal is zero and unproven completion is at least one",
+          "[result_set][rs_matcher][agents_unanswered]") {
+    CHECK(unanswered_agent_count(3, 1, true) == 2);
+    CHECK(unanswered_agent_count(1, 1, true) == 0);
+    CHECK(unanswered_agent_count(3, 5, true) == 0);
+    CHECK(unanswered_agent_count(0, 0, true) == 1);
+    CHECK(unanswered_agent_count(3, 3, false) == 1);
+    CHECK(unanswered_agent_count(0, 0, false) == 1);
+}
+
+TEST_CASE("unanswered_agent_count: a counted answer whose response was not stored is unanswered",
+          "[result_set][rs_matcher][agents_unanswered]") {
+    // Every targeted agent responded, but one terminal answer was lost on ingest.
+    CHECK(unanswered_agent_count(1, 1, true, 1) == 1);
+    CHECK(unanswered_agent_count(3, 3, true, 2) == 2);
+    // Dropped answers add to agents that never responded; the two sets are disjoint.
+    CHECK(unanswered_agent_count(5, 3, true, 1) == 3);
+    // No dropped answers: unchanged.
+    CHECK(unanswered_agent_count(3, 3, true, 0) == 0);
+    CHECK(unanswered_agent_count(3, 3, true) == 0);
+    // A negative count never lowers the result.
+    CHECK(unanswered_agent_count(3, 1, true, -4) == 2);
+}
+
+TEST_CASE("fill_count_decision: an unreadable count waits then fills as incomplete",
+          "[result_set][agents_failed]") {
+    // A readable count is used as is, at any age.
+    CHECK(fill_count_decision(std::optional<int64_t>{0}, 10, 900) == std::optional<int64_t>{0});
+    CHECK(fill_count_decision(std::optional<int64_t>{3}, 5000, 900) == std::optional<int64_t>{3});
+    // Unreadable: skipped for this tick up to and including the give-up age.
+    CHECK(fill_count_decision(std::nullopt, 0, 900) == std::nullopt);
+    CHECK(fill_count_decision(std::nullopt, 900, 900) == std::nullopt);
+    // Past it: filled with one lost answer, so the set reads incomplete.
+    CHECK(fill_count_decision(std::nullopt, 901, 900) == std::optional<int64_t>{1});
+}
+
+// The registry the ingest paths use to carry a non-terminal frame whose provenance lookup failed
+// to the same agent's terminal frame (UP-1). The clock is injected, so expiry is tested without
+// waiting. Every case where it cannot keep an entry must fail closed (report the answer dropped).
+using yuzu::server::UnverifiedFrameRegistry;
+
+TEST_CASE("UnverifiedFrameRegistry: a noted pair is reported until forgotten",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg;
+    CHECK(reg.note("cmd-1", "agent-a", 100).evicted == 0);
+    CHECK(reg.note("cmd-1", "agent-a", 101).evicted == 0); // a repeat keeps one entry
+    CHECK(reg.size() == 1);
+    CHECK_FALSE(reg.contains("cmd-1", "agent-b", 102)); // another agent of the same command
+    CHECK_FALSE(reg.contains("cmd-2", "agent-a", 102)); // another command of the same agent
+    // Checking erases nothing: a terminal frame that could not be recorded leaves the entry, so a
+    // replayed terminal frame still reports it.
+    CHECK(reg.contains("cmd-1", "agent-a", 102));
+    CHECK(reg.contains("cmd-1", "agent-a", 103));
+    CHECK(reg.size() == 1);
+    reg.forget("cmd-1", "agent-b"); // another pair: no effect
+    CHECK(reg.size() == 1);
+    reg.forget("cmd-1", "agent-a"); // recorded: erased
+    CHECK_FALSE(reg.contains("cmd-1", "agent-a", 104));
+    CHECK(reg.size() == 0);
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a repeated note keeps the first-seen time",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(16, 60);
+    (void)reg.note("cmd", "agent-a", 1000);
+    (void)reg.note("cmd", "agent-a", 1050); // must not restart the age
+    CHECK(reg.contains("cmd", "agent-a", 1059));
+    CHECK_FALSE(reg.contains("cmd", "agent-a", 1060)); // 60 s after the FIRST note
+}
+
+TEST_CASE("UnverifiedFrameRegistry: an entry past the age bound is forgotten",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(16, 60);
+    (void)reg.note("cmd", "old", 1000);
+    (void)reg.note("cmd", "new", 1050);
+    CHECK(reg.size() == 2);
+    // Expiry alone (no forget) removes the old entry: exactly at the bound it is gone.
+    CHECK_FALSE(reg.contains("cmd", "old", 1060));
+    CHECK(reg.size() == 1);
+    CHECK(reg.contains("cmd", "new", 1060));
+    (void)reg.note("cmd", "late", 2000);
+    CHECK(reg.size() == 1); // expiry runs on note too
+}
+
+TEST_CASE("UnverifiedFrameRegistry: an evicted pair still reads as not fully stored",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(2, 3600);
+    CHECK(reg.note("cmd-a", "a1", 10).evicted == 0);
+    CHECK(reg.note("cmd-b", "a2", 11).evicted == 0);
+    const auto third = reg.note("cmd-c", "a3", 12);
+    CHECK(third.evicted == 1);
+    CHECK_FALSE(third.latched);
+    CHECK(reg.size() == 2);
+    // The oldest pair was evicted, but its command is remembered: every agent of it reports.
+    CHECK(reg.contains("cmd-a", "a1", 13));
+    CHECK(reg.contains("cmd-a", "other-agent", 13));
+    CHECK(reg.contains("cmd-b", "a2", 13));
+    CHECK(reg.contains("cmd-c", "a3", 13));
+    CHECK_FALSE(reg.contains("cmd-d", "a1", 13));
+    // The remembered command ages out like an entry, counted from the eviction (t=12).
+    CHECK(reg.contains("cmd-a", "a1", 12 + 3599));
+    CHECK_FALSE(reg.contains("cmd-a", "a1", 12 + 3600));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: an agent past its own cap is marked and other agents are "
+          "unaffected",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(100, 3600, 3, 50);
+    (void)reg.note("cmd-b", "agent-b", 1);
+    for (int i = 0; i < 10; ++i) {
+        const auto r = reg.note("many-" + std::to_string(i), "agent-a", 2 + i);
+        CHECK(r.evicted == std::size_t{i < 3 ? 0u : 1u});
+        CHECK(r.marked == (i == 3)); // set once, then refreshed
+        CHECK_FALSE(r.latched);
+    }
+    CHECK(reg.size() == 4); // agent-a holds its cap of three, agent-b its one entry
+    // agent-a's marker covers every answer of agent-a, including commands it never sent.
+    CHECK(reg.contains("many-0", "agent-a", 20));
+    CHECK(reg.contains("never-sent", "agent-a", 20));
+    // Nothing reaches another agent: no remembered command and no latch.
+    CHECK_FALSE(reg.contains("many-0", "agent-b", 20));
+    CHECK_FALSE(reg.contains("never-sent", "agent-c", 20));
+    reg.forget("cmd-b", "agent-a"); // not agent-b's pair
+    CHECK(reg.contains("cmd-b", "agent-b", 20));
+    reg.forget("cmd-b", "agent-b");
+    CHECK_FALSE(reg.contains("cmd-b", "agent-b", 20));
+    // The marker ages out counted from its last refresh (t=11).
+    CHECK(reg.contains("never-sent", "agent-a", 11 + 3599));
+    CHECK_FALSE(reg.contains("never-sent", "agent-a", 11 + 3600));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a full set of agent markers sets the latch",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(100, 60, 1, 64, 2);
+    (void)reg.note("c0", "a", 100);
+    CHECK(reg.note("c1", "a", 101).marked); // a's own cap of one: a is marked
+    (void)reg.note("c0", "b", 102);
+    const auto b = reg.note("c1", "b", 103);
+    CHECK(b.marked);
+    CHECK_FALSE(b.latched); // two markers fit
+    CHECK_FALSE(reg.contains("c9", "z", 103));
+    (void)reg.note("c0", "c", 104);
+    const auto c = reg.note("c1", "c", 105); // a third marker: the oldest is dropped
+    CHECK(c.latched);
+    CHECK(reg.contains("c9", "z", 106)); // the latch covers every pair
+    CHECK(reg.contains("c9", "a", 106)); // including the dropped marker's agent
+    CHECK_FALSE(reg.contains("c9", "z", 105 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a long command id and a 256-byte agent id round-trip",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(16, 60);
+    const std::string long_cmd(100000, 'c');
+    const std::string agent(UnverifiedFrameRegistry::kMaxAgentIdBytes, 'a');
+    const auto r = reg.note(long_cmd, agent, 100);
+    CHECK(r.evicted == 0);
+    CHECK_FALSE(r.latched);
+    CHECK(reg.size() == 1);
+    CHECK(reg.contains(long_cmd, agent, 101));
+    CHECK_FALSE(reg.contains(long_cmd, agent.substr(1), 101)); // a prefix is another agent
+    CHECK_FALSE(reg.contains("other-cmd", "other-agent", 101)); // no latch
+    reg.forget(long_cmd, agent);
+    CHECK(reg.size() == 0);
+}
+
+TEST_CASE("UnverifiedFrameRegistry: an agent id past the bound is never stored and fails closed",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(16, 60);
+    const std::string too_long(UnverifiedFrameRegistry::kMaxAgentIdBytes + 1, 'a');
+    const auto r = reg.note("cmd", too_long, 100);
+    CHECK(r.latched);
+    CHECK(r.evicted == 1); // counted, so the overflow counter moves
+    CHECK(reg.size() == 0);
+    CHECK(reg.contains("cmd", too_long, 101));
+    CHECK(reg.contains("other-cmd", "other-agent", 101)); // the latch covers every pair
+    CHECK_FALSE(reg.contains("other-cmd", "other-agent", 100 + 60));
+}
+
+// Every command id shares one digest here, so only the exact agent id tells pairs apart.
+static uint64_t colliding_command_digest(uint64_t, std::string_view) { return 7; }
+
+TEST_CASE("UnverifiedFrameRegistry: with colliding command digests one agent never erases or reads "
+          "another agent's entry",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(16, 60, 64, 1024, 1024, &colliding_command_digest);
+    (void)reg.note("cmd-1", "agent-b", 100);
+    CHECK_FALSE(reg.contains("cmd-1", "agent-a", 101)); // agent-a does not see agent-b's entry
+    CHECK_FALSE(reg.contains("cmd-2", "agent-a", 101));
+    reg.forget("cmd-1", "agent-a"); // agent-a's recorded terminal frame
+    reg.forget("cmd-2", "agent-a");
+    CHECK(reg.contains("cmd-1", "agent-b", 102)); // agent-b's entry survives
+    CHECK(reg.size() == 1);
+    // Within one agent a shared digest reads as the same pair.
+    CHECK(reg.contains("cmd-2", "agent-b", 102));
+    CHECK(reg.note("cmd-2", "agent-b", 103).evicted == 0);
+    CHECK(reg.size() == 1);
+}
+
+TEST_CASE("UnverifiedFrameRegistry: two agents of one command are kept apart by the exact agent id",
+          "[result_set][unverified_frames]") {
+    // An agent id chosen to look like another agent's (one character apart) is another agent.
+    UnverifiedFrameRegistry reg;
+    (void)reg.note("cmd-issued-1", "host-B-7f3a9c21", 100);
+    CHECK_FALSE(reg.contains("cmd-issued-1", "host-B-7f3a9c22", 101));
+    reg.forget("cmd-issued-1", "host-B-7f3a9c22");
+    CHECK(reg.contains("cmd-issued-1", "host-B-7f3a9c21", 102));
+    CHECK(reg.size() == 1);
+}
+
+TEST_CASE("UnverifiedFrameRegistry: an agent marker covers only that exact agent id",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(100, 3600, 1, 50, 50);
+    (void)reg.note("c0", "agent-a", 1);
+    CHECK(reg.note("c1", "agent-a", 2).marked);
+    CHECK(reg.contains("never-sent", "agent-a", 3));
+    CHECK_FALSE(reg.contains("never-sent", "agent-b", 3)); // one character apart
+    CHECK_FALSE(reg.contains("never-sent", "agent-", 3));  // a prefix
+    CHECK_FALSE(reg.contains("never-sent", "agent-aa", 3));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a lost answer noted after a failed tracker write reaches the "
+          "replayed terminal frame",
+          "[result_set][unverified_frames]") {
+    // notify_exec_tracker notes the pair when the store did not keep the frame and the tracker
+    // row could not be written either; the replayed terminal frame then reads it, and it is
+    // erased only after a tracker write that carried the flag.
+    UnverifiedFrameRegistry reg;
+    CHECK_FALSE(reg.contains("cmd", "agent-a", 100));
+    (void)reg.note("cmd", "agent-a", 100);
+    CHECK(reg.contains("cmd", "agent-a", 101)); // replayed terminal frame: still dropped
+    (void)reg.note("cmd", "agent-a", 102);      // its write failed too: noted again, one entry
+    CHECK(reg.size() == 1);
+    CHECK(reg.contains("cmd", "agent-a", 103));
+    reg.forget("cmd", "agent-a"); // a write that carried the flag
+    CHECK_FALSE(reg.contains("cmd", "agent-a", 104));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a pair noted while its agent marker covers it outlives the "
+          "marker",
+          "[result_set][unverified_frames]") {
+    // notify_exec_tracker notes a lost answer even when the pair already reads as not fully
+    // stored: the marker that covers it may expire before a fresh entry would. A cap of two, and
+    // the agent below it when the pair is noted, so the note inserts without refreshing the marker.
+    UnverifiedFrameRegistry reg(100, 60, 2, 50, 50);
+    (void)reg.note("c0", "agent-a", 1);
+    (void)reg.note("c1", "agent-a", 2);
+    CHECK(reg.note("c2", "agent-a", 3).marked); // evicts c0: marker set at t=3
+    reg.forget("c2", "agent-a");                // agent-a now holds one entry (c1)
+    CHECK(reg.contains("lost", "agent-a", 50)); // covered by the marker
+    const auto r = reg.note("lost", "agent-a", 50);
+    CHECK(r.evicted == 0); // inserted below the cap: the marker is not refreshed
+    CHECK(reg.size() == 2);
+    CHECK_FALSE(reg.contains("other", "agent-a", 50 + 59)); // the marker ended at t=63
+    CHECK(reg.contains("lost", "agent-a", 50 + 59));         // the fresh entry still covers
+    CHECK_FALSE(reg.contains("lost", "agent-a", 50 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a pair noted while the latch covers it outlives the latch",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(100, 60, 1, 64, 1);
+    (void)reg.note("c0", "a", 0);
+    (void)reg.note("c1", "a", 1); // marker a
+    (void)reg.note("c0", "b", 2);
+    CHECK(reg.note("c1", "b", 3).latched);   // a second marker past a cap of one: latch until t=63
+    CHECK(reg.contains("lost", "z", 50));    // covered by the latch
+    CHECK(reg.note("lost", "z", 50).evicted == 0);
+    CHECK_FALSE(reg.contains("other", "y", 50 + 59)); // the latch has ended
+    CHECK(reg.contains("lost", "z", 50 + 59));         // the fresh entry still covers
+    CHECK_FALSE(reg.contains("lost", "z", 50 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a pair noted while its remembered command covers it outlives "
+          "the command",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(1, 60, 64, 50, 50);
+    (void)reg.note("cA", "a0", 0);
+    CHECK(reg.note("cB", "a1", 2).evicted == 1); // evicts cA: cA remembered until t=62
+    CHECK(reg.contains("cA", "z", 50));          // covered by the remembered command
+    (void)reg.note("cA", "z", 50);               // evicts cB (cA is not refreshed)
+    CHECK_FALSE(reg.contains("cA", "other", 50 + 59)); // the remembered command has ended
+    CHECK(reg.contains("cA", "z", 50 + 59));            // the fresh entry still covers
+    CHECK_FALSE(reg.contains("cA", "z", 50 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a refreshed marker no longer holds back the expiry of a later "
+          "one",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(100, 60, 1, 50, 50);
+    (void)reg.note("c0", "x", 0);
+    CHECK(reg.note("c1", "x", 10).marked); // marker x at t=10
+    (void)reg.note("c0", "y", 15);
+    CHECK(reg.note("c1", "y", 20).marked); // marker y at t=20
+    (void)reg.note("c2", "x", 30);         // refreshes marker x to t=30
+    CHECK_FALSE(reg.contains("never-sent", "y", 20 + 60)); // y ends behind the refreshed x
+    CHECK(reg.contains("never-sent", "x", 20 + 60));
+    CHECK(reg.contains("never-sent", "x", 30 + 59));
+    CHECK_FALSE(reg.contains("never-sent", "x", 30 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a refreshed remembered command no longer holds back the expiry "
+          "of a later one",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(1, 60, 64, 50, 50);
+    (void)reg.note("cA", "a0", 10);
+    (void)reg.note("cB", "a1", 15); // evicts cA: cA remembered at t=15
+    (void)reg.note("cC", "a2", 20); // evicts cB: cB at t=20
+    (void)reg.note("cA", "a3", 25); // evicts cC: cC at t=25
+    (void)reg.note("cX", "a4", 30); // evicts cA/a3: cA refreshed to t=30
+    CHECK_FALSE(reg.contains("cB", "other", 20 + 60)); // cB ends behind the refreshed cA
+    CHECK(reg.contains("cA", "other", 20 + 60));
+    CHECK_FALSE(reg.contains("cC", "other", 25 + 60));
+    CHECK(reg.contains("cA", "other", 30 + 59));
+    CHECK_FALSE(reg.contains("cA", "other", 30 + 60));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: the command digest depends on the salt",
+          "[result_set][unverified_frames]") {
+    CHECK(UnverifiedFrameRegistry::default_command_digest(1, "cmd-1") !=
+          UnverifiedFrameRegistry::default_command_digest(2, "cmd-1"));
+    CHECK(UnverifiedFrameRegistry::default_command_digest(1, "cmd-1") ==
+          UnverifiedFrameRegistry::default_command_digest(1, "cmd-1"));
+    UnverifiedFrameRegistry reg;
+    CHECK_FALSE(reg.salt_fell_back());
+}
+
+TEST_CASE("UnverifiedFrameRegistry: concurrent note contains and forget stay consistent",
+          "[result_set][unverified_frames]") {
+    UnverifiedFrameRegistry reg(64, 3600, 8, 32, 32);
+    std::thread writer([&reg] {
+        for (int i = 0; i < 5000; ++i) {
+            const std::string cmd = "c" + std::to_string(i % 200);
+            const std::string agent = "a" + std::to_string(i % 13);
+            (void)reg.note(cmd, agent, i);
+            if (i % 3 == 0)
+                reg.forget(cmd, agent);
+        }
+    });
+    for (int i = 0; i < 5000; ++i)
+        (void)reg.contains("c" + std::to_string(i % 200), "a" + std::to_string(i % 13), i);
+    writer.join();
+    CHECK(reg.size() <= 64);
+    // The writer's last pair (i = 4999, never forgotten) is still reported after the join.
+    CHECK(reg.contains("c" + std::to_string(4999 % 200), "a" + std::to_string(4999 % 13), 4999));
+}
+
+TEST_CASE("UnverifiedFrameRegistry: a full set of remembered commands sets the latch",
+          "[result_set][unverified_frames]") {
+    // Distinct agents, so every eviction is by the global cap of one entry.
+    UnverifiedFrameRegistry reg(1, 60, 64, 2);
+    (void)reg.note("c0", "a0", 100);
+    CHECK_FALSE(reg.note("c1", "a1", 101).latched); // evicts c0: one remembered command
+    CHECK_FALSE(reg.note("c2", "a2", 102).latched); // evicts c1: two
+    const auto r = reg.note("c3", "a3", 103);       // evicts c2: three > 2, the oldest is dropped
+    CHECK(r.latched);
+    CHECK_FALSE(r.marked);                          // a global eviction never marks an agent
+    CHECK(reg.contains("never-seen", "b", 104));   // the latch covers every pair
+    CHECK(reg.contains("c0", "a0", 104));          // including the dropped command
+    CHECK_FALSE(reg.note("c4", "a4", 105).latched); // already set: not reported again
+    CHECK_FALSE(reg.contains("never-seen", "b", 103 + 60 + 2)); // the latch ages out
 }
