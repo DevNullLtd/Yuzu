@@ -488,8 +488,8 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      `tests/test_release_agent_only.py`), so a failed agent packaging step pushes no versioned
      image. The first release tag after this change (an RC by plan) has to confirm the added wait
      (the images now start after the slowest agent build, ~40 min).
-   - **Release publish coupling (owner decision, 2026-11-12; wording pending the owner's
-     confirmation).** The three image-publish jobs (`docker-publish`, `docker-publish-chisel`,
+   - **Release publish coupling (owner decision, 2026-11-12; wording confirmed by the owner the
+     same day).** The three image-publish jobs (`docker-publish`, `docker-publish-chisel`,
      `docker-publish-postgres`) need `build-windows` and `build-macos`, and
      `docker-publish-postgres` also needs `build-linux` and `build-gateway` (it needs no build
      as an input; the jobs are success gates). Why: no `:X.Y.Z` image may exist for a release whose
