@@ -116,7 +116,30 @@ vcs_tag(
 
 # ── Feature summary ───────────────────────────────────────────────────────────
 build_agent    = get_option('build_agent')
-build_server   = get_option('build_server')
+# The server is Linux-only (ADR-0035 Decision 4). `server` is a feature option:
+# auto builds it on a Linux TARGET (a Linux-target cross build from any machine
+# stays legal) and skips it on any other, enabled on a non-Linux target is an
+# error, disabled never builds it. The deprecated boolean `build_server` is
+# still honoured as an extra off-switch, because build dirs and branches from
+# before ADR-0035 step 3 store or pass -Dbuild_server=false; a stored true
+# cannot turn the server on off Linux. Pinned by tests/test_server_feature_option.py.
+# These checks must stay before the first vcpkg/dependency lookup below, so a
+# non-Linux misconfiguration fails here with the ADR-0035 message.
+# Meson keeps a cross file's `system = 'Linux'` verbatim, so compare a lowercased copy.
+_server_host = host_machine.system().to_lower()
+_server_opt = get_option('server').disable_auto_if(_server_host != 'linux')
+if _server_opt.enabled() and _server_host != 'linux'
+  error('-Dserver=enabled: the Yuzu server is Linux-only and cannot be built for a ' + _server_host + ' target (ADR-0035). Build the agent here, and the server on Linux.')
+endif
+if _server_opt.enabled() and not get_option('build_server')
+  error('-Dserver=enabled contradicts the deprecated -Dbuild_server=false passed or stored for this build dir (ADR-0035 step 3). Delete the build dir and configure again (`--wipe` replays the stored options, so it does not clear this), or pass -Dbuild_server=true as well.')
+endif
+build_server   = _server_opt.allowed() and get_option('build_server')
+if not build_server and _server_host != 'linux'
+  message('Server: off (the Yuzu server is Linux-only, ADR-0035; this ' + _server_host + ' build is agent-only)')
+elif _server_opt.allowed() and not build_server
+  message('Server: off because the deprecated -Dbuild_server=false is set (use -Dserver=disabled; ADR-0035 step 3)')
+endif
 build_examples = get_option('build_examples')
 build_tests    = get_option('build_tests')
 
@@ -352,13 +375,15 @@ endif
 
 # libpq — Postgres client library for the server storage substrate (ADR-0006/
 # ADR-0008). Server-only: the agent stays SQLite (ADR-0006), so agent-only
-# (-Dbuild_server=false) and cross builds must not require libpq at configure.
+# configures (-Dserver=disabled, or any non-Linux target) and cross builds must
+# not require libpq at configure.
 #
 # Linkage per platform: static .a on Linux/macOS (vcpkg static triplets);
 # **dynamic DLL on Windows** — triplets/x64-windows.cmake's base linkage is
 # dynamic and its static override is scoped to the grpc stack only, so vcpkg
-# produces libpq.dll + import lib, same as sqlite3/openssl. The release zip's
-# vcpkg-DLL sweep (release.yml `Get-ChildItem $vcpkgBin *.dll`) bundles it.
+# produces libpq.dll + import lib, same as sqlite3/openssl. Since ADR-0035 step 3
+# the release install is agent-only, so libpq is not installed there and the release
+# zip's vcpkg-DLL sweep no longer sees it (release.yml refuses it in the archive).
 # Static libpq (unix) needs the companion libpgcommon/libpgport archives
 # (scram/auth helpers) that neither cmake's FindPostgreSQL nor any imported
 # target carries — only libpq.pc's Libs.private lists them, and pkg-config

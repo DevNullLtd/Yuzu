@@ -2249,7 +2249,7 @@ jobs:
           - build_type: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/dev')) && 'release' || 'NONE' }}
           - build_type: ${{ (github.event_name == 'workflow_dispatch' && !inputs.head_sha && inputs.legs != 'all') && 'debug' || 'NONE' }}
         # No pg_mode include: (ADR-0035 ladder step 1). This leg builds the
-        # agent only (-Dbuild_server=false at Configure below) and runs no
+        # agent only (the server option is off on Windows, see Configure below) and runs no
         # server or Postgres test, so the Linux job's pg_mode key has nothing
         # to select here.
 
@@ -2271,8 +2271,9 @@ jobs:
       # work across matrix runs so the disk cost is the only added cost.
       #
       # The "-agent-" in the dir names (ADR-0035 ladder step 1): this leg
-      # configures with -Dbuild_server=false, while branches cut before that
-      # change still configure the server. Meson keeps a stored option across
+      # configures agent-only (with -Dbuild_server=false at step 1; since step 3
+      # with no switch at all, through the `server` option's auto default), while branches cut before
+      # step 1 still configure the server. Meson keeps a stored option across
       # `meson setup --reconfigure`, and the branch-switch wipe below does not
       # fire on detached-HEAD PR checkouts, so a shared dir would hand
       # build_server=false to an older branch (whose server-suite selection
@@ -2457,9 +2458,18 @@ jobs:
           # the workspace path contains backslashes and bash's escape
           # processing strips them when interpolated as source text.
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          # Agent-only vcpkg profile (ADR-0035 step 3): no `server` feature
+          # (libpq, xmlsec, drogon), plus `tests` for Catch2. Every Windows
+          # CI, nightly and CodeQL job uses this profile (release.yml drops
+          # `tests`), because the CI, nightly and CodeQL jobs a Wee Tam
+          # runner picks up reuse that runner's persistent
+          # vcpkg_installed/x64-windows tree (a clean checkout, such as
+          # release.yml or a trusted-fork run, deletes it and the next
+          # job reinstalls); see docs/build-guide.md.
           "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
             --triplet x64-windows \
-            --x-manifest-root="$GITHUB_WORKSPACE"
+            --x-manifest-root="$GITHUB_WORKSPACE" \
+            --x-no-default-features --x-feature=tests
 
       - name: Configure (Meson)
         env:
@@ -2470,11 +2480,11 @@ jobs:
           # Per-variant build dir under PR-5 clean:false — see the
           # pre-checkout wipe step above for the rationale. Branch on
           # existence to satisfy meson's "use --reconfigure" requirement.
-          # -Dbuild_server=false (ADR-0035 ladder step 1): the server is
-          # Linux-only, so this leg builds and tests the agent only. Passed
-          # explicitly on every configure, including a --reconfigure, so a
-          # stored value can never win. vcpkg above still installs the full
-          # manifest (server ports included) until ladder step 3.
+          # Agent only (ADR-0035): the `server` option defaults to auto,
+          # which is off on a Windows target, so no server flag is passed.
+          # Deliberately none: this build dir persists across branches
+          # (clean: false), and a stored -Dserver value would make an older
+          # branch's reconfigure fail with "Unknown options" (ADR-0035 step 3).
           BUILDDIR=build-windows-agent-${{ matrix.build_type }}
           reconfig=""
           [[ -d "$BUILDDIR/meson-info" ]] && reconfig="--reconfigure"
@@ -2482,7 +2492,6 @@ jobs:
             --buildtype=${{ matrix.build_type }} \
             -Dcpp_std=vc++latest \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-windows" \
-            -Dbuild_server=false \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
           python scripts/ci/assert-gateway-tests.py "$BUILDDIR"
@@ -2564,7 +2573,7 @@ jobs:
         run: ./scripts/ci/stop-dead-etw-sessions.ps1 -Phase pre-test
 
       # Windows CI test phase. Since ADR-0035 ladder step 1 this leg is
-      # agent-only (-Dbuild_server=false), so ONE invocation runs every suite
+      # agent-only (no server off Linux, ADR-0035), so ONE invocation runs every suite
       # the build registers here; the #3443 non-pg/pg-shards/pg-smoke split
       # it used to carry is gone with the server suites (history:
       # docs/ci-architecture.md "Windows test-phase concurrency gate" and
@@ -2622,7 +2631,7 @@ jobs:
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and run on every leg, so
           # the selection swaps docs for platform and the guard excludes docs.
-          # No server suite: the build registers none (-Dbuild_server=false),
+          # No server suite: the build registers none (no server off Linux, ADR-0035),
           # and assert-suite-cover.py fails on a --suite that matches nothing.
           suites=(--suite agent --suite platform --suite proto --suite echo --suite gateway)
           python scripts/ci/assert-suite-cover.py --builddir build-windows-agent-${{ matrix.build_type }} \
@@ -3024,25 +3033,25 @@ jobs:
           VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight-gate.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-macos', runner.tool_cache) }}
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          # Agent-only vcpkg profile (ADR-0035 step 3): no `server` feature,
+          # plus `tests` for Catch2.
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet arm64-osx \
-            --x-manifest-root=${{ github.workspace }}
+            --x-manifest-root=${{ github.workspace }} \
+            --x-no-default-features --x-feature=tests
 
       - name: Configure (Meson)
         env:
           CC: ccache cc
           CXX: ccache c++
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/arm64-osx/lib/pkgconfig
-        # -Dbuild_server=false (ADR-0035 ladder step 1): the server is
-        # Linux-only, so this leg builds and tests the agent only. vcpkg above
-        # still installs the full manifest (server ports included) until
-        # ladder step 3.
+        # Agent only (ADR-0035): the `server` option defaults to auto, which
+        # is off on a macOS target, so no server flag is passed.
         run: |
           meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=${{ matrix.build_type }} \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
-            -Dbuild_server=false \
             -Dbuild_tests=true \
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
           python3 scripts/ci/assert-gateway-tests.py build-macos
@@ -3083,7 +3092,7 @@ jobs:
           rm -f "$YUZU_TEST_PROGRESS_FILE"
           # docs suite is OS-independent and runs on the Linux leg only; OS-contract
           # entries carry suite platform (tests/meson.build) and keep running here.
-          # No server suite is registered (-Dbuild_server=false, ADR-0035), so
+          # No server suite is registered (no server off Linux, ADR-0035), so
           # this runs the agent, proto, echo, gateway and platform suites; the
           # server and its Postgres suites run on Linux only.
           rm -f build-macos/meson-logs/testlog.json
