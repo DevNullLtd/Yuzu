@@ -3162,8 +3162,8 @@ TEST_CASE("#5719 engine: the full_sync rebuild line reports first_attach, then r
 }
 
 // (b) A kept rule on a faulted key that stays on that key, torn down by the full_sync's scoped
-// detach, is reported with the
-// FORCED cause (faulted_key, with its id), never key_busy and never first_attach, even though the
+// detach, is reported with the FORCED cause (faulted_key, with its id), never key_busy and never
+// first_attach, even though the
 // attach path itself sees one of those after the teardown. A shared key reports BOTH siblings.
 // Mutations: drop forced_rebuilds_ (the rule shows key_busy or first_attach: red); consult
 // forced_rebuilds_ only for a first_attach (the io-class key_busy shows: red); record the forced
@@ -3585,7 +3585,7 @@ TEST_CASE("#5719 engine: a forced-rebuild entry never turns a wedge re-observati
     REQUIRE(r.wait_compliant({"s0", "s1"}));
     suppressed_repushes(r, bytes, hk, kValve);
 
-    r.engine->set_post_attach_hook_for_test([&r, &ksvc](const std::string& id) {
+    r.engine->set_post_attach_hook_for_test([&r, ksvc](const std::string& id) {
         if (id == "h")
             r.engine->force_rebuild_reason_unlocked_for_test("h", GuardianRebuildReason::KeyFaulted,
                                                              ksvc);

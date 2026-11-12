@@ -1726,7 +1726,7 @@ flip, with a red-first test each:
     every sixth, logged `other=0` and 60 `first_attach` tokens per agent (the occupied-key retarget
     label fixed in this PR); the same box produced `faulted_key` (a dropped system bus), `key_busy` and
     `unknown_episode` (a stalled bus). On Windows, `baseline_empty` and `baseline_differs` (a missing
-    watched file, and a rule re-authored with another `expected_hash`). Never produced on either OS:
+    watched file, and a rule re-authored with another `expected_hash`). Not seen on either OS:
     `content_changed`, `dead_key`, `health_unknown` and `subscription_replaced`; the last three need a
     broken engine invariant, a backend that throws, or a race, so they are covered by unit tests only.
     The three failure counters were read from a rig-only probe line printed after each rebuild line
@@ -1736,10 +1736,10 @@ flip, with a red-first test each:
     and stayed near 123 MB for the last 13 (about +20 KB/min late; the unflipped control +16 KB/min),
     file descriptors 27 to 29 and flat (the two extra are the Echo plugin's database files, also present
     in the control). Windows 20 minutes: handles rose by about 40 in the first 8 minutes then stayed
-    flat, working set 123 to 136 MB against 61 to 62 MB and 494 to 497 handles for the unflipped control
-    on the same box, so the flipped agent used about twice the control's memory there. Neither soak
-    rules out a slow leak (Linux: under about 20 KB/min; Windows: a few MB over 20 minutes is
-    unexplained). This is evidence for the line, not a flip-safety proof. (c) MEASURED, release build (base `45f727420` against branch tip
+    flat, working set 123 MB at the start and 136 MB at the end, still rising slightly, against 61 to
+    62 MB and 494 to 497 handles for the unflipped control on the same box (the control's rule load is
+    not recorded), so the flipped agent used about twice the control's memory there. Neither soak
+    rules out a slow leak (Linux: under about 20 KB/min; Windows: a few MB over 20 minutes). This is evidence for the line, not a flip-safety proof. (c) MEASURED, release build (base `45f727420` against branch tip
     `3f8dd8d0d`, uncommitted throwaway harness; counts are exact, wall times are not): Linux
     (shared box; the cells that waited for a 1-minute load of 8 or less recorded it, the box
     never went below about 4) S0, S5 and S3s at R up to 5000 and S1d up to R=1000 with fake

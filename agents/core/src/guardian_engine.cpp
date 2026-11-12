@@ -2565,10 +2565,10 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
                 // installed as the engine's override so that, for such a rule whose attach is then
                 // rebuilt and reports a reason, reconcile_rule_locked tallies THAT cause, but only
                 // when the attach targets the key the cause was recorded against (a rule the same
-                // push moves to another key is a first attach of that key): after the
-                // detach the kept rule's own attach sees KeyBusy (an io-class mechanism whose
-                // disarm claim is still queued) or FirstAttach (an inline type, or a disarm that
-                // already completed) depending on timing, not the key's cause. The local map is
+                // push moves to another key is a first attach of that key). The override exists
+                // because, after the detach, the kept rule's own attach sees KeyBusy (an io-class
+                // mechanism whose disarm claim is still queued) or FirstAttach (an inline type, or
+                // a disarm that already completed) depending on timing, not the key's cause. The local map is
                 // built first and installed with a move-assign (noexcept), in its own firewall
                 // below. The record is diagnostic only: no arm, skip or generation decision reads
                 // it, and it is cleared at the top of the next apply_rules.
