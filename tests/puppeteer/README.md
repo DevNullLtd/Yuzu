@@ -86,10 +86,11 @@ runs it before the live run, and a selftest failure fails the gate. Add a case w
 3. Scenarios, six in all. Five force their own precondition (writes are answered by a request
    stub, so none reaches the server): upload rollout percentage and a failing upload, add user,
    the Ctrl+K guard on a focused field, the PKI audit-failed banner and load-error text, and the
-   Engine Principals audit-failed notice. The sixth is the DEX Apps tab: a live half (the tab opens and a platform chip is pressed from the
-   keyboard) and a golden half (the committed `apps__versions.html` is served through a GET stub,
-   so the version expander, the score decomposition and a long application name are exercised on
-   every run whatever the stack holds).
+   Engine Principals audit-failed notice. The sixth is the DEX Apps tab: a live half (the tab
+   opens and a platform chip is pressed from the keyboard) and a golden half (the committed
+   `apps__versions.html` is served through a GET stub, so the version expander, the score
+   decomposition and a long application name are exercised on every run whatever the stack
+   holds).
 
 It does not check: WebGL scenes (the Fleet and Host maps), non-administrator roles, a write that
 really reaches the server, or any route the shell does not link to. The nav list it compares
