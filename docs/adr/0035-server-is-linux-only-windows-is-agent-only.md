@@ -426,7 +426,8 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    - **#5325 and #1835** are closed as resolved by removal when this change merges.
    - Proof without an RC (owner decision, 2026-11-11): the static pins, plus a Windows rehearsal of
      the agent-only build, packaging and installer on a build box. The first stable tag after this
-     change is the first real run of the changed jobs.
+     change is the first real run of the changed jobs. (Superseded 2026-11-12: the next release tag
+     is an RC by plan and is the first real run of both steps' changes.)
 3. **Build guard** — implement Decision 4: convert `build_server` to a feature option, key the guard
    on `host_machine.system()`, make the non-Linux `vcpkg install` paths skip the `server` feature,
    and update `scripts/setup.sh`, the CLAUDE.md quickstarts, and any docs passing
@@ -449,7 +450,7 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    - **`build_server` is KEPT, deprecated** (`deprecated: true`, default `true`), still honoured
      as an extra off-switch, and `-Dserver=enabled` together with a passed or stored
      `build_server=false` is an error. Deleting it would break every build dir and branch that stored or passes it;
-     its removal is owned by step 4, with the build-dir wipe (step 4's text now says so). On
+     its removal is owned by step 4, with the build-dir delete-or-rename (step 4's text now says so). On
      Linux, a server turned off only by the deprecated boolean says so at configure.
    - **vcpkg choice.** The manifest default is unchanged (`server` and `tests` stay default
      features, so Linux and the images keep the full set). Non-Linux paths opt out instead:
@@ -479,26 +480,23 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
      libpgtypes, libpq, libxmlsec1, libxmlsec1-openssl, trantor), so the "verify afterwards" instruction above is a permanent
      gate, pinned (with mutants) in `tests/test_release_agent_only.py`. This supersedes step 2's
      note that the DLL sweep was left unchanged.
-   - **Not yet verified.** The release-time DLL refusal has never run on a real release (it
+   - **Not yet verified** (the first-RC checks are tracked in #7597). The release-time DLL refusal has never run on a real release (it
      ran in the Windows rehearsal below, which is not a release), nothing was run on macOS
      (no box), and the added publish wait below is untimed. If the refusal fails on
-     a release tag, no image is pushed (the build jobs' attestations and workflow artifacts are
-     still recorded): `docker-publish`, `docker-publish-chisel` and
+     a release tag, no image is pushed (the other build jobs' attestations and workflow artifacts are
+     still recorded; build-windows records neither, because the refusal precedes both): `docker-publish`, `docker-publish-chisel` and
      `docker-publish-postgres` all need `build-windows` and `build-macos` (UP-12, pinned in
      `tests/test_release_agent_only.py`), so a failed agent packaging step pushes no versioned
      image. The first release tag after this change (an RC by plan) has to confirm the added wait
      (the images now start after the slowest agent build, ~40 min).
    - **Release publish coupling (owner decision, 2026-11-12; wording confirmed by the owner the
-     same day).** The three image-publish jobs (`docker-publish`, `docker-publish-chisel`,
-     `docker-publish-postgres`) need `build-windows` and `build-macos`, and
-     `docker-publish-postgres` also needs `build-linux` and `build-gateway` (it needs no build
-     as an input; the jobs are success gates). Why: no `:X.Y.Z` image may exist for a release whose
-     agent packaging refused (UP-12). Costs: the images start only after the slowest agent build
-     (~40 min, untimed until an RC), and a failed or cancelled Windows or macOS build blocks every
-     image and the GitHub Release. Recovery: fix the cause and re-tag, or "Re-run failed jobs" on
-     the newest run for the tag (a server-DLL refusal is deterministic, so re-running without
-     fixing the Wee Tam vcpkg tree fails the same way). There is no sanctioned images-only publish
-     path today (tracked separately).
+     same day; recovery sentence corrected and re-confirmed by the owner the same day).** The three image-publish jobs (`docker-publish`, `docker-publish-chisel`,
+     `docker-publish-postgres`) need all four build jobs (`build-linux`, `build-gateway`,
+     `build-windows`, `build-macos`) as success gates; none takes a build's output as an input.
+     Why: no `:X.Y.Z` image may exist for a release whose server or agent packaging failed (UP-12).
+     Costs: the images start only after the slowest build (the Windows agent, ~40 min, untimed
+     until an RC), and a failed or cancelled build job blocks every image and the GitHub Release. Recovery: a server-DLL refusal is deterministic (the release job installs from a clean checkout, so re-running the same tag refuses again): fix the cause and re-tag. 'Re-run failed jobs' on the newest run for the tag is only for a transient failure such as a runner or network fault. There is no sanctioned images-only publish
+     path today (tracked in #7596).
    - **Interim gap until step 5: no native server stack on macOS.** `scripts/start-UAT.sh`
      and the native-stack phases of `/test` need a server binary, which macOS no longer
      builds; run the Linux stack (containers) instead.

@@ -2461,9 +2461,11 @@ jobs:
           # Agent-only vcpkg profile (ADR-0035 step 3): no `server` feature
           # (libpq, xmlsec, drogon), plus `tests` for Catch2. Every Windows
           # CI, nightly and CodeQL job uses this profile (release.yml drops
-          # `tests`), because the jobs a Wee Tam runner
-          # picks up all reuse that runner's one persistent
-          # vcpkg_installed/x64-windows tree; see docs/build-guide.md.
+          # `tests`), because the CI, nightly and CodeQL jobs a Wee Tam
+          # runner picks up reuse that runner's persistent
+          # vcpkg_installed/x64-windows tree (a clean checkout, such as
+          # release.yml or a trusted-fork run, deletes it and the next
+          # job reinstalls); see docs/build-guide.md.
           "$GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install \
             --triplet x64-windows \
             --x-manifest-root="$GITHUB_WORKSPACE" \

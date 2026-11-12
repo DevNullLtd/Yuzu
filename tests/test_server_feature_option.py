@@ -13,7 +13,7 @@ Lexical (always runs, stdlib only):
   keeps `build_server` as a DEPRECATED boolean defaulting to `true`. Deleting
   `build_server` makes Meson refuse to reconfigure any build dir that stored
   it ("Unknown options"), even with --wipe, so its removal is a planned
-  wipe-or-rename event (ADR-0035 step 4), never a quiet cleanup.
+  delete-or-rename event (ADR-0035 step 4), never a quiet cleanup.
 - meson.build derives `build_server` from the feature with
   `disable_auto_if(_server_host != 'linux')`, errors on
   `-Dserver=enabled` for a non-Linux target and on `enabled` contradicting a

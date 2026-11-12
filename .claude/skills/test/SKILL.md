@@ -39,7 +39,7 @@ Modes are layered: `--full` includes everything `default` runs, `default` includ
 The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). The orchestration prefers a single OS-aware script per concern over OS-specific forks:
 
 - Build dir is `build-linux` on Linux, `build-macos` on macOS — `scripts/setup.sh` auto-picks. The skill computes `BUILDDIR=build-$(host_os)` (with `darwin → macos`) via `scripts/test/_portable.sh` and uses `$BUILDDIR` everywhere.
-- Stack stand-up (Phase 4) calls `scripts/start-UAT.sh` — Linux only since ADR-0035 step 3 (macOS builds no native server; see the note under macOS prerequisites); the historical `start-UAT.sh` name is a back-compat shim.
+- Stack stand-up (Phase 4) calls `scripts/start-UAT.sh` — Linux only since ADR-0035 step 3 (macOS builds no native server; see the end of the paragraph after "What skips on macOS"); the historical `start-UAT.sh` name is a back-compat shim.
 - Port checks, disk-free, loadavg/CPU/mem fingerprints all go through `scripts/test/_portable.sh` (lsof + sysctl on macOS, ss + /proc on Linux).
 
 **Security E2E prerequisite:** curl >= 7.68 (>= 7.84 for the Retry-After check; an older curl skips that one assertion, below 7.68 the gate fails with an explicit message).
@@ -51,7 +51,7 @@ The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). Th
 - Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
 - Phase 6 sanitizers → still dispatches to the `yuzu-bigtam-linux` self-hosted pool, unaffected by local Docker availability
 
-Everything else (Phase 0 preflight, Phase 0b tooling, Phase 1 C++ + Erlang build, Phase 5 unit/EUnit/dialyzer/CT, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 4 (native stack) and the live-stack Phase 5 gates (integration, e2e, synthetic-UAT, puppeteer, browser-smoke) need a native `yuzu-server`, which macOS no longer builds (ADR-0035 step 3), so on macOS they fail loudly until step 5: run them on the Linux stack. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
+Everything else (Phase 0 preflight, Phase 0b tooling, Phase 1 C++ + Erlang build, Phase 5 unit/EUnit/dialyzer, Phase 7a perf, Phase 8 teardown) runs natively on macOS. Phase 4 (native stack) and the live-stack Phase 5 gates (integration, e2e, synthetic-UAT, puppeteer, browser-smoke, and the CT real-upstream gate) need a native `yuzu-server`, which macOS no longer builds (ADR-0035 step 3), so on macOS they fail loudly until step 5: run them on the Linux stack. Phase 7b coverage is Linux-only: on macOS the gate refuses with a WARN row (#6187).
 
 ## Workflow summary
 

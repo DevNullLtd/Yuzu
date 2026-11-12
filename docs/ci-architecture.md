@@ -428,7 +428,7 @@ the `release` job needs `docker-publish`, `docker-publish-postgres` and
 `docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
 `:latest`) first (the agent-bundle image needs `release`, so it is not
 published), and the build jobs' provenance attestations are already recorded.
-That holds when the gate fails after the builds passed: every image-publish job (`docker-publish`,
+An image is never published ahead of a failed build: every image-publish job (`docker-publish`,
 `docker-publish-chisel`, `docker-publish-postgres`) also needs all four builds
 (`build-linux`, `build-gateway`, `build-windows`, `build-macos`; ADR-0035 step 3,
 a success gate, not an artifact dependency), so a failed build, including a failed
